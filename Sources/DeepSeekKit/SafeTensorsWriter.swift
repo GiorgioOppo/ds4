@@ -83,8 +83,18 @@ public final class SafeTensorsWriter {
         try out.write(contentsOf: headerBytes)
 
         // 5. Tensor data, in declaration order.
+        //
+        // Each iteration allocates large transient `Data` buffers (a slurped
+        // input weight + a freshly-computed BF16/F16 output, hundreds of MB
+        // each for big tensors). Those buffers bridge to `NSData`/`_DataStorage`
+        // which can land in the thread's autorelease pool. A Swift CLI has no
+        // run loop, so without an explicit drain the pool accumulates for the
+        // whole shard — observed as multi-GB resident growth that goes to swap
+        // under pressure. Drain after every tensor.
         for e in entries {
-            try writeSource(e.source, byteCount: e.byteCount, to: out)
+            try autoreleasepool {
+                try writeSource(e.source, byteCount: e.byteCount, to: out)
+            }
         }
     }
 
@@ -108,14 +118,20 @@ public final class SafeTensorsWriter {
             try input.seek(toOffset: UInt64(off))
             var remaining = n
             while remaining > 0 {
-                let want = min(chunk, remaining)
-                guard let data = try input.read(upToCount: want), data.count == want else {
-                    throw NSError(domain: "SafeTensorsWriter", code: 3, userInfo: [
-                        NSLocalizedDescriptionKey: "short read at \(url.path)"
-                    ])
+                // `read(upToCount:)` returns a bridged `Data` (NSData backing).
+                // Without a pool around each chunk the backing storage piles
+                // up for the duration of the tensor — visible as steady RSS
+                // growth on multi-GB tensors.
+                try autoreleasepool {
+                    let want = min(chunk, remaining)
+                    guard let data = try input.read(upToCount: want), data.count == want else {
+                        throw NSError(domain: "SafeTensorsWriter", code: 3, userInfo: [
+                            NSLocalizedDescriptionKey: "short read at \(url.path)"
+                        ])
+                    }
+                    try out.write(contentsOf: data)
+                    remaining -= want
                 }
-                try out.write(contentsOf: data)
-                remaining -= want
             }
         }
     }
