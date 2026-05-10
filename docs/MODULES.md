@@ -4,10 +4,11 @@ Per-file index of `Sources/`. Each entry: purpose, key public API,
 dependencies, and any cross-references. Use as a directory index when
 deciding which file to open.
 
-For the Metal kernels (`Sources/DeepSeekKit/Kernels/`), see
-[`KERNELS.md`](KERNELS.md).
-
-For the Python correspondence, see [`PYTHON-MAPPING.md`](PYTHON-MAPPING.md).
+For Metal kernels see [`KERNELS.md`](KERNELS.md). For the
+Python correspondence see [`PYTHON-MAPPING.md`](PYTHON-MAPPING.md).
+For contributor recipes (how to add a kernel/layer/test) see
+[`DEVELOPING.md`](DEVELOPING.md). For the test inventory see
+[`TESTING.md`](TESTING.md).
 
 ---
 

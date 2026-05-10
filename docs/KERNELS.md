@@ -175,17 +175,11 @@ post-score topk and reusable for `topK` sampling.
 
 ## How to add a new kernel
 
-1. Write the `.metal` in `Sources/DeepSeekKit/Kernels/foo.metal`.
-   Follow the dispatch / function-constant conventions above.
-2. Add a Swift wrapper in `Sources/DeepSeekKit/Layers/Foo.swift` that:
-   - Constructs the `MTLComputePipelineState` once (lazy or static).
-   - Exposes a public method that builds the encoder, binds buffers,
-     dispatches, ends encoding. Caller manages `commit/waitUntilCompleted`.
-   - Includes a `referenceCPU(...)` pure-Swift implementation when
-     practical.
-3. Add a test in `Tests/DeepSeekKitTests/FooTests.swift` comparing
-   Metal output to the reference on a small randomized input. Build
-   inputs with `Tensor.from(bytes:shape:dtype:)`, read back with
-   `Tensor.toFloatArray()`.
-4. The `MetalLibPlugin` (declared in `Package.swift`) picks up
-   `.metal` files automatically on the next `swift build`.
+See the full recipe in [DEVELOPING.md §3](DEVELOPING.md#3-recipe-add-a-new-metal-kernel).
+
+Short version:
+1. `.metal` source under `Sources/DeepSeekKit/Kernels/`.
+2. Swift wrapper + `referenceCPU` under `Sources/DeepSeekKit/Layers/`.
+3. Test under `Tests/DeepSeekKitTests/`.
+4. `MetalLibPlugin` (Package.swift) picks up the new file on next
+   `swift build`.

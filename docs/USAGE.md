@@ -159,7 +159,15 @@ cp /Volumes/DATA/checkpoints/V4-Flash-HF/config.json \
 The first run is the slowest: the OS has to page in weights from SSD.
 Subsequent runs reuse the file cache and are much faster.
 
+For programmatic examples of the same operations (load a tensor,
+dispatch a kernel, build a Layer), see [EXAMPLES.md](EXAMPLES.md).
+For the conventions to follow when extending the project, see
+[DEVELOPING.md](DEVELOPING.md).
+
 ## Troubleshooting
+
+For an extended list of build-time errors and their causes, see
+[DEVELOPING.md §8 Common pitfalls](DEVELOPING.md#8-common-pitfalls-we-hit-these--you-will-too).
 
 | Symptom | Cause | Fix |
 |---|---|---|

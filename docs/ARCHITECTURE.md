@@ -84,6 +84,9 @@ slice of the same cache.
 
 ## Memory model
 
+See [MEMORY.md](MEMORY.md) for the full mmap walkthrough, KV cache
+lifecycle, and per-phase footprint.
+
 The checkpoint is **memory-mapped**, never copied to RAM in bulk.
 
 - `SafeTensorsFile.init(url:)` does `mmap(MAP_PRIVATE)` on each shard
@@ -196,6 +199,9 @@ one.
 
 ## Dtypes and conversions
 
+See [DTYPES.md](DTYPES.md) for full bit layouts, conversion math, and
+fusion details.
+
 Apple Silicon natively supports `F32`, `F16`, `BF16` (Metal 3+), and
 integer types. It does **not** have native FP8 / FP4 / E8M0 arithmetic.
 
@@ -212,7 +218,9 @@ for the implementation.
 
 ## What's not implemented
 
-See [`ROADMAP.md`](ROADMAP.md) for the full list. Headline items:
+See [`ROADMAP.md`](ROADMAP.md) for the feature roadmap and
+[`PERFORMANCE.md`](PERFORMANCE.md) for the planned perf optimizations.
+Headline items:
 
 - **Multi-token decode** works end-to-end (Tier 1 complete).
 - **act_quant QAT noise** on non-rope KV dims is skipped (Tier 3 deferred:

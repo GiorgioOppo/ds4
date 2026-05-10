@@ -74,27 +74,17 @@ Item by item:
 
 ## Performance — correctness-first, not yet optimized
 
-All the kernels are intentionally naive. Speed-up opportunities (none
-have been pursued yet):
+See [PERFORMANCE.md](PERFORMANCE.md) for the full bottleneck
+breakdown, hardware sizing estimates, profiling instructions, and
+per-optimization spec sheets.
 
-- **simdgroup_matrix BF16 GEMM**: replaces the 16×16 scalar tile in
-  `gemm_bf16.metal` with M3+ matrix instructions. ~5–10× faster GEMMs.
-- **FlashAttention tiling for `sparse_attn`**: the current
-  one-thread-per-(b,m,h) walks K indices serially with device-memory
-  accumulator reads/writes. A tiled version with threadgroup KV
-  shared memory is ~3–5× faster.
-- **Persistent MoE dispatch kernel**: replaces the host-side
-  `MoEDispatch.prepare` + N tiny expert dispatches with a single
-  fused kernel.
-- **Pipeline state caching**: many `Layers/*` create their pipeline
-  state on every `init` (lazy `let`). For deeply nested per-token
-  pipelines (e.g., MoEFFN's per-expert Linear calls) this adds CPU
-  overhead. A library-wide pipeline cache keyed by `(name,
-  constantSet)` saves ~10 ms per inference call.
-- **KV cache pool**: today every layer allocates its KV cache once at
-  construction time. With multi-batch or multi-session inference,
-  pooling these buffers and reusing them across requests cuts the
-  steady-state allocation overhead.
+Headline opportunities, none pursued yet:
+
+- simdgroup_matrix BF16 GEMM → ~5-10× on every Linear
+- FlashAttention tiling for sparse_attn → ~3-5× on attention
+- Persistent MoE dispatch kernel → ~2× per layer
+- Pipeline state caching → ~10-50 ms saved per inference call
+- KV cache pool → matters for multi-session serving
 
 ## Known limitations
 
