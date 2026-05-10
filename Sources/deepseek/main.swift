@@ -45,12 +45,26 @@ while i < args.count {
 let configURL = modelDir.appendingPathComponent("config.json")
 let tokenizerURL = modelDir.appendingPathComponent("tokenizer.json")
 
+// The HuggingFace V4 repo does not ship the ModelArgs JSON used by the
+// inference code (it's produced separately, e.g. by convert.py). When
+// config.json is absent we fall back to ModelArgs defaults so the CLI can
+// at least exercise the loader path. Real inference still needs a real config.
 let config: ModelConfig
-do {
-    config = try ModelConfig.load(from: configURL)
-} catch {
-    FileHandle.standardError.write(Data("failed to load config.json: \(error)\n".utf8))
-    exit(1)
+if FileManager.default.fileExists(atPath: configURL.path) {
+    do {
+        config = try ModelConfig.load(from: configURL)
+    } catch {
+        FileHandle.standardError.write(Data("failed to parse config.json: \(error)\n".utf8))
+        exit(1)
+    }
+} else {
+    FileHandle.standardError.write(Data("""
+    config.json not found at \(configURL.path) — using ModelArgs defaults.
+    Note: defaults are toy-sized (n_layers=7, n_routed_experts=8) and not
+    suitable for real inference.
+
+    """.utf8))
+    config = ModelConfig()
 }
 
 let tokenizer: Tokenizer

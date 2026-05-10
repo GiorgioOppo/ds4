@@ -23,5 +23,10 @@ let package = Package(
             dependencies: ["DeepSeekKit"],
             path: "Sources/deepseek"
         ),
+        .testTarget(
+            name: "DeepSeekKitTests",
+            dependencies: ["DeepSeekKit"],
+            path: "Tests/DeepSeekKitTests"
+        ),
     ]
 )
