@@ -10,6 +10,7 @@ generation natively on Metal.
 
 ```bash
 # 1. Build (the first time compiles all 23 Metal kernels into default.metallib).
+chmod +x Plugins/MetalLibPlugin/build_metallib.sh
 swift build -c release
 
 # 2. Convert a HuggingFace checkpoint to BF16 sharded.
@@ -18,12 +19,17 @@ swift build -c release
   --save-path   /Volumes/DATA/V4-Flash-bf16 \
   --n-experts 256        # from config.json
 
-# 3. Run inference.
+# 3. Stage config.json for the runtime.
+cp /Volumes/DATA/V4-Flash-HF/config.json /Volumes/DATA/V4-Flash-bf16/
+
+# 4. Run inference.
 .build/release/deepseek /Volumes/DATA/V4-Flash-bf16 \
   "Ciao" --mode chat --max-tokens 50
 ```
 
-Full setup, troubleshooting, and resume after a crash: [`USAGE.md`](USAGE.md).
+**Step-by-step guide from scratch (Italian, tutorial style)**:
+[`ISTRUZIONI.md`](ISTRUZIONI.md). For flag reference + troubleshooting:
+[`USAGE.md`](USAGE.md).
 
 ## Document index
 
@@ -32,9 +38,10 @@ already know what you need.
 
 | Doc | When to read |
 |---|---|
+| [`ISTRUZIONI.md`](ISTRUZIONI.md) | **Tutorial passo-passo (italiano)** dal Mac vuoto al primo token. Inizia da qui se è la prima volta. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture: data flow, module dependency graph, memory model, where Metal kernels sit vs Swift wrappers. **Read this before any source file.** |
 | [`GLOSSARY.md`](GLOSSARY.md) | One-stop reference for every domain term used in the source (MLA, MoE, HC, FP4-E2M1, E8M0, RoPE, YaRN, DSML, …). |
-| [`USAGE.md`](USAGE.md) | Prerequisites, build, convert, run, resume after crash, troubleshooting checklist. |
+| [`USAGE.md`](USAGE.md) | Reference completo dei flag CLI, resume after crash, troubleshooting checklist. |
 | [`EXAMPLES.md`](EXAMPLES.md) | Code recipes: load a tensor, dispatch a kernel, add a new Layer, generate a token, parse a chat completion. |
 | [`MODULES.md`](MODULES.md) | Per-file reference for `Sources/`. Purpose + public API + dependencies of every Swift file. Use as a directory index. |
 | [`KERNELS.md`](KERNELS.md) | Per-kernel reference for `Sources/DeepSeekKit/Kernels/*.metal`. Inputs, outputs, dispatch shape, function-constant indices. |
@@ -51,7 +58,8 @@ already know what you need.
 Three paths depending on why you're here:
 
 - **Operativo (just want to run it)**: [README](README.md) →
-  [USAGE](USAGE.md) → [EXAMPLES](EXAMPLES.md) →
+  [ISTRUZIONI](ISTRUZIONI.md) (start here, full Italian walkthrough) →
+  [USAGE](USAGE.md) (flag reference) → [EXAMPLES](EXAMPLES.md) →
   [ROADMAP](ROADMAP.md#known-limitations) for the gotchas.
 - **Architetturale (want to understand it)**: [README](README.md) →
   [ARCHITECTURE](ARCHITECTURE.md) → [GLOSSARY](GLOSSARY.md) →
