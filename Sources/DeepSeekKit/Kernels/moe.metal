@@ -31,9 +31,10 @@ inline float score_fn(float x) {
     } else if (SCORE == 1u) {
         return 1.0f / (1.0f + exp(-x));
     } else {
-        // sqrt(softplus(x)) = sqrt(log1p(exp(x)))
-        // numerically stable: softplus(x) = max(x, 0) + log1p(exp(-|x|))
-        float sp = max(x, 0.0f) + log1p(exp(-abs(x)));
+        // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+        // numerically stable: softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+        // MSL has no log1p; substitute log(1 + .).
+        float sp = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
         return sqrt(sp);
     }
 }
