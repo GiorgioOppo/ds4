@@ -75,13 +75,24 @@ public final class SafeTensorsFile {
         let dealloc: (UnsafeMutableRawPointer, Int) -> Void = { p, n in
             munmap(p, n)
         }
-        guard let buf = Device.shared.mtl.makeBuffer(
+        let device = Device.shared.mtl
+        guard let buf = device.makeBuffer(
                 bytesNoCopy: raw, length: alignedSize,
                 options: .storageModeShared,
                 deallocator: dealloc) else {
             munmap(raw, alignedSize)
+            let gib = 1024.0 * 1024.0 * 1024.0
+            let detail = """
+            MTLBuffer creation failed for mmap of \(url.path)
+              file size     : \(String(format: "%.2f", Double(fileSize) / gib)) GiB
+              aligned size  : \(String(format: "%.2f", Double(alignedSize) / gib)) GiB (page=\(pageSize))
+              maxBufferLen  : \(String(format: "%.2f", Double(device.maxBufferLength) / gib)) GiB
+            Likely causes:
+              - shard exceeds device.maxBufferLength (lower --shard-size-gb in converter)
+              - filesystem is not APFS (exFAT/NTFS mmap may be rejected by Metal)
+            """
             throw NSError(domain: "SafeTensors", code: 13, userInfo: [
-                NSLocalizedDescriptionKey: "MTLBuffer creation failed for mmap"
+                NSLocalizedDescriptionKey: detail
             ])
         }
         self.sharedBuffer = buf
