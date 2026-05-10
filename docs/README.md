@@ -52,6 +52,7 @@ already know what you need.
 | [`PERFORMANCE.md`](PERFORMANCE.md) | Where time goes today, profiling instructions, planned optimizations with effort estimates. |
 | [`PYTHON-MAPPING.md`](PYTHON-MAPPING.md) | Cross-walk: Swift file → `Reference/inference/{model,kernel,convert}.py` line ranges. |
 | [`ROADMAP.md`](ROADMAP.md) | What's implemented, what's stubbed, what's deferred and why. |
+| [`../TODO.md`](../TODO.md) | Living checklist of outstanding work, grouped by area (parity, runtime, encoding, perf, docs, testing). |
 
 ## Reading order
 
