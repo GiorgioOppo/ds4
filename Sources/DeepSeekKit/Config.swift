@@ -97,10 +97,55 @@ public struct ModelConfig: Codable, Sendable {
 
     public init() {}
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func g<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: k)) ?? fallback
+        }
+        self.maxBatchSize       = g(.maxBatchSize, 4)
+        self.maxSeqLen          = g(.maxSeqLen, 4096)
+        self.dtype              = g(.dtype, "fp8")
+        self.scaleFmt           = g(.scaleFmt, "ue8m0")
+        self.expertDtype        = g(.expertDtype, nil)
+        self.scaleDtype         = g(.scaleDtype, "fp8")
+        self.vocabSize          = g(.vocabSize, 129280)
+        self.dim                = g(.dim, 4096)
+        self.moeInterDim        = g(.moeInterDim, 4096)
+        self.nLayers            = g(.nLayers, 7)
+        self.nHashLayers        = g(.nHashLayers, 0)
+        self.nMtpLayers         = g(.nMtpLayers, 1)
+        self.nHeads             = g(.nHeads, 64)
+        self.nRoutedExperts     = g(.nRoutedExperts, 8)
+        self.nSharedExperts     = g(.nSharedExperts, 1)
+        self.nActivatedExperts  = g(.nActivatedExperts, 2)
+        self.scoreFunc          = g(.scoreFunc, "sqrtsoftplus")
+        self.routeScale         = g(.routeScale, 1.0)
+        self.swigluLimit        = g(.swigluLimit, 0.0)
+        self.qLoraRank          = g(.qLoraRank, 1024)
+        self.headDim            = g(.headDim, 512)
+        self.ropeHeadDim        = g(.ropeHeadDim, 64)
+        self.normEps            = g(.normEps, 1e-6)
+        self.oGroups            = g(.oGroups, 8)
+        self.oLoraRank          = g(.oLoraRank, 1024)
+        self.windowSize         = g(.windowSize, 128)
+        self.compressRatios     = g(.compressRatios, [0, 0, 4, 128, 4, 128, 4, 0])
+        self.compressRopeTheta  = g(.compressRopeTheta, 40000.0)
+        self.originalSeqLen     = g(.originalSeqLen, 0)
+        self.ropeTheta          = g(.ropeTheta, 10000.0)
+        self.ropeFactor         = g(.ropeFactor, 40)
+        self.betaFast           = g(.betaFast, 32)
+        self.betaSlow           = g(.betaSlow, 1)
+        self.indexNHeads        = g(.indexNHeads, 64)
+        self.indexHeadDim       = g(.indexHeadDim, 128)
+        self.indexTopk          = g(.indexTopk, 512)
+        self.hcMult             = g(.hcMult, 4)
+        self.hcSinkhornIters    = g(.hcSinkhornIters, 20)
+        self.hcEps              = g(.hcEps, 1e-6)
+    }
+
     public static func load(from url: URL) throws -> ModelConfig {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
-        // Allow extra/missing keys: many configs may omit defaults.
         return try decoder.decode(ModelConfig.self, from: data)
     }
 
