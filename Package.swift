@@ -13,7 +13,10 @@ let package = Package(
     targets: [
         .target(
             name: "DeepSeekKit",
-            path: "Sources/DeepSeekKit"
+            path: "Sources/DeepSeekKit",
+            resources: [
+                .process("Kernels")
+            ]
         ),
         .executableTarget(
             name: "deepseek",
