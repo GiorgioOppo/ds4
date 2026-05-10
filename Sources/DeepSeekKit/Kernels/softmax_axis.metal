@@ -19,11 +19,13 @@ kernel void softmax_axis_f32(
     constant uint3&     dims    [[buffer(1)]],   // (outer, axis, inner)
     threadgroup float*  shared_ [[threadgroup(0)]],
     uint2 tg     [[threadgroup_position_in_grid]],
-    uint  tid    [[thread_position_in_threadgroup]],
-    uint  tgsize [[threads_per_threadgroup]]
+    uint2 tidv   [[thread_position_in_threadgroup]],
+    uint2 tgsv   [[threads_per_threadgroup]]
 ) {
     uint outer = tg.x, inner = tg.y;
     uint OUTER = dims.x, AXIS = dims.y, INNER = dims.z;
+    uint tid = tidv.x;
+    uint tgsize = tgsv.x;
     if (outer >= OUTER || inner >= INNER) return;
 
     // base offset for this (outer, inner) row; stride between successive
