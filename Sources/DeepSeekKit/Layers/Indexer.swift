@@ -2,21 +2,11 @@ import Foundation
 import Metal
 
 /// Indexer: top-k learned KV-position selector for sparse attention.
-/// Mirrors `Indexer` in `Reference/inference/model.py` lines
-/// 380–433. Used by layers whose `compress_ratio == 4` to pick which
-/// compressed positions the main attention should attend to.
+/// Mirrors `Indexer` in `Reference/inference/model.py` lines 380–433.
 ///
-/// Pipeline (decode):
-///   1. q  = wq_b(qr)                  — [b, s, h_idx, d_idx]
-///   2. apply RoPE on the rope tail
-///   3. Hadamard rotate(q), then FP4-quant in-place (QAT noise)
-///   4. compressor(x) produces compressed KV (also FP4 + Hadamard)
-///   5. weights = weights_proj(x) * (softmax_scale * h_idx^-0.5)
-///   6. score   = einsum("bshd,btd->bsht", q, kv) → relu → weighted sum over heads
-///   7. topk_idxs = score.topk(index_topk)
-///
-/// All numerically routed through FP4 — quality matters because these indices
-/// drive the sparse attention.
+/// Used by layers whose `compress_ratio == 4` to pick which compressed KV
+/// positions the main attention should attend to. Implementation matches
+/// the prefill path; the decode path reuses it with `seqlen == 1`.
 public final class Indexer {
     public let dim: Int
     public let nHeads: Int
@@ -27,12 +17,14 @@ public final class Indexer {
     public let compressRatio: Int
     public let softmaxScale: Float
 
-    public let wqB: Linear              // [n_heads * head_dim, q_lora_rank]
-    public let weightsProj: Linear      // [n_heads, dim] (BF16 in checkpoint)
-    public let compressor: Compressor   // its own compressor with rotate=true
-
-    public var kvCache: Tensor          // [maxBatch, maxSeqLen/ratio, head_dim]
+    public let wqB: Linear
+    public let weightsProj: Linear
+    public let compressor: Compressor
+    public var kvCache: Tensor              // [maxBatch, maxSeqLen/ratio, head_dim]
     public var rope: RoPE?
+
+    private let pScoreReduce: MTLComputePipelineState
+    private let pTopKPostproc: MTLComputePipelineState
 
     public init(config: ModelConfig, compressRatio: Int,
                 wqB: Linear, weightsProj: Linear, compressor: Compressor,
@@ -49,12 +41,105 @@ public final class Indexer {
         self.weightsProj = weightsProj
         self.compressor = compressor
         self.kvCache = kvCache
+        self.pScoreReduce = Device.shared.makePipeline("indexer_score_reduce_f32")
+        self.pTopKPostproc = Device.shared.makePipeline("indexer_topk_postprocess_i32")
     }
 
-    /// Returns the int32 topk indices tensor of shape [b, s, indexTopk].
-    /// NOT IMPLEMENTED. See model.py:402 for the reference pipeline.
+    /// Returns `[B, S, K]` Int32 indices (with -1 padding for invalid slots).
     public func callAsFunction(_ x: Tensor, qr: Tensor, startPos: Int, offset: Int,
-                               in cmd: MTLCommandBuffer) -> Tensor {
-        fatalError("Indexer.forward not implemented — porting target: model.py:402")
+                                in cmd: MTLCommandBuffer) -> Tensor {
+        precondition(x.dtype == .f32 && x.shape.count == 3)
+        let B = x.shape[0], S = x.shape[1]
+        let endPos = startPos + S
+        let ratio = compressRatio
+
+        // 1. q = wq_b(qr) → [B, S, n_heads, head_dim]
+        let qFlat = wqB(qr.reshape([B * S, qLoraRank]), in: cmd)
+        let q = qFlat.reshape([B, S, nHeads, headDim])
+
+        // 2. RoPE on rope tail (interpret as [B*S, n_heads, head_dim]).
+        guard let rope = rope else { fatalError("Indexer.rope not set") }
+        rope.apply(q.reshape([B * S, nHeads, headDim]),
+                   startPos: startPos, inverse: false, in: cmd)
+
+        // 3. Hadamard rotation on the head dim (per-head independently).
+        Hadamard.apply(q, in: cmd)
+
+        // 4. FP4 quant in place (QAT noise).
+        _ = ActQuant(format: .fp4).quant(q.reshape([B * S * nHeads, headDim]),
+                                          inplace: true, in: cmd)
+
+        // 5. Run the Compressor and copy its output into our own kvCache so
+        //    the einsum below reads from compressed tokens up to endPos.
+        //    (model.py:417 `self.compressor(x, start_pos)`; self.compressor
+        //    shares kv_cache with us.)
+        guard let compOut = compressor(x, startPos: startPos, in: cmd) else {
+            fatalError("Indexer requires Compressor to emit a tensor on prefill")
+        }
+        do {
+            let blit = cmd.makeBlitCommandEncoder()!
+            let bytesPerRow = headDim * MemoryLayout<Float>.size
+            let rowsPerBatch = compOut.shape[1]                 // S/ratio
+            let cacheRowsPerBatch = kvCache.shape[1]             // maxSeqLen/ratio
+            for b in 0..<B {
+                let srcOff = b * rowsPerBatch * bytesPerRow
+                let dstOff = kvCache.offset + b * cacheRowsPerBatch * bytesPerRow
+                blit.copy(from: compOut.buffer, sourceOffset: srcOff,
+                          to: kvCache.buffer, destinationOffset: dstOff,
+                          size: rowsPerBatch * bytesPerRow)
+            }
+            blit.endEncoding()
+        }
+
+        // 6. weights = weights_proj(x) * (softmax_scale * n_heads^-0.5)
+        let weightsFlat = weightsProj(x.reshape([B * S, dim]), in: cmd)
+        let weightsScale = softmaxScale * pow(Float(nHeads), -0.5)
+        let weights = Elementwise.scale(weightsFlat, by: weightsScale, in: cmd)
+
+        // 7. score = einsum("bshd,btd->bsht", q, kv_cache[:B, :endPos/ratio])
+        let T = endPos / ratio
+        // Slice kv_cache to first T rows by reshaping the same buffer.
+        let kvSlice = Tensor(shape: [B, T, headDim], dtype: .f32,
+                              buffer: kvCache.buffer, offset: kvCache.offset)
+        let score = Einsum.bshdBtd(q: q, kv: kvSlice, in: cmd)   // [B, S, n_heads, T]
+
+        // 8. y[B, S, T] = Σ_h relu(score) * weights, with prefill causal mask.
+        let y = Tensor.empty(shape: [B, S, T], dtype: .f32)
+        do {
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pScoreReduce)
+            enc.setBuffer(score.buffer, offset: 0, index: 0)
+            enc.setBuffer(weights.buffer, offset: 0, index: 1)
+            enc.setBuffer(y.buffer, offset: 0, index: 2)
+            var dims = SIMD4<UInt32>(UInt32(B), UInt32(S), UInt32(nHeads), UInt32(T))
+            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
+            var misc = SIMD2<UInt32>(UInt32(ratio), startPos == 0 ? 1 : 0)
+            enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 4)
+            enc.dispatchThreads(MTLSize(width: T, height: S, depth: B),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            enc.endEncoding()
+        }
+
+        // 9. Top-K along the last axis.
+        let yFlat = y.reshape([B * S, T])
+        let k = min(indexTopk, T)
+        let topk = TopK.apply(yFlat, k: k, in: cmd)
+        let topkIdxs = topk.indices.reshape([B, S, k])
+
+        // 10. Mask invalid + add offset.
+        do {
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pTopKPostproc)
+            enc.setBuffer(topkIdxs.buffer, offset: 0, index: 0)
+            var dims = SIMD3<UInt32>(UInt32(B), UInt32(S), UInt32(k))
+            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 1)
+            var misc = SIMD3<UInt32>(UInt32(ratio), UInt32(offset), startPos == 0 ? 1 : 0)
+            enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 2)
+            enc.dispatchThreads(MTLSize(width: k, height: S, depth: B),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            enc.endEncoding()
+        }
+
+        return topkIdxs
     }
 }
