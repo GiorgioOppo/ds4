@@ -15,7 +15,7 @@ import Metal
 public extension Transformer {
 
     static func randomInit(config: ModelConfig) -> Transformer {
-        var rng = MiniRNG(seed: 0xDEEPC0DE)
+        var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
         let hc = config.hcMult
         let mixHc = (2 + hc) * hc
@@ -149,7 +149,7 @@ public extension Transformer {
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
-        var rng = MiniRNG(seed: 0xDEEPC0DE)
+        var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
         let hc = config.hcMult
         let mixHc = (2 + hc) * hc
