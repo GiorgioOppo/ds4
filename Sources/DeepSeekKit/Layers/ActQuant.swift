@@ -162,8 +162,8 @@ public final class ActQuant {
             let v: Float = 448.0
             return sign == 1 ? -v : v
         }
-        let bits = (UInt32(sign) << 31) | (UInt32(newExp + 120) << 23) | (UInt32(mant3) << 20)
-        return Float(bitPattern: bits)
+        let outBits = (UInt32(sign) << 31) | (UInt32(newExp + 120) << 23) | (UInt32(mant3) << 20)
+        return Float(bitPattern: outBits)
     }
 
     private static func roundToE2M1(_ x: Float) -> Float {
