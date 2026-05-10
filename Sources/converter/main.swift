@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import DeepSeekKit
 
 // Native Swift port of `Reference/inference/convert.py`, extended to
@@ -84,7 +85,24 @@ while !args.isEmpty {
 guard let hf = hfPath, let save = savePath, nExperts > 0 else { usage() }
 precondition(nExperts % mp == 0, "n_experts must be divisible by model_parallel")
 precondition(mp == 1, "model_parallel > 1 not supported by this Swift port (single-rank)")
-let shardSizeBytes = Int(shardSizeGB * 1_000_000_000)
+// Cap shard size to ~95% of the device's per-MTLBuffer limit. The
+// runtime mmaps each shard as one MTLBuffer, so a shard larger than
+// `maxBufferLength` is unloadable on this machine. The 95% margin
+// leaves room for safetensors header + page alignment rounding.
+var shardSizeBytes = Int(shardSizeGB * 1_000_000_000)
+if let dev = MTLCreateSystemDefaultDevice() {
+    let cap = Int(Double(dev.maxBufferLength) * 0.95)
+    if shardSizeBytes > cap {
+        let gib = 1024.0 * 1024.0 * 1024.0
+        print("Capping --shard-size-gb \(shardSizeGB) to "
+              + String(format: "%.2f", Double(cap) / gib)
+              + " GiB (device maxBufferLength = "
+              + String(format: "%.2f", Double(dev.maxBufferLength) / gib)
+              + " GiB).")
+        shardSizeBytes = cap
+        shardSizeGB = Double(cap) / 1_000_000_000.0
+    }
+}
 
 let hfDir = URL(fileURLWithPath: hf)
 let saveDir = URL(fileURLWithPath: save)
