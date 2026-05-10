@@ -239,12 +239,21 @@ func deqE8M0(_ b: UInt8) -> Float {
     return Float(bitPattern: UInt32(b) << 23)
 }
 
+// Pre-computed lookup tables for the dequant functions. Each input byte
+// (or nibble) maps to a fixed Float, so we replace the per-element bit
+// twiddling with a single load. 256-entry tables fit in L1.
+let e4m3LUT: [Float] = (0..<256).map { deqE4M3(UInt8($0)) }
+let e2m1LUT: [Float] = (0..<16).map  { deqE2M1(UInt8($0)) }
+let e8m0LUT: [Float] = (0..<256).map { deqE8M0(UInt8($0)) }
+
 // ---------- FP8 → native fusion ----------
 //
 // Weight: [out, in] FP8-E4M3. Scale: [out/128, in/128] E8M0.
 //   fused[i, j] = deqE4M3(W[i,j]) * deqE8M0(S[i/128, j/128]).
-// Output: [out, in] in `target` (BF16 or F16). Streamed row-by-row so
-// memory stays bounded by inDim regardless of total tensor size.
+// Output: [out, in] in `target` (BF16 or F16). Rows are dequantized in
+// parallel via DispatchQueue.concurrentPerform; the input weight is
+// slurped once so all worker threads can index it without serializing
+// on a shared FileHandle cursor.
 func fuseFP8ToNative(weightURL: URL, weightOffset: Int,
                      scaleURL: URL, scaleOffset: Int,
                      outDim: Int, inDim: Int,
@@ -263,28 +272,48 @@ func fuseFP8ToNative(weightURL: URL, weightOffset: Int,
         throw NSError(domain: "fuseFP8", code: 2)
     }
 
+    // Slurp the entire weight tensor up front so rows can be processed in
+    // parallel. Peak memory adds one tensor's worth of FP8 (= half the
+    // BF16 output we're already allocating below), bounded by tensor size.
     guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
         throw NSError(domain: "fuseFP8", code: 3)
     }
     defer { try? wf.close() }
     try wf.seek(toOffset: UInt64(weightOffset))
+    let weightLen = outDim * inDim
+    guard let weightBytes = try wf.read(upToCount: weightLen),
+          weightBytes.count == weightLen else {
+        throw NSError(domain: "fuseFP8", code: 4)
+    }
 
     var out = Data(count: outDim * inDim * 2)
     out.withUnsafeMutableBytes { outRaw in
         let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
         scaleBytes.withUnsafeBytes { scaleRaw in
             let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            for i in 0..<outDim {
-                guard let row = try? wf.read(upToCount: inDim), row.count == inDim else {
-                    fatalError("short read on FP8 weight row \(i)")
-                }
-                let bo = i / 128
-                row.withUnsafeBytes { rowRaw in
-                    let rowPtr = rowRaw.bindMemory(to: UInt8.self).baseAddress!
-                    for j in 0..<inDim {
-                        let s = deqE8M0(scalePtr[bo * blocksIn + (j / 128)])
-                        let w = deqE4M3(rowPtr[j])
-                        outPtr[i * inDim + j] = packNative(w * s, target)
+            weightBytes.withUnsafeBytes { wRaw in
+                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
+                e4m3LUT.withUnsafeBufferPointer { e4m3 in
+                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
+                        let e4m3Ptr = e4m3.baseAddress!
+                        let e8m0Ptr = e8m0.baseAddress!
+                        // Rows are independent: each writes a disjoint
+                        // [i * inDim, (i+1) * inDim) slice of outPtr.
+                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
+                            let bo = i / 128
+                            let rowIn = wPtr.advanced(by: i * inDim)
+                            let rowOut = outPtr.advanced(by: i * inDim)
+                            // Hoist the scale lookup out of the inner loop:
+                            // it's constant within each 128-element block.
+                            for sb in 0..<blocksIn {
+                                let s = e8m0Ptr[Int(scalePtr[bo * blocksIn + sb])]
+                                let jBase = sb * 128
+                                for k in 0..<128 {
+                                    let w = e4m3Ptr[Int(rowIn[jBase + k])]
+                                    rowOut[jBase + k] = packNative(w * s, target)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -316,6 +345,9 @@ func fuseFP4ToNative(weightURL: URL, weightOffset: Int,
         throw NSError(domain: "fuseFP4", code: 2)
     }
 
+    // Slurp the whole packed-FP4 weight up front so rows can be expanded
+    // in parallel. Packed size is half the logical inDim, so this peak is
+    // a quarter of the BF16 output buffer we're already holding.
     guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
         throw NSError(domain: "fuseFP4", code: 3)
     }
@@ -323,28 +355,43 @@ func fuseFP4ToNative(weightURL: URL, weightOffset: Int,
     try wf.seek(toOffset: UInt64(weightOffset))
 
     let packedRowBytes = inDim / 2
+    let weightLen = outDim * packedRowBytes
+    guard let weightBytes = try wf.read(upToCount: weightLen),
+          weightBytes.count == weightLen else {
+        throw NSError(domain: "fuseFP4", code: 4)
+    }
+
     var out = Data(count: outDim * inDim * 2)
     out.withUnsafeMutableBytes { outRaw in
         let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
         scaleBytes.withUnsafeBytes { scaleRaw in
             let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            for i in 0..<outDim {
-                guard let row = try? wf.read(upToCount: packedRowBytes),
-                      row.count == packedRowBytes else {
-                    fatalError("short read on FP4 weight row \(i)")
-                }
-                row.withUnsafeBytes { rowRaw in
-                    let rowPtr = rowRaw.bindMemory(to: UInt8.self).baseAddress!
-                    for halfIdx in 0..<packedRowBytes {
-                        let byte = rowPtr[halfIdx]
-                        let jLow = 2 * halfIdx
-                        let jHigh = jLow + 1
-                        let sLow = deqE8M0(scalePtr[i * blocksIn + (jLow / 32)])
-                        let sHigh = deqE8M0(scalePtr[i * blocksIn + (jHigh / 32)])
-                        let vLow = deqE2M1(byte & 0xF) * sLow
-                        let vHigh = deqE2M1(byte >> 4) * sHigh
-                        outPtr[i * inDim + jLow]  = packNative(vLow, target)
-                        outPtr[i * inDim + jHigh] = packNative(vHigh, target)
+            weightBytes.withUnsafeBytes { wRaw in
+                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
+                e2m1LUT.withUnsafeBufferPointer { e2m1 in
+                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
+                        let e2m1Ptr = e2m1.baseAddress!
+                        let e8m0Ptr = e8m0.baseAddress!
+                        // Each row owns a disjoint slice of outPtr; safe
+                        // to fan out across cores.
+                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
+                            let rowIn = wPtr.advanced(by: i * packedRowBytes)
+                            let rowOut = outPtr.advanced(by: i * inDim)
+                            let scaleRow = scalePtr.advanced(by: i * blocksIn)
+                            // 32 logical elements per scale block = 16 packed bytes.
+                            for sb in 0..<blocksIn {
+                                let s = e8m0Ptr[Int(scaleRow[sb])]
+                                let inBase = sb * 16
+                                let outBase = sb * 32
+                                for k in 0..<16 {
+                                    let byte = rowIn[inBase + k]
+                                    let vLow  = e2m1Ptr[Int(byte & 0xF)] * s
+                                    let vHigh = e2m1Ptr[Int(byte >> 4)] * s
+                                    rowOut[outBase + 2 * k]     = packNative(vLow, target)
+                                    rowOut[outBase + 2 * k + 1] = packNative(vHigh, target)
+                                }
+                            }
+                        }
                     }
                 }
             }
