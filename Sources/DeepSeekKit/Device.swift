@@ -6,7 +6,14 @@ public final class Device {
 
     public let mtl: MTLDevice
     public let queue: MTLCommandQueue
-    public let library: MTLLibrary
+
+    // Loaded on first use. The converter target only needs `mtl` to wrap
+    // mmapped safetensors as MTLBuffers and never touches the kernel
+    // library; eagerly loading the metallib here would make the converter
+    // fail on builds that don't ship one (e.g. plain `swift build`, which
+    // doesn't always compile the .metal resources into default.metallib).
+    private lazy var _library: MTLLibrary = Self.loadLibrary(device: mtl)
+    public var library: MTLLibrary { _library }
 
     private init() {
         guard let dev = MTLCreateSystemDefaultDevice() else {
@@ -17,7 +24,6 @@ public final class Device {
         }
         self.mtl = dev
         self.queue = q
-        self.library = Self.loadLibrary(device: dev)
     }
 
     private static func loadLibrary(device: MTLDevice) -> MTLLibrary {
