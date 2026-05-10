@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 /// Walsh-Hadamard transform along the last axis. Mirrors `rotate_activation`
-/// in `Original/DeepSeek-V4-Pro/inference/model.py` lines 247–251.
+/// in `Reference/inference/model.py` lines 247–251.
 public enum Hadamard {
     private static let pipeline = Device.shared.makePipeline("hadamard_f32")
 

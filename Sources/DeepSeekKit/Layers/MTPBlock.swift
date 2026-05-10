@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 /// Multi-Token Prediction block. Mirrors `MTPBlock` in
-/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 738–766.
+/// `Reference/inference/model.py` lines 738–766.
 ///
 /// Inherits the structure of `Block` but adds:
 ///   - e_proj, h_proj projections that fuse the new-token embedding with the

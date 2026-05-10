@@ -1,7 +1,7 @@
 import Foundation
 
 /// YaRN frequency scaling for long-context RoPE. Mirrors `precompute_freqs_cis`
-/// from `Original/DeepSeek-V4-Pro/inference/model.py` lines 199–229.
+/// from `Reference/inference/model.py` lines 199–229.
 ///
 /// Returns a flat array of length `2 * seqlen * (dim/2)` interpreted as
 /// `[seqlen][dim/2]` of (cos, sin) pairs. This is what the Metal kernel

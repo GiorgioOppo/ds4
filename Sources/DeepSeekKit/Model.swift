@@ -31,7 +31,7 @@ public final class ParallelHead {
 }
 
 /// DeepSeek-V4 transformer. Mirrors `Transformer` in
-/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 769–809.
+/// `Reference/inference/model.py` lines 769–809.
 ///
 /// forward(input_ids, start_pos):
 ///   h = embed(input_ids).unsqueeze(2).repeat(1, 1, hc_mult, 1)   // expand to hc copies

@@ -2,11 +2,11 @@
 
 Swift + Metal port of [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 inference for Apple Silicon. Targets the same architecture as the upstream
-Python implementation in `Original/DeepSeek-V4-Pro/inference/`.
+Python implementation in `Reference/inference/`.
 
 > **Status: scaffold aligned to the reference implementation.** Module shapes,
 > Metal kernel signatures, and config fields all mirror the Python reference
-> in `Original/DeepSeek-V4-Pro/inference/{model.py, kernel.py}`. The five
+> in `Reference/inference/{model.py, kernel.py}`. The five
 > compute-heavy custom kernels (FP8 GEMM, FP4 GEMM, sparse attention, HC
 > Sinkhorn, FP8/FP4 activation quant) are stubbed and trap on invocation —
 > see "Why parts are intentionally unimplemented" below.
@@ -21,7 +21,7 @@ unified memory. Same code, different `config.json` and weights.
 
 ## Architecture map (Python → Swift)
 
-The reference is in `Original/DeepSeek-V4-Pro/inference/model.py` (827 lines).
+The reference is in `Reference/inference/model.py` (827 lines).
 Each module is mirrored 1:1 in Swift:
 
 | Python (model.py) | Swift |
@@ -128,7 +128,7 @@ In rough dependency order:
 
 - **`assembleModel`** in `Sources/deepseek/main.swift` — reads
   `model.safetensors.index.json`, walks every layer's weight names and builds
-  the `Linear` / `RMSNorm` instances. Run `Original/DeepSeek-V4-Pro/inference/convert.py`
+  the `Linear` / `RMSNorm` instances. Run `Reference/inference/convert.py`
   upstream to produce the single-rank `model0-mp1.safetensors` shard layout
   this loader expects.
 - **`TokenizerLoader`** — port HuggingFace `tokenizer.json` parser
@@ -137,7 +137,7 @@ In rough dependency order:
 
 ### 6. Chat encoding
 
-`Original/DeepSeek-V4-Pro/encoding/encoding_dsv4.py` (744 lines) builds the
+`Reference/encoding/encoding_dsv4.py` (744 lines) builds the
 chat string from OpenAI-style messages with `<think>` / `</think>` markers
 for the three reasoning effort modes. Port it once the rest works; the CLI
 in this scaffold takes a pre-formatted prompt string.
@@ -213,20 +213,28 @@ Sources/
       elementwise.metal         silu_mul, axpy, scale, add
       sampling.metal            argmax, apply_temperature
       moe.metal                 gate scoring + top-k
-      act_quant.metal           STUB — port act_quant_kernel + fp4_quant_kernel
+      act_quant.metal           FP8/FP4 block-wise activation quant (working)
+      hadamard.metal            FWHT for power-of-2 dims (working)
+      hc_sinkhorn.metal         HC pre/post/comb splitter with Sinkhorn (working)
       fp8_gemm.metal            STUB — port fp8_gemm_kernel
       fp4_gemm.metal            STUB — port fp4_gemm_kernel
       sparse_attn.metal         STUB — port sparse_attn_kernel
-      hc_sinkhorn.metal         STUB — port hc_split_sinkhorn_kernel
-      hadamard.metal            STUB — FWHT for power-of-2 dims
   deepseek/
     main.swift                  CLI
 
-Original/                       Reference Python (read-only, gitignored from build)
-  DeepSeek-V4-Pro/
-    inference/                  model.py, kernel.py, generate.py, convert.py
-    encoding/                   encoding_dsv4.py + tests
-    DeepSeek_V4.pdf             technical report
+Tests/
+  DeepSeekKitTests/             XCTest target (Metal vs pure-Swift reference)
+    HadamardTests.swift
+    HCSinkhornTests.swift
+    ActQuantTests.swift
+
+Reference/                      Upstream Python source-of-truth (read-only)
+  inference/                    model.py, kernel.py, generate.py, convert.py
+  encoding/                     encoding_dsv4.py + tests
+  generation_config.json
+  tokenizer_config.json
+  UPSTREAM_README.md            HF model card
+  LICENSE                       upstream MIT
 ```
 
 ## License

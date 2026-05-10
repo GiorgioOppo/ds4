@@ -17,7 +17,7 @@ public enum ScoreFunc: Int, Sendable {
 }
 
 /// MoE Gate. Mirrors `Gate` in
-/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 546–584.
+/// `Reference/inference/model.py` lines 546–584.
 public final class Gate {
     public let topK: Int
     public let nExperts: Int

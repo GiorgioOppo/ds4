@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 /// Linear layer dispatching to BF16 / FP8 / FP4 GEMM based on weight dtype,
-/// matching `linear()` in `Original/DeepSeek-V4-Pro/inference/model.py`.
+/// matching `linear()` in `Reference/inference/model.py`.
 ///
 /// FP8 path: act_quant(x) → fp8_gemm(x_q, x_s, w, w_s) → BF16 out
 /// FP4 path: act_quant(x) → fp4_gemm(x_q, x_s, w, w_s) → BF16 out

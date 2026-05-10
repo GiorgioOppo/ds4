@@ -1,7 +1,7 @@
 import Foundation
 
 /// Quantization layouts used by DeepSeek-V4. These match the reference in
-/// `Original/DeepSeek-V4-Pro/inference/kernel.py` and the FP4/FP8 mixed
+/// `Reference/inference/kernel.py` and the FP4/FP8 mixed
 /// checkpoint format. Apple Metal does not support FP8 or FP4 natively, so
 /// every GEMM that reads these dtypes must dequantize through FP16/FP32 in
 /// the shader before computing.

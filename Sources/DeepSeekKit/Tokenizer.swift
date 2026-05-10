@@ -11,7 +11,7 @@ import Foundation
 /// `add_bos_token` and `add_eos_token` are both false.
 ///
 /// Chat encoding is NOT done by the tokenizer — it's a separate Python
-/// pipeline in `Original/DeepSeek-V4-Pro/encoding/encoding_dsv4.py` (744
+/// pipeline in `Reference/encoding/encoding_dsv4.py` (744
 /// lines) that maps OpenAI-style messages into a single string before the
 /// tokenizer runs. Porting that is its own subproject; for now the CLI
 /// expects an already-formatted prompt string.

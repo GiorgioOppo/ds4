@@ -2,7 +2,7 @@
 using namespace metal;
 
 // hc_split_sinkhorn — port of `hc_split_sinkhorn_kernel`
-// in Original/DeepSeek-V4-Pro/inference/kernel.py lines 371–427.
+// in Reference/inference/kernel.py lines 371–427.
 //
 // Inputs (n = b * s, hc = hcMult, mix_hc = (2 + hc) * hc):
 //   mixes:    [n, mix_hc]  f32

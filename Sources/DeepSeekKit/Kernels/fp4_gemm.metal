@@ -4,7 +4,7 @@ using namespace metal;
 // fp4_gemm — FP8 activation × FP4 weight GEMM with mixed scaling.
 //
 // Port of `fp4_gemm_kernel` from
-// Original/DeepSeek-V4-Pro/inference/kernel.py.
+// Reference/inference/kernel.py.
 //
 // Used by MoE expert weights only (`expert_dtype == "fp4"`).
 //

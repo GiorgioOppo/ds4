@@ -3,7 +3,7 @@ import Metal
 
 /// HC mixing-tensor splitter with Sinkhorn-normalized comb matrix.
 /// Mirrors `hc_split_sinkhorn` in
-/// `Original/DeepSeek-V4-Pro/inference/kernel.py` lines 371–438.
+/// `Reference/inference/kernel.py` lines 371–438.
 public final class HCSinkhorn {
     public let hcMult: Int
     public let sinkhornIters: Int

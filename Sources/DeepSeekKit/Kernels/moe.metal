@@ -4,7 +4,7 @@ using namespace metal;
 // MoE Gate scoring + top-k selection.
 //
 // Mirrors `Gate.forward` in
-// Original/DeepSeek-V4-Pro/inference/model.py lines 564–584.
+// Reference/inference/model.py lines 564–584.
 //
 // Input:
 //   logits:       [tokens, n_experts] f32  — produced by linear(x, gate.weight)

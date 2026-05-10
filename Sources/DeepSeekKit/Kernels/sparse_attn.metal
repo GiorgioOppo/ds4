@@ -5,7 +5,7 @@ using namespace metal;
 // softmax (FlashAttention-style).
 //
 // Port of `sparse_attn_kernel` from
-// Original/DeepSeek-V4-Pro/inference/kernel.py lines 277–352.
+// Reference/inference/kernel.py lines 277–352.
 //
 // Inputs:
 //   q:          [b, m, h, d]    BF16 (m = query length, h = heads)

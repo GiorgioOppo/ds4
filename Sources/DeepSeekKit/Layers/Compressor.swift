@@ -3,7 +3,7 @@ import Metal
 
 /// KV compressor: gated softmax-pooling over `compressRatio` consecutive
 /// tokens. Mirrors the `Compressor` module in
-/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 279–377.
+/// `Reference/inference/model.py` lines 279–377.
 ///
 /// When ratio == 4, uses overlapping windows for smoother boundaries; for
 /// other ratios it operates on disjoint windows. Maintains internal state

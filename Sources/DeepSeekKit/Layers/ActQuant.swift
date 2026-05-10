@@ -3,7 +3,7 @@ import Metal
 
 /// Block-wise activation quantization. Mirrors `act_quant` (FP8) and
 /// `fp4_act_quant` (FP4) in
-/// `Original/DeepSeek-V4-Pro/inference/kernel.py` lines 105–200.
+/// `Reference/inference/kernel.py` lines 105–200.
 ///
 /// Two output modes:
 ///   - `inplace == true`:  round-trip quant→dequant back into the input

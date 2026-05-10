@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 /// Indexer: top-k learned KV-position selector for sparse attention.
-/// Mirrors `Indexer` in `Original/DeepSeek-V4-Pro/inference/model.py` lines
+/// Mirrors `Indexer` in `Reference/inference/model.py` lines
 /// 380–433. Used by layers whose `compress_ratio == 4` to pick which
 /// compressed positions the main attention should attend to.
 ///

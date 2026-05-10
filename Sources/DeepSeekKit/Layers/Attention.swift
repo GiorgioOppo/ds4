@@ -3,7 +3,7 @@ import Metal
 
 /// Multi-head Latent Attention (MLA) with sliding window + per-layer KV
 /// compression. Direct port of the `Attention` module in
-/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 436–543.
+/// `Reference/inference/model.py` lines 436–543.
 ///
 /// Layer-mode is selected by `compressRatio`:
 ///   - 0:   pure sliding-window attention (window_size = 128), no compression

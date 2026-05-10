@@ -11,7 +11,7 @@ public struct GenerationOptions {
 }
 
 /// Generation loop. Mirrors `generate()` in
-/// `Original/DeepSeek-V4-Pro/inference/generate.py` lines 27–69.
+/// `Reference/inference/generate.py` lines 27–69.
 ///
 /// Differences vs the reference:
 ///   - single batch only (the CLI is interactive)

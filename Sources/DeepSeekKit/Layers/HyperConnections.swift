@@ -7,7 +7,7 @@ import Metal
 /// normalization split into three pieces — pre, post, comb — by
 /// `hc_split_sinkhorn`.
 ///
-/// Mirrors `hc_pre` and `hc_post` in `Original/DeepSeek-V4-Pro/inference/model.py`
+/// Mirrors `hc_pre` and `hc_post` in `Reference/inference/model.py`
 /// lines 673–686.
 ///
 /// hc_pre:  collapse [b, s, hc, d] → [b, s, d] for the sublayer input

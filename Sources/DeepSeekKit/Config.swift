@@ -1,6 +1,6 @@
 import Foundation
 
-/// Mirrors the `ModelArgs` dataclass from `Original/DeepSeek-V4-Pro/inference/model.py`.
+/// Mirrors the `ModelArgs` dataclass from `Reference/inference/model.py`.
 /// Field names use the Python snake_case via CodingKeys so config.json maps directly.
 public struct ModelConfig: Codable, Sendable {
     public var maxBatchSize: Int = 4

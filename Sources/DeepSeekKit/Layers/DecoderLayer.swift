@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 /// One transformer block with HC mixing wrapping attention and FFN.
-/// Mirrors `Block` in `Original/DeepSeek-V4-Pro/inference/model.py` lines 647–700.
+/// Mirrors `Block` in `Reference/inference/model.py` lines 647–700.
 ///
 /// forward(x):
 ///   residual = x

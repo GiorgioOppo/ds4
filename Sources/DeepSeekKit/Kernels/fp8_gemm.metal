@@ -4,7 +4,7 @@ using namespace metal;
 // fp8_gemm — FP8 × FP8 matrix multiply with per-128 block scaling.
 //
 // Port of `fp8_gemm_kernel` from
-// Original/DeepSeek-V4-Pro/inference/kernel.py.
+// Reference/inference/kernel.py.
 //
 // Computes:  C[M, N] = A_fp8[M, K] @ B_fp8[N, K]^T   (out: BF16 or FP32)
 // with:

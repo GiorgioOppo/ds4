@@ -3,7 +3,7 @@ using namespace metal;
 
 // act_quant — block-wise activation quantization.
 // Port of `act_quant_kernel` and `fp4_quant_kernel` from
-// Original/DeepSeek-V4-Pro/inference/kernel.py.
+// Reference/inference/kernel.py.
 //
 // One threadgroup per (row, block). Threadgroup size == block_size, so each
 // thread owns one element of the block. The block runs the absmax reduction
