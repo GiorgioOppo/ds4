@@ -131,40 +131,210 @@ public extension Transformer {
                            hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase, hcHeadScale: hcHeadScale)
     }
 
-    /// Load a Transformer from a directory of safetensors shards. Names that
-    /// can't be found are filled in with random init plus a stderr warning.
-    /// Canonical name conventions (after Reference/inference/convert.py
-    /// renames `self_attn → attn`, `mlp → ffn`, etc.):
+    /// Load a Transformer from a directory of safetensors shards.
     ///
-    ///   layers.{i}.attn.{wq_a, q_norm, wq_b, wkv, kv_norm, wo_a, wo_b}.weight
-    ///   layers.{i}.attn.attn_sink
-    ///   layers.{i}.attn_norm.weight, layers.{i}.ffn_norm.weight
-    ///   layers.{i}.ffn.gate.weight, layers.{i}.ffn.gate.bias
-    ///   layers.{i}.ffn.experts.{j}.{w1, w2, w3}.weight
-    ///   layers.{i}.ffn.shared_experts.{w1, w2, w3}.weight
-    ///   layers.{i}.attn.indexer.{wq_b, weights_proj}.weight
-    ///   layers.{i}.attn.indexer.compressor.{ape, wkv.weight, wgate.weight, norm.weight}
-    ///   hc_attn_fn, hc_attn_base, hc_attn_scale          (per layer, suffix appended)
-    ///   hc_ffn_fn, hc_ffn_base, hc_ffn_scale             (per layer)
-    ///   hc_head_fn, hc_head_base, hc_head_scale, embed.weight, lm_head.weight, norm.weight
+    /// Expected layout: the post-`convert.py` form. Run
+    ///   python Reference/inference/convert.py \
+    ///     --hf-ckpt-path <huggingface_dir> \
+    ///     --save-path <converted_dir> \
+    ///     --n-experts <N> --model-parallel 1
+    /// to produce a directory containing `model0-mp1.safetensors` (single-
+    /// rank, names already in the canonical form this loader expects).
     ///
-    /// Implementation note: the actual file walk + per-name dispatch is
-    /// extensive (~300 LOC) and depends on the exact shard layout of the
-    /// shipped V4 checkpoint (which we don't have access to from this
-    /// environment). Until then this method simply delegates to randomInit
-    /// and logs which weights would be loaded. The structure is right; the
-    /// last mile is name matching.
+    /// Names that can't be found are filled in with random init plus a
+    /// stderr summary at the end. This lets a partially-converted or
+    /// pruned checkpoint still produce a forward pass.
     static func load(config: ModelConfig, from weightsDir: URL) throws -> Transformer {
-        FileHandle.standardError.write(Data("""
-        Transformer.load: directory walk for V4 safetensors not implemented.
-        Falling back to randomInit so the forward pipeline still runs.
-        See Sources/DeepSeekKit/Assembly.swift docstring for the canonical
-        weight name list. Provide a SafeTensorsFile-based loader once the
-        production checkpoint shard layout is confirmed.
+        let loader = try WeightLoader(directory: weightsDir)
+        FileHandle.standardError.write(Data(
+            "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
-        """.utf8))
-        return Transformer.randomInit(config: config)
+        var rng = MiniRNG(seed: 0xDEEPC0DE)
+        let dim = config.dim
+        let hc = config.hcMult
+        let mixHc = (2 + hc) * hc
+        let nLayers = config.nLayers
+        let nExperts = config.nRoutedExperts
+
+        // ---------- Top-level ----------
+        let embedW = (try loader.tryLoad(["embed.weight", "model.embed.weight"]))
+            ?? AssemblyHelpers.randomTensor([config.vocabSize, dim], rng: &rng, scale: 0.02)
+        let embed = ParallelEmbedding(vocabSize: config.vocabSize, dim: dim, weight: embedW)
+
+        let normW = (try loader.tryLoad(["norm.weight"]))
+            ?? AssemblyHelpers.onesTensor([dim])
+        let norm = RMSNorm(weight: normW, eps: config.normEps)
+
+        let lmHeadW = (try loader.tryLoad(["head.weight", "lm_head.weight"]))
+            ?? AssemblyHelpers.randomTensor([config.vocabSize, dim], rng: &rng, scale: 0.02)
+        let head = ParallelHead(vocabSize: config.vocabSize, dim: dim,
+                                normEps: config.normEps, hcEps: config.hcEps,
+                                weight: lmHeadW)
+
+        let hcHeadFn = (try loader.tryLoad(["hc_head_fn"]))
+            ?? AssemblyHelpers.randomTensor([hc, hc * dim], rng: &rng, scale: 0.02)
+        let hcHeadBase = (try loader.tryLoad(["hc_head_base"]))
+            ?? AssemblyHelpers.randomTensor([hc], rng: &rng, scale: 0.0)
+        let hcHeadScale = (try loader.tryLoad(["hc_head_scale"]))
+            ?? AssemblyHelpers.randomTensor([1], rng: &rng, scale: 0.5)
+
+        // ---------- Per-layer ----------
+        var blocks: [Block] = []
+        for i in 0..<nLayers {
+            let lp = "layers.\(i)"
+            let attnNorm = RMSNorm(
+                weight: (try loader.tryLoad(["\(lp).attn_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+            let ffnNorm = RMSNorm(
+                weight: (try loader.tryLoad(["\(lp).ffn_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+
+            // ---- MLA ----
+            let wqA = try loadLinear(loader, base: "\(lp).attn.wq_a",
+                                      inF: dim, outF: config.qLoraRank, rng: &rng)
+            let qNorm = RMSNorm(
+                weight: (try loader.tryLoad(["\(lp).attn.q_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([config.qLoraRank]),
+                eps: config.normEps)
+            let wqB = try loadLinear(loader, base: "\(lp).attn.wq_b",
+                                      inF: config.qLoraRank,
+                                      outF: config.nHeads * config.headDim, rng: &rng)
+            let wkv = try loadLinear(loader, base: "\(lp).attn.wkv",
+                                      inF: dim, outF: config.headDim, rng: &rng)
+            let kvNorm = RMSNorm(
+                weight: (try loader.tryLoad(["\(lp).attn.kv_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([config.headDim]),
+                eps: config.normEps)
+            let perGroupD = config.nHeads * config.headDim / config.oGroups
+            let woA = try loadLinear(loader, base: "\(lp).attn.wo_a",
+                                      inF: perGroupD,
+                                      outF: config.oGroups * config.oLoraRank, rng: &rng)
+            let woB = try loadLinear(loader, base: "\(lp).attn.wo_b",
+                                      inF: config.oGroups * config.oLoraRank,
+                                      outF: dim, rng: &rng)
+            let attnSink = (try loader.tryLoad(["\(lp).attn.attn_sink"]))
+                ?? AssemblyHelpers.randomTensor([config.nHeads], rng: &rng, scale: 0.1)
+
+            let ratio = config.compressRatios[i]
+            var compressor: Compressor? = nil
+            var indexer: Indexer? = nil
+            if ratio > 0 {
+                compressor = try AssemblyHelpers.loadCompressor(
+                    loader, base: "\(lp).attn.compressor",
+                    config: config, ratio: ratio, headDim: config.headDim,
+                    rotate: false, rng: &rng)
+                if ratio == 4 {
+                    indexer = try AssemblyHelpers.loadIndexer(
+                        loader, base: "\(lp).attn.indexer",
+                        config: config, ratio: ratio, rng: &rng)
+                }
+            }
+
+            let kvCacheRows = config.windowSize +
+                (ratio > 0 ? config.maxSeqLen / ratio : 0)
+            let kvCache = Tensor.empty(shape: [config.maxBatchSize,
+                                                max(kvCacheRows, 1),
+                                                config.headDim],
+                                        dtype: .f32)
+
+            let rope = RoPE(ropeHeadDim: config.ropeHeadDim,
+                            freqs: RoPE.makeFreqs(config: config, useYarn: ratio > 0))
+
+            let mla = MLA(config: config, layerId: i,
+                          wqA: wqA, qNorm: qNorm, wqB: wqB,
+                          wkv: wkv, kvNorm: kvNorm,
+                          woA: woA, woB: woB,
+                          attnSink: attnSink, rope: rope,
+                          compressor: compressor, indexer: indexer,
+                          kvCache: kvCache)
+
+            // ---- MoE FFN ----
+            let gateW = try loadLinear(loader, base: "\(lp).ffn.gate",
+                                        inF: dim, outF: nExperts, rng: &rng)
+            let gateBias: Tensor? = i < config.nHashLayers ? nil :
+                ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
+                 ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
+            let tid2eid: Tensor? = i < config.nHashLayers
+                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"]))
+                : nil
+            let gate = Gate(config: config, layerId: i,
+                            weight: gateW, bias: gateBias, tid2eid: tid2eid)
+
+            var experts: [Expert?] = []
+            for j in 0..<nExperts {
+                let ep = "\(lp).ffn.experts.\(j)"
+                experts.append(Expert(
+                    w1: try loadLinear(loader, base: "\(ep).w1",
+                                        inF: dim, outF: config.moeInterDim, rng: &rng),
+                    w2: try loadLinear(loader, base: "\(ep).w2",
+                                        inF: config.moeInterDim, outF: dim, rng: &rng),
+                    w3: try loadLinear(loader, base: "\(ep).w3",
+                                        inF: dim, outF: config.moeInterDim, rng: &rng),
+                    swigluLimit: config.swigluLimit))
+            }
+            let sep = "\(lp).ffn.shared_experts"
+            let sharedExpert = Expert(
+                w1: try loadLinear(loader, base: "\(sep).w1",
+                                    inF: dim, outF: config.moeInterDim, rng: &rng),
+                w2: try loadLinear(loader, base: "\(sep).w2",
+                                    inF: config.moeInterDim, outF: dim, rng: &rng),
+                w3: try loadLinear(loader, base: "\(sep).w3",
+                                    inF: dim, outF: config.moeInterDim, rng: &rng),
+                swigluLimit: config.swigluLimit)
+            let moe = MoEFFN(config: config, gate: gate,
+                             experts: experts, shared: sharedExpert)
+
+            // ---- HC params ----
+            let hcAttnFn = (try loader.tryLoad(["\(lp).hc_attn_fn"]))
+                ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
+            let hcAttnBase = (try loader.tryLoad(["\(lp).hc_attn_base"]))
+                ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
+            let hcAttnScale = (try loader.tryLoad(["\(lp).hc_attn_scale"]))
+                ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
+            let hcFfnFn = (try loader.tryLoad(["\(lp).hc_ffn_fn"]))
+                ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
+            let hcFfnBase = (try loader.tryLoad(["\(lp).hc_ffn_base"]))
+                ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
+            let hcFfnScale = (try loader.tryLoad(["\(lp).hc_ffn_scale"]))
+                ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
+
+            blocks.append(Block(layerId: i, config: config,
+                                attn: mla, ffn: moe,
+                                attnNorm: attnNorm, ffnNorm: ffnNorm,
+                                hcAttnFn: hcAttnFn, hcAttnBase: hcAttnBase,
+                                hcAttnScale: hcAttnScale,
+                                hcFfnFn: hcFfnFn, hcFfnBase: hcFfnBase,
+                                hcFfnScale: hcFfnScale))
+        }
+
+        if !loader.missing.isEmpty {
+            FileHandle.standardError.write(Data("""
+            \(loader.missing.count) tensor name(s) were not found in the
+            checkpoint and were filled with random init. First few:
+              \(loader.missing.prefix(8).joined(separator: "\n  "))
+
+            """.utf8))
+        }
+
+        return Transformer(config: config, embed: embed, layers: blocks, mtp: [],
+                           norm: norm, head: head,
+                           hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
+                           hcHeadScale: hcHeadScale)
     }
+}
+
+// MARK: - Loading helpers
+
+internal func loadLinear(_ loader: WeightLoader, base: String,
+                         inF: Int, outF: Int,
+                         rng: inout MiniRNG) throws -> Linear {
+    if let w = try loader.tryLoad(["\(base).weight"]) {
+        let scale = try loader.tryLoad(["\(base).scale"])
+        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
+    }
+    return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
 }
 
 // MARK: - Helpers
@@ -226,6 +396,51 @@ internal enum AssemblyHelpers {
         let compressor = makeCompressor(config: config, ratio: ratio,
                                          headDim: config.indexHeadDim,
                                          rotate: true, rng: &rng)
+        let kvCache = Tensor.empty(shape: [config.maxBatchSize,
+                                            config.maxSeqLen / ratio,
+                                            config.indexHeadDim], dtype: .f32)
+        return Indexer(config: config, compressRatio: ratio,
+                       wqB: wqB, weightsProj: weightsProj,
+                       compressor: compressor, kvCache: kvCache)
+    }
+
+    // ---- Loader-aware variants used by Transformer.load ----
+
+    static func loadCompressor(_ loader: WeightLoader, base: String,
+                               config: ModelConfig, ratio: Int, headDim: Int,
+                               rotate: Bool, rng: inout MiniRNG) throws -> Compressor {
+        let coff = ratio == 4 ? 2 : 1
+        let coffHeadDim = coff * headDim
+        let ape = (try loader.tryLoad(["\(base).ape"]))
+            ?? randomTensor([ratio, coffHeadDim], rng: &rng, scale: 0.05)
+        let wkv = try loadLinear(loader, base: "\(base).wkv",
+                                  inF: config.dim, outF: coffHeadDim, rng: &rng)
+        let wgate = try loadLinear(loader, base: "\(base).wgate",
+                                    inF: config.dim, outF: coffHeadDim, rng: &rng)
+        let norm = RMSNorm(
+            weight: (try loader.tryLoad(["\(base).norm.weight"])) ?? onesTensor([headDim]),
+            eps: config.normEps)
+        let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
+                                    dtype: .f32)
+        let scoreState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
+                                       dtype: .f32)
+        return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
+                          ape: ape, wkv: wkv, wgate: wgate, norm: norm,
+                          kvState: kvState, scoreState: scoreState)
+    }
+
+    static func loadIndexer(_ loader: WeightLoader, base: String,
+                            config: ModelConfig, ratio: Int,
+                            rng: inout MiniRNG) throws -> Indexer {
+        let wqB = try loadLinear(loader, base: "\(base).wq_b",
+                                  inF: config.qLoraRank,
+                                  outF: config.indexNHeads * config.indexHeadDim, rng: &rng)
+        let weightsProj = try loadLinear(loader, base: "\(base).weights_proj",
+                                          inF: config.dim, outF: config.indexNHeads, rng: &rng)
+        let compressor = try loadCompressor(loader, base: "\(base).compressor",
+                                             config: config, ratio: ratio,
+                                             headDim: config.indexHeadDim,
+                                             rotate: true, rng: &rng)
         let kvCache = Tensor.empty(shape: [config.maxBatchSize,
                                             config.maxSeqLen / ratio,
                                             config.indexHeadDim], dtype: .f32)
