@@ -2,19 +2,27 @@ import Foundation
 
 public struct GenerationOptions {
     public var maxNewTokens: Int = 128
-    public var temperature: Float = 0.0   // 0 = greedy
+    public var temperature: Float = 1.0      // V4 default per generation_config.json
 
-    public init(maxNewTokens: Int = 128, temperature: Float = 0.0) {
+    public init(maxNewTokens: Int = 128, temperature: Float = 1.0) {
         self.maxNewTokens = maxNewTokens
         self.temperature = temperature
     }
 }
 
+/// Generation loop. Mirrors `generate()` in
+/// `Original/DeepSeek-V4-Pro/inference/generate.py` lines 27–69.
+///
+/// Differences vs the reference:
+///   - single batch only (the CLI is interactive)
+///   - no MTP speculation (n_mtp_layers > 0 path is left unimplemented)
+///   - greedy when temperature == 0; otherwise Gumbel-max sampling, same as
+///     the reference's `sample()`
 public final class Generator {
-    public let model: DeepSeekV4
+    public let model: Transformer
     public let tokenizer: Tokenizer
 
-    public init(model: DeepSeekV4, tokenizer: Tokenizer) {
+    public init(model: Transformer, tokenizer: Tokenizer) {
         self.model = model
         self.tokenizer = tokenizer
     }
@@ -22,28 +30,17 @@ public final class Generator {
     public func generate(prompt: String,
                          options: GenerationOptions = GenerationOptions(),
                          onToken: (String) -> Void) {
-        let promptIds = tokenizer.encode(prompt)
-        let cache = CacheBank(numLayers: model.config.numHiddenLayers,
-                              maxTokens: model.config.maxPositionEmbeddings,
-                              kvHeads: model.config.numKeyValueHeads,
-                              headDim: model.config.headDim)
-
-        // Prefill: feed prompt tokens one at a time. Real prefill should batch
-        // them through a single forward pass; the loop below is correct but
-        // O(promptLen * decode-cost) — acceptable for the scaffold.
-        var lastLogits: Tensor? = nil
-        for id in promptIds {
-            lastLogits = model.step(tokenId: id, cache: cache)
-        }
-
-        var nextId: Int
-        for _ in 0..<options.maxNewTokens {
-            let logits = lastLogits!
-            Sampler.applyTemperature(logits, options.temperature)
-            nextId = Sampler.argmax(logits)
-            if nextId == (model.config.eosTokenId ?? -1) { break }
-            onToken(tokenizer.decode([nextId]))
-            lastLogits = model.step(tokenId: nextId, cache: cache)
-        }
+        // NOT IMPLEMENTED: model.forward is a stub. Once the chain
+        // (act_quant → fp8/fp4 GEMM → MLA → HC → MoE → head) is wired up,
+        // this becomes the standard prefill+decode loop:
+        //
+        //   ids = tokenizer.encode(prompt)
+        //   logits = model.forward(ids, 0)
+        //   for _ in 0..<options.maxNewTokens:
+        //       next = sample(logits, options.temperature)
+        //       onToken(tokenizer.decode([next]))
+        //       if next == tokenizer.eosId: break
+        //       logits = model.forward([next], cur_pos)
+        fatalError("Generator.generate is a placeholder until Transformer.forward exists")
     }
 }

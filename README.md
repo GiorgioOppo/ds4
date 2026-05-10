@@ -1,70 +1,69 @@
 # DeepSeek-V4-Pro-MacOS
 
-Native Swift + Metal port of [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
-inference for Apple Silicon.
+Swift + Metal port of [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
+inference for Apple Silicon. Targets the same architecture as the upstream
+Python implementation in `Original/DeepSeek-V4-Pro/inference/`.
 
-> **Status: scaffold.** The project structure, core data types, standard Metal
-> kernels (RMSNorm, matmul, RoPE, softmax, SwiGLU, sampling) and the
-> generation loop are in place. The DeepSeek-V4-specific pieces — Compressed
-> Sparse Attention (CSA), Heavily Compressed Attention (HCA), Manifold-
-> Constrained Hyper-Connections (mHC), and the safetensors weight wiring — are
-> intentionally not implemented yet. They are stubbed with explicit fatal
-> errors and per-file design notes pointing at the missing references. **The
-> CLI does not produce text yet.**
+> **Status: scaffold aligned to the reference implementation.** Module shapes,
+> Metal kernel signatures, and config fields all mirror the Python reference
+> in `Original/DeepSeek-V4-Pro/inference/{model.py, kernel.py}`. The five
+> compute-heavy custom kernels (FP8 GEMM, FP4 GEMM, sparse attention, HC
+> Sinkhorn, FP8/FP4 activation quant) are stubbed and trap on invocation —
+> see "Why parts are intentionally unimplemented" below.
 
 ## Reality check
 
-DeepSeek-V4-Pro is a 1.6T-parameter MoE (49B activated). Even at 4-bit
-quantization the weights are ~800 GB. **No Mac can hold that in unified
-memory.** Running V4-Pro locally is not a goal this codebase can meet on
-current hardware. Realistic targets for an on-device runtime are:
+DeepSeek-V4-Pro is a 1.6T-parameter MoE (49B activated). Even at FP4 the
+expert weights alone are ~800 GB. **No Mac can hold V4-Pro in unified
+memory.** Realistic on-device target is **DeepSeek-V4-Flash** (284B / 13B
+activated): at FP4 + FP8 mixed, ≈ 142 GB → fits a Mac Studio with 192 GB+
+unified memory. Same code, different `config.json` and weights.
 
-- **DeepSeek-V4-Flash** (284B / 13B activated) at 4-bit ≈ 142 GB → fits a
-  Mac Studio with 192 GB+ unified memory.
-- A future distilled variant.
+## Architecture map (Python → Swift)
 
-The architecture is shared, so the same code works for both — only the
-weight files and `config.json` change.
+The reference is in `Original/DeepSeek-V4-Pro/inference/model.py` (827 lines).
+Each module is mirrored 1:1 in Swift:
 
-## Layout
+| Python (model.py) | Swift |
+|---|---|
+| `ModelArgs` | `Sources/DeepSeekKit/Config.swift` |
+| `ParallelEmbedding` | `Sources/DeepSeekKit/Model.swift` |
+| `Linear` (BF16/FP8/FP4 dispatch) | `Sources/DeepSeekKit/Layers/Linear.swift` |
+| `RMSNorm` | `Sources/DeepSeekKit/Layers/RMSNorm.swift` |
+| `precompute_freqs_cis` (YaRN) | `Sources/DeepSeekKit/YaRN.swift` |
+| `apply_rotary_emb` | `Sources/DeepSeekKit/Layers/RoPE.swift` + `Kernels/rope.metal` |
+| `Compressor` | `Sources/DeepSeekKit/Layers/Compressor.swift` |
+| `Indexer` | `Sources/DeepSeekKit/Layers/Indexer.swift` |
+| `Attention` (MLA + sliding window + sparse) | `Sources/DeepSeekKit/Layers/Attention.swift` |
+| `Gate`, `Expert`, `MoE` | `Sources/DeepSeekKit/Layers/MoE.swift` |
+| `Block` (with HC pre/post) | `Sources/DeepSeekKit/Layers/DecoderLayer.swift` |
+| `HyperConnections.hc_pre / hc_post` | `Sources/DeepSeekKit/Layers/HyperConnections.swift` |
+| `ParallelHead` | `Sources/DeepSeekKit/Model.swift` |
+| `MTPBlock` | `Sources/DeepSeekKit/Layers/MTPBlock.swift` |
+| `Transformer` | `Sources/DeepSeekKit/Model.swift` |
 
-```
-Package.swift
-Sources/
-  DeepSeekKit/             Library
-    Config.swift           Mirrors config.json
-    Device.swift           MTLDevice + library loader
-    Tensor.swift           MTLBuffer-backed n-d tensor
-    Quantization.swift     int4 block layout (placeholder, confirm vs weights)
-    SafeTensors.swift      .safetensors reader
-    Tokenizer.swift        BPE interface (loader unimplemented)
-    KVCache.swift
-    Sampling.swift         argmax + temperature
-    Generation.swift       generate loop
-    Model.swift            DeepSeekV4 top-level
-    Layers/
-      Linear.swift           dense + q4 matvec
-      RMSNorm.swift
-      RoPE.swift
-      Elementwise.swift      silu_mul, axpy, scale, add
-      Attention.swift        hybrid CSA/HCA dispatcher (forward unimplemented)
-      MoE.swift              top-k routing + per-expert SwiGLU
-      DecoderLayer.swift
-    Kernels/                 Metal source (built into the bundle)
-      common.metal
-      matmul.metal           f32 GEMM + int4 matvec
-      rmsnorm.metal
-      rope.metal
-      softmax.metal
-      elementwise.metal
-      sampling.metal
-      moe.metal              top-k gate
-      attention_csa.metal    STUB — traps when invoked
-      attention_hca.metal    STUB — traps when invoked
-      mhc.metal              STUB — traps when invoked
-  deepseek/
-    main.swift             CLI: deepseek <model-dir> "<prompt>"
-```
+The five tilelang kernels in `kernel.py` map to:
+
+| Python (kernel.py) | Metal stub |
+|---|---|
+| `act_quant_kernel` (FP8), `fp4_quant_kernel` | `Kernels/act_quant.metal` |
+| `fp8_gemm_kernel` | `Kernels/fp8_gemm.metal` |
+| `fp4_gemm_kernel` | `Kernels/fp4_gemm.metal` |
+| `sparse_attn_kernel` | `Kernels/sparse_attn.metal` |
+| `hc_split_sinkhorn_kernel` | `Kernels/hc_sinkhorn.metal` |
+| `rotate_activation` (Hadamard) | `Kernels/hadamard.metal` |
+
+## Per-layer attention modes
+
+The reference uses `compress_ratios = (0, 0, 4, 128, 4, 128, 4, 0)` (or
+similar — confirm from the production `config.json`). Each ratio selects a
+different forward path:
+
+| compress_ratio | Mode | Modules used |
+|---|---|---|
+| 0 | pure sliding-window attention | MLA + window topk |
+| 4 | sliding window + indexed sparse compression | MLA + Compressor (overlap) + Indexer + sparse_attn |
+| 128 | sliding window + heavy compression | MLA + Compressor (no overlap) + sparse_attn |
 
 ## Build
 
@@ -72,7 +71,8 @@ Sources/
 swift build -c release
 ```
 
-Requires macOS 14+, Xcode 15+, and an Apple Silicon Mac for actual execution.
+Requires macOS 14+, Xcode 15+, an Apple Silicon Mac. Today this builds, but
+the CLI exits with a fatal error from any of the unimplemented stubs.
 
 ## Run
 
@@ -80,84 +80,154 @@ Requires macOS 14+, Xcode 15+, and an Apple Silicon Mac for actual execution.
 .build/release/deepseek /path/to/DeepSeek-V4-Pro "Hello,"
 ```
 
-Today this exits with `Tokenizer is not implemented yet.` See Roadmap.
-
 ## Roadmap (in dependency order)
 
-The work below is what stands between the current scaffold and a CLI that
-actually generates tokens. Items are listed in the order they should be
-tackled.
+The following work stands between this scaffold and end-to-end token
+generation. Items are listed in the order they should be tackled.
 
-1. **Download the reference repo.**
-   `git clone https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro` (or
-   `DeepSeek-V4-Flash` for an actually runnable target). Inspect:
-   - `config.json` — confirm the field names assumed in `Config.swift` and
-     read off `csa_compression_ratio`, `hca_compression_ratio`, MoE counts.
-   - `modeling_deepseek_v4.py` (or whatever the inference reference is
-     called) — this is the source of truth for CSA, HCA, mHC, and the weight
-     naming convention used in the safetensors index.
-   - `tokenizer.json` — tokenizer model type and special tokens.
-   - The DeepSeek-V4 technical report PDF — equations for CSA/HCA/mHC.
+### 1. Core math kernels (no dependency on weights)
 
-2. **Tokenizer.** Parse `tokenizer.json` (HuggingFace `tokenizers` JSON
-   format). Implement byte-level BPE with the merges array and byte-fallback.
-   Pure Swift, no FFI.
+- **`hadamard.metal`** — FWHT for power-of-2 dims (128, 512). Easiest target,
+  good warm-up for the Metal toolchain. Validate against `scipy.linalg.hadamard`.
+- **`hc_sinkhorn.metal`** — fixed-size hc=4, ~20 iters. Self-contained.
+  Validate against the Python reference on random input.
+- **`act_quant.metal`** — FP8/FP4 block quant. Needs `fast_log2_ceil` /
+  `fast_pow2` bit hacks (port directly from `kernel.py:22–37`).
 
-3. **CSA kernel.** Port the Python reference. Required pieces:
-   - the K/V compression operator (linear / strided / pooling)
-   - the sparse attention pattern (block, window, top-k, sinks)
-   - causal masking over compressed positions
-   - flash-attention-style tiling for memory efficiency
-   - numerical test against a Python reference on a small input
+### 2. GEMM kernels (depend on quantized formats)
 
-4. **HCA kernel.** Same approach. Likely shares plumbing with CSA.
+- **Dense BF16 GEMM** — needed by Compressor's wkv/wgate (FP32 in checkpoint),
+  the gate weight matrix, and any non-quantized linear. Use simdgroup_matrix.
+- **`fp8_gemm.metal`** — FP8 weight × FP8 act → BF16 out. Tile sizes per
+  reference: 32×128×128. Cast FP8→FP16 on load (Metal has no native FP8).
+- **`fp4_gemm.metal`** — FP8 act × FP4 weight, used only by experts.
+  Per-32 weight scale, per-128 act scale. Unpack nibbles on load.
 
-5. **mHC residual.** Replace `Elementwise.addInPlace` calls in
-   `DecoderLayer.swift` with the manifold-constrained mixing op once the
-   reference is in.
+### 3. Attention kernel
 
-6. **MoE prefill path.** Current `MoEFFN` only handles single-token decode.
-   Prefill needs token-permutation scatter/gather + grouped GEMM across
-   experts. This is its own substantial subproject.
+- **`sparse_attn.metal`** — most complex. FlashAttention-style online softmax
+  + KV gather by topk_idxs + per-head learnable sink. Validate numerically
+  against a small forward pass run with the Python reference.
 
-7. **Quantization layout.** `Quantization.swift` assumes a generic block
-   int4 layout. Verify against the actual quantized weights shipped (the
-   dtype string in the safetensors header will tell you).
+### 4. Module forwards (depend on §1–§3)
 
-8. **Model assembly.** Implement `assembleModel` in `Sources/deepseek/main.swift`
-   to read `model.safetensors.index.json`, walk every layer's weight names,
-   build `Linear` / `RMSNorm` / `MoEFFN` instances and hand them to
-   `DecoderLayer` and `DeepSeekV4`.
+In rough dependency order:
 
-9. **Numerical validation.** For each layer, dump activations from a
-   reference Python forward pass on a fixed prompt and assert max-abs error
-   below tolerance. Without this CSA/HCA/mHC will silently produce wrong
-   tokens.
+- `Linear.callAsFunction` — wires act_quant → fp8/fp4_gemm
+- `RoPE.apply` — already wired, validate end-to-end
+- `Compressor.callAsFunction` — gated pooling + RoPE + fp4 quant
+- `Indexer.callAsFunction` — top-k learned selection
+- `MLA.callAsFunction` — full attention with sliding window + sparse
+- `HyperConnections.pre` / `.post` — uses hc_split_sinkhorn
+- `MoEFFN.callAsFunction` — top-k routing, expert dispatch.  
+  Decode (M=1) first; prefill needs token-permutation scatter/gather.
+- `Block.callAsFunction` — composes attn/ffn with HC wrapping
+- `Transformer.forward` — embed → HC expand → blocks → head
 
-10. **Performance.** The kernels in this scaffold are correct-first, not
-    fast. After numerical parity:
-    - flash-attention tiling for CSA/HCA
-    - simdgroup matrix instructions for matmul
-    - persistent kernel for MoE dispatch
-    - pre-allocated KV cache pool, no per-step allocations
+### 5. Loader and tokenizer
+
+- **`assembleModel`** in `Sources/deepseek/main.swift` — reads
+  `model.safetensors.index.json`, walks every layer's weight names and builds
+  the `Linear` / `RMSNorm` instances. Run `Original/DeepSeek-V4-Pro/inference/convert.py`
+  upstream to produce the single-rank `model0-mp1.safetensors` shard layout
+  this loader expects.
+- **`TokenizerLoader`** — port HuggingFace `tokenizer.json` parser
+  (byte-level BPE + GPT-2 pre-tokenizer regex + DeepSeek special tokens
+  `<｜begin▁of▁sentence｜>`, `<｜end▁of▁sentence｜>`). Pure Swift, no FFI.
+
+### 6. Chat encoding
+
+`Original/DeepSeek-V4-Pro/encoding/encoding_dsv4.py` (744 lines) builds the
+chat string from OpenAI-style messages with `<think>` / `</think>` markers
+for the three reasoning effort modes. Port it once the rest works; the CLI
+in this scaffold takes a pre-formatted prompt string.
+
+### 7. Numerical validation
+
+For each module forward, dump activations from a Python reference run on a
+fixed prompt and assert max-abs error below tolerance. Without this,
+sparse_attn and hc_sinkhorn will silently produce wrong tokens.
+
+### 8. Performance
+
+After numerical parity:
+- simdgroup matrix instructions for all GEMMs
+- threadgroup memory swizzle for FP4 unpack
+- persistent kernel for MoE dispatch
+- pre-allocated KV cache pool, no per-step allocations
+- pipeline state caching keyed by (kernel name, function-constant set)
 
 ## Why parts are intentionally unimplemented
 
-Three reasons informed the decision to stub rather than guess CSA/HCA/mHC
-and tokenizer/assembly logic:
+Three reasons informed the decision to stub the five kernels in §1–§3:
 
-1. The HuggingFace repo is unreachable from this environment (host allowlist
-   blocks `huggingface.co`), so the reference Python and config could not
-   be inspected.
-2. CSA, HCA, and mHC are new in V4 with no public reference implementation
-   outside DeepSeek's repo. The architecture summary in the technical report
-   underdetermines the exact operators (compression op shape, sparsity
-   pattern, manifold constraint factorization).
-3. Wrong inference math is worse than missing math: a guessed implementation
-   would compile, run, and silently produce garbage, masking the work
-   actually required.
+1. **They need numerical validation that requires running the Python reference.**
+   This sandbox can run Swift but not CUDA; I cannot generate ground-truth
+   activations to validate against, so a guess that "compiles and looks right"
+   could silently produce wrong tokens for a long time before being caught.
+2. **They are non-trivial.** The reference `sparse_attn_kernel` is 80 lines
+   of tilelang; porting to Metal Shading Language with simdgroup matrix
+   instructions is ~300 lines plus careful tiling math.
+3. **They build on shared machinery.** Most kernels need Hadamard FWHT,
+   FP8/FP4 dequant LUTs, and act_quant; doing those first as standalone,
+   testable units avoids debugging multiple unknowns at once.
 
-Each stub names exactly what is missing and where to look.
+Each stub names exactly what's missing and which line of the reference to
+port. Module forwards are equally explicit about which Python line they
+mirror (e.g. `model.py:484` for MLA forward).
+
+## Layout
+
+```
+Package.swift
+Sources/
+  DeepSeekKit/                  Library
+    Config.swift                ModelArgs (matches model.py:34)
+    Device.swift                MTLDevice + library loader
+    Tensor.swift                MTLBuffer-backed n-d tensor (f32/f16/bf16/fp8/fp4/e8m0)
+    Quantization.swift          FP8-E4M3 / FP4-E2M1 / E8M0 layouts and dequant
+    SafeTensors.swift           safetensors reader
+    Tokenizer.swift             BPE protocol (loader unimplemented)
+    KVCache.swift               sliding-window + compressed KV per layer
+    Sampling.swift              argmax + temperature
+    YaRN.swift                  precompute_freqs_cis (matches model.py:199)
+    Generation.swift            generate loop (stub)
+    Model.swift                 Embedding, Head, Transformer (stubs)
+    Layers/
+      Linear.swift              BF16/FP8/FP4 dispatch (stubs)
+      RMSNorm.swift             working
+      RoPE.swift                wired (validate when GEMM available)
+      Elementwise.swift         silu_mul, axpy, scale, add (working)
+      Attention.swift           MLA forward (stub)
+      Compressor.swift          gated pooling (stub)
+      Indexer.swift             top-k learned (stub)
+      HyperConnections.swift    HC pre/post (stub)
+      MoE.swift                 Gate, Expert, MoEFFN (stubs)
+      DecoderLayer.swift        Block with HC wrapping (stub)
+      MTPBlock.swift            multi-token prediction (stub)
+    Kernels/
+      common.metal              bf16 helpers
+      rmsnorm.metal             working
+      rope.metal                working (rope_apply_f32, last rope_head_dim only)
+      softmax.metal             working
+      elementwise.metal         silu_mul, axpy, scale, add
+      sampling.metal            argmax, apply_temperature
+      moe.metal                 gate scoring + top-k
+      act_quant.metal           STUB — port act_quant_kernel + fp4_quant_kernel
+      fp8_gemm.metal            STUB — port fp8_gemm_kernel
+      fp4_gemm.metal            STUB — port fp4_gemm_kernel
+      sparse_attn.metal         STUB — port sparse_attn_kernel
+      hc_sinkhorn.metal         STUB — port hc_split_sinkhorn_kernel
+      hadamard.metal            STUB — FWHT for power-of-2 dims
+  deepseek/
+    main.swift                  CLI
+
+Original/                       Reference Python (read-only, gitignored from build)
+  DeepSeek-V4-Pro/
+    inference/                  model.py, kernel.py, generate.py, convert.py
+    encoding/                   encoding_dsv4.py + tests
+    DeepSeek_V4.pdf             technical report
+```
 
 ## License
 

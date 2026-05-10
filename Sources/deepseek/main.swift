@@ -5,18 +5,18 @@ import DeepSeekKit
 //
 // <model-dir> must contain:
 //   - config.json
-//   - tokenizer.json
-//   - one or more *.safetensors shards (with `model.safetensors.index.json`
-//     if sharded)
+//   - tokenizer.json + tokenizer_config.json
+//   - one or more *.safetensors shards (after running convert.py upstream
+//     to produce model0-mp1.safetensors)
 //
-// This is a thin wrapper around DeepSeekKit. The model assembly step (loading
-// every weight, building DecoderLayers) is intentionally not here yet — see
-// `assembleModel` below, which is a TODO until the safetensors weight names
-// for V4-Pro are confirmed.
+// This is a thin wrapper over DeepSeekKit. The model assembly step is
+// `assembleModel` below — left as a TODO until the safetensors weight
+// names in the V4 checkpoint are confirmed.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" [--max-tokens N] [--temperature T]
+
     """.utf8))
     exit(2)
 }
@@ -27,7 +27,7 @@ guard args.count >= 3 else { usage() }
 let modelDir = URL(fileURLWithPath: args[1])
 let prompt = args[2]
 var maxTokens = 128
-var temperature: Float = 0.0
+var temperature: Float = 1.0
 var i = 3
 while i < args.count {
     switch args[i] {
@@ -57,23 +57,18 @@ let tokenizer: Tokenizer
 do {
     tokenizer = try TokenizerLoader.load(from: tokenizerURL)
 } catch {
-    FileHandle.standardError.write(Data("""
-    Tokenizer is not implemented yet. See Sources/DeepSeekKit/Tokenizer.swift.
-    Once tokenizer.json is parsed, this CLI will run end-to-end.
-    \(error)
-
-    """.utf8))
+    FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8))
     exit(1)
 }
 
-func assembleModel(config: ModelConfig, weightsDir: URL) throws -> DeepSeekV4 {
-    // Wire each layer from safetensors shards. This is the largest piece
-    // of integration work remaining — see README "Roadmap".
+func assembleModel(config: ModelConfig, weightsDir: URL) throws -> Transformer {
+    // Wire each layer from safetensors shards. Largest piece of integration
+    // work remaining — needs the V4 weight name map (see README "Roadmap").
     throw NSError(domain: "Assembly", code: -1, userInfo: [NSLocalizedDescriptionKey:
-        "Model assembly not implemented — needs the V4-Pro weight name map."])
+        "Model assembly not implemented — needs V4 safetensors weight name map."])
 }
 
-let model: DeepSeekV4
+let model: Transformer
 do {
     model = try assembleModel(config: config, weightsDir: modelDir)
 } catch {

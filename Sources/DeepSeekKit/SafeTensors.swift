@@ -4,6 +4,12 @@ import Metal
 /// Minimal safetensors reader. The format is:
 ///   [u64 little-endian header length][JSON header][tensor data...]
 /// Header maps tensor name -> { dtype, shape, data_offsets:[start,end] }.
+///
+/// DeepSeek-V4 ships weights in a sharded form indexed by
+/// `model.safetensors.index.json`; the multi-rank Python loader uses
+/// `model{rank}-mp{world_size}.safetensors` after `convert.py` does the
+/// MP repack. For single-rank macOS we want world_size = 1 → use
+/// `convert.py --n-experts ... --model-parallel 1` upstream.
 public final class SafeTensorsFile {
     public struct Entry: Decodable {
         public let dtype: String
@@ -68,9 +74,12 @@ public final class SafeTensorsFile {
         case "F32": return .f32
         case "F16": return .f16
         case "BF16": return .bf16
+        case "I32": return .i32
         case "I8", "U8": return .i8
-        // V4-Pro quantized weights expected to use a custom dtype name (e.g. "Q4_0")
-        // not present in the safetensors spec. Adjust here once weights are inspected.
+        // PyTorch float8/float4 dtypes serialized by safetensors:
+        case "F8_E4M3", "F8E4M3", "FLOAT8_E4M3FN": return .fp8E4M3
+        case "F4_E2M1", "F4E2M1", "FLOAT4_E2M1FN_X2": return .fp4E2M1
+        case "F8_E8M0", "F8E8M0", "FLOAT8_E8M0FNU": return .e8m0
         default:
             fatalError("unsupported safetensors dtype: \(s)")
         }

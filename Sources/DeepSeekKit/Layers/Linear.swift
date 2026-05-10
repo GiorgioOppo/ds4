@@ -1,56 +1,54 @@
 import Foundation
 import Metal
 
+/// Linear layer dispatching to BF16 / FP8 / FP4 GEMM based on weight dtype,
+/// matching `linear()` in `Original/DeepSeek-V4-Pro/inference/model.py`.
+///
+/// FP8 path: act_quant(x) → fp8_gemm(x_q, x_s, w, w_s) → BF16 out
+/// FP4 path: act_quant(x) → fp4_gemm(x_q, x_s, w, w_s) → BF16 out
+///
+/// The act_quant / fp8_gemm / fp4_gemm kernels are not yet implemented; the
+/// public callable here will trap until they are. Bias is not supported in
+/// the reference (assert bias is None).
 public final class Linear {
-    public let outFeatures: Int
     public let inFeatures: Int
-    public let weight: Tensor               // either f32/f16 dense, or i4 packed
-    public let bias: Tensor?
+    public let outFeatures: Int
+    public let weight: Tensor
+    public let scale: Tensor?    // [out, in/blockK] in E8M0 for fp8/fp4 weights
 
-    private let pipelineGEMM: MTLComputePipelineState
-    private let pipelineQ4: MTLComputePipelineState
-
-    public init(weight: Tensor, bias: Tensor? = nil, outFeatures: Int, inFeatures: Int) {
-        self.weight = weight
-        self.bias = bias
-        self.outFeatures = outFeatures
+    public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?) {
         self.inFeatures = inFeatures
-        self.pipelineGEMM = Device.shared.makePipeline("matmul_f32")
-        self.pipelineQ4 = Device.shared.makePipeline("matvec_q4")
+        self.outFeatures = outFeatures
+        self.weight = weight
+        self.scale = scale
     }
 
-    /// y = x @ weight^T  (+ bias)
-    /// `x`: [M, inFeatures] f32. Output: [M, outFeatures] f32.
     public func callAsFunction(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
-        precondition(x.dtype == .f32, "Linear input must be f32 (cast upstream)")
-        let M = x.shape.dropLast().reduce(1, *)
-        let y = Tensor.empty(shape: Array(x.shape.dropLast()) + [outFeatures], dtype: .f32)
-
-        let enc = cmd.makeComputeCommandEncoder()!
-        if weight.dtype == .i4 {
-            precondition(M == 1, "Q4 path is matvec only; use prefill GEMM for M>1")
-            enc.setComputePipelineState(pipelineQ4)
-            enc.setBuffer(x.buffer, offset: x.offset, index: 0)
-            enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
-            enc.setBuffer(y.buffer, offset: 0, index: 2)
-            var dims = SIMD2<UInt32>(UInt32(outFeatures), UInt32(inFeatures))
-            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
-            let tg = MTLSize(width: 64, height: 1, depth: 1)
-            let gr = MTLSize(width: outFeatures, height: 1, depth: 1)
-            enc.dispatchThreads(gr, threadsPerThreadgroup: tg)
-        } else {
-            enc.setComputePipelineState(pipelineGEMM)
-            enc.setBuffer(x.buffer, offset: x.offset, index: 0)
-            enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
-            enc.setBuffer(y.buffer, offset: 0, index: 2)
-            var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
-            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
-            let tg = MTLSize(width: 16, height: 16, depth: 1)
-            let gx = (outFeatures + 15) / 16
-            let gy = (M + 15) / 16
-            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1), threadsPerThreadgroup: tg)
+        switch weight.dtype {
+        case .fp4E2M1:
+            return fp4Forward(x, in: cmd)
+        case .fp8E4M3:
+            return fp8Forward(x, in: cmd)
+        case .f32, .f16, .bf16:
+            return denseForward(x, in: cmd)
+        default:
+            fatalError("Linear: unsupported weight dtype \(weight.dtype)")
         }
-        enc.endEncoding()
-        return y
+    }
+
+    private func denseForward(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+        // BF16/FP16/FP32 dense GEMM — needs a generic GEMM kernel that
+        // covers x:[M, K] f32 @ w:[N, K] (same dtype as x) → y:[M, N] f32.
+        // The previous int4 GEMM has been removed; the BF16 GEMM is one of
+        // the next things to write. See README roadmap.
+        fatalError("Dense Linear not implemented — needs gemm_bf16.metal")
+    }
+
+    private func fp8Forward(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+        fatalError("FP8 Linear not implemented — needs act_quant.metal + fp8_gemm.metal")
+    }
+
+    private func fp4Forward(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+        fatalError("FP4 Linear not implemented — needs act_quant.metal + fp4_gemm.metal")
     }
 }

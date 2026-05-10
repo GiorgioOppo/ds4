@@ -1,79 +1,109 @@
 import Foundation
 
-/// Mirrors `config.json` from the HuggingFace repo.
-/// Field names are placeholders until `deepseek-ai/DeepSeek-V4-Pro/config.json`
-/// is fetched and inspected — names below follow DeepSeek-V3 conventions plus
-/// the new V4 components described in the technical report.
+/// Mirrors the `ModelArgs` dataclass from `Original/DeepSeek-V4-Pro/inference/model.py`.
+/// Field names use the Python snake_case via CodingKeys so config.json maps directly.
 public struct ModelConfig: Codable, Sendable {
-    // Standard transformer
-    public var vocabSize: Int
-    public var hiddenSize: Int
-    public var intermediateSize: Int
-    public var numHiddenLayers: Int
-    public var numAttentionHeads: Int
-    public var numKeyValueHeads: Int
-    public var headDim: Int
-    public var maxPositionEmbeddings: Int
-    public var rmsNormEps: Float
-    public var ropeTheta: Float
+    public var maxBatchSize: Int = 4
+    public var maxSeqLen: Int = 4096
+    public var dtype: String = "fp8"            // "bf16" | "fp8"
+    public var scaleFmt: String? = "ue8m0"      // nil | "ue8m0"
+    public var expertDtype: String? = nil       // nil | "fp4"
+    public var scaleDtype: String = "fp8"       // "fp32" | "fp8"
 
-    // MoE (DeepSeek-style: shared experts + routed experts, top-k gating)
-    public var numRoutedExperts: Int
-    public var numSharedExperts: Int
-    public var numExpertsPerToken: Int
-    public var moeIntermediateSize: Int
-    public var firstKDenseLayers: Int
+    public var vocabSize: Int = 129280
+    public var dim: Int = 4096
+    public var moeInterDim: Int = 4096
+    public var nLayers: Int = 7
+    public var nHashLayers: Int = 0
+    public var nMtpLayers: Int = 1
+    public var nHeads: Int = 64
 
-    // V4 hybrid attention
-    public var csaCompressionRatio: Int      // Compressed Sparse Attention
-    public var hcaCompressionRatio: Int      // Heavily Compressed Attention
-    public var hcaLayerStride: Int           // every N layers use HCA instead of CSA
+    // MoE
+    public var nRoutedExperts: Int = 8
+    public var nSharedExperts: Int = 1
+    public var nActivatedExperts: Int = 2
+    public var scoreFunc: String = "sqrtsoftplus"   // "softmax" | "sigmoid" | "sqrtsoftplus"
+    public var routeScale: Float = 1.0
+    public var swigluLimit: Float = 0.0
 
-    // Manifold-Constrained Hyper-Connections
-    public var mhcRank: Int
-    public var mhcExpansion: Int
+    // MLA + sliding window + per-layer compression
+    public var qLoraRank: Int = 1024
+    public var headDim: Int = 512
+    public var ropeHeadDim: Int = 64
+    public var normEps: Float = 1e-6
+    public var oGroups: Int = 8
+    public var oLoraRank: Int = 1024
+    public var windowSize: Int = 128
+    /// One ratio per layer. 0 = pure sliding window. 4 = compressed with Indexer.
+    /// 128 = heavy compression, no Indexer.
+    public var compressRatios: [Int] = [0, 0, 4, 128, 4, 128, 4, 0]
 
-    public var torchDtype: String?
-    public var bosTokenId: Int?
-    public var eosTokenId: Int?
+    // YaRN RoPE
+    public var compressRopeTheta: Float = 40000.0
+    public var originalSeqLen: Int = 0
+    public var ropeTheta: Float = 10000.0
+    public var ropeFactor: Float = 40
+    public var betaFast: Int = 32
+    public var betaSlow: Int = 1
+
+    // Indexer
+    public var indexNHeads: Int = 64
+    public var indexHeadDim: Int = 128
+    public var indexTopk: Int = 512
+
+    // Hyper-Connections
+    public var hcMult: Int = 4
+    public var hcSinkhornIters: Int = 20
+    public var hcEps: Float = 1e-6
 
     enum CodingKeys: String, CodingKey {
+        case maxBatchSize = "max_batch_size"
+        case maxSeqLen = "max_seq_len"
+        case dtype, scaleFmt = "scale_fmt", expertDtype = "expert_dtype", scaleDtype = "scale_dtype"
         case vocabSize = "vocab_size"
-        case hiddenSize = "hidden_size"
-        case intermediateSize = "intermediate_size"
-        case numHiddenLayers = "num_hidden_layers"
-        case numAttentionHeads = "num_attention_heads"
-        case numKeyValueHeads = "num_key_value_heads"
+        case dim
+        case moeInterDim = "moe_inter_dim"
+        case nLayers = "n_layers"
+        case nHashLayers = "n_hash_layers"
+        case nMtpLayers = "n_mtp_layers"
+        case nHeads = "n_heads"
+        case nRoutedExperts = "n_routed_experts"
+        case nSharedExperts = "n_shared_experts"
+        case nActivatedExperts = "n_activated_experts"
+        case scoreFunc = "score_func"
+        case routeScale = "route_scale"
+        case swigluLimit = "swiglu_limit"
+        case qLoraRank = "q_lora_rank"
         case headDim = "head_dim"
-        case maxPositionEmbeddings = "max_position_embeddings"
-        case rmsNormEps = "rms_norm_eps"
+        case ropeHeadDim = "rope_head_dim"
+        case normEps = "norm_eps"
+        case oGroups = "o_groups"
+        case oLoraRank = "o_lora_rank"
+        case windowSize = "window_size"
+        case compressRatios = "compress_ratios"
+        case compressRopeTheta = "compress_rope_theta"
+        case originalSeqLen = "original_seq_len"
         case ropeTheta = "rope_theta"
-        case numRoutedExperts = "n_routed_experts"
-        case numSharedExperts = "n_shared_experts"
-        case numExpertsPerToken = "num_experts_per_tok"
-        case moeIntermediateSize = "moe_intermediate_size"
-        case firstKDenseLayers = "first_k_dense_replace"
-        case csaCompressionRatio = "csa_compression_ratio"
-        case hcaCompressionRatio = "hca_compression_ratio"
-        case hcaLayerStride = "hca_layer_stride"
-        case mhcRank = "mhc_rank"
-        case mhcExpansion = "mhc_expansion"
-        case torchDtype = "torch_dtype"
-        case bosTokenId = "bos_token_id"
-        case eosTokenId = "eos_token_id"
+        case ropeFactor = "rope_factor"
+        case betaFast = "beta_fast"
+        case betaSlow = "beta_slow"
+        case indexNHeads = "index_n_heads"
+        case indexHeadDim = "index_head_dim"
+        case indexTopk = "index_topk"
+        case hcMult = "hc_mult"
+        case hcSinkhornIters = "hc_sinkhorn_iters"
+        case hcEps = "hc_eps"
     }
+
+    public init() {}
 
     public static func load(from url: URL) throws -> ModelConfig {
         let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(ModelConfig.self, from: data)
+        let decoder = JSONDecoder()
+        // Allow extra/missing keys: many configs may omit defaults.
+        return try decoder.decode(ModelConfig.self, from: data)
     }
 
-    public func usesHCA(layerIndex: Int) -> Bool {
-        guard hcaLayerStride > 0 else { return false }
-        return layerIndex % hcaLayerStride == 0
-    }
-
-    public func isDense(layerIndex: Int) -> Bool {
-        layerIndex < firstKDenseLayers
-    }
+    /// Per-layer effective head dimensions.
+    public var nopeHeadDim: Int { headDim - ropeHeadDim }
 }

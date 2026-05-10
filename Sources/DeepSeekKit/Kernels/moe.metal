@@ -1,55 +1,106 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// MoE routing: top-k softmax gate over expert logits.
-// gate_logits: [tokens, n_experts] f32
-// out_idx:     [tokens, top_k] u32
-// out_w:       [tokens, top_k] f32 (renormalised softmax weights)
+// MoE Gate scoring + top-k selection.
 //
-// This is the standard DeepSeek-V3 routing scheme; V4 keeps it modulo
-// auxiliary-loss-free balancing, which is a training-time concern only.
-kernel void moe_topk_gate(
-    device const float* gate_logits [[buffer(0)]],
-    device uint*        out_idx     [[buffer(1)]],
-    device float*       out_w       [[buffer(2)]],
-    constant uint3&     dims        [[buffer(3)]],   // (tokens, n_experts, top_k)
-    uint                t           [[thread_position_in_grid]]
+// Mirrors `Gate.forward` in
+// Original/DeepSeek-V4-Pro/inference/model.py lines 564–584.
+//
+// Input:
+//   logits:       [tokens, n_experts] f32  — produced by linear(x, gate.weight)
+//   bias:         [n_experts] f32          — additive shift used only for selection
+// Outputs:
+//   indices:      [tokens, top_k] u32      — top-k expert indices
+//   weights:      [tokens, top_k] f32      — gating weights, renormalized
+//
+// score_func (selected via constant `SCORE`):
+//   0 = softmax     scores = softmax(logits, dim=-1)
+//   1 = sigmoid     scores = sigmoid(logits)
+//   2 = sqrtsoftplus  scores = sqrt(softplus(logits))   (DeepSeek-V4 default)
+//
+// For sigmoid / sqrtsoftplus, `weights` is divided by its top-k sum so the
+// gating weights normalize to 1 even though the raw scores don't.
+// `route_scale` is applied at the end.
+
+constant uint  SCORE      [[function_constant(0)]];
+constant float ROUTE_SCALE [[function_constant(1)]];
+
+inline float score_fn(float x) {
+    if (SCORE == 0u) {
+        return x;                                // softmax handled outside
+    } else if (SCORE == 1u) {
+        return 1.0f / (1.0f + exp(-x));
+    } else {
+        // sqrt(softplus(x)) = sqrt(log1p(exp(x)))
+        // numerically stable: softplus(x) = max(x, 0) + log1p(exp(-|x|))
+        float sp = max(x, 0.0f) + log1p(exp(-abs(x)));
+        return sqrt(sp);
+    }
+}
+
+kernel void moe_gate(
+    device const float* logits   [[buffer(0)]],
+    device const float* bias     [[buffer(1)]],   // may be null when SCORE==0 with hash routing
+    device uint*        indices  [[buffer(2)]],
+    device float*       weights  [[buffer(3)]],
+    constant uint3&     dims     [[buffer(4)]],   // (tokens, n_experts, top_k)
+    uint                t        [[thread_position_in_grid]]
 ) {
     uint T = dims.x, E = dims.y, K = dims.z;
     if (t >= T) return;
 
-    device const float* row = gate_logits + t * E;
+    device const float* row = logits + t * E;
 
-    // Selection sort top-K — fine for E up to a few hundred, which is what
-    // DeepSeek MoE uses (V3: 256 routed experts).
-    float bestV[16];
-    uint  bestI[16];
-    for (uint k = 0; k < K; k++) { bestV[k] = -INFINITY; bestI[k] = 0; }
+    // 1) score per expert + remember the original (un-biased) score for the gating weight.
+    float orig[256];   // n_experts up to 256 in V4 configs; oversize is fine
+    float sel[256];
+    for (uint e = 0; e < E; e++) {
+        float l = row[e];
+        if (SCORE == 0u) {
+            orig[e] = l;
+        } else {
+            orig[e] = score_fn(l);
+        }
+    }
+    if (SCORE == 0u) {
+        // softmax in place
+        float m = -INFINITY;
+        for (uint e = 0; e < E; e++) m = max(m, orig[e]);
+        float s = 0;
+        for (uint e = 0; e < E; e++) { orig[e] = exp(orig[e] - m); s += orig[e]; }
+        for (uint e = 0; e < E; e++) orig[e] /= s;
+    }
 
     for (uint e = 0; e < E; e++) {
-        float v = row[e];
-        // find smallest in bestV
-        uint  smallI = 0;
-        float smallV = bestV[0];
+        float v = orig[e];
+        if (SCORE != 0u && bias != nullptr) v += bias[e];
+        sel[e] = v;
+    }
+
+    // 2) selection sort top-K from sel[]
+    float bestV[16]; uint bestI[16];
+    for (uint k = 0; k < K; k++) { bestV[k] = -INFINITY; bestI[k] = 0; }
+    for (uint e = 0; e < E; e++) {
+        float v = sel[e];
+        uint smallI = 0; float smallV = bestV[0];
         for (uint k = 1; k < K; k++) if (bestV[k] < smallV) { smallV = bestV[k]; smallI = k; }
         if (v > smallV) { bestV[smallI] = v; bestI[smallI] = e; }
     }
 
-    // softmax over the K kept logits
-    float m = -INFINITY;
-    for (uint k = 0; k < K; k++) m = max(m, bestV[k]);
-    float s = 0.0f;
-    for (uint k = 0; k < K; k++) { bestV[k] = exp(bestV[k] - m); s += bestV[k]; }
-    for (uint k = 0; k < K; k++) bestV[k] /= s;
+    // 3) gather original scores for the selected experts and renormalise
+    float gw[16];
+    float sumGw = 0;
+    for (uint k = 0; k < K; k++) {
+        gw[k] = orig[bestI[k]];
+        sumGw += gw[k];
+    }
+    if (SCORE != 0u) {
+        for (uint k = 0; k < K; k++) gw[k] /= max(sumGw, 1e-12f);
+    }
+    for (uint k = 0; k < K; k++) gw[k] *= ROUTE_SCALE;
 
     for (uint k = 0; k < K; k++) {
-        out_idx[t * K + k] = bestI[k];
-        out_w  [t * K + k] = bestV[k];
+        indices[t * K + k] = bestI[k];
+        weights[t * K + k] = gw[k];
     }
 }
-
-// Per-token expert dispatch is deliberately left to host-orchestrated calls
-// to matvec_q4: for batch=1 decode, the active set is just top_k experts and
-// we issue top_k MLP matvecs sequentially. Full batched scatter/gather MoE
-// dispatch (needed for prefill of long prompts) requires a token-permutation
-// kernel + grouped GEMM, which is its own project — see README "Roadmap".

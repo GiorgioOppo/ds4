@@ -5,20 +5,26 @@ public enum DType: Int, Sendable {
     case f32 = 0
     case f16 = 1
     case bf16 = 2
-    case i8 = 3
-    case i4 = 4   // packed two-per-byte
+    case i32 = 3
+    case i8 = 4
+    /// FP8 E4M3 (1 sign + 4 exp + 3 mantissa). Storage: 1 byte per value.
+    case fp8E4M3 = 5
+    /// FP4 E2M1 packed two-per-byte. Storage: 1 byte per 2 values.
+    case fp4E2M1 = 6
+    /// E8M0 unbiased exponent format used as block scale. Storage: 1 byte per value.
+    case e8m0 = 7
 
     public var bitsPerElement: Int {
         switch self {
-        case .f32: return 32
+        case .f32, .i32: return 32
         case .f16, .bf16: return 16
-        case .i8: return 8
-        case .i4: return 4
+        case .i8, .fp8E4M3, .e8m0: return 8
+        case .fp4E2M1: return 4
         }
     }
 }
 
-/// Row-major n-dim tensor backed by an `MTLBuffer`. No autograd, no broadcasting.
+/// Row-major n-dim tensor backed by an `MTLBuffer`.
 public final class Tensor {
     public let shape: [Int]
     public let dtype: DType
@@ -34,13 +40,11 @@ public final class Tensor {
 
     public var count: Int { shape.reduce(1, *) }
 
-    public var byteCount: Int {
-        (count * dtype.bitsPerElement + 7) / 8
-    }
+    public var byteCount: Int { (count * dtype.bitsPerElement + 7) / 8 }
 
     public static func empty(shape: [Int], dtype: DType, on device: Device = .shared) -> Tensor {
-        let bytes = (shape.reduce(1, *) * dtype.bitsPerElement + 7) / 8
-        guard let buf = device.mtl.makeBuffer(length: max(bytes, 16), options: .storageModeShared) else {
+        let bytes = max(((shape.reduce(1, *) * dtype.bitsPerElement) + 7) / 8, 16)
+        guard let buf = device.mtl.makeBuffer(length: bytes, options: .storageModeShared) else {
             fatalError("MTLBuffer allocation failed for \(bytes) bytes")
         }
         return Tensor(shape: shape, dtype: dtype, buffer: buf)
@@ -48,10 +52,10 @@ public final class Tensor {
 
     public static func from(bytes: UnsafeRawBufferPointer, shape: [Int], dtype: DType,
                             on device: Device = .shared) -> Tensor {
-        let bytesNeeded = (shape.reduce(1, *) * dtype.bitsPerElement + 7) / 8
-        precondition(bytes.count >= bytesNeeded, "byte buffer smaller than tensor shape")
+        let needed = (shape.reduce(1, *) * dtype.bitsPerElement + 7) / 8
+        precondition(bytes.count >= needed, "byte buffer smaller than tensor")
         guard let buf = device.mtl.makeBuffer(bytes: bytes.baseAddress!,
-                                              length: bytesNeeded,
+                                              length: needed,
                                               options: .storageModeShared) else {
             fatalError("MTLBuffer creation failed")
         }
@@ -63,7 +67,9 @@ public final class Tensor {
         return Tensor(shape: newShape, dtype: dtype, buffer: buffer, offset: offset)
     }
 
-    /// Copy the contents to a host array of `Float`. Only for f32/f16/bf16.
+    /// Copy contents to a host array of `Float`. For inspection / tests only —
+    /// quantized dtypes (fp8/fp4/e8m0) require a dequant pass that has not been
+    /// written yet, so this path traps for them.
     public func toFloatArray() -> [Float] {
         let n = count
         let raw = buffer.contents().advanced(by: offset)
@@ -78,7 +84,7 @@ public final class Tensor {
             let p = raw.bindMemory(to: UInt16.self, capacity: n)
             return (0..<n).map { Float(bitPattern: UInt32(p[$0]) << 16) }
         default:
-            fatalError("toFloatArray not supported for \(dtype)")
+            fatalError("toFloatArray not supported for \(dtype) — needs dequant kernel")
         }
     }
 

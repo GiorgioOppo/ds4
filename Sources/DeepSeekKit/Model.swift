@@ -1,67 +1,77 @@
 import Foundation
 import Metal
 
-/// Top-level DeepSeek-V4 model. The constructor below is the assembly entry
-/// point — populate the layers from a `SafeTensorsFile` once the weight
-/// naming convention is confirmed.
-public final class DeepSeekV4 {
+/// Embedding table + lookup. Stripped down from `ParallelEmbedding`
+/// in model.py:83 — single-rank (no tensor parallel).
+public final class ParallelEmbedding {
+    public let vocabSize: Int
+    public let dim: Int
+    public let weight: Tensor      // [vocab, dim]
+
+    public init(vocabSize: Int, dim: Int, weight: Tensor) {
+        self.vocabSize = vocabSize; self.dim = dim; self.weight = weight
+    }
+}
+
+/// LM head with HC mixing applied to the input. Mirrors `ParallelHead`
+/// in model.py:703–735. Logits are computed only on the LAST sequence
+/// position via `get_logits(x[:, -1])`.
+public final class ParallelHead {
+    public let vocabSize: Int
+    public let dim: Int
+    public let normEps: Float
+    public let hcEps: Float
+    public let weight: Tensor      // [vocab, dim] f32
+
+    public init(vocabSize: Int, dim: Int, normEps: Float, hcEps: Float, weight: Tensor) {
+        self.vocabSize = vocabSize; self.dim = dim
+        self.normEps = normEps; self.hcEps = hcEps
+        self.weight = weight
+    }
+}
+
+/// DeepSeek-V4 transformer. Mirrors `Transformer` in
+/// `Original/DeepSeek-V4-Pro/inference/model.py` lines 769–809.
+///
+/// forward(input_ids, start_pos):
+///   h = embed(input_ids).unsqueeze(2).repeat(1, 1, hc_mult, 1)   // expand to hc copies
+///   for layer in layers: h = layer(h, start_pos, input_ids)
+///   logits = head(h, hc_head_fn, hc_head_scale, hc_head_base, norm)
+public final class Transformer {
     public let config: ModelConfig
-    public let embedTokens: Tensor          // [vocab, hidden]
-    public let layers: [DecoderLayer]
-    public let finalNorm: RMSNorm
-    public let lmHead: Linear               // weight tied to embedTokens unless config says otherwise
+    public let embed: ParallelEmbedding
+    public let layers: [Block]
+    public let mtp: [MTPBlock]
+    public let norm: RMSNorm
+    public let head: ParallelHead
+
+    // Top-level HC head parameters
+    public let hcHeadFn: Tensor          // [hc_mult, hc_mult*dim] f32
+    public let hcHeadBase: Tensor        // [hc_mult] f32
+    public let hcHeadScale: Tensor       // [1] f32
 
     public init(config: ModelConfig,
-                embedTokens: Tensor,
-                layers: [DecoderLayer],
-                finalNorm: RMSNorm,
-                lmHead: Linear) {
+                embed: ParallelEmbedding,
+                layers: [Block],
+                mtp: [MTPBlock],
+                norm: RMSNorm,
+                head: ParallelHead,
+                hcHeadFn: Tensor, hcHeadBase: Tensor, hcHeadScale: Tensor) {
         self.config = config
-        self.embedTokens = embedTokens
+        self.embed = embed
         self.layers = layers
-        self.finalNorm = finalNorm
-        self.lmHead = lmHead
+        self.mtp = mtp
+        self.norm = norm
+        self.head = head
+        self.hcHeadFn = hcHeadFn
+        self.hcHeadBase = hcHeadBase
+        self.hcHeadScale = hcHeadScale
     }
 
-    /// Forward a single new token. Returns logits of shape [1, vocab].
-    public func step(tokenId: Int, cache: CacheBank) -> Tensor {
-        let cmd = Device.shared.queue.makeCommandBuffer()!
-        var x = embedRow(tokenId)
-        for (i, layer) in layers.enumerated() {
-            x = layer(x, cache: cache.layers[i], in: cmd)
-        }
-        let h = finalNorm(x, in: cmd)
-        let logits = lmHead(h, in: cmd)
-        cmd.commit(); cmd.waitUntilCompleted()
-        return logits
-    }
-
-    private func embedRow(_ tokenId: Int) -> Tensor {
-        // Copy one embedding row into a fresh f32 buffer.
-        let dim = config.hiddenSize
-        let dst = Tensor.empty(shape: [1, dim], dtype: .f32)
-        let cmd = Device.shared.queue.makeCommandBuffer()!
-        let blit = cmd.makeBlitCommandEncoder()!
-        let srcOffset = embedTokens.offset + tokenId * dim * (embedTokens.dtype.bitsPerElement / 8)
-        let bytes = dim * (embedTokens.dtype.bitsPerElement / 8)
-        if embedTokens.dtype == .f32 {
-            blit.copy(from: embedTokens.buffer, sourceOffset: srcOffset,
-                      to: dst.buffer, destinationOffset: 0, size: bytes)
-        } else {
-            // For non-f32 embedding tables we need a dequant kernel; fall back to
-            // host conversion for now so the pipeline runs end-to-end.
-            blit.endEncoding()
-            cmd.commit(); cmd.waitUntilCompleted()
-            let row = embedTokens.toFloatArray()
-            let start = tokenId * dim
-            let slice = Array(row[start..<start+dim])
-            slice.withUnsafeBufferPointer { p in
-                memcpy(dst.buffer.contents(), p.baseAddress, dim * MemoryLayout<Float>.size)
-            }
-            return dst
-        }
-        blit.endEncoding()
-        cmd.commit(); cmd.waitUntilCompleted()
-        return dst
+    /// Forward a batch of new tokens. Returns logits of shape [b, vocab].
+    /// NOT IMPLEMENTED — needs the full chain (embed lookup → HC expand →
+    /// per-layer Block → ParallelHead). All sublayer forwards are still stubs.
+    public func forward(inputIds: [[Int]], startPos: Int) -> Tensor {
+        fatalError("Transformer.forward not implemented — porting target: model.py:802")
     }
 }
