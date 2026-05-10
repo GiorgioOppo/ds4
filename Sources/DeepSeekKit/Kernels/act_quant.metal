@@ -159,13 +159,15 @@ kernel void act_quant_fp8(
     constant uint&      inplace  [[buffer(5)]],
     threadgroup float*  shared_  [[threadgroup(0)]],
     uint2 tg      [[threadgroup_position_in_grid]],
-    uint  tid     [[thread_position_in_threadgroup]],
-    uint  tgsize  [[threads_per_threadgroup]]
+    uint2 tidv    [[thread_position_in_threadgroup]],
+    uint2 tgsv    [[threads_per_threadgroup]]
 ) {
     uint M = dims.x, N = dims.y;
     uint blkSize = BLOCK_SIZE_FP8;
     uint row = tg.x;
     uint blkIdx = tg.y;
+    uint tid = tidv.x;
+    uint tgsize = tgsv.x;
     uint blockStart = blkIdx * blkSize;
     if (row >= M || blockStart >= N) return;
 
@@ -206,13 +208,15 @@ kernel void act_quant_fp4(
     constant uint&      inplace  [[buffer(5)]],
     threadgroup float*  shared_  [[threadgroup(0)]],
     uint2 tg      [[threadgroup_position_in_grid]],
-    uint  tid     [[thread_position_in_threadgroup]],
-    uint  tgsize  [[threads_per_threadgroup]]
+    uint2 tidv    [[thread_position_in_threadgroup]],
+    uint2 tgsv    [[threads_per_threadgroup]]
 ) {
     uint M = dims.x, N = dims.y;
     uint blkSize = BLOCK_SIZE_FP4;
     uint row = tg.x;
     uint blkIdx = tg.y;
+    uint tid = tidv.x;
+    uint tgsize = tgsv.x;
     uint blockStart = blkIdx * blkSize;
     if (row >= M || blockStart >= N) return;
 
