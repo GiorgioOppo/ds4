@@ -15,8 +15,13 @@ let package = Package(
         .target(
             name: "DeepSeekKit",
             path: "Sources/DeepSeekKit",
-            resources: [
-                .process("Kernels")
+            // Kernels is owned by MetalLibPlugin, which compiles the .metal
+            // files into default.metallib and emits that as a resource.
+            // Excluding the directory here prevents SwiftPM from also
+            // copying the raw .metal sources into the bundle.
+            exclude: ["Kernels"],
+            plugins: [
+                .plugin(name: "MetalLibPlugin"),
             ]
         ),
         .executableTarget(
@@ -28,6 +33,11 @@ let package = Package(
             name: "converter",
             dependencies: ["DeepSeekKit"],
             path: "Sources/converter"
+        ),
+        .plugin(
+            name: "MetalLibPlugin",
+            capability: .buildTool(),
+            path: "Plugins/MetalLibPlugin"
         ),
         .testTarget(
             name: "DeepSeekKitTests",
