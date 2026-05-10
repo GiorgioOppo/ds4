@@ -114,15 +114,12 @@ var generatedIds: [Int] = []
 
 // Prefill.
 var logits = model.forward(inputIds: [promptIds], startPos: 0)
+var samplingOpts = SamplingOptions(temperature: temperature,
+                                    topK: 0, topP: 1.0,
+                                    repetitionPenalty: 1.0)
 
 for step in 0..<maxTokens {
-    let nextId: Int
-    if temperature == 0 {
-        nextId = Sampler.argmax(logits)
-    } else {
-        Sampler.applyTemperature(logits, temperature)
-        nextId = Sampler.argmax(logits)   // proper multinomial → Sampler.multinomial in T2.1
-    }
+    let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
     if nextId == eosId { break }
     generatedIds.append(nextId)
 
