@@ -17,11 +17,13 @@ import DeepSeekKit
 //       --n-experts <N> \
 //       [--model-parallel 1] \
 //       [--expert-dtype fp4|fp8]   # default: relabel only (fp4 view)
+//       [--shard-size-gb 5]        # max bytes per output shard (default 5 GB)
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: converter --hf-ckpt-path <dir> --save-path <dir> --n-experts <N>
                      [--model-parallel 1] [--expert-dtype fp4|fp8]
+                     [--shard-size-gb 5]
 
     """.utf8))
     exit(2)
@@ -34,6 +36,7 @@ var savePath: String?
 var nExperts: Int = 0
 var mp: Int = 1
 var expertDtype: String? = nil
+var shardSizeGB: Double = 5.0
 
 var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
@@ -56,6 +59,9 @@ while !args.isEmpty {
         let s = args.removeFirst()
         guard ["fp4", "fp8"].contains(s) else { usage() }
         expertDtype = s
+    case "--shard-size-gb":
+        guard !args.isEmpty, let v = Double(args.removeFirst()) else { usage() }
+        shardSizeGB = v
     default:
         usage()
     }
@@ -64,6 +70,7 @@ while !args.isEmpty {
 guard let hf = hfPath, let save = savePath, nExperts > 0 else { usage() }
 precondition(nExperts % mp == 0, "n_experts must be divisible by model_parallel")
 precondition(mp == 1, "model_parallel > 1 not supported by this Swift port (single-rank)")
+let shardSizeBytes = Int(shardSizeGB * 1_000_000_000)
 
 if expertDtype == "fp8" {
     FileHandle.standardError.write(Data("""
@@ -273,44 +280,102 @@ for inputURL in inputs {
 
 print("Collected \(plan.count) tensors plus \(woAScales.count) wo_a scales.")
 
-// ---------- Write ----------
+// ---------- Build per-tensor write entries ----------
+//
+// Each entry is (name, dtype, shape, byteCount, sourceFactory). Then we
+// pack them greedily into shards of <= shardSizeBytes, in sorted name
+// order so contiguous layers end up co-located. Sharding gives the OS
+// page cache a chance to evict cold weights at file granularity instead
+// of paging in the middle of one giant 140 GB blob.
 
-let outURL = saveDir.appendingPathComponent("model0-mp1.safetensors")
-let writer = SafeTensorsWriter()
+struct WriteEntry {
+    let name: String
+    let dtype: String
+    let shape: [Int]
+    let byteCount: Int
+    let source: SafeTensorsWriter.Source
+}
 
-// Sort for deterministic output.
+var writeEntries: [WriteEntry] = []
 for newName in plan.keys.sorted() {
     let pt = plan[newName]!
     if newName.hasSuffix(".wo_a.weight"), let sc = woAScales[newName] {
-        // Fuse FP8 + scale → BF16 single tensor.
         let outDim = pt.shape[0]
         let inDim = pt.shape[1]
-        // Lazy compute: the data is produced when the writer streams it out.
         let n = outDim * inDim * 2
-        writer.add(name: newName, dtype: "BF16", shape: pt.shape,
-                   source: .compute(byteCount: n) {
-            try fuseWoA(weightURL: pt.url, weightOffset: pt.offset,
-                        scaleURL: sc.url, scaleOffset: sc.offset,
-                        outDim: outDim, inDim: inDim)
-        })
+        writeEntries.append(WriteEntry(
+            name: newName, dtype: "BF16", shape: pt.shape, byteCount: n,
+            source: .compute(byteCount: n) {
+                try fuseWoA(weightURL: pt.url, weightOffset: pt.offset,
+                            scaleURL: sc.url, scaleOffset: sc.offset,
+                            outDim: outDim, inDim: inDim)
+            }))
         continue
     }
-
-    // Expert weight relabeling: convert.py reinterprets I8 → F4_E2M1
-    // (`view(torch.float4_e2m1fn_x2)`). Bytes unchanged, only the dtype tag.
     var dtype = pt.dtype
     if newName.contains(".experts.") && newName.hasSuffix(".weight") {
         if pt.dtype.uppercased() == "I8" || pt.dtype.uppercased() == "U8" {
             dtype = "F4_E2M1"
         }
     }
-    writer.add(name: newName, dtype: dtype, shape: pt.shape,
-               source: .file(url: pt.url, offset: pt.offset, byteCount: pt.byteCount))
+    writeEntries.append(WriteEntry(
+        name: newName, dtype: dtype, shape: pt.shape, byteCount: pt.byteCount,
+        source: .file(url: pt.url, offset: pt.offset, byteCount: pt.byteCount)))
 }
 
-print("Writing \(outURL.path) …")
-try writer.write(to: outURL)
-print("Wrote \(plan.count) tensors.")
+// ---------- Pack into shards ----------
+
+struct Shard {
+    var entries: [WriteEntry]
+    var totalBytes: Int
+}
+
+var shards: [Shard] = [Shard(entries: [], totalBytes: 0)]
+for e in writeEntries {
+    var current = shards[shards.count - 1]
+    if !current.entries.isEmpty && current.totalBytes + e.byteCount > shardSizeBytes {
+        shards.append(Shard(entries: [], totalBytes: 0))
+        current = shards[shards.count - 1]
+    }
+    let idx = shards.count - 1
+    shards[idx].entries.append(e)
+    shards[idx].totalBytes += e.byteCount
+}
+
+print("Packing \(writeEntries.count) tensors into \(shards.count) shard(s) " +
+      "(target \(String(format: "%.1f", shardSizeGB)) GB/shard)")
+
+// ---------- Write each shard + index.json ----------
+
+let total = shards.count
+var weightMap: [String: String] = [:]      // tensor name → shard filename
+let totalBytes = shards.reduce(0) { $0 + $1.totalBytes }
+
+for (i, shard) in shards.enumerated() {
+    let fileName = String(format: "model-%05d-of-%05d.safetensors", i + 1, total)
+    let outURL = saveDir.appendingPathComponent(fileName)
+    let w = SafeTensorsWriter()
+    for e in shard.entries {
+        w.add(name: e.name, dtype: e.dtype, shape: e.shape, source: e.source)
+        weightMap[e.name] = fileName
+    }
+    print("  [\(i + 1)/\(total)] \(fileName) — " +
+          "\(shard.entries.count) tensors, " +
+          "\(String(format: "%.2f", Double(shard.totalBytes) / 1_000_000_000)) GB")
+    try w.write(to: outURL)
+}
+
+// HuggingFace-style index.json, useful for tooling and reproducibility.
+let indexObj: [String: Any] = [
+    "metadata": ["total_size": totalBytes] as [String: Any],
+    "weight_map": weightMap,
+]
+let indexData = try JSONSerialization.data(withJSONObject: indexObj,
+                                            options: [.sortedKeys, .prettyPrinted])
+let indexURL = saveDir.appendingPathComponent("model.safetensors.index.json")
+try indexData.write(to: indexURL)
+print("Wrote \(weightMap.count) tensors across \(total) shard(s); " +
+      "\(String(format: "%.1f", Double(totalBytes) / 1_000_000_000)) GB total.")
 
 // ---------- Copy tokenizer ----------
 
@@ -323,8 +388,8 @@ for f in ["tokenizer.json", "tokenizer_config.json"] {
     }
 }
 
-print("Done. Run:")
-print("  swift run -c release deepseek \(saveDir.path) \"<prompt>\" --mode chat")
+print("Done.")
+print("Run:  swift run -c release deepseek \(saveDir.path) \"<prompt>\" --mode chat")
 
 // ---------- Helpers ----------
 
