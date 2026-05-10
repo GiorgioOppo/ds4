@@ -232,4 +232,25 @@ public final class Transformer {
                           norm: norm, in: cmdH)
         return logits
     }
+
+    /// Drop all runtime KV cache buffers across every layer (main blocks
+    /// and MTP blocks), including the compressor's rolling state and any
+    /// indexer kvCache. ARC frees the underlying `MTLBuffer`s and the
+    /// pages return to the system. The next `forward` re-allocates lazily.
+    ///
+    /// Intended for use between unrelated prompts, when pausing a session,
+    /// or under memory pressure. Cheap to call (O(numLayers) host-side, no
+    /// GPU work).
+    public func releaseCache() {
+        for block in layers {
+            block.attn.releaseCache()
+            block.attn.compressor?.releaseState()
+            block.attn.indexer?.releaseCache()
+        }
+        for m in mtp {
+            m.block.attn.releaseCache()
+            m.block.attn.compressor?.releaseState()
+            m.block.attn.indexer?.releaseCache()
+        }
+    }
 }
