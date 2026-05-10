@@ -101,7 +101,6 @@ public final class MTPBlock {
         blit.endEncoding()
         // 2. out += addend, broadcast across HC.
         // Use Elementwise.addInPlace HC times, each on a [N, D] slice.
-        let bytesPerSlice = N * D * MemoryLayout<Float>.size
         for h in 0..<HC {
             let outSlice = Tensor(shape: [N, D], dtype: .f32,
                                    buffer: out.buffer,
