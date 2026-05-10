@@ -1,15 +1,24 @@
 import Foundation
 import Metal
+#if canImport(Darwin)
+import Darwin
+#endif
 
-/// Minimal safetensors reader. The format is:
-///   [u64 little-endian header length][JSON header][tensor data...]
-/// Header maps tensor name -> { dtype, shape, data_offsets:[start,end] }.
+/// Memory-mapped safetensors reader.
 ///
-/// DeepSeek-V4 ships weights in a sharded form indexed by
-/// `model.safetensors.index.json`; the multi-rank Python loader uses
-/// `model{rank}-mp{world_size}.safetensors` after `convert.py` does the
-/// MP repack. For single-rank macOS we want world_size = 1 → use
-/// `convert.py --n-experts ... --model-parallel 1` upstream.
+/// File layout:
+///   [u64 little-endian header length][JSON header][tensor data...]
+///
+/// The whole file is `mmap`-ed once and exposed as a single `MTLBuffer`
+/// (via `makeBuffer(bytesNoCopy:length:options:deallocator:)`). On Apple
+/// Silicon the GPU and CPU share the same address space, so the mmapped
+/// pages are directly readable by Metal kernels without copying. Pages are
+/// faulted in on first access and can be evicted by the OS under memory
+/// pressure — this is the only way to handle a 900 GB V4-Pro checkpoint
+/// on a Mac with 192-512 GB of unified memory.
+///
+/// `Tensor` returned from `load(_:)` carries the shared buffer + the
+/// absolute byte offset into it; reads at the GPU do not allocate.
 public final class SafeTensorsFile {
     public struct Entry: Decodable {
         public let dtype: String
@@ -24,49 +33,87 @@ public final class SafeTensorsFile {
     public let url: URL
     public let entries: [String: Entry]
     private let dataStart: Int
-    private let fileHandle: FileHandle
+
+    /// Shared MTLBuffer covering the entire mmapped file. All Tensors
+    /// returned by `load(_:)` reference this buffer with their `offset`
+    /// field set to the absolute byte position in the file.
+    private let sharedBuffer: MTLBuffer
 
     public init(url: URL) throws {
         self.url = url
-        let fh = try FileHandle(forReadingFrom: url)
-        self.fileHandle = fh
 
-        try fh.seek(toOffset: 0)
-        guard let lenData = try fh.read(upToCount: 8), lenData.count == 8 else {
-            throw NSError(domain: "SafeTensors", code: 1)
+        // 1. Open the file for read.
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(domain: "SafeTensors", code: 10, userInfo: [
+                NSLocalizedDescriptionKey: "open failed: \(url.path)"
+            ])
         }
-        let headerLen = lenData.withUnsafeBytes { $0.load(as: UInt64.self) }
-        guard let header = try fh.read(upToCount: Int(headerLen)) else {
-            throw NSError(domain: "SafeTensors", code: 2)
+        defer { close(fd) }
+
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            throw NSError(domain: "SafeTensors", code: 11)
+        }
+        let fileSize = Int(st.st_size)
+
+        // 2. mmap the whole file. The pointer is page-aligned by mmap
+        //    design; we round the mapping size up to a page boundary so
+        //    `makeBuffer(bytesNoCopy:length:)` accepts it.
+        let pageSize = Int(sysconf(_SC_PAGESIZE))
+        let alignedSize = ((fileSize + pageSize - 1) / pageSize) * pageSize
+        guard let raw = mmap(nil, alignedSize, PROT_READ, MAP_PRIVATE, fd, 0),
+              raw != MAP_FAILED else {
+            throw NSError(domain: "SafeTensors", code: 12, userInfo: [
+                NSLocalizedDescriptionKey: "mmap failed for \(url.path)"
+            ])
         }
 
-        let raw = try JSONSerialization.jsonObject(with: header) as? [String: Any] ?? [:]
+        // 3. Wrap as MTLBuffer. Deallocator unmaps when the buffer is
+        //    released, which happens when the last Tensor referencing it
+        //    is freed.
+        let dealloc: (UnsafeMutableRawPointer, Int) -> Void = { p, n in
+            munmap(p, n)
+        }
+        guard let buf = Device.shared.mtl.makeBuffer(
+                bytesNoCopy: raw, length: alignedSize,
+                options: .storageModeShared,
+                deallocator: dealloc) else {
+            munmap(raw, alignedSize)
+            throw NSError(domain: "SafeTensors", code: 13, userInfo: [
+                NSLocalizedDescriptionKey: "MTLBuffer creation failed for mmap"
+            ])
+        }
+        self.sharedBuffer = buf
+
+        // 4. Parse the JSON header.
+        let lenPtr = raw.bindMemory(to: UInt64.self, capacity: 1)
+        let headerLen = Int(lenPtr.pointee)
+        let headerData = Data(bytesNoCopy: raw.advanced(by: 8),
+                              count: headerLen,
+                              deallocator: .none)
+        let rawJSON = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] ?? [:]
         var parsed: [String: Entry] = [:]
-        for (k, v) in raw {
+        for (k, v) in rawJSON {
             if k == "__metadata__" { continue }
             let entryData = try JSONSerialization.data(withJSONObject: v)
             parsed[k] = try JSONDecoder().decode(Entry.self, from: entryData)
         }
         self.entries = parsed
-        self.dataStart = 8 + Int(headerLen)
+        self.dataStart = 8 + headerLen
     }
 
+    /// Returns a Tensor referencing the mmapped region. No bytes are
+    /// copied; the GPU reads directly from the mmapped pages.
     public func load(_ name: String, on device: Device = .shared) throws -> Tensor {
         guard let e = entries[name] else {
             throw NSError(domain: "SafeTensors", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "missing tensor \(name)"])
         }
-        let start = dataStart + e.dataOffsets[0]
-        let end = dataStart + e.dataOffsets[1]
-        let len = end - start
-        try fileHandle.seek(toOffset: UInt64(start))
-        guard let bytes = try fileHandle.read(upToCount: len), bytes.count == len else {
-            throw NSError(domain: "SafeTensors", code: 4)
-        }
+        let absOffset = dataStart + e.dataOffsets[0]
         let dt = Self.parseDType(e.dtype)
-        return bytes.withUnsafeBytes { raw in
-            Tensor.from(bytes: raw, shape: e.shape, dtype: dt, on: device)
-        }
+        return Tensor(shape: e.shape, dtype: dt,
+                      buffer: sharedBuffer, offset: absOffset)
     }
 
     private static func parseDType(_ s: String) -> DType {
@@ -76,7 +123,6 @@ public final class SafeTensorsFile {
         case "BF16": return .bf16
         case "I32": return .i32
         case "I8", "U8": return .i8
-        // PyTorch float8/float4 dtypes serialized by safetensors:
         case "F8_E4M3", "F8E4M3", "FLOAT8_E4M3FN": return .fp8E4M3
         case "F4_E2M1", "F4E2M1", "FLOAT4_E2M1FN_X2": return .fp4E2M1
         case "F8_E8M0", "F8E8M0", "FLOAT8_E8M0FNU": return .e8m0
