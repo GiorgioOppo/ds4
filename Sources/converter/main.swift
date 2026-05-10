@@ -579,6 +579,21 @@ func depthKey(of name: String) -> Int {
 var bucketsByDepth: [Int: [WriteEntry]] = [:]
 for e in writeEntries { bucketsByDepth[depthKey(of: e.name), default: []].append(e) }
 
+// Sanity log: report what depth structure we discovered just from the
+// tensor names. Useful to cross-check against config.json's `n_layers`
+// and `n_mtp_layers` if you have them.
+let layerDepths = bucketsByDepth.keys.filter { $0 >= 0 && $0 < 100_000 }.sorted()
+let mtpDepths = bucketsByDepth.keys.filter { $0 >= 100_000 }.sorted().map { $0 - 100_000 }
+let topLevelTensors = bucketsByDepth[-1]?.count ?? 0
+print("Discovered structure (from tensor names, no config.json read):")
+print("  top-level tensors:  \(topLevelTensors)")
+if let lo = layerDepths.first, let hi = layerDepths.last {
+    print("  layers:             \(layerDepths.count) (indices \(lo)…\(hi))")
+}
+if !mtpDepths.isEmpty {
+    print("  mtp blocks:         \(mtpDepths.count)")
+}
+
 struct Shard {
     var entries: [WriteEntry]
     var totalBytes: Int
