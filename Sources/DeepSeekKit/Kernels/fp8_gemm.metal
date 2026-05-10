@@ -1,42 +1,72 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// FP8-E4M3FN dequant — duplicated from act_quant.metal (each .metal is its own
+// compilation unit). See dtype semantics in Quantization.swift.
+inline float deq_e4m3(uchar b) {
+    uint sign = (uint)(b >> 7) & 1u;
+    uint exp = (uint)(b >> 3) & 0xFu;
+    uint mant = (uint)b & 0x7u;
+    if (exp == 0u && mant == 0u) return sign != 0u ? -0.0f : 0.0f;
+    if (exp == 0xFu && mant == 0x7u) return NAN;
+    if (exp == 0u) {
+        float v = (float)mant * 0x1p-9f;
+        return sign != 0u ? -v : v;
+    }
+    uint bits = (sign << 31) | ((exp + 120u) << 23) | (mant << 20);
+    return as_type<float>(bits);
+}
+
 // fp8_gemm — FP8 × FP8 matrix multiply with per-128 block scaling.
 //
-// Port of `fp8_gemm_kernel` from
-// Reference/inference/kernel.py.
+// Mirrors `fp8_gemm_kernel` from
+// Reference/inference/kernel.py lines 203–273.
 //
-// Computes:  C[M, N] = A_fp8[M, K] @ B_fp8[N, K]^T   (out: BF16 or FP32)
-// with:
-//   scales_a: [M, K/128] in E8M0 — one scale per 1×128 row block
-//   scales_b: [N/128, K/128] in E8M0 — one scale per 128×128 weight block
+// Layout:
+//   A:        [M, K] fp8_e4m3
+//   A_scale:  [M, K/128] f32  (E8M0 stored as float for now)
+//   B:        [N, K] fp8_e4m3
+//   B_scale:  [N/128, K/128] f32  (1 scale per 128×128 weight block)
+//   C:        [M, N] f32 output
 //
-// Reference tile sizes: block_M=32, block_N=128, block_K=128, num_stages=4.
-// Inner loop:
-//   for k in pipelined(K/128):
-//     load A_tile[32,128] FP8, B_tile[128,128] FP8
-//     dequant via FP8→FP16 cast in shader (Metal has no native FP8)
-//     simdgroup_matrix bf16 GEMM into C_local
-//     scale_c[i] = scales_a[i, k] * scales_b[bx, k]   (FP32)
-//     C_local_accum[i, j] += C_local[i, j] * scale_c[i]
+// Naive tiled implementation: one thread per output cell, scalar loop over
+// K-blocks of 128 elements. Apple Silicon has no native FP8 GEMM so each
+// FP8 byte is dequantized through `deq_e4m3` in-shader before multiplying.
 //
-// NOT IMPLEMENTED. Required machinery:
-//   - FP8-E4M3 → FP16 dequant function (see Quantization.swift for the
-//     scalar reference; on GPU use a 256-entry lookup table in constant memory
-//     or a bit-twiddling implementation)
-//   - simdgroup_matrix-based BF16 GEMM (Apple Silicon M3/M4 simdgroup
-//     instructions: simdgroup_load, simdgroup_multiply_accumulate)
-//   - swizzle-aware threadgroup memory layout to avoid bank conflicts
-//   - 2-stage accumulator: per-tile FP32 accum, scaled, then folded into the
-//     outer FP32 accumulator (matches reference's C_local / C_local_accum)
-//
-// One subtle point: the reference does NOT pre-dequant the FP8 to BF16 in
-// shared memory; it relies on tilelang's FP8 GEMM. On Metal we have no FP8
-// matrix instructions, so we MUST cast on load.
+// Slow but correct — replace with simdgroup_matrix-based BF16 GEMM after
+// dequantizing FP8 → BF16 in shared memory once correctness is verified.
 
-kernel void fp8_gemm_unimplemented(
-    device float* dst [[buffer(0)]],
-    uint gid [[thread_position_in_grid]]
+constant uint BLOCK_K = 128;
+constant uint BLOCK_N_FP8 = 128;
+
+kernel void gemm_fp8_to_f32(
+    device const uchar*  A      [[buffer(0)]],
+    device const float*  A_sc   [[buffer(1)]],
+    device const uchar*  B      [[buffer(2)]],
+    device const float*  B_sc   [[buffer(3)]],
+    device float*        C      [[buffer(4)]],
+    constant uint3&      dims   [[buffer(5)]],   // (M, N, K)
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    if (gid == 0) dst[0] = NAN;
+    uint M = dims.x, N = dims.y, K = dims.z;
+    uint row = gid.y, col = gid.x;
+    if (row >= M || col >= N) return;
+
+    uint blocksK = K / BLOCK_K;
+    float acc = 0.0f;
+
+    for (uint kb = 0; kb < blocksK; kb++) {
+        float a_scale = A_sc[row * blocksK + kb];
+        float b_scale = B_sc[(col / BLOCK_N_FP8) * blocksK + kb];
+
+        float block_acc = 0.0f;
+        uint k0 = kb * BLOCK_K;
+        for (uint k = 0; k < BLOCK_K; k++) {
+            float a = deq_e4m3(A[row * K + k0 + k]);
+            float b = deq_e4m3(B[col * K + k0 + k]);
+            block_acc += a * b;
+        }
+        acc += block_acc * a_scale * b_scale;
+    }
+    C[row * N + col] = acc;
 }

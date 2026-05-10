@@ -20,9 +20,9 @@ public final class HCSinkhorn {
         var hc = UInt32(hcMult)
         var iters = UInt32(sinkhornIters)
         var eps = hcEps
-        constants.setConstantValue(&hc, type: .uint, index: 0)
-        constants.setConstantValue(&iters, type: .uint, index: 1)
-        constants.setConstantValue(&eps, type: .float, index: 2)
+        constants.setConstantValue(&hc, type: .uint, index: 4)
+        constants.setConstantValue(&iters, type: .uint, index: 5)
+        constants.setConstantValue(&eps, type: .float, index: 6)
 
         let lib = Device.shared.library
         do {

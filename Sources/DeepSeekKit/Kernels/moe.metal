@@ -22,8 +22,8 @@ using namespace metal;
 // gating weights normalize to 1 even though the raw scores don't.
 // `route_scale` is applied at the end.
 
-constant uint  SCORE      [[function_constant(0)]];
-constant float ROUTE_SCALE [[function_constant(1)]];
+constant uint  SCORE      [[function_constant(2)]];
+constant float ROUTE_SCALE [[function_constant(3)]];
 
 inline float score_fn(float x) {
     if (SCORE == 0u) {

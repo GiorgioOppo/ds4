@@ -148,6 +148,14 @@ inline float e2m1_to_f32(uchar b) {
 //   4  block_size     uint
 //   5  inplace_flag   uint
 
+// Function-constant index assignment for the entire library:
+//   0  BLOCK_SIZE_FP8
+//   1  BLOCK_SIZE_FP4
+//   2  SCORE          (moe.metal)
+//   3  ROUTE_SCALE    (moe.metal)
+//   4  HC             (hc_sinkhorn.metal)
+//   5  SINKHORN_ITERS (hc_sinkhorn.metal)
+//   6  HC_EPS         (hc_sinkhorn.metal)
 constant uint BLOCK_SIZE_FP8 [[function_constant(0)]];
 
 kernel void act_quant_fp8(
@@ -197,7 +205,7 @@ kernel void act_quant_fp8(
     }
 }
 
-constant uint BLOCK_SIZE_FP4 [[function_constant(10)]];
+constant uint BLOCK_SIZE_FP4 [[function_constant(1)]];
 
 kernel void act_quant_fp4(
     device const float* x_in     [[buffer(0)]],

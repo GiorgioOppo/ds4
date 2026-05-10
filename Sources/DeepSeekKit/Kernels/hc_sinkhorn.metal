@@ -28,9 +28,9 @@ using namespace metal;
 // HC*HC threads. Each thread owns one (j,k) cell of `comb`. The hc values
 // are tiny (4×4 = 16 cells) so everything lives in threadgroup memory.
 
-constant uint  HC             [[function_constant(0)]];
-constant uint  SINKHORN_ITERS [[function_constant(1)]];
-constant float HC_EPS         [[function_constant(2)]];
+constant uint  HC             [[function_constant(4)]];
+constant uint  SINKHORN_ITERS [[function_constant(5)]];
+constant float HC_EPS         [[function_constant(6)]];
 
 inline float sigmoid_f(float x) {
     return 1.0f / (1.0f + exp(-x));

@@ -24,7 +24,7 @@ public final class ActQuant {
         self.blockSize = format == .fp8 ? Quant.actBlockSizeFP8 : Quant.actBlockSizeFP4
         let consts = MTLFunctionConstantValues()
         var bs = UInt32(self.blockSize)
-        consts.setConstantValue(&bs, type: .uint, index: format == .fp8 ? 0 : 10)
+        consts.setConstantValue(&bs, type: .uint, index: format == .fp8 ? 0 : 1)
         let lib = Device.shared.library
         let name = format == .fp8 ? "act_quant_fp8" : "act_quant_fp4"
         do {
