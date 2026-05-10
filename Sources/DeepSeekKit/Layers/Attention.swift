@@ -74,19 +74,21 @@ public final class MLA {
         self.kvCache = kvCache
     }
 
-    /// Prefill forward pass. Mirrors model.py:484 with these temporary
-    /// constraints:
-    ///   - startPos == 0 only (decode left as fatalError until the sliding-
-    ///     window ring buffer + compressor decode path are wired)
-    ///   - seqlen <= window_size (the cutoff/shift split for seqlen > window
-    ///     in model.py:520-523 isn't implemented yet)
-    ///   - act_quant of non-rope KV dims is skipped (QAT noise; structural
-    ///     forward correctness doesn't depend on it)
+    /// MLA forward. Handles all three cases:
+    ///   - prefill startPos == 0, seqlen <= window_size: write whole kv
+    ///   - prefill startPos == 0, seqlen > window_size: write last window
+    ///     rows with cutoff/wrap (model.py:521-523)
+    ///   - decode startPos > 0, seqlen == 1: ring-buffer single-row write
+    ///
+    /// act_quant of the non-rope KV dims is skipped (QAT noise; structural
+    /// forward correctness doesn't depend on it). Tier 3 will add it back.
     public func callAsFunction(_ x: Tensor, startPos: Int, in cmd: MTLCommandBuffer) -> Tensor {
         precondition(x.dtype == .f32 && x.shape.count == 3)
         let B = x.shape[0], S = x.shape[1]
-        precondition(startPos == 0, "MLA decode path not implemented")
-        precondition(S <= windowSize, "MLA prefill with seqlen > window not implemented")
+        let isDecode = startPos > 0
+        if isDecode {
+            precondition(S == 1, "MLA decode expects seqlen == 1")
+        }
 
         // Wire compressor's KV cache slice on first call (model.py:490-494).
         if let comp = compressor, comp.kvCache == nil {
@@ -156,21 +158,26 @@ public final class MLA {
         let kv = kvFlat.reshape([B, S, headDim])
 
         // ---------- Topk indices ----------
+        // Window indices use the actual startPos so the ring-buffer wrap
+        // is handled correctly during decode. For prefill startPos == 0
+        // and AttentionIndices.slidingWindow returns the prefill table.
         let winIdxs = AttentionIndices.slidingWindow(windowSize: windowSize,
-                                                       batch: B, seqlen: S, startPos: 0)
-        var topkArr = winIdxs                            // ints
+                                                       batch: B, seqlen: S, startPos: startPos)
+        var topkArr = winIdxs
         var K = windowSize
+
+        // Compressed offset: prefill compressed tokens are appended to `kv`
+        // at index `kv.size(1)` == S. Decode reads from kvCache where the
+        // compressed slice starts at `windowSize` (after the window ring).
+        let compOffset = isDecode ? windowSize : S
 
         var compK = 0
         if compressRatio > 0 {
-            let compOffset = S                            // kv ends at S, compressed tokens follow
             if let idx = indexer {
-                // Indexer returns [B, S, K_idx] i32 directly on GPU. We read
-                // it back to host so we can concat with winIdxs uniformly.
+                // Indexer returns [B, S, K_idx] i32 on GPU. Read back to
+                // host so we can concat with winIdxs uniformly.
                 let topkT = idx(x, qr: qr, startPos: startPos, offset: compOffset, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
-                let cmdLocal = Device.shared.queue.makeCommandBuffer()!
-                _ = cmdLocal
                 compK = topkT.shape[2]
                 let p = topkT.buffer.contents().bindMemory(to: Int32.self,
                                                             capacity: B * S * compK)
@@ -181,7 +188,8 @@ public final class MLA {
             } else {
                 let (compIdxs, kc) = AttentionIndices.compressed(ratio: compressRatio,
                                                                   batch: B, seqlen: S,
-                                                                  startPos: 0, offset: compOffset)
+                                                                  startPos: startPos,
+                                                                  offset: compOffset)
                 compK = kc
                 topkArr = mergeTopk(window: winIdxs, compress: compIdxs,
                                      B: B, S: S, kWin: K, kComp: compK)
@@ -192,28 +200,77 @@ public final class MLA {
             Tensor.from(bytes: $0, shape: [B, S, K], dtype: .i32)
         }
 
-        // ---------- KV cache write + compressor concat ----------
-        // For seqlen <= window, kv_cache[:B, :S, :] = kv (model.py:520).
+        // ---------- KV cache write ----------
+        let bytesPerRow = headDim * MemoryLayout<Float>.size
+        let cacheRows = kvCache.shape[1]
         do {
             let blit = cmd.makeBlitCommandEncoder()!
-            let bytesPerRow = headDim * MemoryLayout<Float>.size
-            let cacheRows = kvCache.shape[1]
-            for b in 0..<B {
-                let srcOff = b * S * bytesPerRow
-                let dstOff = kvCache.offset + b * cacheRows * bytesPerRow
-                blit.copy(from: kv.buffer, sourceOffset: srcOff,
-                          to: kvCache.buffer, destinationOffset: dstOff,
-                          size: S * bytesPerRow)
+            if isDecode {
+                // Single-row ring-buffer write: kv_cache[:B, startPos % win] = kv[:, 0]
+                let slot = startPos % windowSize
+                for b in 0..<B {
+                    let srcOff = b * bytesPerRow
+                    let dstOff = kvCache.offset + (b * cacheRows + slot) * bytesPerRow
+                    blit.copy(from: kv.buffer, sourceOffset: srcOff,
+                              to: kvCache.buffer, destinationOffset: dstOff,
+                              size: bytesPerRow)
+                }
+            } else if S <= windowSize {
+                // Full S rows, contiguous, starting at slot 0.
+                for b in 0..<B {
+                    let srcOff = b * S * bytesPerRow
+                    let dstOff = kvCache.offset + b * cacheRows * bytesPerRow
+                    blit.copy(from: kv.buffer, sourceOffset: srcOff,
+                              to: kvCache.buffer, destinationOffset: dstOff,
+                              size: S * bytesPerRow)
+                }
+            } else {
+                // Prefill seqlen > window: keep only the last `windowSize` kv
+                // rows, with cutoff/wrap so the ring buffer ends at
+                // (S - 1) % win. Mirrors model.py:521-523.
+                let cutoff = S % windowSize
+                let firstHalf = windowSize - cutoff   // rows that go into [cutoff, windowSize)
+                let kvLastWinStart = S - windowSize
+                for b in 0..<B {
+                    // First chunk: kv[:, S-win .. S-cutoff] → kvCache[:, cutoff..win]
+                    if firstHalf > 0 {
+                        let srcOff = (b * S + kvLastWinStart) * bytesPerRow
+                        let dstOff = kvCache.offset
+                            + (b * cacheRows + cutoff) * bytesPerRow
+                        blit.copy(from: kv.buffer, sourceOffset: srcOff,
+                                  to: kvCache.buffer, destinationOffset: dstOff,
+                                  size: firstHalf * bytesPerRow)
+                    }
+                    // Second chunk: kv[:, S-cutoff .. S] → kvCache[:, 0..cutoff]
+                    if cutoff > 0 {
+                        let srcOff = (b * S + (S - cutoff)) * bytesPerRow
+                        let dstOff = kvCache.offset + b * cacheRows * bytesPerRow
+                        blit.copy(from: kv.buffer, sourceOffset: srcOff,
+                                  to: kvCache.buffer, destinationOffset: dstOff,
+                                  size: cutoff * bytesPerRow)
+                    }
+                }
             }
             blit.endEncoding()
         }
 
-        // Build kv_full = kv ++ kv_compressed (along S axis) for sparse_attn.
+        // ---------- Build the kv tensor passed to sparse_attn ----------
+        // Prefill: kvFull = kv ++ compressor_output (along S axis), so the
+        //   topk indices [0, S) map into kv and [S, S+compS) into the comp.
+        // Decode: kvFull = kvCache[:B] (the whole [windowSize + compRows]
+        //   buffer the compressor itself writes into).
         let kvFull: Tensor
-        if let comp = compressor, let cOut = comp(x, startPos: startPos, in: cmd) {
+        if isDecode {
+            // Run compressor for side-effect: it updates state and may write
+            // a new compressed token into the trailing slice of kvCache.
+            if let comp = compressor {
+                _ = comp(x, startPos: startPos, in: cmd)
+            }
+            kvFull = Tensor(shape: [B, cacheRows, headDim], dtype: .f32,
+                             buffer: kvCache.buffer, offset: kvCache.offset)
+        } else if let comp = compressor, let cOut = comp(x, startPos: startPos, in: cmd) {
             let compS = cOut.shape[1]
             let total = S + compS
-            let bytesPerRow = headDim * MemoryLayout<Float>.size
             kvFull = Tensor.empty(shape: [B, total, headDim], dtype: .f32)
             let blit = cmd.makeBlitCommandEncoder()!
             for b in 0..<B {

@@ -5,11 +5,10 @@ import Metal
 /// tokens. Mirrors the `Compressor` module in
 /// `Reference/inference/model.py` lines 279–377.
 ///
-/// **Implemented**: prefill path (`startPos == 0`), with and without overlap.
-/// **Not implemented yet**: decode path (single-token incremental). Decode
-/// requires keeping the `kv_state` / `score_state` buffers populated across
-/// commits and emitting a compressed token only every `ratio` steps; that
-/// state-machine is its own subproject and is left as a `fatalError` here.
+/// Both prefill (`startPos == 0`, multi-token) and decode (`startPos > 0`,
+/// single-token incremental) paths are implemented, with and without
+/// overlap. The decode path maintains `kvState`/`scoreState` across calls
+/// and only emits a compressed token every `compressRatio` steps.
 ///
 /// The Compressor's KV cache is owned by the parent (MLA / Indexer); the
 /// caller assigns `self.kvCache` and `self.rope` before invoking forward.
@@ -38,6 +37,8 @@ public final class Compressor {
 
     private let pBroadcastAdd: MTLComputePipelineState
     private let pWeightedSum: MTLComputePipelineState
+    private let pOverlapConcat: MTLComputePipelineState
+    private let pStateShift: MTLComputePipelineState
 
     public init(config: ModelConfig, compressRatio: Int, headDim: Int, rotate: Bool,
                 ape: Tensor, wkv: Linear, wgate: Linear, norm: RMSNorm,
@@ -58,52 +59,47 @@ public final class Compressor {
         self.scoreState = scoreState
         self.pBroadcastAdd = Device.shared.makePipeline("broadcast_add_4d_2d_f32")
         self.pWeightedSum = Device.shared.makePipeline("weighted_sum_axis2_f32")
+        self.pOverlapConcat = Device.shared.makePipeline("compressor_overlap_concat_f32")
+        self.pStateShift = Device.shared.makePipeline("compressor_state_shift_copy_f32")
     }
 
-    /// Prefill path. Returns the compressed KV `[B, S/ratio, head_dim]` after
-    /// norm + RoPE on the rope tail and (optionally) Hadamard + FP4 quant or
-    /// FP8 act_quant on the nope dims.
-    ///
-    /// Caller is responsible for writing the result into the attention KV
-    /// cache after this returns; the reference Python does that, but pulling
-    /// it inside the Compressor would require a blit copy that's clearer at
-    /// the call site.
+    /// Forward pass. Returns the compressed KV when one is emitted, else nil.
+    /// Prefill (startPos == 0) emits `[B, S/ratio, head_dim]`; decode emits
+    /// `[B, 1, head_dim]` only when `(start_pos + 1) % ratio == 0`.
     public func callAsFunction(_ x: Tensor, startPos: Int, in cmd: MTLCommandBuffer) -> Tensor? {
         precondition(x.dtype == .f32 && x.shape.count == 3,
                      "Compressor expects f32 [B, S, dim]")
-        guard startPos == 0 else {
-            fatalError("Compressor decode path not implemented yet — see file header")
+        if startPos == 0 {
+            return forwardPrefill(x, in: cmd)
         }
+        return forwardDecode(x, startPos: startPos, in: cmd)
+    }
+
+    // MARK: - Prefill
+
+    private func forwardPrefill(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor? {
         let B = x.shape[0]
         let S = x.shape[1]
         let ratio = compressRatio
         let coff = overlap ? 2 : 1
         let coffHeadDim = coff * headDim
 
-        // The simplest path: assume seqlen is a multiple of `ratio`. The
-        // reference handles a non-multiple by stashing the tail into
-        // kv_state for the next decode step; for the prefill-only port we
-        // require the caller to pad / chunk so that S % ratio == 0.
         precondition(S % ratio == 0, "Compressor prefill requires S divisible by ratio")
         let numBlocks = S / ratio
+        if numBlocks == 0 { return nil }
 
-        // 1. Linear projections.
-        let kvFlat = wkv(x.reshape([B * S, dim]), in: cmd)             // [B*S, coffHeadDim]
-        let scoreFlat = wgate(x.reshape([B * S, dim]), in: cmd)        // [B*S, coffHeadDim]
+        let kvFlat = wkv(x.reshape([B * S, dim]), in: cmd)
+        let scoreFlat = wgate(x.reshape([B * S, dim]), in: cmd)
         let kv = kvFlat.reshape([B, numBlocks, ratio, coffHeadDim])
         let score = scoreFlat.reshape([B, numBlocks, ratio, coffHeadDim])
 
-        // 2. score += ape (broadcast over [B, numBlocks])
         broadcastAdd(target: score, weight: ape,
                      B: B, NS: numBlocks, R: ratio, C: coffHeadDim, in: cmd)
 
-        // 3. Optional overlap_transform; otherwise the tensors are already
-        //    [B, NS, ratio, head_dim].
         let kvWide: Tensor
         let scoreWide: Tensor
         let axisR: Int
         if overlap {
-            // Pad value for score is -inf so masked positions vanish in softmax.
             kvWide = OverlapTransform.apply(kv, padValue: 0, in: cmd)
             scoreWide = OverlapTransform.apply(score, padValue: -.infinity, in: cmd)
             axisR = 2 * ratio
@@ -113,44 +109,190 @@ public final class Compressor {
             axisR = ratio
         }
 
-        // 4. Softmax along axis=2 (the ratio axis).
         SoftmaxAxis.apply(scoreWide, axis: 2, in: cmd)
 
-        // 5. y[B, NS, head_dim] = Σ_r kv[B, NS, r, head_dim] * score[B, NS, r, head_dim].
         let pooled = Tensor.empty(shape: [B, numBlocks, headDim], dtype: .f32)
         weightedSumAxis2(kv: kvWide, score: scoreWide, out: pooled,
                           B: B, NS: numBlocks, R: axisR, C: headDim, in: cmd)
 
-        // 6. Norm.
-        let normed = norm(pooled, in: cmd)
+        return postProcess(pooled.reshape([B * numBlocks, 1, headDim]),
+                           tokens: B * numBlocks, in: cmd)
+            .reshape([B, numBlocks, headDim])
+    }
 
-        // 7. RoPE on the rope tail. Reshape to [B*NS, 1, head_dim] so the
-        //    existing RoPE kernel (which expects [tokens, heads, head_dim])
-        //    treats each compressed token as one head.
-        guard let rope = rope else {
-            fatalError("Compressor.rope must be set before forward")
+    // MARK: - Decode (one token at a time, model.py:343-377)
+
+    private func forwardDecode(_ x: Tensor, startPos: Int,
+                               in cmd: MTLCommandBuffer) -> Tensor? {
+        let B = x.shape[0]
+        precondition(x.shape[1] == 1, "Compressor decode expects seqlen == 1")
+        let ratio = compressRatio
+        let coff = overlap ? 2 : 1
+        let coffHeadDim = coff * headDim
+        let shouldEmit = (startPos + 1) % ratio == 0
+
+        // 1. Linear projections — one row per batch.
+        let kvRow = wkv(x.reshape([B, dim]), in: cmd)        // [B, coffHeadDim]
+        let scoreRow = wgate(x.reshape([B, dim]), in: cmd)   // [B, coffHeadDim]
+
+        // score += ape[startPos % ratio] (broadcast across B)
+        addApeRow(scoreRow, apeRow: startPos % ratio,
+                  B: B, C: coffHeadDim, in: cmd)
+
+        // 2. Write into kvState / scoreState at the right slot.
+        let stateRow = overlap ? (ratio + startPos % ratio) : (startPos % ratio)
+        blitRowToState(src: kvRow, state: kvState, B: B,
+                       stateRows: kvState.shape[1], rowIndex: stateRow,
+                       rowBytes: coffHeadDim * MemoryLayout<Float>.size, in: cmd)
+        blitRowToState(src: scoreRow, state: scoreState, B: B,
+                       stateRows: scoreState.shape[1], rowIndex: stateRow,
+                       rowBytes: coffHeadDim * MemoryLayout<Float>.size, in: cmd)
+
+        if !shouldEmit {
+            return nil
         }
-        let normedAsTokens = normed.reshape([B * numBlocks, 1, headDim])
-        rope.apply(normedAsTokens, startPos: 0, inverse: false, in: cmd)
 
-        // 8. Quantization step. We currently route to act_quant in inplace
-        //    mode (round-trip) so the math matches QAT noise but the tensor
-        //    stays f32 for downstream consumers.
-        if rotate {
-            Hadamard.apply(normedAsTokens, in: cmd)
-            let aq = ActQuant(format: .fp4)
-            _ = aq.quant(normedAsTokens.reshape([B * numBlocks, headDim]),
-                         inplace: true, in: cmd)
+        // 3. Build the [B, axisR, headDim] kv/score tensors to pool from.
+        let axisR: Int
+        let pooledKV: Tensor
+        let pooledScore: Tensor
+
+        if overlap {
+            // axis = 2*ratio rows, headDim cols per row, gathered with the
+            // first/second-half slice trick (model.py:350-351).
+            axisR = 2 * ratio
+            pooledKV = overlapConcat(kvState, B: B, R: ratio, D: headDim, in: cmd)
+            pooledScore = overlapConcat(scoreState, B: B, R: ratio, D: headDim, in: cmd)
         } else {
-            // Non-overlap path quantises only the non-rope dims. With the
-            // current f32-only scaffold we keep both halves in f32; this
-            // matches the reference except the QAT noise is not applied.
-            // TODO: split the buffer and call ActQuant.fp8 on the leading
-            //       (head_dim - rope_head_dim) columns when we add a slicing
-            //       primitive.
+            axisR = ratio
+            pooledKV = kvState                  // [B, ratio, headDim]
+            pooledScore = scoreState
         }
 
-        return normedAsTokens.reshape([B, numBlocks, headDim])
+        // 4. Softmax along the ratio axis (which is axis=1 of the [B, R, D]
+        //    tensors), then weighted sum.
+        SoftmaxAxis.apply(pooledScore, axis: 1, in: cmd)
+
+        // weighted_sum_axis2 expects [B, NS, R, C] → [B, NS, C]. With NS=1
+        // we reshape and dispatch.
+        let kvAsBlocks = pooledKV.reshape([B, 1, axisR, headDim])
+        let scoreAsBlocks = pooledScore.reshape([B, 1, axisR, headDim])
+        let emitted = Tensor.empty(shape: [B, 1, headDim], dtype: .f32)
+        weightedSumAxis2(kv: kvAsBlocks, score: scoreAsBlocks, out: emitted,
+                          B: B, NS: 1, R: axisR, C: headDim, in: cmd)
+
+        // 5. Overlap path: shift state[:, R:] → state[:, :R].
+        if overlap {
+            stateShiftDown(state: kvState, B: B, R: ratio, twoD: coffHeadDim, in: cmd)
+            stateShiftDown(state: scoreState, B: B, R: ratio, twoD: coffHeadDim, in: cmd)
+        }
+
+        // 6. Shared post-emit: norm + RoPE + (Hadamard+FP4 | FP8 noise stub).
+        // RoPE freqs index for decode is (startPos + 1 - ratio).
+        let ropePos = startPos + 1 - ratio
+        return postProcess(emitted.reshape([B, 1, headDim]),
+                           tokens: B, in: cmd, ropeStartPos: ropePos)
+    }
+
+    /// Norm + RoPE + (rotate? Hadamard + FP4 quant : FP8 quant). Shared
+    /// between prefill and decode. Returns the same tensor reshape as
+    /// `[tokens, 1, headDim]` after the in-place ops.
+    private func postProcess(_ pooled: Tensor, tokens: Int,
+                              in cmd: MTLCommandBuffer,
+                              ropeStartPos: Int = 0) -> Tensor {
+        guard let rope = rope else { fatalError("Compressor.rope must be set") }
+
+        // pooled comes in as [tokens, 1, headDim]; norm wants 2D-ish input.
+        let normed = norm(pooled.reshape([tokens, headDim]), in: cmd)
+            .reshape([tokens, 1, headDim])
+        rope.apply(normed, startPos: ropeStartPos, inverse: false, in: cmd)
+
+        if rotate {
+            Hadamard.apply(normed, in: cmd)
+            _ = ActQuant(format: .fp4).quant(normed.reshape([tokens, headDim]),
+                                              inplace: true, in: cmd)
+        }
+        // (Non-rotate FP8 act_quant on nope dims requires a slicing primitive
+        // and is handled in Tier 3 — skipping here is structurally correct
+        // but skips QAT noise.)
+        return normed
+    }
+
+    // MARK: - Small helpers wrapping kernels / blits
+
+    private func addApeRow(_ scoreRow: Tensor, apeRow: Int,
+                           B: Int, C: Int, in cmd: MTLCommandBuffer) {
+        // scoreRow: [B, C]. ape: [ratio, C]. Add ape[apeRow] to every row
+        // of scoreRow. Reuse broadcast_add_4d_2d by viewing scoreRow as
+        // [B, 1, 1, C] and a one-row slice of ape as [1, C].
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pBroadcastAdd)
+        enc.setBuffer(scoreRow.buffer, offset: scoreRow.offset, index: 0)
+        let apeOff = ape.offset + apeRow * C * MemoryLayout<Float>.size
+        enc.setBuffer(ape.buffer, offset: apeOff, index: 1)
+        var dims = SIMD4<UInt32>(UInt32(B), 1, 1, UInt32(C))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
+        enc.dispatchThreads(MTLSize(width: C, height: 1, depth: B),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    private func blitRowToState(src: Tensor, state: Tensor, B: Int,
+                                 stateRows: Int, rowIndex: Int,
+                                 rowBytes: Int, in cmd: MTLCommandBuffer) {
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcOff = src.offset + b * rowBytes
+            let dstOff = state.offset + (b * stateRows + rowIndex) * rowBytes
+            blit.copy(from: src.buffer, sourceOffset: srcOff,
+                      to: state.buffer, destinationOffset: dstOff,
+                      size: rowBytes)
+        }
+        blit.endEncoding()
+    }
+
+    private func overlapConcat(_ state: Tensor, B: Int, R: Int, D: Int,
+                                in cmd: MTLCommandBuffer) -> Tensor {
+        let out = Tensor.empty(shape: [B, 2 * R, D], dtype: .f32)
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pOverlapConcat)
+        enc.setBuffer(state.buffer, offset: state.offset, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        var dims = SIMD3<UInt32>(UInt32(B), UInt32(R), UInt32(D))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
+        enc.dispatchThreads(MTLSize(width: D, height: 2 * R, depth: B),
+                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        enc.endEncoding()
+        return out
+    }
+
+    private func stateShiftDown(state: Tensor, B: Int, R: Int, twoD: Int,
+                                 in cmd: MTLCommandBuffer) {
+        // state[:, :R] = state[:, R:]. Two-step: copy the high half to a
+        // temp, then blit-copy the temp back to the low half.
+        let tmp = Tensor.empty(shape: [B, R, twoD], dtype: .f32)
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pStateShift)
+        enc.setBuffer(state.buffer, offset: state.offset, index: 0)
+        enc.setBuffer(tmp.buffer, offset: 0, index: 1)
+        var dims = SIMD3<UInt32>(UInt32(B), UInt32(R), UInt32(twoD))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
+        enc.dispatchThreads(MTLSize(width: twoD, height: R, depth: B),
+                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        enc.endEncoding()
+        // Now copy tmp back into state[:, :R, :]
+        let blit = cmd.makeBlitCommandEncoder()!
+        let bytesPerRow = twoD * MemoryLayout<Float>.size
+        let stateRows = state.shape[1]      // == 2*R
+        for b in 0..<B {
+            for r in 0..<R {
+                blit.copy(from: tmp.buffer, sourceOffset: (b * R + r) * bytesPerRow,
+                          to: state.buffer,
+                          destinationOffset: state.offset + (b * stateRows + r) * bytesPerRow,
+                          size: bytesPerRow)
+            }
+        }
+        blit.endEncoding()
     }
 
     private func broadcastAdd(target y: Tensor, weight w: Tensor,

@@ -101,42 +101,54 @@ let promptIds = tokenizer.encode(promptText)
 print("Prompt tokens: \(promptIds.count)")
 
 // ---------- Generation loop ----------
-// Prefill: feed the entire prompt at start_pos = 0. Then decode token by
-// token. Single-token decode requires a working MLA decode path which is
-// not yet implemented (it traps with a precondition). For now we run the
-// prefill, take the last-position logits, sample once, and stop. That
-// exercises the full pipeline end-to-end without hitting the decode trap.
-//
-// Flag `--max-tokens 1` is the safe default; larger values currently
-// cause the second forward call to fail.
+// Prefill: feed the entire prompt at start_pos = 0. Then decode one token
+// at a time, feeding the previous token at start_pos = (prompt_len + i).
+// Each decode call updates the sliding-window KV cache + compressor state
+// and produces logits for one new token.
 
-let logits = model.forward(inputIds: [promptIds], startPos: 0)
-
-// Sampling: argmax for temperature == 0, else sample with temperature.
-let sampledId: Int
-if temperature == 0 {
-    sampledId = Sampler.argmax(logits)
-} else {
-    Sampler.applyTemperature(logits, temperature)
-    sampledId = Sampler.argmax(logits)   // greedy after temperature scaling — proper
-                                           // multinomial sampling is a future step
-}
-
-let sampled = tokenizer.decode([sampledId])
 print("---")
-if mode == "chat" {
-    let msg = EncodingDSV4.parseCompletion(sampled, mode: .chat)
-    print(msg.content)
-} else {
-    print(sampled)
+fflush(stdout)
+
+let eosId: Int = tokenizer.eosId ?? -1
+var generatedIds: [Int] = []
+
+// Prefill.
+var logits = model.forward(inputIds: [promptIds], startPos: 0)
+
+for step in 0..<maxTokens {
+    let nextId: Int
+    if temperature == 0 {
+        nextId = Sampler.argmax(logits)
+    } else {
+        Sampler.applyTemperature(logits, temperature)
+        nextId = Sampler.argmax(logits)   // proper multinomial → Sampler.multinomial in T2.1
+    }
+    if nextId == eosId { break }
+    generatedIds.append(nextId)
+
+    // Stream the new token to stdout immediately. In chat mode, we buffer
+    // the whole output and parse <think>...</think> at the end so the
+    // reasoning block doesn't leak before its closing tag.
+    if mode == "raw" {
+        print(tokenizer.decode([nextId]), terminator: "")
+        fflush(stdout)
+    }
+
+    // Stop after sampling the requested count without doing one more
+    // unnecessary forward.
+    if step == maxTokens - 1 { break }
+
+    // Decode step: feed only the just-sampled token at startPos = promptLen + step.
+    let startPos = promptIds.count + step
+    logits = model.forward(inputIds: [[nextId]], startPos: startPos)
 }
 
-if maxTokens > 1 {
-    FileHandle.standardError.write(Data("""
-
-    Note: only one token is generated end-to-end at this stage.
-    Multi-token decode requires the sliding-window MLA decode path which
-    is still a fatalError in Sources/DeepSeekKit/Layers/Attention.swift.
-
-    """.utf8))
+print("")    // newline after streaming
+if mode == "chat" {
+    let combined = tokenizer.decode(generatedIds)
+    let msg = EncodingDSV4.parseCompletion(combined, mode: .chat)
+    if let r = msg.reasoningContent, !r.isEmpty {
+        print("[reasoning]\n\(r)\n[/reasoning]")
+    }
+    print(msg.content)
 }
