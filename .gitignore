@@ -1,0 +1,10 @@
+.build/
+.swiftpm/
+.DS_Store
+*.xcodeproj
+Package.resolved
+weights/
+*.safetensors
+*.gguf
+tokenizer.json
+config.json
