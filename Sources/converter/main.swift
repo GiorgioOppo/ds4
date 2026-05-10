@@ -455,22 +455,30 @@ var plan: [String: PendingTensor] = [:]
 var woAScales: [String: PendingTensor] = [:]   // keyed by the fused weight's new name
 
 for inputURL in inputs {
-    let stf = try SafeTensorsFile(url: inputURL)
-    for (origName, entry) in stf.entries {
-        if shouldSkip(origName) { continue }
-        let newName = renameKey(origName)
-        // Compute absolute byte range in the input file.
-        // SafeTensorsFile keeps the data section start internally; we need
-        // to recompute it here by re-reading the header length.
-        let absOffset = try absoluteOffset(of: entry, in: inputURL)
-        let pt = PendingTensor(url: inputURL, offset: absOffset,
-                                byteCount: entry.dataOffsets[1] - entry.dataOffsets[0],
-                                dtype: entry.dtype, shape: entry.shape)
-        if newName.hasSuffix(".wo_a.scale") {
-            // Buffer the scale; we'll fuse with the matching .weight below.
-            woAScales[newName.replacingOccurrences(of: ".scale", with: ".weight")] = pt
-        } else {
-            plan[newName] = pt
+    // `SafeTensorsFile` mmaps the whole shard and wraps it as an `MTLBuffer`.
+    // `MTLBuffer` is an ObjC protocol — its release (and our `munmap`
+    // deallocator) can ride the autorelease pool. Without an explicit drain
+    // every shard's mapping stays alive for the whole indexing phase: at
+    // ~14 GB virtual per shard with header pages faulted in, that's real
+    // RSS that goes to swap under pressure.
+    try autoreleasepool {
+        let stf = try SafeTensorsFile(url: inputURL)
+        for (origName, entry) in stf.entries {
+            if shouldSkip(origName) { continue }
+            let newName = renameKey(origName)
+            // Compute absolute byte range in the input file.
+            // SafeTensorsFile keeps the data section start internally; we need
+            // to recompute it here by re-reading the header length.
+            let absOffset = try absoluteOffset(of: entry, in: inputURL)
+            let pt = PendingTensor(url: inputURL, offset: absOffset,
+                                    byteCount: entry.dataOffsets[1] - entry.dataOffsets[0],
+                                    dtype: entry.dtype, shape: entry.shape)
+            if newName.hasSuffix(".wo_a.scale") {
+                // Buffer the scale; we'll fuse with the matching .weight below.
+                woAScales[newName.replacingOccurrences(of: ".scale", with: ".weight")] = pt
+            } else {
+                plan[newName] = pt
+            }
         }
     }
 }
@@ -712,16 +720,22 @@ if resumeFromShard > 0 {
 for (i, shard) in shards.enumerated() {
     let fileName = expectedFilename(i: i, total: total)
     if i < resumeFromShard { continue }
-    let outURL = saveDir.appendingPathComponent(fileName)
-    let w = SafeTensorsWriter()
-    for e in shard.entries {
-        w.add(name: e.name, dtype: e.dtype, shape: e.shape, source: e.source)
-        weightMap[e.name] = fileName
+    // Each shard write churns through many GB of NSData-backed buffers
+    // (input slurps, fused BF16 outputs, output `FileHandle` write chunks).
+    // Drain the pool at the shard boundary so transient allocations from
+    // one shard don't survive into the next.
+    try autoreleasepool {
+        let outURL = saveDir.appendingPathComponent(fileName)
+        let w = SafeTensorsWriter()
+        for e in shard.entries {
+            w.add(name: e.name, dtype: e.dtype, shape: e.shape, source: e.source)
+            weightMap[e.name] = fileName
+        }
+        print("  [\(i + 1)/\(total)] \(fileName) — " +
+              "\(shard.entries.count) tensors, " +
+              "\(String(format: "%.2f", Double(shard.totalBytes) / 1_000_000_000)) GB")
+        try w.write(to: outURL)
     }
-    print("  [\(i + 1)/\(total)] \(fileName) — " +
-          "\(shard.entries.count) tensors, " +
-          "\(String(format: "%.2f", Double(shard.totalBytes) / 1_000_000_000)) GB")
-    try w.write(to: outURL)
 }
 
 // HuggingFace-style index.json, useful for tooling and reproducibility.
