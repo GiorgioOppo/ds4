@@ -3,18 +3,6 @@ import Metal
 
 /// One transformer block with HC mixing wrapping attention and FFN.
 /// Mirrors `Block` in `Reference/inference/model.py` lines 647–700.
-///
-/// forward(x):
-///   residual = x
-///   x, post, comb = hc_pre(x, hc_attn_fn, hc_attn_scale, hc_attn_base)
-///   x = attn_norm(x); x = attn(x, start_pos)
-///   x = hc_post(x, residual, post, comb)
-///
-///   residual = x
-///   x, post, comb = hc_pre(x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
-///   x = ffn_norm(x); x = ffn(x, input_ids)
-///   x = hc_post(x, residual, post, comb)
-///   return x
 public final class Block {
     public let layerId: Int
     public let attn: MLA
@@ -22,11 +10,12 @@ public final class Block {
     public let attnNorm: RMSNorm
     public let ffnNorm: RMSNorm
     public let hc: HyperConnections
+    public let dim: Int
+    public let hcMult: Int
 
-    // Per-sublayer HC parameters (attn + ffn each get their own triple)
-    public let hcAttnFn: Tensor          // [(2+hc)*hc, hc*dim] f32
-    public let hcAttnBase: Tensor        // [(2+hc)*hc] f32
-    public let hcAttnScale: Tensor       // [3] f32
+    public let hcAttnFn: Tensor
+    public let hcAttnBase: Tensor
+    public let hcAttnScale: Tensor
     public let hcFfnFn: Tensor
     public let hcFfnBase: Tensor
     public let hcFfnScale: Tensor
@@ -40,15 +29,41 @@ public final class Block {
         self.attn = attn; self.ffn = ffn
         self.attnNorm = attnNorm; self.ffnNorm = ffnNorm
         self.hc = HyperConnections(config: config, dim: config.dim)
+        self.dim = config.dim
+        self.hcMult = config.hcMult
         self.hcAttnFn = hcAttnFn; self.hcAttnBase = hcAttnBase; self.hcAttnScale = hcAttnScale
         self.hcFfnFn = hcFfnFn; self.hcFfnBase = hcFfnBase; self.hcFfnScale = hcFfnScale
     }
 
-    /// Forward — input is [b, s, hc, d], output same.
-    /// NOT IMPLEMENTED until HyperConnections.pre/post and MLA.forward
-    /// and MoEFFN.forward are.
-    public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int],
-                               in cmd: MTLCommandBuffer) -> Tensor {
-        fatalError("Block.forward depends on MLA / MoE / HC implementations")
+    /// `x`: [B, S, hc, D] f32. Returns same shape.
+    public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int32],
+                                in cmd: MTLCommandBuffer) -> Tensor {
+        precondition(x.dtype == .f32 && x.shape.count == 4)
+        let B = x.shape[0], S = x.shape[1]
+        let N = B * S
+
+        // ---- Attention sublayer ----
+        let xFlat = x.reshape([N, hcMult, dim])
+
+        let attnPre = hc.pre(x: xFlat, hcFn: hcAttnFn,
+                             hcScale: hcAttnScale, hcBase: hcAttnBase, in: cmd)
+        // attnPre.y: [N, dim]
+        let yNorm = attnNorm(attnPre.y, in: cmd).reshape([B, S, dim])
+        let attnOut = attn(yNorm, startPos: startPos, in: cmd)        // [B, S, dim]
+
+        let xMid = hc.post(x: attnOut.reshape([N, dim]),
+                           residual: xFlat,
+                           post: attnPre.post, comb: attnPre.comb, in: cmd)
+        // xMid: [N, hc, dim]
+
+        // ---- FFN sublayer ----
+        let ffnPre = hc.pre(x: xMid, hcFn: hcFfnFn,
+                            hcScale: hcFfnScale, hcBase: hcFfnBase, in: cmd)
+        let yNorm2 = ffnNorm(ffnPre.y, in: cmd).reshape([B, S, dim])
+        let ffnOut = ffn(yNorm2, inputIds: inputIds, in: cmd)         // [B, S, dim]
+        let xOut = hc.post(x: ffnOut.reshape([N, dim]),
+                           residual: xMid,
+                           post: ffnPre.post, comb: ffnPre.comb, in: cmd)
+        return xOut.reshape([B, S, hcMult, dim])
     }
 }

@@ -6,37 +6,157 @@ import Metal
 public final class ParallelEmbedding {
     public let vocabSize: Int
     public let dim: Int
-    public let weight: Tensor      // [vocab, dim]
+    public let weight: Tensor      // [vocab, dim] f32
+
+    private static let pipeline = Device.shared.makePipeline("embed_lookup_f32")
 
     public init(vocabSize: Int, dim: Int, weight: Tensor) {
+        precondition(weight.dtype == .f32, "ParallelEmbedding currently requires f32 weight")
         self.vocabSize = vocabSize; self.dim = dim; self.weight = weight
+    }
+
+    /// `ids`: flat [N] Int32 array of token ids.
+    public func lookup(_ ids: [Int32], in cmd: MTLCommandBuffer) -> Tensor {
+        let N = ids.count
+        let idsT = ids.withUnsafeBytes { Tensor.from(bytes: $0, shape: [N], dtype: .i32) }
+        let out = Tensor.empty(shape: [N, dim], dtype: .f32)
+
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(Self.pipeline)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 0)
+        enc.setBuffer(idsT.buffer, offset: 0, index: 1)
+        enc.setBuffer(out.buffer, offset: 0, index: 2)
+        var dims = SIMD2<UInt32>(UInt32(N), UInt32(dim))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
+        enc.dispatchThreads(MTLSize(width: dim, height: N, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        enc.endEncoding()
+        return out
     }
 }
 
-/// LM head with HC mixing applied to the input. Mirrors `ParallelHead`
-/// in model.py:703–735. Logits are computed only on the LAST sequence
+/// LM head with HC mixing. Mirrors `ParallelHead` in model.py:703–735.
+/// `hc_head` here is the simpler sigmoid-only collapse (no Sinkhorn) used
+/// before the lm_head matmul. Logits are produced only for the LAST sequence
 /// position via `get_logits(x[:, -1])`.
 public final class ParallelHead {
     public let vocabSize: Int
     public let dim: Int
     public let normEps: Float
     public let hcEps: Float
-    public let weight: Tensor      // [vocab, dim] f32
+    public let weight: Tensor              // [vocab, dim] f32
+
+    private static let pRsqrt = Device.shared.makePipeline("rsqrt_mean_square_f32")
+    private static let pCollapse = Device.shared.makePipeline("hc_collapse_f32")
 
     public init(vocabSize: Int, dim: Int, normEps: Float, hcEps: Float, weight: Tensor) {
         self.vocabSize = vocabSize; self.dim = dim
         self.normEps = normEps; self.hcEps = hcEps
         self.weight = weight
     }
+
+    /// `x`: [B, S, hc, D] f32. Returns [B, vocab] f32 (logits on last token).
+    public func callAsFunction(_ x: Tensor,
+                                hcFn: Tensor, hcScale: Tensor, hcBase: Tensor,
+                                norm: RMSNorm,
+                                in cmd: MTLCommandBuffer) -> Tensor {
+        precondition(x.dtype == .f32 && x.shape.count == 4)
+        let B = x.shape[0], S = x.shape[1], HC = x.shape[2], D = x.shape[3]
+        let N = B * S
+        precondition(D == dim)
+        let hcDim = HC * D
+        let hcMult = HC
+
+        let xFlat = x.reshape([N, hcDim])
+
+        // 1. rsqrt(mean(x²) + eps)
+        let rsqrt = Tensor.empty(shape: [N], dtype: .f32)
+        do {
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(Self.pRsqrt)
+            enc.setBuffer(xFlat.buffer, offset: xFlat.offset, index: 0)
+            enc.setBuffer(rsqrt.buffer, offset: 0, index: 1)
+            var d = UInt32(hcDim); var e = normEps
+            enc.setBytes(&d, length: 4, index: 2)
+            enc.setBytes(&e, length: 4, index: 3)
+            enc.setThreadgroupMemoryLength(256 * MemoryLayout<Float>.size, index: 0)
+            enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding()
+        }
+
+        // 2. mixes = Linear(hcFn)(x_flat); mixes *= rsqrt; pre = sigmoid(mixes*scale + base) + eps
+        let lin = Linear(inFeatures: hcDim, outFeatures: hcMult,
+                         weight: hcFn, scale: nil)
+        let mixes = lin(xFlat, in: cmd)        // [N, hcMult]
+
+        // mixes *= rsqrt (broadcast)
+        let bcast = Device.shared.makePipeline("broadcast_row_mul_f32")
+        do {
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(bcast)
+            enc.setBuffer(mixes.buffer, offset: 0, index: 0)
+            enc.setBuffer(rsqrt.buffer, offset: 0, index: 1)
+            var dims = SIMD2<UInt32>(UInt32(N), UInt32(hcMult))
+            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
+            enc.dispatchThreads(MTLSize(width: hcMult, height: N, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            enc.endEncoding()
+        }
+        // pre = sigmoid(mixes * hcScale + hcBase) + hcEps  — done host-side via scalar broadcast.
+        cmd.commit(); cmd.waitUntilCompleted()
+        let mixesPtr = mixes.buffer.contents().bindMemory(to: Float.self, capacity: N * hcMult)
+        let scalePtr = hcScale.buffer.contents().bindMemory(to: Float.self, capacity: 1)
+        let basePtr = hcBase.buffer.contents().bindMemory(to: Float.self, capacity: hcMult)
+        let scaleVal = scalePtr[0]
+        for i in 0..<(N * hcMult) {
+            let h = i % hcMult
+            let v = 1.0 / (1.0 + expf(-(mixesPtr[i] * scaleVal + basePtr[h])))
+            mixesPtr[i] = v + hcEps
+        }
+
+        // 3. y[N, D] = Σ_h pre[N, h] * x[N, h, D]
+        let y = Tensor.empty(shape: [N, D], dtype: .f32)
+        let cmd2 = Device.shared.queue.makeCommandBuffer()!
+        do {
+            let enc = cmd2.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(Self.pCollapse)
+            enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+            enc.setBuffer(mixes.buffer, offset: 0, index: 1)
+            enc.setBuffer(y.buffer, offset: 0, index: 2)
+            var dims = SIMD3<UInt32>(UInt32(N), UInt32(HC), UInt32(D))
+            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
+            enc.dispatchThreads(MTLSize(width: D, height: N, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            enc.endEncoding()
+        }
+
+        // 4. norm(y); take last token of each batch; matmul against lm_head.
+        let yNorm = norm(y, in: cmd2)
+        // Slice last token per batch via blit copy.
+        let lastTok = Tensor.empty(shape: [B, dim], dtype: .f32)
+        let blit = cmd2.makeBlitCommandEncoder()!
+        let bytesPerRow = dim * MemoryLayout<Float>.size
+        for b in 0..<B {
+            let src = (b * S + S - 1) * bytesPerRow
+            let dst = b * bytesPerRow
+            blit.copy(from: yNorm.buffer, sourceOffset: src,
+                      to: lastTok.buffer, destinationOffset: dst,
+                      size: bytesPerRow)
+        }
+        blit.endEncoding()
+
+        // 5. logits = lastTok @ weight^T   (Linear with weight shape [vocab, dim])
+        let lmHead = Linear(inFeatures: dim, outFeatures: vocabSize,
+                            weight: weight, scale: nil)
+        let logits = lmHead(lastTok, in: cmd2)
+        cmd2.commit(); cmd2.waitUntilCompleted()
+        return logits
+    }
 }
 
 /// DeepSeek-V4 transformer. Mirrors `Transformer` in
 /// `Reference/inference/model.py` lines 769–809.
-///
-/// forward(input_ids, start_pos):
-///   h = embed(input_ids).unsqueeze(2).repeat(1, 1, hc_mult, 1)   // expand to hc copies
-///   for layer in layers: h = layer(h, start_pos, input_ids)
-///   logits = head(h, hc_head_fn, hc_head_scale, hc_head_base, norm)
 public final class Transformer {
     public let config: ModelConfig
     public let embed: ParallelEmbedding
@@ -45,10 +165,11 @@ public final class Transformer {
     public let norm: RMSNorm
     public let head: ParallelHead
 
-    // Top-level HC head parameters
-    public let hcHeadFn: Tensor          // [hc_mult, hc_mult*dim] f32
-    public let hcHeadBase: Tensor        // [hc_mult] f32
-    public let hcHeadScale: Tensor       // [1] f32
+    public let hcHeadFn: Tensor
+    public let hcHeadBase: Tensor
+    public let hcHeadScale: Tensor
+
+    private let pHcExpand: MTLComputePipelineState
 
     public init(config: ModelConfig,
                 embed: ParallelEmbedding,
@@ -66,12 +187,49 @@ public final class Transformer {
         self.hcHeadFn = hcHeadFn
         self.hcHeadBase = hcHeadBase
         self.hcHeadScale = hcHeadScale
+        self.pHcExpand = Device.shared.makePipeline("hc_expand_f32")
     }
 
-    /// Forward a batch of new tokens. Returns logits of shape [b, vocab].
-    /// NOT IMPLEMENTED — needs the full chain (embed lookup → HC expand →
-    /// per-layer Block → ParallelHead). All sublayer forwards are still stubs.
+    /// `inputIds`: [[Int]] — outer is batch, inner is seqlen. All inner
+    /// arrays must have the same length.
     public func forward(inputIds: [[Int]], startPos: Int) -> Tensor {
-        fatalError("Transformer.forward not implemented — porting target: model.py:802")
+        let B = inputIds.count
+        precondition(B > 0)
+        let S = inputIds[0].count
+        for row in inputIds { precondition(row.count == S, "ragged batch not supported") }
+
+        let flatIds: [Int32] = inputIds.flatMap { $0.map(Int32.init) }
+        let cmd = Device.shared.queue.makeCommandBuffer()!
+
+        // 1. embed → [B*S, dim]
+        let h = embed.lookup(flatIds, in: cmd)
+
+        // 2. hc-expand [B*S, dim] → [B*S, hc, dim]
+        let hc = config.hcMult
+        let hExpanded = Tensor.empty(shape: [B * S, hc, config.dim], dtype: .f32)
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pHcExpand)
+        enc.setBuffer(h.buffer, offset: 0, index: 0)
+        enc.setBuffer(hExpanded.buffer, offset: 0, index: 1)
+        var dims = SIMD3<UInt32>(UInt32(B * S), UInt32(hc), UInt32(config.dim))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
+        enc.dispatchThreads(MTLSize(width: config.dim, height: hc, depth: B * S),
+                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        enc.endEncoding()
+        cmd.commit(); cmd.waitUntilCompleted()
+
+        // 3. Run each block sequentially. Each commits its own buffers.
+        var x = hExpanded.reshape([B, S, hc, config.dim])
+        for layer in layers {
+            let cmdL = Device.shared.queue.makeCommandBuffer()!
+            x = layer(x, startPos: startPos, inputIds: flatIds, in: cmdL)
+            cmdL.commit(); cmdL.waitUntilCompleted()
+        }
+
+        // 4. Head.
+        let cmdH = Device.shared.queue.makeCommandBuffer()!
+        let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
+                          norm: norm, in: cmdH)
+        return logits
     }
 }
