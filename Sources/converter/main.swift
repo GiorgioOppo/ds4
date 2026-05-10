@@ -626,8 +626,45 @@ let total = shards.count
 var weightMap: [String: String] = [:]      // tensor name → shard filename
 let totalBytes = shards.reduce(0) { $0 + $1.totalBytes }
 
+// Resume detection: if the output dir already contains shards from a
+// previous (interrupted) run, skip the ones that are present and the
+// right size. Sharding is deterministic given the same input + flags,
+// so file `model-(i+1)-of-total.safetensors` produced now must match
+// any file with the same name from a prior run.
+//
+// A shard is considered "complete" iff:
+//   - its filename matches model-(i+1)-of-(total).safetensors exactly
+//     (so a partial write under a different `total` is skipped)
+//   - its size on disk is at least `shard.totalBytes` (the header adds a
+//     few KB of JSON, so >= totalBytes implies full write)
+//
+// We also pre-populate `weightMap` for the skipped shards so the final
+// index.json comes out correct.
+
+func expectedFilename(i: Int, total: Int) -> String {
+    return String(format: "model-%05d-of-%05d.safetensors", i + 1, total)
+}
+
+var resumeFromShard = 0
 for (i, shard) in shards.enumerated() {
-    let fileName = String(format: "model-%05d-of-%05d.safetensors", i + 1, total)
+    let fileName = expectedFilename(i: i, total: total)
+    let url = saveDir.appendingPathComponent(fileName)
+    guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+          let size = attrs[.size] as? Int,
+          size >= shard.totalBytes else { break }
+    // Mark as already-written, populate the index.
+    for e in shard.entries { weightMap[e.name] = fileName }
+    resumeFromShard = i + 1
+}
+if resumeFromShard > 0 {
+    let skippedBytes = shards[..<resumeFromShard].reduce(0) { $0 + $1.totalBytes }
+    print("Resume: \(resumeFromShard)/\(total) shard(s) already on disk " +
+          "(\(String(format: "%.1f", Double(skippedBytes) / 1_000_000_000)) GB skipped).")
+}
+
+for (i, shard) in shards.enumerated() {
+    let fileName = expectedFilename(i: i, total: total)
+    if i < resumeFromShard { continue }
     let outURL = saveDir.appendingPathComponent(fileName)
     let w = SafeTensorsWriter()
     for e in shard.entries {
