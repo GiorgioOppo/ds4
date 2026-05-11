@@ -14,13 +14,24 @@ public final class Linear {
     public let weight: Tensor
     public let scale: Tensor?
 
-    private static let pBF16ToF32  = Device.shared.makePipeline("gemm_bf16_to_f32")
-    private static let pF32BF16    = Device.shared.makePipeline("gemm_f32_bf16_to_f32")
-    private static let pF32        = Device.shared.makePipeline("gemm_f32_to_f32")
-    private static let pFP8        = Device.shared.makePipeline("gemm_fp8_to_f32")
-    private static let pFP4        = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
-    private static let pInt8F32    = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
-    private static let pInt8BF16   = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
+    private static let pBF16ToF32     = Device.shared.makePipeline("gemm_bf16_to_f32")
+    private static let pBF16ToF32SG   = Device.shared.makePipeline("gemm_bf16_to_f32_sg")
+    private static let pF32BF16       = Device.shared.makePipeline("gemm_f32_bf16_to_f32")
+    private static let pF32BF16SG     = Device.shared.makePipeline("gemm_f32_bf16_to_f32_sg")
+    private static let pF32           = Device.shared.makePipeline("gemm_f32_to_f32")
+    private static let pFP8           = Device.shared.makePipeline("gemm_fp8_to_f32")
+    private static let pFP4           = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
+    private static let pInt8F32       = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
+    private static let pInt8BF16      = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
+
+    /// simdgroup_matrix GEMM produces 32×32 C blocks via 8×8 tiles; the
+    /// K dimension is reduced in steps of 8. M, N must be multiples of 32
+    /// and K a multiple of 8 — caller falls back to the legacy tiled
+    /// kernel otherwise.
+    private static func canUseSG(M: Int, N: Int, K: Int) -> Bool {
+        return M >= 32 && N >= 32 && K >= 8
+            && M % 32 == 0 && N % 32 == 0 && K % 8 == 0
+    }
 
     public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?) {
         self.inFeatures = inFeatures
@@ -61,17 +72,24 @@ public final class Linear {
                               pipelineForFloatX: MTLComputePipelineState,
                               pipelineForBFloatX: MTLComputePipelineState,
                               in cmd: MTLCommandBuffer) {
+        // Pick simdgroup_matrix variant when M/N/K align; otherwise fall
+        // back to the legacy tile-and-reduce kernel.
+        let useSG = Self.canUseSG(M: M, N: outFeatures, K: inFeatures)
         let pipeline: MTLComputePipelineState
         switch x.dtype {
-        case .f32: pipeline = pipelineForFloatX
-        case .bf16: pipeline = pipelineForBFloatX
-        default: fatalError("Linear dense: input dtype \(x.dtype) not supported")
+        case .f32:
+            pipeline = useSG ? Self.pF32BF16SG : pipelineForFloatX
+        case .bf16:
+            pipeline = useSG ? Self.pBF16ToF32SG : pipelineForBFloatX
+        default:
+            fatalError("Linear dense: input dtype \(x.dtype) not supported")
         }
-        dispatchGEMM(pipeline: pipeline, x: x, y: y, M: M, in: cmd)
+        dispatchGEMM(pipeline: pipeline, x: x, y: y, M: M, useSG: useSG, in: cmd)
     }
 
     private func dispatchGEMM(pipeline: MTLComputePipelineState,
                               x: Tensor, y: Tensor, M: Int,
+                              useSG: Bool = false,
                               in cmd: MTLCommandBuffer) {
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline)
@@ -81,11 +99,20 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
 
-        let tg = MTLSize(width: 16, height: 16, depth: 1)
-        let gx = (outFeatures + 15) / 16
-        let gy = (M + 15) / 16
-        enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
-                                 threadsPerThreadgroup: tg)
+        if useSG {
+            // simdgroup_matrix: one simdgroup (32 threads) per 32×32 C tile.
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            let gx = outFeatures / 32
+            let gy = M / 32
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        } else {
+            let tg = MTLSize(width: 16, height: 16, depth: 1)
+            let gx = (outFeatures + 15) / 16
+            let gy = (M + 15) / 16
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        }
         enc.endEncoding()
     }
 
