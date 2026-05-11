@@ -42,7 +42,12 @@ public final class MLA {
 
     /// Sliding window KV ring buffer + compressed KV tail.
     /// Layout: kv_cache[:, :window] = window ring; kv_cache[:, window:] = compressed.
-    public var kvCache: Tensor
+    /// Optional so `releaseCache()` can drop the underlying `MTLBuffer` and
+    /// return its pages to the system; the next forward re-allocates lazily.
+    public private(set) var kvCache: Tensor?
+
+    private let kvCacheShape: [Int]
+    private let kvCacheDType: DType
 
     public init(config: ModelConfig, layerId: Int,
                 wqA: Linear, qNorm: RMSNorm, wqB: Linear,
@@ -72,6 +77,24 @@ public final class MLA {
         self.compressor = compressor
         self.indexer = indexer
         self.kvCache = kvCache
+        self.kvCacheShape = kvCache.shape
+        self.kvCacheDType = kvCache.dtype
+    }
+
+    private func ensureKVCache() -> Tensor {
+        if let c = kvCache { return c }
+        let t = Tensor.empty(shape: kvCacheShape, dtype: kvCacheDType)
+        kvCache = t
+        return t
+    }
+
+    /// Drop the KV cache buffer (and the compressor's alias to it). ARC
+    /// frees the underlying `MTLBuffer`, returning unified-memory pages to
+    /// the system. Safe to call between prompts; the next `callAsFunction`
+    /// will re-allocate a fresh zero-initialized buffer.
+    public func releaseCache() {
+        kvCache = nil
+        compressor?.kvCache = nil
     }
 
     /// MLA forward. Handles all three cases:
@@ -90,7 +113,11 @@ public final class MLA {
             precondition(S == 1, "MLA decode expects seqlen == 1")
         }
 
+        let kvCache = ensureKVCache()
+
         // Wire compressor's KV cache slice on first call (model.py:490-494).
+        // After releaseCache() comp.kvCache is also nil, so this re-aliases
+        // against the freshly-allocated kvCache.
         if let comp = compressor, comp.kvCache == nil {
             // The compressor writes into the trailing slice of kv_cache.
             // We model this by sharing the buffer via a Tensor with offset.

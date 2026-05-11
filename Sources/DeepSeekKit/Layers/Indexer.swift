@@ -20,8 +20,13 @@ public final class Indexer {
     public let wqB: Linear
     public let weightsProj: Linear
     public let compressor: Compressor
-    public var kvCache: Tensor              // [maxBatch, maxSeqLen/ratio, head_dim]
+    /// `[maxBatch, maxSeqLen/ratio, head_dim]`. Optional so `releaseCache()`
+    /// can free the underlying `MTLBuffer`; lazy re-alloc on next forward.
+    public private(set) var kvCache: Tensor?
     public var rope: RoPE?
+
+    private let kvCacheShape: [Int]
+    private let kvCacheDType: DType
 
     private let pScoreReduce: MTLComputePipelineState
     private let pTopKPostproc: MTLComputePipelineState
@@ -41,8 +46,24 @@ public final class Indexer {
         self.weightsProj = weightsProj
         self.compressor = compressor
         self.kvCache = kvCache
+        self.kvCacheShape = kvCache.shape
+        self.kvCacheDType = kvCache.dtype
         self.pScoreReduce = Device.shared.makePipeline("indexer_score_reduce_f32")
         self.pTopKPostproc = Device.shared.makePipeline("indexer_topk_postprocess_i32")
+    }
+
+    private func ensureKVCache() -> Tensor {
+        if let c = kvCache { return c }
+        let t = Tensor.empty(shape: kvCacheShape, dtype: kvCacheDType)
+        kvCache = t
+        return t
+    }
+
+    /// Drop the indexer's kvCache buffer. ARC frees the underlying
+    /// `MTLBuffer`; the next forward will re-allocate.
+    public func releaseCache() {
+        kvCache = nil
+        compressor.releaseState()
     }
 
     /// Returns `[B, S, K]` Int32 indices (with -1 padding for invalid slots).
@@ -52,6 +73,7 @@ public final class Indexer {
         let B = x.shape[0], S = x.shape[1]
         let endPos = startPos + S
         let ratio = compressRatio
+        let kvCache = ensureKVCache()
 
         // 1. q = wq_b(qr) → [B, S, n_heads, head_dim]
         let qFlat = wqB(qr.reshape([B * S, qLoraRank]), in: cmd)

@@ -27,8 +27,15 @@ public final class Compressor {
     public let wgate: Linear
     public let norm: RMSNorm
 
-    public var kvState: Tensor              // [maxBatch, coff*ratio, coff*head_dim] f32
-    public var scoreState: Tensor           // [maxBatch, coff*ratio, coff*head_dim] f32
+    /// Per-batch rolling state for the decode path. Optional so
+    /// `releaseState()` can free the underlying `MTLBuffer`; lazy re-alloc
+    /// happens on the next decode call.
+    public private(set) var kvState: Tensor?
+    public private(set) var scoreState: Tensor?
+
+    private let kvStateShape: [Int]
+    private let scoreStateShape: [Int]
+    private let stateDType: DType
 
     /// Assigned by the parent module (MLA / Indexer) — the slice of the
     /// attention KV cache where compressed tokens are written.
@@ -57,10 +64,36 @@ public final class Compressor {
         self.norm = norm
         self.kvState = kvState
         self.scoreState = scoreState
+        self.kvStateShape = kvState.shape
+        self.scoreStateShape = scoreState.shape
+        self.stateDType = kvState.dtype
         self.pBroadcastAdd = Device.shared.makePipeline("broadcast_add_4d_2d_f32")
         self.pWeightedSum = Device.shared.makePipeline("weighted_sum_axis2_f32")
         self.pOverlapConcat = Device.shared.makePipeline("compressor_overlap_concat_f32")
         self.pStateShift = Device.shared.makePipeline("compressor_state_shift_copy_f32")
+    }
+
+    private func ensureKVState() -> Tensor {
+        if let t = kvState { return t }
+        let t = Tensor.empty(shape: kvStateShape, dtype: stateDType)
+        kvState = t
+        return t
+    }
+
+    private func ensureScoreState() -> Tensor {
+        if let t = scoreState { return t }
+        let t = Tensor.empty(shape: scoreStateShape, dtype: stateDType)
+        scoreState = t
+        return t
+    }
+
+    /// Drop the rolling state buffers (kvState, scoreState) and the
+    /// kvCache alias. ARC frees the underlying `MTLBuffer`s; the next
+    /// decode call lazy-reallocates.
+    public func releaseState() {
+        kvState = nil
+        scoreState = nil
+        kvCache = nil
     }
 
     /// Forward pass. Returns the compressed KV when one is emitted, else nil.
@@ -130,6 +163,9 @@ public final class Compressor {
         let coff = overlap ? 2 : 1
         let coffHeadDim = coff * headDim
         let shouldEmit = (startPos + 1) % ratio == 0
+
+        let kvState = ensureKVState()
+        let scoreState = ensureScoreState()
 
         // 1. Linear projections — one row per batch.
         let kvRow = wkv(x.reshape([B, dim]), in: cmd)        // [B, coffHeadDim]
