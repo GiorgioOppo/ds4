@@ -88,13 +88,22 @@ public final class MLA {
         return t
     }
 
-    /// Drop the KV cache buffer (and the compressor's alias to it). ARC
-    /// frees the underlying `MTLBuffer`, returning unified-memory pages to
-    /// the system. Safe to call between prompts; the next `callAsFunction`
-    /// will re-allocate a fresh zero-initialized buffer.
+    /// Drop the KV cache buffer (and all state of the attached compressor).
+    /// ARC frees the underlying `MTLBuffer`s, returning unified-memory pages
+    /// to the system. The next `callAsFunction` will re-allocate everything
+    /// lazily and re-wire the compressor's alias against the fresh buffer.
+    ///
+    /// Must be called only between forward passes — not thread-safe.
+    /// Use between unrelated prompts; if a decode resumes after a release
+    /// it must start from `startPos == 0` (post-prefill or a fresh
+    /// sequence) since the compressor's rolling `kvState`/`scoreState` is
+    /// zeroed on realloc.
     public func releaseCache() {
         kvCache = nil
-        compressor?.kvCache = nil
+        // Drop the compressor's alias into the kv cache buffer *and* its
+        // own rolling state so the whole MLA-side state is freed in one
+        // call. Symmetrical with `Indexer.releaseCache`.
+        compressor?.releaseState()
     }
 
     /// MLA forward. Handles all three cases:

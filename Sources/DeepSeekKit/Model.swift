@@ -234,22 +234,26 @@ public final class Transformer {
     }
 
     /// Drop all runtime KV cache buffers across every layer (main blocks
-    /// and MTP blocks), including the compressor's rolling state and any
+    /// and MTP blocks), including each compressor's rolling state and any
     /// indexer kvCache. ARC frees the underlying `MTLBuffer`s and the
     /// pages return to the system. The next `forward` re-allocates lazily.
     ///
+    /// `MLA.releaseCache` already releases the attention-side compressor's
+    /// state, and `Indexer.releaseCache` releases the indexer-owned
+    /// compressor — together they cover every Compressor instance in the
+    /// model.
+    ///
     /// Intended for use between unrelated prompts, when pausing a session,
     /// or under memory pressure. Cheap to call (O(numLayers) host-side, no
-    /// GPU work).
+    /// GPU work). Must be called only between forward passes — not
+    /// thread-safe.
     public func releaseCache() {
         for block in layers {
             block.attn.releaseCache()
-            block.attn.compressor?.releaseState()
             block.attn.indexer?.releaseCache()
         }
         for m in mtp {
             m.block.attn.releaseCache()
-            m.block.attn.compressor?.releaseState()
             m.block.attn.indexer?.releaseCache()
         }
     }
