@@ -6,12 +6,14 @@ import Metal
 public final class ParallelEmbedding {
     public let vocabSize: Int
     public let dim: Int
-    public let weight: Tensor      // [vocab, dim] f32
+    public let weight: Tensor      // [vocab, dim] f32 or bf16
 
-    private static let pipeline = Device.shared.makePipeline("embed_lookup_f32")
+    private static let pF32  = Device.shared.makePipeline("embed_lookup_f32")
+    private static let pBF16 = Device.shared.makePipeline("embed_lookup_bf16_to_f32")
 
     public init(vocabSize: Int, dim: Int, weight: Tensor) {
-        precondition(weight.dtype == .f32, "ParallelEmbedding currently requires f32 weight")
+        precondition(weight.dtype == .f32 || weight.dtype == .bf16,
+                     "ParallelEmbedding: weight must be f32 or bf16, got \(weight.dtype)")
         self.vocabSize = vocabSize; self.dim = dim; self.weight = weight
     }
 
@@ -21,8 +23,9 @@ public final class ParallelEmbedding {
         let idsT = ids.withUnsafeBytes { Tensor.from(bytes: $0, shape: [N], dtype: .i32) }
         let out = Tensor.empty(shape: [N, dim], dtype: .f32)
 
+        let pipeline: MTLComputePipelineState = (weight.dtype == .bf16) ? Self.pBF16 : Self.pF32
         let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(Self.pipeline)
+        enc.setComputePipelineState(pipeline)
         enc.setBuffer(weight.buffer, offset: weight.offset, index: 0)
         enc.setBuffer(idsT.buffer, offset: 0, index: 1)
         enc.setBuffer(out.buffer, offset: 0, index: 2)
