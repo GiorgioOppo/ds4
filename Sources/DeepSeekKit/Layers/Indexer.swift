@@ -75,6 +75,16 @@ public final class Indexer {
         let ratio = compressRatio
         let kvCache = ensureKVCache()
 
+        // Wire our internal Compressor to share kv_cache + rope on first
+        // call. Mirrors model.py:408-410 (`self.compressor.kv_cache = self.kv_cache;
+        // self.compressor.freqs_cis = self.freqs_cis`). Without this the
+        // compressor traps in its decode path at the first should_emit
+        // boundary, because its `rope` is nil.
+        if compressor.kvCache == nil {
+            compressor.kvCache = kvCache
+            compressor.rope = rope
+        }
+
         // 1. q = wq_b(qr) → [B, S, n_heads, head_dim]
         let qFlat = wqB(qr.reshape([B * S, qLoraRank]), in: cmd)
         let q = qFlat.reshape([B, S, nHeads, headDim])
