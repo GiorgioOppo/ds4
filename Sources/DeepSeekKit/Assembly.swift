@@ -381,8 +381,8 @@ internal enum AssemblyHelpers {
         let norm = RMSNorm(weight: onesTensor([headDim]), eps: config.normEps)
         let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
                                     dtype: .f32)
-        let scoreState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                       dtype: .f32)
+        let scoreState = Compressor.makeScoreState(
+            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)
@@ -422,8 +422,8 @@ internal enum AssemblyHelpers {
             eps: config.normEps)
         let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
                                     dtype: .f32)
-        let scoreState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                       dtype: .f32)
+        let scoreState = Compressor.makeScoreState(
+            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)
