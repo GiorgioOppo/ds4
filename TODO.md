@@ -8,6 +8,35 @@ Legend: `[ ]` open · `[~]` partial · `[x]` done · `[!]` blocked
 
 ---
 
+## 0. Quantizzazione
+
+- [x] **`--target-dtype int8`** — INT8 W8A16 (peso INT8 simmetrico
+  per-riga, gruppo K=128, scala F16; attivazioni F32/BF16 passano
+  invariate). Quantizza solo i pesi `Linear` (whitelist in
+  `shouldQuantizeToInt8`); embed/head/norm/attn_sink/hc_*/bias restano
+  BF16. Footprint ≈ ½ × BF16 sui pesi Linear. Sorgenti supportate:
+  BF16, F32, FP8+scala, FP4+scala. Kernel: `int8_gemm.metal`. Test:
+  `Int8GemmTests.swift`, `Int8ConverterTests.swift`.
+
+- [ ] **W8A8 (activations INT8)**. Follow-up di W8A16. Richiede:
+  1. nuovo formato in `ActQuant` per quantizzare le attivazioni a
+     INT8 con scala per-token o per-128;
+  2. GEMM `int8 × int8 → int32` con rescale finale (Apple Silicon
+     ha `simd_matrix<char,...>`, sfruttabile);
+  3. branch alternativo in `Linear.int8Forward`.
+  Beneficio atteso: throughput memory-bound dimezzato.
+
+- [ ] **Quantizzazione calibrata (GPTQ / AWQ / SmoothQuant)** sui pesi
+  INT8/INT4. RTN attuale è il baseline; calibrazione recupera ~1-2
+  punti di perplexity. Struttura di `Int8Quant.swift` lascia spazio
+  per `quantizeBF16ToInt8Calibrated`.
+
+- [ ] **`--target-dtype int4`**. Branch
+  `claude/convert-bf16-to-int4-7mO21`. Necessita un nuovo kernel
+  `int4_gemm.metal` con unpacking nibble + scala per-32 o per-64.
+
+---
+
 ## 1. Parità con il reference Python
 
 - [ ] **act_quant noise sulle dimensioni non-rope di KV** in `MLA` e

@@ -49,6 +49,7 @@ The five tilelang kernels in `kernel.py` map to:
 | `act_quant_kernel` (FP8), `fp4_quant_kernel` | `Kernels/act_quant.metal` |
 | `fp8_gemm_kernel` | `Kernels/fp8_gemm.metal` |
 | `fp4_gemm_kernel` | `Kernels/fp4_gemm.metal` |
+| _(new — INT8 W8A16 weight-only)_ | `Kernels/int8_gemm.metal` |
 | `sparse_attn_kernel` | `Kernels/sparse_attn.metal` |
 | `hc_split_sinkhorn_kernel` | `Kernels/hc_sinkhorn.metal` |
 | `rotate_activation` (Hadamard) | `Kernels/hadamard.metal` |
@@ -73,6 +74,33 @@ swift build -c release
 
 Requires macOS 14+, Xcode 15+, an Apple Silicon Mac. Today this builds, but
 the CLI exits with a fatal error from any of the unimplemented stubs.
+
+## Convert weights
+
+```bash
+swift run -c release converter \
+    --hf-ckpt-path <upstream-hf-checkpoint> \
+    --save-path <converted-output-dir> \
+    --n-experts <N> \
+    --target-dtype <bf16|f16|int8|keep>
+```
+
+`--target-dtype` controls how non-native dtypes in the upstream checkpoint
+get rewritten:
+
+| value | Linear weights | other tensors | disk footprint |
+|---|---|---|---|
+| `bf16` (default) | FP8/FP4 fused to BF16 | BF16 | ~3-4× input |
+| `f16` | FP8/FP4 fused to F16 | F16 | ~3-4× input |
+| `int8` | INT8 W8A16 (per-row × per-128 F16 scales) | BF16 | ~½ × BF16 |
+| `keep` | preserved (FP4/FP8/etc.) | preserved | ≈ input |
+
+INT8 quantization is symmetric round-to-nearest, range `[-127, 127]`, with
+F16 group scales. Only the leaves consumed via the `Linear` module are
+quantized (whitelist in `Int8Quant.shouldQuantizeToInt8`); embeddings,
+LM head, norms, attention sinks, hyper-connection scalars, biases and
+gates stay BF16. The Metal kernel `gemm_int8_w8a16_to_f32` accepts F32 or
+BF16 activations and produces F32 output — no activation quantization.
 
 ## Run
 
@@ -218,6 +246,7 @@ Sources/
       hc_sinkhorn.metal         HC pre/post/comb splitter with Sinkhorn (working)
       fp8_gemm.metal            STUB — port fp8_gemm_kernel
       fp4_gemm.metal            STUB — port fp4_gemm_kernel
+      int8_gemm.metal           INT8 W8A16 GEMM (per-row × per-128 F16 scales)
       sparse_attn.metal         STUB — port sparse_attn_kernel
   deepseek/
     main.swift                  CLI
