@@ -117,12 +117,27 @@ public final class Compressor {
         let coff = overlap ? 2 : 1
         let coffHeadDim = coff * headDim
 
-        precondition(S % ratio == 0, "Compressor prefill requires S divisible by ratio")
         let numBlocks = S / ratio
         if numBlocks == 0 { return nil }
+        let cutoff = numBlocks * ratio
 
-        let kvFlat = wkv(x.reshape([B * S, dim]), in: cmd)
-        let scoreFlat = wgate(x.reshape([B * S, dim]), in: cmd)
+        // Truncate to the first `cutoff` tokens for the wkv/wgate pass.
+        // For B==1 the first cutoff*dim entries of x are contiguous, so we
+        // can alias. For B>1 the per-batch rows are interleaved and we'd
+        // need a gather blit — defer that until a multi-batch prompt path
+        // exists.
+        let xUsed: Tensor
+        if cutoff == S {
+            xUsed = x
+        } else {
+            precondition(B == 1,
+                         "Compressor: S=\(S) not divisible by ratio=\(ratio); slicing only supported for B==1")
+            xUsed = Tensor(shape: [B, cutoff, dim], dtype: x.dtype,
+                           buffer: x.buffer, offset: x.offset)
+        }
+
+        let kvFlat = wkv(xUsed.reshape([B * cutoff, dim]), in: cmd)
+        let scoreFlat = wgate(xUsed.reshape([B * cutoff, dim]), in: cmd)
         let kv = kvFlat.reshape([B, numBlocks, ratio, coffHeadDim])
         let score = scoreFlat.reshape([B, numBlocks, ratio, coffHeadDim])
 

@@ -95,10 +95,10 @@ public final class Indexer {
         //    the einsum below reads from compressed tokens up to endPos.
         //    (model.py:417 `self.compressor(x, start_pos)`; self.compressor
         //    shares kv_cache with us.)
-        guard let compOut = compressor(x, startPos: startPos, in: cmd) else {
-            fatalError("Indexer requires Compressor to emit a tensor on prefill")
-        }
-        do {
+        //    If the compressor emits nothing (prefill S < ratio, or decode
+        //    between compression boundaries), skip the blit.
+        let compOut = compressor(x, startPos: startPos, in: cmd)
+        if let compOut = compOut {
             let blit = cmd.makeBlitCommandEncoder()!
             let bytesPerRow = headDim * MemoryLayout<Float>.size
             let rowsPerBatch = compOut.shape[1]                 // S/ratio
@@ -113,13 +113,19 @@ public final class Indexer {
             blit.endEncoding()
         }
 
+        // No compressed positions available yet — return an empty top-k.
+        // MLA's caller path treats compK==0 as "use window indices only".
+        let T = endPos / ratio
+        if T == 0 {
+            return Tensor.empty(shape: [B, S, 0], dtype: .i32)
+        }
+
         // 6. weights = weights_proj(x) * (softmax_scale * n_heads^-0.5)
         let weightsFlat = weightsProj(x.reshape([B * S, dim]), in: cmd)
         let weightsScale = softmaxScale * pow(Float(nHeads), -0.5)
         let weights = Elementwise.scale(weightsFlat, by: weightsScale, in: cmd)
 
-        // 7. score = einsum("bshd,btd->bsht", q, kv_cache[:B, :endPos/ratio])
-        let T = endPos / ratio
+        // 7. score = einsum("bshd,btd->bsht", q, kv_cache[:B, :T]).
         // Slice kv_cache to first T rows by reshaping the same buffer.
         let kvSlice = Tensor(shape: [B, T, headDim], dtype: .f32,
                               buffer: kvCache.buffer, offset: kvCache.offset)
