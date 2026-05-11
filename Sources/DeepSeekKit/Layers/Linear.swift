@@ -23,6 +23,8 @@ public final class Linear {
     private static let pFP4           = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
     private static let pInt8F32       = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
     private static let pInt8BF16      = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
+    private static let pInt8F32SG     = Device.shared.makePipeline("gemm_int8_w8a16_to_f32_sg")
+    private static let pInt8BF16SG    = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32_sg")
 
     /// simdgroup_matrix GEMM produces 32×32 C blocks via 8×8 tiles; the
     /// K dimension is reduced in steps of 8. M, N must be multiples of 32
@@ -172,10 +174,14 @@ public final class Linear {
                               in cmd: MTLCommandBuffer) {
         precondition(inFeatures % 128 == 0,
                      "INT8 Linear: inFeatures must be a multiple of 128 (got \(inFeatures))")
+        // simdgroup_matrix INT8 path: 32×32 C blocks. K alignment is already
+        // guaranteed (inFeatures % 128 == 0 → K % 8 == 0).
+        let useSG = M >= 32 && outFeatures >= 32
+                 && M % 32 == 0 && outFeatures % 32 == 0
         let pipeline: MTLComputePipelineState
         switch x.dtype {
-        case .f32:  pipeline = Self.pInt8F32
-        case .bf16: pipeline = Self.pInt8BF16
+        case .f32:  pipeline = useSG ? Self.pInt8F32SG  : Self.pInt8F32
+        case .bf16: pipeline = useSG ? Self.pInt8BF16SG : Self.pInt8BF16
         default:
             fatalError("INT8 Linear: input dtype \(x.dtype) not supported (need f32 or bf16)")
         }
@@ -189,8 +195,16 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 4)
 
-        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        if useSG {
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            let gx = outFeatures / 32
+            let gy = M / 32
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        } else {
+            enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        }
         enc.endEncoding()
     }
 }
