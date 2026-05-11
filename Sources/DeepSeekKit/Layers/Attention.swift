@@ -198,50 +198,57 @@ public final class MLA {
         let kv = kvFlat.reshape([B, S, headDim])
 
         // ---------- Topk indices ----------
+        // All built directly on GPU into a single [B, S, kWin+kComp] i32
+        // tensor: window slice via `attn_window_indices_i32`, compressed
+        // slice via either `attn_copy_compressed_i32` (indexer present)
+        // or `attn_compressed_indices_i32` (ratio==128).
+        //
         // Window indices use the actual startPos so the ring-buffer wrap
         // is handled correctly during decode. For prefill startPos == 0
-        // and AttentionIndices.slidingWindow returns the prefill table.
-        let winIdxs = AttentionIndices.slidingWindow(windowSize: windowSize,
-                                                       batch: B, seqlen: S, startPos: startPos)
-        var topkArr = winIdxs
-        var K = windowSize
-
+        // the kernel produces the prefill table.
+        let kWin = windowSize
         // Compressed offset: prefill compressed tokens are appended to `kv`
         // at index `kv.size(1)` == S. Decode reads from kvCache where the
         // compressed slice starts at `windowSize` (after the window ring).
         let compOffset = isDecode ? windowSize : S
 
-        var compK = 0
+        var kComp = 0
         if compressRatio > 0 {
             if let idx = indexer {
-                // Indexer returns [B, S, K_idx] i32 on GPU. Read back to
-                // host so we can concat with winIdxs uniformly.
-                let topkT = idx(x, qr: qr, startPos: startPos, offset: compOffset, in: cmd)
-                cmd.commit(); cmd.waitUntilCompleted()
-                compK = topkT.shape[2]
-                let p = topkT.buffer.contents().bindMemory(to: Int32.self,
-                                                            capacity: B * S * compK)
-                let compIdxs = Array(UnsafeBufferPointer(start: p, count: B * S * compK))
-                topkArr = mergeTopk(window: winIdxs, compress: compIdxs,
-                                     B: B, S: S, kWin: K, kComp: compK)
-                K += compK
-                // cmd was committed for the host readback; swap in a fresh
-                // buffer so the rest of MLA (and the caller) can keep
-                // encoding work.
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                let endPos = startPos + S
+                let T = endPos / compressRatio
+                kComp = min(idx.indexTopk, T)
             } else {
-                let (compIdxs, kc) = AttentionIndices.compressed(ratio: compressRatio,
-                                                                  batch: B, seqlen: S,
-                                                                  startPos: startPos,
-                                                                  offset: compOffset)
-                compK = kc
-                topkArr = mergeTopk(window: winIdxs, compress: compIdxs,
-                                     B: B, S: S, kWin: K, kComp: compK)
-                K += kc
+                kComp = isDecode
+                    ? (startPos + 1) / compressRatio
+                    : (S / compressRatio)
             }
         }
-        let topkT = topkArr.withUnsafeBytes {
-            Tensor.from(bytes: $0, shape: [B, S, K], dtype: .i32)
+        let K = kWin + kComp
+
+        let topkT = Tensor.empty(shape: [B, S, K], dtype: .i32)
+        AttnIndicesGPU.window(into: topkT, B: B, S: S, K: K,
+                              kWin: kWin, startPos: startPos, in: cmd)
+
+        if compressRatio > 0 {
+            if let idx = indexer {
+                // Indexer returns [B, S, kComp] i32 on GPU; copy into the
+                // right half of topkT. No commit, no host readback.
+                let comp = idx(x, qr: qr, startPos: startPos,
+                                offset: compOffset, in: cmd)
+                AttnIndicesGPU.copyCompressed(into: topkT, from: comp,
+                                               B: B, S: S, K: K,
+                                               kWin: kWin, kComp: kComp,
+                                               in: cmd)
+            } else {
+                AttnIndicesGPU.compressedDeterministic(into: topkT,
+                                                        B: B, S: S, K: K,
+                                                        kWin: kWin, kComp: kComp,
+                                                        ratio: compressRatio,
+                                                        offset: compOffset,
+                                                        startPos: startPos,
+                                                        in: cmd)
+            }
         }
 
         // ---------- KV cache write ----------
@@ -353,21 +360,4 @@ public final class MLA {
     }
 
     private var dim: Int { wkv.inFeatures }
-
-    private func mergeTopk(window: [Int32], compress: [Int32],
-                           B: Int, S: Int, kWin: Int, kComp: Int) -> [Int32] {
-        let total = kWin + kComp
-        var out = [Int32](repeating: 0, count: B * S * total)
-        for b in 0..<B {
-            for s in 0..<S {
-                for k in 0..<kWin {
-                    out[(b * S + s) * total + k] = window[(b * S + s) * kWin + k]
-                }
-                for k in 0..<kComp {
-                    out[(b * S + s) * total + kWin + k] = compress[(b * S + s) * kComp + k]
-                }
-            }
-        }
-        return out
-    }
 }
