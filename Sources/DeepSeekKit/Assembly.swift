@@ -331,7 +331,16 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
                          rng: inout MiniRNG) throws -> Linear {
     if let w = try loader.tryLoad(["\(base).weight"]) {
-        let scale = try loader.tryLoad(["\(base).scale"])
+        // Only quantized dtypes carry a `.scale` companion. Asking for
+        // one on bf16/f32 paths adds noise to the missing-tensor report
+        // and does nothing useful (Linear's switch ignores `scale` for
+        // those dtypes).
+        let needsScale = w.dtype == .i8
+                      || w.dtype == .fp8E4M3
+                      || w.dtype == .fp4E2M1
+        let scale: Tensor? = needsScale
+            ? try loader.tryLoad(["\(base).scale"])
+            : nil
         return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
     }
     return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
