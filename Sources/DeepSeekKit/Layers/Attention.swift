@@ -114,7 +114,11 @@ public final class MLA {
     ///
     /// act_quant of the non-rope KV dims is skipped (QAT noise; structural
     /// forward correctness doesn't depend on it). Tier 3 will add it back.
-    public func callAsFunction(_ x: Tensor, startPos: Int, in cmd: MTLCommandBuffer) -> Tensor {
+    /// `cmd` is `inout`: when MLA has to flush the queue to read indexer
+    /// topk to host (compress_ratio == 4), the original command buffer is
+    /// committed and replaced with a fresh one. Caller's subsequent work
+    /// must go onto the swapped buffer.
+    public func callAsFunction(_ x: Tensor, startPos: Int, in cmd: inout MTLCommandBuffer) -> Tensor {
         precondition(x.dtype == .f32 && x.shape.count == 3)
         let B = x.shape[0], S = x.shape[1]
         let isDecode = startPos > 0
@@ -221,6 +225,10 @@ public final class MLA {
                 topkArr = mergeTopk(window: winIdxs, compress: compIdxs,
                                      B: B, S: S, kWin: K, kComp: compK)
                 K += compK
+                // cmd was committed for the host readback; swap in a fresh
+                // buffer so the rest of MLA (and the caller) can keep
+                // encoding work.
+                cmd = Device.shared.queue.makeCommandBuffer()!
             } else {
                 let (compIdxs, kc) = AttentionIndices.compressed(ratio: compressRatio,
                                                                   batch: B, seqlen: S,

@@ -36,8 +36,13 @@ public final class Block {
     }
 
     /// `x`: [B, S, hc, D] f32. Returns same shape.
+    ///
+    /// `cmd` is `inout`: both `attn` (when the indexer is enabled) and
+    /// `ffn` need to commit-and-wait mid-flight to read GPU output back to
+    /// host. They replace `cmd` with a fresh buffer on swap; the rest of
+    /// this method continues encoding into the swapped value.
     public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int32],
-                                in cmd: MTLCommandBuffer) -> Tensor {
+                                in cmd: inout MTLCommandBuffer) -> Tensor {
         precondition(x.dtype == .f32 && x.shape.count == 4)
         let B = x.shape[0], S = x.shape[1]
         let N = B * S
@@ -49,7 +54,7 @@ public final class Block {
                              hcScale: hcAttnScale, hcBase: hcAttnBase, in: cmd)
         // attnPre.y: [N, dim]
         let yNorm = attnNorm(attnPre.y, in: cmd).reshape([B, S, dim])
-        let attnOut = attn(yNorm, startPos: startPos, in: cmd)        // [B, S, dim]
+        let attnOut = attn(yNorm, startPos: startPos, in: &cmd)       // [B, S, dim]
 
         let xMid = hc.post(x: attnOut.reshape([N, dim]),
                            residual: xFlat,
@@ -60,7 +65,7 @@ public final class Block {
         let ffnPre = hc.pre(x: xMid, hcFn: hcFfnFn,
                             hcScale: hcFfnScale, hcBase: hcFfnBase, in: cmd)
         let yNorm2 = ffnNorm(ffnPre.y, in: cmd).reshape([B, S, dim])
-        let ffnOut = ffn(yNorm2, inputIds: inputIds, in: cmd)         // [B, S, dim]
+        let ffnOut = ffn(yNorm2, inputIds: inputIds, in: &cmd)        // [B, S, dim]
         let xOut = hc.post(x: ffnOut.reshape([N, dim]),
                            residual: xMid,
                            post: ffnPre.post, comb: ffnPre.comb, in: cmd)

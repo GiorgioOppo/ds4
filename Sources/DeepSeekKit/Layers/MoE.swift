@@ -151,8 +151,13 @@ public final class MoEFFN {
     }
 
     /// `x`: [B, S, D] f32. `inputIds`: [B*S] (used for hash routing only).
+    ///
+    /// `cmd` is `inout`: the gate output has to be read back to host to
+    /// build the dispatch plan, so the original command buffer is
+    /// committed and replaced with a fresh one. Caller's subsequent work
+    /// goes onto the swapped buffer.
     public func callAsFunction(_ x: Tensor, inputIds: [Int32],
-                                in cmd: MTLCommandBuffer) -> Tensor {
+                                in cmd: inout MTLCommandBuffer) -> Tensor {
         precondition(x.dtype == .f32)
         let shape = x.shape
         let N = shape.dropLast().reduce(1, *)
@@ -170,16 +175,19 @@ public final class MoEFFN {
         let plan = MoEDispatch.prepare(indices: idxArr, weights: wArr,
                                         N: N, topK: topK, nExperts: nExperts)
 
+        // Swap in a fresh command buffer for the rest of the work; the
+        // committed one above can no longer accept encoders.
+        cmd = Device.shared.queue.makeCommandBuffer()!
+
         // 2. Gather tokens per expert.
-        let cmd2 = Device.shared.queue.makeCommandBuffer()!
-        let gathered = MoEDispatch.gather(xFlat, plan: plan, in: cmd2)
+        let gathered = MoEDispatch.gather(xFlat, plan: plan, in: cmd)
 
         // 3. Forward each active expert on its slice; write into a flat
         //    [T, D] output buffer.
         let T = plan.totalAssignments
         let outs = Tensor.empty(shape: [max(T, 1), dim], dtype: .f32)
         // Zero outs first.
-        let blit = cmd2.makeBlitCommandEncoder()!
+        let blit = cmd.makeBlitCommandEncoder()!
         blit.fill(buffer: outs.buffer, range: 0..<outs.byteCount, value: 0)
         blit.endEncoding()
 
@@ -194,9 +202,9 @@ public final class MoEFFN {
             let slice = Tensor(shape: [count, dim], dtype: .f32,
                                 buffer: gathered.buffer,
                                 offset: gathered.offset + lo * bytesPerRow)
-            let outSlice = expert(slice, in: cmd2)
+            let outSlice = expert(slice, in: cmd)
             // Copy into outs.
-            let blit2 = cmd2.makeBlitCommandEncoder()!
+            let blit2 = cmd.makeBlitCommandEncoder()!
             blit2.copy(from: outSlice.buffer, sourceOffset: 0,
                        to: outs.buffer, destinationOffset: lo * bytesPerRow,
                        size: count * bytesPerRow)
@@ -205,15 +213,15 @@ public final class MoEFFN {
 
         // 4. Scatter back into a dense [N, D] tensor.
         let y = Tensor.empty(shape: [N, dim], dtype: .f32)
-        let blitY = cmd2.makeBlitCommandEncoder()!
+        let blitY = cmd.makeBlitCommandEncoder()!
         blitY.fill(buffer: y.buffer, range: 0..<y.byteCount, value: 0)
         blitY.endEncoding()
-        MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd2)
+        MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd)
 
-        // 5. Add shared expert output.
-        let sharedOut = sharedExpert(xFlat, in: cmd2)
-        Elementwise.addInPlace(y, sharedOut, in: cmd2)
-        cmd2.commit(); cmd2.waitUntilCompleted()
+        // 5. Add shared expert output. Leave cmd uncommitted; the caller
+        // (Block) continues encoding hc.post into the same buffer.
+        let sharedOut = sharedExpert(xFlat, in: cmd)
+        Elementwise.addInPlace(y, sharedOut, in: cmd)
 
         return y.reshape(shape)
     }

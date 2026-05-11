@@ -50,7 +50,7 @@ public final class MTPBlock {
     /// current position is what we predict.
     /// Returns logits `[B, vocab]` for the speculative prediction.
     public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int32],
-                                in cmd: MTLCommandBuffer) -> Tensor {
+                                in cmd: inout MTLCommandBuffer) -> Tensor {
         precondition(x.dtype == .f32 && x.shape.count == 4)
         guard let embed = embed, let head = head else {
             fatalError("MTPBlock.embed and .head must be wired by the parent Transformer")
@@ -79,7 +79,7 @@ public final class MTPBlock {
 
         // 4. Run the inner Block.forward with the fused input.
         let combined4 = combined.reshape([B, S, HC, D])
-        let after = block(combined4, startPos: startPos, inputIds: inputIds, in: cmd)
+        let after = block(combined4, startPos: startPos, inputIds: inputIds, in: &cmd)
 
         // 5. Head with the MTP-block's own (hc_head_fn, base, scale, norm).
         return head(after, hcFn: hcHeadFn, hcScale: hcHeadScale,

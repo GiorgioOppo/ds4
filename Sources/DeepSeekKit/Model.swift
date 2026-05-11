@@ -224,8 +224,8 @@ public final class Transformer {
         // 3. Run each block sequentially. Each commits its own buffers.
         var x = hExpanded.reshape([B, S, hc, config.dim])
         for layer in layers {
-            let cmdL = Device.shared.queue.makeCommandBuffer()!
-            x = layer(x, startPos: startPos, inputIds: flatIds, in: cmdL)
+            var cmdL = Device.shared.queue.makeCommandBuffer()!
+            x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
         }
 
