@@ -163,9 +163,33 @@ public final class Compressor {
         weightedSumAxis2(kv: kvWide, score: scoreWide, out: pooled,
                           B: B, NS: numBlocks, R: axisR, C: headDim, in: cmd)
 
-        return postProcess(pooled.reshape([B * numBlocks, 1, headDim]),
-                           tokens: B * numBlocks, in: cmd)
+        let result = postProcess(pooled.reshape([B * numBlocks, 1, headDim]),
+                                  tokens: B * numBlocks, in: cmd)
             .reshape([B, numBlocks, headDim])
+
+        // Write the compressed tokens into the shared kvCache slice
+        // (assigned by the parent MLA/Indexer). Mirrors
+        // model.py:373-374 `self.kv_cache[:bsz, :seqlen // ratio] = kv`.
+        writeKVCachePrefill(result, B: B, numBlocks: numBlocks, in: cmd)
+
+        return result
+    }
+
+    /// Copies `result[:B, :numBlocks]` into `self.kvCache[:B, :numBlocks]`.
+    private func writeKVCachePrefill(_ result: Tensor, B: Int, numBlocks: Int,
+                                      in cmd: MTLCommandBuffer) {
+        guard let cache = kvCache else { return }
+        let bytesPerRow = headDim * MemoryLayout<Float>.size
+        let cacheRows = cache.shape[1]
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcOff = result.offset + b * numBlocks * bytesPerRow
+            let dstOff = cache.offset + b * cacheRows * bytesPerRow
+            blit.copy(from: result.buffer, sourceOffset: srcOff,
+                      to: cache.buffer, destinationOffset: dstOff,
+                      size: numBlocks * bytesPerRow)
+        }
+        blit.endEncoding()
     }
 
     // MARK: - Decode (one token at a time, model.py:343-377)
@@ -241,8 +265,31 @@ public final class Compressor {
         // 6. Shared post-emit: norm + RoPE + (Hadamard+FP4 | FP8 noise stub).
         // RoPE freqs index for decode is (startPos + 1 - ratio).
         let ropePos = startPos + 1 - ratio
-        return postProcess(emitted.reshape([B, 1, headDim]),
-                           tokens: B, in: cmd, ropeStartPos: ropePos)
+        let result = postProcess(emitted.reshape([B, 1, headDim]),
+                                  tokens: B, in: cmd, ropeStartPos: ropePos)
+
+        // Mirrors model.py:376 `self.kv_cache[:bsz, start_pos // ratio] = kv`.
+        writeKVCacheDecodeRow(result, B: B, row: startPos / ratio, in: cmd)
+
+        return result
+    }
+
+    /// Copies `result[:B, 0]` (shape [B, 1, headDim]) into
+    /// `self.kvCache[:B, row]`.
+    private func writeKVCacheDecodeRow(_ result: Tensor, B: Int, row: Int,
+                                        in cmd: MTLCommandBuffer) {
+        guard let cache = kvCache else { return }
+        let bytesPerRow = headDim * MemoryLayout<Float>.size
+        let cacheRows = cache.shape[1]
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcOff = result.offset + b * bytesPerRow
+            let dstOff = cache.offset + (b * cacheRows + row) * bytesPerRow
+            blit.copy(from: result.buffer, sourceOffset: srcOff,
+                      to: cache.buffer, destinationOffset: dstOff,
+                      size: bytesPerRow)
+        }
+        blit.endEncoding()
     }
 
     /// Norm + RoPE + (rotate? Hadamard + FP4 quant : FP8 quant). Shared

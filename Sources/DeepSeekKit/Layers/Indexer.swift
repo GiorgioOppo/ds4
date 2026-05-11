@@ -101,27 +101,11 @@ public final class Indexer {
         _ = ActQuant(format: .fp4).quant(q.reshape([B * S * nHeads, headDim]),
                                           inplace: true, in: cmd)
 
-        // 5. Run the Compressor and copy its output into our own kvCache so
-        //    the einsum below reads from compressed tokens up to endPos.
-        //    (model.py:417 `self.compressor(x, start_pos)`; self.compressor
-        //    shares kv_cache with us.)
-        //    If the compressor emits nothing (prefill S < ratio, or decode
-        //    between compression boundaries), skip the blit.
-        let compOut = compressor(x, startPos: startPos, in: cmd)
-        if let compOut = compOut {
-            let blit = cmd.makeBlitCommandEncoder()!
-            let bytesPerRow = headDim * MemoryLayout<Float>.size
-            let rowsPerBatch = compOut.shape[1]                 // S/ratio
-            let cacheRowsPerBatch = kvCache.shape[1]             // maxSeqLen/ratio
-            for b in 0..<B {
-                let srcOff = b * rowsPerBatch * bytesPerRow
-                let dstOff = kvCache.offset + b * cacheRowsPerBatch * bytesPerRow
-                blit.copy(from: compOut.buffer, sourceOffset: srcOff,
-                          to: kvCache.buffer, destinationOffset: dstOff,
-                          size: rowsPerBatch * bytesPerRow)
-            }
-            blit.endEncoding()
-        }
+        // 5. Run the Compressor — it writes into self.kvCache (shared with
+        //    us via the wiring above), so by the time this call returns
+        //    the einsum below reads the up-to-date compressed positions.
+        //    No explicit blit is needed any more.
+        _ = compressor(x, startPos: startPos, in: cmd)
 
         // No compressed positions available yet — return an empty top-k.
         // MLA's caller path treats compK==0 as "use window indices only".
