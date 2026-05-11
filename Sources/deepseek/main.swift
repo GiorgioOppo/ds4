@@ -99,6 +99,14 @@ default: usage()
 
 let promptIds = tokenizer.encode(promptText)
 print("Prompt tokens: \(promptIds.count)")
+if promptIds.isEmpty {
+    FileHandle.standardError.write(Data("""
+    tokenizer produced 0 tokens for the prompt. Check tokenizer.json's
+    pre_tokenizer regex — see `jq '.pre_tokenizer' \(tokenizerURL.path)`.
+
+    """.utf8))
+    exit(1)
+}
 
 // ---------- Generation loop ----------
 // Prefill: feed the entire prompt at start_pos = 0. Then decode one token
