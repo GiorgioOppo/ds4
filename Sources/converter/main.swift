@@ -497,7 +497,6 @@ struct PendingTensor {
 }
 
 var plan: [String: PendingTensor] = [:]
-var woAScales: [String: PendingTensor] = [:]   // keyed by the fused weight's new name
 
 for inputURL in inputs {
     // `SafeTensorsFile` mmaps the whole shard and wraps it as an `MTLBuffer`.
@@ -518,17 +517,21 @@ for inputURL in inputs {
             let pt = PendingTensor(url: inputURL, offset: absOffset,
                                     byteCount: entry.dataOffsets[1] - entry.dataOffsets[0],
                                     dtype: entry.dtype, shape: entry.shape)
-            if newName.hasSuffix(".wo_a.scale") {
-                // Buffer the scale; we'll fuse with the matching .weight below.
-                woAScales[newName.replacingOccurrences(of: ".scale", with: ".weight")] = pt
-            } else {
-                plan[newName] = pt
-            }
+            // All tensors (wo_a included) go into a single map. An earlier
+            // refactor segregated `wo_a.scale` into its own dict but never
+            // looked it up again, which silently broke wo_a fusion in
+            // every mode (FP8 wo_a was passed through verbatim instead of
+            // being fused into BF16 / INT8). Treating it like any other
+            // scale lets the existing FP8/INT8 fusion paths find it via
+            // `plan[scaleName]`. The dispatch loop's E8M0-skip check
+            // guarantees the standalone scale is dropped (parent weight
+            // is in plan → `continue`).
+            plan[newName] = pt
         }
     }
 }
 
-print("Collected \(plan.count) tensors plus \(woAScales.count) wo_a scales.")
+print("Collected \(plan.count) tensors.")
 
 // ---------- Build per-tensor write entries ----------
 //
