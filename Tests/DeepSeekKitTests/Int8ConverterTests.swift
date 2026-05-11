@@ -15,6 +15,8 @@ final class Int8ConverterTests: XCTestCase {
         XCTAssertTrue(shouldQuantizeToInt8("layers.3.attn.wq.weight", lastDim: 128))
         XCTAssertTrue(shouldQuantizeToInt8("layers.0.ffn.experts.5.w1.weight", lastDim: 256))
         XCTAssertTrue(shouldQuantizeToInt8("layers.3.attn.wo_b.weight", lastDim: 512))
+        XCTAssertTrue(shouldQuantizeToInt8("layers.3.attn.wkv.weight", lastDim: 4096))
+        XCTAssertTrue(shouldQuantizeToInt8("layers.3.attn.compressor.wgate.weight", lastDim: 4096))
 
         XCTAssertFalse(shouldQuantizeToInt8("layers.0.attn_norm.weight", lastDim: 4096))
         XCTAssertFalse(shouldQuantizeToInt8("embed.weight", lastDim: 4096))
@@ -23,6 +25,9 @@ final class Int8ConverterTests: XCTestCase {
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wq.scale", lastDim: 128))
         // wo_a is excluded — its weight feeds Einsum.bsgdGrd which needs F32.
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wo_a.weight", lastDim: 128))
+        // gate / weights_proj kept BF16 — small routing scores, RTN noise hurts topk.
+        XCTAssertFalse(shouldQuantizeToInt8("layers.3.ffn.gate.weight", lastDim: 4096))
+        XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.indexer.weights_proj.weight", lastDim: 4096))
         // K not divisible by 128 → fall back.
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wq.weight", lastDim: 100))
     }
