@@ -21,6 +21,8 @@ final class Int8ConverterTests: XCTestCase {
         XCTAssertFalse(shouldQuantizeToInt8("head.weight", lastDim: 4096))
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.attn_sink", lastDim: 128))
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wq.scale", lastDim: 128))
+        // wo_a is excluded — its weight feeds Einsum.bsgdGrd which needs F32.
+        XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wo_a.weight", lastDim: 128))
         // K not divisible by 128 → fall back.
         XCTAssertFalse(shouldQuantizeToInt8("layers.3.attn.wq.weight", lastDim: 100))
     }

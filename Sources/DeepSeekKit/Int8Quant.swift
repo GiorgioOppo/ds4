@@ -47,10 +47,18 @@ public func shouldQuantizeToInt8(_ renamedName: String, lastDim: Int) -> Bool {
     // Whitelist of leaves we know are `Linear` weights consumed via
     // `Linear.callAsFunction`. Mirrors the `loadLinear` call sites in
     // Sources/DeepSeekKit/Assembly.swift.
+    //
+    // `wo_a` is intentionally excluded: although loaded as a `Linear`,
+    // its weight is read directly by `Einsum.bsgdGrd` in MLA.forward
+    // (see Sources/DeepSeekKit/Layers/Attention.swift:305-306) which
+    // requires F32. Quantizing it to INT8 would break inference; the
+    // converter's documented intent is to always materialize wo_a as
+    // BF16 (TODO §2 "Restore wo_a non fuso"), so we let it fall through
+    // to the BF16 fusion path.
     let linearLeaves: Set<String> = [
         "wq", "wq_a", "wq_b",
         "wkv_a", "wkv_b",
-        "wo", "wo_a", "wo_b",
+        "wo", "wo_b",
         "w1", "w2", "w3",
     ]
     return linearLeaves.contains(leaf)
