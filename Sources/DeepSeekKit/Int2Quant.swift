@@ -204,6 +204,77 @@ public func quantizeF32ToInt2(srcURL: URL, srcOffset: Int,
     return (weight, scale)
 }
 
+/// Read a previously-quantized INT8 W8A16 checkpoint
+/// (signed-int8 weight + F16 per-128 group scale) and re-quantize
+/// to INT2. Sister of `quantizeInt8ToInt4` for the more aggressive
+/// 2-bit target. The double-quantization noise is even more
+/// pronounced here — accuracy hit is severe; treat as a
+/// memory-bound experiment, not a production path.
+public func quantizeInt8ToInt2(weightURL: URL, weightOffset: Int,
+                                scaleURL: URL, scaleOffset: Int,
+                                outDim: Int, inDim: Int) throws -> (weight: Data, scale: Data) {
+    precondition(inDim % kInt2GroupK == 0)
+    let blocksIn = inDim / kInt2GroupK
+
+    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
+        throw NSError(domain: "quantizeInt8ToInt2", code: 1)
+    }
+    defer { try? sf.close() }
+    try sf.seek(toOffset: UInt64(scaleOffset))
+    let inScaleBytes = outDim * blocksIn * 2
+    guard let sBytes = try sf.read(upToCount: inScaleBytes),
+          sBytes.count == inScaleBytes else {
+        throw NSError(domain: "quantizeInt8ToInt2", code: 2)
+    }
+
+    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
+        throw NSError(domain: "quantizeInt8ToInt2", code: 3)
+    }
+    defer { try? wf.close() }
+    try wf.seek(toOffset: UInt64(weightOffset))
+    let weightLen = outDim * inDim
+    guard let wBytes = try wf.read(upToCount: weightLen),
+          wBytes.count == weightLen else {
+        throw NSError(domain: "quantizeInt8ToInt2", code: 4)
+    }
+
+    let packedRowBytes = inDim / 4
+    var weight = Data(count: outDim * packedRowBytes)
+    var scale = Data(count: outDim * blocksIn * 2)
+    weight.withUnsafeMutableBytes { wOutRaw in
+        scale.withUnsafeMutableBytes { sOutRaw in
+            wBytes.withUnsafeBytes { wInRaw in
+                sBytes.withUnsafeBytes { sInRaw in
+                    let wOut = wOutRaw.bindMemory(to: UInt8.self).baseAddress!
+                    let sOut = sOutRaw.bindMemory(to: UInt16.self).baseAddress!
+                    let wIn = wInRaw.bindMemory(to: Int8.self).baseAddress!
+                    let sIn = sInRaw.bindMemory(to: UInt16.self).baseAddress!
+                    DispatchQueue.concurrentPerform(iterations: outDim) { i in
+                        let rowIn = wIn.advanced(by: i * inDim)
+                        let scaleRow = sIn.advanced(by: i * blocksIn)
+                        var rowF = [Float](repeating: 0, count: inDim)
+                        rowF.withUnsafeMutableBufferPointer { buf in
+                            for sb in 0..<blocksIn {
+                                let s = f16ToFloatLocal(scaleRow[sb])
+                                let base = sb * kInt2GroupK
+                                for k in 0..<kInt2GroupK {
+                                    buf.baseAddress![base + k] = Float(rowIn[base + k]) * s
+                                }
+                            }
+                            quantizeRowFromFloatI2(
+                                rowPtr: buf.baseAddress!,
+                                outRow: wOut.advanced(by: i * packedRowBytes),
+                                scaleRow: sOut.advanced(by: i * blocksIn),
+                                inDim: inDim)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (weight, scale)
+}
+
 public func quantizeFP8ToInt2(weightURL: URL, weightOffset: Int,
                               scaleURL: URL, scaleOffset: Int,
                               outDim: Int, inDim: Int,

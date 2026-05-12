@@ -84,6 +84,33 @@ private func bf16ToFloat(_ b: UInt16) -> Float {
     return Float(bitPattern: UInt32(b) << 16)
 }
 
+/// F16 → Float. Mirrors the inverse of `floatToF16Local` above.
+/// Used by `quantizeInt8ToInt4` to read back the source
+/// checkpoint's per-block scale companion.
+@inline(__always)
+internal func f16ToFloatLocal(_ h: UInt16) -> Float {
+    let sign = UInt32(h >> 15) & 0x1
+    let exp = UInt32(h >> 10) & 0x1F
+    let mant = UInt32(h) & 0x3FF
+    var f: UInt32
+    if exp == 0 {
+        if mant == 0 {
+            f = sign << 31
+        } else {
+            var e: UInt32 = 1
+            var m = mant
+            while m & 0x400 == 0 { m <<= 1; e += 1 }
+            m &= 0x3FF
+            f = (sign << 31) | ((127 - 15 - e + 1) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        f = (sign << 31) | (0xFF << 23) | (mant << 13)
+    } else {
+        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    }
+    return Float(bitPattern: f)
+}
+
 /// Pack two signed-4-bit values into one byte: low nibble = a, high = b.
 /// Caller has already clamped to [-8, 7]; we mask to 4 bits to clear the
 /// sign-extension bits.
@@ -173,6 +200,88 @@ public func quantizeBF16ToInt4(srcURL: URL, srcOffset: Int,
                                                 outRow: outRow,
                                                 scaleRow: scaleRow,
                                                 inDim: inDim)
+                    }
+                }
+            }
+        }
+    }
+    return (weight, scale)
+}
+
+/// Read a previously-quantized INT8 W8A16 checkpoint
+/// (signed-int8 weight + F16 per-128 group scale) and re-quantize
+/// it to INT4. Used by the converter for the INT8 → INT4 transcode
+/// path so users with an existing INT8 model don't need to re-
+/// download the FP8/FP4-native HF weights to halve their disk
+/// footprint.
+///
+/// Block geometry matches both source and destination (128
+/// elements per group → same `[N, K/128]` scale shape). Per row we:
+///   1. Multiply each int8 value by its F16 block scale → float.
+///   2. Re-find max-abs across the 128 floats.
+///   3. New scale = max_abs / 7; quantize each to [-8, 7]; pack
+///      two-per-byte. (`quantizeRowFromFloatI4`)
+///
+/// Note this is a double-quantization (8-bit → 4-bit on already-
+/// noisy weights) so RTN noise compounds. Expect ~10-20% extra
+/// perplexity vs INT4 quantized directly from BF16 / FP8 source.
+public func quantizeInt8ToInt4(weightURL: URL, weightOffset: Int,
+                                scaleURL: URL, scaleOffset: Int,
+                                outDim: Int, inDim: Int) throws -> (weight: Data, scale: Data) {
+    precondition(inDim % kInt4GroupK == 0)
+    let blocksIn = inDim / kInt4GroupK
+
+    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
+        throw NSError(domain: "quantizeInt8ToInt4", code: 1)
+    }
+    defer { try? sf.close() }
+    try sf.seek(toOffset: UInt64(scaleOffset))
+    let inScaleBytes = outDim * blocksIn * 2
+    guard let sBytes = try sf.read(upToCount: inScaleBytes),
+          sBytes.count == inScaleBytes else {
+        throw NSError(domain: "quantizeInt8ToInt4", code: 2)
+    }
+
+    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
+        throw NSError(domain: "quantizeInt8ToInt4", code: 3)
+    }
+    defer { try? wf.close() }
+    try wf.seek(toOffset: UInt64(weightOffset))
+    let weightLen = outDim * inDim
+    guard let wBytes = try wf.read(upToCount: weightLen),
+          wBytes.count == weightLen else {
+        throw NSError(domain: "quantizeInt8ToInt4", code: 4)
+    }
+
+    let packedRowBytes = inDim / 2
+    var weight = Data(count: outDim * packedRowBytes)
+    var scale = Data(count: outDim * blocksIn * 2)
+    weight.withUnsafeMutableBytes { wOutRaw in
+        scale.withUnsafeMutableBytes { sOutRaw in
+            wBytes.withUnsafeBytes { wInRaw in
+                sBytes.withUnsafeBytes { sInRaw in
+                    let wOut = wOutRaw.bindMemory(to: UInt8.self).baseAddress!
+                    let sOut = sOutRaw.bindMemory(to: UInt16.self).baseAddress!
+                    let wIn = wInRaw.bindMemory(to: Int8.self).baseAddress!
+                    let sIn = sInRaw.bindMemory(to: UInt16.self).baseAddress!
+                    DispatchQueue.concurrentPerform(iterations: outDim) { i in
+                        let rowIn = wIn.advanced(by: i * inDim)
+                        let scaleRow = sIn.advanced(by: i * blocksIn)
+                        var rowF = [Float](repeating: 0, count: inDim)
+                        rowF.withUnsafeMutableBufferPointer { buf in
+                            for sb in 0..<blocksIn {
+                                let s = f16ToFloatLocal(scaleRow[sb])
+                                let base = sb * kInt4GroupK
+                                for k in 0..<kInt4GroupK {
+                                    buf.baseAddress![base + k] = Float(rowIn[base + k]) * s
+                                }
+                            }
+                            quantizeRowFromFloatI4(
+                                rowPtr: buf.baseAddress!,
+                                outRow: wOut.advanced(by: i * packedRowBytes),
+                                scaleRow: sOut.advanced(by: i * blocksIn),
+                                inDim: inDim)
+                        }
                     }
                 }
             }
