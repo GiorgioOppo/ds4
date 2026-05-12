@@ -38,7 +38,22 @@ let package = Package(
         .executableTarget(
             name: "DeepSeekUI",
             dependencies: ["DeepSeekKit"],
-            path: "Sources/DeepSeekUI"
+            path: "Sources/DeepSeekUI",
+            exclude: ["Resources/Info.plist"],
+            // Embed Info.plist directly into the executable's __TEXT
+            // section. This is the Apple-standard "non-bundle" trick:
+            // macOS reads CFBundleIdentifier / CFBundleName etc. from
+            // this section without needing a .app/Contents directory.
+            // Silences the linkd.autoShortcut + Process Instance
+            // Registry warnings at launch.
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/DeepSeekUI/Resources/Info.plist",
+                ])
+            ]
         ),
         .plugin(
             name: "MetalLibPlugin",
