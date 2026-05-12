@@ -44,7 +44,12 @@ public final class WeightLoader {
         self.directory = first.url.deletingLastPathComponent()
 
         switch plan.strategy {
-        case .mmap:
+        case .mmap, .streaming:
+            // Identical load-time path. `.streaming` only differs at
+            // runtime: `Transformer.forward` calls `prefetchLayer` /
+            // `releaseLayer` between blocks so the kernel can drop
+            // cold pages without thrashing the GUI. The shards
+            // themselves are mmap'd the same way.
             for (url, _) in plan.shards {
                 let f = try SafeTensorsFile(url: url)
                 let shardIdx = shards.count
