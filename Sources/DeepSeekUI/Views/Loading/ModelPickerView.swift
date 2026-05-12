@@ -83,7 +83,3 @@ struct ModelPickerView: View {
         }
     }
 }
-
-#Preview {
-    ModelPickerView { url in print("picked \(url)") }
-}
