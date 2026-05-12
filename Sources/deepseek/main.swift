@@ -137,37 +137,77 @@ print("---")
 fflush(stdout)
 
 let eosId: Int = tokenizer.eosId ?? -1
+// Generation runs on a background DispatchQueue so the main thread
+// is free to poll memory metrics at fixed intervals. Without this
+// the only memory snapshots we get during a forward are the ones
+// `MemoryLogger.snapshot(...)` is called at explicitly — between
+// `cmd.commit()` and `waitUntilCompleted()` the calling thread is
+// blocked for tens of seconds on V4-Flash. A separate polling
+// thread on stdout/stderr captures the entire memory trace,
+// including the spike that precedes a kernel panic.
+//
+// `generatedIds` is mutated only by the inference closure; the
+// main thread reads it only after `done.wait()` returns (no race).
+// `print()` to stdout is internally synchronized by libc, so
+// streamed tokens and monitor lines interleave cleanly.
+let inferenceQueue = DispatchQueue(label: "deepseek.inference",
+                                    qos: .userInitiated)
+let done = DispatchSemaphore(value: 0)
 var generatedIds: [Int] = []
+var inferenceError: Error? = nil
 
-// Prefill.
-var logits = model.forward(inputIds: [promptIds], startPos: 0)
-MemoryLogger.snapshot("prefill-complete", force: true)
-var samplingOpts = SamplingOptions(temperature: temperature,
-                                    topK: 0, topP: 1.0,
-                                    repetitionPenalty: 1.0)
+inferenceQueue.async {
+    defer { done.signal() }
+    var samplingOpts = SamplingOptions(temperature: temperature,
+                                        topK: 0, topP: 1.0,
+                                        repetitionPenalty: 1.0)
 
-for step in 0..<maxTokens {
-    let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
-    if nextId == eosId { break }
-    generatedIds.append(nextId)
-    MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
-                          force: true)
+    // Prefill.
+    var logits = model.forward(inputIds: [promptIds], startPos: 0)
+    MemoryLogger.snapshot("prefill-complete", force: true)
 
-    // Stream the new token to stdout immediately. In chat mode, we buffer
-    // the whole output and parse <think>...</think> at the end so the
-    // reasoning block doesn't leak before its closing tag.
-    if mode == "raw" {
-        print(tokenizer.decode([nextId]), terminator: "")
-        fflush(stdout)
+    for step in 0..<maxTokens {
+        let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
+        if nextId == eosId { break }
+        generatedIds.append(nextId)
+        MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
+                              force: true)
+
+        // Stream the new token to stdout immediately. In chat mode, we buffer
+        // the whole output and parse <think>...</think> at the end so the
+        // reasoning block doesn't leak before its closing tag.
+        if mode == "raw" {
+            print(tokenizer.decode([nextId]), terminator: "")
+            fflush(stdout)
+        }
+
+        // Stop after sampling the requested count without doing one more
+        // unnecessary forward.
+        if step == maxTokens - 1 { break }
+
+        // Decode step: feed only the just-sampled token at startPos = promptLen + step.
+        let startPos = promptIds.count + step
+        logits = model.forward(inputIds: [[nextId]], startPos: startPos)
     }
+}
 
-    // Stop after sampling the requested count without doing one more
-    // unnecessary forward.
-    if step == maxTokens - 1 { break }
-
-    // Decode step: feed only the just-sampled token at startPos = promptLen + step.
-    let startPos = promptIds.count + step
-    logits = model.forward(inputIds: [[nextId]], startPos: startPos)
+// Main thread: poll memory metrics every 250 ms while the
+// inference thread runs. Each tick is `force: true` so the line
+// always emits regardless of `thresholdBytes`. The `tick:NNNN`
+// label runs through 1 ≤ tick ≤ 9999; at 250 ms per tick that's
+// ~40 minutes of trace before the counter wraps.
+var monitorTick = 0
+let pollInterval: DispatchTimeInterval = .milliseconds(250)
+while done.wait(timeout: .now() + pollInterval) == .timedOut {
+    monitorTick &+= 1
+    MemoryLogger.snapshot(
+        "monitor:tick-\(String(format: "%04d", monitorTick))",
+        force: true)
+}
+if let err = inferenceError {
+    FileHandle.standardError.write(Data(
+        "inference failed: \(err.localizedDescription)\n".utf8))
+    exit(1)
 }
 
 print("")    // newline after streaming
