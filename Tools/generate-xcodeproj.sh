@@ -30,15 +30,18 @@ xcodegen generate
 cat <<'EOF'
 
 DeepSeekV4Pro.xcodeproj generated. **Open the workspace, not the
-xcodeproj** — the workspace lets Xcode resolve the local Swift
-Package at workspace level, avoiding the "Missing package product
-'DeepSeekKit'" trap that hits an xcodeproj sitting next to a
-Package.swift in the same directory.
+xcodeproj** — it lets Xcode resolve the local Swift Package at
+workspace level, avoiding the "Missing package product 'DeepSeekKit'"
+trap when an xcodeproj sits next to Package.swift in the same dir.
 
     open DeepSeekV4Pro.xcworkspace
 
-then select the "DeepSeekUI" scheme and ⌘R. If Xcode still reports
-the package as missing on first open:
+In the scheme picker pick **`DeepSeekApp`** (the macOS .app target)
+— *not* "DeepSeekUI" (that's the SPM executable scheme exposed by
+the package, which has no "My Mac" run destination since SPM
+treats it as a CLI). Then ⌘R.
+
+If Xcode still reports the package as missing on first open:
 
     File → Packages → Reset Package Caches
     File → Packages → Resolve Package Versions

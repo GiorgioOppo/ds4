@@ -44,6 +44,11 @@ settings:
   base:
     SWIFT_VERSION: "5.10"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Be explicit about platform so Xcode's destination resolver
+    # never falls back to "no eligible run destination".
+    SDKROOT: macosx
+    SUPPORTED_PLATFORMS: macosx
+    ARCHS: "$(ARCHS_STANDARD)"
     # Local dev: skip codesigning entirely. Faster builds, no
     # entitlements headaches. Re-enable for distribution by setting
     # CODE_SIGN_IDENTITY to "Developer ID Application: …" + a
@@ -56,7 +61,17 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
 targets:
-  DeepSeekUI:
+  # NOTE: this target is named "DeepSeekApp" — *not* "DeepSeekUI" —
+  # to avoid a scheme-name collision with the SPM executable target
+  # (also named "DeepSeekUI") that the workspace exposes via
+  # Package.swift. With both visible in the workspace, Xcode would
+  # otherwise show two "DeepSeekUI" schemes: the SPM one (an
+  # executable, no "My Mac" destination, what triggered the user's
+  # "no destination" error) and this app one. Renaming this target
+  # disambiguates the scheme picker. PRODUCT_NAME below stays
+  # "DeepSeekUI" so the produced .app + binary still match the
+  # Info.plist.
+  DeepSeekApp:
     type: application
     platform: macOS
     deploymentTarget: "14.0"
@@ -78,12 +93,12 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.deepseek.v4pro.ui
         # PRODUCT_NAME drives both the .app folder name and the
-        # binary inside Contents/MacOS/. It must match the Info.plist
-        # `CFBundleExecutable` ("DeepSeekUI") or macOS' Intents /
-        # Shortcuts services log "Unable to re-register with Process
-        # Instance Registry" warnings every launch. The user-facing
-        # display name lives in CFBundleDisplayName = "DeepSeek-V4"
-        # which is independent.
+        # binary inside Contents/MacOS/. We pin it to "DeepSeekUI"
+        # so it matches the Info.plist `CFBundleExecutable` and the
+        # SPM executable name — no Intents / Shortcuts registration
+        # mismatch. The user-facing display name lives in the
+        # Info.plist's CFBundleDisplayName = "DeepSeek-V4" which is
+        # independent of the binary name.
         PRODUCT_NAME: DeepSeekUI
         # The UI is a SwiftUI macOS app, not a sandboxed App Store
         # build. NSOpenPanel needs filesystem access to /Volumes/...
