@@ -132,7 +132,8 @@ public final class SafeTensorsFile {
         case "F32": return .f32
         case "F16": return .f16
         case "BF16": return .bf16
-        case "I32": return .i32
+        case "I32", "U32": return .i32
+        case "I64", "U64": return .i64
         case "I8", "U8": return .i8
         case "F8_E4M3", "F8E4M3", "FLOAT8_E4M3FN": return .fp8E4M3
         case "F4_E2M1", "F4E2M1", "FLOAT4_E2M1FN_X2": return .fp4E2M1

@@ -13,6 +13,10 @@ public enum DType: Int, Sendable {
     case fp4E2M1 = 6
     /// E8M0 unbiased exponent format used as block scale. Storage: 1 byte per value.
     case e8m0 = 7
+    /// 64-bit signed/unsigned integer (only used as a load-time staging
+    /// dtype for tensors that the downstream code wants as i32 — see
+    /// AssemblyHelpers.castIntToI32).
+    case i64 = 8
 
     public var bitsPerElement: Int {
         switch self {
@@ -20,6 +24,7 @@ public enum DType: Int, Sendable {
         case .f16, .bf16: return 16
         case .i8, .fp8E4M3, .e8m0: return 8
         case .fp4E2M1: return 4
+        case .i64: return 64
         }
     }
 }

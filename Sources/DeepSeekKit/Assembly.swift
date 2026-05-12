@@ -263,7 +263,7 @@ public extension Transformer {
                 ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
                  ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
             let tid2eid: Tensor? = i < config.nHashLayers
-                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"]))
+                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"])).map(AssemblyHelpers.castIntToI32)
                 : nil
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: tid2eid)
@@ -378,6 +378,29 @@ internal enum AssemblyHelpers {
         let n = shape.reduce(1, *)
         let arr = [Float](repeating: 1.0, count: n)
         return arr.withUnsafeBytes { Tensor.from(bytes: $0, shape: shape, dtype: .f32) }
+    }
+
+    /// Returns a copy of `t` as an i32 tensor. Used at load time for
+    /// integer tables (e.g. tid2eid) that the on-disk safetensors stores
+    /// as i64 but downstream Swift code (Gate.tidPtr binding) expects as
+    /// Int32. Idempotent for already-i32 input.
+    static func castIntToI32(_ t: Tensor) -> Tensor {
+        if t.dtype == .i32 { return t }
+        let n = t.count
+        let dst = Tensor.empty(shape: t.shape, dtype: .i32)
+        let dstP = dst.buffer.contents().bindMemory(to: Int32.self, capacity: n)
+        let srcRaw = t.buffer.contents().advanced(by: t.offset)
+        switch t.dtype {
+        case .i64:
+            let srcP = srcRaw.bindMemory(to: Int64.self, capacity: n)
+            for i in 0..<n { dstP[i] = Int32(truncatingIfNeeded: srcP[i]) }
+        case .i8:
+            let srcP = srcRaw.bindMemory(to: Int8.self, capacity: n)
+            for i in 0..<n { dstP[i] = Int32(srcP[i]) }
+        default:
+            fatalError("castIntToI32: unsupported source dtype \(t.dtype)")
+        }
+        return dst
     }
 
     static func linear(`in` inFeatures: Int, out outFeatures: Int,
