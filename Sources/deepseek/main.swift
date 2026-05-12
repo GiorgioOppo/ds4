@@ -52,7 +52,7 @@ while i < args.count {
         mode = args[i + 1]; i += 2
     case "--load-strategy":
         guard i + 1 < args.count,
-              ["auto", "preload", "mmap"].contains(args[i + 1]) else { usage() }
+              ["auto", "preload", "mmap", "streaming"].contains(args[i + 1]) else { usage() }
         loadStrategy = args[i + 1]; i += 2
     case "--force-load":
         forceLoad = true; i += 1

@@ -39,8 +39,10 @@ public final class SafeTensorsFile {
     /// Shared MTLBuffer covering the entire file (mmap window or
     /// preloaded copy). All Tensors returned by `load(_:)` reference
     /// this buffer with their `offset` field set to the absolute byte
-    /// position in the file.
-    private let sharedBuffer: MTLBuffer
+    /// position in the file. `internal` so the streaming path
+    /// (`WeightLoader.adviseShard`) can call `madvise` against the
+    /// underlying mmap pages.
+    internal let sharedBuffer: MTLBuffer
 
     // ---- mmap path ----
     public init(url: URL) throws {

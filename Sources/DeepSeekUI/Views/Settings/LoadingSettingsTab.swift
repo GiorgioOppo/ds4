@@ -18,11 +18,12 @@ struct LoadingSettingsTab: View {
                     Text("Auto").tag("auto")
                     Text("Preload").tag("preload")
                     Text("Mmap").tag("mmap")
+                    Text("Streaming").tag("streaming")
                 }
                 .pickerStyle(.segmented)
                 Toggle("Bypass RAM-safety refusals (--force-load)",
                         isOn: $forceLoad)
-                Text("Force-load skips the 70 % shard cap and the 25× total-RAM oversubscription guard. Use when you accept the risk of paging-driven freezes.")
+                Text("Auto picks streaming when the checkpoint is more than 10× the effective unified-memory budget — between-layer madvise hints keep the working set bounded so the OS doesn't freeze. Force-load skips the 50% shard cap entirely. Preload copies everything to a fresh MTLBuffer (rare on small Macs).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

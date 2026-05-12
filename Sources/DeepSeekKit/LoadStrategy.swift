@@ -11,7 +11,18 @@ import Foundation
 ///     parallelism wouldn't help).
 public enum LoadStrategy: String, Sendable {
     case preload
+    /// Standard mmap; OS pages on demand, eviction is OS-driven.
     case mmap
+    /// Mmap + cooperative streaming hints. Same byte-level
+    /// representation as `.mmap` (every shard mmapped at load time)
+    /// but `WeightLoader.prefetchLayer(K+1)` /
+    /// `releaseLayer(K-1)` run between blocks of
+    /// `Transformer.forward`, using `madvise(MADV_WILLNEED /
+    /// MADV_DONTNEED)` to steer the kernel's LRU. Trades per-token
+    /// latency (cold pages need refaulting on the next token) for
+    /// a constant-bounded working set that won't freeze the OS on
+    /// wildly oversubscribed checkpoints.
+    case streaming
 }
 
 /// Output of `LoadPlan.decide`: the strategy plus everything the
@@ -183,6 +194,9 @@ extension LoadPlan {
             // Guard 1: largest shard must fit with headroom. Without
             // it the kernel is forced to evict the file cache or the
             // GUI's resident pages on every fresh hot-tensor fault.
+            // Streaming doesn't help here — a single shard is still
+            // mmap'd contiguously, and the GPU has to read all of it
+            // during the layer that owns it.
             let shardCap = UInt64(Double(budget) * shardCapFraction)
             if maxShard > shardCap {
                 let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
@@ -190,21 +204,17 @@ extension LoadPlan {
                     maxShard: maxShard, available: budget,
                     capFraction: shardCapFraction, shardURL: biggest)
             }
-            // Guard 2: catch the wildly-oversubscribed case
-            // (e.g. 147 GB INT4 V4-Flash on a 16 GB Mac with ~9 GB
-            // effective budget → 16× — well above 10×). The shard
-            // cap alone passes these because individual shards are
-            // small, but the working set across a forward still
-            // thrashes hard enough to freeze the system.
-            if Double(total) > Double(budget) * totalOversubMultiplier {
-                throw LoadStrategyError.totalTooLarge(
-                    total: total, available: budget,
-                    multiplier: totalOversubMultiplier)
-            }
+            // Guard 2: wildly-oversubscribed total. The
+            // pickStrategy below DOWNGRADES this into a `.streaming`
+            // strategy instead of refusing, so the model can still
+            // load — but only after the user (or auto) accepted
+            // that they're past the shard cap is the only hard line.
         }
 
         let (strategy, reason) = try Self.pickStrategy(
-            total: total, available: budget, override: override)
+            total: total, available: budget,
+            totalOversubMultiplier: totalOversubMultiplier,
+            override: override)
 
         return LoadPlan(
             strategy: strategy,
@@ -222,11 +232,20 @@ extension LoadPlan {
     /// `decideForTesting`. Returns the strategy plus the human-readable
     /// reason for the log.
     static func pickStrategy(total: UInt64, available: UInt64,
+                              totalOversubMultiplier: Double = defaultTotalOversubMultiplier,
                               override: String?) throws -> (LoadStrategy, String) {
         switch override?.lowercased() {
         case nil, "", "auto":
             if available == 0 {
                 return (.mmap, "auto: available-RAM probe unavailable, defaulting to mmap")
+            }
+            // Wildly oversubscribed → streaming with madvise hints
+            // instead of refusing or freezing.
+            if Double(total) > Double(available) * totalOversubMultiplier {
+                let ratio = Double(total) / Double(available)
+                return (.streaming, String(format:
+                    "auto: total is %.1f× effective budget (cap %.0f×) — streaming with per-layer madvise hints",
+                    ratio, totalOversubMultiplier))
             }
             if totalFitsPreloadCap(total: total, available: available) {
                 return (.preload, "auto: total fits under 80% of available RAM")
@@ -236,6 +255,8 @@ extension LoadPlan {
             return (.preload, "forced by --load-strategy")
         case "mmap":
             return (.mmap, "forced by --load-strategy")
+        case "streaming":
+            return (.streaming, "forced by --load-strategy")
         case let other?:
             throw LoadStrategyError.unknownOverride(other)
         }
@@ -261,14 +282,13 @@ extension LoadPlan {
                     maxShard: maxShard, available: availableRAM,
                     capFraction: shardCapFraction, shardURL: biggest)
             }
-            if Double(total) > Double(availableRAM) * totalOversubMultiplier {
-                throw LoadStrategyError.totalTooLarge(
-                    total: total, available: availableRAM,
-                    multiplier: totalOversubMultiplier)
-            }
+            // total-oversub no longer throws — auto picks .streaming
+            // when ratio exceeds the multiplier.
         }
         let (strategy, reason) = try pickStrategy(
-            total: total, available: availableRAM, override: override)
+            total: total, available: availableRAM,
+            totalOversubMultiplier: totalOversubMultiplier,
+            override: override)
         return LoadPlan(
             strategy: strategy, shards: shards,
             totalBytes: total, maxShardBytes: maxShard,

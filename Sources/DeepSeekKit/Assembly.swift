@@ -330,10 +330,17 @@ public extension Transformer {
             """.utf8))
         }
 
-        return Transformer(config: config, embed: embed, layers: blocks, mtp: [],
-                           norm: norm, head: head,
-                           hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
-                           hcHeadScale: hcHeadScale)
+        let model = Transformer(config: config, embed: embed, layers: blocks, mtp: [],
+                                 norm: norm, head: head,
+                                 hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
+                                 hcHeadScale: hcHeadScale)
+        // Park the WeightLoader on the model so its `shardLayers`
+        // index lives as long as the model and `forward(...)` can
+        // call `prefetchLayer` / `releaseLayer` between blocks.
+        // This matters for `.streaming` strategy; for `.mmap` /
+        // `.preload` the loader is held but never queried.
+        model.weightLoader = loader
+        return model
     }
 }
 

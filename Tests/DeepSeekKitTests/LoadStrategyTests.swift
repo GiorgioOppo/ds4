@@ -91,9 +91,13 @@ final class LoadStrategyTests: XCTestCase {
         )
     }
 
-    /// total > 25× available → .totalTooLarge even when individual shards fit.
-    func testHardErrorWhenTotalOversubscriptionTooHigh() {
-        // 50 × 4 GB shards = 200 GB total, 4 GB available → 50× oversub.
+    /// When BOTH the per-shard cap and the total oversub multiplier
+    /// are blown, the shard cap is the only hard refusal —
+    /// streaming can't help a single oversize shard since the GPU
+    /// has to read all of it at once.
+    func testHardErrorWhenShardCapBlown() {
+        // 50 × 4 GB shards = 200 GB total, 4 GB available.
+        // Each shard 4 GB > 0.5 × 4 GB = 2 GB cap → throws shardTooLarge.
         let shards = (0..<50).map { (u("s\($0)"), 4 * 1024 * 1024 * 1024 as UInt64) }
         XCTAssertThrowsError(
             try LoadPlan.decideForTesting(
@@ -102,37 +106,28 @@ final class LoadStrategyTests: XCTestCase {
                 override: nil)
         ) { error in
             guard case LoadStrategyError.shardTooLarge = error else {
-                // First trip should be shardTooLarge: 4 GB shard > 0.7 × 4 GB = 2.8 GB.
-                // The total-cap is checked after; this is fine.
-                if case LoadStrategyError.totalTooLarge = error { return }
-                XCTFail("expected shardTooLarge or totalTooLarge, got \(error)")
+                XCTFail("expected .shardTooLarge, got \(error)")
                 return
             }
         }
     }
 
-    /// The total-cap fires independently when shards are individually small.
-    func testHardErrorWhenTotalOversubscriptionAlone() {
+    /// When the total dwarfs available RAM but every individual
+    /// shard fits, we DOWNGRADE to `.streaming` (madvise hints)
+    /// instead of throwing — the kernel can still serve forwards
+    /// page-by-page if the loader proactively releases cold layers.
+    func testTotalOversubscriptionPicksStreaming() throws {
         // 100 × 40 MB shards = ~3.9 GB total, 100 MB available → ~39× oversub.
-        // Each shard alone (40 MB) is under the 50% cap (50 MB) so guard 1
-        // passes; guard 2 fires because 39× > 10× multiplier.
+        // Each shard alone (40 MB) is under the 50% cap (50 MB) so the
+        // shard guard passes; pickStrategy downgrades to streaming
+        // because 39× exceeds the 10× total-oversub multiplier.
         let shardBytes: UInt64 = 40 * 1024 * 1024
         let avail: UInt64 = 100 * 1024 * 1024
         let shards = (0..<100).map { (u("s\($0)"), shardBytes) }
-        XCTAssertThrowsError(
-            try LoadPlan.decideForTesting(
-                shards: shards, availableRAM: avail, override: nil)
-        ) { error in
-            guard case LoadStrategyError.totalTooLarge(let total, let av, let mult) = error else {
-                XCTFail("expected .totalTooLarge, got \(error)")
-                return
-            }
-            XCTAssertEqual(total, UInt64(100) * shardBytes)
-            XCTAssertEqual(av, avail)
-            // Default multiplier tightened to 10× in the unified-memory
-            // revision (was 25×).
-            XCTAssertEqual(mult, 10.0, accuracy: 1e-9)
-        }
+        let plan = try LoadPlan.decideForTesting(
+            shards: shards, availableRAM: avail, override: nil)
+        XCTAssertEqual(plan.strategy, .streaming)
+        XCTAssertTrue(plan.reason.contains("streaming"))
     }
 
     /// `--force-load` skips both refusals.

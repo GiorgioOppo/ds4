@@ -1,5 +1,8 @@
 import Foundation
 import Dispatch
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Indexes every `.safetensors` shard in a directory and exposes a
 /// `load(name:)` API that returns the tensor regardless of which shard it
@@ -16,6 +19,16 @@ public final class WeightLoader {
     private var shards: [SafeTensorsFile] = []
     private var index: [String: Int] = [:]   // name → shards[index]
     public private(set) var missing: Set<String> = []
+
+    /// Per-shard "dominant layer index" used by the streaming hints.
+    /// Built once at init by inspecting tensor names: a shard whose
+    /// entries are all `layers.K.*` is owned by layer K and can be
+    /// page-evicted (`madvise MADV_DONTNEED`) when layer K is done
+    /// with the current token's forward. -1 means "shared / always
+    /// resident" — embedding, output head, RMSNorm gains, and any
+    /// shard mixing tensors from more than one layer.
+    private var shardLayers: [Int] = []
+    public var streamingEnabled: Bool = false
 
     /// Construct from an already-decided `LoadPlan`. The plan owns the
     /// list of shards and chooses mmap vs preload; this initializer
@@ -77,6 +90,13 @@ public final class WeightLoader {
                 for name in f.entries.keys { index[name] = shardIdx }
             }
         }
+
+        // Populate the per-shard layer ownership table (for the
+        // streaming hints API). Streaming is gated on `plan.strategy
+        // == .streaming` below; for `.mmap` / `.preload` the table
+        // is still built but never consulted.
+        self.shardLayers = Self.buildShardLayers(shards: shards)
+        self.streamingEnabled = (plan.strategy == .streaming)
     }
 
     /// Backwards-compat convenience: build a default `mmap` plan
@@ -167,5 +187,90 @@ public final class WeightLoader {
             if let s = shape(of: n) { return s }
         }
         return nil
+    }
+
+    // ----------- Streaming hints (madvise-based) -----------
+    //
+    // For very-oversubscribed checkpoints (e.g. 147 GB INT4 V4-Flash
+    // on a 16 GB Mac) the all-resident mmap path lets macOS evict
+    // pages from the GUI compositor and the kernel itself when
+    // weights compete for the same unified-memory pool — freezing
+    // the box. With streaming hints enabled, `Transformer.forward`
+    // calls `prefetchLayer(K+1)` while computing layer K and
+    // `releaseLayer(K-1)` right after, telling the kernel which
+    // ranges are hot and which are cold so eviction stays inside
+    // OUR mapping rather than ranging across the system.
+    //
+    // The hints use Darwin's `madvise(MADV_WILLNEED / MADV_DONTNEED)`
+    // — they don't actually load or unload anything synchronously,
+    // they steer the kernel's LRU. The MTLBuffer references stay
+    // valid throughout; only the physical-memory residency of the
+    // backing mmap pages changes.
+
+    /// Build a map from each shard index to the "dominant layer"
+    /// whose tensors it contains. The converter writes layer-aligned
+    /// shards (one bucket per layer), so most shards have a single
+    /// owning layer. Shards containing top-level tensors (embed,
+    /// head, hc_head_*, RMSNorm gains) or mixing multiple layers
+    /// get `-1` → never page-evicted.
+    private static func buildShardLayers(shards: [SafeTensorsFile]) -> [Int] {
+        var out = [Int](repeating: -1, count: shards.count)
+        for (idx, shard) in shards.enumerated() {
+            var seenLayers: Set<Int> = []
+            var hasTopLevel = false
+            for name in shard.entries.keys {
+                if let layer = Self.parseLayerIndex(from: name) {
+                    seenLayers.insert(layer)
+                } else {
+                    hasTopLevel = true
+                }
+            }
+            if hasTopLevel || seenLayers.count != 1 {
+                out[idx] = -1
+            } else {
+                out[idx] = seenLayers.first!
+            }
+        }
+        return out
+    }
+
+    /// Parse `N` from `layers.N.<anything>` or `mtp.N.<anything>`.
+    /// MTP layers get encoded as `1000 + N` so they don't collide
+    /// with the main-layer numbering — the model's MTP modules call
+    /// `prefetchLayer(1000 + mtpIdx)` if they want streaming.
+    private static func parseLayerIndex(from name: String) -> Int? {
+        let parts = name.split(separator: ".").map(String.init)
+        guard parts.count >= 2 else { return nil }
+        if parts[0] == "layers", let n = Int(parts[1]) { return n }
+        if parts[0] == "mtp",    let n = Int(parts[1]) { return 1000 + n }
+        return nil
+    }
+
+    /// Hint to the kernel that layer K's pages will be touched
+    /// soon. No-op unless `streamingEnabled` is true. Idempotent.
+    public func prefetchLayer(_ layerIndex: Int) {
+        guard streamingEnabled else { return }
+        for (shardIdx, owner) in shardLayers.enumerated()
+            where owner == layerIndex {
+            adviseShard(shardIdx, advice: MADV_WILLNEED)
+        }
+    }
+
+    /// Hint to the kernel that layer K's pages are cold and can be
+    /// reclaimed. Top-level / shared shards (`owner == -1`) are
+    /// always skipped. No-op unless `streamingEnabled`.
+    public func releaseLayer(_ layerIndex: Int) {
+        guard streamingEnabled else { return }
+        for (shardIdx, owner) in shardLayers.enumerated()
+            where owner == layerIndex {
+            adviseShard(shardIdx, advice: MADV_DONTNEED)
+        }
+    }
+
+    private func adviseShard(_ idx: Int, advice: Int32) {
+        let buf = shards[idx].sharedBuffer
+        let len = buf.length
+        guard let addr = buf.contents() as UnsafeMutableRawPointer? else { return }
+        _ = madvise(addr, len, advice)
     }
 }

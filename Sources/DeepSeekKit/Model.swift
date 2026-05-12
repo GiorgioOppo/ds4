@@ -174,6 +174,14 @@ public final class Transformer {
 
     private let pHcExpand: MTLComputePipelineState
 
+    /// Optional reference to the WeightLoader that built this model.
+    /// `Transformer.load` parks it here so the loader (and its
+    /// `shardLayers` index) stays alive for the model's lifetime and
+    /// `forward(...)` can call `prefetchLayer` / `releaseLayer`
+    /// between blocks. Nil for non-streaming strategies — `forward`
+    /// short-circuits on nil.
+    internal var weightLoader: WeightLoader? = nil
+
     public init(config: ModelConfig,
                 embed: ParallelEmbedding,
                 layers: [Block],
@@ -222,11 +230,29 @@ public final class Transformer {
         cmd.commit(); cmd.waitUntilCompleted()
 
         // 3. Run each block sequentially. Each commits its own buffers.
+        //
+        // Streaming hints: when `weightLoader.streamingEnabled` is
+        // true, we prefetch layer K+1's pages while computing K (the
+        // commit/wait below gives the kernel time to fault them in),
+        // and release layer K-1's pages after the wait so the
+        // working set stays bounded. Lag-1 retention so that
+        // committing layer K's command buffer can still touch K-1's
+        // pages while the GPU is doing its post-launch cleanup.
         var x = hExpanded.reshape([B, S, hc, config.dim])
-        for layer in layers {
+        let loader = self.weightLoader
+        for (k, layer) in layers.enumerated() {
+            if let l = loader, k + 1 < layers.count {
+                l.prefetchLayer(k + 1)
+            }
             var cmdL = Device.shared.queue.makeCommandBuffer()!
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
+            if let l = loader, k >= 1 {
+                l.releaseLayer(k - 1)
+            }
+        }
+        if let l = loader, !layers.isEmpty {
+            l.releaseLayer(layers.count - 1)
         }
 
         // 4. Head.
