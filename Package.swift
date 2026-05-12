@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "DeepSeekKit", targets: ["DeepSeekKit"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
         .executable(name: "converter", targets: ["converter"]),
+        .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
     ],
     targets: [
         .target(
@@ -33,6 +34,11 @@ let package = Package(
             name: "converter",
             dependencies: ["DeepSeekKit"],
             path: "Sources/converter"
+        ),
+        .executableTarget(
+            name: "DeepSeekUI",
+            dependencies: ["DeepSeekKit"],
+            path: "Sources/DeepSeekUI"
         ),
         .plugin(
             name: "MetalLibPlugin",
