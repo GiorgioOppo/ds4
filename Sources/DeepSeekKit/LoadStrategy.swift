@@ -43,7 +43,7 @@ public struct LoadPlan: Sendable {
     }
 }
 
-public enum LoadStrategyError: Error, CustomStringConvertible {
+public enum LoadStrategyError: Error, CustomStringConvertible, LocalizedError {
     /// The biggest single shard exceeds the process's available RAM.
     /// Re-shard the checkpoint (lower `--shard-size-gb` in the
     /// converter) or run on a host with more memory.
@@ -59,14 +59,21 @@ public enum LoadStrategyError: Error, CustomStringConvertible {
             largest shard \(shardURL.lastPathComponent) is \
             \(String(format: "%.2f GB", Double(maxShard) / gib)) but only \
             \(String(format: "%.2f GB", Double(available) / gib)) of RAM \
-            is available to this process. Re-shard the checkpoint with a \
-            smaller --shard-size-gb in the converter, free up memory, or \
-            run on a larger host.
+            is available to this process. Free memory (close other apps), \
+            re-shard the checkpoint with a smaller --shard-size-gb in the \
+            converter, or run on a host with more RAM.
             """
         case let .unknownOverride(s):
             return "unknown --load-strategy value: \(s) (expected auto|preload|mmap)"
         }
     }
+
+    /// Forwarded to `(self as NSError).localizedDescription`, which is
+    /// what `main.swift`'s `catch` block prints. Without this
+    /// conformance Foundation falls back to the generic
+    /// "The operation couldn't be completed. (DeepSeekKit.LoadStrategyError error N.)"
+    /// wrapper that hides our human-readable text.
+    public var errorDescription: String? { description }
 }
 
 extension LoadPlan {
