@@ -62,16 +62,17 @@ public final class Gate {
         precondition(x.dtype == .f32 && x.shape.count == 2)
         let N = x.shape[0]
 
-        // logits = x @ weight^T   [N, n_experts]
-        let logits = weight(x, in: cmd)
-
         let weights = Tensor.empty(shape: [N, topK], dtype: .f32)
         let indices = Tensor.empty(shape: [N, topK], dtype: .i32)
 
         if hashRouting {
             guard let tid = tid2eid else { fatalError("hash routing requires tid2eid") }
-            // Read tid2eid for each input id and write directly.
-            cmd.commit(); cmd.waitUntilCompleted()
+            // Pure host-side lookup; tid2eid was cast to i32 at load time
+            // (AssemblyHelpers.castIntToI32) and inputIds is already a
+            // Swift [Int32]. No GPU work needs to be issued — and crucially
+            // no commit, since the caller (MoEFFN) will commit `cmd` itself
+            // to drain pre-Gate work (RMSNorm, hc.pre) before reading our
+            // output buffers.
             let tidPtr = tid.buffer.contents().bindMemory(to: Int32.self,
                                                             capacity: tid.count)
             let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self,
@@ -90,7 +91,9 @@ public final class Gate {
             return (weights, indices)
         }
 
-        // Score-based routing — invoke the moe_gate kernel.
+        // Score-based routing — needs `logits = x @ weight^T` on GPU.
+        let logits = weight(x, in: cmd)
+
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(logits.buffer, offset: 0, index: 0)
