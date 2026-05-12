@@ -48,11 +48,38 @@ public enum MemoryLogger {
     public static var pressureHigh: Double = 0.70
     public static var pressureCritical: Double = 0.85
 
+    /// `willAllocate` skips lines for allocations smaller than
+    /// this. Default 1 MB — keeps the trace focused on the
+    /// allocations that matter for OOM diagnosis (KV cache,
+    /// activations, mmap shards). Set to 0 to see every single
+    /// MTLBuffer creation.
+    public static var allocLogThresholdBytes: UInt64 = 1024 * 1024
+
     /// Lazily-mutated state — single-threaded use only (we only
     /// snapshot from MainActor or the inference Task, never both).
     nonisolated(unsafe) private static var last = Sample()
     nonisolated(unsafe) private static var headerEmitted = false
     nonisolated(unsafe) private static var cachedPhysical: UInt64 = 0
+
+    /// Emit a one-line log RIGHT BEFORE an MTLBuffer / mmap region
+    /// is allocated, so if the allocation triggers a kernel panic
+    /// the user sees "what was being requested" as the last
+    /// surviving line in the trace.
+    public static func willAllocate(bytes: Int,
+                                     shape: [Int]? = nil,
+                                     dtype: DType? = nil,
+                                     label: String = "") {
+        guard enabled, UInt64(bytes) >= allocLogThresholdBytes else { return }
+        emitHeaderIfNeeded()
+        var parts: [String] = []
+        parts.append("[alloc \(formatBytes(UInt64(bytes)))")
+        if let s = shape { parts.append("shape=\(s)") }
+        if let d = dtype { parts.append("dtype=\(d.shortName)") }
+        if !label.isEmpty { parts.append(label) }
+        parts[parts.count - 1] += "]"
+        let line = parts.joined(separator: " ") + "\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
 
     public static func snapshot(_ label: String, force: Bool = false) {
         guard enabled else { return }
@@ -163,6 +190,37 @@ public enum MemoryLogger {
 
     private static func absDelta(_ a: UInt64, _ b: UInt64) -> UInt64 {
         a > b ? a - b : b - a
+    }
+
+    private static func formatBytes(_ b: UInt64) -> String {
+        let kib = 1024.0
+        let mib = kib * 1024
+        let gib = mib * 1024
+        let bd = Double(b)
+        if bd >= gib { return String(format: "%.2fGB", bd / gib) }
+        if bd >= mib { return String(format: "%.1fMB", bd / mib) }
+        if bd >= kib { return String(format: "%.0fKB", bd / kib) }
+        return "\(b)B"
+    }
+}
+
+private extension DType {
+    /// Short tag used in alloc log lines. Mirrors the safetensors
+    /// dtype strings where possible.
+    var shortName: String {
+        switch self {
+        case .f32:      return "f32"
+        case .f16:      return "f16"
+        case .bf16:     return "bf16"
+        case .i32:      return "i32"
+        case .i64:      return "i64"
+        case .i8:       return "i8"
+        case .i4:       return "i4"
+        case .i2:       return "i2"
+        case .fp8E4M3:  return "fp8"
+        case .fp4E2M1:  return "fp4"
+        case .e8m0:     return "e8m0"
+        }
     }
 }
 

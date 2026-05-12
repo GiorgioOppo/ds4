@@ -60,6 +60,11 @@ public final class Tensor {
 
     public static func empty(shape: [Int], dtype: DType, on device: Device = .shared) -> Tensor {
         let bytes = max(((shape.reduce(1, *) * dtype.bitsPerElement) + 7) / 8, 16)
+        // Log BEFORE the alloc so if the kernel kills the process
+        // mid-makeBuffer the last surviving stderr line tells us
+        // exactly what was being requested.
+        MemoryLogger.willAllocate(bytes: bytes, shape: shape,
+                                   dtype: dtype, label: "empty")
         guard let buf = device.mtl.makeBuffer(length: bytes, options: .storageModeShared) else {
             fatalError("MTLBuffer allocation failed for \(bytes) bytes")
         }
@@ -70,6 +75,8 @@ public final class Tensor {
                             on device: Device = .shared) -> Tensor {
         let needed = (shape.reduce(1, *) * dtype.bitsPerElement + 7) / 8
         precondition(bytes.count >= needed, "byte buffer smaller than tensor")
+        MemoryLogger.willAllocate(bytes: needed, shape: shape,
+                                   dtype: dtype, label: "from-bytes")
         guard let buf = device.mtl.makeBuffer(bytes: bytes.baseAddress!,
                                               length: needed,
                                               options: .storageModeShared) else {

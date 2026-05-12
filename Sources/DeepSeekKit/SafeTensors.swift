@@ -65,6 +65,12 @@ public final class SafeTensorsFile {
         // mmap rounded up to a page boundary so `bytesNoCopy:` accepts it.
         let pageSize = Int(sysconf(_SC_PAGESIZE))
         let alignedSize = ((fileSize + pageSize - 1) / pageSize) * pageSize
+        // mmap reserves virtual address space immediately. Physical
+        // pages fault in on first read, but the kernel maintains a
+        // page table for the whole region from the moment mmap
+        // returns — non-trivial overhead for multi-GB ranges.
+        MemoryLogger.willAllocate(bytes: alignedSize,
+                                   label: "mmap \(url.lastPathComponent)")
         guard let raw = mmap(nil, alignedSize, PROT_READ, MAP_PRIVATE, fd, 0),
               raw != MAP_FAILED else {
             throw NSError(domain: "SafeTensors", code: 12, userInfo: [
@@ -101,6 +107,8 @@ public final class SafeTensorsFile {
         self.url = url
 
         let device = Device.shared.mtl
+        MemoryLogger.willAllocate(bytes: Int(byteCount),
+                                   label: "preload \(url.lastPathComponent)")
         guard let buf = device.makeBuffer(
                 length: Int(byteCount), options: .storageModeShared) else {
             throw Self.bufferCreationError(url: url,
