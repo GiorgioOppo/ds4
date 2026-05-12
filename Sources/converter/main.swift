@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import DeepSeekKit
+import DeepSeekConverter
 
 // Native Swift port of `Reference/inference/convert.py`, extended to
 // transcode every non-native dtype into a type Apple Silicon supports
@@ -40,32 +41,9 @@ func usage() -> Never {
     exit(2)
 }
 
-enum TargetDType: String {
-    case bf16, f16, int8, int4, int2, keep
-    var safetensorsTag: String {
-        switch self {
-        case .bf16: return "BF16"
-        case .f16:  return "F16"
-        case .int8: return "I8"
-        case .int4: return "I4"
-        case .int2: return "I2"
-        case .keep: return ""
-        }
-    }
-    // For BF16/F16 (the only target dtypes that emit a single tensor per
-    // weight) this is 2 bytes per element. The INT* paths size their own
-    // outputs (sub-byte packing + scale companion), so callers that hit
-    // those return values here are not reading them.
-    var bytesPerElement: Int {
-        switch self {
-        case .bf16, .f16: return 2
-        case .int8:       return 1
-        case .int4:       return 1   // unused; INT4 path computes inDim/2
-        case .int2:       return 1   // unused; INT2 path computes inDim/4
-        case .keep:       return 2   // unused in keep mode
-        }
-    }
-}
+// `TargetDType` is now `ConversionTarget` and lives in the
+// DeepSeekConverter library. Imported above.
+typealias TargetDType = ConversionTarget
 
 // ---------- Argument parsing ----------
 
@@ -129,336 +107,17 @@ let hfDir = URL(fileURLWithPath: hf)
 let saveDir = URL(fileURLWithPath: save)
 try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
 
-// ---------- Rename mapping (port of convert.py:55-79) ----------
-
-let leafMapping: [String: String] = [
-    "embed_tokens": "embed",
-    "input_layernorm": "attn_norm",
-    "post_attention_layernorm": "ffn_norm",
-    "q_proj": "wq",
-    "q_a_proj": "wq_a",
-    "q_a_layernorm": "q_norm",
-    "q_b_proj": "wq_b",
-    "kv_a_proj_with_mqa": "wkv_a",
-    "kv_a_layernorm": "kv_norm",
-    "kv_b_proj": "wkv_b",
-    "o_proj": "wo",
-    "gate_proj": "w1",
-    "down_proj": "w2",
-    "up_proj": "w3",
-    "lm_head": "head",
-    // Identity / passthrough names that already match.
-    "embed": "embed",
-    "wq_b": "wq_b",
-    "wo_a": "wo_a",
-    "wo_b": "wo_b",
-    "head": "head",
-    "attn_sink": "attn_sink",
-    "weights_proj": "weights_proj",
-]
-
-func renameKey(_ name: String) -> String {
-    var n = name
-    if n.hasPrefix("model.") { n = String(n.dropFirst("model.".count)) }
-    n = n.replacingOccurrences(of: "self_attn", with: "attn")
-    n = n.replacingOccurrences(of: "mlp", with: "ffn")
-    n = n.replacingOccurrences(of: "weight_scale_inv", with: "scale")
-    n = n.replacingOccurrences(of: "e_score_correction_bias", with: "bias")
-
-    let parts = n.split(separator: ".").map(String.init)
-    let leaf: String
-    if parts.contains(where: { ["hc", "attn_sink", "tie2eid", "ape"].contains($0) ||
-                                $0.hasPrefix("hc_") }) {
-        leaf = parts.last ?? n
-    } else {
-        leaf = parts.count >= 2 ? parts[parts.count - 2] : (parts.last ?? n)
-    }
-    if let mapped = leafMapping[leaf] {
-        n = n.replacingOccurrences(of: leaf, with: mapped)
-    }
-    return n
-}
-
-func shouldSkip(_ name: String) -> Bool {
-    // convert.py:105 — skip MTP-tied embed/head; they alias the main ones.
-    if name.hasPrefix("mtp.") {
-        if name.contains("emb") { return true }
-        if name.hasSuffix("head.weight") { return true }
-    }
-    return false
-}
-
-// ---------- Native-dtype conversion helpers ----------
-
-@inline(__always)
-func floatToBF16(_ f: Float) -> UInt16 {
-    let bits = f.bitPattern
-    let rounded = bits &+ ((bits >> 16) & 1) &+ 0x7FFF
-    return UInt16(truncatingIfNeeded: rounded >> 16)
-}
-
-@inline(__always)
-func floatToF16(_ f: Float) -> UInt16 {
-    // IEEE 754 single → half with round-to-nearest-even, saturating to
-    // ±inf on overflow. Subnormals are flushed via the standard formula.
-    let bits = f.bitPattern
-    let sign = (bits >> 31) & 1
-    let exp = (bits >> 23) & 0xFF
-    let mant = bits & 0x7FFFFF
-    if exp == 0 { return UInt16(truncatingIfNeeded: sign << 15) }
-    if exp == 0xFF {
-        let m: UInt32 = mant != 0 ? 0x200 : 0   // NaN if mantissa, else inf
-        return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10) | m)
-    }
-    let unbiased = Int(exp) - 127
-    if unbiased > 15 { return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10)) }
-    if unbiased < -14 {
-        // Subnormal half.
-        let shift = -14 - unbiased + 13
-        if shift > 24 { return UInt16(truncatingIfNeeded: sign << 15) }
-        let full = (mant | 0x800000) >> (shift - 1)
-        let halfMant = (full + 1) >> 1
-        return UInt16(truncatingIfNeeded: (sign << 15) | halfMant)
-    }
-    let halfExp = UInt32(unbiased + 15)
-    let halfMant = (mant + 0x1000) >> 13
-    if halfMant >= 0x400 {
-        if halfExp + 1 >= 0x1F {
-            return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10))
-        }
-        return UInt16(truncatingIfNeeded: (sign << 15) | ((halfExp + 1) << 10))
-    }
-    return UInt16(truncatingIfNeeded: (sign << 15) | (halfExp << 10) | halfMant)
-}
-
-@inline(__always)
-func packNative(_ f: Float, _ target: TargetDType) -> UInt16 {
-    switch target {
-    case .bf16: return floatToBF16(f)
-    case .f16:  return floatToF16(f)
-    case .int8: fatalError("packNative requires bf16 or f16; INT8 path uses Int8Quant")
-    case .int4: fatalError("packNative requires bf16 or f16; INT4 path uses Int4Quant")
-    case .int2: fatalError("packNative requires bf16 or f16; INT2 path uses Int2Quant")
-    case .keep: fatalError("packNative requires bf16 or f16")
-    }
-}
-
-@inline(__always)
-func deqE4M3(_ b: UInt8) -> Float {
-    let sign = (UInt32(b) >> 7) & 1
-    let exp = (UInt32(b) >> 3) & 0xF
-    let mant = UInt32(b) & 0x7
-    if exp == 0 && mant == 0 { return sign == 1 ? -0.0 : 0.0 }
-    if exp == 0xF && mant == 0x7 { return .nan }
-    if exp == 0 {
-        let v = Float(mant) * 0x1p-9
-        return sign == 1 ? -v : v
-    }
-    let bp = (sign << 31) | ((exp + 120) << 23) | (mant << 20)
-    return Float(bitPattern: bp)
-}
-
-@inline(__always)
-func deqE2M1(_ nibble: UInt8) -> Float {
-    let mag = nibble & 7
-    let v: Float
-    switch mag {
-    case 0: v = 0.0
-    case 1: v = 0.5
-    case 2: v = 1.0
-    case 3: v = 1.5
-    case 4: v = 2.0
-    case 5: v = 3.0
-    case 6: v = 4.0
-    default: v = 6.0
-    }
-    return (nibble & 8) != 0 ? -v : v
-}
-
-@inline(__always)
-func deqE8M0(_ b: UInt8) -> Float {
-    if b == 0xFF { return .nan }
-    return Float(bitPattern: UInt32(b) << 23)
-}
-
-// Pre-computed lookup tables for the dequant functions. Each input byte
-// (or nibble) maps to a fixed Float, so we replace the per-element bit
-// twiddling with a single load. 256-entry tables fit in L1.
-let e4m3LUT: [Float] = (0..<256).map { deqE4M3(UInt8($0)) }
-let e2m1LUT: [Float] = (0..<16).map  { deqE2M1(UInt8($0)) }
-let e8m0LUT: [Float] = (0..<256).map { deqE8M0(UInt8($0)) }
-
-// ---------- FP8 → native fusion ----------
+// Rename mapping (`leafMapping`, `renameKey`, `shouldSkip`),
+// dtype packers (`floatToBF16`, `floatToF16`, `packNative`,
+// `deqE4M3`, `deqE2M1`, `deqE8M0`), LUTs (`e4m3LUT`, `e2m1LUT`,
+// `e8m0LUT`), dtype probes (`isFP8DType`, `isFP4DType`,
+// `isE8M0DType`), and the FP8/FP4 → BF16/F16 fusion functions
+// (`fuseFP8ToNative`, `fuseFP4ToNative`) now live in the
+// DeepSeekConverter library — imported above.
 //
-// Weight: [out, in] FP8-E4M3. Scale: [out/128, in/128] E8M0.
-//   fused[i, j] = deqE4M3(W[i,j]) * deqE8M0(S[i/128, j/128]).
-// Output: [out, in] in `target` (BF16 or F16). Rows are dequantized in
-// parallel via DispatchQueue.concurrentPerform; the input weight is
-// slurped once so all worker threads can index it without serializing
-// on a shared FileHandle cursor.
-func fuseFP8ToNative(weightURL: URL, weightOffset: Int,
-                     scaleURL: URL, scaleOffset: Int,
-                     outDim: Int, inDim: Int,
-                     target: TargetDType) throws -> Data {
-    precondition(outDim % 128 == 0 && inDim % 128 == 0,
-                 "FP8 weight dims must be 128-aligned")
-    let blocksOut = outDim / 128
-    let blocksIn = inDim / 128
+// `scaleNameFor` is also there (Rename.swift); the local
+// duplicate below is removed.
 
-    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
-        throw NSError(domain: "fuseFP8", code: 1)
-    }
-    defer { try? sf.close() }
-    try sf.seek(toOffset: UInt64(scaleOffset))
-    guard let scaleBytes = try sf.read(upToCount: blocksOut * blocksIn) else {
-        throw NSError(domain: "fuseFP8", code: 2)
-    }
-
-    // Slurp the entire weight tensor up front so rows can be processed in
-    // parallel. Peak memory adds one tensor's worth of FP8 (= half the
-    // BF16 output we're already allocating below), bounded by tensor size.
-    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
-        throw NSError(domain: "fuseFP8", code: 3)
-    }
-    defer { try? wf.close() }
-    try wf.seek(toOffset: UInt64(weightOffset))
-    let weightLen = outDim * inDim
-    guard let weightBytes = try wf.read(upToCount: weightLen),
-          weightBytes.count == weightLen else {
-        throw NSError(domain: "fuseFP8", code: 4)
-    }
-
-    var out = Data(count: outDim * inDim * 2)
-    out.withUnsafeMutableBytes { outRaw in
-        let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
-        scaleBytes.withUnsafeBytes { scaleRaw in
-            let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            weightBytes.withUnsafeBytes { wRaw in
-                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
-                e4m3LUT.withUnsafeBufferPointer { e4m3 in
-                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
-                        let e4m3Ptr = e4m3.baseAddress!
-                        let e8m0Ptr = e8m0.baseAddress!
-                        // Rows are independent: each writes a disjoint
-                        // [i * inDim, (i+1) * inDim) slice of outPtr.
-                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
-                            let bo = i / 128
-                            let rowIn = wPtr.advanced(by: i * inDim)
-                            let rowOut = outPtr.advanced(by: i * inDim)
-                            // Hoist the scale lookup out of the inner loop:
-                            // it's constant within each 128-element block.
-                            for sb in 0..<blocksIn {
-                                let s = e8m0Ptr[Int(scalePtr[bo * blocksIn + sb])]
-                                let jBase = sb * 128
-                                for k in 0..<128 {
-                                    let w = e4m3Ptr[Int(rowIn[jBase + k])]
-                                    rowOut[jBase + k] = packNative(w * s, target)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return out
-}
-
-// ---------- FP4 → native fusion ----------
-//
-// Weight: [out, in/2] packed FP4-E2M1 (low nibble = element 2*i,
-// high nibble = element 2*i+1). Scale: [out, in/32] E8M0.
-//   fused[i, j] = deqE2M1(W_nibble(i, j)) * deqE8M0(S[i, j/32]).
-// Output: [out, in] in `target` — 4× the input weight bytes.
-func fuseFP4ToNative(weightURL: URL, weightOffset: Int,
-                     scaleURL: URL, scaleOffset: Int,
-                     outDim: Int, inDim: Int,
-                     target: TargetDType) throws -> Data {
-    precondition(inDim % 32 == 0, "FP4 weight inDim must be 32-aligned")
-    precondition(inDim % 2 == 0, "FP4 weight inDim must be even (packed pairs)")
-    let blocksIn = inDim / 32
-
-    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
-        throw NSError(domain: "fuseFP4", code: 1)
-    }
-    defer { try? sf.close() }
-    try sf.seek(toOffset: UInt64(scaleOffset))
-    guard let scaleBytes = try sf.read(upToCount: outDim * blocksIn) else {
-        throw NSError(domain: "fuseFP4", code: 2)
-    }
-
-    // Slurp the whole packed-FP4 weight up front so rows can be expanded
-    // in parallel. Packed size is half the logical inDim, so this peak is
-    // a quarter of the BF16 output buffer we're already holding.
-    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
-        throw NSError(domain: "fuseFP4", code: 3)
-    }
-    defer { try? wf.close() }
-    try wf.seek(toOffset: UInt64(weightOffset))
-
-    let packedRowBytes = inDim / 2
-    let weightLen = outDim * packedRowBytes
-    guard let weightBytes = try wf.read(upToCount: weightLen),
-          weightBytes.count == weightLen else {
-        throw NSError(domain: "fuseFP4", code: 4)
-    }
-
-    var out = Data(count: outDim * inDim * 2)
-    out.withUnsafeMutableBytes { outRaw in
-        let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
-        scaleBytes.withUnsafeBytes { scaleRaw in
-            let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            weightBytes.withUnsafeBytes { wRaw in
-                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
-                e2m1LUT.withUnsafeBufferPointer { e2m1 in
-                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
-                        let e2m1Ptr = e2m1.baseAddress!
-                        let e8m0Ptr = e8m0.baseAddress!
-                        // Each row owns a disjoint slice of outPtr; safe
-                        // to fan out across cores.
-                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
-                            let rowIn = wPtr.advanced(by: i * packedRowBytes)
-                            let rowOut = outPtr.advanced(by: i * inDim)
-                            let scaleRow = scalePtr.advanced(by: i * blocksIn)
-                            // 32 logical elements per scale block = 16 packed bytes.
-                            for sb in 0..<blocksIn {
-                                let s = e8m0Ptr[Int(scaleRow[sb])]
-                                let inBase = sb * 16
-                                let outBase = sb * 32
-                                for k in 0..<16 {
-                                    let byte = rowIn[inBase + k]
-                                    let vLow  = e2m1Ptr[Int(byte & 0xF)] * s
-                                    let vHigh = e2m1Ptr[Int(byte >> 4)] * s
-                                    rowOut[outBase + 2 * k]     = packNative(vLow, target)
-                                    rowOut[outBase + 2 * k + 1] = packNative(vHigh, target)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return out
-}
-
-@inline(__always)
-func isFP8DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F8_E4M3" || u == "F8E4M3" || u == "FLOAT8_E4M3FN"
-}
-
-@inline(__always)
-func isFP4DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F4_E2M1" || u == "F4E2M1" || u == "FLOAT4_E2M1FN_X2"
-}
-
-@inline(__always)
-func isE8M0DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F8_E8M0" || u == "F8E8M0" || u == "FLOAT8_E8M0FNU"
-}
 
 // ---------- Walk + collect ----------
 
@@ -569,9 +228,10 @@ struct WriteEntry {
     let source: SafeTensorsWriter.Source
 }
 
-func scaleNameFor(_ weightName: String) -> String {
-    return weightName.replacingOccurrences(of: ".weight", with: ".scale")
-}
+// `scaleNameFor` now lives in DeepSeekConverter (Rename.swift).
+// Imported above; the original definition uses
+// `replacingOccurrences(of:.weight, with:.scale)` which is
+// equivalent for the names we emit (`<base>.weight`).
 
 var writeEntries: [WriteEntry] = []
 var scalesConsumed = Set<String>()    // .scale entries that have been folded in

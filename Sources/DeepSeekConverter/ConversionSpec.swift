@@ -24,6 +24,21 @@ public enum ConversionTarget: String, Sendable, CaseIterable {
         case .keep: return ""  // determined per-tensor
         }
     }
+
+    /// For BF16/F16 (the only target dtypes that emit a single
+    /// tensor per weight) this is 2 bytes per element. The INT*
+    /// paths size their own outputs (sub-byte packing + scale
+    /// companion), so callers that hit those return values here
+    /// don't read them.
+    public var bytesPerElement: Int {
+        switch self {
+        case .bf16, .f16: return 2
+        case .int8:       return 1
+        case .int4:       return 1   // unused; INT4 path computes inDim/2
+        case .int2:       return 1   // unused; INT2 path computes inDim/4
+        case .keep:       return 2   // unused in keep mode
+        }
+    }
 }
 
 /// Input parameters for a HF → native conversion run.
