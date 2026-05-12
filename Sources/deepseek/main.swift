@@ -103,6 +103,7 @@ do {
     exit(1)
 }
 print(" ready.")
+MemoryLogger.snapshot("model-ready", force: true)
 
 // ---------- Prompt formatting ----------
 let promptText: String
@@ -140,6 +141,7 @@ var generatedIds: [Int] = []
 
 // Prefill.
 var logits = model.forward(inputIds: [promptIds], startPos: 0)
+MemoryLogger.snapshot("prefill-complete", force: true)
 var samplingOpts = SamplingOptions(temperature: temperature,
                                     topK: 0, topP: 1.0,
                                     repetitionPenalty: 1.0)
@@ -148,6 +150,8 @@ for step in 0..<maxTokens {
     let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
     if nextId == eosId { break }
     generatedIds.append(nextId)
+    MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
+                          force: true)
 
     // Stream the new token to stdout immediately. In chat mode, we buffer
     // the whole output and parse <think>...</think> at the end so the

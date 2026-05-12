@@ -147,11 +147,13 @@ public extension Transformer {
     static func load(config: ModelConfig, from weightsDir: URL,
                       strategyOverride: String? = nil,
                       forceLoad: Bool = false) throws -> Transformer {
+        MemoryLogger.snapshot("load:start", force: true)
         let plan = try LoadPlan.decide(modelDir: weightsDir,
                                         override: strategyOverride,
                                         forceLoad: forceLoad)
         FileHandle.standardError.write(Data(plan.summary().utf8))
         let loader = try WeightLoader(plan: plan)
+        MemoryLogger.snapshot("load:after-mmap", force: true)
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
@@ -210,6 +212,7 @@ public extension Transformer {
             ?? AssemblyHelpers.randomTensor([hc], rng: &rng, scale: 0.0)
         let hcHeadScale = (try loader.tryLoad(["hc_head_scale"]))
             ?? AssemblyHelpers.randomTensor([1], rng: &rng, scale: 0.5)
+        MemoryLogger.snapshot("load:embed+head-built", force: true)
 
         // ---------- Per-layer ----------
         var blocks: [Block] = []
@@ -341,6 +344,7 @@ public extension Transformer {
                                 hcFfnFn: hcFfnFn, hcFfnBase: hcFfnBase,
                                 hcFfnScale: hcFfnScale))
         }
+        MemoryLogger.snapshot("load:layers-built", force: true)
 
         if !loader.missing.isEmpty {
             FileHandle.standardError.write(Data("""
@@ -361,6 +365,7 @@ public extension Transformer {
         // This matters for `.streaming` strategy; for `.mmap` /
         // `.preload` the loader is held but never queried.
         model.weightLoader = loader
+        MemoryLogger.snapshot("load:complete", force: true)
         return model
     }
 }

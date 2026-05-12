@@ -208,6 +208,7 @@ public final class Transformer {
         precondition(B > 0)
         let S = inputIds[0].count
         for row in inputIds { precondition(row.count == S, "ragged batch not supported") }
+        MemoryLogger.snapshot("forward:start", force: true)
 
         let flatIds: [Int32] = inputIds.flatMap { $0.map(Int32.init) }
         let cmd = Device.shared.queue.makeCommandBuffer()!
@@ -228,6 +229,7 @@ public final class Transformer {
                             threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
         enc.endEncoding()
         cmd.commit(); cmd.waitUntilCompleted()
+        MemoryLogger.snapshot("forward:embed+hc-expanded", force: true)
 
         // 3. Run each block sequentially. Each commits its own buffers.
         //
@@ -252,12 +254,15 @@ public final class Transformer {
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
             loader?.releaseLayer(k)
+            MemoryLogger.snapshot(
+                "forward:layer-\(String(format: "%02d", k))", force: true)
         }
 
         // 4. Head.
         let cmdH = Device.shared.queue.makeCommandBuffer()!
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
+        MemoryLogger.snapshot("forward:complete", force: true)
         return logits
     }
 
