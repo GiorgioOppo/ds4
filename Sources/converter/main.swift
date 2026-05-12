@@ -21,7 +21,7 @@ import DeepSeekKit
 //       --save-path /path/V4-Flash-converted \
 //       --n-experts <N> \
 //       [--model-parallel 1] \
-//       [--target-dtype bf16|f16|int8|keep]   # default: bf16
+//       [--target-dtype bf16|f16|int8|int4|int2|keep]  # default: bf16
 //       [--shard-size-gb 5]                   # default: 5 GB per shard
 //
 // `int8` is a W8A16 weight-only quantization: every Linear weight that
@@ -33,7 +33,7 @@ import DeepSeekKit
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: converter --hf-ckpt-path <dir> --save-path <dir> --n-experts <N>
-                     [--model-parallel 1] [--target-dtype bf16|f16|int8|keep]
+                     [--model-parallel 1] [--target-dtype bf16|f16|int8|int4|int2|keep]
                      [--shard-size-gb 5]
 
     """.utf8))
@@ -41,23 +41,27 @@ func usage() -> Never {
 }
 
 enum TargetDType: String {
-    case bf16, f16, int8, keep
+    case bf16, f16, int8, int4, int2, keep
     var safetensorsTag: String {
         switch self {
         case .bf16: return "BF16"
         case .f16:  return "F16"
         case .int8: return "I8"
+        case .int4: return "I4"
+        case .int2: return "I2"
         case .keep: return ""
         }
     }
     // For BF16/F16 (the only target dtypes that emit a single tensor per
-    // weight) this is 2 bytes per element. For INT8 the byte count per
-    // weight is 1 byte (plus a small F16 scale companion), so callers that
-    // size INT8 outputs compute the size locally rather than reading this.
+    // weight) this is 2 bytes per element. The INT* paths size their own
+    // outputs (sub-byte packing + scale companion), so callers that hit
+    // those return values here are not reading them.
     var bytesPerElement: Int {
         switch self {
         case .bf16, .f16: return 2
         case .int8:       return 1
+        case .int4:       return 1   // unused; INT4 path computes inDim/2
+        case .int2:       return 1   // unused; INT2 path computes inDim/4
         case .keep:       return 2   // unused in keep mode
         }
     }
@@ -562,6 +566,8 @@ func scaleNameFor(_ weightName: String) -> String {
 var writeEntries: [WriteEntry] = []
 var scalesConsumed = Set<String>()    // .scale entries that have been folded in
 var int8QuantizedCount = 0
+var int4QuantizedCount = 0
+var int2QuantizedCount = 0
 
 for newName in plan.keys.sorted() {
     let pt = plan[newName]!
@@ -669,11 +675,95 @@ for newName in plan.keys.sorted() {
         // Fall through: non-whitelisted tensors get BF16 fusion below.
     }
 
-    // Effective target for non-INT8 (or non-whitelisted) tensors: when the
-    // user asked for INT8, anything that didn't quantize falls back to
-    // BF16; otherwise honor the user's target verbatim.
+    // ----- INT4 W4A16 quantization branch -----
+    // Same whitelist + same per-128-block layout as INT8; the only
+    // differences are nibble packing and the [-8, 7] quantization range.
+    if targetDType == .int4 {
+        let outDim = pt.shape[0]
+        let logicalInDim: Int
+        let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
+                                                    (pt.dtype.uppercased() == "I8" ||
+                                                     pt.dtype.uppercased() == "U8"))
+        if isPackedFP4 {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
+        } else {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] : 0
+        }
+
+        if pt.shape.count == 2 &&
+           shouldQuantizeToInt4(newName, lastDim: logicalInDim) {
+            let inDim = logicalInDim
+            let blocksIn = inDim / kInt4GroupK
+            let packedRowBytes = inDim / 2
+            let weightBytes = outDim * packedRowBytes
+            let scaleBytes = outDim * blocksIn * 2
+            let logicalShape = [outDim, inDim]
+            let scaleShape = [outDim, blocksIn]
+            let scaleName = scaleNameFor(newName)
+            let srcDtype = pt.dtype
+            let companion = plan[scaleName]
+            if companion != nil &&
+                (isFP8DType(srcDtype) || isPackedFP4) {
+                scalesConsumed.insert(scaleName)
+            }
+
+            var cached: (weight: Data, scale: Data)? = nil
+            let upper = srcDtype.uppercased()
+            let weightURL = pt.url
+            let weightOffset = pt.offset
+            let scaleURL = companion?.url
+            let scaleOffset = companion?.offset ?? 0
+            let isFP8 = isFP8DType(srcDtype)
+            let isFP4 = isPackedFP4
+            let compute: () throws -> (weight: Data, scale: Data) = {
+                if let c = cached { return c }
+                let r: (weight: Data, scale: Data)
+                if isFP8, let sURL = scaleURL {
+                    r = try quantizeFP8ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e4m3LUT: e4m3LUT, e8m0LUT: e8m0LUT)
+                } else if isFP4, let sURL = scaleURL {
+                    r = try quantizeFP4ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if upper == "BF16" {
+                    r = try quantizeBF16ToInt4(srcURL: weightURL, srcOffset: weightOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "F32" {
+                    r = try quantizeF32ToInt4(srcURL: weightURL, srcOffset: weightOffset,
+                                               outDim: outDim, inDim: inDim)
+                } else {
+                    throw NSError(domain: "Int4Quant", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INT4 quant: unsupported source dtype \(srcDtype) for \(newName)"
+                    ])
+                }
+                cached = r
+                return r
+            }
+
+            writeEntries.append(WriteEntry(
+                name: newName, dtype: "I4", shape: logicalShape, byteCount: weightBytes,
+                source: .compute(byteCount: weightBytes) { try compute().weight }))
+            writeEntries.append(WriteEntry(
+                name: scaleName, dtype: "F16", shape: scaleShape, byteCount: scaleBytes,
+                source: .compute(byteCount: scaleBytes) {
+                    let s = try compute().scale
+                    cached = nil
+                    return s
+                }))
+            int4QuantizedCount += 1
+            continue
+        }
+    }
+
+    // Effective target for non-INT* (or non-whitelisted) tensors: when the
+    // user asked for INT8/INT4/INT2, anything that didn't quantize falls
+    // back to BF16; otherwise honor the user's target verbatim.
     let effectiveTarget: TargetDType =
-        (targetDType == .int8) ? .bf16 : targetDType
+        (targetDType == .int8 || targetDType == .int4 || targetDType == .int2) ? .bf16 : targetDType
 
     // Native-dtype transcoding: FP8/FP4 weight + scale → BF16/F16.
     if effectiveTarget != .keep {
@@ -825,6 +915,14 @@ print("Packing \(writeEntries.count) tensors into \(shards.count) shard(s) " +
 if targetDType == .int8 {
     print("  INT8-quantized:  \(int8QuantizedCount) Linear weight(s) " +
           "(each splits into <name>.weight + <name>.scale).")
+}
+if targetDType == .int4 {
+    print("  INT4-quantized:  \(int4QuantizedCount) Linear weight(s) " +
+          "(each splits into <name>.weight + <name>.scale, packed 2-per-byte).")
+}
+if targetDType == .int2 {
+    print("  INT2-quantized:  \(int2QuantizedCount) Linear weight(s) " +
+          "(each splits into <name>.weight + <name>.scale, packed 4-per-byte).")
 }
 
 // ---------- Write each shard + index.json ----------

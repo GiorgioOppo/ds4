@@ -348,6 +348,8 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
         // and does nothing useful (Linear's switch ignores `scale` for
         // those dtypes).
         let needsScale = w.dtype == .i8
+                      || w.dtype == .i4
+                      || w.dtype == .i2
                       || w.dtype == .fp8E4M3
                       || w.dtype == .fp4E2M1
         let scale: Tensor? = needsScale

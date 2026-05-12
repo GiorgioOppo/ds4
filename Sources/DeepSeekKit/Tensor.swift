@@ -17,14 +17,25 @@ public enum DType: Int, Sendable {
     /// dtype for tensors that the downstream code wants as i32 — see
     /// AssemblyHelpers.castIntToI32).
     case i64 = 8
+    /// 4-bit signed integer (two's complement, range [-8, 7]) packed
+    /// two-per-byte (low nibble = index 2k, high nibble = index 2k+1).
+    /// Storage: 1 byte per 2 values. Symmetric per-row × per-128-block
+    /// F16 scales, mirroring the INT8 layout. See Int4Quant.swift.
+    case i4 = 9
+    /// 2-bit signed integer (two's complement, range [-2, 1]) packed
+    /// four-per-byte (LSB-first: index 4k in bits [1:0], 4k+1 in [3:2],
+    /// 4k+2 in [5:4], 4k+3 in [7:6]). Storage: 1 byte per 4 values.
+    /// Symmetric per-row × per-128-block F16 scales. See Int2Quant.swift.
+    case i2 = 10
 
     public var bitsPerElement: Int {
         switch self {
         case .f32, .i32: return 32
         case .f16, .bf16: return 16
         case .i8, .fp8E4M3, .e8m0: return 8
-        case .fp4E2M1: return 4
+        case .fp4E2M1, .i4: return 4
         case .i64: return 64
+        case .i2: return 2
         }
     }
 }
