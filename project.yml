@@ -1,0 +1,85 @@
+# XcodeGen project specification.
+#
+# Generates `DeepSeekV4Pro.xcodeproj` from this declarative spec so
+# the repo doesn't have to commit the fragile pbxproj format. The
+# generated .xcodeproj is gitignored; this file is the source of
+# truth.
+#
+# One-time setup:
+#     brew install xcodegen
+#
+# Each time this file or the source layout changes:
+#     xcodegen generate
+#     # or:
+#     ./Tools/generate-xcodeproj.sh
+#
+# After generation:
+#     open DeepSeekV4Pro.xcodeproj
+#     # → select scheme "DeepSeekUI" → ⌘R
+#
+# The SPM Package.swift still works as before — `swift run DeepSeekUI`
+# / `swift test` / `swift build` are unchanged. The Xcode project is
+# an alternative entry point that produces a proper .app bundle with
+# codesign, an Info.plist in Contents/, dock icon, and the usual Mac
+# app affordances.
+
+name: DeepSeekV4Pro
+
+options:
+  bundleIdPrefix: com.deepseek.v4pro
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+  defaultConfig: Debug
+
+packages:
+  # The local Swift Package contains DeepSeekKit + the MetalLibPlugin
+  # build tool that compiles .metal kernels. The Xcode App target
+  # below depends only on the DeepSeekKit library product; the kernel
+  # build phase runs transparently when Xcode resolves the package.
+  DeepSeekKit:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Automatic
+    # Ad-hoc signing identity — sufficient for local runs. Replace
+    # with a real Team ID for distribution (Settings → Signing & Caps
+    # → Team in Xcode, or set DEVELOPMENT_TEAM here).
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  DeepSeekUI:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/DeepSeekUI
+        # The Info.plist is referenced via INFOPLIST_FILE below;
+        # exclude it from the Compile Sources phase so Xcode doesn't
+        # try to treat it as a Swift file or duplicate-copy it.
+        excludes:
+          - "Resources/Info.plist"
+    dependencies:
+      - package: DeepSeekKit
+        product: DeepSeekKit
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/DeepSeekUI/Resources/Info.plist
+        # XcodeGen would otherwise auto-generate a stub Info.plist
+        # and conflict with the one we ship.
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.deepseek.v4pro.ui
+        PRODUCT_NAME: "DeepSeek-V4"
+        # The UI is a SwiftUI macOS app, not a sandboxed App Store
+        # build. NSOpenPanel needs filesystem access to /Volumes/...
+        # for the model directory.
+        ENABLE_APP_SANDBOX: NO
+        # Asset catalog hook — empty for now; future: add an
+        # Assets.xcassets with an AppIcon set under Sources/DeepSeekUI/Resources.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
