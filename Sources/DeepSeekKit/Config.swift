@@ -265,10 +265,14 @@ public struct ModelConfig: Codable, Sendable {
         var c = self
         var notes: [String] = []
 
-        // n_layers: trust compress_ratios.count if it differs from current.
-        if c.compressRatios.count != c.nLayers {
-            notes.append("n_layers: \(c.nLayers) → \(c.compressRatios.count) (from compress_ratios.count)")
-            c.nLayers = c.compressRatios.count
+        // n_layers: compress_ratios covers main + MTP layers (model.py:785-791
+        // appends MTPBlock at indices [n_layers, n_layers + n_mtp_layers)
+        // and they index into compress_ratios). Only override when the
+        // config is internally inconsistent.
+        let inferredNLayers = c.compressRatios.count - c.nMtpLayers
+        if inferredNLayers > 0 && inferredNLayers != c.nLayers {
+            notes.append("n_layers: \(c.nLayers) → \(inferredNLayers) (from compress_ratios.count - n_mtp_layers)")
+            c.nLayers = inferredNLayers
         }
 
         // vocab_size + dim: from embed.weight shape [vocab, dim].
