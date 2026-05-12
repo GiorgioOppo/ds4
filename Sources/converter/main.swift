@@ -759,6 +759,90 @@ for newName in plan.keys.sorted() {
         }
     }
 
+    // ----- INT2 W2A16 quantization branch -----
+    // Same shape conventions as INT4 with 4-per-byte packing and the
+    // [-2, 1] quantization range.
+    if targetDType == .int2 {
+        let outDim = pt.shape[0]
+        let logicalInDim: Int
+        let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
+                                                    (pt.dtype.uppercased() == "I8" ||
+                                                     pt.dtype.uppercased() == "U8"))
+        if isPackedFP4 {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
+        } else {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] : 0
+        }
+
+        if pt.shape.count == 2 &&
+           shouldQuantizeToInt2(newName, lastDim: logicalInDim) {
+            let inDim = logicalInDim
+            let blocksIn = inDim / kInt2GroupK
+            let packedRowBytes = inDim / 4
+            let weightBytes = outDim * packedRowBytes
+            let scaleBytes = outDim * blocksIn * 2
+            let logicalShape = [outDim, inDim]
+            let scaleShape = [outDim, blocksIn]
+            let scaleName = scaleNameFor(newName)
+            let srcDtype = pt.dtype
+            let companion = plan[scaleName]
+            if companion != nil &&
+                (isFP8DType(srcDtype) || isPackedFP4) {
+                scalesConsumed.insert(scaleName)
+            }
+
+            var cached: (weight: Data, scale: Data)? = nil
+            let upper = srcDtype.uppercased()
+            let weightURL = pt.url
+            let weightOffset = pt.offset
+            let scaleURL = companion?.url
+            let scaleOffset = companion?.offset ?? 0
+            let isFP8 = isFP8DType(srcDtype)
+            let isFP4 = isPackedFP4
+            let compute: () throws -> (weight: Data, scale: Data) = {
+                if let c = cached { return c }
+                let r: (weight: Data, scale: Data)
+                if isFP8, let sURL = scaleURL {
+                    r = try quantizeFP8ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e4m3LUT: e4m3LUT, e8m0LUT: e8m0LUT)
+                } else if isFP4, let sURL = scaleURL {
+                    r = try quantizeFP4ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if upper == "BF16" {
+                    r = try quantizeBF16ToInt2(srcURL: weightURL, srcOffset: weightOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "F32" {
+                    r = try quantizeF32ToInt2(srcURL: weightURL, srcOffset: weightOffset,
+                                               outDim: outDim, inDim: inDim)
+                } else {
+                    throw NSError(domain: "Int2Quant", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INT2 quant: unsupported source dtype \(srcDtype) for \(newName)"
+                    ])
+                }
+                cached = r
+                return r
+            }
+
+            writeEntries.append(WriteEntry(
+                name: newName, dtype: "I2", shape: logicalShape, byteCount: weightBytes,
+                source: .compute(byteCount: weightBytes) { try compute().weight }))
+            writeEntries.append(WriteEntry(
+                name: scaleName, dtype: "F16", shape: scaleShape, byteCount: scaleBytes,
+                source: .compute(byteCount: scaleBytes) {
+                    let s = try compute().scale
+                    cached = nil
+                    return s
+                }))
+            int2QuantizedCount += 1
+            continue
+        }
+    }
+
     // Effective target for non-INT* (or non-whitelisted) tensors: when the
     // user asked for INT8/INT4/INT2, anything that didn't quantize falls
     // back to BF16; otherwise honor the user's target verbatim.
