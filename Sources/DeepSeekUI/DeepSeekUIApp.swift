@@ -12,5 +12,7 @@ struct DeepSeekUIApp: App {
                 .frame(minWidth: 720, minHeight: 480)
         }
         .windowResizability(.contentMinSize)
+
+        SettingsScene()
     }
 }
