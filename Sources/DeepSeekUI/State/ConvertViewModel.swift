@@ -57,26 +57,30 @@ final class ConvertViewModel: ObservableObject {
                     spec: spec,
                     cancellation: token,
                     binaryOverridePath: binaryOverridePath,
-                    onEvent: { event in
+                    onEvent: { [weak self] event in
                         // Hop to MainActor to mutate @Published state.
-                        Task { @MainActor [weak self] in
+                        // Capture self weakly at the outer Sendable
+                        // boundary; the inner Task then just uses it,
+                        // avoiding the Swift 6 "concurrently-captured
+                        // var" warning.
+                        Task { @MainActor in
                             self?.status.apply(event)
                         }
                     })
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     self?.isRunning = false
-                    // Ensure the rolled-up state shows completion.
                     if self?.status.finishedAt == nil {
                         self?.status.apply(.finished(outputBytes: 0))
                     }
                 }
             } catch {
-                await MainActor.run {
+                await MainActor.run { [weak self] in
                     self?.isRunning = false
                     self?.lastError = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
                 }
             }
+            _ = self  // keep reference alive across the await
         }
     }
 
