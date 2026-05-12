@@ -16,13 +16,7 @@ struct MessageView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let r = message.reasoningContent, !r.isEmpty {
-                    // Commit 5 replaces this with a DisclosureGroup.
-                    Text(r)
-                        .font(.system(.callout, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .padding(8)
-                        .background(Color(NSColor.controlBackgroundColor),
-                                     in: RoundedRectangle(cornerRadius: 8))
+                    ReasoningDisclosure(reasoning: r)
                 }
                 streamingContent
             }
@@ -56,9 +50,17 @@ struct MessageView: View {
                 ProgressView().controlSize(.mini)
                 Text("Thinking…").foregroundStyle(.secondary)
             }
+        } else if isStreaming {
+            // Partial markdown parses ugly (open `**` / unclosed code
+            // fence). Stay on plain Text + blinking caret until done.
+            Text(message.content + "▌")
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if message.role == .assistant {
+            // Finalized: render through Markdown.
+            MarkdownText(raw: message.content)
         } else {
-            // Commit 5 swaps Text for an AttributedString(markdown:) view.
-            Text(message.content + (isStreaming ? "▌" : ""))
+            Text(message.content)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
