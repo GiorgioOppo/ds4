@@ -44,24 +44,47 @@ public struct LoadPlan: Sendable {
 }
 
 public enum LoadStrategyError: Error, CustomStringConvertible, LocalizedError {
-    /// The biggest single shard exceeds the process's available RAM.
-    /// Re-shard the checkpoint (lower `--shard-size-gb` in the
-    /// converter) or run on a host with more memory.
-    case shardTooLarge(maxShard: UInt64, available: UInt64, shardURL: URL)
+    /// The biggest single shard exceeds the conservative shard cap
+    /// (70% of available RAM by default). Refusing here leaves
+    /// headroom for the OS file cache and other processes; without it
+    /// page-faulting during inference can starve the system.
+    case shardTooLarge(maxShard: UInt64, available: UInt64,
+                        capFraction: Double, shardURL: URL)
+    /// Total checkpoint dwarfs available RAM by more than the
+    /// oversubscription multiplier (25× by default). Even MoE models
+    /// with sparse activation can grind a small-RAM host to a halt
+    /// when the working set is dozens of times what's resident.
+    case totalTooLarge(total: UInt64, available: UInt64, multiplier: Double)
     /// `--load-strategy` got something other than auto/preload/mmap.
     case unknownOverride(String)
 
     public var description: String {
         let gib = 1024.0 * 1024.0 * 1024.0
         switch self {
-        case let .shardTooLarge(maxShard, available, shardURL):
+        case let .shardTooLarge(maxShard, available, capFraction, shardURL):
+            let capGB = Double(available) / gib * capFraction
             return """
             largest shard \(shardURL.lastPathComponent) is \
-            \(String(format: "%.2f GB", Double(maxShard) / gib)) but only \
-            \(String(format: "%.2f GB", Double(available) / gib)) of RAM \
-            is available to this process. Free memory (close other apps), \
-            re-shard the checkpoint with a smaller --shard-size-gb in the \
-            converter, or run on a host with more RAM.
+            \(String(format: "%.2f GB", Double(maxShard) / gib)) which exceeds the \
+            conservative cap of \(String(format: "%.2f GB", capGB)) \
+            (\(String(format: "%.0f", capFraction * 100))% of \
+            \(String(format: "%.2f GB", Double(available) / gib)) available). \
+            Free memory (close other apps, run `sudo purge`), re-shard the \
+            checkpoint with a smaller --shard-size-gb in the converter, \
+            or pass --force-load to bypass.
+            """
+        case let .totalTooLarge(total, available, multiplier):
+            let totalGB = Double(total) / gib
+            let availGB = Double(available) / gib
+            return """
+            checkpoint is \(String(format: "%.2f GB", totalGB)) but only \
+            \(String(format: "%.2f GB", availGB)) of RAM is available — \
+            oversubscription ratio \(String(format: "%.1fx", totalGB / availGB)) \
+            exceeds the safety multiplier \
+            (\(String(format: "%.0fx", multiplier))). Mmap'ing a checkpoint \
+            this much larger than RAM tends to thrash the system. Run on a \
+            host with more RAM, re-quantize to a smaller dtype, or pass \
+            --force-load if you accept the risk.
             """
         case let .unknownOverride(s):
             return "unknown --load-strategy value: \(s) (expected auto|preload|mmap)"
@@ -84,6 +107,18 @@ extension LoadPlan {
     static let preloadThresholdNumerator: UInt64 = 4
     static let preloadThresholdDenominator: UInt64 = 5
 
+    /// Conservative RAM policy applied at pre-flight. Defaults are
+    /// tuned for "don't lock up a small-RAM Mac under load":
+    ///   - shardCapFraction = 0.7 leaves a 30% headroom for the OS
+    ///     file cache and other processes when mmap-ing a hot shard.
+    ///   - totalOversubMultiplier = 25 refuses checkpoints that are
+    ///     more than 25× available RAM — even sparse MoE inference
+    ///     tends to thrash above that ratio.
+    /// Both are bypassed when `forceLoad: true` (the `--force-load`
+    /// CLI flag).
+    public static let defaultShardCapFraction: Double = 0.7
+    public static let defaultTotalOversubMultiplier: Double = 25.0
+
     /// `total ≤ 0.80 × available`, computed without floats so the
     /// boundary is exactly representable in tests.
     static func totalFitsPreloadCap(total: UInt64, available: UInt64) -> Bool {
@@ -92,13 +127,26 @@ extension LoadPlan {
             <= available.multipliedReportingOverflow(by: preloadThresholdNumerator).0
     }
 
-    /// Picks `.preload` vs `.mmap`, validates the hard-error guard.
+    /// Picks `.preload` vs `.mmap`, validates the conservative
+    /// pre-flight guards.
     ///
     /// - Parameters:
     ///   - modelDir: directory containing `.safetensors` shards.
-    ///   - override: nil/"auto" → automatic; "preload"/"mmap" → forced
-    ///     (the hard-error refuse-to-start still applies in both cases).
-    public static func decide(modelDir: URL, override: String?) throws -> LoadPlan {
+    ///   - override: nil/"auto" → automatic; "preload"/"mmap" → forced.
+    ///   - forceLoad: bypass the RAM-safety refusals (shardTooLarge,
+    ///     totalTooLarge). The strategy decision still runs; only the
+    ///     two refusal guards are skipped.
+    ///   - shardCapFraction: max shard size as a fraction of available
+    ///     RAM. Default 0.7; pass 1.0 to match the pre-conservative
+    ///     behaviour. Ignored when forceLoad=true.
+    ///   - totalOversubMultiplier: cap on `total/available`. Default
+    ///     25.0; pass .infinity to disable.
+    public static func decide(modelDir: URL,
+                               override: String?,
+                               forceLoad: Bool = false,
+                               shardCapFraction: Double = defaultShardCapFraction,
+                               totalOversubMultiplier: Double = defaultTotalOversubMultiplier
+    ) throws -> LoadPlan {
         let shards = try WeightLoader.discoverShards(in: modelDir)
         let total = shards.reduce(0 as UInt64) { $0 + $1.byteCount }
         let maxShard = shards.map(\.byteCount).max() ?? 0
@@ -107,13 +155,28 @@ extension LoadPlan {
         let mtl = SystemProbe.mtlRecommendedWorkingSet()
         let cores = SystemProbe.cpuCount()
 
-        // Hard guard: the biggest single shard must fit at once, even
-        // with mmap. Demand-paging a >RAM shard works for a moment but
-        // thrashes during inference and risks jetsam.
-        if avail > 0, maxShard > avail {
-            let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
-            throw LoadStrategyError.shardTooLarge(
-                maxShard: maxShard, available: avail, shardURL: biggest)
+        if !forceLoad, avail > 0 {
+            // Guard 1: largest shard must fit with headroom. Without
+            // it the kernel can be forced to evict the file cache (or
+            // worse, page anonymous memory to swap) at every fault on
+            // a hot tensor.
+            let shardCap = UInt64(Double(avail) * shardCapFraction)
+            if maxShard > shardCap {
+                let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
+                throw LoadStrategyError.shardTooLarge(
+                    maxShard: maxShard, available: avail,
+                    capFraction: shardCapFraction, shardURL: biggest)
+            }
+            // Guard 2: catch the wildly-oversubscribed case (e.g.
+            // 277 GB INT8 V4-Flash on a 16 GB Mac with 7 GB free →
+            // ratio 39×, well above 25×). The shard cap alone would
+            // pass these because individual shards are small, but the
+            // working set across a forward still thrashes.
+            if Double(total) > Double(avail) * totalOversubMultiplier {
+                throw LoadStrategyError.totalTooLarge(
+                    total: total, available: avail,
+                    multiplier: totalOversubMultiplier)
+            }
         }
 
         let (strategy, reason) = try Self.pickStrategy(
@@ -159,14 +222,26 @@ extension LoadPlan {
     public static func decideForTesting(
         shards: [(url: URL, byteCount: UInt64)],
         availableRAM: UInt64,
-        override: String? = nil
+        override: String? = nil,
+        forceLoad: Bool = false,
+        shardCapFraction: Double = defaultShardCapFraction,
+        totalOversubMultiplier: Double = defaultTotalOversubMultiplier
     ) throws -> LoadPlan {
         let total = shards.reduce(0 as UInt64) { $0 + $1.byteCount }
         let maxShard = shards.map(\.byteCount).max() ?? 0
-        if availableRAM > 0, maxShard > availableRAM {
-            let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
-            throw LoadStrategyError.shardTooLarge(
-                maxShard: maxShard, available: availableRAM, shardURL: biggest)
+        if !forceLoad, availableRAM > 0 {
+            let shardCap = UInt64(Double(availableRAM) * shardCapFraction)
+            if maxShard > shardCap {
+                let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
+                throw LoadStrategyError.shardTooLarge(
+                    maxShard: maxShard, available: availableRAM,
+                    capFraction: shardCapFraction, shardURL: biggest)
+            }
+            if Double(total) > Double(availableRAM) * totalOversubMultiplier {
+                throw LoadStrategyError.totalTooLarge(
+                    total: total, available: availableRAM,
+                    multiplier: totalOversubMultiplier)
+            }
         }
         let (strategy, reason) = try pickStrategy(
             total: total, available: availableRAM, override: override)

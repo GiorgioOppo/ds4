@@ -145,8 +145,11 @@ public extension Transformer {
     /// stderr summary at the end. This lets a partially-converted or
     /// pruned checkpoint still produce a forward pass.
     static func load(config: ModelConfig, from weightsDir: URL,
-                      strategyOverride: String? = nil) throws -> Transformer {
-        let plan = try LoadPlan.decide(modelDir: weightsDir, override: strategyOverride)
+                      strategyOverride: String? = nil,
+                      forceLoad: Bool = false) throws -> Transformer {
+        let plan = try LoadPlan.decide(modelDir: weightsDir,
+                                        override: strategyOverride,
+                                        forceLoad: forceLoad)
         FileHandle.standardError.write(Data(plan.summary().utf8))
         let loader = try WeightLoader(plan: plan)
         FileHandle.standardError.write(Data(

@@ -6,16 +6,22 @@ import DeepSeekKit
 //                   [--temperature T]
 //                   [--mode raw|chat]
 //                   [--load-strategy auto|preload|mmap]
+//                   [--force-load]
 //
 // `<model-dir>` should contain config.json (optional) and tokenizer.json.
 // safetensors weights are loaded if present, otherwise the model is
 // initialised with random f32 weights so the smoke flow still runs.
+//
+// `--force-load` bypasses the conservative RAM-safety refusals
+// (shard > 70% of available, total > 25× available). Use only if you
+// know you can tolerate aggressive paging — on small-RAM Macs the
+// system can lock up under sustained mmap thrash.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" \
         [--max-tokens N] [--temperature T] [--mode raw|chat] \
-        [--load-strategy auto|preload|mmap]
+        [--load-strategy auto|preload|mmap] [--force-load]
 
     """.utf8))
     exit(2)
@@ -30,6 +36,7 @@ var maxTokens = 32
 var temperature: Float = 1.0
 var mode = "chat"
 var loadStrategy: String? = nil
+var forceLoad = false
 
 var i = 3
 while i < args.count {
@@ -47,6 +54,8 @@ while i < args.count {
         guard i + 1 < args.count,
               ["auto", "preload", "mmap"].contains(args[i + 1]) else { usage() }
         loadStrategy = args[i + 1]; i += 2
+    case "--force-load":
+        forceLoad = true; i += 1
     default: usage()
     }
 }
@@ -87,7 +96,8 @@ fflush(stdout)
 let model: Transformer
 do {
     model = try Transformer.load(config: config, from: modelDir,
-                                  strategyOverride: loadStrategy)
+                                  strategyOverride: loadStrategy,
+                                  forceLoad: forceLoad)
 } catch {
     FileHandle.standardError.write(Data("model load failed: \(error.localizedDescription)\n".utf8))
     exit(1)
