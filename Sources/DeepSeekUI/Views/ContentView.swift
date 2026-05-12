@@ -36,18 +36,22 @@ struct ContentView: View {
                             onCancel:  { phase = .picking })
 
             case .ready(let url, _):
-                ChatContainer(store: ChatStore(
-                    modelDirPath: url.path,
-                    service: service))
+                ChatContainer(
+                    store: ChatStore(modelDirPath: url.path,
+                                      service: service),
+                    onUnload: { phase = .picking })
             }
         }
     }
 }
 
 /// Hosts the `ChatStore` for the lifetime of the .ready phase and
-/// lays out the NavigationSplitView (sidebar + detail).
+/// lays out the NavigationSplitView (sidebar + detail). An "Unload"
+/// toolbar action lets the user drop back to the picker without
+/// quitting the app.
 private struct ChatContainer: View {
     @StateObject var store: ChatStore
+    var onUnload: () -> Void
 
     var body: some View {
         NavigationSplitView {
@@ -55,6 +59,15 @@ private struct ChatContainer: View {
                 .frame(minWidth: 200)
         } detail: {
             ChatView(store: store)
+                .toolbar {
+                    ToolbarItem(placement: .destructiveAction) {
+                        Button {
+                            onUnload()
+                        } label: {
+                            Label("Unload model", systemImage: "eject")
+                        }
+                    }
+                }
         }
     }
 }

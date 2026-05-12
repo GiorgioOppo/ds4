@@ -37,8 +37,32 @@ struct LoadingSettingsTab: View {
                     }
                 }
             }
+            Section("Recent model folders") {
+                if recents.isEmpty {
+                    Text("No recents.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(recents, id: \.self) { path in
+                        HStack {
+                            Text(path)
+                                .font(.system(.body, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Forget") {
+                                AppSettings.forgetRecentDir(path)
+                                recents = AppSettings.recentDirs()
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear { recents = AppSettings.recentDirs() }
     }
+
+    @State private var recents: [String] = AppSettings.recentDirs()
 }

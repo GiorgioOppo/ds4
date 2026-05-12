@@ -60,6 +60,14 @@ struct ChatView: View {
                 .onChange(of: c.messages.count) { _, _ in scrollToBottom(proxy, c) }
                 .onChange(of: scrollBufferLength(phase)) { _, _ in scrollToBottom(proxy, c) }
             }
+            if c.messages.allSatisfy({ $0.role != .assistant || $0.content.isEmpty }),
+               case .idle = phase {
+                Text("First token may take 30 s – 3 min on a small-RAM Mac while weights page in. Subsequent tokens are faster.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 6)
+            }
             Divider()
             ComposerView(draft: $draft, phase: phase,
                           onSend: sendCurrent, onStop: { store.cancel() })
