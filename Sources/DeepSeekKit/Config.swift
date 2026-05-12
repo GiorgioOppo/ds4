@@ -151,4 +151,91 @@ public struct ModelConfig: Codable, Sendable {
 
     /// Per-layer effective head dimensions.
     public var nopeHeadDim: Int { headDim - ropeHeadDim }
+
+    /// Returns a copy of `self` with key dimensions overridden to match
+    /// the actual tensor shapes in `loader`. Use this to recover from a
+    /// `config.json` that's missing fields (e.g. only `head_dim` and
+    /// `compress_ratios` set, leaving `dim`, `n_heads`, `n_layers`, etc.
+    /// at toy defaults that don't match the converted checkpoint).
+    ///
+    /// Each override is reported on stderr so the user can see what was
+    /// inferred. Fields that can't be inferred from the checkpoint
+    /// (max_batch_size, max_seq_len, hcMult, etc.) are left as-is.
+    public func inferred(from loader: WeightLoader) -> ModelConfig {
+        var c = self
+        var notes: [String] = []
+
+        // n_layers: trust compress_ratios.count if it differs from current.
+        if c.compressRatios.count != c.nLayers {
+            notes.append("n_layers: \(c.nLayers) → \(c.compressRatios.count) (from compress_ratios.count)")
+            c.nLayers = c.compressRatios.count
+        }
+
+        // vocab_size + dim: from embed.weight shape [vocab, dim].
+        if let s = loader.shape(ofAny: ["embed.weight", "model.embed.weight"]),
+           s.count == 2 {
+            if s[0] != c.vocabSize {
+                notes.append("vocab_size: \(c.vocabSize) → \(s[0]) (from embed.weight)")
+                c.vocabSize = s[0]
+            }
+            if s[1] != c.dim {
+                notes.append("dim: \(c.dim) → \(s[1]) (from embed.weight)")
+                c.dim = s[1]
+            }
+        }
+
+        // q_lora_rank + n_heads: from layers.0.attn.wq_b.weight shape
+        // [n_heads * head_dim, q_lora_rank].
+        if let s = loader.shape(of: "layers.0.attn.wq_b.weight"), s.count == 2 {
+            let inferredQLora = s[1]
+            if inferredQLora != c.qLoraRank {
+                notes.append("q_lora_rank: \(c.qLoraRank) → \(inferredQLora) (from wq_b)")
+                c.qLoraRank = inferredQLora
+            }
+            if c.headDim > 0 && s[0] % c.headDim == 0 {
+                let inferredHeads = s[0] / c.headDim
+                if inferredHeads != c.nHeads {
+                    notes.append("n_heads: \(c.nHeads) → \(inferredHeads) (from wq_b / head_dim)")
+                    c.nHeads = inferredHeads
+                }
+            }
+        }
+
+        // o_lora_rank: from layers.0.attn.wo_b.weight shape [dim, o_groups * o_lora_rank].
+        if let s = loader.shape(of: "layers.0.attn.wo_b.weight"),
+           s.count == 2, c.oGroups > 0, s[1] % c.oGroups == 0 {
+            let inferredOLora = s[1] / c.oGroups
+            if inferredOLora != c.oLoraRank {
+                notes.append("o_lora_rank: \(c.oLoraRank) → \(inferredOLora) (from wo_b / o_groups)")
+                c.oLoraRank = inferredOLora
+            }
+        }
+
+        // moe_inter_dim: from layers.0.ffn.experts.0.w1.weight shape
+        // [moe_inter_dim, dim].
+        if let s = loader.shape(of: "layers.0.ffn.experts.0.w1.weight"), s.count == 2 {
+            if s[0] != c.moeInterDim {
+                notes.append("moe_inter_dim: \(c.moeInterDim) → \(s[0]) (from expert.w1)")
+                c.moeInterDim = s[0]
+            }
+        }
+
+        // index_n_heads: from indexer wq_b on the first ratio==4 layer.
+        // Shape [index_n_heads * index_head_dim, q_lora_rank].
+        if let firstRatio4 = c.compressRatios.firstIndex(of: 4),
+           let s = loader.shape(of: "layers.\(firstRatio4).attn.indexer.wq_b.weight"),
+           s.count == 2, c.indexHeadDim > 0, s[0] % c.indexHeadDim == 0 {
+            let inferredIdxH = s[0] / c.indexHeadDim
+            if inferredIdxH != c.indexNHeads {
+                notes.append("index_n_heads: \(c.indexNHeads) → \(inferredIdxH) (from indexer.wq_b / index_head_dim)")
+                c.indexNHeads = inferredIdxH
+            }
+        }
+
+        if !notes.isEmpty {
+            FileHandle.standardError.write(Data(("config.json was missing or stale; inferred from checkpoint:\n  "
+                + notes.joined(separator: "\n  ") + "\n").utf8))
+        }
+        return c
+    }
 }

@@ -72,4 +72,21 @@ public final class WeightLoader {
 
     public var totalKnownNames: Int { index.count }
     public var shardCount: Int { shards.count }
+
+    /// Queries the on-disk shape of a tensor without loading its data.
+    /// Useful for auto-inferring missing fields in ModelConfig when
+    /// config.json is incomplete.
+    public func shape(of name: String) -> [Int]? {
+        guard let s = index[name] else { return nil }
+        return shards[s].entries[name]?.shape
+    }
+
+    /// Convenience: try a list of candidate names and return the first
+    /// shape found.
+    public func shape(ofAny candidates: [String]) -> [Int]? {
+        for n in candidates {
+            if let s = shape(of: n) { return s }
+        }
+        return nil
+    }
 }

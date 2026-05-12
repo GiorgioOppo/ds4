@@ -149,6 +149,12 @@ public extension Transformer {
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
+        // Patch missing/stale config fields from actual tensor shapes so a
+        // partial config.json (only head_dim + compress_ratios + n_routed_experts,
+        // for instance) doesn't leave the rest at toy defaults that mismatch
+        // the real checkpoint and produce garbage logits.
+        let config = config.inferred(from: loader)
+
         var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
         let hc = config.hcMult
