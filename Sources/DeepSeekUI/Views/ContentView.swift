@@ -35,36 +35,31 @@ struct ContentView: View {
                             onLoaded: { cfg in phase = .ready(url, cfg) },
                             onCancel:  { phase = .picking })
 
-            case .ready(let url, let cfg):
-                readyPlaceholder(url: url, cfg: cfg)
+            case .ready(let url, _):
+                ChatContainer(store: ChatStore(
+                    modelDirPath: url.path,
+                    service: service))
             }
         }
     }
+}
 
-    /// Commit 3 replaces this with the chat surface (NavigationSplitView).
-    @ViewBuilder
-    private func readyPlaceholder(url: URL, cfg: ModelConfig) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Model ready", systemImage: "checkmark.seal.fill")
-                .foregroundStyle(.green)
-                .font(.title3)
-            Text(url.path)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(.secondary)
-            Divider()
-            Text("layers: \(cfg.nLayers) · heads: \(cfg.nHeads) · dim: \(cfg.dim)")
-                .font(.callout)
-            Text("Chat UI lands in the next commit.")
-                .foregroundStyle(.tertiary)
-                .padding(.top, 12)
-            HStack {
-                Button("Unload & pick another") {
-                    phase = .picking
+/// Hosts a `ChatStore` for the lifetime of the ready phase plus an
+/// "Unload & pick another" toolbar action. Multi-chat lands in
+/// commit 4.
+private struct ChatContainer: View {
+    @StateObject var store: ChatStore
+
+    var body: some View {
+        ChatView(store: store)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        store.newChat()
+                    } label: {
+                        Label("New Chat", systemImage: "plus.bubble")
+                    }
                 }
-                Spacer()
             }
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
