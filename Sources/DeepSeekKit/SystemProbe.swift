@@ -20,17 +20,18 @@ public enum SystemProbe {
         return 0
     }
 
-    /// Best-effort estimate of how many bytes this process can still
-    /// allocate before tripping the jetsam threshold. Prefers
-    /// `os_proc_available_memory()` (introduced in macOS 10.16/iOS 13,
-    /// reports the per-process budget directly). Falls back to
-    /// `host_statistics64(HOST_VM_INFO64)` summing free + inactive +
-    /// speculative pages — the same definition Activity Monitor uses
-    /// for "Memory Free + Cached Files".
+    /// Best-effort estimate of how many bytes are currently
+    /// allocatable on this host before triggering jetsam.
+    ///
+    /// macOS has no per-process available-memory API exposed to
+    /// userland (`os_proc_available_memory` is iOS-only, marked
+    /// `API_UNAVAILABLE(macos)`), so we read the host-wide VM
+    /// statistics and sum the page classes that the kernel treats as
+    /// reclaimable: `free + inactive + speculative`. This matches
+    /// Activity Monitor's "Memory Free + Cached Files" figure and is
+    /// the same metric most pressure-aware tools (`vm_stat`, `top -l`)
+    /// surface.
     public static func processAvailableRAM() -> UInt64 {
-        let osBudget = os_proc_available_memory()
-        if osBudget > 0 { return UInt64(osBudget) }
-
         var stats = vm_statistics64_data_t()
         var count = mach_msg_type_number_t(
             MemoryLayout<vm_statistics64_data_t>.stride /
