@@ -351,12 +351,25 @@ for newName in plan.keys.sorted() {
     if targetDType == .int4 {
         let outDim = pt.shape[0]
         let logicalInDim: Int
+        let scaleName = scaleNameFor(newName)
+        let companion = plan[scaleName]
+        let scaleDtype = companion?.dtype.uppercased() ?? ""
+        // Disambiguate two cases of `pt.dtype == "I8"`:
+        //   - HF V4 ships FP4 expert weights packed two-per-byte
+        //     with safetensors dtype I8/U8 and an E8M0 scale.
+        //   - Our previous INT8 conversion ships real signed-int8
+        //     weights with an F16 scale.
+        // Use the scale dtype to tell them apart so we run the
+        // correct row dequantizer.
         let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
                                                     (pt.dtype.uppercased() == "I8" ||
-                                                     pt.dtype.uppercased() == "U8"))
+                                                     pt.dtype.uppercased() == "U8") &&
+                                                    isE8M0DType(scaleDtype))
+        let isRealInt8 = pt.dtype.uppercased() == "I8" && scaleDtype == "F16"
         if isPackedFP4 {
             logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
         } else {
+            // INT8 and BF16/F32 use the canonical 2D layout.
             logicalInDim = pt.shape.count >= 2 ? pt.shape[1] : 0
         }
 
@@ -369,11 +382,9 @@ for newName in plan.keys.sorted() {
             let scaleBytes = outDim * blocksIn * 2
             let logicalShape = [outDim, inDim]
             let scaleShape = [outDim, blocksIn]
-            let scaleName = scaleNameFor(newName)
             let srcDtype = pt.dtype
-            let companion = plan[scaleName]
             if companion != nil &&
-                (isFP8DType(srcDtype) || isPackedFP4) {
+                (isFP8DType(srcDtype) || isPackedFP4 || isRealInt8) {
                 scalesConsumed.insert(scaleName)
             }
 
@@ -385,6 +396,7 @@ for newName in plan.keys.sorted() {
             let scaleOffset = companion?.offset ?? 0
             let isFP8 = isFP8DType(srcDtype)
             let isFP4 = isPackedFP4
+            let isInt8 = isRealInt8
             let compute: () throws -> (weight: Data, scale: Data) = {
                 if let c = cached { return c }
                 let r: (weight: Data, scale: Data)
@@ -398,6 +410,10 @@ for newName in plan.keys.sorted() {
                                                scaleURL: sURL, scaleOffset: scaleOffset,
                                                outDim: outDim, inDim: inDim,
                                                e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if isInt8, let sURL = scaleURL {
+                    r = try quantizeInt8ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                                scaleURL: sURL, scaleOffset: scaleOffset,
+                                                outDim: outDim, inDim: inDim)
                 } else if upper == "BF16" {
                     r = try quantizeBF16ToInt4(srcURL: weightURL, srcOffset: weightOffset,
                                                 outDim: outDim, inDim: inDim)
@@ -435,9 +451,18 @@ for newName in plan.keys.sorted() {
     if targetDType == .int2 {
         let outDim = pt.shape[0]
         let logicalInDim: Int
+        let scaleName = scaleNameFor(newName)
+        let companion = plan[scaleName]
+        let scaleDtype = companion?.dtype.uppercased() ?? ""
+        // Same FP4-vs-INT8 disambiguation as the INT4 branch above —
+        // see comments there. INT8-source path lets users
+        // re-quantize an existing INT8 checkpoint without going back
+        // to the HF native weights.
         let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
                                                     (pt.dtype.uppercased() == "I8" ||
-                                                     pt.dtype.uppercased() == "U8"))
+                                                     pt.dtype.uppercased() == "U8") &&
+                                                    isE8M0DType(scaleDtype))
+        let isRealInt8 = pt.dtype.uppercased() == "I8" && scaleDtype == "F16"
         if isPackedFP4 {
             logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
         } else {
@@ -453,11 +478,9 @@ for newName in plan.keys.sorted() {
             let scaleBytes = outDim * blocksIn * 2
             let logicalShape = [outDim, inDim]
             let scaleShape = [outDim, blocksIn]
-            let scaleName = scaleNameFor(newName)
             let srcDtype = pt.dtype
-            let companion = plan[scaleName]
             if companion != nil &&
-                (isFP8DType(srcDtype) || isPackedFP4) {
+                (isFP8DType(srcDtype) || isPackedFP4 || isRealInt8) {
                 scalesConsumed.insert(scaleName)
             }
 
@@ -469,6 +492,7 @@ for newName in plan.keys.sorted() {
             let scaleOffset = companion?.offset ?? 0
             let isFP8 = isFP8DType(srcDtype)
             let isFP4 = isPackedFP4
+            let isInt8 = isRealInt8
             let compute: () throws -> (weight: Data, scale: Data) = {
                 if let c = cached { return c }
                 let r: (weight: Data, scale: Data)
@@ -482,6 +506,10 @@ for newName in plan.keys.sorted() {
                                                scaleURL: sURL, scaleOffset: scaleOffset,
                                                outDim: outDim, inDim: inDim,
                                                e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if isInt8, let sURL = scaleURL {
+                    r = try quantizeInt8ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                                scaleURL: sURL, scaleOffset: scaleOffset,
+                                                outDim: outDim, inDim: inDim)
                 } else if upper == "BF16" {
                     r = try quantizeBF16ToInt2(srcURL: weightURL, srcOffset: weightOffset,
                                                 outDim: outDim, inDim: inDim)
