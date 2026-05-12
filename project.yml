@@ -44,13 +44,15 @@ settings:
   base:
     SWIFT_VERSION: "5.10"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    CODE_SIGN_STYLE: Automatic
-    # Ad-hoc signing identity — sufficient for local runs. Replace
-    # with a real Team ID for distribution (Settings → Signing & Caps
-    # → Team in Xcode, or set DEVELOPMENT_TEAM here).
-    CODE_SIGN_IDENTITY: "-"
+    # Local dev: skip codesigning entirely. Faster builds, no
+    # entitlements headaches. Re-enable for distribution by setting
+    # CODE_SIGN_IDENTITY to "Developer ID Application: …" + a
+    # DEVELOPMENT_TEAM.
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
     DEVELOPMENT_TEAM: ""
-    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_HARDENED_RUNTIME: NO
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
 targets:

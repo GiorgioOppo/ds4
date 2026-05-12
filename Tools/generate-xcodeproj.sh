@@ -29,11 +29,19 @@ xcodegen generate
 
 cat <<'EOF'
 
-DeepSeekV4Pro.xcodeproj generated. Open it with:
+DeepSeekV4Pro.xcodeproj generated. **Open the workspace, not the
+xcodeproj** — the workspace lets Xcode resolve the local Swift
+Package at workspace level, avoiding the "Missing package product
+'DeepSeekKit'" trap that hits an xcodeproj sitting next to a
+Package.swift in the same directory.
 
-    open DeepSeekV4Pro.xcodeproj
+    open DeepSeekV4Pro.xcworkspace
 
-then select the "DeepSeekUI" scheme and ⌘R.
+then select the "DeepSeekUI" scheme and ⌘R. If Xcode still reports
+the package as missing on first open:
+
+    File → Packages → Reset Package Caches
+    File → Packages → Resolve Package Versions
 
 Re-run this script after editing project.yml or after restructuring
 the source tree (XcodeGen scans Sources/DeepSeekUI but caches it in
