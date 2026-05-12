@@ -475,6 +475,8 @@ let dtypeNote: String
 switch targetDType {
 case .keep: dtypeNote = "(non-native FP8/FP4 preserved)"
 case .int8: dtypeNote = "(Linear weights → INT8 W8A16 + F16 group scales; other tensors → BF16)"
+case .int4: dtypeNote = "(Linear weights → INT4 W4A16 packed 2-per-byte + F16 group scales; other tensors → BF16)"
+case .int2: dtypeNote = "(Linear weights → INT2 W2A16 packed 4-per-byte + F16 group scales; other tensors → BF16)"
 case .bf16, .f16: dtypeNote = "(FP8/FP4+scale fused into native)"
 }
 print("  target dtype:    \(targetDType.rawValue) \(dtypeNote)")
@@ -485,6 +487,12 @@ case .keep:
     break
 case .int8:
     print("  note:            INT8 quant covers Linear weights only; net disk ≈ ½ × BF16.")
+case .int4:
+    print("  note:            INT4 quant covers Linear weights only; net disk ≈ ¼ × BF16. " +
+          "Accuracy lower than INT8 — RTN only, no calibration.")
+case .int2:
+    print("  note:            INT2 quant covers Linear weights only; net disk ≈ ⅛ × BF16. " +
+          "Brutal accuracy hit at this bit-width — RTN only, calibration recommended for production.")
 case .bf16, .f16:
     print("  note:            FP8 → 2× size, FP4 → 4× size; expect ~3-4× the " +
           "input directory's footprint on disk.")
