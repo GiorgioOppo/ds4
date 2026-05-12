@@ -29,7 +29,8 @@ kernel void gemm_bf16_to_f32_sg(
     constant uint3&      dims  [[buffer(3)]],   // (M, N, K)
     uint2 gpos [[threadgroup_position_in_grid]]
 ) {
-    uint M = dims.x, N = dims.y, K = dims.z;
+    // M is implicit in the grid dispatch (gpos.y) so we don't read it here.
+    uint N = dims.y, K = dims.z;
     uint row0 = gpos.y * SG_TM;
     uint col0 = gpos.x * SG_TN;
 
@@ -79,7 +80,8 @@ kernel void gemm_f32_bf16_to_f32_sg(
     uint  lid  [[thread_index_in_simdgroup]],
     uint2 gpos [[threadgroup_position_in_grid]]
 ) {
-    uint M = dims.x, N = dims.y, K = dims.z;
+    // M is implicit in the grid dispatch (gpos.y) so we don't read it here.
+    uint N = dims.y, K = dims.z;
     uint row0 = gpos.y * SG_TM;
     uint col0 = gpos.x * SG_TN;
 

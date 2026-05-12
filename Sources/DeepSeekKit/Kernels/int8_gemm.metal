@@ -134,7 +134,9 @@ kernel void gemm_int8_w8a16_to_f32_sg(
     uint  tid  [[thread_index_in_simdgroup]],
     uint2 gpos [[threadgroup_position_in_grid]]
 ) {
-    uint M = dims.x, N = dims.y, K = dims.z;
+    // M is implicit in the grid dispatch (gpos.y); skip reading it
+    // from `dims` so -Wunused-variable stays quiet.
+    uint N = dims.y, K = dims.z;
     uint row0 = gpos.y * SG_INT8_TM;
     uint col0 = gpos.x * SG_INT8_TN;
     uint blocksK = K / SG_INT8_K_BLOCK;
@@ -185,7 +187,9 @@ kernel void gemm_int8_w8a16_bf16_to_f32_sg(
     uint  tid  [[thread_index_in_simdgroup]],
     uint2 gpos [[threadgroup_position_in_grid]]
 ) {
-    uint M = dims.x, N = dims.y, K = dims.z;
+    // M is implicit in the grid dispatch (gpos.y); skip reading it
+    // from `dims` so -Wunused-variable stays quiet.
+    uint N = dims.y, K = dims.z;
     uint row0 = gpos.y * SG_INT8_TM;
     uint col0 = gpos.x * SG_INT8_TN;
     uint blocksK = K / SG_INT8_K_BLOCK;

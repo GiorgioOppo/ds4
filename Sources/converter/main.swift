@@ -237,6 +237,8 @@ func packNative(_ f: Float, _ target: TargetDType) -> UInt16 {
     case .bf16: return floatToBF16(f)
     case .f16:  return floatToF16(f)
     case .int8: fatalError("packNative requires bf16 or f16; INT8 path uses Int8Quant")
+    case .int4: fatalError("packNative requires bf16 or f16; INT4 path uses Int4Quant")
+    case .int2: fatalError("packNative requires bf16 or f16; INT2 path uses Int2Quant")
     case .keep: fatalError("packNative requires bf16 or f16")
     }
 }
