@@ -161,6 +161,27 @@ public extension Transformer {
         // the real checkpoint and produce garbage logits.
         let config = config.inferred(from: loader)
 
+        // Refuse early if the projected KV cache size at the chosen
+        // (max_seq_len, max_batch_size) would blow the budget. KV
+        // caches are dense storageModeShared MTLBuffers (not mmap),
+        // streaming hints don't help. Common trap: the HF config
+        // ships max_position_embeddings = 1M, which on a 16 GB Mac
+        // tries to allocate ~50 GB of KV state at load time and
+        // jetsams the process.
+        let kvProjected = config.projectedKVCacheBytes
+        let kvBudget = SystemProbe.effectiveProcessBudget()
+        if kvBudget > 0, kvProjected > kvBudget {
+            throw LoadStrategyError.kvCacheTooLarge(
+                projected: kvProjected,
+                available: kvBudget,
+                maxSeqLen: config.maxSeqLen,
+                maxBatchSize: config.maxBatchSize)
+        }
+        FileHandle.standardError.write(Data(String(
+            format: "Projected KV cache: %.2f GB at max_seq_len=%d, max_batch_size=%d.\n",
+            Double(kvProjected) / 1_073_741_824.0,
+            config.maxSeqLen, config.maxBatchSize).utf8))
+
         var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
         let hc = config.hcMult

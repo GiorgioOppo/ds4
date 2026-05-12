@@ -252,6 +252,55 @@ public struct ModelConfig: Codable, Sendable {
     /// Per-layer effective head dimensions.
     public var nopeHeadDim: Int { headDim - ropeHeadDim }
 
+    /// Coarse upper bound on the total bytes of attention KV cache
+    /// the model will allocate at load time (per Assembly.swift's
+    /// `Tensor.empty(...)` calls for each layer's kvCache + the
+    /// indexer/compressor caches). Streaming the weights doesn't
+    /// help these — they're real `storageModeShared` MTLBuffers
+    /// the GPU writes to during forward, so they have to stay
+    /// resident at full size.
+    ///
+    /// Formula (rough): for each layer with compress ratio R,
+    ///   maxBatchSize × (windowSize + maxSeqLen / max(R, 1)) × headDim × 4
+    /// plus a comparable indexer cache on layers where R == 4.
+    /// MTP layers add another batch's worth.
+    public var projectedKVCacheBytes: UInt64 {
+        var total: UInt64 = 0
+        let perRow = UInt64(maxBatchSize) * UInt64(headDim) * 4   // f32 bytes
+        let win = UInt64(windowSize)
+        let seq = UInt64(maxSeqLen)
+
+        for i in 0..<min(nLayers, compressRatios.count) {
+            let r = compressRatios[i]
+            let cacheRows = r > 0
+                ? win &+ (seq / UInt64(r))
+                : win
+            // Attention KV cache.
+            total &+= cacheRows &* perRow
+            // Indexer KV cache lives on ratio==4 layers and is
+            // roughly the same size.
+            if r == 4 {
+                total &+= cacheRows &* perRow
+            }
+            // Compressor `kvState` + `cacheView` (alias of kvState,
+            // but I count once; cacheView shares storage).
+            let coff = UInt64(hcMult)
+            if r > 0 {
+                total &+= coff &* UInt64(r) &* UInt64(maxBatchSize)
+                    &* UInt64(headDim) &* 4
+            }
+        }
+        // MTP layers reuse the same shapes; ~1 batch each.
+        for j in 0..<nMtpLayers {
+            let idx = nLayers + j
+            guard idx < compressRatios.count else { break }
+            let r = compressRatios[idx]
+            let cacheRows = r > 0 ? win &+ (seq / UInt64(r)) : win
+            total &+= cacheRows &* perRow
+        }
+        return total
+    }
+
     /// Returns a copy of `self` with key dimensions overridden to match
     /// the actual tensor shapes in `loader`. Use this to recover from a
     /// `config.json` that's missing fields (e.g. only `head_dim` and

@@ -71,11 +71,17 @@ public enum LoadStrategyError: Error, CustomStringConvertible, LocalizedError {
     /// page-faulting during inference can starve the system.
     case shardTooLarge(maxShard: UInt64, available: UInt64,
                         capFraction: Double, shardURL: URL)
-    /// Total checkpoint dwarfs available RAM by more than the
-    /// oversubscription multiplier (25× by default). Even MoE models
-    /// with sparse activation can grind a small-RAM host to a halt
-    /// when the working set is dozens of times what's resident.
+    /// Retained for API compatibility; no longer thrown by
+    /// `decide()` since pickStrategy downgrades to `.streaming`.
     case totalTooLarge(total: UInt64, available: UInt64, multiplier: Double)
+    /// Projected KV cache size at the configured `max_seq_len` ×
+    /// `max_batch_size` exceeds the unified-memory budget.
+    /// Streaming can't help: KV caches are real `storageModeShared`
+    /// MTLBuffers (not mmap'd file pages), the GPU writes to them
+    /// during forward, so every byte stays resident. Lower
+    /// `max_position_embeddings` / `max_batch_size` in config.json.
+    case kvCacheTooLarge(projected: UInt64, available: UInt64,
+                          maxSeqLen: Int, maxBatchSize: Int)
     /// `--load-strategy` got something other than auto/preload/mmap.
     case unknownOverride(String)
 
@@ -106,6 +112,18 @@ public enum LoadStrategyError: Error, CustomStringConvertible, LocalizedError {
             this much larger than RAM tends to thrash the system. Run on a \
             host with more RAM, re-quantize to a smaller dtype, or pass \
             --force-load if you accept the risk.
+            """
+        case let .kvCacheTooLarge(projected, available, maxSeq, maxBatch):
+            return """
+            projected KV cache is \
+            \(String(format: "%.2f GB", Double(projected) / gib)) at \
+            max_position_embeddings=\(maxSeq), max_batch_size=\(maxBatch), \
+            but only \(String(format: "%.2f GB", Double(available) / gib)) of unified \
+            memory is available to this process. KV caches are dense MTLBuffers, \
+            not mmap'd file pages — streaming doesn't help and force-load won't \
+            either. Edit config.json:
+              jq '.max_position_embeddings = 4096 | .max_batch_size = 1' \
+                  <model-dir>/config.json > /tmp/c.json && mv /tmp/c.json <model-dir>/config.json
             """
         case let .unknownOverride(s):
             return "unknown --load-strategy value: \(s) (expected auto|preload|mmap)"
