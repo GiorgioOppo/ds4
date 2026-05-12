@@ -252,25 +252,38 @@ public final class WeightLoader {
     }
 
     /// Hint to the kernel that layer K's pages will be touched
-    /// soon. No-op unless `streamingEnabled` is true. Idempotent.
+    /// soon. Currently a no-op even when streamingEnabled — the
+    /// MADV_WILLNEED variant of the previous revision caused
+    /// triple-residency (K-1 pending eviction + K active + K+1
+    /// pre-faulted) that OOM'd 16 GB Macs during forward. Leaving
+    /// the API in place for future re-introduction once we have a
+    /// better way to bound residency.
     public func prefetchLayer(_ layerIndex: Int) {
-        guard streamingEnabled else { return }
-        for (shardIdx, owner) in shardLayers.enumerated()
-            where owner == layerIndex {
-            adviseShard(shardIdx, advice: MADV_WILLNEED)
-        }
+        // Intentional no-op. See doc comment.
+        _ = layerIndex
     }
 
-    /// Hint to the kernel that layer K's pages are cold and can be
-    /// reclaimed. Top-level / shared shards (`owner == -1`) are
-    /// always skipped. No-op unless `streamingEnabled`.
+    /// Aggressively reclaim layer K's pages. Uses MADV_FREE_REUSABLE
+    /// — Darwin's "this region's pages can be dropped *immediately*,
+    /// I'll refault them if I touch them again" advisory, much
+    /// stronger than the previous MADV_DONTNEED hint which the
+    /// kernel only honoured under severe pressure.
+    ///
+    /// Called from `Transformer.forward` right after each layer's
+    /// `commit+wait`. No-op unless `streamingEnabled`. Top-level
+    /// shards (owner == -1) skipped.
     public func releaseLayer(_ layerIndex: Int) {
         guard streamingEnabled else { return }
         for (shardIdx, owner) in shardLayers.enumerated()
             where owner == layerIndex {
-            adviseShard(shardIdx, advice: MADV_DONTNEED)
+            adviseShard(shardIdx, advice: Self.MADV_FREE_REUSABLE)
         }
     }
+
+    /// Darwin's MADV_FREE_REUSABLE constant (sys/mman.h). Defined
+    /// statically because Swift's Darwin shim sometimes doesn't
+    /// re-export this even when it's available at the C layer.
+    private static let MADV_FREE_REUSABLE: Int32 = 7
 
     private func adviseShard(_ idx: Int, advice: Int32) {
         let buf = shards[idx].sharedBuffer

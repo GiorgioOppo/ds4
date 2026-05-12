@@ -232,27 +232,26 @@ public final class Transformer {
         // 3. Run each block sequentially. Each commits its own buffers.
         //
         // Streaming hints: when `weightLoader.streamingEnabled` is
-        // true, we prefetch layer K+1's pages while computing K (the
-        // commit/wait below gives the kernel time to fault them in),
-        // and release layer K-1's pages after the wait so the
-        // working set stays bounded. Lag-1 retention so that
-        // committing layer K's command buffer can still touch K-1's
-        // pages while the GPU is doing its post-launch cleanup.
+        // true, we release layer K's pages immediately after its
+        // commit+wait completes. Working window is bounded to one
+        // layer at a time (~max-shard bytes), with shared shards
+        // (embed/head/norms, owner == -1) excluded from release.
+        //
+        // Previous revision added MADV_WILLNEED prefetch on K+1
+        // before computing K. That backfired: the kernel would
+        // start pulling K+1's pages while K-1's MADV_DONTNEED hint
+        // hadn't been honoured yet → ~3 layers resident
+        // simultaneously, OOMing 16 GB Macs. Letting the natural
+        // page-fault path handle the next layer keeps residency
+        // strictly to "the layer the GPU is currently reading
+        // from".
         var x = hExpanded.reshape([B, S, hc, config.dim])
         let loader = self.weightLoader
         for (k, layer) in layers.enumerated() {
-            if let l = loader, k + 1 < layers.count {
-                l.prefetchLayer(k + 1)
-            }
             var cmdL = Device.shared.queue.makeCommandBuffer()!
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
-            if let l = loader, k >= 1 {
-                l.releaseLayer(k - 1)
-            }
-        }
-        if let l = loader, !layers.isEmpty {
-            l.releaseLayer(layers.count - 1)
+            loader?.releaseLayer(k)
         }
 
         // 4. Head.
