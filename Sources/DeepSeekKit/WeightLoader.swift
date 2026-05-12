@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 /// Indexes every `.safetensors` shard in a directory and exposes a
 /// `load(name:)` API that returns the tensor regardless of which shard it
@@ -16,40 +17,118 @@ public final class WeightLoader {
     private var index: [String: Int] = [:]   // name → shards[index]
     public private(set) var missing: Set<String> = []
 
-    public init(directory: URL) throws {
-        self.directory = directory
+    /// Construct from an already-decided `LoadPlan`. The plan owns the
+    /// list of shards and chooses mmap vs preload; this initializer
+    /// just opens them. Preload is parallelized via
+    /// `DispatchQueue.concurrentPerform`; mmap stays sequential (the
+    /// VM-mapping syscall is microseconds, parallelism is noise).
+    public init(plan: LoadPlan) throws {
+        guard let first = plan.shards.first else {
+            throw NSError(domain: "WeightLoader", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "LoadPlan has no shards"
+            ])
+        }
+        self.directory = first.url.deletingLastPathComponent()
+
+        switch plan.strategy {
+        case .mmap:
+            for (url, _) in plan.shards {
+                let f = try SafeTensorsFile(url: url)
+                let shardIdx = shards.count
+                shards.append(f)
+                for name in f.entries.keys { index[name] = shardIdx }
+            }
+
+        case .preload:
+            // Pre-size and fill in parallel; flatten + index after.
+            // `concurrentPerform` saturates the GCD default-pool width
+            // (≈ active cores). On a single APFS-on-NVMe volume that
+            // exceeds the ~4-stream sweet spot, but the extra threads
+            // mostly block on read syscalls — measured penalty is small
+            // and not worth gating with a semaphore.
+            let n = plan.shards.count
+            var slots: [SafeTensorsFile?] = Array(repeating: nil, count: n)
+            var firstError: Error?
+            let lock = NSLock()
+            DispatchQueue.concurrentPerform(iterations: n) { i in
+                lock.lock()
+                let abort = firstError != nil
+                lock.unlock()
+                if abort { return }
+                do {
+                    let (url, bytes) = plan.shards[i]
+                    let f = try SafeTensorsFile(preloadedURL: url, byteCount: bytes)
+                    slots[i] = f
+                } catch {
+                    lock.lock()
+                    if firstError == nil { firstError = error }
+                    lock.unlock()
+                }
+            }
+            if let e = firstError { throw e }
+            for f in slots {
+                guard let f else {
+                    throw NSError(domain: "WeightLoader", code: 4, userInfo: [
+                        NSLocalizedDescriptionKey: "preload returned a nil slot"
+                    ])
+                }
+                let shardIdx = shards.count
+                shards.append(f)
+                for name in f.entries.keys { index[name] = shardIdx }
+            }
+        }
+    }
+
+    /// Backwards-compat convenience: build a default `mmap` plan
+    /// covering the whole directory, then delegate. Kept so existing
+    /// tests and callers that don't care about strategy keep
+    /// compiling.
+    public convenience init(directory: URL) throws {
+        let shards = try Self.discoverShards(in: directory)
+        let total = shards.reduce(0 as UInt64) { $0 + $1.byteCount }
+        let maxShard = shards.map(\.byteCount).max() ?? 0
+        let plan = LoadPlan(
+            strategy: .mmap, shards: shards.map { ($0.url, $0.byteCount) },
+            totalBytes: total, maxShardBytes: maxShard,
+            availableRAM: 0, physicalRAM: 0, mtlWorkingSet: 0,
+            cores: 0, reason: "legacy WeightLoader(directory:) — mmap default")
+        try self.init(plan: plan)
+    }
+
+    /// Enumerate `.safetensors` shards in `dir`, skipping LFS pointer
+    /// stubs (3-line text files < 1 KiB), and return them sorted by
+    /// filename together with their byte size. Used by both
+    /// `LoadPlan.decide` (to total / cap-check) and `WeightLoader.init`
+    /// (to actually open them).
+    public static func discoverShards(in dir: URL) throws -> [(url: URL, byteCount: UInt64)] {
         let fm = FileManager.default
-        let contents = (try? fm.contentsOfDirectory(at: directory,
+        let contents = (try? fm.contentsOfDirectory(at: dir,
                                                      includingPropertiesForKeys: nil)) ?? []
-        let sortedShards = contents
+        let candidates = contents
             .filter { $0.pathExtension == "safetensors" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
-        if sortedShards.isEmpty {
+        if candidates.isEmpty {
             throw NSError(domain: "WeightLoader", code: 1, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "no .safetensors files in \(directory.path) — did you run convert.py?"
+                    "no .safetensors files in \(dir.path) — did you run convert.py?"
             ])
         }
 
-        for url in sortedShards {
-            // Skip the LFS pointer files (3-line text files masquerading as
-            // safetensors when LFS payload wasn't fetched).
+        var out: [(URL, UInt64)] = []
+        for url in candidates {
             let attrs = try fm.attributesOfItem(atPath: url.path)
-            if let size = attrs[.size] as? Int, size < 1024 { continue }
-
-            let f = try SafeTensorsFile(url: url)
-            let shardIdx = shards.count
-            shards.append(f)
-            for name in f.entries.keys { index[name] = shardIdx }
+            let size = (attrs[.size] as? Int) ?? 0
+            if size < 1024 { continue }   // LFS pointer stub
+            out.append((url, UInt64(size)))
         }
-
-        if shards.isEmpty {
+        if out.isEmpty {
             throw NSError(domain: "WeightLoader", code: 2, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "all safetensors files in \(directory.path) were LFS pointers — run `git lfs pull` or download the actual blobs"
+                    "all safetensors files in \(dir.path) were LFS pointers — run `git lfs pull` or download the actual blobs"
             ])
         }
+        return out
     }
 
     /// Returns the tensor for `name`, or nil if not present.

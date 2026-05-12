@@ -5,6 +5,7 @@ import DeepSeekKit
 //                   [--max-tokens N]
 //                   [--temperature T]
 //                   [--mode raw|chat]
+//                   [--load-strategy auto|preload|mmap]
 //
 // `<model-dir>` should contain config.json (optional) and tokenizer.json.
 // safetensors weights are loaded if present, otherwise the model is
@@ -13,7 +14,8 @@ import DeepSeekKit
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" \
-        [--max-tokens N] [--temperature T] [--mode raw|chat]
+        [--max-tokens N] [--temperature T] [--mode raw|chat] \
+        [--load-strategy auto|preload|mmap]
 
     """.utf8))
     exit(2)
@@ -27,6 +29,7 @@ let prompt = args[2]
 var maxTokens = 32
 var temperature: Float = 1.0
 var mode = "chat"
+var loadStrategy: String? = nil
 
 var i = 3
 while i < args.count {
@@ -40,6 +43,10 @@ while i < args.count {
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
+    case "--load-strategy":
+        guard i + 1 < args.count,
+              ["auto", "preload", "mmap"].contains(args[i + 1]) else { usage() }
+        loadStrategy = args[i + 1]; i += 2
     default: usage()
     }
 }
@@ -79,7 +86,8 @@ print("Loading model …", terminator: "")
 fflush(stdout)
 let model: Transformer
 do {
-    model = try Transformer.load(config: config, from: modelDir)
+    model = try Transformer.load(config: config, from: modelDir,
+                                  strategyOverride: loadStrategy)
 } catch {
     FileHandle.standardError.write(Data("model load failed: \(error.localizedDescription)\n".utf8))
     exit(1)

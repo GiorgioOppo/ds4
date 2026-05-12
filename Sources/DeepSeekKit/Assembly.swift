@@ -144,8 +144,11 @@ public extension Transformer {
     /// Names that can't be found are filled in with random init plus a
     /// stderr summary at the end. This lets a partially-converted or
     /// pruned checkpoint still produce a forward pass.
-    static func load(config: ModelConfig, from weightsDir: URL) throws -> Transformer {
-        let loader = try WeightLoader(directory: weightsDir)
+    static func load(config: ModelConfig, from weightsDir: URL,
+                      strategyOverride: String? = nil) throws -> Transformer {
+        let plan = try LoadPlan.decide(modelDir: weightsDir, override: strategyOverride)
+        FileHandle.standardError.write(Data(plan.summary().utf8))
+        let loader = try WeightLoader(plan: plan)
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
