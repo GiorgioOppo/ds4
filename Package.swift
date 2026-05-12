@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .library(name: "DeepSeekKit", targets: ["DeepSeekKit"]),
+        .library(name: "DeepSeekConverter", targets: ["DeepSeekConverter"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
         .executable(name: "converter", targets: ["converter"]),
         .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
@@ -30,9 +31,14 @@ let package = Package(
             dependencies: ["DeepSeekKit"],
             path: "Sources/deepseek"
         ),
+        .target(
+            name: "DeepSeekConverter",
+            dependencies: ["DeepSeekKit"],
+            path: "Sources/DeepSeekConverter"
+        ),
         .executableTarget(
             name: "converter",
-            dependencies: ["DeepSeekKit"],
+            dependencies: ["DeepSeekKit", "DeepSeekConverter"],
             path: "Sources/converter"
         ),
         .executableTarget(
