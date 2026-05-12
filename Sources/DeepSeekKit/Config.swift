@@ -143,10 +143,110 @@ public struct ModelConfig: Codable, Sendable {
         self.hcEps              = g(.hcEps, 1e-6)
     }
 
+    /// Loads a config.json. Accepts both the Swift-port snake_case names
+    /// (used by Reference/inference/model.py and tests in this repo) and
+    /// the HuggingFace `transformers` field names (used by the upstream
+    /// model card's config.json). For HF, also flattens nested
+    /// `rope_scaling.{factor,original_max_position_embeddings,beta_fast,beta_slow}`.
     public static func load(from url: URL) throws -> ModelConfig {
         let data = try Data(contentsOf: url)
-        let decoder = JSONDecoder()
-        return try decoder.decode(ModelConfig.self, from: data)
+        guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "ModelConfig", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "config.json is not a JSON object"])
+        }
+        return ModelConfig(fromDict: dict)
+    }
+
+    /// Initializes from a parsed JSON dictionary, accepting multiple
+    /// key aliases per field (Swift-port name + HF name).
+    public init(fromDict dict: [String: Any]) {
+        // Flatten HF's nested rope_scaling so the lookup helpers below
+        // can treat its members like top-level keys.
+        var flat = dict
+        if let rs = dict["rope_scaling"] as? [String: Any] {
+            for (k, v) in rs { flat["rope_scaling.\(k)"] = v }
+        }
+
+        func intOf(_ any: Any) -> Int? {
+            if let v = any as? Int { return v }
+            if let v = any as? Double { return Int(v) }
+            if let v = any as? NSNumber { return v.intValue }
+            return nil
+        }
+        func floatOf(_ any: Any) -> Float? {
+            if let v = any as? Double { return Float(v) }
+            if let v = any as? Float  { return v }
+            if let v = any as? Int    { return Float(v) }
+            if let v = any as? NSNumber { return v.floatValue }
+            return nil
+        }
+        func getInt(_ keys: [String], _ fallback: Int) -> Int {
+            for k in keys { if let v = flat[k], let i = intOf(v) { return i } }
+            return fallback
+        }
+        func getFloat(_ keys: [String], _ fallback: Float) -> Float {
+            for k in keys { if let v = flat[k], let f = floatOf(v) { return f } }
+            return fallback
+        }
+        func getString(_ keys: [String], _ fallback: String) -> String {
+            for k in keys { if let v = flat[k] as? String { return v } }
+            return fallback
+        }
+        func getOptString(_ keys: [String]) -> String? {
+            for k in keys {
+                if let v = flat[k] as? String { return v }
+                if flat[k] is NSNull { return nil }
+            }
+            return nil
+        }
+        func getIntArray(_ keys: [String], _ fallback: [Int]) -> [Int] {
+            for k in keys {
+                if let arr = flat[k] as? [Any] {
+                    return arr.compactMap(intOf)
+                }
+            }
+            return fallback
+        }
+
+        self.maxBatchSize       = getInt(["max_batch_size"], 4)
+        self.maxSeqLen          = getInt(["max_seq_len", "max_position_embeddings"], 4096)
+        self.dtype              = getString(["dtype", "torch_dtype"], "fp8")
+        self.scaleFmt           = getOptString(["scale_fmt"]) ?? "ue8m0"
+        self.expertDtype        = getOptString(["expert_dtype"])
+        self.scaleDtype         = getString(["scale_dtype"], "fp8")
+        self.vocabSize          = getInt(["vocab_size"], 129280)
+        self.dim                = getInt(["dim", "hidden_size"], 4096)
+        self.moeInterDim        = getInt(["moe_inter_dim", "moe_intermediate_size"], 4096)
+        self.nLayers            = getInt(["n_layers", "num_hidden_layers"], 7)
+        self.nHashLayers        = getInt(["n_hash_layers", "num_hash_layers"], 0)
+        self.nMtpLayers         = getInt(["n_mtp_layers", "num_nextn_predict_layers"], 1)
+        self.nHeads             = getInt(["n_heads", "num_attention_heads"], 64)
+        self.nRoutedExperts     = getInt(["n_routed_experts"], 8)
+        self.nSharedExperts     = getInt(["n_shared_experts"], 1)
+        self.nActivatedExperts  = getInt(["n_activated_experts", "num_experts_per_tok"], 2)
+        self.scoreFunc          = getString(["score_func", "scoring_func"], "sqrtsoftplus")
+        self.routeScale         = getFloat(["route_scale", "routed_scaling_factor"], 1.0)
+        self.swigluLimit        = getFloat(["swiglu_limit"], 0.0)
+        self.qLoraRank          = getInt(["q_lora_rank"], 1024)
+        self.headDim            = getInt(["head_dim"], 512)
+        self.ropeHeadDim        = getInt(["rope_head_dim", "qk_rope_head_dim"], 64)
+        self.normEps            = getFloat(["norm_eps", "rms_norm_eps"], 1e-6)
+        self.oGroups            = getInt(["o_groups"], 8)
+        self.oLoraRank          = getInt(["o_lora_rank"], 1024)
+        self.windowSize         = getInt(["window_size", "sliding_window"], 128)
+        self.compressRatios     = getIntArray(["compress_ratios"], [0, 0, 4, 128, 4, 128, 4, 0])
+        self.compressRopeTheta  = getFloat(["compress_rope_theta"], 40000.0)
+        self.originalSeqLen     = getInt(["original_seq_len", "rope_scaling.original_max_position_embeddings"], 0)
+        self.ropeTheta          = getFloat(["rope_theta"], 10000.0)
+        self.ropeFactor         = getFloat(["rope_factor", "rope_scaling.factor"], 40)
+        self.betaFast           = getInt(["beta_fast", "rope_scaling.beta_fast"], 32)
+        self.betaSlow           = getInt(["beta_slow", "rope_scaling.beta_slow"], 1)
+        self.indexNHeads        = getInt(["index_n_heads"], 64)
+        self.indexHeadDim       = getInt(["index_head_dim"], 128)
+        self.indexTopk          = getInt(["index_topk"], 512)
+        self.hcMult             = getInt(["hc_mult"], 4)
+        self.hcSinkhornIters    = getInt(["hc_sinkhorn_iters"], 20)
+        self.hcEps              = getFloat(["hc_eps"], 1e-6)
     }
 
     /// Per-layer effective head dimensions.
