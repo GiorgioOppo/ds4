@@ -77,7 +77,14 @@ targets:
         # and conflict with the one we ship.
         GENERATE_INFOPLIST_FILE: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.deepseek.v4pro.ui
-        PRODUCT_NAME: "DeepSeek-V4"
+        # PRODUCT_NAME drives both the .app folder name and the
+        # binary inside Contents/MacOS/. It must match the Info.plist
+        # `CFBundleExecutable` ("DeepSeekUI") or macOS' Intents /
+        # Shortcuts services log "Unable to re-register with Process
+        # Instance Registry" warnings every launch. The user-facing
+        # display name lives in CFBundleDisplayName = "DeepSeek-V4"
+        # which is independent.
+        PRODUCT_NAME: DeepSeekUI
         # The UI is a SwiftUI macOS app, not a sandboxed App Store
         # build. NSOpenPanel needs filesystem access to /Volumes/...
         # for the model directory.
