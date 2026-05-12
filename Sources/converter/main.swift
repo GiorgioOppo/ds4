@@ -902,9 +902,10 @@ try indexData.write(to: indexURL)
 print("Wrote \(weightMap.count) tensors across \(total) shard(s); " +
       "\(String(format: "%.1f", Double(totalBytes) / 1_000_000_000)) GB total.")
 
-// ---------- Copy tokenizer ----------
+// ---------- Copy tokenizer + config ----------
 
-for f in ["tokenizer.json", "tokenizer_config.json"] {
+for f in ["tokenizer.json", "tokenizer_config.json", "config.json",
+          "generation_config.json", "special_tokens_map.json"] {
     let src = hfDir.appendingPathComponent(f)
     if fm.fileExists(atPath: src.path) {
         let dst = saveDir.appendingPathComponent(f)
