@@ -44,22 +44,17 @@ struct ContentView: View {
     }
 }
 
-/// Hosts a `ChatStore` for the lifetime of the ready phase plus an
-/// "Unload & pick another" toolbar action. Multi-chat lands in
-/// commit 4.
+/// Hosts the `ChatStore` for the lifetime of the .ready phase and
+/// lays out the NavigationSplitView (sidebar + detail).
 private struct ChatContainer: View {
     @StateObject var store: ChatStore
 
     var body: some View {
-        ChatView(store: store)
-            .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        store.newChat()
-                    } label: {
-                        Label("New Chat", systemImage: "plus.bubble")
-                    }
-                }
-            }
+        NavigationSplitView {
+            ConversationListView(store: store)
+                .frame(minWidth: 200)
+        } detail: {
+            ChatView(store: store)
+        }
     }
 }

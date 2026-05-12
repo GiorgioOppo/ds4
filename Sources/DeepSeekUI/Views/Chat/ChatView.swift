@@ -1,15 +1,12 @@
 import SwiftUI
 import DeepSeekKit
 
-/// Single-conversation chat surface: scrollable message list +
-/// composer. Reads sampler defaults from `@AppStorage`. Multi-chat
-/// (sidebar) and persistence land in commit 4; advanced settings in
-/// commit 6.
+/// Single-conversation chat surface bound to the currently-selected
+/// `ChatStore` conversation. Reads sampler defaults from `@AppStorage`.
 struct ChatView: View {
     @ObservedObject var store: ChatStore
     @State private var draft: String = ""
 
-    // Sampler defaults — exposed in Settings (commit 6).
     @AppStorage("deepseek.temperature")       private var temperature: Double = 1.0
     @AppStorage("deepseek.topK")              private var topK: Int = 0
     @AppStorage("deepseek.topP")              private var topP: Double = 1.0
@@ -18,24 +15,40 @@ struct ChatView: View {
     @AppStorage("deepseek.mode")              private var modeRaw: String = "chat"
 
     var body: some View {
+        if let c = store.selectedConversation {
+            content(c)
+        } else {
+            VStack {
+                Spacer()
+                Text("No conversation selected.")
+                    .foregroundStyle(.secondary)
+                Button("New Chat") { store.newChat() }
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func content(_ c: Conversation) -> some View {
+        let phase = store.phase(of: c.id)
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(store.conversation.messages) { msg in
+                        ForEach(c.messages) { msg in
                             MessageView(
                                 message: msg,
-                                isStreaming: isStreamingPlaceholder(msg))
+                                isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase))
                             .id(msg.id)
                         }
-                        if case .streaming(_, let status) = store.phase,
-                           !status.isEmpty {
+                        if case .streaming(_, let status) = phase, !status.isEmpty {
                             Text(status)
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
                                 .padding(.leading, 40)
                         }
-                        if case .error(let msg) = store.phase {
+                        if case .error(let msg) = phase {
                             Label(msg, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.red)
                                 .font(.callout)
@@ -44,39 +57,32 @@ struct ChatView: View {
                     }
                     .padding(20)
                 }
-                .onChange(of: store.conversation.messages.count) { _, _ in
-                    scrollToBottom(proxy)
-                }
-                .onChange(of: scrollBufferLength) { _, _ in
-                    scrollToBottom(proxy)
-                }
+                .onChange(of: c.messages.count) { _, _ in scrollToBottom(proxy, c) }
+                .onChange(of: scrollBufferLength(phase)) { _, _ in scrollToBottom(proxy, c) }
             }
             Divider()
-            ComposerView(draft: $draft, phase: store.phase,
+            ComposerView(draft: $draft, phase: phase,
                           onSend: sendCurrent, onStop: { store.cancel() })
         }
-        .navigationTitle(store.conversation.title)
+        .navigationTitle(c.title)
     }
 
-    private func isStreamingPlaceholder(_ msg: StoredMessage) -> Bool {
-        guard case .streaming = store.phase,
+    private func isStreamingPlaceholder(_ msg: StoredMessage,
+                                         in c: Conversation,
+                                         phase: GenerationPhase) -> Bool {
+        guard case .streaming = phase,
               msg.role == .assistant,
-              msg.id == store.conversation.messages.last?.id
-        else { return false }
+              msg.id == c.messages.last?.id else { return false }
         return true
     }
 
-    /// Used to retrigger scroll-to-bottom on every streamed token, not
-    /// just on message append.
-    private var scrollBufferLength: Int {
-        if case .streaming(let buffer, _) = store.phase {
-            return buffer.count
-        }
+    private func scrollBufferLength(_ phase: GenerationPhase) -> Int {
+        if case .streaming(let buffer, _) = phase { return buffer.count }
         return 0
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        guard let last = store.conversation.messages.last else { return }
+    private func scrollToBottom(_ proxy: ScrollViewProxy, _ c: Conversation) {
+        guard let last = c.messages.last else { return }
         withAnimation(.easeOut(duration: 0.15)) {
             proxy.scrollTo(last.id, anchor: .bottom)
         }
@@ -87,10 +93,9 @@ struct ChatView: View {
         draft = ""
         let opts = SamplingOptions(
             temperature: Float(temperature),
-            topK: topK,
-            topP: Float(topP),
+            topK: topK, topP: Float(topP),
             repetitionPenalty: Float(repPenalty))
-        let mode: ThinkingMode = (modeRaw == "max")    ? .max
+        let mode: ThinkingMode = (modeRaw == "max")  ? .max
                                 : (modeRaw == "high") ? .high
                                 : .chat
         store.send(text: text, mode: mode,
