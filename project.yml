@@ -49,13 +49,13 @@ settings:
     SDKROOT: macosx
     SUPPORTED_PLATFORMS: macosx
     ARCHS: "$(ARCHS_STANDARD)"
-    # Local dev: skip codesigning entirely. Faster builds, no
-    # entitlements headaches. Re-enable for distribution by setting
-    # CODE_SIGN_IDENTITY to "Developer ID Application: …" + a
-    # DEVELOPMENT_TEAM.
-    CODE_SIGNING_ALLOWED: NO
-    CODE_SIGNING_REQUIRED: NO
-    CODE_SIGN_IDENTITY: ""
+    # Local dev: ad-hoc signing only. Gatekeeper on macOS 14+
+    # silently refuses to launch *unsigned* binaries; ad-hoc ("-")
+    # is the lightest signing identity that satisfies it. Hardened
+    # runtime stays OFF because it requires a real Developer ID
+    # team — incompatible with ad-hoc.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
     DEVELOPMENT_TEAM: ""
     ENABLE_HARDENED_RUNTIME: NO
     ENABLE_USER_SCRIPT_SANDBOXING: NO
