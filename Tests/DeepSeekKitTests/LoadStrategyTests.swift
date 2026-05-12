@@ -59,7 +59,9 @@ final class LoadStrategyTests: XCTestCase {
             }
             XCTAssertEqual(maxShard, 12 * 1024 * 1024 * 1024)
             XCTAssertEqual(avail, 16 * 1024 * 1024 * 1024)
-            XCTAssertEqual(cap, 0.7, accuracy: 1e-9)
+            // Default shard cap tightened to 50% in the unified-memory
+            // revision (was 70%).
+            XCTAssertEqual(cap, 0.5, accuracy: 1e-9)
             XCTAssertEqual(url.lastPathComponent, "big.safetensors")
         }
     }
@@ -111,10 +113,10 @@ final class LoadStrategyTests: XCTestCase {
 
     /// The total-cap fires independently when shards are individually small.
     func testHardErrorWhenTotalOversubscriptionAlone() {
-        // 100 × 60 MB shards = ~5.86 GB total, 100 MB available → ~60× oversub.
-        // Each shard alone (60 MB) is under the 70% cap (70 MB) so guard 1
-        // passes; guard 2 fires because 60× > 25× multiplier.
-        let shardBytes: UInt64 = 60 * 1024 * 1024
+        // 100 × 40 MB shards = ~3.9 GB total, 100 MB available → ~39× oversub.
+        // Each shard alone (40 MB) is under the 50% cap (50 MB) so guard 1
+        // passes; guard 2 fires because 39× > 10× multiplier.
+        let shardBytes: UInt64 = 40 * 1024 * 1024
         let avail: UInt64 = 100 * 1024 * 1024
         let shards = (0..<100).map { (u("s\($0)"), shardBytes) }
         XCTAssertThrowsError(
@@ -127,7 +129,9 @@ final class LoadStrategyTests: XCTestCase {
             }
             XCTAssertEqual(total, UInt64(100) * shardBytes)
             XCTAssertEqual(av, avail)
-            XCTAssertEqual(mult, 25.0, accuracy: 1e-9)
+            // Default multiplier tightened to 10× in the unified-memory
+            // revision (was 25×).
+            XCTAssertEqual(mult, 10.0, accuracy: 1e-9)
         }
     }
 

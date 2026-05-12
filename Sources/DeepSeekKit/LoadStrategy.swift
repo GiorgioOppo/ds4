@@ -30,13 +30,23 @@ public struct LoadPlan: Sendable {
     public let reason: String
 
     /// Multi-line stderr-bound summary. Always ends with `\n`.
+    ///
+    /// `availableRAM` here is the *effective unified-memory budget*
+    /// the guards used (`min(processAvailable, physical × 0.6)`),
+    /// not raw "free + inactive". On Apple Silicon the GPU and CPU
+    /// share the same pages, so the GPU rec. working-set is the
+    /// upper bound MTL prefers — NOT additional memory.
     public func summary() -> String {
         let gib = 1024.0 * 1024.0 * 1024.0
         func g(_ b: UInt64) -> String { String(format: "%.2f GB", Double(b) / gib) }
+        let ratio = availableRAM == 0 ? 0
+            : Double(totalBytes) / Double(availableRAM)
         return """
-        system: \(g(physicalRAM)) physical / \(g(availableRAM)) available / \
-        \(cores) cores / GPU rec. working-set \(g(mtlWorkingSet))
+        system: \(g(physicalRAM)) unified (CPU + GPU share this pool)
+                \(g(availableRAM)) effective budget for this process
+                \(cores) cores · GPU rec. working-set \(g(mtlWorkingSet)) (same pool)
         checkpoint: \(shards.count) shards, \(g(totalBytes)) total, largest \(g(maxShardBytes))
+        oversubscription: \(String(format: "%.1f×", ratio)) of effective budget
         strategy: \(strategy.rawValue) (\(reason))
 
         """
@@ -107,17 +117,27 @@ extension LoadPlan {
     static let preloadThresholdNumerator: UInt64 = 4
     static let preloadThresholdDenominator: UInt64 = 5
 
-    /// Conservative RAM policy applied at pre-flight. Defaults are
-    /// tuned for "don't lock up a small-RAM Mac under load":
-    ///   - shardCapFraction = 0.7 leaves a 30% headroom for the OS
-    ///     file cache and other processes when mmap-ing a hot shard.
-    ///   - totalOversubMultiplier = 25 refuses checkpoints that are
-    ///     more than 25× available RAM — even sparse MoE inference
-    ///     tends to thrash above that ratio.
-    /// Both are bypassed when `forceLoad: true` (the `--force-load`
-    /// CLI flag).
-    public static let defaultShardCapFraction: Double = 0.7
-    public static let defaultTotalOversubMultiplier: Double = 25.0
+    /// Conservative RAM policy applied at pre-flight. Tightened in
+    /// the unified-memory-aware revision after a user report that
+    /// 25×-oversubscription froze a 16 GB Mac:
+    ///   - shardCapFraction = 0.5 leaves a 50% headroom for the OS
+    ///     file cache, the GUI compositor, and the GPU's
+    ///     command-buffer working set when mmap-ing a hot shard.
+    ///   - totalOversubMultiplier = 10 refuses checkpoints more
+    ///     than 10× the effective unified-memory budget. Even
+    ///     sparse-MoE inference at ~6 GB active footprint thrashes
+    ///     above that ratio because every fresh token activates
+    ///     slightly different experts and the kernel pages them in
+    ///     against the GUI's pages.
+    ///   - both are evaluated against
+    ///     `SystemProbe.effectiveProcessBudget` (which is
+    ///     `min(available, physical × 0.6)`), NOT raw
+    ///     `processAvailableRAM`. On Apple Silicon the "available"
+    ///     pages include inactive file cache and other apps' working
+    ///     sets the kernel doesn't want to evict.
+    /// Both bypassed when `forceLoad: true`.
+    public static let defaultShardCapFraction: Double = 0.5
+    public static let defaultTotalOversubMultiplier: Double = 10.0
 
     /// `total ≤ 0.80 × available`, computed without floats so the
     /// boundary is exactly representable in tests.
@@ -154,33 +174,37 @@ extension LoadPlan {
         let phys = SystemProbe.physicalRAM()
         let mtl = SystemProbe.mtlRecommendedWorkingSet()
         let cores = SystemProbe.cpuCount()
+        // Unified-memory-aware effective budget. On Apple Silicon
+        // the GPU and CPU share physical pages, so `processAvailable`
+        // alone (free + inactive + speculative) is optimistic.
+        let budget = SystemProbe.effectiveProcessBudget()
 
-        if !forceLoad, avail > 0 {
+        if !forceLoad, budget > 0 {
             // Guard 1: largest shard must fit with headroom. Without
-            // it the kernel can be forced to evict the file cache (or
-            // worse, page anonymous memory to swap) at every fault on
-            // a hot tensor.
-            let shardCap = UInt64(Double(avail) * shardCapFraction)
+            // it the kernel is forced to evict the file cache or the
+            // GUI's resident pages on every fresh hot-tensor fault.
+            let shardCap = UInt64(Double(budget) * shardCapFraction)
             if maxShard > shardCap {
                 let biggest = shards.max(by: { $0.byteCount < $1.byteCount })!.url
                 throw LoadStrategyError.shardTooLarge(
-                    maxShard: maxShard, available: avail,
+                    maxShard: maxShard, available: budget,
                     capFraction: shardCapFraction, shardURL: biggest)
             }
-            // Guard 2: catch the wildly-oversubscribed case (e.g.
-            // 277 GB INT8 V4-Flash on a 16 GB Mac with 7 GB free →
-            // ratio 39×, well above 25×). The shard cap alone would
-            // pass these because individual shards are small, but the
-            // working set across a forward still thrashes.
-            if Double(total) > Double(avail) * totalOversubMultiplier {
+            // Guard 2: catch the wildly-oversubscribed case
+            // (e.g. 147 GB INT4 V4-Flash on a 16 GB Mac with ~9 GB
+            // effective budget → 16× — well above 10×). The shard
+            // cap alone passes these because individual shards are
+            // small, but the working set across a forward still
+            // thrashes hard enough to freeze the system.
+            if Double(total) > Double(budget) * totalOversubMultiplier {
                 throw LoadStrategyError.totalTooLarge(
-                    total: total, available: avail,
+                    total: total, available: budget,
                     multiplier: totalOversubMultiplier)
             }
         }
 
         let (strategy, reason) = try Self.pickStrategy(
-            total: total, available: avail, override: override)
+            total: total, available: budget, override: override)
 
         return LoadPlan(
             strategy: strategy,

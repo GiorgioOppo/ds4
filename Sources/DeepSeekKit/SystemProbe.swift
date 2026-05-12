@@ -69,4 +69,32 @@ public enum SystemProbe {
     public static func preloadConcurrency() -> Int {
         min(cpuCount(), 4)
     }
+
+    /// Effective unified-memory budget the loader's safety guards
+    /// should treat as "the size we shouldn't oversubscribe past".
+    ///
+    /// Returns `min(processAvailableRAM, physicalRAM × cap)` with a
+    /// conservative cap (default 60%): on Apple Silicon the GPU and
+    /// CPU share the same physical pages, so the "available" figure
+    /// from `host_statistics64` (free + inactive + speculative) is
+    /// optimistic — those inactive pages are file cache and other
+    /// processes' working sets that the kernel only evicts under
+    /// real pressure. Once we start mmap'ing a multi-hundred-GB
+    /// checkpoint the kernel is forced to evict, the GPU's working
+    /// set competes for the same pages, and the whole system
+    /// thrashes.
+    ///
+    /// Treating 60% of physical as the ceiling keeps roughly 40%
+    /// of unified memory for the OS, the GUI, the GPU command
+    /// queue, and any other app the user has open.
+    public static func effectiveProcessBudget(
+        physicalCap: Double = 0.60
+    ) -> UInt64 {
+        let phys = physicalRAM()
+        let avail = processAvailableRAM()
+        if phys == 0 { return avail }
+        let physCap = UInt64(Double(phys) * physicalCap)
+        if avail == 0 { return physCap }
+        return min(avail, physCap)
+    }
 }
