@@ -48,10 +48,13 @@ struct ContentView: View {
 /// Hosts the `ChatStore` for the lifetime of the .ready phase and
 /// lays out the NavigationSplitView (sidebar + detail). An "Unload"
 /// toolbar action lets the user drop back to the picker without
-/// quitting the app.
+/// quitting the app, and a "Convert…" action opens the
+/// ConvertSheet for offline checkpoint quantization.
 private struct ChatContainer: View {
     @StateObject var store: ChatStore
     var onUnload: () -> Void
+
+    @State private var showConvert: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -60,6 +63,13 @@ private struct ChatContainer: View {
         } detail: {
             ChatView(store: store)
                 .toolbar {
+                    ToolbarItem {
+                        Button {
+                            showConvert = true
+                        } label: {
+                            Label("Convert model…", systemImage: "wand.and.stars")
+                        }
+                    }
                     ToolbarItem(placement: .destructiveAction) {
                         Button {
                             onUnload()
@@ -68,6 +78,9 @@ private struct ChatContainer: View {
                         }
                     }
                 }
+        }
+        .sheet(isPresented: $showConvert) {
+            ConvertSheet()
         }
     }
 }

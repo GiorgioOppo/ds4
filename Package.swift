@@ -43,7 +43,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "DeepSeekUI",
-            dependencies: ["DeepSeekKit"],
+            dependencies: ["DeepSeekKit", "DeepSeekConverter"],
             path: "Sources/DeepSeekUI",
             exclude: ["Resources/Info.plist"],
             // Embed Info.plist directly into the executable's __TEXT

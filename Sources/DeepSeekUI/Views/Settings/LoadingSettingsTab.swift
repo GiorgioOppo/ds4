@@ -1,11 +1,15 @@
 import SwiftUI
+import AppKit
 
-/// Pre-flight knobs: strategy override + force-load + recent dirs.
-/// Changes affect the next model load, not the current session.
+/// Pre-flight knobs: strategy override + force-load + recent dirs +
+/// converter binary path. Changes affect the next model load /
+/// conversion, not the current session.
 struct LoadingSettingsTab: View {
     @AppStorage(AppSettingsKey.loadStrategy) private var loadStrategy: String = "auto"
     @AppStorage(AppSettingsKey.forceLoad)    private var forceLoad: Bool = false
     @AppStorage(AppSettingsKey.lastModelDir) private var lastModelDir: String = ""
+    @AppStorage(AppSettingsKey.converterBinaryPath)
+    private var converterPath: String = ""
 
     var body: some View {
         Form {
@@ -36,6 +40,29 @@ struct LoadingSettingsTab: View {
                         Button("Forget") { lastModelDir = "" }
                     }
                 }
+            }
+            Section("Converter binary") {
+                LabeledContent("Path") {
+                    HStack {
+                        TextField("Auto-detect", text: $converterPath)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                            .frame(minWidth: 240)
+                        Button("Choose…") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseFiles = true
+                            panel.canChooseDirectories = false
+                            panel.allowsMultipleSelection = false
+                            panel.prompt = "Select"
+                            if panel.runModal() == .OK, let u = panel.url {
+                                converterPath = u.path
+                            }
+                        }
+                    }
+                }
+                Text("Used by Convert model… When empty, the runner searches Bundle Resources, the running executable's sibling dir, `.build/{debug,release}/converter`, and `/usr/local/bin/converter` in that order.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Recent model folders") {
                 if recents.isEmpty {

@@ -8,6 +8,9 @@ enum AppSettingsKey {
     static let forceLoad    = "deepseek.forceLoad"         // Bool
     static let lastModelDir = "deepseek.lastModelDir"      // path
     static let recentModelDirs = "deepseek.recentModelDirs" // JSON-encoded [String]
+    /// Filesystem path to the `converter` CLI binary, used by
+    /// ConvertSheet. Empty → ConverterRunner auto-discovers.
+    static let converterBinaryPath = "deepseek.converterBinaryPath"
 }
 
 /// Helper for code paths that need to read defaults without going
