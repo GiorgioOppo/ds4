@@ -166,20 +166,29 @@ public final class StreamingPool {
            sharedAligned > 0 {
             let rc = mlock(addr, sharedAligned)
             if rc == 0 {
-                FileHandle.standardError.write(Data(String(format:
+                Self.log(String(format:
                     "[pool] sharedSlot %.2f GB mlocked (%d shard(s))\n",
                     Double(sharedAligned) / 1_073_741_824,
-                    sharedIndices.count).utf8))
+                    sharedIndices.count))
             } else {
                 let errnoStr = String(cString: strerror(errno))
-                FileHandle.standardError.write(Data(String(format:
+                Self.log(String(format:
                     "[pool] sharedSlot mlock FAILED: %s — proceeding unpinned\n",
-                    errnoStr).utf8))
+                    errnoStr))
             }
         }
-        FileHandle.standardError.write(Data(String(format:
+        Self.log(String(format:
             "[pool] rotatingSlot capacity %.2f GB (largest layer shard)\n",
-            Double(rotatingAligned) / 1_073_741_824).utf8))
+            Double(rotatingAligned) / 1_073_741_824))
+    }
+
+    /// Gate diagnostic output behind `MemoryLogger.enabled` so the
+    /// pool stays quiet in normal runs and verbose under the
+    /// `DEEPSEEK_MEM_LOG=1` env var.
+    @inline(__always)
+    private static func log(_ s: String) {
+        guard MemoryLogger.enabled else { return }
+        FileHandle.standardError.write(Data(s.utf8))
     }
 
     /// Ensure layer K's shard is loaded into `rotatingSlot`.
@@ -200,9 +209,9 @@ public final class StreamingPool {
                             fileOffset: src.dataStart,
                             byteCount: src.dataByteCount)
         currentRotatingLayer = K
-        FileHandle.standardError.write(Data(String(format:
+        Self.log(String(format:
             "[pool] layer=%d shard preaded %.2f GB into rotatingSlot\n",
-            K, Double(src.dataByteCount) / 1_073_741_824).utf8))
+            K, Double(src.dataByteCount) / 1_073_741_824))
     }
 
     // ---- internals ----

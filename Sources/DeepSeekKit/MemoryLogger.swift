@@ -31,9 +31,12 @@ import MachO
 ///                the kernel and drivers — grows with our MTL
 ///                allocations even when rss doesn't.
 public enum MemoryLogger {
-    /// Master switch — disable for production runs once we trust
-    /// the bookkeeping.
-    public static var enabled: Bool = true
+    /// Master switch. Off by default — flip to true (programmatically
+    /// or via the env var below) to re-enable the trace when
+    /// diagnosing memory growth.
+    public static var enabled: Bool = {
+        ProcessInfo.processInfo.environment["DEEPSEEK_MEM_LOG"] == "1"
+    }()
 
     /// Skip a snapshot if none of the metrics moved more than this
     /// since the last log. Default is 0 (emit every call) — debug
