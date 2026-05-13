@@ -271,6 +271,11 @@ public final class MoEFFN {
             let slice = Tensor(shape: [count, dim], dtype: .f32,
                                 buffer: gathered.buffer,
                                 offset: gathered.offset + lo * bytesPerRow)
+            if perExpertTrace {
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[\(layerId)] expert[\(e)] in  (count=\(count))", slice)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+            }
             let outSlice = expert(slice, in: cmd)
             if perExpertTrace {
                 cmd.commit(); cmd.waitUntilCompleted()
