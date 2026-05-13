@@ -33,6 +33,15 @@ func usage() -> Never {
             deepseek /path/to/model "" --load-strategy streaming \\
                 --dump-tensor layers.0.attn.wq.weight:row=0:cols=0..32
 
+    --list-tensors [PREFIX]
+        Diagnostic mode. Prints every tensor name in the checkpoint
+        (optionally filtered by prefix) to stdout, one per line, then
+        exits. Useful when --dump-tensor reports "tensor not found"
+        and you need to discover the actual naming convention.
+        Example:
+            deepseek /path/to/model "" --load-strategy streaming \\
+                --list-tensors layers.0.
+
     """.utf8))
     exit(2)
 }
@@ -57,6 +66,8 @@ var mode = "chat"
 var loadStrategy: String? = nil
 var forceLoad = false
 var dumpSpec: String? = nil
+var listPrefix: String? = nil
+var listEnabled = false
 
 var i = nextArg
 while i < args.count {
@@ -79,7 +90,46 @@ while i < args.count {
     case "--dump-tensor":
         guard i + 1 < args.count else { usage() }
         dumpSpec = args[i + 1]; i += 2
+    case "--list-tensors":
+        listEnabled = true
+        // Optional prefix argument. Treat the next token as a
+        // prefix only if it doesn't start with `--`.
+        if i + 1 < args.count, !args[i + 1].hasPrefix("--") {
+            listPrefix = args[i + 1]; i += 2
+        } else {
+            i += 1
+        }
     default: usage()
+    }
+}
+
+// ---------- Diagnostic: --list-tensors ----------
+// Prints every tensor name in the checkpoint (optionally filtered
+// by prefix) and exits. Runs before any model build so it works on
+// directories whose downstream load would refuse.
+if listEnabled {
+    let prevLog = MemoryLogger.enabled
+    MemoryLogger.enabled = true
+    defer { MemoryLogger.enabled = prevLog }
+    do {
+        let plan = try LoadPlan.decide(modelDir: modelDir,
+                                        override: loadStrategy,
+                                        forceLoad: forceLoad)
+        FileHandle.standardError.write(Data(plan.summary().utf8))
+        let loader = try WeightLoader(plan: plan)
+        var names = loader.allKnownNames
+        if let pfx = listPrefix {
+            names = names.filter { $0.hasPrefix(pfx) }
+        }
+        names.sort()
+        FileHandle.standardError.write(Data(
+            "\(names.count) tensor(s)\(listPrefix.map { " matching prefix \($0)" } ?? "")\n".utf8))
+        for n in names { print(n) }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "--list-tensors failed: \(error)\n".utf8))
+        exit(1)
     }
 }
 

@@ -30,7 +30,7 @@ public enum TensorDump {
     }
 
     public enum DumpError: Swift.Error, CustomStringConvertible {
-        case notFound(String)
+        case notFound(String, candidates: [String])
         case missingScale(weight: String, scale: String)
         case rankUnsupported(name: String, rank: Int)
         case rowOutOfRange(Int, count: Int)
@@ -40,8 +40,16 @@ public enum TensorDump {
 
         public var description: String {
             switch self {
-            case .notFound(let n):
-                return "tensor not found in checkpoint: \(n)"
+            case .notFound(let n, let cands):
+                if cands.isEmpty {
+                    return "tensor not found in checkpoint: \(n)"
+                }
+                let list = cands.prefix(15).joined(separator: "\n  ")
+                return """
+                tensor not found in checkpoint: \(n)
+                did you mean (closest \(min(cands.count, 15)) of \(cands.count)):
+                  \(list)
+                """
             case .missingScale(let w, let s):
                 return "\(w) is quantized (needs scale companion \(s)) but \(s) is missing"
             case .rankUnsupported(let n, let r):
@@ -56,6 +64,26 @@ public enum TensorDump {
                 return "row length \(r) is not a multiple of quant block size \(b)"
             }
         }
+    }
+
+    /// Rank candidate names by a coarse similarity to `target`: prefer
+    /// names that share the longest common prefix, break ties by the
+    /// Levenshtein-lite difference. Cheap; we don't expect O(N²)
+    /// behavior to matter for the ~70k-tensor checkpoints we ship.
+    public static func candidates(for target: String,
+                                    among names: [String],
+                                    limit: Int = 15) -> [String] {
+        let scored = names.map { name -> (String, Int) in
+            var prefix = 0
+            for (a, b) in zip(name, target) {
+                if a == b { prefix += 1 } else { break }
+            }
+            // Higher prefix = better. Lower length-diff = better.
+            // Pack so sort key is descending by prefix, ascending by diff.
+            let score = -prefix * 1000 + abs(name.count - target.count)
+            return (name, score)
+        }
+        return scored.sorted { $0.1 < $1.1 }.prefix(limit).map(\.0)
     }
 
     /// Block size baked into the quant kernels. Mirrors `kInt4GroupK`
@@ -74,7 +102,8 @@ public enum TensorDump {
             loader.ensureLayer(layer)
         }
         guard let w = try loader.load(name) else {
-            throw DumpError.notFound(name)
+            let suggestions = candidates(for: name, among: loader.allKnownNames)
+            throw DumpError.notFound(name, candidates: suggestions)
         }
 
         let rows: Int, rowLen: Int

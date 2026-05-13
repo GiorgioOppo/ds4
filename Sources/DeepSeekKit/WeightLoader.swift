@@ -261,6 +261,12 @@ public final class WeightLoader {
     }
 
     public var totalKnownNames: Int { index.count }
+    /// All tensor names indexed across every shard. Order is
+    /// dictionary-iteration order, not stable. Useful for
+    /// diagnostic tooling that needs to enumerate the checkpoint
+    /// (e.g. `--list-tensors` in the deepseek CLI) without paying
+    /// the cost of building the full Transformer.
+    public var allKnownNames: [String] { Array(index.keys) }
     /// Number of input shards covered by this loader. Reports the
     /// real count for both strategies — `.mmap` / `.preload` use
     /// the legacy `shards: [SafeTensorsFile]` array; `.streaming`
