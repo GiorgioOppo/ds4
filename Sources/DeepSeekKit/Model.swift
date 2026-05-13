@@ -257,9 +257,9 @@ public final class Transformer {
         // V4 Compressor / Indexer modules activate (compress_ratios=0
         // at layers 0-1, then alternates 4/128 from layer 2 on).
         let nL = layers.count
-        let traceLayers: Set<Int> = nL <= 6
+        let traceLayers: Set<Int> = nL <= 12
             ? Set(0..<nL)
-            : Set([0, 1, 2, 3, 5, 10, 20, 30, nL - 1])
+            : Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 30, nL - 1])
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
