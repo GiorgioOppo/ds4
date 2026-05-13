@@ -114,6 +114,7 @@ public extension Transformer {
                 swigluLimit: config.swigluLimit
             )
             let moe = MoEFFN(config: config, gate: gate, experts: experts, shared: sharedExpert)
+            moe.layerId = i
 
             // ---- HC params ----
             let hcAttnFn = AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
@@ -336,6 +337,7 @@ public extension Transformer {
                 swigluLimit: config.swigluLimit)
             let moe = MoEFFN(config: config, gate: gate,
                              experts: experts, shared: sharedExpert)
+            moe.layerId = i
 
             // ---- HC params ----
             let hcAttnFn = (try loader.tryLoad(["\(lp).hc_attn_fn"]))

@@ -194,6 +194,7 @@ public final class MoEFFN {
     public let dim: Int
     public let nExperts: Int
     public let topK: Int
+    public var layerId: Int = -1
 
     public init(config: ModelConfig, gate: Gate, experts: [Expert?], shared: Expert) {
         self.gate = gate
@@ -228,6 +229,19 @@ public final class MoEFFN {
 
         let plan = MoEDispatch.prepare(indices: idxArr, weights: wArr,
                                         N: N, topK: topK, nExperts: nExperts)
+
+        // Layer 5/6 diagnostic: which experts get chosen, with what weight?
+        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+            var msg = "[trace moe[\(layerId)] routing] indices/weights (N=\(N), topK=\(topK)):\n"
+            for n in 0..<N {
+                var parts: [String] = []
+                for k in 0..<topK {
+                    parts.append("e\(idxArr[n * topK + k])(w=\(String(format: "%.4f", wArr[n * topK + k])))")
+                }
+                msg += "  tok\(n): " + parts.joined(separator: " ") + "\n"
+            }
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
 
         // Swap in a fresh command buffer for the rest of the work; the
         // committed one above can no longer accept encoders.
@@ -272,10 +286,30 @@ public final class MoEFFN {
         blitY.endEncoding()
         MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd)
 
+        // Diagnostic trace: routed-expert contribution before adding shared.
+        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] routed-only (post-scatter)", y)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+
         // 5. Add shared expert output. Leave cmd uncommitted; the caller
         // (Block) continues encoding hc.post into the same buffer.
         let sharedOut = sharedExpert(xFlat, in: cmd)
+
+        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] shared-only", sharedOut)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+
         Elementwise.addInPlace(y, sharedOut, in: cmd)
+
+        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] final (routed+shared)", y)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
 
         return y.reshape(shape)
     }
