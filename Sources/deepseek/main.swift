@@ -410,7 +410,13 @@ inferenceQueue.async {
 
     for step in 0..<maxTokens {
         let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
-        if nextId == eosId { break }
+        if nextId == eosId {
+            // Mirrors generate.py:67 — Python appends the EOS token to
+            // the completion stream so downstream decoders see a well-
+            // terminated sequence.
+            generatedIds.append(eosId)
+            break
+        }
         generatedIds.append(nextId)
         MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
                               force: true)

@@ -178,6 +178,10 @@ public final class Expert {
         let u = w3(x, in: cmd)
         // Pass swigluLimit through so the kernel applies the V4 clamp.
         let h = Elementwise.siluMul(g, u, swigluLimit: swigluLimit, in: cmd)
+        // Mirrors model.py:606 — the clamped + SiLU activation is cast back
+        // to the activation dtype (BF16) before flowing into w2. Round-trip
+        // in place to inject the per-block QAT noise.
+        Elementwise.bf16RoundTripInplace(h, in: cmd)
         return w2(h, in: cmd)
     }
 }

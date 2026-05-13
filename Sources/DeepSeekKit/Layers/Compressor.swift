@@ -401,7 +401,13 @@ public final class Compressor {
         guard let rope = rope else { fatalError("Compressor.rope must be set") }
 
         // pooled comes in as [tokens, 1, headDim]; norm wants 2D-ish input.
-        let normed = norm(pooled.reshape([tokens, headDim]), in: cmd)
+        // Mirrors model.py:362 `kv = self.norm(kv.to(dtype))` — the pooled
+        // KV is cast back to the network's activation dtype (BF16) before
+        // norming. Without this round-trip the norm sees ~16 bits more
+        // precision than the network ever did in training.
+        let pooled2D = pooled.reshape([tokens, headDim])
+        Elementwise.bf16RoundTripInplace(pooled2D, in: cmd)
+        let normed = norm(pooled2D, in: cmd)
             .reshape([tokens, 1, headDim])
         rope.apply(normed, startPos: ropeStartPos, inverse: false, in: cmd)
 

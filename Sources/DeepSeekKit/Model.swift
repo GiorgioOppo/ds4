@@ -34,6 +34,11 @@ public final class ParallelEmbedding {
         enc.dispatchThreads(MTLSize(width: dim, height: N, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
+        // Mirrors model.py:101 — F.embedding returns the weight's dtype
+        // (BF16 in V4-Flash). We always allocate F32 storage; round-trip
+        // so layer 0 sees the same numerical distribution the network was
+        // trained on.
+        Elementwise.bf16RoundTripInplace(out, in: cmd)
         return out
     }
 }
