@@ -57,8 +57,13 @@ public final class Gate {
     }
 
     /// Returns `(weights, indices)` of shape `[N, topK]` each.
+    /// `cmd` is `inout` because the hash-routing path needs to commit
+    /// the caller's buffer (to materialise the input `x`, which is the
+    /// product of preceding kernels) and swap in a fresh one so the
+    /// caller doesn't double-commit. The score-based path treats it
+    /// as a regular non-mutating reference.
     public func callAsFunction(_ x: Tensor, inputIds: [Int32],
-                                in cmd: MTLCommandBuffer) -> (weights: Tensor, indices: Tensor) {
+                                in cmd: inout MTLCommandBuffer) -> (weights: Tensor, indices: Tensor) {
         precondition(x.dtype == .f32 && x.shape.count == 2)
         let N = x.shape[0]
 
@@ -67,27 +72,68 @@ public final class Gate {
 
         if hashRouting {
             guard let tid = tid2eid else { fatalError("hash routing requires tid2eid") }
-            // Pure host-side lookup; tid2eid was cast to i32 at load time
-            // (AssemblyHelpers.castIntToI32) and inputIds is already a
-            // Swift [Int32]. No GPU work needs to be issued — and crucially
-            // no commit, since the caller (MoEFFN) will commit `cmd` itself
-            // to drain pre-Gate work (RMSNorm, hc.pre) before reading our
-            // output buffers.
-            let tidPtr = tid.buffer.contents().bindMemory(to: Int32.self,
-                                                            capacity: tid.count)
-            let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self,
-                                                                capacity: N * topK)
-            let weightsPtr = weights.buffer.contents().bindMemory(to: Float.self,
-                                                                    capacity: N * topK)
+            // Hash-routed layer: expert indices come from a precomputed
+            // tid2eid table (lookup keyed on the input token id), but
+            // the per-expert routing WEIGHTS still come from
+            //     softplus(linear(x, gate.weight)).sqrt()
+            // gathered at those indices, normalised across the topK and
+            // multiplied by route_scale. Mirrors Reference/inference/
+            // model.py:576-583. Earlier this branch used a uniform
+            // 1/topK weight, which silently degraded the first
+            // n_hash_layers (=3 for V4-Flash) by replacing learned
+            // gating with a flat average.
+            //
+            // `x` was produced by kernels queued on the caller's `cmd`
+            // (RMSNorm + hc.pre at least) which hasn't been committed
+            // yet, so its bytes aren't valid host-side until we drain
+            // that buffer. We commit + wait, then run the gate
+            // projection on a fresh cmd, then swap a brand-new cmd
+            // back to the caller so its later `cmd.commit()` doesn't
+            // try to commit an already-committed buffer.
+            cmd.commit(); cmd.waitUntilCompleted()
+            let scoreCmd = Device.shared.queue.makeCommandBuffer()!
+            let logits = weight(x, in: scoreCmd)
+            scoreCmd.commit(); scoreCmd.waitUntilCompleted()
+            let logitsPtr = logits.buffer.contents()
+                .bindMemory(to: Float.self, capacity: N * nExperts)
+            let tidPtr = tid.buffer.contents()
+                .bindMemory(to: Int32.self, capacity: tid.count)
+            let idxPtr = indices.buffer.contents()
+                .bindMemory(to: Int32.self, capacity: N * topK)
+            let weightsPtr = weights.buffer.contents()
+                .bindMemory(to: Float.self, capacity: N * topK)
             let vocabSize = tid.shape[0]
+            // sqrt(softplus(x)) — numerically stable form matching the
+            // moe_gate Metal kernel's score_fn for SCORE==2.
+            @inline(__always)
+            func sqrtSoftplus(_ x: Float) -> Float {
+                let sp = max(x, 0) + log(1 + expf(-abs(x)))
+                return sqrt(sp)
+            }
             for n in 0..<N {
                 let id = Int(inputIds[n])
                 precondition(id >= 0 && id < vocabSize)
+                var sum: Float = 0
                 for k in 0..<topK {
-                    idxPtr[n * topK + k] = tidPtr[id * topK + k]
-                    weightsPtr[n * topK + k] = 1.0 / Float(topK) * routeScale
+                    let e = Int(tidPtr[id * topK + k])
+                    let l = logitsPtr[n * nExperts + e]
+                    let w = sqrtSoftplus(l)
+                    weightsPtr[n * topK + k] = w
+                    idxPtr[n * topK + k] = Int32(e)
+                    sum += w
+                }
+                // Renormalise + scale (the reference normalises only
+                // when score_func != "softmax" — V4 uses sqrtsoftplus
+                // so we always normalise here).
+                let inv = 1.0 / max(sum, 1e-12)
+                for k in 0..<topK {
+                    weightsPtr[n * topK + k] *= inv * routeScale
                 }
             }
+            // Replace the caller's already-committed cmd so its
+            // upcoming `cmd.commit()` (the MoEFFN drain at gate +1)
+            // runs against a fresh buffer.
+            cmd = Device.shared.queue.makeCommandBuffer()!
             return (weights, indices)
         }
 
@@ -167,7 +213,7 @@ public final class MoEFFN {
         let xFlat = x.reshape([N, dim])
 
         // 1. Gate.
-        let (weights, indices) = gate(xFlat, inputIds: inputIds, in: cmd)
+        let (weights, indices) = gate(xFlat, inputIds: inputIds, in: &cmd)
         // We need indices+weights on host to build the dispatch plan.
         cmd.commit(); cmd.waitUntilCompleted()
         let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self, capacity: N * topK)

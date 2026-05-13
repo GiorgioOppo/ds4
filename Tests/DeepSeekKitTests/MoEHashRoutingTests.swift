@@ -53,8 +53,8 @@ final class MoEHashRoutingTests: XCTestCase {
             Tensor.from(bytes: $0, shape: [N, dim], dtype: .f32)
         }
 
-        let cmd = Device.shared.queue.makeCommandBuffer()!
-        let (_, indicesT) = gate(xT, inputIds: inputIds, in: cmd)
+        var cmd = Device.shared.queue.makeCommandBuffer()!
+        let (_, indicesT) = gate(xT, inputIds: inputIds, in: &cmd)
         cmd.commit(); cmd.waitUntilCompleted()
 
         let idxPtr = indicesT.buffer.contents().bindMemory(to: Int32.self,
