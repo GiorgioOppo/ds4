@@ -176,7 +176,8 @@ public final class Expert {
     public func callAsFunction(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
         let g = w1(x, in: cmd)
         let u = w3(x, in: cmd)
-        let h = Elementwise.siluMul(g, u, in: cmd)
+        // Pass swigluLimit through so the kernel applies the V4 clamp.
+        let h = Elementwise.siluMul(g, u, swigluLimit: swigluLimit, in: cmd)
         return w2(h, in: cmd)
     }
 }
