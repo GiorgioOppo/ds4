@@ -30,6 +30,15 @@ public final class WeightLoader {
     private var shardLayers: [Int] = []
     public var streamingEnabled: Bool = false
 
+    /// Non-nil when `plan.strategy == .streaming` and the pool
+    /// path activated successfully. Replaces the per-shard mmap
+    /// MTLBuffers with two pre-allocated `.storageModeShared`
+    /// slots (sharedSlot + rotatingSlot). `load(_:)` returns
+    /// Tensors pointing into the pool; `Transformer.forward`
+    /// calls `ensureLayer(_:)` before each block to swap layer
+    /// K's data into the rotating slot.
+    private var pool: StreamingPool? = nil
+
     /// Construct from an already-decided `LoadPlan`. The plan owns the
     /// list of shards and chooses mmap vs preload; this initializer
     /// just opens them. Preload is parallelized via
@@ -44,19 +53,54 @@ public final class WeightLoader {
         self.directory = first.url.deletingLastPathComponent()
 
         switch plan.strategy {
-        case .mmap, .streaming:
-            // Identical load-time path EXCEPT `.streaming` mmaps
-            // with `MAP_NOCACHE` so pages don't get promoted to the
-            // OS-wide unified buffer cache — keeps the kernel's
-            // file cache lean while we're cycling shards on
-            // streaming releases.
-            let nocache = (plan.strategy == .streaming)
+        case .mmap:
             for (url, _) in plan.shards {
-                let f = try SafeTensorsFile(url: url, mapNoCache: nocache)
+                let f = try SafeTensorsFile(url: url)
                 let shardIdx = shards.count
                 shards.append(f)
                 for name in f.entries.keys { index[name] = shardIdx }
             }
+
+        case .streaming:
+            // Pool path: parse every shard's HEADER only (no
+            // mmap of the data section), then build a
+            // StreamingPool that owns two MTLBuffer slots. The
+            // legacy `shards: [SafeTensorsFile]` array stays
+            // empty — `load(_:)` short-circuits to the pool
+            // instead.
+            var headers: [SafeTensorsHeader] = []
+            for (url, _) in plan.shards {
+                let h = try SafeTensorsHeader.parse(url: url)
+                headers.append(h)
+                // Populate name → shardIdx index so the existing
+                // shape(of:) / missing reporting still works.
+                let shardIdx = headers.count - 1
+                for name in h.entries.keys { index[name] = shardIdx }
+            }
+            // Classify shards (same logic as buildShardLayers,
+            // but on SafeTensorsHeader.entries instead of
+            // SafeTensorsFile.entries).
+            var classifyLayers = [Int](repeating: -1, count: headers.count)
+            for (i, h) in headers.enumerated() {
+                var seenLayers: Set<Int> = []
+                var hasTopLevel = false
+                for name in h.entries.keys {
+                    if let layer = Self.parseLayerIndex(from: name) {
+                        seenLayers.insert(layer)
+                    } else {
+                        hasTopLevel = true
+                    }
+                }
+                classifyLayers[i] = (hasTopLevel || seenLayers.count != 1)
+                    ? -1 : seenLayers.first!
+            }
+            self.shardLayers = classifyLayers
+            self.streamingEnabled = true
+            self.pool = try StreamingPool(shards: headers,
+                                            shardLayers: classifyLayers)
+            // The legacy `shards: [SafeTensorsFile]` array stays
+            // empty in this strategy — `load(_:)` checks `pool`
+            // first.
 
         case .preload:
             // Pre-size and fill in parallel; flatten + index after.
@@ -97,24 +141,14 @@ public final class WeightLoader {
             }
         }
 
-        // Populate the per-shard layer ownership table (for the
-        // streaming hints API). Streaming is gated on `plan.strategy
-        // == .streaming` below; for `.mmap` / `.preload` the table
-        // is still built but never consulted.
-        self.shardLayers = Self.buildShardLayers(shards: shards)
-        self.streamingEnabled = (plan.strategy == .streaming)
-
-        // mlock the "shared" shards (top-level: embed, head, norms,
-        // hc_head_*) so they NEVER get evicted or swapped during
-        // streaming. The forward pass touches them on every token
-        // (embed at start, head + final norm at end); if they're
-        // not pinned the kernel will repeatedly refault them while
-        // we're cycling layer shards through MADV_FREE_REUSABLE.
-        // Limited to ~500 MB on typical V4-Flash so we don't blow
-        // the wired-memory budget. Best-effort: failure logged but
-        // not fatal.
-        if streamingEnabled {
-            pinSharedShards()
+        // For `.mmap` / `.preload` we build the per-shard layer
+        // ownership table over the legacy `shards: [SafeTensorsFile]`
+        // array. `.streaming` already populated `shardLayers` and
+        // `streamingEnabled` inside its switch arm via the pool's
+        // header-classified data; nothing more to do.
+        if pool == nil {
+            self.shardLayers = Self.buildShardLayers(shards: shards)
+            self.streamingEnabled = false
         }
     }
 
@@ -171,12 +205,44 @@ public final class WeightLoader {
     }
 
     /// Returns the tensor for `name`, or nil if not present.
+    /// In streaming mode, returns a Tensor pointing into the
+    /// StreamingPool's sharedSlot or rotatingSlot — the rotating
+    /// slot's BACKING DATA isn't valid until `ensureLayer(K)` has
+    /// been called for the right K (the caller, `Transformer.forward`,
+    /// does this between blocks).
     public func load(_ name: String) throws -> Tensor? {
+        if let pool = pool {
+            guard let loc = pool.tensorLocation[name] else {
+                missing.insert(name)
+                return nil
+            }
+            let buf: MTLBuffer
+            switch loc.slot {
+            case .shared:   buf = pool.sharedSlot
+            case .rotating: buf = pool.rotatingSlot
+            }
+            return Tensor(shape: loc.shape, dtype: loc.dtype,
+                          buffer: buf, offset: loc.offsetInSlot)
+        }
         guard let s = index[name] else {
             missing.insert(name)
             return nil
         }
         return try shards[s].load(name)
+    }
+
+    /// In streaming-pool mode, swap layer K's shard data into the
+    /// rotating slot. Idempotent. Called by `Transformer.forward`
+    /// before each block. No-op when not streaming.
+    public func ensureLayer(_ K: Int) {
+        guard let pool = pool else { return }
+        do {
+            try pool.ensureLayer(K)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[pool] ensureLayer(\(K)) failed: \(error.localizedDescription)\n"
+                    .utf8))
+        }
     }
 
     /// Convenience: load with a fallback name list. Tries each in order.
@@ -195,6 +261,11 @@ public final class WeightLoader {
     /// Useful for auto-inferring missing fields in ModelConfig when
     /// config.json is incomplete.
     public func shape(of name: String) -> [Int]? {
+        // Pool mode: look up in the StreamingPool's pre-resolved
+        // index — `shards` array is empty under this strategy.
+        if let pool = pool {
+            return pool.tensorLocation[name]?.shape
+        }
         guard let s = index[name] else { return nil }
         return shards[s].entries[name]?.shape
     }
@@ -296,6 +367,15 @@ public final class WeightLoader {
     /// `commit+wait`. No-op unless `streamingEnabled`. Top-level
     /// shards (owner == -1) skipped.
     public func releaseLayer(_ layerIndex: Int) {
+        // Pool mode: nothing to release — the next `ensureLayer`
+        // overwrites the rotating slot's bytes via pread. Layer K's
+        // tensors become silently invalid the moment ensureLayer(K')
+        // is called for K' != K, but that's the design contract:
+        // Transformer.forward only accesses layer K's tensors
+        // BETWEEN ensureLayer(K) and ensureLayer(K+1).
+        if pool != nil { return }
+        // Legacy mmap path (unused in current streaming, kept in
+        // case we re-enable madvise-only experimentation).
         guard streamingEnabled else { return }
         for (shardIdx, owner) in shardLayers.enumerated()
             where owner == layerIndex {

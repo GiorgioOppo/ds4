@@ -250,6 +250,10 @@ public final class Transformer {
         var x = hExpanded.reshape([B, S, hc, config.dim])
         let loader = self.weightLoader
         for (k, layer) in layers.enumerated() {
+            // Pool mode: pread layer K's shard into the rotating
+            // slot BEFORE the block's forward references its
+            // Tensors. (No-op in `.mmap` / `.preload` strategies.)
+            loader?.ensureLayer(k)
             var cmdL = Device.shared.queue.makeCommandBuffer()!
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
