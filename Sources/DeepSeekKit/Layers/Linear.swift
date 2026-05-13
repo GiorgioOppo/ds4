@@ -39,14 +39,28 @@ public final class Linear {
             && M % 32 == 0 && N % 32 == 0 && K % 8 == 0
     }
 
-    public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?) {
+    /// When true (default), the GEMM output is round-tripped through BF16
+    /// in-place before being returned. This mirrors the reference's
+    /// `torch_dtype: bfloat16` propagation: every Linear in V4-Flash writes
+    /// its output as BF16 (the FP32 accumulator is cast back to BF16
+    /// before downstream ops read it). Set to `false` only for the LM
+    /// head, where the logits feed straight into argmax / softmax and
+    /// losing the low 16 mantissa bits is undesirable.
+    public let castOutputToBF16: Bool
+
+    public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?,
+                castOutputToBF16: Bool = true) {
         self.inFeatures = inFeatures
         self.outFeatures = outFeatures
         self.weight = weight
         self.scale = scale
+        self.castOutputToBF16 = castOutputToBF16
     }
 
-    /// `x`: [M, K] f32 or bf16. Output: [M, N] f32.
+    /// `x`: [M, K] f32 or bf16. Output: [M, N] f32. When `castOutputToBF16`
+    /// is true (default), the returned tensor is round-tripped through
+    /// BF16 in-place so callers see the same precision the reference's
+    /// BF16 activations would carry.
     public func callAsFunction(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
         let M = x.shape.dropLast().reduce(1, *)
         let outShape = Array(x.shape.dropLast()) + [outFeatures]
@@ -76,6 +90,9 @@ public final class Linear {
             dispatchGEMM(pipeline: Self.pF32, x: x, y: y, M: M, in: cmd)
         default:
             fatalError("Linear: unsupported weight dtype \(weight.dtype)")
+        }
+        if castOutputToBF16 {
+            Elementwise.bf16RoundTripInplace(y, in: cmd)
         }
         return y
     }

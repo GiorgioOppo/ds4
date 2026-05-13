@@ -89,8 +89,11 @@ public final class ParallelHead {
         }
 
         // 2. mixes = Linear(hcFn)(x_flat); mixes *= rsqrt; pre = sigmoid(mixes*scale + base) + eps
+        // ParallelHead.hc_head runs in FP32 (model.py:730 `x = x.flatten(2).float()`)
+        // — no BF16 quantisation on the gating mixes.
         let lin = Linear(inFeatures: hcDim, outFeatures: hcMult,
-                         weight: hcFn, scale: nil)
+                         weight: hcFn, scale: nil,
+                         castOutputToBF16: false)
         let mixes = lin(xFlat, in: cmd)        // [N, hcMult]
 
         // mixes *= rsqrt (broadcast)
@@ -150,8 +153,13 @@ public final class ParallelHead {
         blit.endEncoding()
 
         // 5. logits = lastTok @ weight^T   (Linear with weight shape [vocab, dim])
+        // castOutputToBF16=false: the logits feed straight into argmax /
+        // softmax (sampling) — losing 16 mantissa bits here would
+        // collapse ties and warp the temperature scaling. The reference
+        // also keeps the LM-head output in F32 for the same reason.
         let lmHead = Linear(inFeatures: dim, outFeatures: vocabSize,
-                            weight: weight, scale: nil)
+                            weight: weight, scale: nil,
+                            castOutputToBF16: false)
         let logits = lmHead(lastTok, in: cmd2)
         cmd2.commit(); cmd2.waitUntilCompleted()
         return logits

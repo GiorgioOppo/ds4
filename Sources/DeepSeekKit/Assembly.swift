@@ -374,6 +374,7 @@ public extension Transformer {
 
 internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
+                         castOutputToBF16: Bool = true,
                          rng: inout MiniRNG) throws -> Linear {
     if var w = try loader.tryLoad(["\(base).weight"]) {
         // V4-Flash-HF stores routed-expert FP4 weights as raw I8/U8
@@ -412,7 +413,8 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
         let scale: Tensor? = needsScale
             ? try loader.tryLoad(["\(base).scale", "\(base).weight_scale_inv"])
             : nil
-        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
+        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale,
+                      castOutputToBF16: castOutputToBF16)
     }
     return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
 }
@@ -516,10 +518,16 @@ internal enum AssemblyHelpers {
         let coffHeadDim = coff * headDim
         let ape = (try loader.tryLoad(["\(base).ape"]))
             ?? randomTensor([ratio, coffHeadDim], rng: &rng, scale: 0.05)
+        // Compressor's wkv / wgate are FP32 in the reference (model.py:297-298
+        // — the comment notes BF16 storage but FP32 parameters at runtime).
+        // The forward at model.py:322-324 explicitly does `x = x.float()`
+        // before these Linears, so their outputs propagate in FP32.
         let wkv = try loadLinear(loader, base: "\(base).wkv",
-                                  inF: config.dim, outF: coffHeadDim, rng: &rng)
+                                  inF: config.dim, outF: coffHeadDim,
+                                  castOutputToBF16: false, rng: &rng)
         let wgate = try loadLinear(loader, base: "\(base).wgate",
-                                    inF: config.dim, outF: coffHeadDim, rng: &rng)
+                                    inF: config.dim, outF: coffHeadDim,
+                                    castOutputToBF16: false, rng: &rng)
         let norm = RMSNorm(
             weight: (try loader.tryLoad(["\(base).norm.weight"])) ?? onesTensor([headDim]),
             eps: config.normEps)
