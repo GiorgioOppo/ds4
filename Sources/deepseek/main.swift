@@ -207,9 +207,9 @@ if let spec = dumpSpec {
     }
 }
 
-if prompt.isEmpty {
+if prompt.isEmpty && !printConfigAndExit {
     FileHandle.standardError.write(Data(
-        "missing prompt (and no --dump-tensor given)\n".utf8))
+        "missing prompt (and no --dump-tensor / --print-config given)\n".utf8))
     usage()
 }
 
