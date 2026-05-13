@@ -16,26 +16,15 @@ using namespace metal;
 // read as F32 give ~1e35. That blows up the RMSNorm output to NaN and
 // every downstream layer collapses.
 
-template <typename W>
-inline float load_weight(device const W* w, uint i);
-
-template <> inline float load_weight<float>(device const float* w, uint i) {
-    return w[i];
-}
-template <> inline float load_weight<bfloat>(device const bfloat* w, uint i) {
-    return float(w[i]);
-}
-
-template <typename W>
-inline void rmsnorm_impl(
-    device const float* x,
-    device const W*     weight,
-    device float*       y,
-    uint                dim,
-    float               eps,
-    uint                row,
-    uint                tid,
-    uint                tcount
+kernel void rmsnorm_f32(
+    device const float* x       [[buffer(0)]],
+    device const float* weight  [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint&      dim     [[buffer(3)]],
+    constant float&     eps     [[buffer(4)]],
+    uint                row     [[threadgroup_position_in_grid]],
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                tcount  [[threads_per_threadgroup]]
 ) {
     threadgroup float partial[32];
 
@@ -65,23 +54,12 @@ inline void rmsnorm_impl(
     float scale = rsqrt(mean + eps);
 
     for (uint i = tid; i < dim; i += tcount) {
-        yrow[i] = xrow[i] * scale * load_weight<W>(weight, i);
+        yrow[i] = xrow[i] * scale * weight[i];
     }
 }
 
-kernel void rmsnorm_f32(
-    device const float* x       [[buffer(0)]],
-    device const float* weight  [[buffer(1)]],
-    device float*       y       [[buffer(2)]],
-    constant uint&      dim     [[buffer(3)]],
-    constant float&     eps     [[buffer(4)]],
-    uint                row     [[threadgroup_position_in_grid]],
-    uint                tid     [[thread_position_in_threadgroup]],
-    uint                tcount  [[threads_per_threadgroup]]
-) {
-    rmsnorm_impl<float>(x, weight, y, dim, eps, row, tid, tcount);
-}
-
+// Same math, but `weight` is bf16 [dim]. HF-native checkpoints
+// (`torch_dtype: bfloat16`) ship every RMSNorm gain in BF16.
 kernel void rmsnorm_bf16w_f32(
     device const float*  x      [[buffer(0)]],
     device const bfloat* weight [[buffer(1)]],
@@ -92,5 +70,34 @@ kernel void rmsnorm_bf16w_f32(
     uint                 tid    [[thread_position_in_threadgroup]],
     uint                 tcount [[threads_per_threadgroup]]
 ) {
-    rmsnorm_impl<bfloat>(x, weight, y, dim, eps, row, tid, tcount);
+    threadgroup float partial[32];
+
+    device const float* xrow = x + row * dim;
+    device float*       yrow = y + row * dim;
+
+    float sumsq = 0.0f;
+    for (uint i = tid; i < dim; i += tcount) {
+        float v = xrow[i];
+        sumsq += v * v;
+    }
+
+    sumsq = simd_sum(sumsq);
+    uint lane = tid % 32;
+    uint warp = tid / 32;
+    if (lane == 0) partial[warp] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (warp == 0) {
+        float v = (tid < (tcount + 31) / 32) ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0) partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean = partial[0] / (float)dim;
+    float scale = rsqrt(mean + eps);
+
+    for (uint i = tid; i < dim; i += tcount) {
+        yrow[i] = xrow[i] * scale * float(weight[i]);
+    }
 }
