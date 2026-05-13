@@ -231,7 +231,7 @@ public final class MoEFFN {
                                         N: N, topK: topK, nExperts: nExperts)
 
         // Layer 5/6 diagnostic: which experts get chosen, with what weight?
-        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             var msg = "[trace moe[\(layerId)] routing] indices/weights (N=\(N), topK=\(topK)):\n"
             for n in 0..<N {
                 var parts: [String] = []
@@ -260,6 +260,7 @@ public final class MoEFFN {
         blit.endEncoding()
 
         let bytesPerRow = dim * MemoryLayout<Float>.size
+        let perExpertTrace = TraceFlags.normTrace && (layerId == 5 || layerId == 6)
         for e in 0..<nExperts {
             let lo = plan.perExpertOffsets[e]
             let hi = plan.perExpertOffsets[e + 1]
@@ -271,6 +272,11 @@ public final class MoEFFN {
                                 buffer: gathered.buffer,
                                 offset: gathered.offset + lo * bytesPerRow)
             let outSlice = expert(slice, in: cmd)
+            if perExpertTrace {
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[\(layerId)] expert[\(e)] out (count=\(count))", outSlice)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+            }
             // Copy into outs.
             let blit2 = cmd.makeBlitCommandEncoder()!
             blit2.copy(from: outSlice.buffer, sourceOffset: 0,
@@ -287,7 +293,7 @@ public final class MoEFFN {
         MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd)
 
         // Diagnostic trace: routed-expert contribution before adding shared.
-        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] routed-only (post-scatter)", y)
             cmd = Device.shared.queue.makeCommandBuffer()!
@@ -297,7 +303,7 @@ public final class MoEFFN {
         // (Block) continues encoding hc.post into the same buffer.
         let sharedOut = sharedExpert(xFlat, in: cmd)
 
-        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] shared-only", sharedOut)
             cmd = Device.shared.queue.makeCommandBuffer()!
@@ -305,7 +311,7 @@ public final class MoEFFN {
 
         Elementwise.addInPlace(y, sharedOut, in: cmd)
 
-        if TraceFlags.normTrace && (layerId == 5 || layerId == 6) {
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] final (routed+shared)", y)
             cmd = Device.shared.queue.makeCommandBuffer()!
