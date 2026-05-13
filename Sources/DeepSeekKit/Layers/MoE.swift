@@ -212,27 +212,8 @@ public final class MoEFFN {
         let N = shape.dropLast().reduce(1, *)
         let xFlat = x.reshape([N, dim])
 
-        // Inline diagnostic trace — only fires under --trace-norms,
-        // and we keyhole on layer 0 by checking N==1 (single token
-        // prompt at start of session). Coarse but enough to localize.
-        @inline(__always) func traceHere(_ name: String, _ t: Tensor) {
-            guard TraceFlags.normTrace else { return }
-            cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("moe[\(layerId)] \(name)", t)
-            cmd = Device.shared.queue.makeCommandBuffer()!
-        }
-        // Gated by layerId so the trace doesn't multiply output for all
-        // 43 layers. (Block.callAsFunction's enclosing trace already
-        // narrows to layer 0, but a MoE layer is called once per
-        // forward and we can guard inline.)
-        let trace = TraceFlags.normTrace && layerId == 0
-        @inline(__always) func tracePoint(_ name: String, _ t: Tensor) {
-            if trace { traceHere(name, t) }
-        }
-
         // 1. Gate.
         let (weights, indices) = gate(xFlat, inputIds: inputIds, in: &cmd)
-        tracePoint("after gate.weights", weights)
         // We need indices+weights on host to build the dispatch plan.
         cmd.commit(); cmd.waitUntilCompleted()
         let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self, capacity: N * topK)
@@ -279,22 +260,17 @@ public final class MoEFFN {
             blit2.endEncoding()
         }
 
-        tracePoint("after routed experts (outs flat)", outs)
-
         // 4. Scatter back into a dense [N, D] tensor.
         let y = Tensor.empty(shape: [N, dim], dtype: .f32)
         let blitY = cmd.makeBlitCommandEncoder()!
         blitY.fill(buffer: y.buffer, range: 0..<y.byteCount, value: 0)
         blitY.endEncoding()
         MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd)
-        tracePoint("after scatter (routed only)", y)
 
         // 5. Add shared expert output. Leave cmd uncommitted; the caller
         // (Block) continues encoding hc.post into the same buffer.
         let sharedOut = sharedExpert(xFlat, in: cmd)
-        tracePoint("after shared_experts", sharedOut)
         Elementwise.addInPlace(y, sharedOut, in: cmd)
-        tracePoint("after routed + shared sum", y)
 
         return y.reshape(shape)
     }
