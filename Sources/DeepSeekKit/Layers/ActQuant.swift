@@ -84,6 +84,58 @@ public final class ActQuant {
         return Output(inplace: yIp, qbytes: qbytes, scales: scales)
     }
 
+    /// In-place FP8 E4M3 round-trip on a column slice of each row, used for
+    /// V4's QAT noise injection on KV nope dims. Mirrors the Python reference
+    /// calls at `model.py:372` (Compressor rotate=False) and `model.py:506`
+    /// (MLA):
+    ///
+    ///     act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+    ///
+    /// Quantises `x[..., colStart..<colEnd]` to FP8 then dequantises back
+    /// into the same buffer; columns outside the slice are untouched. The
+    /// model was trained with this round-trip and silently relies on the
+    /// ±448 clipping window of FP8 to keep KV values bounded — omitting it
+    /// lets the residual stream amplify uncontrolled past layer 5.
+    ///
+    /// `blockSize` controls the per-row absmax granularity (64 for the V4
+    /// KV-nope case; can be anything that divides `colEnd - colStart`).
+    /// `x` must be f32, rank-2 [M, totalCols].
+    public static func partialInplaceQuant(_ x: Tensor,
+                                            colStart: Int,
+                                            colEnd: Int,
+                                            blockSize: Int = Quant.actBlockSizeFP8KVNope,
+                                            in cmd: MTLCommandBuffer) {
+        precondition(x.dtype == .f32 && x.shape.count == 2,
+                     "ActQuant.partialInplaceQuant: x must be f32 [M, totalCols]")
+        let M = x.shape[0]
+        let totalCols = x.shape[1]
+        precondition(colStart >= 0 && colEnd <= totalCols && colStart < colEnd,
+                     "ActQuant.partialInplaceQuant: bad column range \(colStart)..\(colEnd)")
+        let span = colEnd - colStart
+        precondition(span % blockSize == 0,
+                     "ActQuant.partialInplaceQuant: span \(span) not divisible by block \(blockSize)")
+        let blocks = span / blockSize
+
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(Self.partialP)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        var dims = SIMD3<UInt32>(UInt32(M), UInt32(totalCols), UInt32(blockSize))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 1)
+        var range = SIMD2<UInt32>(UInt32(colStart), UInt32(colEnd))
+        enc.setBytes(&range, length: MemoryLayout.size(ofValue: range), index: 2)
+        enc.setThreadgroupMemoryLength(blockSize * MemoryLayout<Float>.size, index: 0)
+
+        let tg = MTLSize(width: blockSize, height: 1, depth: 1)
+        let grid = MTLSize(width: M, height: blocks, depth: 1)
+        enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Pipeline for `act_quant_fp8_partial_inplace`. Block size is a runtime
+    /// argument on this kernel so we only need one specialisation.
+    private static let partialP: MTLComputePipelineState = Device.shared.makePipeline(
+        "act_quant_fp8_partial_inplace")
+
     // MARK: - Pure-Swift reference
 
     public static func referenceCPU(_ row: [Float], format: Format,

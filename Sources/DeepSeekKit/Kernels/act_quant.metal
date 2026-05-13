@@ -263,3 +263,58 @@ kernel void act_quant_fp4(
         }
     }
 }
+
+// ---------- FP8 partial in-place QAT noise -------------------------------
+//
+// In-place FP8 E4M3 round-trip on a column slice [colStart, colEnd) of each
+// row of an [M, totalCols] f32 tensor. Block size is a runtime parameter so
+// the same kernel can quantize at the V4 KV-nope block size (64) without
+// rebuilding the pipeline for every variant.
+//
+// Mirrors `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)` from
+// official/DeepSeek-V4-Flash/inference/model.py:506 (MLA) and :372
+// (Compressor rotate=False) — these are the QAT noise injections the model
+// was trained with on KV nope dims. Without them, KV values past layer 5
+// exceed the FP8 ±448 clipping window and the residual stream amplifies
+// across layers (observed in our trace: layer 0 L2=75 → layer 42 L2=615000).
+//
+// Threadgroup layout: one threadgroup per (row, in-range-block), threadgroup
+// width == block_size. Blocks are taken from the [colStart, colEnd) slice
+// only; columns outside the slice are untouched. block_size is passed as
+// part of `dims` so the kernel doesn't need a function constant.
+
+kernel void act_quant_fp8_partial_inplace(
+    device float*       x          [[buffer(0)]],
+    constant uint3&     dims       [[buffer(1)]],   // (M, totalCols, blockSize)
+    constant uint2&     range      [[buffer(2)]],   // (colStart, colEnd)
+    threadgroup float*  shared_    [[threadgroup(0)]],
+    uint2 tg      [[threadgroup_position_in_grid]],
+    uint2 tidv    [[thread_position_in_threadgroup]],
+    uint2 tgsv    [[threads_per_threadgroup]]
+) {
+    uint M = dims.x, totalCols = dims.y, blkSize = dims.z;
+    uint colStart = range.x, colEnd = range.y;
+    uint row = tg.x;
+    uint blkIdx = tg.y;
+    uint tid = tidv.x;
+    uint tgsize = tgsv.x;
+
+    uint blockStart = colStart + blkIdx * blkSize;
+    if (row >= M || blockStart >= colEnd) return;
+
+    uint idx = row * totalCols + blockStart + tid;
+    float v = x[idx];
+    float a = fabs(v);
+
+    shared_[tid] = a;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) shared_[tid] = max(shared_[tid], shared_[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float amax = max(shared_[0], 1e-4f);
+    float scale = round_pow2_scale(amax, 1.0f / 448.0f);
+    float clipped = clamp(v / scale, -448.0f, 448.0f);
+    uchar qb = f32_to_e4m3(clipped);
+    x[idx] = e4m3_to_f32(qb) * scale;
+}

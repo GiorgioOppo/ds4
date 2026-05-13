@@ -120,8 +120,10 @@ public final class MLA {
     ///     rows with cutoff/wrap (model.py:521-523)
     ///   - decode startPos > 0, seqlen == 1: ring-buffer single-row write
     ///
-    /// act_quant of the non-rope KV dims is skipped (QAT noise; structural
-    /// forward correctness doesn't depend on it). Tier 3 will add it back.
+    /// FP8 QAT noise is applied in-place to the non-rope dims of KV after
+    /// RoPE, matching model.py:506 (`act_quant(kv[..., :-rd], 64, ..., True)`).
+    /// Without this the residual stream amplifies uncontrolled past layer 5.
+    ///
     /// `cmd` is `inout`: when MLA has to flush the queue to read indexer
     /// topk to host (compress_ratio == 4), the original command buffer is
     /// committed and replaced with a fresh one. Caller's subsequent work
@@ -223,6 +225,23 @@ public final class MLA {
         // RoPE on rope tail (interpret as [B*S, 1, head_dim]).
         rope.apply(kvFlat.reshape([B * S, 1, headDim]),
                    startPos: startPos, inverse: false, in: cmd)
+        // FP8-simulate the non-rope dims of KV to match training-time QAT
+        // noise. Mirrors model.py:506
+        //     act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        // The model was trained with KV nope dims round-tripped through
+        // FP8 (block 64, clipped to ±448). Without this step the KV
+        // values exceed FP8 range in deeper layers, attention scores
+        // become outsized, and the residual stream amplifies across
+        // layers (observed: layer 0 L2=75 → layer 42 L2=615k).
+        ActQuant.partialInplaceQuant(
+            kvFlat.reshape([B * S, headDim]),
+            colStart: 0, colEnd: headDim - ropeHeadDim,
+            blockSize: Quant.actBlockSizeFP8KVNope, in: cmd)
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] kv after fp8-QAT", kvFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let kv = kvFlat.reshape([B, S, headDim])
 
         // ---------- Topk indices ----------
