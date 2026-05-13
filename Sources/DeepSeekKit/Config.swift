@@ -401,4 +401,40 @@ public struct ModelConfig: Codable, Sendable {
         }
         return c
     }
+
+    /// Multi-line human-readable dump of every config field. For
+    /// `--print-config` diagnostics: lets the caller diff the loaded
+    /// values against config.json field-by-field to catch keys that
+    /// silently fell back to the hard-coded defaults.
+    public var summary: String {
+        var s = ""
+        s += "ModelConfig {\n"
+        s += "  // shape\n"
+        s += "  vocabSize=\(vocabSize) dim=\(dim) maxSeqLen=\(maxSeqLen) maxBatchSize=\(maxBatchSize)\n"
+        s += "  nLayers=\(nLayers) nHashLayers=\(nHashLayers) nMtpLayers=\(nMtpLayers)\n"
+        s += "  nHeads=\(nHeads) headDim=\(headDim) ropeHeadDim=\(ropeHeadDim)\n"
+        s += "  qLoraRank=\(qLoraRank) oLoraRank=\(oLoraRank) oGroups=\(oGroups)\n"
+        s += "  windowSize=\(windowSize)\n"
+        s += "  // MoE\n"
+        s += "  nRoutedExperts=\(nRoutedExperts) nSharedExperts=\(nSharedExperts) nActivatedExperts=\(nActivatedExperts)\n"
+        s += "  moeInterDim=\(moeInterDim) routeScale=\(routeScale) scoreFunc=\"\(scoreFunc)\" swigluLimit=\(swigluLimit)\n"
+        s += "  // dtype + scale\n"
+        s += "  dtype=\"\(dtype)\" scaleDtype=\"\(scaleDtype)\" "
+        s += "expertDtype=\(expertDtype.map { "\"\($0)\"" } ?? "nil") "
+        s += "scaleFmt=\(scaleFmt.map { "\"\($0)\"" } ?? "nil")\n"
+        s += "  // RoPE / YaRN\n"
+        s += "  ropeTheta=\(ropeTheta) compressRopeTheta=\(compressRopeTheta)\n"
+        s += "  ropeFactor=\(ropeFactor) originalSeqLen=\(originalSeqLen)\n"
+        s += "  betaFast=\(betaFast) betaSlow=\(betaSlow) mscale=\(mscale)\n"
+        s += "  // per-layer compress_ratios (count=\(compressRatios.count))\n"
+        s += "  compressRatios=\(compressRatios)\n"
+        s += "  // norms\n"
+        s += "  normEps=\(normEps)\n"
+        s += "  // indexer\n"
+        s += "  indexNHeads=\(indexNHeads) indexHeadDim=\(indexHeadDim) indexTopk=\(indexTopk)\n"
+        s += "  // hyper-connections\n"
+        s += "  hcMult=\(hcMult) hcSinkhornIters=\(hcSinkhornIters) hcEps=\(hcEps)\n"
+        s += "}\n"
+        return s
+    }
 }

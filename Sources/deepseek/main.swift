@@ -50,6 +50,13 @@ func usage() -> Never {
         collapse to zero, or go NaN. Output goes to stderr; the
         usual token stream still goes to stdout. Off by default.
 
+    --print-config
+        Diagnostic mode. Loads config.json (or the defaults if
+        missing), prints every field of the resulting ModelConfig to
+        stderr, and exits. Use to verify that all keys actually
+        round-trip from JSON instead of silently falling back to
+        hard-coded defaults.
+
     """.utf8))
     exit(2)
 }
@@ -76,6 +83,7 @@ var forceLoad = false
 var dumpSpec: String? = nil
 var listPrefix: String? = nil
 var listEnabled = false
+var printConfigAndExit = false
 
 var i = nextArg
 while i < args.count {
@@ -109,6 +117,8 @@ while i < args.count {
         }
     case "--trace-norms":
         TraceFlags.normTrace = true; i += 1
+    case "--print-config":
+        printConfigAndExit = true; i += 1
     default: usage()
     }
 }
@@ -221,6 +231,15 @@ if FileManager.default.fileExists(atPath: configURL.path) {
 
     """.utf8))
     config = ModelConfig()
+}
+
+// ---------- Diagnostic: --print-config ----------
+// Exits after printing every field of the loaded ModelConfig, so the
+// caller can diff against config.json line-by-line and spot any keys
+// that silently fell back to a hard-coded default.
+if printConfigAndExit {
+    FileHandle.standardError.write(Data(config.summary.utf8))
+    exit(0)
 }
 
 // ---------- Tokenizer ----------
