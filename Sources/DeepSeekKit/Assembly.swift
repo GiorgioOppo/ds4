@@ -90,7 +90,11 @@ public extension Transformer {
                           kvCache: kvCache)
 
             // ---- MoE FFN ----
-            let gateW = AssemblyHelpers.linear(in: dim, out: nExperts, rng: &rng)
+            // Gate logits stay in FP32 (see real-load path comment).
+            let gateWWeight = AssemblyHelpers.randomTensor([nExperts, dim], rng: &rng, scale: 0.02)
+            let gateW = Linear(inFeatures: dim, outFeatures: nExperts,
+                                weight: gateWWeight, scale: nil,
+                                castOutputToBF16: false)
             let gateBias: Tensor? = i < config.nHashLayers ? nil :
                 AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0)
             let gate = Gate(config: config, layerId: i,
@@ -287,8 +291,19 @@ public extension Transformer {
                           kvCache: kvCache)
 
             // ---- MoE FFN ----
+            // Gate logits MUST stay in FP32: model.py:566 spells out
+            //   scores = linear(x.float(), self.weight.float())
+            // i.e. the projection is run in FP32 explicitly. Quantising the
+            // logits to BF16 (~7 mantissa bits) before sqrt(softplus) + topk
+            // perturbs which experts get selected, and on V4-Flash that
+            // perturbation shows up as an 8.4× residual-stream cliff at the
+            // first SCORE-routed layer (= the first layer past
+            // `n_hash_layers`). Hash-routed layers are spared because their
+            // expert indices come from a precomputed token→expert table —
+            // only the weights are affected, not the routing.
             let gateW = try loadLinear(loader, base: "\(lp).ffn.gate",
-                                        inF: dim, outF: nExperts, rng: &rng)
+                                        inF: dim, outF: nExperts,
+                                        castOutputToBF16: false, rng: &rng)
             let gateBias: Tensor? = i < config.nHashLayers ? nil :
                 ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
                  ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
