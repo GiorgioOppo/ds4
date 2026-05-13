@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import DeepSeekKit
+import DeepSeekConverter
 
 // Native Swift port of `Reference/inference/convert.py`, extended to
 // transcode every non-native dtype into a type Apple Silicon supports
@@ -21,7 +22,7 @@ import DeepSeekKit
 //       --save-path /path/V4-Flash-converted \
 //       --n-experts <N> \
 //       [--model-parallel 1] \
-//       [--target-dtype bf16|f16|int8|keep]   # default: bf16
+//       [--target-dtype bf16|f16|int8|int4|int2|keep]  # default: bf16
 //       [--shard-size-gb 5]                   # default: 5 GB per shard
 //
 // `int8` is a W8A16 weight-only quantization: every Linear weight that
@@ -33,35 +34,16 @@ import DeepSeekKit
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: converter --hf-ckpt-path <dir> --save-path <dir> --n-experts <N>
-                     [--model-parallel 1] [--target-dtype bf16|f16|int8|keep]
+                     [--model-parallel 1] [--target-dtype bf16|f16|int8|int4|int2|keep]
                      [--shard-size-gb 5]
 
     """.utf8))
     exit(2)
 }
 
-enum TargetDType: String {
-    case bf16, f16, int8, keep
-    var safetensorsTag: String {
-        switch self {
-        case .bf16: return "BF16"
-        case .f16:  return "F16"
-        case .int8: return "I8"
-        case .keep: return ""
-        }
-    }
-    // For BF16/F16 (the only target dtypes that emit a single tensor per
-    // weight) this is 2 bytes per element. For INT8 the byte count per
-    // weight is 1 byte (plus a small F16 scale companion), so callers that
-    // size INT8 outputs compute the size locally rather than reading this.
-    var bytesPerElement: Int {
-        switch self {
-        case .bf16, .f16: return 2
-        case .int8:       return 1
-        case .keep:       return 2   // unused in keep mode
-        }
-    }
-}
+// `TargetDType` is now `ConversionTarget` and lives in the
+// DeepSeekConverter library. Imported above.
+typealias TargetDType = ConversionTarget
 
 // ---------- Argument parsing ----------
 
@@ -125,334 +107,17 @@ let hfDir = URL(fileURLWithPath: hf)
 let saveDir = URL(fileURLWithPath: save)
 try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
 
-// ---------- Rename mapping (port of convert.py:55-79) ----------
-
-let leafMapping: [String: String] = [
-    "embed_tokens": "embed",
-    "input_layernorm": "attn_norm",
-    "post_attention_layernorm": "ffn_norm",
-    "q_proj": "wq",
-    "q_a_proj": "wq_a",
-    "q_a_layernorm": "q_norm",
-    "q_b_proj": "wq_b",
-    "kv_a_proj_with_mqa": "wkv_a",
-    "kv_a_layernorm": "kv_norm",
-    "kv_b_proj": "wkv_b",
-    "o_proj": "wo",
-    "gate_proj": "w1",
-    "down_proj": "w2",
-    "up_proj": "w3",
-    "lm_head": "head",
-    // Identity / passthrough names that already match.
-    "embed": "embed",
-    "wq_b": "wq_b",
-    "wo_a": "wo_a",
-    "wo_b": "wo_b",
-    "head": "head",
-    "attn_sink": "attn_sink",
-    "weights_proj": "weights_proj",
-]
-
-func renameKey(_ name: String) -> String {
-    var n = name
-    if n.hasPrefix("model.") { n = String(n.dropFirst("model.".count)) }
-    n = n.replacingOccurrences(of: "self_attn", with: "attn")
-    n = n.replacingOccurrences(of: "mlp", with: "ffn")
-    n = n.replacingOccurrences(of: "weight_scale_inv", with: "scale")
-    n = n.replacingOccurrences(of: "e_score_correction_bias", with: "bias")
-
-    let parts = n.split(separator: ".").map(String.init)
-    let leaf: String
-    if parts.contains(where: { ["hc", "attn_sink", "tie2eid", "ape"].contains($0) ||
-                                $0.hasPrefix("hc_") }) {
-        leaf = parts.last ?? n
-    } else {
-        leaf = parts.count >= 2 ? parts[parts.count - 2] : (parts.last ?? n)
-    }
-    if let mapped = leafMapping[leaf] {
-        n = n.replacingOccurrences(of: leaf, with: mapped)
-    }
-    return n
-}
-
-func shouldSkip(_ name: String) -> Bool {
-    // convert.py:105 — skip MTP-tied embed/head; they alias the main ones.
-    if name.hasPrefix("mtp.") {
-        if name.contains("emb") { return true }
-        if name.hasSuffix("head.weight") { return true }
-    }
-    return false
-}
-
-// ---------- Native-dtype conversion helpers ----------
-
-@inline(__always)
-func floatToBF16(_ f: Float) -> UInt16 {
-    let bits = f.bitPattern
-    let rounded = bits &+ ((bits >> 16) & 1) &+ 0x7FFF
-    return UInt16(truncatingIfNeeded: rounded >> 16)
-}
-
-@inline(__always)
-func floatToF16(_ f: Float) -> UInt16 {
-    // IEEE 754 single → half with round-to-nearest-even, saturating to
-    // ±inf on overflow. Subnormals are flushed via the standard formula.
-    let bits = f.bitPattern
-    let sign = (bits >> 31) & 1
-    let exp = (bits >> 23) & 0xFF
-    let mant = bits & 0x7FFFFF
-    if exp == 0 { return UInt16(truncatingIfNeeded: sign << 15) }
-    if exp == 0xFF {
-        let m: UInt32 = mant != 0 ? 0x200 : 0   // NaN if mantissa, else inf
-        return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10) | m)
-    }
-    let unbiased = Int(exp) - 127
-    if unbiased > 15 { return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10)) }
-    if unbiased < -14 {
-        // Subnormal half.
-        let shift = -14 - unbiased + 13
-        if shift > 24 { return UInt16(truncatingIfNeeded: sign << 15) }
-        let full = (mant | 0x800000) >> (shift - 1)
-        let halfMant = (full + 1) >> 1
-        return UInt16(truncatingIfNeeded: (sign << 15) | halfMant)
-    }
-    let halfExp = UInt32(unbiased + 15)
-    let halfMant = (mant + 0x1000) >> 13
-    if halfMant >= 0x400 {
-        if halfExp + 1 >= 0x1F {
-            return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10))
-        }
-        return UInt16(truncatingIfNeeded: (sign << 15) | ((halfExp + 1) << 10))
-    }
-    return UInt16(truncatingIfNeeded: (sign << 15) | (halfExp << 10) | halfMant)
-}
-
-@inline(__always)
-func packNative(_ f: Float, _ target: TargetDType) -> UInt16 {
-    switch target {
-    case .bf16: return floatToBF16(f)
-    case .f16:  return floatToF16(f)
-    case .int8: fatalError("packNative requires bf16 or f16; INT8 path uses Int8Quant")
-    case .keep: fatalError("packNative requires bf16 or f16")
-    }
-}
-
-@inline(__always)
-func deqE4M3(_ b: UInt8) -> Float {
-    let sign = (UInt32(b) >> 7) & 1
-    let exp = (UInt32(b) >> 3) & 0xF
-    let mant = UInt32(b) & 0x7
-    if exp == 0 && mant == 0 { return sign == 1 ? -0.0 : 0.0 }
-    if exp == 0xF && mant == 0x7 { return .nan }
-    if exp == 0 {
-        let v = Float(mant) * 0x1p-9
-        return sign == 1 ? -v : v
-    }
-    let bp = (sign << 31) | ((exp + 120) << 23) | (mant << 20)
-    return Float(bitPattern: bp)
-}
-
-@inline(__always)
-func deqE2M1(_ nibble: UInt8) -> Float {
-    let mag = nibble & 7
-    let v: Float
-    switch mag {
-    case 0: v = 0.0
-    case 1: v = 0.5
-    case 2: v = 1.0
-    case 3: v = 1.5
-    case 4: v = 2.0
-    case 5: v = 3.0
-    case 6: v = 4.0
-    default: v = 6.0
-    }
-    return (nibble & 8) != 0 ? -v : v
-}
-
-@inline(__always)
-func deqE8M0(_ b: UInt8) -> Float {
-    if b == 0xFF { return .nan }
-    return Float(bitPattern: UInt32(b) << 23)
-}
-
-// Pre-computed lookup tables for the dequant functions. Each input byte
-// (or nibble) maps to a fixed Float, so we replace the per-element bit
-// twiddling with a single load. 256-entry tables fit in L1.
-let e4m3LUT: [Float] = (0..<256).map { deqE4M3(UInt8($0)) }
-let e2m1LUT: [Float] = (0..<16).map  { deqE2M1(UInt8($0)) }
-let e8m0LUT: [Float] = (0..<256).map { deqE8M0(UInt8($0)) }
-
-// ---------- FP8 → native fusion ----------
+// Rename mapping (`leafMapping`, `renameKey`, `shouldSkip`),
+// dtype packers (`floatToBF16`, `floatToF16`, `packNative`,
+// `deqE4M3`, `deqE2M1`, `deqE8M0`), LUTs (`e4m3LUT`, `e2m1LUT`,
+// `e8m0LUT`), dtype probes (`isFP8DType`, `isFP4DType`,
+// `isE8M0DType`), and the FP8/FP4 → BF16/F16 fusion functions
+// (`fuseFP8ToNative`, `fuseFP4ToNative`) now live in the
+// DeepSeekConverter library — imported above.
 //
-// Weight: [out, in] FP8-E4M3. Scale: [out/128, in/128] E8M0.
-//   fused[i, j] = deqE4M3(W[i,j]) * deqE8M0(S[i/128, j/128]).
-// Output: [out, in] in `target` (BF16 or F16). Rows are dequantized in
-// parallel via DispatchQueue.concurrentPerform; the input weight is
-// slurped once so all worker threads can index it without serializing
-// on a shared FileHandle cursor.
-func fuseFP8ToNative(weightURL: URL, weightOffset: Int,
-                     scaleURL: URL, scaleOffset: Int,
-                     outDim: Int, inDim: Int,
-                     target: TargetDType) throws -> Data {
-    precondition(outDim % 128 == 0 && inDim % 128 == 0,
-                 "FP8 weight dims must be 128-aligned")
-    let blocksOut = outDim / 128
-    let blocksIn = inDim / 128
+// `scaleNameFor` is also there (Rename.swift); the local
+// duplicate below is removed.
 
-    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
-        throw NSError(domain: "fuseFP8", code: 1)
-    }
-    defer { try? sf.close() }
-    try sf.seek(toOffset: UInt64(scaleOffset))
-    guard let scaleBytes = try sf.read(upToCount: blocksOut * blocksIn) else {
-        throw NSError(domain: "fuseFP8", code: 2)
-    }
-
-    // Slurp the entire weight tensor up front so rows can be processed in
-    // parallel. Peak memory adds one tensor's worth of FP8 (= half the
-    // BF16 output we're already allocating below), bounded by tensor size.
-    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
-        throw NSError(domain: "fuseFP8", code: 3)
-    }
-    defer { try? wf.close() }
-    try wf.seek(toOffset: UInt64(weightOffset))
-    let weightLen = outDim * inDim
-    guard let weightBytes = try wf.read(upToCount: weightLen),
-          weightBytes.count == weightLen else {
-        throw NSError(domain: "fuseFP8", code: 4)
-    }
-
-    var out = Data(count: outDim * inDim * 2)
-    out.withUnsafeMutableBytes { outRaw in
-        let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
-        scaleBytes.withUnsafeBytes { scaleRaw in
-            let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            weightBytes.withUnsafeBytes { wRaw in
-                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
-                e4m3LUT.withUnsafeBufferPointer { e4m3 in
-                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
-                        let e4m3Ptr = e4m3.baseAddress!
-                        let e8m0Ptr = e8m0.baseAddress!
-                        // Rows are independent: each writes a disjoint
-                        // [i * inDim, (i+1) * inDim) slice of outPtr.
-                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
-                            let bo = i / 128
-                            let rowIn = wPtr.advanced(by: i * inDim)
-                            let rowOut = outPtr.advanced(by: i * inDim)
-                            // Hoist the scale lookup out of the inner loop:
-                            // it's constant within each 128-element block.
-                            for sb in 0..<blocksIn {
-                                let s = e8m0Ptr[Int(scalePtr[bo * blocksIn + sb])]
-                                let jBase = sb * 128
-                                for k in 0..<128 {
-                                    let w = e4m3Ptr[Int(rowIn[jBase + k])]
-                                    rowOut[jBase + k] = packNative(w * s, target)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return out
-}
-
-// ---------- FP4 → native fusion ----------
-//
-// Weight: [out, in/2] packed FP4-E2M1 (low nibble = element 2*i,
-// high nibble = element 2*i+1). Scale: [out, in/32] E8M0.
-//   fused[i, j] = deqE2M1(W_nibble(i, j)) * deqE8M0(S[i, j/32]).
-// Output: [out, in] in `target` — 4× the input weight bytes.
-func fuseFP4ToNative(weightURL: URL, weightOffset: Int,
-                     scaleURL: URL, scaleOffset: Int,
-                     outDim: Int, inDim: Int,
-                     target: TargetDType) throws -> Data {
-    precondition(inDim % 32 == 0, "FP4 weight inDim must be 32-aligned")
-    precondition(inDim % 2 == 0, "FP4 weight inDim must be even (packed pairs)")
-    let blocksIn = inDim / 32
-
-    guard let sf = FileHandle(forReadingAtPath: scaleURL.path) else {
-        throw NSError(domain: "fuseFP4", code: 1)
-    }
-    defer { try? sf.close() }
-    try sf.seek(toOffset: UInt64(scaleOffset))
-    guard let scaleBytes = try sf.read(upToCount: outDim * blocksIn) else {
-        throw NSError(domain: "fuseFP4", code: 2)
-    }
-
-    // Slurp the whole packed-FP4 weight up front so rows can be expanded
-    // in parallel. Packed size is half the logical inDim, so this peak is
-    // a quarter of the BF16 output buffer we're already holding.
-    guard let wf = FileHandle(forReadingAtPath: weightURL.path) else {
-        throw NSError(domain: "fuseFP4", code: 3)
-    }
-    defer { try? wf.close() }
-    try wf.seek(toOffset: UInt64(weightOffset))
-
-    let packedRowBytes = inDim / 2
-    let weightLen = outDim * packedRowBytes
-    guard let weightBytes = try wf.read(upToCount: weightLen),
-          weightBytes.count == weightLen else {
-        throw NSError(domain: "fuseFP4", code: 4)
-    }
-
-    var out = Data(count: outDim * inDim * 2)
-    out.withUnsafeMutableBytes { outRaw in
-        let outPtr = outRaw.bindMemory(to: UInt16.self).baseAddress!
-        scaleBytes.withUnsafeBytes { scaleRaw in
-            let scalePtr = scaleRaw.bindMemory(to: UInt8.self).baseAddress!
-            weightBytes.withUnsafeBytes { wRaw in
-                let wPtr = wRaw.bindMemory(to: UInt8.self).baseAddress!
-                e2m1LUT.withUnsafeBufferPointer { e2m1 in
-                    e8m0LUT.withUnsafeBufferPointer { e8m0 in
-                        let e2m1Ptr = e2m1.baseAddress!
-                        let e8m0Ptr = e8m0.baseAddress!
-                        // Each row owns a disjoint slice of outPtr; safe
-                        // to fan out across cores.
-                        DispatchQueue.concurrentPerform(iterations: outDim) { i in
-                            let rowIn = wPtr.advanced(by: i * packedRowBytes)
-                            let rowOut = outPtr.advanced(by: i * inDim)
-                            let scaleRow = scalePtr.advanced(by: i * blocksIn)
-                            // 32 logical elements per scale block = 16 packed bytes.
-                            for sb in 0..<blocksIn {
-                                let s = e8m0Ptr[Int(scaleRow[sb])]
-                                let inBase = sb * 16
-                                let outBase = sb * 32
-                                for k in 0..<16 {
-                                    let byte = rowIn[inBase + k]
-                                    let vLow  = e2m1Ptr[Int(byte & 0xF)] * s
-                                    let vHigh = e2m1Ptr[Int(byte >> 4)] * s
-                                    rowOut[outBase + 2 * k]     = packNative(vLow, target)
-                                    rowOut[outBase + 2 * k + 1] = packNative(vHigh, target)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return out
-}
-
-@inline(__always)
-func isFP8DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F8_E4M3" || u == "F8E4M3" || u == "FLOAT8_E4M3FN"
-}
-
-@inline(__always)
-func isFP4DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F4_E2M1" || u == "F4E2M1" || u == "FLOAT4_E2M1FN_X2"
-}
-
-@inline(__always)
-func isE8M0DType(_ s: String) -> Bool {
-    let u = s.uppercased()
-    return u == "F8_E8M0" || u == "F8E8M0" || u == "FLOAT8_E8M0FNU"
-}
 
 // ---------- Walk + collect ----------
 
@@ -471,6 +136,8 @@ let dtypeNote: String
 switch targetDType {
 case .keep: dtypeNote = "(non-native FP8/FP4 preserved)"
 case .int8: dtypeNote = "(Linear weights → INT8 W8A16 + F16 group scales; other tensors → BF16)"
+case .int4: dtypeNote = "(Linear weights → INT4 W4A16 packed 2-per-byte + F16 group scales; other tensors → BF16)"
+case .int2: dtypeNote = "(Linear weights → INT2 W2A16 packed 4-per-byte + F16 group scales; other tensors → BF16)"
 case .bf16, .f16: dtypeNote = "(FP8/FP4+scale fused into native)"
 }
 print("  target dtype:    \(targetDType.rawValue) \(dtypeNote)")
@@ -481,6 +148,12 @@ case .keep:
     break
 case .int8:
     print("  note:            INT8 quant covers Linear weights only; net disk ≈ ½ × BF16.")
+case .int4:
+    print("  note:            INT4 quant covers Linear weights only; net disk ≈ ¼ × BF16. " +
+          "Accuracy lower than INT8 — RTN only, no calibration.")
+case .int2:
+    print("  note:            INT2 quant covers Linear weights only; net disk ≈ ⅛ × BF16. " +
+          "Brutal accuracy hit at this bit-width — RTN only, calibration recommended for production.")
 case .bf16, .f16:
     print("  note:            FP8 → 2× size, FP4 → 4× size; expect ~3-4× the " +
           "input directory's footprint on disk.")
@@ -555,13 +228,16 @@ struct WriteEntry {
     let source: SafeTensorsWriter.Source
 }
 
-func scaleNameFor(_ weightName: String) -> String {
-    return weightName.replacingOccurrences(of: ".weight", with: ".scale")
-}
+// `scaleNameFor` now lives in DeepSeekConverter (Rename.swift).
+// Imported above; the original definition uses
+// `replacingOccurrences(of:.weight, with:.scale)` which is
+// equivalent for the names we emit (`<base>.weight`).
 
 var writeEntries: [WriteEntry] = []
 var scalesConsumed = Set<String>()    // .scale entries that have been folded in
 var int8QuantizedCount = 0
+var int4QuantizedCount = 0
+var int2QuantizedCount = 0
 
 for newName in plan.keys.sorted() {
     let pt = plan[newName]!
@@ -669,11 +345,207 @@ for newName in plan.keys.sorted() {
         // Fall through: non-whitelisted tensors get BF16 fusion below.
     }
 
-    // Effective target for non-INT8 (or non-whitelisted) tensors: when the
-    // user asked for INT8, anything that didn't quantize falls back to
-    // BF16; otherwise honor the user's target verbatim.
+    // ----- INT4 W4A16 quantization branch -----
+    // Same whitelist + same per-128-block layout as INT8; the only
+    // differences are nibble packing and the [-8, 7] quantization range.
+    if targetDType == .int4 {
+        let outDim = pt.shape[0]
+        let logicalInDim: Int
+        let scaleName = scaleNameFor(newName)
+        let companion = plan[scaleName]
+        let scaleDtype = companion?.dtype.uppercased() ?? ""
+        // Disambiguate two cases of `pt.dtype == "I8"`:
+        //   - HF V4 ships FP4 expert weights packed two-per-byte
+        //     with safetensors dtype I8/U8 and an E8M0 scale.
+        //   - Our previous INT8 conversion ships real signed-int8
+        //     weights with an F16 scale.
+        // Use the scale dtype to tell them apart so we run the
+        // correct row dequantizer.
+        let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
+                                                    (pt.dtype.uppercased() == "I8" ||
+                                                     pt.dtype.uppercased() == "U8") &&
+                                                    isE8M0DType(scaleDtype))
+        let isRealInt8 = pt.dtype.uppercased() == "I8" && scaleDtype == "F16"
+        if isPackedFP4 {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
+        } else {
+            // INT8 and BF16/F32 use the canonical 2D layout.
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] : 0
+        }
+
+        if pt.shape.count == 2 &&
+           shouldQuantizeToInt4(newName, lastDim: logicalInDim) {
+            let inDim = logicalInDim
+            let blocksIn = inDim / kInt4GroupK
+            let packedRowBytes = inDim / 2
+            let weightBytes = outDim * packedRowBytes
+            let scaleBytes = outDim * blocksIn * 2
+            let logicalShape = [outDim, inDim]
+            let scaleShape = [outDim, blocksIn]
+            let srcDtype = pt.dtype
+            if companion != nil &&
+                (isFP8DType(srcDtype) || isPackedFP4 || isRealInt8) {
+                scalesConsumed.insert(scaleName)
+            }
+
+            var cached: (weight: Data, scale: Data)? = nil
+            let upper = srcDtype.uppercased()
+            let weightURL = pt.url
+            let weightOffset = pt.offset
+            let scaleURL = companion?.url
+            let scaleOffset = companion?.offset ?? 0
+            let isFP8 = isFP8DType(srcDtype)
+            let isFP4 = isPackedFP4
+            let isInt8 = isRealInt8
+            let compute: () throws -> (weight: Data, scale: Data) = {
+                if let c = cached { return c }
+                let r: (weight: Data, scale: Data)
+                if isFP8, let sURL = scaleURL {
+                    r = try quantizeFP8ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e4m3LUT: e4m3LUT, e8m0LUT: e8m0LUT)
+                } else if isFP4, let sURL = scaleURL {
+                    r = try quantizeFP4ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if isInt8, let sURL = scaleURL {
+                    r = try quantizeInt8ToInt4(weightURL: weightURL, weightOffset: weightOffset,
+                                                scaleURL: sURL, scaleOffset: scaleOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "BF16" {
+                    r = try quantizeBF16ToInt4(srcURL: weightURL, srcOffset: weightOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "F32" {
+                    r = try quantizeF32ToInt4(srcURL: weightURL, srcOffset: weightOffset,
+                                               outDim: outDim, inDim: inDim)
+                } else {
+                    throw NSError(domain: "Int4Quant", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INT4 quant: unsupported source dtype \(srcDtype) for \(newName)"
+                    ])
+                }
+                cached = r
+                return r
+            }
+
+            writeEntries.append(WriteEntry(
+                name: newName, dtype: "I4", shape: logicalShape, byteCount: weightBytes,
+                source: .compute(byteCount: weightBytes) { try compute().weight }))
+            writeEntries.append(WriteEntry(
+                name: scaleName, dtype: "F16", shape: scaleShape, byteCount: scaleBytes,
+                source: .compute(byteCount: scaleBytes) {
+                    let s = try compute().scale
+                    cached = nil
+                    return s
+                }))
+            int4QuantizedCount += 1
+            continue
+        }
+    }
+
+    // ----- INT2 W2A16 quantization branch -----
+    // Same shape conventions as INT4 with 4-per-byte packing and the
+    // [-2, 1] quantization range.
+    if targetDType == .int2 {
+        let outDim = pt.shape[0]
+        let logicalInDim: Int
+        let scaleName = scaleNameFor(newName)
+        let companion = plan[scaleName]
+        let scaleDtype = companion?.dtype.uppercased() ?? ""
+        // Same FP4-vs-INT8 disambiguation as the INT4 branch above —
+        // see comments there. INT8-source path lets users
+        // re-quantize an existing INT8 checkpoint without going back
+        // to the HF native weights.
+        let isPackedFP4 = isFP4DType(pt.dtype) || (newName.contains(".experts.") &&
+                                                    (pt.dtype.uppercased() == "I8" ||
+                                                     pt.dtype.uppercased() == "U8") &&
+                                                    isE8M0DType(scaleDtype))
+        let isRealInt8 = pt.dtype.uppercased() == "I8" && scaleDtype == "F16"
+        if isPackedFP4 {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] * 2 : 0
+        } else {
+            logicalInDim = pt.shape.count >= 2 ? pt.shape[1] : 0
+        }
+
+        if pt.shape.count == 2 &&
+           shouldQuantizeToInt2(newName, lastDim: logicalInDim) {
+            let inDim = logicalInDim
+            let blocksIn = inDim / kInt2GroupK
+            let packedRowBytes = inDim / 4
+            let weightBytes = outDim * packedRowBytes
+            let scaleBytes = outDim * blocksIn * 2
+            let logicalShape = [outDim, inDim]
+            let scaleShape = [outDim, blocksIn]
+            let srcDtype = pt.dtype
+            if companion != nil &&
+                (isFP8DType(srcDtype) || isPackedFP4 || isRealInt8) {
+                scalesConsumed.insert(scaleName)
+            }
+
+            var cached: (weight: Data, scale: Data)? = nil
+            let upper = srcDtype.uppercased()
+            let weightURL = pt.url
+            let weightOffset = pt.offset
+            let scaleURL = companion?.url
+            let scaleOffset = companion?.offset ?? 0
+            let isFP8 = isFP8DType(srcDtype)
+            let isFP4 = isPackedFP4
+            let isInt8 = isRealInt8
+            let compute: () throws -> (weight: Data, scale: Data) = {
+                if let c = cached { return c }
+                let r: (weight: Data, scale: Data)
+                if isFP8, let sURL = scaleURL {
+                    r = try quantizeFP8ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e4m3LUT: e4m3LUT, e8m0LUT: e8m0LUT)
+                } else if isFP4, let sURL = scaleURL {
+                    r = try quantizeFP4ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                               scaleURL: sURL, scaleOffset: scaleOffset,
+                                               outDim: outDim, inDim: inDim,
+                                               e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
+                } else if isInt8, let sURL = scaleURL {
+                    r = try quantizeInt8ToInt2(weightURL: weightURL, weightOffset: weightOffset,
+                                                scaleURL: sURL, scaleOffset: scaleOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "BF16" {
+                    r = try quantizeBF16ToInt2(srcURL: weightURL, srcOffset: weightOffset,
+                                                outDim: outDim, inDim: inDim)
+                } else if upper == "F32" {
+                    r = try quantizeF32ToInt2(srcURL: weightURL, srcOffset: weightOffset,
+                                               outDim: outDim, inDim: inDim)
+                } else {
+                    throw NSError(domain: "Int2Quant", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "INT2 quant: unsupported source dtype \(srcDtype) for \(newName)"
+                    ])
+                }
+                cached = r
+                return r
+            }
+
+            writeEntries.append(WriteEntry(
+                name: newName, dtype: "I2", shape: logicalShape, byteCount: weightBytes,
+                source: .compute(byteCount: weightBytes) { try compute().weight }))
+            writeEntries.append(WriteEntry(
+                name: scaleName, dtype: "F16", shape: scaleShape, byteCount: scaleBytes,
+                source: .compute(byteCount: scaleBytes) {
+                    let s = try compute().scale
+                    cached = nil
+                    return s
+                }))
+            int2QuantizedCount += 1
+            continue
+        }
+    }
+
+    // Effective target for non-INT* (or non-whitelisted) tensors: when the
+    // user asked for INT8/INT4/INT2, anything that didn't quantize falls
+    // back to BF16; otherwise honor the user's target verbatim.
     let effectiveTarget: TargetDType =
-        (targetDType == .int8) ? .bf16 : targetDType
+        (targetDType == .int8 || targetDType == .int4 || targetDType == .int2) ? .bf16 : targetDType
 
     // Native-dtype transcoding: FP8/FP4 weight + scale → BF16/F16.
     if effectiveTarget != .keep {
@@ -826,6 +698,14 @@ if targetDType == .int8 {
     print("  INT8-quantized:  \(int8QuantizedCount) Linear weight(s) " +
           "(each splits into <name>.weight + <name>.scale).")
 }
+if targetDType == .int4 {
+    print("  INT4-quantized:  \(int4QuantizedCount) Linear weight(s) " +
+          "(each splits into <name>.weight + <name>.scale, packed 2-per-byte).")
+}
+if targetDType == .int2 {
+    print("  INT2-quantized:  \(int2QuantizedCount) Linear weight(s) " +
+          "(each splits into <name>.weight + <name>.scale, packed 4-per-byte).")
+}
 
 // ---------- Write each shard + index.json ----------
 
@@ -902,9 +782,10 @@ try indexData.write(to: indexURL)
 print("Wrote \(weightMap.count) tensors across \(total) shard(s); " +
       "\(String(format: "%.1f", Double(totalBytes) / 1_000_000_000)) GB total.")
 
-// ---------- Copy tokenizer ----------
+// ---------- Copy tokenizer + config ----------
 
-for f in ["tokenizer.json", "tokenizer_config.json"] {
+for f in ["tokenizer.json", "tokenizer_config.json", "config.json",
+          "generation_config.json", "special_tokens_map.json"] {
     let src = hfDir.appendingPathComponent(f)
     if fm.fileExists(atPath: src.path) {
         let dst = saveDir.appendingPathComponent(f)

@@ -6,12 +6,14 @@ import Metal
 public final class ParallelEmbedding {
     public let vocabSize: Int
     public let dim: Int
-    public let weight: Tensor      // [vocab, dim] f32
+    public let weight: Tensor      // [vocab, dim] f32 or bf16
 
-    private static let pipeline = Device.shared.makePipeline("embed_lookup_f32")
+    private static let pF32  = Device.shared.makePipeline("embed_lookup_f32")
+    private static let pBF16 = Device.shared.makePipeline("embed_lookup_bf16_to_f32")
 
     public init(vocabSize: Int, dim: Int, weight: Tensor) {
-        precondition(weight.dtype == .f32, "ParallelEmbedding currently requires f32 weight")
+        precondition(weight.dtype == .f32 || weight.dtype == .bf16,
+                     "ParallelEmbedding: weight must be f32 or bf16, got \(weight.dtype)")
         self.vocabSize = vocabSize; self.dim = dim; self.weight = weight
     }
 
@@ -21,8 +23,9 @@ public final class ParallelEmbedding {
         let idsT = ids.withUnsafeBytes { Tensor.from(bytes: $0, shape: [N], dtype: .i32) }
         let out = Tensor.empty(shape: [N, dim], dtype: .f32)
 
+        let pipeline: MTLComputePipelineState = (weight.dtype == .bf16) ? Self.pBF16 : Self.pF32
         let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(Self.pipeline)
+        enc.setComputePipelineState(pipeline)
         enc.setBuffer(weight.buffer, offset: weight.offset, index: 0)
         enc.setBuffer(idsT.buffer, offset: 0, index: 1)
         enc.setBuffer(out.buffer, offset: 0, index: 2)
@@ -171,6 +174,14 @@ public final class Transformer {
 
     private let pHcExpand: MTLComputePipelineState
 
+    /// Optional reference to the WeightLoader that built this model.
+    /// `Transformer.load` parks it here so the loader (and its
+    /// `shardLayers` index) stays alive for the model's lifetime and
+    /// `forward(...)` can call `prefetchLayer` / `releaseLayer`
+    /// between blocks. Nil for non-streaming strategies — `forward`
+    /// short-circuits on nil.
+    internal var weightLoader: WeightLoader? = nil
+
     public init(config: ModelConfig,
                 embed: ParallelEmbedding,
                 layers: [Block],
@@ -197,6 +208,7 @@ public final class Transformer {
         precondition(B > 0)
         let S = inputIds[0].count
         for row in inputIds { precondition(row.count == S, "ragged batch not supported") }
+        MemoryLogger.snapshot("forward:start", force: true)
 
         let flatIds: [Int32] = inputIds.flatMap { $0.map(Int32.init) }
         let cmd = Device.shared.queue.makeCommandBuffer()!
@@ -217,19 +229,48 @@ public final class Transformer {
                             threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
         enc.endEncoding()
         cmd.commit(); cmd.waitUntilCompleted()
+        MemoryLogger.snapshot("forward:embed+hc-expanded", force: true)
 
         // 3. Run each block sequentially. Each commits its own buffers.
+        //
+        // Streaming hints: when `weightLoader.streamingEnabled` is
+        // true, we release layer K's pages immediately after its
+        // commit+wait completes. Working window is bounded to one
+        // layer at a time (~max-shard bytes), with shared shards
+        // (embed/head/norms, owner == -1) excluded from release.
+        //
+        // Previous revision added MADV_WILLNEED prefetch on K+1
+        // before computing K. That backfired: the kernel would
+        // start pulling K+1's pages while K-1's MADV_DONTNEED hint
+        // hadn't been honoured yet → ~3 layers resident
+        // simultaneously, OOMing 16 GB Macs. Letting the natural
+        // page-fault path handle the next layer keeps residency
+        // strictly to "the layer the GPU is currently reading
+        // from".
         var x = hExpanded.reshape([B, S, hc, config.dim])
-        for layer in layers {
-            let cmdL = Device.shared.queue.makeCommandBuffer()!
-            x = layer(x, startPos: startPos, inputIds: flatIds, in: cmdL)
+        let loader = self.weightLoader
+        for (k, layer) in layers.enumerated() {
+            // Pool mode: pread layer K's shard into the rotating
+            // slot BEFORE the block's forward references its
+            // Tensors. (No-op in `.mmap` / `.preload` strategies.)
+            loader?.ensureLayer(k)
+            var cmdL = Device.shared.queue.makeCommandBuffer()!
+            x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
+            loader?.releaseLayer(k)
+            MemoryLogger.snapshot(
+                "forward:layer-\(String(format: "%02d", k))", force: true)
         }
 
-        // 4. Head.
+        // 4. Head. `ParallelHead.callAsFunction` commits `cmdH`
+        // internally (after rsqrt + mixes) and the remaining work
+        // (collapse + norm + slice + lm_head) on a fresh cmd2 that
+        // it also commits before returning. Caller must NOT commit
+        // cmdH again — double-commit traps inside Metal.
         let cmdH = Device.shared.queue.makeCommandBuffer()!
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
+        MemoryLogger.snapshot("forward:complete", force: true)
         return logits
     }
 

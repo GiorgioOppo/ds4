@@ -149,30 +149,41 @@ public final class BPETokenizer: Tokenizer {
 
     private func encodeChunk(_ text: String) -> [Int] {
         var out: [Int] = []
+        var coveredAny = false
         let ns = text as NSString
         pretokRegex.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { match, _, _ in
             guard let m = match else { return }
+            coveredAny = true
             let piece = ns.substring(with: m.range)
-            // byte-level encode: UTF-8 bytes → unicode chars from byteToUnicode map
-            var encoded = ""
-            for byte in piece.utf8 {
-                encoded += byteToUnicode[byte]!
-            }
-            // Apply BPE
-            for tok in bpe(encoded) {
-                if let id = vocab[tok] {
-                    out.append(id)
-                } else {
-                    // unknown — emit byte-by-byte as a fallback
-                    for b in tok.utf8 {
-                        if let id = vocab[String(UnicodeScalar(UInt32(b))!)] {
-                            out.append(id)
-                        }
+            appendEncodedPiece(piece, into: &out)
+        }
+        // Fallback: if the pre-tokenizer regex didn't match anything in a
+        // non-empty chunk (e.g. tokenizer.json's pre_tokenizer regex is a
+        // special-token splitter rather than a word splitter), encode the
+        // whole chunk as a single byte-level piece instead of silently
+        // dropping it.
+        if !coveredAny && ns.length > 0 {
+            appendEncodedPiece(text, into: &out)
+        }
+        return out
+    }
+
+    private func appendEncodedPiece(_ piece: String, into out: inout [Int]) {
+        var encoded = ""
+        for byte in piece.utf8 {
+            encoded += byteToUnicode[byte]!
+        }
+        for tok in bpe(encoded) {
+            if let id = vocab[tok] {
+                out.append(id)
+            } else {
+                for b in tok.utf8 {
+                    if let id = vocab[String(UnicodeScalar(UInt32(b))!)] {
+                        out.append(id)
                     }
                 }
             }
         }
-        return out
     }
 
     private func bpe(_ word: String) -> [String] {

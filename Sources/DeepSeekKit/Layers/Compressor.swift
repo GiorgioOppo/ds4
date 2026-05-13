@@ -82,8 +82,21 @@ public final class Compressor {
 
     private func ensureScoreState() -> Tensor {
         if let t = scoreState { return t }
-        let t = Tensor.empty(shape: scoreStateShape, dtype: stateDType)
+        let t = Compressor.makeScoreState(shape: scoreStateShape)
         scoreState = t
+        return t
+    }
+
+    /// Allocates a score-state buffer initialised to `-Float.infinity` so
+    /// unused slots contribute zero weight through softmax. Matches the
+    /// Python reference's `torch.full(..., float("-inf"))` at
+    /// model.py:303-304. Plain Tensor.empty would leave it at 0, which
+    /// dilutes the softmax across the unused half of the state.
+    internal static func makeScoreState(shape: [Int]) -> Tensor {
+        let t = Tensor.empty(shape: shape, dtype: .f32)
+        let n = t.count
+        let p = t.buffer.contents().bindMemory(to: Float.self, capacity: n)
+        for i in 0..<n { p[i] = -Float.infinity }
         return t
     }
 
@@ -117,12 +130,69 @@ public final class Compressor {
         let coff = overlap ? 2 : 1
         let coffHeadDim = coff * headDim
 
-        precondition(S % ratio == 0, "Compressor prefill requires S divisible by ratio")
         let numBlocks = S / ratio
+        let cutoff = numBlocks * ratio
+        let remainder = S - cutoff
+
+        // For B > 1 with a non-zero remainder we'd need a per-batch gather
+        // blit to feed the pool reshape. Defer until a multi-batch prompt
+        // path exists.
+        if B > 1 {
+            precondition(remainder == 0,
+                         "Compressor: S=\(S) not divisible by ratio=\(ratio) with B>1 not supported yet")
+        }
+
+        // Run wkv/wgate on ALL S tokens — the remainder rows are needed
+        // for state stashing (model.py:325-336) even when numBlocks == 0.
+        let kvFlatFull = wkv(x.reshape([B * S, dim]), in: cmd)
+        let scoreFlatFull = wgate(x.reshape([B * S, dim]), in: cmd)
+
+        // Stash state rows so the next decode that crosses a compression
+        // boundary has the prompt tokens available. Mirrors:
+        //   if overlap and cutoff >= ratio:
+        //       state[:, :ratio] = (kv|score+ape)[cutoff-ratio:cutoff]
+        //   if remainder > 0:
+        //       state[:, offset:offset+remainder] =
+        //           (kv|score+ape[:remainder])[cutoff:cutoff+remainder]
+        // (offset = ratio for overlap, 0 otherwise.)
+        if (overlap && cutoff >= ratio) || remainder > 0 {
+            _ = ensureKVState()
+            _ = ensureScoreState()
+        }
+        if overlap && cutoff >= ratio {
+            stashStateSlice(kvFlat: kvFlatFull, scoreFlat: scoreFlatFull,
+                            B: B, S: S, srcStartRow: cutoff - ratio,
+                            dstStartRow: 0, numRows: ratio,
+                            apeStartRow: 0,
+                            coffHeadDim: coffHeadDim, in: cmd)
+        }
+        if remainder > 0 {
+            let dstStart = overlap ? ratio : 0
+            stashStateSlice(kvFlat: kvFlatFull, scoreFlat: scoreFlatFull,
+                            B: B, S: S, srcStartRow: cutoff,
+                            dstStartRow: dstStart, numRows: remainder,
+                            apeStartRow: 0,
+                            coffHeadDim: coffHeadDim, in: cmd)
+        }
+
         if numBlocks == 0 { return nil }
 
-        let kvFlat = wkv(x.reshape([B * S, dim]), in: cmd)
-        let scoreFlat = wgate(x.reshape([B * S, dim]), in: cmd)
+        // For the pooling reshape we only need the first `cutoff` rows of
+        // kvFlatFull / scoreFlatFull. For B==1 these are a contiguous
+        // prefix; for B>1 cutoff == S (guarded above), so the full buffer
+        // is fine.
+        let kvFlat: Tensor
+        let scoreFlat: Tensor
+        if cutoff == S {
+            kvFlat = kvFlatFull
+            scoreFlat = scoreFlatFull
+        } else {
+            // B==1 case (asserted above).
+            kvFlat = Tensor(shape: [B * cutoff, coffHeadDim], dtype: .f32,
+                             buffer: kvFlatFull.buffer, offset: kvFlatFull.offset)
+            scoreFlat = Tensor(shape: [B * cutoff, coffHeadDim], dtype: .f32,
+                                buffer: scoreFlatFull.buffer, offset: scoreFlatFull.offset)
+        }
         let kv = kvFlat.reshape([B, numBlocks, ratio, coffHeadDim])
         let score = scoreFlat.reshape([B, numBlocks, ratio, coffHeadDim])
 
@@ -148,9 +218,78 @@ public final class Compressor {
         weightedSumAxis2(kv: kvWide, score: scoreWide, out: pooled,
                           B: B, NS: numBlocks, R: axisR, C: headDim, in: cmd)
 
-        return postProcess(pooled.reshape([B * numBlocks, 1, headDim]),
-                           tokens: B * numBlocks, in: cmd)
+        let result = postProcess(pooled.reshape([B * numBlocks, 1, headDim]),
+                                  tokens: B * numBlocks, in: cmd)
             .reshape([B, numBlocks, headDim])
+
+        // Write the compressed tokens into the shared kvCache slice
+        // (assigned by the parent MLA/Indexer). Mirrors
+        // model.py:373-374 `self.kv_cache[:bsz, :seqlen // ratio] = kv`.
+        writeKVCachePrefill(result, B: B, numBlocks: numBlocks, in: cmd)
+
+        return result
+    }
+
+    /// Blit `(kv|score)Flat[:, srcStartRow:srcStartRow+numRows, :]` into
+    /// `(kv|score)State[:, dstStartRow:dstStartRow+numRows, :]`, and add
+    /// `ape[apeStartRow:apeStartRow+numRows]` into the score destination.
+    /// Mirrors the prefill-time state population in model.py:325-336.
+    /// B==1 only — multi-batch needs a per-batch broadcast variant.
+    private func stashStateSlice(kvFlat: Tensor, scoreFlat: Tensor,
+                                  B: Int, S: Int,
+                                  srcStartRow: Int, dstStartRow: Int,
+                                  numRows: Int, apeStartRow: Int,
+                                  coffHeadDim: Int,
+                                  in cmd: MTLCommandBuffer) {
+        precondition(B == 1, "stashStateSlice currently only supports B==1")
+        guard let kvSt = kvState, let scoreSt = scoreState else { return }
+
+        let rowBytes = coffHeadDim * MemoryLayout<Float>.size
+        let stateRows = kvSt.shape[1]    // 2*ratio for overlap, ratio otherwise
+
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcKvOff    = kvFlat.offset    + (b * S + srcStartRow) * rowBytes
+            let dstKvOff    = kvSt.offset      + (b * stateRows + dstStartRow) * rowBytes
+            blit.copy(from: kvFlat.buffer, sourceOffset: srcKvOff,
+                      to: kvSt.buffer, destinationOffset: dstKvOff,
+                      size: numRows * rowBytes)
+            let srcScoreOff = scoreFlat.offset + (b * S + srcStartRow) * rowBytes
+            let dstScoreOff = scoreSt.offset   + (b * stateRows + dstStartRow) * rowBytes
+            blit.copy(from: scoreFlat.buffer, sourceOffset: srcScoreOff,
+                      to: scoreSt.buffer, destinationOffset: dstScoreOff,
+                      size: numRows * rowBytes)
+        }
+        blit.endEncoding()
+
+        // Add ape[apeStartRow:apeStartRow+numRows] to the score slot.
+        let scoreSlot = Tensor(
+            shape: [B, numRows, coffHeadDim], dtype: .f32,
+            buffer: scoreSt.buffer,
+            offset: scoreSt.offset + dstStartRow * rowBytes)
+        let apeSlice = Tensor(
+            shape: [numRows, coffHeadDim], dtype: .f32,
+            buffer: ape.buffer,
+            offset: ape.offset + apeStartRow * rowBytes)
+        broadcastAdd(target: scoreSlot, weight: apeSlice,
+                     B: B, NS: 1, R: numRows, C: coffHeadDim, in: cmd)
+    }
+
+    /// Copies `result[:B, :numBlocks]` into `self.kvCache[:B, :numBlocks]`.
+    private func writeKVCachePrefill(_ result: Tensor, B: Int, numBlocks: Int,
+                                      in cmd: MTLCommandBuffer) {
+        guard let cache = kvCache else { return }
+        let bytesPerRow = headDim * MemoryLayout<Float>.size
+        let cacheRows = cache.shape[1]
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcOff = result.offset + b * numBlocks * bytesPerRow
+            let dstOff = cache.offset + b * cacheRows * bytesPerRow
+            blit.copy(from: result.buffer, sourceOffset: srcOff,
+                      to: cache.buffer, destinationOffset: dstOff,
+                      size: numBlocks * bytesPerRow)
+        }
+        blit.endEncoding()
     }
 
     // MARK: - Decode (one token at a time, model.py:343-377)
@@ -226,8 +365,31 @@ public final class Compressor {
         // 6. Shared post-emit: norm + RoPE + (Hadamard+FP4 | FP8 noise stub).
         // RoPE freqs index for decode is (startPos + 1 - ratio).
         let ropePos = startPos + 1 - ratio
-        return postProcess(emitted.reshape([B, 1, headDim]),
-                           tokens: B, in: cmd, ropeStartPos: ropePos)
+        let result = postProcess(emitted.reshape([B, 1, headDim]),
+                                  tokens: B, in: cmd, ropeStartPos: ropePos)
+
+        // Mirrors model.py:376 `self.kv_cache[:bsz, start_pos // ratio] = kv`.
+        writeKVCacheDecodeRow(result, B: B, row: startPos / ratio, in: cmd)
+
+        return result
+    }
+
+    /// Copies `result[:B, 0]` (shape [B, 1, headDim]) into
+    /// `self.kvCache[:B, row]`.
+    private func writeKVCacheDecodeRow(_ result: Tensor, B: Int, row: Int,
+                                        in cmd: MTLCommandBuffer) {
+        guard let cache = kvCache else { return }
+        let bytesPerRow = headDim * MemoryLayout<Float>.size
+        let cacheRows = cache.shape[1]
+        let blit = cmd.makeBlitCommandEncoder()!
+        for b in 0..<B {
+            let srcOff = result.offset + b * bytesPerRow
+            let dstOff = cache.offset + (b * cacheRows + row) * bytesPerRow
+            blit.copy(from: result.buffer, sourceOffset: srcOff,
+                      to: cache.buffer, destinationOffset: dstOff,
+                      size: bytesPerRow)
+        }
+        blit.endEncoding()
     }
 
     /// Norm + RoPE + (rotate? Hadamard + FP4 quant : FP8 quant). Shared

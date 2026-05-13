@@ -1,5 +1,25 @@
 import Foundation
 import Metal
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Mix wall-clock nanoseconds + pid into a 64-bit LCG seed. Avoids
+/// the trap where two runs of the CLI with `--temperature > 0` would
+/// produce identical "random" output because every `SamplingOptions`
+/// instance was seeded with the same compile-time constant.
+///
+/// `@usableFromInline` (not `public`) so it can be referenced from a
+/// public initializer's default-argument expression without becoming
+/// part of the module's public ABI surface.
+@usableFromInline
+@inline(__always)
+internal func defaultSamplerSeed() -> UInt64 {
+    var seed: UInt64 = UInt64(DispatchTime.now().uptimeNanoseconds)
+    seed ^= UInt64(bitPattern: Int64(getpid())) &* 0x9E37_79B9_7F4A_7C15
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return seed | 1   // keep odd to avoid degenerate LCG cycles
+}
 
 /// Sampling options collected for one decode step. Mirrors the standard
 /// HF sampling pipeline: temperature → repetition penalty → top-K → top-P
@@ -9,10 +29,14 @@ public struct SamplingOptions {
     public var topK: Int = 0                    // 0 = disabled
     public var topP: Float = 1.0                // 1.0 = disabled
     public var repetitionPenalty: Float = 1.0   // 1.0 = disabled
-    public var rngState: UInt64 = 0xA17EBABE
+    /// Per-instance LCG state. Pass an explicit value for reproducibility;
+    /// the default is wall-clock + pid mixed, so distinct runs really
+    /// produce distinct streams.
+    public var rngState: UInt64 = defaultSamplerSeed()
 
     public init(temperature: Float = 1.0, topK: Int = 0, topP: Float = 1.0,
-                repetitionPenalty: Float = 1.0, rngState: UInt64 = 0xA17EBABE) {
+                repetitionPenalty: Float = 1.0,
+                rngState: UInt64 = defaultSamplerSeed()) {
         self.temperature = temperature
         self.topK = topK
         self.topP = topP

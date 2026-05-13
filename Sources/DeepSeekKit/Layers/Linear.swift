@@ -14,13 +14,30 @@ public final class Linear {
     public let weight: Tensor
     public let scale: Tensor?
 
-    private static let pBF16ToF32  = Device.shared.makePipeline("gemm_bf16_to_f32")
-    private static let pF32BF16    = Device.shared.makePipeline("gemm_f32_bf16_to_f32")
-    private static let pF32        = Device.shared.makePipeline("gemm_f32_to_f32")
-    private static let pFP8        = Device.shared.makePipeline("gemm_fp8_to_f32")
-    private static let pFP4        = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
-    private static let pInt8F32    = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
-    private static let pInt8BF16   = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
+    private static let pBF16ToF32     = Device.shared.makePipeline("gemm_bf16_to_f32")
+    private static let pBF16ToF32SG   = Device.shared.makePipeline("gemm_bf16_to_f32_sg")
+    private static let pF32BF16       = Device.shared.makePipeline("gemm_f32_bf16_to_f32")
+    private static let pF32BF16SG     = Device.shared.makePipeline("gemm_f32_bf16_to_f32_sg")
+    private static let pF32           = Device.shared.makePipeline("gemm_f32_to_f32")
+    private static let pFP8           = Device.shared.makePipeline("gemm_fp8_to_f32")
+    private static let pFP4           = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
+    private static let pInt8F32       = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
+    private static let pInt8BF16      = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
+    private static let pInt8F32SG     = Device.shared.makePipeline("gemm_int8_w8a16_to_f32_sg")
+    private static let pInt8BF16SG    = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32_sg")
+    private static let pInt4F32       = Device.shared.makePipeline("gemm_int4_w4a16_to_f32")
+    private static let pInt4BF16      = Device.shared.makePipeline("gemm_int4_w4a16_bf16_to_f32")
+    private static let pInt2F32       = Device.shared.makePipeline("gemm_int2_w2a16_to_f32")
+    private static let pInt2BF16      = Device.shared.makePipeline("gemm_int2_w2a16_bf16_to_f32")
+
+    /// simdgroup_matrix GEMM produces 32×32 C blocks via 8×8 tiles; the
+    /// K dimension is reduced in steps of 8. M, N must be multiples of 32
+    /// and K a multiple of 8 — caller falls back to the legacy tiled
+    /// kernel otherwise.
+    private static func canUseSG(M: Int, N: Int, K: Int) -> Bool {
+        return M >= 32 && N >= 32 && K >= 8
+            && M % 32 == 0 && N % 32 == 0 && K % 8 == 0
+    }
 
     public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?) {
         self.inFeatures = inFeatures
@@ -45,6 +62,12 @@ public final class Linear {
         case .i8:
             guard let s = scale else { fatalError("INT8 Linear needs F16 group scale") }
             int8Forward(x: x, y: y, M: M, scale: s, in: cmd)
+        case .i4:
+            guard let s = scale else { fatalError("INT4 Linear needs F16 group scale") }
+            int4Forward(x: x, y: y, M: M, scale: s, in: cmd)
+        case .i2:
+            guard let s = scale else { fatalError("INT2 Linear needs F16 group scale") }
+            int2Forward(x: x, y: y, M: M, scale: s, in: cmd)
         case .bf16:
             denseForward(x: x, y: y, M: M, pipelineForFloatX: Self.pF32BF16,
                          pipelineForBFloatX: Self.pBF16ToF32, in: cmd)
@@ -61,17 +84,24 @@ public final class Linear {
                               pipelineForFloatX: MTLComputePipelineState,
                               pipelineForBFloatX: MTLComputePipelineState,
                               in cmd: MTLCommandBuffer) {
+        // Pick simdgroup_matrix variant when M/N/K align; otherwise fall
+        // back to the legacy tile-and-reduce kernel.
+        let useSG = Self.canUseSG(M: M, N: outFeatures, K: inFeatures)
         let pipeline: MTLComputePipelineState
         switch x.dtype {
-        case .f32: pipeline = pipelineForFloatX
-        case .bf16: pipeline = pipelineForBFloatX
-        default: fatalError("Linear dense: input dtype \(x.dtype) not supported")
+        case .f32:
+            pipeline = useSG ? Self.pF32BF16SG : pipelineForFloatX
+        case .bf16:
+            pipeline = useSG ? Self.pBF16ToF32SG : pipelineForBFloatX
+        default:
+            fatalError("Linear dense: input dtype \(x.dtype) not supported")
         }
-        dispatchGEMM(pipeline: pipeline, x: x, y: y, M: M, in: cmd)
+        dispatchGEMM(pipeline: pipeline, x: x, y: y, M: M, useSG: useSG, in: cmd)
     }
 
     private func dispatchGEMM(pipeline: MTLComputePipelineState,
                               x: Tensor, y: Tensor, M: Int,
+                              useSG: Bool = false,
                               in cmd: MTLCommandBuffer) {
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline)
@@ -81,11 +111,20 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
 
-        let tg = MTLSize(width: 16, height: 16, depth: 1)
-        let gx = (outFeatures + 15) / 16
-        let gy = (M + 15) / 16
-        enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
-                                 threadsPerThreadgroup: tg)
+        if useSG {
+            // simdgroup_matrix: one simdgroup (32 threads) per 32×32 C tile.
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            let gx = outFeatures / 32
+            let gy = M / 32
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        } else {
+            let tg = MTLSize(width: 16, height: 16, depth: 1)
+            let gx = (outFeatures + 15) / 16
+            let gy = (M + 15) / 16
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        }
         enc.endEncoding()
     }
 
@@ -145,12 +184,83 @@ public final class Linear {
                               in cmd: MTLCommandBuffer) {
         precondition(inFeatures % 128 == 0,
                      "INT8 Linear: inFeatures must be a multiple of 128 (got \(inFeatures))")
+        // simdgroup_matrix INT8 path: 32×32 C blocks. K alignment is already
+        // guaranteed (inFeatures % 128 == 0 → K % 8 == 0).
+        let useSG = M >= 32 && outFeatures >= 32
+                 && M % 32 == 0 && outFeatures % 32 == 0
         let pipeline: MTLComputePipelineState
         switch x.dtype {
-        case .f32:  pipeline = Self.pInt8F32
-        case .bf16: pipeline = Self.pInt8BF16
+        case .f32:  pipeline = useSG ? Self.pInt8F32SG  : Self.pInt8F32
+        case .bf16: pipeline = useSG ? Self.pInt8BF16SG : Self.pInt8BF16
         default:
             fatalError("INT8 Linear: input dtype \(x.dtype) not supported (need f32 or bf16)")
+        }
+
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(wScale.buffer, offset: wScale.offset, index: 2)
+        enc.setBuffer(y.buffer, offset: 0, index: 3)
+        var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 4)
+
+        if useSG {
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            let gx = outFeatures / 32
+            let gy = M / 32
+            enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
+                                     threadsPerThreadgroup: tg)
+        } else {
+            enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        }
+        enc.endEncoding()
+    }
+
+    /// W4A16 INT4 forward. Weight is `[N, K/2]` packed nibbles with per-
+    /// row/per-128 F16 group scales `[N, K/128]`. Same K%128 requirement
+    /// as the INT8 path; the kernel is naive (one thread per output) — a
+    /// simdgroup_matrix variant can be added later for prefill speed.
+    private func int4Forward(x: Tensor, y: Tensor, M: Int, scale wScale: Tensor,
+                              in cmd: MTLCommandBuffer) {
+        precondition(inFeatures % 128 == 0,
+                     "INT4 Linear: inFeatures must be a multiple of 128 (got \(inFeatures))")
+        let pipeline: MTLComputePipelineState
+        switch x.dtype {
+        case .f32:  pipeline = Self.pInt4F32
+        case .bf16: pipeline = Self.pInt4BF16
+        default:
+            fatalError("INT4 Linear: input dtype \(x.dtype) not supported (need f32 or bf16)")
+        }
+
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
+        enc.setBuffer(wScale.buffer, offset: wScale.offset, index: 2)
+        enc.setBuffer(y.buffer, offset: 0, index: 3)
+        var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
+        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 4)
+
+        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// W2A16 INT2 forward. Weight is `[N, K/4]` packed 2-bit values
+    /// (LSB-first) with per-row/per-128 F16 group scales. K%128 enforced
+    /// at quant time and rechecked here. Same naive dispatch as INT4.
+    private func int2Forward(x: Tensor, y: Tensor, M: Int, scale wScale: Tensor,
+                              in cmd: MTLCommandBuffer) {
+        precondition(inFeatures % 128 == 0,
+                     "INT2 Linear: inFeatures must be a multiple of 128 (got \(inFeatures))")
+        let pipeline: MTLComputePipelineState
+        switch x.dtype {
+        case .f32:  pipeline = Self.pInt2F32
+        case .bf16: pipeline = Self.pInt2BF16
+        default:
+            fatalError("INT2 Linear: input dtype \(x.dtype) not supported (need f32 or bf16)")
         }
 
         let enc = cmd.makeComputeCommandEncoder()!

@@ -64,3 +64,28 @@ kernel void einsum_bsgd_grd_to_bsgr_f32(
     }
     out_[((b * S + s) * G + g) * R + r] = acc;
 }
+
+// BF16 wo_a variant. o stays f32, wo_a is bf16 (per the INT8 converter,
+// which skips wo_a in the INT8 path and leaves it as bf16).
+kernel void einsum_bsgd_grd_to_bsgr_bf16wo(
+    device const float*  o     [[buffer(0)]],
+    device const bfloat* wo_a  [[buffer(1)]],
+    device float*        out_  [[buffer(2)]],
+    constant uint4&      dims  [[buffer(3)]],
+    constant uint&       R     [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.x, sg = gid.y, b = gid.z;
+    uint B = dims.x, S = dims.y, G = dims.z, D = dims.w;
+    if (b >= B || sg >= S * G || r >= R) return;
+    uint s = sg / G;
+    uint g = sg - s * G;
+
+    uint oOff = ((b * S + s) * G + g) * D;
+    uint wOff = (g * R + r) * D;
+    float acc = 0.0f;
+    for (uint d = 0; d < D; d++) {
+        acc += o[oOff + d] * float(wo_a[wOff + d]);
+    }
+    out_[((b * S + s) * G + g) * R + r] = acc;
+}

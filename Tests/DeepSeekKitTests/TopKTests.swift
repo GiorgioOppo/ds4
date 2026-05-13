@@ -34,7 +34,9 @@ final class TopKTests: XCTestCase {
         let cmd = Device.shared.queue.makeCommandBuffer()!
         let out = TopK.apply(t, k: 1, in: cmd)
         cmd.commit(); cmd.waitUntilCompleted()
-        let gpuI = out.indices.buffer.contents().bindMemory(to: Int32.self, capacity: N).map { $0 }
+        let gpuI = Array(UnsafeBufferPointer(
+            start: out.indices.buffer.contents().bindMemory(to: Int32.self, capacity: N),
+            count: N))
 
         for n in 0..<N {
             var maxV = -Float.infinity; var maxI = 0

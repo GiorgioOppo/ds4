@@ -144,10 +144,45 @@ public extension Transformer {
     /// Names that can't be found are filled in with random init plus a
     /// stderr summary at the end. This lets a partially-converted or
     /// pruned checkpoint still produce a forward pass.
-    static func load(config: ModelConfig, from weightsDir: URL) throws -> Transformer {
-        let loader = try WeightLoader(directory: weightsDir)
+    static func load(config: ModelConfig, from weightsDir: URL,
+                      strategyOverride: String? = nil,
+                      forceLoad: Bool = false) throws -> Transformer {
+        MemoryLogger.snapshot("load:start", force: true)
+        let plan = try LoadPlan.decide(modelDir: weightsDir,
+                                        override: strategyOverride,
+                                        forceLoad: forceLoad)
+        FileHandle.standardError.write(Data(plan.summary().utf8))
+        let loader = try WeightLoader(plan: plan)
+        MemoryLogger.snapshot("load:after-mmap", force: true)
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
+
+        // Patch missing/stale config fields from actual tensor shapes so a
+        // partial config.json (only head_dim + compress_ratios + n_routed_experts,
+        // for instance) doesn't leave the rest at toy defaults that mismatch
+        // the real checkpoint and produce garbage logits.
+        let config = config.inferred(from: loader)
+
+        // Refuse early if the projected KV cache size at the chosen
+        // (max_seq_len, max_batch_size) would blow the budget. KV
+        // caches are dense storageModeShared MTLBuffers (not mmap),
+        // streaming hints don't help. Common trap: the HF config
+        // ships max_position_embeddings = 1M, which on a 16 GB Mac
+        // tries to allocate ~50 GB of KV state at load time and
+        // jetsams the process.
+        let kvProjected = config.projectedKVCacheBytes
+        let kvBudget = SystemProbe.effectiveProcessBudget()
+        if kvBudget > 0, kvProjected > kvBudget {
+            throw LoadStrategyError.kvCacheTooLarge(
+                projected: kvProjected,
+                available: kvBudget,
+                maxSeqLen: config.maxSeqLen,
+                maxBatchSize: config.maxBatchSize)
+        }
+        FileHandle.standardError.write(Data(String(
+            format: "Projected KV cache: %.2f GB at max_seq_len=%d, max_batch_size=%d.\n",
+            Double(kvProjected) / 1_073_741_824.0,
+            config.maxSeqLen, config.maxBatchSize).utf8))
 
         var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
@@ -177,6 +212,7 @@ public extension Transformer {
             ?? AssemblyHelpers.randomTensor([hc], rng: &rng, scale: 0.0)
         let hcHeadScale = (try loader.tryLoad(["hc_head_scale"]))
             ?? AssemblyHelpers.randomTensor([1], rng: &rng, scale: 0.5)
+        MemoryLogger.snapshot("load:embed+head-built", force: true)
 
         // ---------- Per-layer ----------
         var blocks: [Block] = []
@@ -257,7 +293,7 @@ public extension Transformer {
                 ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
                  ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
             let tid2eid: Tensor? = i < config.nHashLayers
-                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"]))
+                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"])).map(AssemblyHelpers.castIntToI32)
                 : nil
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: tid2eid)
@@ -308,6 +344,7 @@ public extension Transformer {
                                 hcFfnFn: hcFfnFn, hcFfnBase: hcFfnBase,
                                 hcFfnScale: hcFfnScale))
         }
+        MemoryLogger.snapshot("load:layers-built", force: true)
 
         if !loader.missing.isEmpty {
             FileHandle.standardError.write(Data("""
@@ -318,10 +355,18 @@ public extension Transformer {
             """.utf8))
         }
 
-        return Transformer(config: config, embed: embed, layers: blocks, mtp: [],
-                           norm: norm, head: head,
-                           hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
-                           hcHeadScale: hcHeadScale)
+        let model = Transformer(config: config, embed: embed, layers: blocks, mtp: [],
+                                 norm: norm, head: head,
+                                 hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
+                                 hcHeadScale: hcHeadScale)
+        // Park the WeightLoader on the model so its `shardLayers`
+        // index lives as long as the model and `forward(...)` can
+        // call `prefetchLayer` / `releaseLayer` between blocks.
+        // This matters for `.streaming` strategy; for `.mmap` /
+        // `.preload` the loader is held but never queried.
+        model.weightLoader = loader
+        MemoryLogger.snapshot("load:complete", force: true)
+        return model
     }
 }
 
@@ -331,7 +376,18 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
                          rng: inout MiniRNG) throws -> Linear {
     if let w = try loader.tryLoad(["\(base).weight"]) {
-        let scale = try loader.tryLoad(["\(base).scale"])
+        // Only quantized dtypes carry a `.scale` companion. Asking for
+        // one on bf16/f32 paths adds noise to the missing-tensor report
+        // and does nothing useful (Linear's switch ignores `scale` for
+        // those dtypes).
+        let needsScale = w.dtype == .i8
+                      || w.dtype == .i4
+                      || w.dtype == .i2
+                      || w.dtype == .fp8E4M3
+                      || w.dtype == .fp4E2M1
+        let scale: Tensor? = needsScale
+            ? try loader.tryLoad(["\(base).scale"])
+            : nil
         return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
     }
     return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
@@ -365,6 +421,29 @@ internal enum AssemblyHelpers {
         return arr.withUnsafeBytes { Tensor.from(bytes: $0, shape: shape, dtype: .f32) }
     }
 
+    /// Returns a copy of `t` as an i32 tensor. Used at load time for
+    /// integer tables (e.g. tid2eid) that the on-disk safetensors stores
+    /// as i64 but downstream Swift code (Gate.tidPtr binding) expects as
+    /// Int32. Idempotent for already-i32 input.
+    static func castIntToI32(_ t: Tensor) -> Tensor {
+        if t.dtype == .i32 { return t }
+        let n = t.count
+        let dst = Tensor.empty(shape: t.shape, dtype: .i32)
+        let dstP = dst.buffer.contents().bindMemory(to: Int32.self, capacity: n)
+        let srcRaw = t.buffer.contents().advanced(by: t.offset)
+        switch t.dtype {
+        case .i64:
+            let srcP = srcRaw.bindMemory(to: Int64.self, capacity: n)
+            for i in 0..<n { dstP[i] = Int32(truncatingIfNeeded: srcP[i]) }
+        case .i8:
+            let srcP = srcRaw.bindMemory(to: Int8.self, capacity: n)
+            for i in 0..<n { dstP[i] = Int32(srcP[i]) }
+        default:
+            fatalError("castIntToI32: unsupported source dtype \(t.dtype)")
+        }
+        return dst
+    }
+
     static func linear(`in` inFeatures: Int, out outFeatures: Int,
                        rng: inout MiniRNG, scale: Float = 0.02) -> Linear {
         let w = randomTensor([outFeatures, inFeatures], rng: &rng, scale: scale)
@@ -381,8 +460,8 @@ internal enum AssemblyHelpers {
         let norm = RMSNorm(weight: onesTensor([headDim]), eps: config.normEps)
         let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
                                     dtype: .f32)
-        let scoreState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                       dtype: .f32)
+        let scoreState = Compressor.makeScoreState(
+            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)
@@ -422,8 +501,8 @@ internal enum AssemblyHelpers {
             eps: config.normEps)
         let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
                                     dtype: .f32)
-        let scoreState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                       dtype: .f32)
+        let scoreState = Compressor.makeScoreState(
+            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)

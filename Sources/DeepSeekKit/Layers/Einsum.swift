@@ -5,6 +5,7 @@ import Metal
 public enum Einsum {
     private static let pBshdBtd = Device.shared.makePipeline("einsum_bshd_btd_to_bsht_f32")
     private static let pBsgdGrd = Device.shared.makePipeline("einsum_bsgd_grd_to_bsgr_f32")
+    private static let pBsgdGrdBF16wo = Device.shared.makePipeline("einsum_bsgd_grd_to_bsgr_bf16wo")
 
     /// `q`: [B, S, H, D]. `kv`: [B, T, D]. Returns [B, S, H, T].
     /// Used by Indexer.
@@ -31,18 +32,20 @@ public enum Einsum {
         return out
     }
 
-    /// `o`: [B, S, G, D]. `wo_a`: [G, R, D]. Returns [B, S, G, R].
+    /// `o`: [B, S, G, D] f32. `wo_a`: [G, R, D] f32 or bf16. Returns [B, S, G, R] f32.
     /// Used by MLA grouped output projection.
     public static func bsgdGrd(o: Tensor, woA: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
         precondition(o.dtype == .f32 && o.shape.count == 4)
-        precondition(woA.dtype == .f32 && woA.shape.count == 3)
+        precondition((woA.dtype == .f32 || woA.dtype == .bf16) && woA.shape.count == 3,
+                     "Einsum.bsgdGrd: woA must be f32 or bf16, got \(woA.dtype)")
         let B = o.shape[0], S = o.shape[1], G = o.shape[2], D = o.shape[3]
         precondition(woA.shape[0] == G && woA.shape[2] == D)
         let R = woA.shape[1]
 
+        let pipeline = (woA.dtype == .bf16) ? pBsgdGrdBF16wo : pBsgdGrd
         let out = Tensor.empty(shape: [B, S, G, R], dtype: .f32)
         let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(pBsgdGrd)
+        enc.setComputePipelineState(pipeline)
         enc.setBuffer(o.buffer, offset: o.offset, index: 0)
         enc.setBuffer(woA.buffer, offset: woA.offset, index: 1)
         enc.setBuffer(out.buffer, offset: 0, index: 2)

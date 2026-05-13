@@ -5,15 +5,23 @@ import DeepSeekKit
 //                   [--max-tokens N]
 //                   [--temperature T]
 //                   [--mode raw|chat]
+//                   [--load-strategy auto|preload|mmap]
+//                   [--force-load]
 //
 // `<model-dir>` should contain config.json (optional) and tokenizer.json.
 // safetensors weights are loaded if present, otherwise the model is
 // initialised with random f32 weights so the smoke flow still runs.
+//
+// `--force-load` bypasses the conservative RAM-safety refusals
+// (shard > 70% of available, total > 25× available). Use only if you
+// know you can tolerate aggressive paging — on small-RAM Macs the
+// system can lock up under sustained mmap thrash.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" \
-        [--max-tokens N] [--temperature T] [--mode raw|chat]
+        [--max-tokens N] [--temperature T] [--mode raw|chat] \
+        [--load-strategy auto|preload|mmap] [--force-load]
 
     """.utf8))
     exit(2)
@@ -27,6 +35,8 @@ let prompt = args[2]
 var maxTokens = 32
 var temperature: Float = 1.0
 var mode = "chat"
+var loadStrategy: String? = nil
+var forceLoad = false
 
 var i = 3
 while i < args.count {
@@ -40,6 +50,12 @@ while i < args.count {
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
+    case "--load-strategy":
+        guard i + 1 < args.count,
+              ["auto", "preload", "mmap", "streaming"].contains(args[i + 1]) else { usage() }
+        loadStrategy = args[i + 1]; i += 2
+    case "--force-load":
+        forceLoad = true; i += 1
     default: usage()
     }
 }
@@ -79,12 +95,15 @@ print("Loading model …", terminator: "")
 fflush(stdout)
 let model: Transformer
 do {
-    model = try Transformer.load(config: config, from: modelDir)
+    model = try Transformer.load(config: config, from: modelDir,
+                                  strategyOverride: loadStrategy,
+                                  forceLoad: forceLoad)
 } catch {
     FileHandle.standardError.write(Data("model load failed: \(error.localizedDescription)\n".utf8))
     exit(1)
 }
 print(" ready.")
+MemoryLogger.snapshot("model-ready", force: true)
 
 // ---------- Prompt formatting ----------
 let promptText: String
@@ -99,6 +118,14 @@ default: usage()
 
 let promptIds = tokenizer.encode(promptText)
 print("Prompt tokens: \(promptIds.count)")
+if promptIds.isEmpty {
+    FileHandle.standardError.write(Data("""
+    tokenizer produced 0 tokens for the prompt. Check tokenizer.json's
+    pre_tokenizer regex — see `jq '.pre_tokenizer' \(tokenizerURL.path)`.
+
+    """.utf8))
+    exit(1)
+}
 
 // ---------- Generation loop ----------
 // Prefill: feed the entire prompt at start_pos = 0. Then decode one token
@@ -110,34 +137,77 @@ print("---")
 fflush(stdout)
 
 let eosId: Int = tokenizer.eosId ?? -1
+// Generation runs on a background DispatchQueue so the main thread
+// is free to poll memory metrics at fixed intervals. Without this
+// the only memory snapshots we get during a forward are the ones
+// `MemoryLogger.snapshot(...)` is called at explicitly — between
+// `cmd.commit()` and `waitUntilCompleted()` the calling thread is
+// blocked for tens of seconds on V4-Flash. A separate polling
+// thread on stdout/stderr captures the entire memory trace,
+// including the spike that precedes a kernel panic.
+//
+// `generatedIds` is mutated only by the inference closure; the
+// main thread reads it only after `done.wait()` returns (no race).
+// `print()` to stdout is internally synchronized by libc, so
+// streamed tokens and monitor lines interleave cleanly.
+let inferenceQueue = DispatchQueue(label: "deepseek.inference",
+                                    qos: .userInitiated)
+let done = DispatchSemaphore(value: 0)
 var generatedIds: [Int] = []
+var inferenceError: Error? = nil
 
-// Prefill.
-var logits = model.forward(inputIds: [promptIds], startPos: 0)
-var samplingOpts = SamplingOptions(temperature: temperature,
-                                    topK: 0, topP: 1.0,
-                                    repetitionPenalty: 1.0)
+inferenceQueue.async {
+    defer { done.signal() }
+    var samplingOpts = SamplingOptions(temperature: temperature,
+                                        topK: 0, topP: 1.0,
+                                        repetitionPenalty: 1.0)
 
-for step in 0..<maxTokens {
-    let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
-    if nextId == eosId { break }
-    generatedIds.append(nextId)
+    // Prefill.
+    var logits = model.forward(inputIds: [promptIds], startPos: 0)
+    MemoryLogger.snapshot("prefill-complete", force: true)
 
-    // Stream the new token to stdout immediately. In chat mode, we buffer
-    // the whole output and parse <think>...</think> at the end so the
-    // reasoning block doesn't leak before its closing tag.
-    if mode == "raw" {
-        print(tokenizer.decode([nextId]), terminator: "")
-        fflush(stdout)
+    for step in 0..<maxTokens {
+        let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
+        if nextId == eosId { break }
+        generatedIds.append(nextId)
+        MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
+                              force: true)
+
+        // Stream the new token to stdout immediately. In chat mode, we buffer
+        // the whole output and parse <think>...</think> at the end so the
+        // reasoning block doesn't leak before its closing tag.
+        if mode == "raw" {
+            print(tokenizer.decode([nextId]), terminator: "")
+            fflush(stdout)
+        }
+
+        // Stop after sampling the requested count without doing one more
+        // unnecessary forward.
+        if step == maxTokens - 1 { break }
+
+        // Decode step: feed only the just-sampled token at startPos = promptLen + step.
+        let startPos = promptIds.count + step
+        logits = model.forward(inputIds: [[nextId]], startPos: startPos)
     }
+}
 
-    // Stop after sampling the requested count without doing one more
-    // unnecessary forward.
-    if step == maxTokens - 1 { break }
-
-    // Decode step: feed only the just-sampled token at startPos = promptLen + step.
-    let startPos = promptIds.count + step
-    logits = model.forward(inputIds: [[nextId]], startPos: startPos)
+// Main thread: poll memory metrics every 250 ms while the
+// inference thread runs. Each tick is `force: true` so the line
+// always emits regardless of `thresholdBytes`. The `tick:NNNN`
+// label runs through 1 ≤ tick ≤ 9999; at 250 ms per tick that's
+// ~40 minutes of trace before the counter wraps.
+var monitorTick = 0
+let pollInterval: DispatchTimeInterval = .milliseconds(250)
+while done.wait(timeout: .now() + pollInterval) == .timedOut {
+    monitorTick &+= 1
+    MemoryLogger.snapshot(
+        "monitor:tick-\(String(format: "%04d", monitorTick))",
+        force: true)
+}
+if let err = inferenceError {
+    FileHandle.standardError.write(Data(
+        "inference failed: \(err.localizedDescription)\n".utf8))
+    exit(1)
 }
 
 print("")    // newline after streaming
