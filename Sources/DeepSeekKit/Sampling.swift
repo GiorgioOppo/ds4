@@ -8,8 +8,13 @@ import Darwin
 /// the trap where two runs of the CLI with `--temperature > 0` would
 /// produce identical "random" output because every `SamplingOptions`
 /// instance was seeded with the same compile-time constant.
+///
+/// `@usableFromInline` (not `public`) so it can be referenced from a
+/// public initializer's default-argument expression without becoming
+/// part of the module's public ABI surface.
+@usableFromInline
 @inline(__always)
-private func defaultSamplerSeed() -> UInt64 {
+internal func defaultSamplerSeed() -> UInt64 {
     var seed: UInt64 = UInt64(DispatchTime.now().uptimeNanoseconds)
     seed ^= UInt64(bitPattern: Int64(getpid())) &* 0x9E37_79B9_7F4A_7C15
     seed = seed &* 6364136223846793005 &+ 1442695040888963407
