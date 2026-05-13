@@ -276,6 +276,28 @@ public final class MoEFFN {
                 traceTensorStats("moe[\(layerId)] expert[\(e)] in  (count=\(count))", slice)
                 cmd = Device.shared.queue.makeCommandBuffer()!
             }
+            // Layer-6 byte-level dump of expert 56 and expert 66's w1 weight + scale.
+            // Compare against the on-disk content from the safetensors python dump
+            // to catch streaming-pool offset corruption.
+            if layerId == 6 && (e == 56 || e == 66) && TraceFlags.normTrace {
+                let w1 = expert.w1
+                let wBuf = w1.weight.buffer
+                let wOff = w1.weight.offset
+                let wPtr = wBuf.contents().advanced(by: wOff)
+                    .bindMemory(to: UInt8.self, capacity: 32)
+                var wBytes = "moe[6] expert[\(e)] w1.weight first 32B:"
+                for b in 0..<32 { wBytes += String(format: " %02x", wPtr[b]) }
+                FileHandle.standardError.write(Data((wBytes + "\n").utf8))
+                if let sc = w1.scale {
+                    let scPtr = sc.buffer.contents().advanced(by: sc.offset)
+                        .bindMemory(to: UInt8.self, capacity: 32)
+                    var sBytes = "moe[6] expert[\(e)] w1.scale  first 32B:"
+                    for b in 0..<32 { sBytes += String(format: " %02x", scPtr[b]) }
+                    FileHandle.standardError.write(Data((sBytes + "\n").utf8))
+                } else {
+                    FileHandle.standardError.write(Data("moe[6] expert[\(e)] w1.scale  IS NIL\n".utf8))
+                }
+            }
             let outSlice = expert(slice, in: cmd)
             if perExpertTrace {
                 cmd.commit(); cmd.waitUntilCompleted()
