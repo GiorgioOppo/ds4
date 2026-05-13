@@ -251,14 +251,15 @@ public final class Transformer {
         // from".
         var x = hExpanded.reshape([B, S, hc, config.dim])
         let loader = self.weightLoader
-        // Layers to dump stats for under --trace-norms. Spread the
-        // milestones across the stack so we can see at which block
-        // the residual diverges / collapses without printing a line
-        // for every one of ~43 layers.
+        // Layers to dump stats for under --trace-norms. Densified through
+        // the first few layers because the prefill-vs-decode residual
+        // divergence appears between layer 0 and 10, exactly where the
+        // V4 Compressor / Indexer modules activate (compress_ratios=0
+        // at layers 0-1, then alternates 4/128 from layer 2 on).
         let nL = layers.count
-        let traceLayers: Set<Int> = nL <= 4
+        let traceLayers: Set<Int> = nL <= 6
             ? Set(0..<nL)
-            : [0, nL / 4, nL / 2, (3 * nL) / 4, nL - 1]
+            : Set([0, 1, 2, 3, 5, 10, 20, 30, nL - 1])
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
