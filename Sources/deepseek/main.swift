@@ -21,24 +21,44 @@ func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" \
         [--max-tokens N] [--temperature T] [--mode raw|chat] \
-        [--load-strategy auto|preload|mmap] [--force-load]
+        [--load-strategy auto|preload|mmap] [--force-load] \
+        [--dump-tensor NAME[:row=R][:cols=A..B]]
+
+    --dump-tensor NAME[:row=R][:cols=A..B]
+        Diagnostic mode. Dequantizes a single row slice of the named
+        tensor and prints the float values one per line, then exits.
+        The prompt argument is ignored in this mode (use "" as
+        placeholder). Default row=0, default cols=0..32.
+        Example:
+            deepseek /path/to/model "" --load-strategy streaming \\
+                --dump-tensor layers.0.attn.wq.weight:row=0:cols=0..32
 
     """.utf8))
     exit(2)
 }
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { usage() }
+guard args.count >= 2 else { usage() }
 
 let modelDir = URL(fileURLWithPath: args[1])
-let prompt = args[2]
+// In normal inference mode the prompt is positional (args[2]); in
+// `--dump-tensor` mode the user can pass `""` (or omit it entirely
+// when no other positional args remain). Treat a leading `--` token
+// as "no prompt given".
+var prompt = ""
+var nextArg = 2
+if nextArg < args.count, !args[nextArg].hasPrefix("--") {
+    prompt = args[nextArg]
+    nextArg += 1
+}
 var maxTokens = 32
 var temperature: Float = 1.0
 var mode = "chat"
 var loadStrategy: String? = nil
 var forceLoad = false
+var dumpSpec: String? = nil
 
-var i = 3
+var i = nextArg
 while i < args.count {
     switch args[i] {
     case "--max-tokens":
@@ -56,8 +76,71 @@ while i < args.count {
         loadStrategy = args[i + 1]; i += 2
     case "--force-load":
         forceLoad = true; i += 1
+    case "--dump-tensor":
+        guard i + 1 < args.count else { usage() }
+        dumpSpec = args[i + 1]; i += 2
     default: usage()
     }
+}
+
+// ---------- Diagnostic: --dump-tensor ----------
+// Runs before config/tokenizer/model build so we can inspect tensors
+// even on a checkpoint whose downstream load would fail. Builds only
+// `WeightLoader` (so streaming-pool buffers are allocated, but no
+// Transformer is constructed), prints the requested row slice, exits.
+if let spec = dumpSpec {
+    let parsed: TensorDumpSpec.Parsed
+    do {
+        parsed = try TensorDumpSpec.parse(spec)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "--dump-tensor: \(error)\n".utf8))
+        exit(2)
+    }
+    // Force-enable MemoryLogger during the dump so any pread / pool
+    // failures inside ensureLayer print to stderr instead of being
+    // swallowed — a diagnostic mode that silently returns garbage
+    // would defeat the whole point.
+    let prevLog = MemoryLogger.enabled
+    MemoryLogger.enabled = true
+    defer { MemoryLogger.enabled = prevLog }
+    do {
+        let plan = try LoadPlan.decide(modelDir: modelDir,
+                                        override: loadStrategy,
+                                        forceLoad: forceLoad)
+        FileHandle.standardError.write(Data(plan.summary().utf8))
+        let loader = try WeightLoader(plan: plan)
+        let r = try TensorDump.dumpRow(parsed.name,
+                                        row: parsed.row,
+                                        cols: parsed.cols,
+                                        loader: loader)
+        // Header lines on stderr so they don't pollute the numeric
+        // dump on stdout — caller can pipe `2>/dev/null` to get just
+        // the floats, or `1>vals.txt 2>info.txt` to keep both.
+        FileHandle.standardError.write(Data("""
+        tensor: \(r.name)
+        shape:  \(r.shape)
+        dtype:  \(r.dtype)
+        row:    \(r.row)
+        cols:   \(r.cols.lowerBound)..\(r.cols.upperBound) (\(r.cols.count) values)
+        scale:  \(r.scaleName ?? "—")
+
+        """.utf8))
+        for v in r.values {
+            print(String(format: "%.8e", v))
+        }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "--dump-tensor failed: \(error)\n".utf8))
+        exit(1)
+    }
+}
+
+if prompt.isEmpty {
+    FileHandle.standardError.write(Data(
+        "missing prompt (and no --dump-tensor given)\n".utf8))
+    usage()
 }
 
 // ---------- Config ----------
