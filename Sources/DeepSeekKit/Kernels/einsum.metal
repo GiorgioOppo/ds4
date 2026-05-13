@@ -89,3 +89,67 @@ kernel void einsum_bsgd_grd_to_bsgr_bf16wo(
     }
     out_[((b * S + s) * G + g) * R + r] = acc;
 }
+
+// FP8-E4M3 wo_a + UE8M0 per-block scale. Used when the loaded checkpoint
+// keeps wo_a in its native FP8 form (DeepSeek-V4-HF). Weight is logically
+// reshaped to [G, R, D] but stored linearly as [G*R, D] FP8; the scale is
+// [G*R/128, D/128] UE8M0 (1 byte per scale), 128×128 2D blocks.
+//
+// Each thread computes one (b, s, g, r) output cell, iterating over D in
+// blocks of 128. The active block-row in scale-space is (g*R+r)/128 and
+// the active block-column is d/128. Bytes are dequantized inline so the
+// scale buffer can stay 4× smaller than an f32 tensor would be.
+inline float fp8wo_deq_e4m3(uchar b) {
+    uint sign = (uint)(b >> 7) & 1u;
+    uint exp = (uint)(b >> 3) & 0xFu;
+    uint mant = (uint)b & 0x7u;
+    if (exp == 0u && mant == 0u) return sign != 0u ? -0.0f : 0.0f;
+    if (exp == 0xFu && mant == 0x7u) return NAN;
+    if (exp == 0u) {
+        float v = (float)mant * 0x1p-9f;
+        return sign != 0u ? -v : v;
+    }
+    uint bits = (sign << 31) | ((exp + 120u) << 23) | (mant << 20);
+    return as_type<float>(bits);
+}
+inline float fp8wo_deq_e8m0(uchar b) {
+    if (b == 0xFFu) return NAN;
+    return as_type<float>(((uint)b) << 23);
+}
+constant uint FP8WO_BLOCK = 128u;
+
+kernel void einsum_bsgd_grd_to_bsgr_fp8wo(
+    device const float* o      [[buffer(0)]],
+    device const uchar* wo_a   [[buffer(1)]],   // [G*R, D] FP8
+    device const uchar* w_sc   [[buffer(2)]],   // [G*R/128, D/128] UE8M0
+    device float*       out_   [[buffer(3)]],
+    constant uint4&     dims   [[buffer(4)]],   // (B, S, G, D)
+    constant uint&      R      [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint r = gid.x, sg = gid.y, b = gid.z;
+    uint B = dims.x, S = dims.y, G = dims.z, D = dims.w;
+    if (b >= B || sg >= S * G || r >= R) return;
+    uint s = sg / G;
+    uint g = sg - s * G;
+
+    uint flatRow      = g * R + r;
+    uint scaleBlockR  = flatRow / FP8WO_BLOCK;
+    uint blocksK      = D / FP8WO_BLOCK;
+    uint oOff         = ((b * S + s) * G + g) * D;
+    uint wOff         = flatRow * D;
+
+    float acc = 0.0f;
+    for (uint kb = 0; kb < blocksK; kb++) {
+        float scl = fp8wo_deq_e8m0(w_sc[scaleBlockR * blocksK + kb]);
+        float block_acc = 0.0f;
+        uint k0 = kb * FP8WO_BLOCK;
+        for (uint k = 0; k < FP8WO_BLOCK; k++) {
+            uint d = k0 + k;
+            float w = fp8wo_deq_e4m3(wo_a[wOff + d]);
+            block_acc += o[oOff + d] * w;
+        }
+        acc += block_acc * scl;
+    }
+    out_[((b * S + s) * G + g) * R + r] = acc;
+}

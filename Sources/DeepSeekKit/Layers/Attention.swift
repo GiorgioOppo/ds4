@@ -362,7 +362,14 @@ public final class MLA {
         let perGroupD = nHeads * headDim / nGroups
         let oView = o.reshape([B, S, nGroups, perGroupD])
         let woAR = woA.weight.reshape([nGroups, oLoraRank, perGroupD])
-        let oR = Einsum.bsgdGrd(o: oView, woA: woAR, in: cmd)        // [B, S, nGroups, oLoraRank]
+        // When wo_a is FP8 on disk (DeepSeek-V4-HF native, expert_dtype=fp4
+        // / attn fmt=e4m3), we keep the FP8 + UE8M0 scale all the way to
+        // the einsum kernel which dequantizes inline. For INT-quantized
+        // / BF16-fused converted models woA.scale is nil and the kernel
+        // takes the BF16 or f32 path automatically.
+        let oR = Einsum.bsgdGrd(o: oView, woA: woAR,
+                                  woAScale: woA.scale,
+                                  in: cmd)                            // [B, S, nGroups, oLoraRank]
         let oFlat = oR.reshape([B * S, nGroups * oLoraRank])
         return woB(oFlat, in: cmd).reshape([B, S, dim])
     }

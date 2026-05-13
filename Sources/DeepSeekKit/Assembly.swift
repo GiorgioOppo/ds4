@@ -385,8 +385,11 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
                       || w.dtype == .i2
                       || w.dtype == .fp8E4M3
                       || w.dtype == .fp4E2M1
+        // Names: post-converter we use `<base>.scale`, but HF-native
+        // FP8/FP4 release stores it as `<base>.weight_scale_inv`. Try
+        // both so the same code path serves both directories.
         let scale: Tensor? = needsScale
-            ? try loader.tryLoad(["\(base).scale"])
+            ? try loader.tryLoad(["\(base).scale", "\(base).weight_scale_inv"])
             : nil
         return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
     }

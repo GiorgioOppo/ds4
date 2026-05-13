@@ -31,6 +31,14 @@ inline float deq_e2m1(uchar nib) {
     return ((nib & 8u) != 0u) ? -v : v;
 }
 
+// E8M0 (unsigned-exponent-only) dequant: value = 2^(b-127). Encoded by
+// placing `b` into the 8 exponent bits of an IEEE 754 single. Mirrors
+// `deqE8M0` in DTypePacking.swift.
+inline float deq_e8m0(uchar b) {
+    if (b == 0xFFu) return NAN;
+    return as_type<float>(((uint)b) << 23);
+}
+
 // fp4_gemm — FP8 activation × FP4 weight GEMM with mixed scaling.
 //
 // Mirrors `fp4_gemm_kernel` from
@@ -38,10 +46,15 @@ inline float deq_e2m1(uchar nib) {
 //
 // Layout:
 //   A:        [M, K]    fp8_e4m3
-//   A_sc:     [M, K/128] f32       per-128 act scale along K
+//   A_sc:     [M, K/128] f32       per-128 act scale along K (from ActQuant)
 //   B:        [N, K/2]  fp4_e2m1   packed two nibbles per byte along K
-//   B_sc:     [N, K/32] f32        per-32 weight scale along K
+//   B_sc:     [N, K/32] uchar      per-32 UE8M0 weight scale from disk
 //   C:        [M, N]    f32        output
+//
+// Weight scales arrive as UE8M0 (1 byte each — `scale_fmt: ue8m0` in the
+// DeepSeek-V4-HF checkpoint). Earlier this kernel read `B_sc` as `float*`
+// which silently mis-aligned the buffer (every 4 bytes treated as one f32)
+// and produced garbage. Dequant inline via `deq_e8m0`.
 //
 // FP4 nibble layout per byte (matches the upstream `float4_e2m1fn_x2` ordering):
 //   - the LOW nibble (`byte & 0xF`) is the value at K-index 2*i
@@ -57,7 +70,7 @@ kernel void gemm_fp8_fp4_to_f32(
     device const uchar*  A      [[buffer(0)]],
     device const float*  A_sc   [[buffer(1)]],
     device const uchar*  B      [[buffer(2)]],
-    device const float*  B_sc   [[buffer(3)]],
+    device const uchar*  B_sc   [[buffer(3)]],
     device float*        C      [[buffer(4)]],
     constant uint3&      dims   [[buffer(5)]],   // (M, N, K)
     uint2 gid [[thread_position_in_grid]]
@@ -72,7 +85,7 @@ kernel void gemm_fp8_fp4_to_f32(
 
     for (uint wb = 0; wb < blocksKW; wb++) {
         float a_scale = A_sc[row * blocksKAct + wb / (BLOCK_K_ACT / BLOCK_K_W)];
-        float b_scale = B_sc[col * blocksKW + wb];
+        float b_scale = deq_e8m0(B_sc[col * blocksKW + wb]);
 
         float block_acc = 0.0f;
         uint k0 = wb * BLOCK_K_W;
