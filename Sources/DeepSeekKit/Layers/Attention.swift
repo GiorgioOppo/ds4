@@ -162,18 +162,18 @@ public final class MLA {
         // operation that introduces NaN/Inf. Streaming inference also
         // commits per-layer, so the extra sync only fires under the
         // diagnostic flag.
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after wqA+qNorm", qrFlat)
+            traceTensorStats("mla[\(layerId)] after wqA+qNorm", qrFlat)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         let qr = qrFlat.reshape([B, S, qLoraRank])
 
         // q = wq_b(qr).unflatten(-1, (n_heads, head_dim))
         var q = wqB(qrFlat, in: cmd)                                 // [B*S, n_heads*head_dim]
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after wqB", q)
+            traceTensorStats("mla[\(layerId)] after wqB", q)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         q = q.reshape([B * S, nHeads, headDim])
@@ -215,9 +215,9 @@ public final class MLA {
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
         let kvFlat = kvNorm(wkv(xFlat, in: cmd), in: cmd)
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after wkv+kvNorm", kvFlat)
+            traceTensorStats("mla[\(layerId)] after wkv+kvNorm", kvFlat)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         // RoPE on rope tail (interpret as [B*S, 1, head_dim]).
@@ -373,9 +373,9 @@ public final class MLA {
         let qPerToken = q.reshape([B, S, nHeads, headDim])
         let o = SparseAttention.apply(q: qPerToken, kv: kvFull, sink: attnSink,
                                        topkIdxs: topkT, scale: softmaxScale, in: cmd)
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after sparse_attn", o)
+            traceTensorStats("mla[\(layerId)] after sparse_attn", o)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
 
@@ -395,16 +395,16 @@ public final class MLA {
         let oR = Einsum.bsgdGrd(o: oView, woA: woAR,
                                   woAScale: woA.scale,
                                   in: cmd)                            // [B, S, nGroups, oLoraRank]
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after einsum wo_a", oR)
+            traceTensorStats("mla[\(layerId)] after einsum wo_a", oR)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         let oFlat = oR.reshape([B * S, nGroups * oLoraRank])
         let result = woB(oFlat, in: cmd).reshape([B, S, dim])
-        if TraceFlags.normTrace && layerId == 0 {
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("mla[0] after wo_b", result)
+            traceTensorStats("mla[\(layerId)] after wo_b", result)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         return result

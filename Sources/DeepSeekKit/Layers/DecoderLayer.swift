@@ -48,9 +48,9 @@ public final class Block {
         let N = B * S
 
         @inline(__always) func traceHere(_ name: String, _ t: Tensor) {
-            guard TraceFlags.normTrace && layerId == 0 else { return }
+            guard TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) else { return }
             cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("block[0] \(name)", t)
+            traceTensorStats("block[\(layerId)] \(name)", t)
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
 
