@@ -1,5 +1,6 @@
 import Foundation
 import Dispatch
+import Metal
 #if canImport(Darwin)
 import Darwin
 #endif
