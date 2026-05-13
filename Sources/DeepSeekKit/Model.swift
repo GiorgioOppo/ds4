@@ -262,14 +262,14 @@ public final class Transformer {
                 "forward:layer-\(String(format: "%02d", k))", force: true)
         }
 
-        // 4. Head. Must commit + wait, otherwise the encoded GEMM /
-        // norm kernels are silently dropped when `cmdH` deallocates
-        // and `logits` ends up pointing at an uninitialized buffer —
-        // which produces the same garbled sequence for every prompt.
+        // 4. Head. `ParallelHead.callAsFunction` commits `cmdH`
+        // internally (after rsqrt + mixes) and the remaining work
+        // (collapse + norm + slice + lm_head) on a fresh cmd2 that
+        // it also commits before returning. Caller must NOT commit
+        // cmdH again — double-commit traps inside Metal.
         let cmdH = Device.shared.queue.makeCommandBuffer()!
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
-        cmdH.commit(); cmdH.waitUntilCompleted()
         MemoryLogger.snapshot("forward:complete", force: true)
         return logits
     }
