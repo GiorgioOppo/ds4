@@ -157,10 +157,25 @@ public final class MLA {
         // qr = q_norm(wq_a(x))
         let xFlat = x.reshape([B * S, x.shape[2]])
         let qrFlat = qNorm(wqA(xFlat, in: cmd), in: cmd)            // [B*S, q_lora_rank]
+        // Drain the pipe and trace at layer 0 only — we need the layer
+        // boundary intermediates resolved on host to localize the first
+        // operation that introduces NaN/Inf. Streaming inference also
+        // commits per-layer, so the extra sync only fires under the
+        // diagnostic flag.
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after wqA+qNorm", qrFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let qr = qrFlat.reshape([B, S, qLoraRank])
 
         // q = wq_b(qr).unflatten(-1, (n_heads, head_dim))
         var q = wqB(qrFlat, in: cmd)                                 // [B*S, n_heads*head_dim]
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after wqB", q)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         q = q.reshape([B * S, nHeads, headDim])
 
         // q *= rsqrt(mean(q^2) + eps) over head_dim (re-norm per head)
@@ -200,6 +215,11 @@ public final class MLA {
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
         let kvFlat = kvNorm(wkv(xFlat, in: cmd), in: cmd)
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after wkv+kvNorm", kvFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         // RoPE on rope tail (interpret as [B*S, 1, head_dim]).
         rope.apply(kvFlat.reshape([B * S, 1, headDim]),
                    startPos: startPos, inverse: false, in: cmd)
@@ -353,6 +373,11 @@ public final class MLA {
         let qPerToken = q.reshape([B, S, nHeads, headDim])
         let o = SparseAttention.apply(q: qPerToken, kv: kvFull, sink: attnSink,
                                        topkIdxs: topkT, scale: softmaxScale, in: cmd)
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after sparse_attn", o)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
 
         // ---------- Inverse RoPE ----------
         rope.apply(o.reshape([B * S, nHeads, headDim]),
@@ -370,8 +395,19 @@ public final class MLA {
         let oR = Einsum.bsgdGrd(o: oView, woA: woAR,
                                   woAScale: woA.scale,
                                   in: cmd)                            // [B, S, nGroups, oLoraRank]
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after einsum wo_a", oR)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let oFlat = oR.reshape([B * S, nGroups * oLoraRank])
-        return woB(oFlat, in: cmd).reshape([B, S, dim])
+        let result = woB(oFlat, in: cmd).reshape([B, S, dim])
+        if TraceFlags.normTrace && layerId == 0 {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[0] after wo_b", result)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+        return result
     }
 
     private var dim: Int { wkv.inFeatures }
