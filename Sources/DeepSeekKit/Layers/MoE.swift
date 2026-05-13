@@ -303,14 +303,36 @@ public final class MoEFFN {
             // experts 56 / 66 to keep cost manageable.
             let outSlice: Tensor
             if layerId == 6 && (e == 56 || e == 66) && TraceFlags.normTrace {
+                // Dump the actual input vector for offline Python comparison:
+                // /tmp/moe6_e<id>_input.bin (single token's [dim] f32 little-endian).
+                cmd.commit(); cmd.waitUntilCompleted()
+                do {
+                    let inPtr = slice.buffer.contents().advanced(by: slice.offset)
+                    let inData = Data(bytes: inPtr, count: dim * MemoryLayout<Float>.size)
+                    let url = URL(fileURLWithPath: "/tmp/moe6_e\(e)_input.bin")
+                    try? inData.write(to: url)
+                    FileHandle.standardError.write(Data("moe[6] expert[\(e)] dumped input to \(url.path)\n".utf8))
+                }
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
                 let g = expert.w1(slice, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[6] expert[\(e)] w1·x (g)", g)
+                do {
+                    let gPtr = g.buffer.contents().advanced(by: g.offset)
+                    try? Data(bytes: gPtr, count: g.count * MemoryLayout<Float>.size)
+                        .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_g.bin"))
+                }
                 cmd = Device.shared.queue.makeCommandBuffer()!
 
                 let u = expert.w3(slice, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[6] expert[\(e)] w3·x (u)", u)
+                do {
+                    let uPtr = u.buffer.contents().advanced(by: u.offset)
+                    try? Data(bytes: uPtr, count: u.count * MemoryLayout<Float>.size)
+                        .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_u.bin"))
+                }
                 cmd = Device.shared.queue.makeCommandBuffer()!
 
                 let h = Elementwise.siluMul(g, u, swigluLimit: expert.swigluLimit, in: cmd)
