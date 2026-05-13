@@ -324,7 +324,13 @@ default: usage()
 }
 
 let promptIds = tokenizer.encode(promptText)
-print("Prompt tokens: \(promptIds.count)")
+print("Prompt tokens: \(promptIds.count) — ids=\(promptIds)")
+// Echo the decoded form so we can spot tokenizer drift: if `decode(encode(s))`
+// doesn't round-trip to the input text, the tokenizer is splitting or
+// merging tokens wrong and the model sees something different from what
+// the user typed.
+let roundTripped = tokenizer.decode(promptIds)
+print("Prompt round-trip: \"\(roundTripped)\"")
 if promptIds.isEmpty {
     FileHandle.standardError.write(Data("""
     tokenizer produced 0 tokens for the prompt. Check tokenizer.json's
