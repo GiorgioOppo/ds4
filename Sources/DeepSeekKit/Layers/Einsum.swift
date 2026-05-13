@@ -36,6 +36,23 @@ public enum Einsum {
     /// Used by MLA grouped output projection.
     public static func bsgdGrd(o: Tensor, woA: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
         precondition(o.dtype == .f32 && o.shape.count == 4)
+        // Log the actual dtype + shape to stderr *before* the
+        // precondition fires — Swift's panic backtrace sometimes
+        // swallows the precondition message, so without this we have
+        // no diagnostic to work from.
+        if !(woA.dtype == .f32 || woA.dtype == .bf16) || woA.shape.count != 3 {
+            let msg = """
+            Einsum.bsgdGrd: unsupported woA tensor.
+              expected: dtype=f32|bf16, rank=3
+              got:      dtype=\(woA.dtype) shape=\(woA.shape)
+            If wo_a is f16 in your checkpoint this kernel needs an f16
+            variant; if it's a quantized dtype (i4/fp8) the converter
+            should have left it as bf16 (see Int4Quant.shouldQuantizeToInt4 —
+            wo_a is intentionally excluded from INT4).
+            \n
+            """
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
         precondition((woA.dtype == .f32 || woA.dtype == .bf16) && woA.shape.count == 3,
                      "Einsum.bsgdGrd: woA must be f32 or bf16, got \(woA.dtype)")
         let B = o.shape[0], S = o.shape[1], G = o.shape[2], D = o.shape[3]
