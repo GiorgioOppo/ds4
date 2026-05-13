@@ -298,7 +298,35 @@ public final class MoEFFN {
                     FileHandle.standardError.write(Data("moe[6] expert[\(e)] w1.scale  IS NIL\n".utf8))
                 }
             }
-            let outSlice = expert(slice, in: cmd)
+            // Decompose expert FFN to isolate which sub-op (w1, w3, siluMul, w2)
+            // amplifies for the data-dependent kernel issue. Only at layer 6
+            // experts 56 / 66 to keep cost manageable.
+            let outSlice: Tensor
+            if layerId == 6 && (e == 56 || e == 66) && TraceFlags.normTrace {
+                let g = expert.w1(slice, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w1·x (g)", g)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let u = expert.w3(slice, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w3·x (u)", u)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let h = Elementwise.siluMul(g, u, swigluLimit: expert.swigluLimit, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] siluMul(g,u)", h)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                Elementwise.bf16RoundTripInplace(h, in: cmd)
+                let y = expert.w2(h, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w2(h)", y)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+                outSlice = y
+            } else {
+                outSlice = expert(slice, in: cmd)
+            }
             if perExpertTrace {
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[\(layerId)] expert[\(e)] out (count=\(count))", outSlice)
