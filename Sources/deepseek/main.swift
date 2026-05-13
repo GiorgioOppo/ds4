@@ -21,9 +21,19 @@ func usage() -> Never {
     FileHandle.standardError.write(Data("""
     usage: deepseek <model-dir> "<prompt>" \
         [--max-tokens N] [--temperature T] [--mode raw|chat] \
+        [--thinking off|high|max] \
         [--load-strategy auto|preload|mmap] [--force-load] \
         [--max-seq-len N] [--max-batch-size N] \
         [--dump-tensor NAME[:row=R][:cols=A..B]]
+
+    --thinking off|high|max
+        Chat-mode thinking budget. Only meaningful with --mode chat.
+            off  (default) — no thinking: appends </think> after
+                              <｜Assistant｜>, model answers directly.
+            high           — appends <think>, model emits reasoning,
+                              then </think>, then the answer.
+            max            — same as high plus the REASONING_EFFORT_MAX
+                              system-prompt block prepended.
 
     --dump-tensor NAME[:row=R][:cols=A..B]
         Diagnostic mode. Dequantizes a single row slice of the named
@@ -91,6 +101,7 @@ if nextArg < args.count, !args[nextArg].hasPrefix("--") {
 var maxTokens = 32
 var temperature: Float = 1.0
 var mode = "chat"
+var thinking = "off"   // off | high | max — picks the trailing think marker in chat mode
 var loadStrategy: String? = nil
 var forceLoad = false
 var dumpSpec: String? = nil
@@ -117,6 +128,10 @@ while i < args.count {
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
+    case "--thinking":
+        guard i + 1 < args.count,
+              ["off", "high", "max"].contains(args[i + 1]) else { usage() }
+        thinking = args[i + 1]; i += 2
     case "--load-strategy":
         guard i + 1 < args.count,
               ["auto", "preload", "mmap", "streaming"].contains(args[i + 1]) else { usage() }
@@ -326,7 +341,14 @@ case "raw":
     promptText = EncodingDSV4.bosToken + prompt
 case "chat":
     let msg = Message(role: .user, content: prompt)
-    promptText = EncodingDSV4.encodeMessages([msg], mode: .chat)
+    let thinkMode: ThinkingMode
+    switch thinking {
+    case "off":  thinkMode = .chat
+    case "high": thinkMode = .high
+    case "max":  thinkMode = .max
+    default:     thinkMode = .chat
+    }
+    promptText = EncodingDSV4.encodeMessages([msg], mode: thinkMode)
 default: usage()
 }
 
