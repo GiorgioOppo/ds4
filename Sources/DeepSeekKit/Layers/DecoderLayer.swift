@@ -71,7 +71,16 @@ public final class Block {
         let xMid = hc.post(x: attnOut.reshape([N, dim]),
                            residual: xFlat,
                            post: attnPre.post, comb: attnPre.comb, in: cmd)
-        traceHere("after hc.post(attn)", xMid)
+        // BF16 round-trip on the residual stream — mirrors the reference's
+        // `torch_dtype: bfloat16` activation propagation. V4 is trained with
+        // BF16 activations between sub-layers; running this forward in pure
+        // F32 leaves the residual ~16 bits more precise than the network
+        // ever saw during training, which compounds across 43 layers and
+        // pushes the deep layers into out-of-distribution territory.
+        // Truncating to BF16 here re-injects the per-block noise the model
+        // learned to tolerate.
+        Elementwise.bf16RoundTripInplace(xMid, in: cmd)
+        traceHere("after hc.post(attn) [bf16 RT]", xMid)
         // xMid: [N, hc, dim]
 
         // ---- FFN sublayer ----
@@ -85,7 +94,9 @@ public final class Block {
         let xOut = hc.post(x: ffnOut.reshape([N, dim]),
                            residual: xMid,
                            post: ffnPre.post, comb: ffnPre.comb, in: cmd)
-        traceHere("after hc.post(ffn)", xOut)
+        // Same BF16 round-trip on the residual stream out of the block.
+        Elementwise.bf16RoundTripInplace(xOut, in: cmd)
+        traceHere("after hc.post(ffn) [bf16 RT]", xOut)
         return xOut.reshape([B, S, hcMult, dim])
     }
 }
