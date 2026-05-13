@@ -261,7 +261,14 @@ public final class WeightLoader {
     }
 
     public var totalKnownNames: Int { index.count }
-    public var shardCount: Int { shards.count }
+    /// Number of input shards covered by this loader. Reports the
+    /// real count for both strategies — `.mmap` / `.preload` use
+    /// the legacy `shards: [SafeTensorsFile]` array; `.streaming`
+    /// keeps that array empty and stores shard-ownership classes
+    /// in `shardLayers`.
+    public var shardCount: Int {
+        pool != nil ? shardLayers.count : shards.count
+    }
 
     /// Queries the on-disk shape of a tensor without loading its data.
     /// Useful for auto-inferring missing fields in ModelConfig when
