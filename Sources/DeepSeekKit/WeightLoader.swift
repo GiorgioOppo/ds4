@@ -240,9 +240,14 @@ public final class WeightLoader {
         do {
             try pool.ensureLayer(K)
         } catch {
-            FileHandle.standardError.write(Data(
-                "[pool] ensureLayer(\(K)) failed: \(error.localizedDescription)\n"
-                    .utf8))
+            // Gated like the rest of the [pool] diagnostics — set
+            // `DEEPSEEK_MEM_LOG=1` (or flip MemoryLogger.enabled
+            // at runtime) to see pread failures here.
+            if MemoryLogger.enabled {
+                FileHandle.standardError.write(Data(
+                    "[pool] ensureLayer(\(K)) failed: \(error.localizedDescription)\n"
+                        .utf8))
+            }
         }
     }
 
