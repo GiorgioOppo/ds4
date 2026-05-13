@@ -375,7 +375,28 @@ public extension Transformer {
 internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
                          rng: inout MiniRNG) throws -> Linear {
-    if let w = try loader.tryLoad(["\(base).weight"]) {
+    if var w = try loader.tryLoad(["\(base).weight"]) {
+        // V4-Flash-HF stores routed-expert FP4 weights as raw I8/U8
+        // bytes (each byte packs two E2M1 nibbles) because safetensors
+        // has no native FP4 dtype. Our `Linear.callAsFunction` switch
+        // on `.i8` dispatches the W8A16 INT8 kernel, which reads the
+        // bytes as signed [-128, 127] integers and multiplies by an
+        // F16 group scale — completely the wrong math, so expert
+        // outputs blow up to 1e25 and NaN the whole block.
+        //
+        // Reinterpret the tensor as FP4 with the LOGICAL shape (last
+        // dim doubled) when the name matches a routed expert. The
+        // converter's CLI already does the same reinterpretation
+        // (Sources/converter/main.swift:568) — this is just the
+        // inference-side equivalent so we can run the HF checkpoint
+        // directly without converting.
+        if base.contains(".experts.") && (w.dtype == .i8) {
+            let packedLast = w.shape.last ?? 0
+            let logicalShape = Array(w.shape.dropLast()) + [packedLast * 2]
+            w = Tensor(shape: logicalShape, dtype: .fp4E2M1,
+                       buffer: w.buffer, offset: w.offset)
+        }
+
         // Only quantized dtypes carry a `.scale` companion. Asking for
         // one on bf16/f32 paths adds noise to the missing-tensor report
         // and does nothing useful (Linear's switch ignores `scale` for
