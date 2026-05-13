@@ -68,7 +68,29 @@ public final class MLA {
         self.windowSize = config.windowSize
         self.compressRatio = config.compressRatios[layerId]
         self.eps = config.normEps
-        self.softmaxScale = pow(Float(config.headDim), -0.5)
+        // YaRN-aware softmax scaling. Mirrors DeepSeek-V3/V4:
+        //   softmax_scale = head_dim^(-0.5)
+        //   if rope_factor > 1:
+        //       mscale = 0.1 * mscale_factor * log(rope_factor) + 1
+        //       softmax_scale *= mscale**2
+        // The model is TRAINED with this scaling — omitting it at
+        // inference time leaves softmax systematically under-peaked,
+        // producing a "too-uniform" attention that sees the context
+        // but cannot pull specific information out of it. With
+        // rope_factor=40 (default V4-Flash) the missing factor is
+        // ≈1.87×, which matches our observed symptom: model
+        // differentiates prompts but predictions are semantically
+        // unrelated.
+        do {
+            let base = 1.0 / Double(config.headDim).squareRoot()
+            var scale = base
+            if config.ropeFactor > 1.0 {
+                let m = 0.1 * Double(config.mscale)
+                          * Foundation.log(Double(config.ropeFactor)) + 1.0
+                scale *= m * m
+            }
+            self.softmaxScale = Float(scale)
+        }
         self.wqA = wqA; self.qNorm = qNorm; self.wqB = wqB
         self.wkv = wkv; self.kvNorm = kvNorm
         self.woA = woA; self.woB = woB
