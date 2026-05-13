@@ -85,6 +85,13 @@ targets:
     dependencies:
       - package: DeepSeekKit
         product: DeepSeekKit
+      # ConvertSheet.swift / ConvertViewModel.swift import this for
+      # `Converter.runQuantize` and the TargetDType enum. The SPM
+      # DeepSeekUI target already depends on it; the Xcode project
+      # has to declare it explicitly because XcodeGen doesn't mirror
+      # SPM target deps automatically.
+      - package: DeepSeekKit
+        product: DeepSeekConverter
     settings:
       base:
         INFOPLIST_FILE: Sources/DeepSeekUI/Resources/Info.plist
