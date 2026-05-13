@@ -22,6 +22,7 @@ func usage() -> Never {
     usage: deepseek <model-dir> "<prompt>" \
         [--max-tokens N] [--temperature T] [--mode raw|chat] \
         [--load-strategy auto|preload|mmap] [--force-load] \
+        [--max-seq-len N] [--max-batch-size N] \
         [--dump-tensor NAME[:row=R][:cols=A..B]]
 
     --dump-tensor NAME[:row=R][:cols=A..B]
@@ -57,6 +58,18 @@ func usage() -> Never {
         round-trip from JSON instead of silently falling back to
         hard-coded defaults.
 
+    --max-seq-len N
+        Override config.json's `max_seq_len`. Caps the KV cache /
+        compressor size: cache row count per layer is
+        `windowSize + N / compress_ratio`. Lower = less RAM, shorter
+        context. Must be > 0. The model still accepts prompts up to
+        N tokens; longer ones will overflow the cache.
+
+    --max-batch-size N
+        Override config.json's `max_batch_size`. Multiplies the KV
+        cache footprint. Default in V4-Flash config is 1; raise only
+        if you actually need parallel batched decode.
+
     """.utf8))
     exit(2)
 }
@@ -84,6 +97,13 @@ var dumpSpec: String? = nil
 var listPrefix: String? = nil
 var listEnabled = false
 var printConfigAndExit = false
+// Overrides for KV-cache-sizing fields in config.json. Nil = keep the
+// loaded value. Smaller numbers trade context length / batch size for
+// less RAM; larger numbers do the opposite. Applied AFTER
+// ModelConfig.load and BEFORE Transformer.load so every per-layer
+// allocation picks up the override.
+var maxSeqLenOverride: Int? = nil
+var maxBatchSizeOverride: Int? = nil
 
 var i = nextArg
 while i < args.count {
@@ -119,6 +139,12 @@ while i < args.count {
         TraceFlags.normTrace = true; i += 1
     case "--print-config":
         printConfigAndExit = true; i += 1
+    case "--max-seq-len":
+        guard i + 1 < args.count, let n = Int(args[i + 1]), n > 0 else { usage() }
+        maxSeqLenOverride = n; i += 2
+    case "--max-batch-size":
+        guard i + 1 < args.count, let n = Int(args[i + 1]), n > 0 else { usage() }
+        maxBatchSizeOverride = n; i += 2
     default: usage()
     }
 }
@@ -215,7 +241,9 @@ if prompt.isEmpty && !printConfigAndExit {
 
 // ---------- Config ----------
 let configURL = modelDir.appendingPathComponent("config.json")
-let config: ModelConfig
+// `var` so the --max-seq-len / --max-batch-size CLI overrides below
+// can replace the loaded values before Transformer.load picks them up.
+var config: ModelConfig
 if FileManager.default.fileExists(atPath: configURL.path) {
     do {
         config = try ModelConfig.load(from: configURL)
@@ -231,6 +259,23 @@ if FileManager.default.fileExists(atPath: configURL.path) {
 
     """.utf8))
     config = ModelConfig()
+}
+
+// Apply CLI overrides for KV-cache sizing. Done HERE (after load,
+// before --print-config and Transformer.load) so the override flows
+// through to every per-layer allocation and the print-config dump
+// reflects the effective values.
+if let n = maxSeqLenOverride {
+    let prev = config.maxSeqLen
+    config.maxSeqLen = n
+    FileHandle.standardError.write(Data(
+        "max_seq_len: \(prev) → \(n) (--max-seq-len override)\n".utf8))
+}
+if let n = maxBatchSizeOverride {
+    let prev = config.maxBatchSize
+    config.maxBatchSize = n
+    FileHandle.standardError.write(Data(
+        "max_batch_size: \(prev) → \(n) (--max-batch-size override)\n".utf8))
 }
 
 // ---------- Diagnostic: --print-config ----------
