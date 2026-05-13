@@ -316,7 +316,14 @@ MemoryLogger.snapshot("model-ready", force: true)
 let promptText: String
 switch mode {
 case "raw":
-    promptText = prompt
+    // V4 is trained with `<｜begin▁of▁sentence｜>` as the unconditional
+    // prefix on every sample. Feeding a raw prompt without it puts the
+    // model in an out-of-distribution state and the first generated
+    // token tends to be BOS itself (the model "recovers" by emitting
+    // what it expected to see). Prepend the BOS string here; the BPE
+    // tokenizer recognises it as a single added-token id, not a byte
+    // sequence.
+    promptText = EncodingDSV4.bosToken + prompt
 case "chat":
     let msg = Message(role: .user, content: prompt)
     promptText = EncodingDSV4.encodeMessages([msg], mode: .chat)
