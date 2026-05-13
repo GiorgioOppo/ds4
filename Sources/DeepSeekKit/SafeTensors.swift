@@ -45,7 +45,15 @@ public final class SafeTensorsFile {
     internal let sharedBuffer: MTLBuffer
 
     // ---- mmap path ----
-    public init(url: URL) throws {
+    /// - Parameter mapNoCache: pass `true` for streaming-mode loads.
+    ///   Adds the Darwin `MAP_NOCACHE` flag to mmap so the file's
+    ///   pages bypass the unified buffer cache — they're read from
+    ///   disk into our mapping but NEVER promoted to the system
+    ///   file cache. Saves multi-GB of competing cache when many
+    ///   apps + the model share unified memory; the cost is that
+    ///   re-faulting a page after `MADV_FREE_REUSABLE` hits disk
+    ///   directly instead of a warm cache.
+    public init(url: URL, mapNoCache: Bool = false) throws {
         self.url = url
 
         let fd = open(url.path, O_RDONLY)
@@ -70,8 +78,12 @@ public final class SafeTensorsFile {
         // page table for the whole region from the moment mmap
         // returns — non-trivial overhead for multi-GB ranges.
         MemoryLogger.willAllocate(bytes: alignedSize,
-                                   label: "mmap \(url.lastPathComponent)")
-        guard let raw = mmap(nil, alignedSize, PROT_READ, MAP_PRIVATE, fd, 0),
+                                   label: "mmap \(url.lastPathComponent)\(mapNoCache ? " NOCACHE" : "")")
+        var mapFlags: Int32 = MAP_PRIVATE
+        if mapNoCache {
+            mapFlags |= MAP_NOCACHE
+        }
+        guard let raw = mmap(nil, alignedSize, PROT_READ, mapFlags, fd, 0),
               raw != MAP_FAILED else {
             throw NSError(domain: "SafeTensors", code: 12, userInfo: [
                 NSLocalizedDescriptionKey: "mmap failed for \(url.path)"

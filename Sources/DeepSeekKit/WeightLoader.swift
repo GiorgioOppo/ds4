@@ -45,13 +45,14 @@ public final class WeightLoader {
 
         switch plan.strategy {
         case .mmap, .streaming:
-            // Identical load-time path. `.streaming` only differs at
-            // runtime: `Transformer.forward` calls `prefetchLayer` /
-            // `releaseLayer` between blocks so the kernel can drop
-            // cold pages without thrashing the GUI. The shards
-            // themselves are mmap'd the same way.
+            // Identical load-time path EXCEPT `.streaming` mmaps
+            // with `MAP_NOCACHE` so pages don't get promoted to the
+            // OS-wide unified buffer cache — keeps the kernel's
+            // file cache lean while we're cycling shards on
+            // streaming releases.
+            let nocache = (plan.strategy == .streaming)
             for (url, _) in plan.shards {
-                let f = try SafeTensorsFile(url: url)
+                let f = try SafeTensorsFile(url: url, mapNoCache: nocache)
                 let shardIdx = shards.count
                 shards.append(f)
                 for name in f.entries.keys { index[name] = shardIdx }
@@ -102,6 +103,19 @@ public final class WeightLoader {
         // is still built but never consulted.
         self.shardLayers = Self.buildShardLayers(shards: shards)
         self.streamingEnabled = (plan.strategy == .streaming)
+
+        // mlock the "shared" shards (top-level: embed, head, norms,
+        // hc_head_*) so they NEVER get evicted or swapped during
+        // streaming. The forward pass touches them on every token
+        // (embed at start, head + final norm at end); if they're
+        // not pinned the kernel will repeatedly refault them while
+        // we're cycling layer shards through MADV_FREE_REUSABLE.
+        // Limited to ~500 MB on typical V4-Flash so we don't blow
+        // the wired-memory budget. Best-effort: failure logged but
+        // not fatal.
+        if streamingEnabled {
+            pinSharedShards()
+        }
     }
 
     /// Backwards-compat convenience: build a default `mmap` plan
@@ -263,11 +277,20 @@ public final class WeightLoader {
         _ = layerIndex
     }
 
-    /// Aggressively reclaim layer K's pages. Uses MADV_FREE_REUSABLE
-    /// — Darwin's "this region's pages can be dropped *immediately*,
-    /// I'll refault them if I touch them again" advisory, much
-    /// stronger than the previous MADV_DONTNEED hint which the
-    /// kernel only honoured under severe pressure.
+    /// Aggressively reclaim layer K's pages. Three-step Darwin
+    /// sequence after which `mincore()` is used to verify how
+    /// many pages actually got dropped:
+    ///
+    ///   1. `MADV_DONTNEED`        — soft hint "don't need soon"
+    ///   2. `MADV_ZERO_WIRED_PAGES` — drop wired-down content
+    ///   3. `MADV_FREE_REUSABLE`    — mark pages immediately
+    ///                                 reclaimable for reuse
+    ///
+    /// `MADV_FREE_REUSABLE` alone is often ignored under low
+    /// pressure; the cascade gives the kernel three increasingly
+    /// strong nudges. The `mincore` verification logs the
+    /// resident-page count BEFORE and AFTER so we can see in the
+    /// trace whether the OS is actually honouring our hints.
     ///
     /// Called from `Transformer.forward` right after each layer's
     /// `commit+wait`. No-op unless `streamingEnabled`. Top-level
@@ -276,19 +299,81 @@ public final class WeightLoader {
         guard streamingEnabled else { return }
         for (shardIdx, owner) in shardLayers.enumerated()
             where owner == layerIndex {
+            let before = residentPageCount(shardIdx)
+            adviseShard(shardIdx, advice: MADV_DONTNEED)
+            adviseShard(shardIdx, advice: Self.MADV_ZERO_WIRED_PAGES)
             adviseShard(shardIdx, advice: Self.MADV_FREE_REUSABLE)
+            let after = residentPageCount(shardIdx)
+            let line = String(format:
+                "[release shard=%d layer=%d resident-pages: %d → %d (-%d, %.0f%%)]\n",
+                shardIdx, layerIndex,
+                before, after,
+                before > after ? before - after : 0,
+                before > 0 ? Double(before - after) * 100.0 / Double(before) : 0)
+            FileHandle.standardError.write(Data(line.utf8))
         }
     }
 
-    /// Darwin's MADV_FREE_REUSABLE constant (sys/mman.h). Defined
-    /// statically because Swift's Darwin shim sometimes doesn't
-    /// re-export this even when it's available at the C layer.
+    /// Darwin's MADV_* constants (sys/mman.h). Defined statically
+    /// because Swift's Darwin shim doesn't always re-export all of
+    /// them.
     private static let MADV_FREE_REUSABLE: Int32 = 7
+    private static let MADV_ZERO_WIRED_PAGES: Int32 = 6
+
+    /// Pin the shared shards into physical RAM via `mlock(2)`. The
+    /// top-level shard(s) carry embed/head/norms — touched on every
+    /// forward, never long enough offline to amortise a refault.
+    /// Pinning them spends ~500 MB of wired-memory budget for a
+    /// large per-token speedup AND removes them from the pool of
+    /// pages the OS could decide to swap during a memory crunch.
+    private func pinSharedShards() {
+        var totalPinned: UInt64 = 0
+        for (shardIdx, owner) in shardLayers.enumerated() where owner == -1 {
+            let buf = shards[shardIdx].sharedBuffer
+            let len = buf.length
+            guard let addr = buf.contents() as UnsafeMutableRawPointer? else { continue }
+            let rc = mlock(addr, len)
+            if rc == 0 {
+                totalPinned &+= UInt64(len)
+                let line = String(format:
+                    "[pin shard=%d  shared  %.2f MB mlocked]\n",
+                    shardIdx, Double(len) / (1024 * 1024))
+                FileHandle.standardError.write(Data(line.utf8))
+            } else {
+                let errnoStr = String(cString: strerror(errno))
+                let line = String(format:
+                    "[pin shard=%d  shared  %.2f MB mlock FAILED: %s]\n",
+                    shardIdx, Double(len) / (1024 * 1024),
+                    errnoStr)
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+        }
+        let summary = String(format:
+            "[pin] total wired %.2f GB across shared shards\n",
+            Double(totalPinned) / (1024 * 1024 * 1024))
+        FileHandle.standardError.write(Data(summary.utf8))
+    }
 
     private func adviseShard(_ idx: Int, advice: Int32) {
         let buf = shards[idx].sharedBuffer
         let len = buf.length
         guard let addr = buf.contents() as UnsafeMutableRawPointer? else { return }
         _ = madvise(addr, len, advice)
+    }
+
+    /// Counts pages still physically resident in the given shard's
+    /// mapping using `mincore(2)`. Returns 0 on error. Cheap: one
+    /// byte-per-page in a stack buffer, O(pages-in-shard).
+    private func residentPageCount(_ idx: Int) -> Int {
+        let buf = shards[idx].sharedBuffer
+        let len = buf.length
+        guard let addr = buf.contents() as UnsafeMutableRawPointer? else { return 0 }
+        let pageSize = Int(sysconf(_SC_PAGESIZE))
+        let nPages = (len + pageSize - 1) / pageSize
+        var vec = [Int8](repeating: 0, count: nPages)
+        let rc = vec.withUnsafeMutableBufferPointer { mincore(addr, len, $0.baseAddress) }
+        guard rc == 0 else { return 0 }
+        // mincore's vec[i] low-order bit set when page is resident.
+        return vec.reduce(0) { $0 + (Int($1) & 1) }
     }
 }
