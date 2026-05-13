@@ -230,6 +230,8 @@ public final class Transformer {
         enc.endEncoding()
         cmd.commit(); cmd.waitUntilCompleted()
         MemoryLogger.snapshot("forward:embed+hc-expanded", force: true)
+        traceTensorStats("embed", h)
+        traceTensorStats("hc-expand", hExpanded)
 
         // 3. Run each block sequentially. Each commits its own buffers.
         //
@@ -249,6 +251,14 @@ public final class Transformer {
         // from".
         var x = hExpanded.reshape([B, S, hc, config.dim])
         let loader = self.weightLoader
+        // Layers to dump stats for under --trace-norms. Spread the
+        // milestones across the stack so we can see at which block
+        // the residual diverges / collapses without printing a line
+        // for every one of ~43 layers.
+        let nL = layers.count
+        let traceLayers: Set<Int> = nL <= 4
+            ? Set(0..<nL)
+            : [0, nL / 4, nL / 2, (3 * nL) / 4, nL - 1]
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
@@ -260,6 +270,9 @@ public final class Transformer {
             loader?.releaseLayer(k)
             MemoryLogger.snapshot(
                 "forward:layer-\(String(format: "%02d", k))", force: true)
+            if traceLayers.contains(k) {
+                traceTensorStats("layer-\(String(format: "%02d", k))", x)
+            }
         }
 
         // 4. Head. `ParallelHead.callAsFunction` commits `cmdH`
@@ -271,6 +284,7 @@ public final class Transformer {
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
         MemoryLogger.snapshot("forward:complete", force: true)
+        traceTensorStats("logits", logits)
         return logits
     }
 

@@ -42,6 +42,14 @@ func usage() -> Never {
             deepseek /path/to/model "" --load-strategy streaming \\
                 --list-tensors layers.0.
 
+    --trace-norms
+        Diagnostic mode. Prints L2 norm + min/max/mean + NaN/Inf
+        counters of the residual stream at key points in the forward
+        pass (after embed, hc-expand, selected layers, logits).
+        Useful for finding the layer at which activations diverge,
+        collapse to zero, or go NaN. Output goes to stderr; the
+        usual token stream still goes to stdout. Off by default.
+
     """.utf8))
     exit(2)
 }
@@ -99,6 +107,8 @@ while i < args.count {
         } else {
             i += 1
         }
+    case "--trace-norms":
+        TraceFlags.normTrace = true; i += 1
     default: usage()
     }
 }
