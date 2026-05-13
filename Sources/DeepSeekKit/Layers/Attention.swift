@@ -68,29 +68,15 @@ public final class MLA {
         self.windowSize = config.windowSize
         self.compressRatio = config.compressRatios[layerId]
         self.eps = config.normEps
-        // YaRN-aware softmax scaling. Mirrors DeepSeek-V3/V4:
-        //   softmax_scale = head_dim^(-0.5)
-        //   if rope_factor > 1:
-        //       mscale = 0.1 * mscale_factor * log(rope_factor) + 1
-        //       softmax_scale *= mscale**2
-        // The model is TRAINED with this scaling — omitting it at
-        // inference time leaves softmax systematically under-peaked,
-        // producing a "too-uniform" attention that sees the context
-        // but cannot pull specific information out of it. With
-        // rope_factor=40 (default V4-Flash) the missing factor is
-        // ≈1.87×, which matches our observed symptom: model
-        // differentiates prompts but predictions are semantically
-        // unrelated.
-        do {
-            let base = 1.0 / Double(config.headDim).squareRoot()
-            var scale = base
-            if config.ropeFactor > 1.0 {
-                let m = 0.1 * Double(config.mscale)
-                          * Foundation.log(Double(config.ropeFactor)) + 1.0
-                scale *= m * m
-            }
-            self.softmaxScale = Float(scale)
-        }
+        // V4 reference (`Reference/inference/model.py:395`):
+        //   self.softmax_scale = self.head_dim ** -0.5
+        // — plain inverse-sqrt with NO YaRN mscale correction (unlike
+        // V3, which adds `mscale = 0.1 * f * log(rope_factor) + 1` and
+        // multiplies by `mscale**2`). The earlier attempt to import
+        // V3's formula here made attention slightly sharper than what
+        // the V4 weights were trained for, and outputs got worse.
+        // Keep it simple and match the reference.
+        self.softmaxScale = pow(Float(config.headDim), -0.5)
         self.wqA = wqA; self.qNorm = qNorm; self.wqB = wqB
         self.wkv = wkv; self.kvNorm = kvNorm
         self.woA = woA; self.woB = woB
