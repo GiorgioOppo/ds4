@@ -75,17 +75,29 @@ enum ProjectIndexer {
                               into out: inout [IndexCandidate]) {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+        // `DirectoryEnumerationOptions` doesn't expose a
+        // `.skipsSymbolicLinks` — we filter symlinks per-entry
+        // below to avoid following them (and risking cycles).
         guard let it = fm.enumerator(
             at: root,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsSymbolicLinks, .skipsPackageDescendants])
+            options: [.skipsHiddenFiles, .skipsPackageDescendants])
         else { return }
 
         while let item = it.nextObject() as? URL {
             let comp = item.lastPathComponent
-            // Directory-level skips: prune subtree.
-            if let vals = try? item.resourceValues(forKeys: Set(keys)),
-               vals.isDirectory == true {
+            let vals = try? item.resourceValues(forKeys: Set(keys))
+            if vals?.isSymbolicLink == true {
+                // Don't follow symlinks: a symlinked directory could
+                // loop back into the project tree; a symlinked file
+                // gets re-indexed when its real path is visited
+                // elsewhere in the source list.
+                if vals?.isDirectory == true {
+                    it.skipDescendants()
+                }
+                continue
+            }
+            if vals?.isDirectory == true {
                 if excludedDirectories.contains(comp) {
                     it.skipDescendants()
                 }
