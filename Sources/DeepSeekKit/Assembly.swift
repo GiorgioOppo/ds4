@@ -391,7 +391,7 @@ public extension Transformer {
 
 internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
-                         castOutputToBF16: Bool = true,
+                         castOutputToBF16: Bool = false,
                          rng: inout MiniRNG) throws -> Linear {
     if var w = try loader.tryLoad(["\(base).weight"]) {
         // V4-Flash-HF stores routed-expert FP4 weights as raw I8/U8

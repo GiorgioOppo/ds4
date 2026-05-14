@@ -47,10 +47,6 @@ public final class RMSNorm {
         let tg = MTLSize(width: 256, height: 1, depth: 1)
         enc.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
-        // Mirrors model.py:196 `(self.weight * x).to(dtype)` — the training
-        // pipeline ran activations in BF16, so the norm's output gets
-        // quantised back to BF16 between sublayers. Match that here.
-        Elementwise.bf16RoundTripInplace(y, in: cmd)
         return y
     }
 }

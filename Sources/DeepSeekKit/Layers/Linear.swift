@@ -49,7 +49,7 @@ public final class Linear {
     public let castOutputToBF16: Bool
 
     public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?,
-                castOutputToBF16: Bool = true) {
+                castOutputToBF16: Bool = false) {
         self.inFeatures = inFeatures
         self.outFeatures = outFeatures
         self.weight = weight
