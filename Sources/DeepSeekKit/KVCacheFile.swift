@@ -78,13 +78,16 @@ public final class KVCacheFile {
         // 2) Map the whole file. PROT_READ|WRITE + MAP_SHARED so writes
         //    persist; MADV_RANDOM tells the kernel not to prefetch — the
         //    attention kernel reads scattered rows.
-        //    Depending on the SDK, mmap is imported as either an IUO or
-        //    a plain Optional pointer; MAP_FAILED ((void *)-1) is the
-        //    error sentinel either way. Compare against the bit pattern
-        //    so we don't depend on the symbol being surfaced as a
-        //    named constant, and unwrap with `guard let` to satisfy the
-        //    Optional import.
-        let mapFailed = UnsafeMutableRawPointer(bitPattern: -1)
+        //    mmap is imported as Optional in this SDK; MAP_FAILED is
+        //    ((void *)-1). Compare against the bit pattern. Force-unwrap
+        //    `UnsafeMutableRawPointer(bitPattern: -1)` is safe because
+        //    the failable initialiser only returns nil for 0 — every
+        //    non-zero Int produces a Some.
+        //    `mapFailed` is annotated non-optional so the `raw != mapFailed`
+        //    branch doesn't promote `raw` to `UnsafeMutableRawPointer?`
+        //    and lose the unwrap performed by `guard let`.
+        let mapFailed: UnsafeMutableRawPointer =
+            UnsafeMutableRawPointer(bitPattern: -1)!
         let rawOpt = mmap(nil, total,
                            PROT_READ | PROT_WRITE,
                            MAP_SHARED, fd, 0)
