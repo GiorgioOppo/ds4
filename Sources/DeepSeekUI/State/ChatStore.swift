@@ -72,8 +72,14 @@ final class ChatStore: ObservableObject {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations.remove(at: idx)
         phases.removeValue(forKey: id)
-        // Best-effort: remove the on-disk file.
+        // Best-effort: remove the on-disk files. Both the JSON
+        // transcript and the persistent KV cache live next to each
+        // other; wipe both so a future conversation reusing this
+        // UUID never inherits stale prefill bytes.
         if let url = try? PersistencePaths.conversationURL(id: id) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let url = try? PersistencePaths.kvCacheURL(id: id) {
             try? FileManager.default.removeItem(at: url)
         }
         if selectedID == id {

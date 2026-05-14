@@ -25,4 +25,14 @@ enum PersistencePaths {
         try conversationsDir()
             .appendingPathComponent("\(id.uuidString).json")
     }
+
+    /// Path to the persistent KV cache file for a conversation. Lives
+    /// next to the conversation's `.json` so deleting a conversation
+    /// can wipe both atomically. Step 2 wires this into the layer
+    /// allocators; Step 3 uses the header inside to enable cross-turn
+    /// prefill reuse.
+    static func kvCacheURL(id: UUID) throws -> URL {
+        try conversationsDir()
+            .appendingPathComponent("\(id.uuidString).kvcache")
+    }
 }
