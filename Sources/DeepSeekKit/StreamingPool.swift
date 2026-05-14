@@ -4,10 +4,9 @@ import Metal
 import Darwin
 #endif
 
-/// Pool architecture for true single-shard-at-a-time streaming on
-/// Apple Silicon. Replaces the `MTLBuffer(bytesNoCopy:)` over mmap
-/// path used by `.mmap`/`.preload` strategies for the `.streaming`
-/// strategy.
+/// Pool architecture for sliding-window streaming on Apple Silicon.
+/// Replaces the `MTLBuffer(bytesNoCopy:)` over mmap path used by
+/// `.mmap`/`.preload` strategies for the `.streaming` strategy.
 ///
 /// **Why this exists.** On Apple Silicon, when you wrap an mmap'd
 /// region as a Metal buffer via `bytesNoCopy:`, the driver pins
@@ -18,28 +17,58 @@ import Darwin
 /// 100% memory pressure permanently and either crashes or makes
 /// inference unusably slow.
 ///
-/// **The pool.** Two MTLBuffer slots, both `.storageModeShared`,
+/// **The pool.** Two MTLBuffer regions, both `.storageModeShared`,
 /// allocated ONCE at load time:
 ///
 ///   - `sharedSlot`: holds concatenated data of "shared" shards
 ///     (top-level tensors: embed, head, RMSNorm gains, hc_head_*).
-///     `mlock`'d so it never gets evicted. Sized at typical ~2 GB
-///     for V4-Flash.
-///   - `rotatingSlot`: sized to the largest per-layer shard
-///     (~3.4 GB for V4-Flash). At runtime, `ensureLayer(K)`
-///     `pread`s layer K's shard data into this slot. Layer K's
-///     `Tensor`s all point into this single buffer with offsets
-///     within the shard; when we `pread` shard K+1 over the same
-///     bytes, layer K's tensors are invalidated (their data is
-///     overwritten) but the buffer object is the same, so the
-///     refs remain "valid" — we just have to ensure we never use
-///     a previous layer's tensors after `ensureLayer(K+1)`.
+///     `mlock`'d so it never gets evicted.
+///   - `rotatingSlot`: a single MTLBuffer carved into **N sub-slots**
+///     of `slotSize` bytes each (slotSize = aligned max per-layer
+///     shard size). Each per-layer shard K is permanently assigned
+///     to sub-slot `K mod N` — the slot index is a property of K,
+///     not of access order. Layer K's `Tensor` objects all point
+///     into the rotating buffer at offset
+///     `(K mod N) * slotSize + tensorOffsetInShard`, fixed at init.
 ///
-/// Total memory: shared + rotating + KV cache + activations ≈ 6 GB
-/// for V4-Flash, fits comfortably in 16 GB with the OS and GUI.
+/// **Why modular assignment.** `Tensor` captures `MTLBuffer + offset`
+/// at construction time (Assembly.swift builds every block's
+/// weights up-front, before the first forward). To avoid an
+/// indirection layer on every tensor access, layer K's bytes must
+/// always live at the same address. With sub-slot = `K mod N`,
+/// the address is `rotatingSlot.contents() + (K mod N) * slotSize +
+/// inShardOffset` — stable for the lifetime of the pool.
+///
+/// **Sliding window.** With N sub-slots and strictly sequential
+/// forward (layer 0, 1, ..., L-1), the working set per layer is 1
+/// and the prefetched window is N-1. After computing layer K and
+/// `releaseLayer(K)`, the pool schedules a background pread of
+/// layer K+N into sub-slot `(K+N) mod N = K mod N` — i.e. the slot
+/// holding K, which is no longer needed because the GPU finished
+/// with it before `releaseLayer` ran (`cmdL.waitUntilCompleted`).
+/// By the time `ensureLayer(K+N)` is called, the prefetch is
+/// already complete and the fast path returns without I/O.
+///
+/// **Memory.** Total rotating bytes = `N * slotSize`. With N=1 the
+/// behaviour is identical to the previous single-slot design (a
+/// blocking pread per layer transition). With N >= numLayerShards,
+/// every per-layer shard is pre-loaded once at init and never
+/// pread again — equivalent to a partial preload but only for the
+/// per-layer subset of shards.
 public final class StreamingPool {
     public let sharedSlot: MTLBuffer
+    /// Backing buffer for the rotating region. Internally divided
+    /// into `slotCount` sub-slots of `slotSize` bytes; layer K
+    /// always lives in sub-slot `K mod slotCount`. Exposed as a
+    /// single buffer so existing callers don't need to know about
+    /// the partitioning — the per-tensor `offsetInSlot` already
+    /// encodes the sub-slot offset.
     public let rotatingSlot: MTLBuffer
+    /// Number of rotating sub-slots (N). Always >= 1.
+    public let slotCount: Int
+    /// Bytes per sub-slot. Aligned to 4 KiB. The maximum per-layer
+    /// shard data size, rounded up.
+    public let slotSize: Int
 
     public enum Slot: Sendable { case shared, rotating }
 
@@ -47,25 +76,39 @@ public final class StreamingPool {
     /// at init from parsed shard headers.
     public struct TensorLocation: Sendable {
         public let slot: Slot
+        /// For `.shared`, offset within `sharedSlot`.
+        /// For `.rotating`, ABSOLUTE offset within `rotatingSlot`
+        /// (i.e. already includes `(K mod N) * slotSize`).
         public let offsetInSlot: Int
         public let shape: [Int]
         public let dtype: DType
     }
     public let tensorLocation: [String: TensorLocation]
 
-    /// One entry per non-shared shard: which file to `pread`
-    /// from and what byte range.
+    /// Per per-layer-shard source needed to `pread` it on demand.
     private struct LayerShardSource {
         let url: URL
         let dataStart: Int
         let dataByteCount: Int
-        /// Pre-allocated open fd or -1 to open lazily. Today we
-        /// open on demand because we may have 43 shards and only
-        /// 1 active at a time.
     }
     private let layerToShard: [Int: LayerShardSource]
-    private var currentRotatingLayer: Int = -1
-    private let rotatingCapacity: Int
+
+    /// Resident state of each rotating sub-slot. Lock-protected.
+    /// `loadedLayer == nil` means the sub-slot is empty or its
+    /// content is stale (e.g. a load failed mid-way and poisoned
+    /// the slot — the next ensure/prefetch for that K will retry).
+    private struct SlotState {
+        var loadedLayer: Int?
+    }
+    private var slotStates: [SlotState]
+    private let stateLock = NSLock()
+
+    /// Serial queue for all `pread` I/O. `ensureLayer` uses
+    /// `sync` (blocks the caller); `prefetchLayer` uses `async`
+    /// (returns immediately). Serial because APFS-on-NVMe peaks
+    /// around 3-4 concurrent reads and we'd rather have one
+    /// in-flight at a time than fight for disk bandwidth.
+    private let ioQueue: DispatchQueue
 
     /// Build the pool.
     ///
@@ -74,9 +117,19 @@ public final class StreamingPool {
     /// - Parameter shardLayers: from `WeightLoader.buildShardLayers`
     ///   — same shard ownership classification we already use for
     ///   `.streaming`'s madvise path.
+    /// - Parameter targetSlotCount: number of rotating sub-slots
+    ///   to allocate. Clamped to `[1, numLayerShards]`. Caller is
+    ///   responsible for sizing this against the available
+    ///   unified-memory budget; the pool itself does not probe
+    ///   `SystemProbe`. Pass 1 for the legacy single-slot
+    ///   behaviour, or higher to keep multiple per-layer shards
+    ///   resident simultaneously.
     public init(shards: [SafeTensorsHeader],
-                 shardLayers: [Int]) throws {
+                 shardLayers: [Int],
+                 targetSlotCount: Int) throws {
         precondition(shards.count == shardLayers.count)
+        precondition(targetSlotCount >= 1,
+                      "targetSlotCount must be >= 1; got \(targetSlotCount)")
 
         // Partition shards: shared vs per-layer.
         var sharedIndices: [Int] = []
@@ -93,8 +146,7 @@ public final class StreamingPool {
         }
         self.layerToShard = layerToShard
 
-        // Allocate sharedSlot at size = sum of shared shard data
-        // sizes. Aligned to 4096 bytes so we can `mlock` cleanly.
+        // -------- sharedSlot: same as before --------
         let sharedTotal = sharedIndices.reduce(0) { $0 + shards[$1].dataByteCount }
         let sharedAligned = ((sharedTotal + 4095) / 4096) * 4096
         MemoryLogger.willAllocate(bytes: sharedAligned, label: "sharedSlot")
@@ -107,23 +159,34 @@ public final class StreamingPool {
         }
         self.sharedSlot = sharedBuf
 
-        // Allocate rotatingSlot at size = max per-layer shard
-        // data size (so any layer's shard fits).
+        // -------- rotatingSlot: N sub-slots in one buffer --------
         let maxLayerBytes = layerToShard.values.map(\.dataByteCount).max() ?? 0
-        let rotatingAligned = ((maxLayerBytes + 4095) / 4096) * 4096
-        MemoryLogger.willAllocate(bytes: rotatingAligned, label: "rotatingSlot")
+        let slotSize = ((maxLayerBytes + 4095) / 4096) * 4096
+        // Clamp slot count to the number of distinct per-layer
+        // shards: anything beyond is wasted address space (we'd
+        // have empty sub-slots forever).
+        let layerShardCount = layerToShard.count
+        let slotCount = max(1, min(targetSlotCount, max(1, layerShardCount)))
+        let rotatingTotal = slotSize * slotCount
+        self.slotSize = slotSize
+        self.slotCount = slotCount
+        self.slotStates = Array(repeating: SlotState(loadedLayer: nil),
+                                  count: slotCount)
+        self.ioQueue = DispatchQueue(label: "deepseek.streaming-pool.io",
+                                       qos: .userInitiated)
+
+        MemoryLogger.willAllocate(bytes: rotatingTotal, label: "rotatingSlot")
         guard let rotBuf = Device.shared.mtl.makeBuffer(
-                length: max(rotatingAligned, 16),
+                length: max(rotatingTotal, 16),
                 options: .storageModeShared) else {
             throw NSError(domain: "StreamingPool", code: 31, userInfo: [
-                NSLocalizedDescriptionKey: "rotatingSlot allocation failed"
+                NSLocalizedDescriptionKey:
+                    "rotatingSlot allocation failed (slotCount=\(slotCount), slotSize=\(slotSize))"
             ])
         }
         self.rotatingSlot = rotBuf
-        self.rotatingCapacity = rotatingAligned
 
-        // Fill sharedSlot via pread of each shared shard's data
-        // section, recording the offset for each tensor name.
+        // -------- Fill sharedSlot from shared shards --------
         var locations: [String: TensorLocation] = [:]
         var sharedOffsetCursor = 0
         for i in sharedIndices {
@@ -133,7 +196,6 @@ public final class StreamingPool {
                                 url: header.url,
                                 fileOffset: header.dataStart,
                                 byteCount: header.dataByteCount)
-            // Record tensor locations within sharedSlot.
             for (name, entry) in header.entries {
                 let inShard = entry.dataOffsets[0]
                 locations[name] = TensorLocation(
@@ -145,23 +207,24 @@ public final class StreamingPool {
             sharedOffsetCursor += header.dataByteCount
         }
 
-        // Record per-layer tensor locations (slot=rotating).
+        // -------- Resolve per-layer tensor locations (offsets
+        //          already include the sub-slot base address) --------
         for (layerK, _) in layerToShard {
-            // Find the shard this layer owns.
             guard let shardIdx = shardLayers.firstIndex(of: layerK) else { continue }
             let header = shards[shardIdx]
+            let slotBase = (layerK % slotCount) * slotSize
             for (name, entry) in header.entries {
                 let inShard = entry.dataOffsets[0]
                 locations[name] = TensorLocation(
                     slot: .rotating,
-                    offsetInSlot: inShard,
+                    offsetInSlot: slotBase + inShard,
                     shape: entry.shape,
                     dtype: Self.parseDType(entry.dtype))
             }
         }
         self.tensorLocation = locations
 
-        // mlock the shared slot so it's truly resident-and-pinned.
+        // -------- mlock the shared slot --------
         if let addr = sharedSlot.contents() as UnsafeMutableRawPointer?,
            sharedAligned > 0 {
             let rc = mlock(addr, sharedAligned)
@@ -178,40 +241,121 @@ public final class StreamingPool {
             }
         }
         Self.log(String(format:
-            "[pool] rotatingSlot capacity %.2f GB (largest layer shard)\n",
-            Double(rotatingAligned) / 1_073_741_824))
+            "[pool] rotatingSlot %d sub-slot(s) × %.2f GB = %.2f GB total\n",
+            slotCount,
+            Double(slotSize) / 1_073_741_824,
+            Double(rotatingTotal) / 1_073_741_824))
+
+        // -------- Pre-fill: load the first N per-layer shards --------
+        // We bias the pre-fill toward the lowest layer indices since
+        // forward starts at layer 0 and proceeds upward. With N slots
+        // covering layers 0..N-1, the first N-1 ensureLayer() calls
+        // hit the cache; the first miss (ensureLayer(N)) triggers a
+        // pread for layer N that overwrites slot 0 (which held layer
+        // 0 and is no longer needed). MTP layers (1000+) and any
+        // sparse layer indices fill in afterwards as ensureLayer hits.
+        let sortedLayers = layerToShard.keys.sorted()
+        for layerK in sortedLayers.prefix(slotCount) {
+            try loadLayerSync(layerK)
+        }
     }
 
-    /// Gate diagnostic output behind `MemoryLogger.enabled` so the
-    /// pool stays quiet in normal runs and verbose under the
-    /// `DEEPSEEK_MEM_LOG=1` env var.
+    /// Gate diagnostic output behind `MemoryLogger.enabled`.
     @inline(__always)
     private static func log(_ s: String) {
         guard MemoryLogger.enabled else { return }
         FileHandle.standardError.write(Data(s.utf8))
     }
 
-    /// Ensure layer K's shard is loaded into `rotatingSlot`.
-    /// Idempotent: no-op if already loaded.
+    /// Ensure layer K's shard is loaded into its sub-slot. Blocks
+    /// until the data is resident. Idempotent: no-op if already
+    /// loaded (fast path skips the I/O queue entirely).
     public func ensureLayer(_ K: Int) throws {
-        if currentRotatingLayer == K { return }
+        // Fast path: already resident, no queue wait. Safe because
+        // `loadedLayer` is set to K *only after* the pread completes.
+        let slotIdx = K % slotCount
+        stateLock.lock()
+        let alreadyLoaded = slotStates[slotIdx].loadedLayer == K
+        stateLock.unlock()
+        if alreadyLoaded { return }
+
+        // Slow path: serialize through the I/O queue. If a prefetch
+        // for the same slot is in flight (likely for the same K),
+        // we land behind it and find the slot already loaded by the
+        // time our job runs.
+        var caught: Error?
+        ioQueue.sync {
+            do { try self.loadLayerSync(K) }
+            catch { caught = error }
+        }
+        if let e = caught { throw e }
+    }
+
+    /// Schedule a background pread of layer K's shard. Returns
+    /// immediately. Errors are logged but not propagated — the
+    /// next `ensureLayer(K)` will retry synchronously and surface
+    /// any persistent failure.
+    public func prefetchLayer(_ K: Int) {
+        // Skip layers that have no per-layer shard (top-level only)
+        // without queueing — cheap predicate, avoids cluttering
+        // ioQueue with no-ops on every release.
+        guard layerToShard[K] != nil else { return }
+        ioQueue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try self.loadLayerSync(K)
+            } catch {
+                Self.log("[pool] prefetchLayer(\(K)) failed: " +
+                          "\(error.localizedDescription)\n")
+            }
+        }
+    }
+
+    /// Run on `ioQueue` (sync caller) or as the queue's async job.
+    /// Performs the pread for layer K into its sub-slot and
+    /// updates `slotStates` atomically.
+    private func loadLayerSync(_ K: Int) throws {
         guard let src = layerToShard[K] else {
             // Layer has no per-layer shard (probably entirely in
             // shared shard, e.g. a one-block toy model). Nothing
             // to load.
             return
         }
-        precondition(src.dataByteCount <= rotatingCapacity,
-                     "shard for layer \(K) exceeds rotatingSlot capacity")
-        try Self.preadInto(buffer: rotatingSlot,
-                            bufferOffset: 0,
-                            url: src.url,
-                            fileOffset: src.dataStart,
-                            byteCount: src.dataByteCount)
-        currentRotatingLayer = K
+        precondition(src.dataByteCount <= slotSize,
+                     "shard for layer \(K) (\(src.dataByteCount) B) exceeds slotSize \(slotSize) B")
+
+        let slotIdx = K % slotCount
+        stateLock.lock()
+        if slotStates[slotIdx].loadedLayer == K {
+            // Another job loaded it while we waited on the queue.
+            stateLock.unlock()
+            return
+        }
+        // Mark the slot as "in flight": clear loadedLayer so any
+        // concurrent fast-path reader takes the slow path and ends
+        // up serialized behind this job.
+        slotStates[slotIdx].loadedLayer = nil
+        stateLock.unlock()
+
+        do {
+            try Self.preadInto(buffer: rotatingSlot,
+                                bufferOffset: slotIdx * slotSize,
+                                url: src.url,
+                                fileOffset: src.dataStart,
+                                byteCount: src.dataByteCount)
+        } catch {
+            // Pread failed; leave the slot poisoned (loadedLayer
+            // = nil) so the next caller retries instead of
+            // trusting stale bytes.
+            throw error
+        }
+
+        stateLock.lock()
+        slotStates[slotIdx].loadedLayer = K
+        stateLock.unlock()
         Self.log(String(format:
-            "[pool] layer=%d shard preaded %.2f GB into rotatingSlot\n",
-            K, Double(src.dataByteCount) / 1_073_741_824))
+            "[pool] layer=%d preaded %.2f GB into sub-slot %d\n",
+            K, Double(src.dataByteCount) / 1_073_741_824, slotIdx))
     }
 
     // ---- internals ----

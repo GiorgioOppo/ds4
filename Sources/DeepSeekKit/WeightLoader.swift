@@ -97,8 +97,34 @@ public final class WeightLoader {
             }
             self.shardLayers = classifyLayers
             self.streamingEnabled = true
+            // Decide how many rotating sub-slots the pool should
+            // allocate. Each sub-slot is `slotSize` bytes (≈ the
+            // largest per-layer shard, 4 KiB-aligned), so the
+            // rotating region as a whole costs `slotCount ×
+            // slotSize` of unified memory.
+            //
+            // Budget = effectiveProcessBudget − sharedShards
+            //          − reserve(KV / activations / OS).
+            // `effectiveProcessBudget` already applies the 60%
+            // physical cap that the rest of the loader uses, so
+            // we don't double-discount here.
+            //
+            // The reserve is a flat 4 GiB headroom by default —
+            // covers the KV cache for V4-Flash at conservative
+            // sequence lengths, framework command-buffer working
+            // set, and any other app. Tunable via
+            // `DEEPSEEK_STREAMING_RESERVE_GB`.
+            //
+            // The user can also force a specific count via
+            // `DEEPSEEK_STREAMING_SLOTS=N` — useful for tests and
+            // for power users on hosts where the auto-probe
+            // underestimates (e.g. dedicated inference rigs with
+            // no GUI competing for memory).
+            let targetSlots = Self.computeStreamingSlotCount(
+                headers: headers, shardLayers: classifyLayers)
             self.pool = try StreamingPool(shards: headers,
-                                            shardLayers: classifyLayers)
+                                            shardLayers: classifyLayers,
+                                            targetSlotCount: targetSlots)
             // The legacy `shards: [SafeTensorsFile]` array stays
             // empty in this strategy — `load(_:)` checks `pool`
             // first.
@@ -232,9 +258,15 @@ public final class WeightLoader {
         return try shards[s].load(name)
     }
 
-    /// In streaming-pool mode, swap layer K's shard data into the
-    /// rotating slot. Idempotent. Called by `Transformer.forward`
-    /// before each block. No-op when not streaming.
+    /// In streaming-pool mode, ensure layer K's shard is resident
+    /// in its sub-slot. Blocks only if the pool has to do a
+    /// synchronous pread (i.e. the layer wasn't pre-fetched). With
+    /// the default sliding-window setup the first `slotCount`
+    /// ensureLayer calls of each token are cache hits; subsequent
+    /// ones either find the layer already prefetched (no I/O) or
+    /// fall back to a synchronous pread. Idempotent. Called by
+    /// `Transformer.forward` before each block. No-op when not
+    /// streaming.
     public func ensureLayer(_ K: Int) {
         guard let pool = pool else { return }
         do {
@@ -249,6 +281,75 @@ public final class WeightLoader {
                         .utf8))
             }
         }
+    }
+
+    /// Returns the effective rotating-slot count when in pool mode,
+    /// or 0 otherwise. Used by callers that want to size their own
+    /// per-layer work to match the streaming window (e.g. tests,
+    /// diagnostics).
+    public var streamingSlotCount: Int { pool?.slotCount ?? 0 }
+
+    /// Decide how many rotating sub-slots the streaming pool
+    /// should allocate. Pure function over the parsed shard
+    /// headers; reads `SystemProbe` and environment variables.
+    /// Public-ish for `LoadStrategyTests` to dry-run the heuristic.
+    private static func computeStreamingSlotCount(
+        headers: [SafeTensorsHeader],
+        shardLayers: [Int]
+    ) -> Int {
+        // Pair headers with their layer ownership; split shared
+        // (-1) vs per-layer.
+        var sharedBytes: UInt64 = 0
+        var perLayerBytes: [Int] = []
+        for (i, owner) in shardLayers.enumerated() {
+            if owner == -1 {
+                sharedBytes &+= UInt64(headers[i].dataByteCount)
+            } else {
+                perLayerBytes.append(headers[i].dataByteCount)
+            }
+        }
+        let layerShardCount = perLayerBytes.count
+        guard layerShardCount > 0 else { return 1 }
+
+        // Explicit override wins. Accept any positive integer;
+        // StreamingPool clamps it to `[1, layerShardCount]`.
+        let env = ProcessInfo.processInfo.environment
+        if let s = env["DEEPSEEK_STREAMING_SLOTS"],
+           let n = Int(s), n >= 1 {
+            return n
+        }
+
+        let maxLayerBytes = UInt64(perLayerBytes.max() ?? 0)
+        let slotSize = (maxLayerBytes + 4095) / 4096 * 4096
+        guard slotSize > 0 else { return 1 }
+
+        let budgetCap = SystemProbe.effectiveProcessBudget()
+        if budgetCap == 0 {
+            // Probe unavailable — fall back to 1 (legacy
+            // single-slot behaviour). Better than risking OOM by
+            // guessing high.
+            return 1
+        }
+
+        // Reserve room for the KV cache, activation tensors, the
+        // Metal command queue, and any other app. 4 GiB is the
+        // conservative default; the env var lets users on
+        // headless inference rigs trade some headroom for more
+        // rotating cache.
+        let reserveGB: Double
+        if let s = env["DEEPSEEK_STREAMING_RESERVE_GB"],
+           let g = Double(s), g >= 0 {
+            reserveGB = g
+        } else {
+            reserveGB = 4.0
+        }
+        let reserveBytes = UInt64(reserveGB * 1_073_741_824)
+
+        let consumed = sharedBytes &+ reserveBytes
+        if consumed >= budgetCap { return 1 }
+        let rotatingBudget = budgetCap - consumed
+        let computed = Int(rotatingBudget / slotSize)
+        return max(1, min(layerShardCount, computed))
     }
 
     /// Convenience: load with a fallback name list. Tries each in order.
@@ -386,13 +487,25 @@ public final class WeightLoader {
     /// `commit+wait`. No-op unless `streamingEnabled`. Top-level
     /// shards (owner == -1) skipped.
     public func releaseLayer(_ layerIndex: Int) {
-        // Pool mode: nothing to release — the next `ensureLayer`
-        // overwrites the rotating slot's bytes via pread. Layer K's
-        // tensors become silently invalid the moment ensureLayer(K')
-        // is called for K' != K, but that's the design contract:
-        // Transformer.forward only accesses layer K's tensors
-        // BETWEEN ensureLayer(K) and ensureLayer(K+1).
-        if pool != nil { return }
+        // Pool mode: kick off a background prefetch for layer
+        // `K + slotCount` (the layer whose sub-slot will collide
+        // with the one we just finished with: `(K + N) mod N = K
+        // mod N`). The forward loop is at `cmdL.waitUntilCompleted`
+        // by the time releaseLayer runs, so the GPU is done with
+        // K's bytes — overwriting them with K+N is safe.
+        //
+        // If layer K+N doesn't exist (last sliding window of the
+        // forward pass), `prefetchLayer` just returns without
+        // queueing. Tensors for layer K become silently invalid
+        // the moment the prefetch's pread starts overwriting its
+        // sub-slot, but the design contract is unchanged:
+        // Transformer.forward only references layer K's tensors
+        // between `ensureLayer(K)` and the next `ensureLayer(K')`
+        // for any K' that shares K's sub-slot.
+        if let pool = pool {
+            pool.prefetchLayer(layerIndex + pool.slotCount)
+            return
+        }
         // Legacy mmap path (unused in current streaming, kept in
         // case we re-enable madvise-only experimentation).
         guard streamingEnabled else { return }
