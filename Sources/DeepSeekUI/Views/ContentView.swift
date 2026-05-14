@@ -7,10 +7,13 @@ enum AppPhase {
     case ready(URL, ModelConfig)
 }
 
-/// Top-level view. Receives the shared `InferenceService` from the
-/// App scene and routes between picker → loading → ready.
+/// Top-level view. Receives the shared `InferenceService` and
+/// `ProjectLibrary` from the App scene and routes between picker →
+/// loading → ready. The project library is threaded down so the chat
+/// surface can show / pick the active project.
 struct ContentView: View {
     let service: InferenceService
+    @ObservedObject var projects: ProjectLibrary
     @State private var phase: AppPhase = .picking
 
     var body: some View {
@@ -38,6 +41,7 @@ struct ContentView: View {
                 ChatContainer(
                     store: ChatStore(modelDirPath: url.path,
                                       service: service),
+                    projects: projects,
                     onUnload: { phase = .picking })
             }
         }
@@ -45,12 +49,12 @@ struct ContentView: View {
 }
 
 /// Hosts the `ChatStore` for the lifetime of the .ready phase and
-/// lays out the NavigationSplitView (sidebar + detail). An "Unload"
-/// toolbar action lets the user drop back to the picker without
-/// quitting the app, and a "Convert…" action opens the
-/// ConvertSheet for offline checkpoint quantization.
+/// lays out the NavigationSplitView (sidebar + detail). Toolbar
+/// items: convert model, unload, and a project picker that lets the
+/// active conversation reference a `Project` from the library.
 private struct ChatContainer: View {
     @StateObject var store: ChatStore
+    @ObservedObject var projects: ProjectLibrary
     var onUnload: () -> Void
 
     @State private var showConvert: Bool = false
@@ -62,6 +66,9 @@ private struct ChatContainer: View {
         } detail: {
             ChatView(store: store)
                 .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        projectPicker
+                    }
                     ToolbarItem {
                         Button {
                             showConvert = true
@@ -80,6 +87,50 @@ private struct ChatContainer: View {
         }
         .sheet(isPresented: $showConvert) {
             ConvertSheet()
+        }
+    }
+
+    @ViewBuilder
+    private var projectPicker: some View {
+        // Disabled when there is no active conversation; the menu is
+        // a no-op without a target. The label reads the currently-
+        // attached project (or "No project") so the user can tell at
+        // a glance which context the chat is wired to.
+        if let c = store.selectedConversation {
+            let attached = c.projectID.flatMap { projects.project(id: $0) }
+            Menu {
+                Button {
+                    store.setProject(nil, for: c.id)
+                } label: {
+                    if attached == nil {
+                        Label("None", systemImage: "checkmark")
+                    } else {
+                        Text("None")
+                    }
+                }
+                if !projects.projects.isEmpty {
+                    Divider()
+                }
+                ForEach(projects.projects) { p in
+                    Button {
+                        store.setProject(p.id, for: c.id)
+                    } label: {
+                        if attached?.id == p.id {
+                            Label(p.name, systemImage: "checkmark")
+                        } else {
+                            Text(p.name)
+                        }
+                    }
+                }
+            } label: {
+                Label(attached?.name ?? "No project",
+                       systemImage: attached == nil ? "folder" : "folder.fill")
+            }
+            .help(attached == nil
+                   ? "Attach a project from Settings → Projects"
+                   : "Project attached: \(attached!.name)")
+        } else {
+            EmptyView()
         }
     }
 }

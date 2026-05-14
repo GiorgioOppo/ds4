@@ -75,14 +75,24 @@ struct Conversation: Codable, Identifiable, Hashable {
     var createdAt: Date
     var modelDirPath: String      // captured at chat creation
     var messages: [StoredMessage]
+    /// Optional reference to a `Project` in `ProjectLibrary`. When
+    /// set, the chat surface shows the project's name in the toolbar.
+    /// Step 3 of the KV cache pipeline will turn this reference into
+    /// an actual prefill rehydration of the project's documents.
+    /// `Codable` sees this as Optional and reads existing on-disk
+    /// `.json` files (written before this field existed) as nil, so
+    /// no migration is needed.
+    var projectID: UUID?
 
     init(id: UUID = UUID(),
          title: String = "New Chat",
          createdAt: Date = .now,
          modelDirPath: String,
-         messages: [StoredMessage] = []) {
+         messages: [StoredMessage] = [],
+         projectID: UUID? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
+        self.projectID = projectID
     }
 
     mutating func retitleIfNeeded() {

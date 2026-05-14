@@ -68,6 +68,17 @@ final class ChatStore: ObservableObject {
         scheduleSave(c.id)
     }
 
+    /// Attach (or detach when `pid == nil`) a project to a conversation
+    /// and persist. The reference is metadata for now; the chat path
+    /// reads it only for the toolbar label until Step 3 of the KV
+    /// pipeline pulls the project's documents into the prefill.
+    func setProject(_ pid: UUID?, for id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        guard conversations[idx].projectID != pid else { return }
+        conversations[idx].projectID = pid
+        scheduleSave(id)
+    }
+
     func delete(_ id: UUID) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations.remove(at: idx)
