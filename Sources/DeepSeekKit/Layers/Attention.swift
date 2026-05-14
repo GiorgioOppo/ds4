@@ -68,6 +68,14 @@ public final class MLA {
         self.windowSize = config.windowSize
         self.compressRatio = config.compressRatios[layerId]
         self.eps = config.normEps
+        // V4 reference (`Reference/inference/model.py:395`):
+        //   self.softmax_scale = self.head_dim ** -0.5
+        // — plain inverse-sqrt with NO YaRN mscale correction (unlike
+        // V3, which adds `mscale = 0.1 * f * log(rope_factor) + 1` and
+        // multiplies by `mscale**2`). The earlier attempt to import
+        // V3's formula here made attention slightly sharper than what
+        // the V4 weights were trained for, and outputs got worse.
+        // Keep it simple and match the reference.
         self.softmaxScale = pow(Float(config.headDim), -0.5)
         self.wqA = wqA; self.qNorm = qNorm; self.wqB = wqB
         self.wkv = wkv; self.kvNorm = kvNorm
@@ -112,8 +120,10 @@ public final class MLA {
     ///     rows with cutoff/wrap (model.py:521-523)
     ///   - decode startPos > 0, seqlen == 1: ring-buffer single-row write
     ///
-    /// act_quant of the non-rope KV dims is skipped (QAT noise; structural
-    /// forward correctness doesn't depend on it). Tier 3 will add it back.
+    /// FP8 QAT noise is applied in-place to the non-rope dims of KV after
+    /// RoPE, matching model.py:506 (`act_quant(kv[..., :-rd], 64, ..., True)`).
+    /// Without this the residual stream amplifies uncontrolled past layer 5.
+    ///
     /// `cmd` is `inout`: when MLA has to flush the queue to read indexer
     /// topk to host (compress_ratio == 4), the original command buffer is
     /// committed and replaced with a fresh one. Caller's subsequent work
@@ -149,10 +159,25 @@ public final class MLA {
         // qr = q_norm(wq_a(x))
         let xFlat = x.reshape([B * S, x.shape[2]])
         let qrFlat = qNorm(wqA(xFlat, in: cmd), in: cmd)            // [B*S, q_lora_rank]
+        // Drain the pipe and trace at layer 0 only — we need the layer
+        // boundary intermediates resolved on host to localize the first
+        // operation that introduces NaN/Inf. Streaming inference also
+        // commits per-layer, so the extra sync only fires under the
+        // diagnostic flag.
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after wqA+qNorm", qrFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let qr = qrFlat.reshape([B, S, qLoraRank])
 
         // q = wq_b(qr).unflatten(-1, (n_heads, head_dim))
         var q = wqB(qrFlat, in: cmd)                                 // [B*S, n_heads*head_dim]
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after wqB", q)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         q = q.reshape([B * S, nHeads, headDim])
 
         // q *= rsqrt(mean(q^2) + eps) over head_dim (re-norm per head)
@@ -192,9 +217,31 @@ public final class MLA {
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
         let kvFlat = kvNorm(wkv(xFlat, in: cmd), in: cmd)
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after wkv+kvNorm", kvFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         // RoPE on rope tail (interpret as [B*S, 1, head_dim]).
         rope.apply(kvFlat.reshape([B * S, 1, headDim]),
                    startPos: startPos, inverse: false, in: cmd)
+        // FP8-simulate the non-rope dims of KV to match training-time QAT
+        // noise. Mirrors model.py:506
+        //     act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        // The model was trained with KV nope dims round-tripped through
+        // FP8 (block 64, clipped to ±448). Without this step the KV
+        // values exceed FP8 range in deeper layers, attention scores
+        // become outsized, and the residual stream amplifies across
+        // layers (observed: layer 0 L2=75 → layer 42 L2=615k).
+        ActQuant.partialInplaceQuant(
+            kvFlat.reshape([B * S, headDim]),
+            colStart: 0, colEnd: headDim - ropeHeadDim,
+            blockSize: Quant.actBlockSizeFP8KVNope, in: cmd)
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] kv after fp8-QAT", kvFlat)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let kv = kvFlat.reshape([B, S, headDim])
 
         // ---------- Topk indices ----------
@@ -345,6 +392,11 @@ public final class MLA {
         let qPerToken = q.reshape([B, S, nHeads, headDim])
         let o = SparseAttention.apply(q: qPerToken, kv: kvFull, sink: attnSink,
                                        topkIdxs: topkT, scale: softmaxScale, in: cmd)
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after sparse_attn", o)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
 
         // ---------- Inverse RoPE ----------
         rope.apply(o.reshape([B * S, nHeads, headDim]),
@@ -354,9 +406,27 @@ public final class MLA {
         let perGroupD = nHeads * headDim / nGroups
         let oView = o.reshape([B, S, nGroups, perGroupD])
         let woAR = woA.weight.reshape([nGroups, oLoraRank, perGroupD])
-        let oR = Einsum.bsgdGrd(o: oView, woA: woAR, in: cmd)        // [B, S, nGroups, oLoraRank]
+        // When wo_a is FP8 on disk (DeepSeek-V4-HF native, expert_dtype=fp4
+        // / attn fmt=e4m3), we keep the FP8 + UE8M0 scale all the way to
+        // the einsum kernel which dequantizes inline. For INT-quantized
+        // / BF16-fused converted models woA.scale is nil and the kernel
+        // takes the BF16 or f32 path automatically.
+        let oR = Einsum.bsgdGrd(o: oView, woA: woAR,
+                                  woAScale: woA.scale,
+                                  in: cmd)                            // [B, S, nGroups, oLoraRank]
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after einsum wo_a", oR)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
         let oFlat = oR.reshape([B * S, nGroups * oLoraRank])
-        return woB(oFlat, in: cmd).reshape([B, S, dim])
+        let result = woB(oFlat, in: cmd).reshape([B, S, dim])
+        if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("mla[\(layerId)] after wo_b", result)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+        return result
     }
 
     private var dim: Int { wkv.inFeatures }

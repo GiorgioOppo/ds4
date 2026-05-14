@@ -42,8 +42,10 @@ struct ConversationListView: View {
                 Text(c.createdAt, format: .dateTime.month().day().hour().minute())
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                if case .streaming = store.phase(of: c.id) {
+                switch store.phase(of: c.id) {
+                case .streaming, .prefilling:
                     ProgressView().controlSize(.mini)
+                default: EmptyView()
                 }
             }
         }

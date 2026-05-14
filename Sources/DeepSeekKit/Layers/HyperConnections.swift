@@ -68,9 +68,13 @@ public final class HyperConnections {
             enc.endEncoding()
         }
 
-        // 2. mixes = xFlat @ hcFnᵀ via Linear (f32 dense)
+        // 2. mixes = xFlat @ hcFnᵀ via Linear (f32 dense). Reference runs
+        // the entirety of hc_pre in FP32 (model.py:676 `x = x.flatten(2).float()`),
+        // so the linear's output stays in FP32 — `castOutputToBF16: false`
+        // so we don't quantise the mixes feeding into Sinkhorn.
         precondition(hcFn.dtype == .f32 && hcFn.shape == [mixHc, hcD])
-        let lin = Linear(inFeatures: hcD, outFeatures: mixHc, weight: hcFn, scale: nil)
+        let lin = Linear(inFeatures: hcD, outFeatures: mixHc, weight: hcFn, scale: nil,
+                          castOutputToBF16: false)
         let mixes = lin(xFlat, in: cmd)
 
         // 3. mixes *= rsqrt (broadcast over rows)

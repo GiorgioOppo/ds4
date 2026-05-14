@@ -89,8 +89,11 @@ public final class ParallelHead {
         }
 
         // 2. mixes = Linear(hcFn)(x_flat); mixes *= rsqrt; pre = sigmoid(mixes*scale + base) + eps
+        // ParallelHead.hc_head runs in FP32 (model.py:730 `x = x.flatten(2).float()`)
+        // — no BF16 quantisation on the gating mixes.
         let lin = Linear(inFeatures: hcDim, outFeatures: hcMult,
-                         weight: hcFn, scale: nil)
+                         weight: hcFn, scale: nil,
+                         castOutputToBF16: false)
         let mixes = lin(xFlat, in: cmd)        // [N, hcMult]
 
         // mixes *= rsqrt (broadcast)
@@ -150,8 +153,13 @@ public final class ParallelHead {
         blit.endEncoding()
 
         // 5. logits = lastTok @ weight^T   (Linear with weight shape [vocab, dim])
+        // castOutputToBF16=false: the logits feed straight into argmax /
+        // softmax (sampling) — losing 16 mantissa bits here would
+        // collapse ties and warp the temperature scaling. The reference
+        // also keeps the LM-head output in F32 for the same reason.
         let lmHead = Linear(inFeatures: dim, outFeatures: vocabSize,
-                            weight: weight, scale: nil)
+                            weight: weight, scale: nil,
+                            castOutputToBF16: false)
         let logits = lmHead(lastTok, in: cmd2)
         cmd2.commit(); cmd2.waitUntilCompleted()
         return logits
@@ -230,6 +238,8 @@ public final class Transformer {
         enc.endEncoding()
         cmd.commit(); cmd.waitUntilCompleted()
         MemoryLogger.snapshot("forward:embed+hc-expanded", force: true)
+        traceTensorStats("embed", h)
+        traceTensorStats("hc-expand", hExpanded)
 
         // 3. Run each block sequentially. Each commits its own buffers.
         //
@@ -249,6 +259,15 @@ public final class Transformer {
         // from".
         var x = hExpanded.reshape([B, S, hc, config.dim])
         let loader = self.weightLoader
+        // Layers to dump stats for under --trace-norms. Densified through
+        // the first few layers because the prefill-vs-decode residual
+        // divergence appears between layer 0 and 10, exactly where the
+        // V4 Compressor / Indexer modules activate (compress_ratios=0
+        // at layers 0-1, then alternates 4/128 from layer 2 on).
+        let nL = layers.count
+        let traceLayers: Set<Int> = nL <= 12
+            ? Set(0..<nL)
+            : Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 30, nL - 1])
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
@@ -260,6 +279,9 @@ public final class Transformer {
             loader?.releaseLayer(k)
             MemoryLogger.snapshot(
                 "forward:layer-\(String(format: "%02d", k))", force: true)
+            if traceLayers.contains(k) {
+                traceTensorStats("layer-\(String(format: "%02d", k))", x)
+            }
         }
 
         // 4. Head. `ParallelHead.callAsFunction` commits `cmdH`
@@ -271,6 +293,7 @@ public final class Transformer {
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
         MemoryLogger.snapshot("forward:complete", force: true)
+        traceTensorStats("logits", logits)
         return logits
     }
 

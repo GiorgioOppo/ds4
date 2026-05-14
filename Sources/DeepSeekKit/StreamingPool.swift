@@ -229,11 +229,28 @@ public final class StreamingPool {
         }
         defer { close(fd) }
 
+        // macOS / Darwin `pread` returns EINVAL when `nbyte` exceeds
+        // a per-syscall cap (observed at ~2 GiB on M-series Macs,
+        // even though POSIX permits up to SSIZE_MAX). For per-layer
+        // shards larger than that (V4-Flash's biggest is 3.37 GB)
+        // the very first iteration fails before the short-read loop
+        // can chunk it. We cap each call at 1 GiB to stay safely
+        // below INT_MAX with headroom; the loop iterates as before.
+        //
+        // This is silently catastrophic if not capped: ensureLayer
+        // swallows the error (`DEEPSEEK_MEM_LOG=0` is the default),
+        // leaving the rotating slot full of stale or uninitialised
+        // bytes, so every block above the failed layer computes its
+        // attention / MLP against zero (or previous layer's) weights
+        // and produces tokens that look uniform-random across scripts
+        // — the exact symptom we've been chasing.
+        let kPreadCap = 1 << 30   // 1 GiB
         let base = buffer.contents().advanced(by: bufferOffset)
         var off = 0
         while off < byteCount {
+            let toRead = min(byteCount - off, kPreadCap)
             let n = pread(fd, base.advanced(by: off),
-                          byteCount - off,
+                          toRead,
                           off_t(fileOffset + off))
             if n > 0 {
                 off += n
@@ -246,7 +263,7 @@ public final class StreamingPool {
                 let errnoStr = String(cString: strerror(errno))
                 throw NSError(domain: "StreamingPool", code: 34, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "pread failed at \(off): \(errnoStr) — \(url.lastPathComponent)"
+                        "pread failed at \(off) (req \(toRead) bytes): \(errnoStr) — \(url.lastPathComponent)"
                 ])
             }
         }

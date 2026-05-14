@@ -57,8 +57,13 @@ public final class Gate {
     }
 
     /// Returns `(weights, indices)` of shape `[N, topK]` each.
+    /// `cmd` is `inout` because the hash-routing path needs to commit
+    /// the caller's buffer (to materialise the input `x`, which is the
+    /// product of preceding kernels) and swap in a fresh one so the
+    /// caller doesn't double-commit. The score-based path treats it
+    /// as a regular non-mutating reference.
     public func callAsFunction(_ x: Tensor, inputIds: [Int32],
-                                in cmd: MTLCommandBuffer) -> (weights: Tensor, indices: Tensor) {
+                                in cmd: inout MTLCommandBuffer) -> (weights: Tensor, indices: Tensor) {
         precondition(x.dtype == .f32 && x.shape.count == 2)
         let N = x.shape[0]
 
@@ -67,27 +72,68 @@ public final class Gate {
 
         if hashRouting {
             guard let tid = tid2eid else { fatalError("hash routing requires tid2eid") }
-            // Pure host-side lookup; tid2eid was cast to i32 at load time
-            // (AssemblyHelpers.castIntToI32) and inputIds is already a
-            // Swift [Int32]. No GPU work needs to be issued — and crucially
-            // no commit, since the caller (MoEFFN) will commit `cmd` itself
-            // to drain pre-Gate work (RMSNorm, hc.pre) before reading our
-            // output buffers.
-            let tidPtr = tid.buffer.contents().bindMemory(to: Int32.self,
-                                                            capacity: tid.count)
-            let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self,
-                                                                capacity: N * topK)
-            let weightsPtr = weights.buffer.contents().bindMemory(to: Float.self,
-                                                                    capacity: N * topK)
+            // Hash-routed layer: expert indices come from a precomputed
+            // tid2eid table (lookup keyed on the input token id), but
+            // the per-expert routing WEIGHTS still come from
+            //     softplus(linear(x, gate.weight)).sqrt()
+            // gathered at those indices, normalised across the topK and
+            // multiplied by route_scale. Mirrors Reference/inference/
+            // model.py:576-583. Earlier this branch used a uniform
+            // 1/topK weight, which silently degraded the first
+            // n_hash_layers (=3 for V4-Flash) by replacing learned
+            // gating with a flat average.
+            //
+            // `x` was produced by kernels queued on the caller's `cmd`
+            // (RMSNorm + hc.pre at least) which hasn't been committed
+            // yet, so its bytes aren't valid host-side until we drain
+            // that buffer. We commit + wait, then run the gate
+            // projection on a fresh cmd, then swap a brand-new cmd
+            // back to the caller so its later `cmd.commit()` doesn't
+            // try to commit an already-committed buffer.
+            cmd.commit(); cmd.waitUntilCompleted()
+            let scoreCmd = Device.shared.queue.makeCommandBuffer()!
+            let logits = weight(x, in: scoreCmd)
+            scoreCmd.commit(); scoreCmd.waitUntilCompleted()
+            let logitsPtr = logits.buffer.contents()
+                .bindMemory(to: Float.self, capacity: N * nExperts)
+            let tidPtr = tid.buffer.contents()
+                .bindMemory(to: Int32.self, capacity: tid.count)
+            let idxPtr = indices.buffer.contents()
+                .bindMemory(to: Int32.self, capacity: N * topK)
+            let weightsPtr = weights.buffer.contents()
+                .bindMemory(to: Float.self, capacity: N * topK)
             let vocabSize = tid.shape[0]
+            // sqrt(softplus(x)) — numerically stable form matching the
+            // moe_gate Metal kernel's score_fn for SCORE==2.
+            @inline(__always)
+            func sqrtSoftplus(_ x: Float) -> Float {
+                let sp = max(x, 0) + log(1 + expf(-abs(x)))
+                return sqrt(sp)
+            }
             for n in 0..<N {
                 let id = Int(inputIds[n])
                 precondition(id >= 0 && id < vocabSize)
+                var sum: Float = 0
                 for k in 0..<topK {
-                    idxPtr[n * topK + k] = tidPtr[id * topK + k]
-                    weightsPtr[n * topK + k] = 1.0 / Float(topK) * routeScale
+                    let e = Int(tidPtr[id * topK + k])
+                    let l = logitsPtr[n * nExperts + e]
+                    let w = sqrtSoftplus(l)
+                    weightsPtr[n * topK + k] = w
+                    idxPtr[n * topK + k] = Int32(e)
+                    sum += w
+                }
+                // Renormalise + scale (the reference normalises only
+                // when score_func != "softmax" — V4 uses sqrtsoftplus
+                // so we always normalise here).
+                let inv = 1.0 / max(sum, 1e-12)
+                for k in 0..<topK {
+                    weightsPtr[n * topK + k] *= inv * routeScale
                 }
             }
+            // Replace the caller's already-committed cmd so its
+            // upcoming `cmd.commit()` (the MoEFFN drain at gate +1)
+            // runs against a fresh buffer.
+            cmd = Device.shared.queue.makeCommandBuffer()!
             return (weights, indices)
         }
 
@@ -130,7 +176,8 @@ public final class Expert {
     public func callAsFunction(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
         let g = w1(x, in: cmd)
         let u = w3(x, in: cmd)
-        let h = Elementwise.siluMul(g, u, in: cmd)
+        // Pass swigluLimit through so the kernel applies the V4 clamp.
+        let h = Elementwise.siluMul(g, u, swigluLimit: swigluLimit, in: cmd)
         return w2(h, in: cmd)
     }
 }
@@ -143,6 +190,7 @@ public final class MoEFFN {
     public let dim: Int
     public let nExperts: Int
     public let topK: Int
+    public var layerId: Int = -1
 
     public init(config: ModelConfig, gate: Gate, experts: [Expert?], shared: Expert) {
         self.gate = gate
@@ -167,7 +215,7 @@ public final class MoEFFN {
         let xFlat = x.reshape([N, dim])
 
         // 1. Gate.
-        let (weights, indices) = gate(xFlat, inputIds: inputIds, in: cmd)
+        let (weights, indices) = gate(xFlat, inputIds: inputIds, in: &cmd)
         // We need indices+weights on host to build the dispatch plan.
         cmd.commit(); cmd.waitUntilCompleted()
         let idxPtr = indices.buffer.contents().bindMemory(to: Int32.self, capacity: N * topK)
@@ -177,6 +225,19 @@ public final class MoEFFN {
 
         let plan = MoEDispatch.prepare(indices: idxArr, weights: wArr,
                                         N: N, topK: topK, nExperts: nExperts)
+
+        // Layer 5/6 diagnostic: which experts get chosen, with what weight?
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
+            var msg = "[trace moe[\(layerId)] routing] indices/weights (N=\(N), topK=\(topK)):\n"
+            for n in 0..<N {
+                var parts: [String] = []
+                for k in 0..<topK {
+                    parts.append("e\(idxArr[n * topK + k])(w=\(String(format: "%.4f", wArr[n * topK + k])))")
+                }
+                msg += "  tok\(n): " + parts.joined(separator: " ") + "\n"
+            }
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
 
         // Swap in a fresh command buffer for the rest of the work; the
         // committed one above can no longer accept encoders.
@@ -195,6 +256,7 @@ public final class MoEFFN {
         blit.endEncoding()
 
         let bytesPerRow = dim * MemoryLayout<Float>.size
+        let perExpertTrace = TraceFlags.normTrace && (layerId == 5 || layerId == 6)
         for e in 0..<nExperts {
             let lo = plan.perExpertOffsets[e]
             let hi = plan.perExpertOffsets[e + 1]
@@ -205,7 +267,88 @@ public final class MoEFFN {
             let slice = Tensor(shape: [count, dim], dtype: .f32,
                                 buffer: gathered.buffer,
                                 offset: gathered.offset + lo * bytesPerRow)
-            let outSlice = expert(slice, in: cmd)
+            if perExpertTrace {
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[\(layerId)] expert[\(e)] in  (count=\(count))", slice)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+            }
+            // Layer-6 byte-level dump of expert 56 and expert 66's w1 weight + scale.
+            // Compare against the on-disk content from the safetensors python dump
+            // to catch streaming-pool offset corruption.
+            if layerId == 6 && (e == 56 || e == 66) && TraceFlags.normTrace {
+                let w1 = expert.w1
+                let wBuf = w1.weight.buffer
+                let wOff = w1.weight.offset
+                let wPtr = wBuf.contents().advanced(by: wOff)
+                    .bindMemory(to: UInt8.self, capacity: 32)
+                var wBytes = "moe[6] expert[\(e)] w1.weight first 32B:"
+                for b in 0..<32 { wBytes += String(format: " %02x", wPtr[b]) }
+                FileHandle.standardError.write(Data((wBytes + "\n").utf8))
+                if let sc = w1.scale {
+                    let scPtr = sc.buffer.contents().advanced(by: sc.offset)
+                        .bindMemory(to: UInt8.self, capacity: 32)
+                    var sBytes = "moe[6] expert[\(e)] w1.scale  first 32B:"
+                    for b in 0..<32 { sBytes += String(format: " %02x", scPtr[b]) }
+                    FileHandle.standardError.write(Data((sBytes + "\n").utf8))
+                } else {
+                    FileHandle.standardError.write(Data("moe[6] expert[\(e)] w1.scale  IS NIL\n".utf8))
+                }
+            }
+            // Decompose expert FFN to isolate which sub-op (w1, w3, siluMul, w2)
+            // amplifies for the data-dependent kernel issue. Only at layer 6
+            // experts 56 / 66 to keep cost manageable.
+            let outSlice: Tensor
+            if layerId == 6 && (e == 56 || e == 66) && TraceFlags.normTrace {
+                // Dump the actual input vector for offline Python comparison:
+                // /tmp/moe6_e<id>_input.bin (single token's [dim] f32 little-endian).
+                cmd.commit(); cmd.waitUntilCompleted()
+                do {
+                    let inPtr = slice.buffer.contents().advanced(by: slice.offset)
+                    let inData = Data(bytes: inPtr, count: dim * MemoryLayout<Float>.size)
+                    let url = URL(fileURLWithPath: "/tmp/moe6_e\(e)_input.bin")
+                    try? inData.write(to: url)
+                    FileHandle.standardError.write(Data("moe[6] expert[\(e)] dumped input to \(url.path)\n".utf8))
+                }
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let g = expert.w1(slice, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w1·x (g)", g)
+                do {
+                    let gPtr = g.buffer.contents().advanced(by: g.offset)
+                    try? Data(bytes: gPtr, count: g.count * MemoryLayout<Float>.size)
+                        .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_g.bin"))
+                }
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let u = expert.w3(slice, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w3·x (u)", u)
+                do {
+                    let uPtr = u.buffer.contents().advanced(by: u.offset)
+                    try? Data(bytes: uPtr, count: u.count * MemoryLayout<Float>.size)
+                        .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_u.bin"))
+                }
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let h = Elementwise.siluMul(g, u, swigluLimit: expert.swigluLimit, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] siluMul(g,u)", h)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+
+                let y = expert.w2(h, in: cmd)
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[6] expert[\(e)] w2(h)", y)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+                outSlice = y
+            } else {
+                outSlice = expert(slice, in: cmd)
+            }
+            if perExpertTrace {
+                cmd.commit(); cmd.waitUntilCompleted()
+                traceTensorStats("moe[\(layerId)] expert[\(e)] out (count=\(count))", outSlice)
+                cmd = Device.shared.queue.makeCommandBuffer()!
+            }
             // Copy into outs.
             let blit2 = cmd.makeBlitCommandEncoder()!
             blit2.copy(from: outSlice.buffer, sourceOffset: 0,
@@ -221,10 +364,30 @@ public final class MoEFFN {
         blitY.endEncoding()
         MoEDispatch.scatter(y: y, outs: outs, plan: plan, in: cmd)
 
+        // Diagnostic trace: routed-expert contribution before adding shared.
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] routed-only (post-scatter)", y)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+
         // 5. Add shared expert output. Leave cmd uncommitted; the caller
         // (Block) continues encoding hc.post into the same buffer.
         let sharedOut = sharedExpert(xFlat, in: cmd)
+
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] shared-only", sharedOut)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+
         Elementwise.addInPlace(y, sharedOut, in: cmd)
+
+        if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("moe[\(layerId)] final (routed+shared)", y)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
 
         return y.reshape(shape)
     }

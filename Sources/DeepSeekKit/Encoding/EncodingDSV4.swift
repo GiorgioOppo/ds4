@@ -86,7 +86,22 @@ public enum EncodingDSV4 {
                 out += eosToken
             }
         }
+        // Trailing assistant turn (the one the model fills in). Mirrors
+        // Reference/encoding/encoding_dsv4.py:render_message lines
+        // 250-258: after every user message we emit ASSISTANT_SP_TOKEN
+        // and then either thinking_start_token (<think>) when the model
+        // is asked to think, or thinking_end_token (</think>) for plain
+        // chat (signals "no thinking, here's the response"). The earlier
+        // Swift impl emitted only the assistant token, which left the
+        // model in an undefined state (it expected one of the two think
+        // markers) and produced incoherent first tokens.
         out += assistantToken
+        switch mode {
+        case .chat:
+            out += thinkClose
+        case .high, .max:
+            out += thinkOpen
+        }
         return out
     }
 

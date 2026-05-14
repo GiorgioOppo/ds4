@@ -28,6 +28,10 @@ public enum Quant {
     public static let actBlockSizeFP8 = 128
     /// FP4 activation quant block size used by `fp4_act_quant`.
     public static let actBlockSizeFP4 = 32
+    /// FP8 block size used by the V4 QAT noise injection on KV nope dims.
+    /// `official/DeepSeek-V4-Flash/inference/model.py:372,506` call
+    /// `act_quant(kv[..., :-rd], 64, ...)` — block 64, not the 128 default.
+    public static let actBlockSizeFP8KVNope = 64
 
     /// FP8-E4M3 numeric range.
     public static let fp8Min: Float = -448.0

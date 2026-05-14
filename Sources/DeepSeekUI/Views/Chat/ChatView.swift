@@ -7,7 +7,7 @@ struct ChatView: View {
     @ObservedObject var store: ChatStore
     @State private var draft: String = ""
 
-    @AppStorage("deepseek.temperature")       private var temperature: Double = 1.0
+    @AppStorage("deepseek.temperature")       private var temperature: Double = 0.7
     @AppStorage("deepseek.topK")              private var topK: Int = 0
     @AppStorage("deepseek.topP")              private var topP: Double = 1.0
     @AppStorage("deepseek.repPenalty")        private var repPenalty: Double = 1.0
@@ -42,10 +42,13 @@ struct ChatView: View {
                                 isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase))
                             .id(msg.id)
                         }
-                        if case .streaming(_, let status) = phase, !status.isEmpty {
-                            Text(status)
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
+                        if case .prefilling(let promptTokens, let startTime) = phase {
+                            PrefillIndicator(promptTokens: promptTokens,
+                                              startTime: startTime)
+                                .padding(.leading, 40)
+                        }
+                        if case .streaming(_, let status, let metrics) = phase {
+                            ThroughputBar(metrics: metrics, status: status)
                                 .padding(.leading, 40)
                         }
                         if case .error(let msg) = phase {
@@ -85,7 +88,7 @@ struct ChatView: View {
     }
 
     private func scrollBufferLength(_ phase: GenerationPhase) -> Int {
-        if case .streaming(let buffer, _) = phase { return buffer.count }
+        if case .streaming(let buffer, _, _) = phase { return buffer.count }
         return 0
     }
 
@@ -99,8 +102,13 @@ struct ChatView: View {
     private func sendCurrent() {
         let text = draft
         draft = ""
+        // Clamp temperature into the supported [0.5, 1.0] range in case
+        // an older @AppStorage value (default used to be 1.0, slider
+        // used to span 0…2) is still on disk for a user who never
+        // touched the Settings tab.
+        let clampedT = min(1.0, max(0.5, temperature))
         let opts = SamplingOptions(
-            temperature: Float(temperature),
+            temperature: Float(clampedT),
             topK: topK, topP: Float(topP),
             repetitionPenalty: Float(repPenalty))
         let mode: ThinkingMode = (modeRaw == "max")  ? .max
@@ -108,5 +116,69 @@ struct ChatView: View {
                                 : .chat
         store.send(text: text, mode: mode,
                     options: opts, maxTokens: maxTokens)
+    }
+}
+
+/// Animated indicator shown while the prefill forward is running. The
+/// elapsed seconds tick live via a TimelineView; the prompt token count
+/// stays constant so the user can see how many positions the model is
+/// chewing through.
+private struct PrefillIndicator: View {
+    let promptTokens: Int
+    let startTime: Date
+
+    var body: some View {
+        TimelineView(.periodic(from: startTime, by: 0.1)) { ctx in
+            let elapsed = ctx.date.timeIntervalSince(startTime)
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(String(format: "Prefilling %d tokens · %.1fs",
+                            promptTokens, elapsed))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+/// Compact two-line throughput readout for the streaming phase. Renders
+/// nothing until at least one metric is populated, so very short prompts
+/// don't get a blank caption bar before prefillDone arrives.
+private struct ThroughputBar: View {
+    let metrics: GenerationMetrics
+    let status: String
+
+    var body: some View {
+        let hasPrefill = metrics.promptTokens > 0
+        let hasGen = metrics.generatedTokens > 0
+        let hasStatus = !status.isEmpty
+        if hasPrefill || hasGen || hasStatus {
+            VStack(alignment: .leading, spacing: 2) {
+                if hasPrefill {
+                    Text(String(format:
+                        "Prefill: %d tok in %.2fs · %.0f tok/min",
+                        metrics.promptTokens,
+                        metrics.prefillElapsed,
+                        metrics.prefillTokPerMin))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if hasGen {
+                    Text(String(format:
+                        "Generation: %d tok in %.2fs · %.0f tok/min",
+                        metrics.generatedTokens,
+                        metrics.generationElapsed,
+                        metrics.generationTokPerMin))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                if hasStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
     }
 }

@@ -47,28 +47,46 @@ public final class Block {
         let B = x.shape[0], S = x.shape[1]
         let N = B * S
 
+        @inline(__always) func traceHere(_ name: String, _ t: Tensor) {
+            guard TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) else { return }
+            cmd.commit(); cmd.waitUntilCompleted()
+            traceTensorStats("block[\(layerId)] \(name)", t)
+            cmd = Device.shared.queue.makeCommandBuffer()!
+        }
+
         // ---- Attention sublayer ----
         let xFlat = x.reshape([N, hcMult, dim])
 
         let attnPre = hc.pre(x: xFlat, hcFn: hcAttnFn,
                              hcScale: hcAttnScale, hcBase: hcAttnBase, in: cmd)
+        traceHere("after hc.pre(attn).y", attnPre.y)
+        traceHere("after hc.pre(attn).post", attnPre.post)
+        traceHere("after hc.pre(attn).comb", attnPre.comb)
         // attnPre.y: [N, dim]
         let yNorm = attnNorm(attnPre.y, in: cmd).reshape([B, S, dim])
+        traceHere("after attnNorm", yNorm)
         let attnOut = attn(yNorm, startPos: startPos, in: &cmd)       // [B, S, dim]
+        traceHere("after attn (MLA returned)", attnOut)
 
         let xMid = hc.post(x: attnOut.reshape([N, dim]),
                            residual: xFlat,
                            post: attnPre.post, comb: attnPre.comb, in: cmd)
+        // BF16 round-trip on the residual stream — mirrors the reference's
+        traceHere("after hc.post(attn)", xMid)
         // xMid: [N, hc, dim]
 
         // ---- FFN sublayer ----
         let ffnPre = hc.pre(x: xMid, hcFn: hcFfnFn,
                             hcScale: hcFfnScale, hcBase: hcFfnBase, in: cmd)
+        traceHere("after hc.pre(ffn).y", ffnPre.y)
         let yNorm2 = ffnNorm(ffnPre.y, in: cmd).reshape([B, S, dim])
+        traceHere("after ffnNorm", yNorm2)
         let ffnOut = ffn(yNorm2, inputIds: inputIds, in: &cmd)        // [B, S, dim]
+        traceHere("after ffn", ffnOut)
         let xOut = hc.post(x: ffnOut.reshape([N, dim]),
                            residual: xMid,
                            post: ffnPre.post, comb: ffnPre.comb, in: cmd)
+        traceHere("after hc.post(ffn)", xOut)
         return xOut.reshape([B, S, hcMult, dim])
     }
 }

@@ -1,0 +1,14 @@
+system: 16.00 GB unified (CPU + GPU share this pool)
+        9.63 GB effective budget for this process
+        10 cores · GPU rec. working-set 11.84 GB (same pool)
+checkpoint: 46 shards, 148.66 GB total, largest 3.35 GB
+oversubscription: 15.4× of effective budget
+strategy: streaming (forced by --load-strategy)
+[mem] columns: rss=process resident · vsz=virtual addr space · mtl=Metal driver allocated · sysFree=system pages free · wired=system pages wired · pressure=1-sysFree/physical
+[mem] watermarks: ⚠️ HIGH at 70% · 🔥 CRITICAL at 85%
+[alloc 1.97GB sharedSlot]
+[alloc 3.35GB rotatingSlot]
+[pool] sharedSlot 1.97 GB mlocked (2 shard(s))
+[pool] rotatingSlot capacity 3.35 GB (largest layer shard)
+[pool] layer=0 shard preaded 3.32 GB into rotatingSlot
+--dump-tensor failed: TensorDump does not yet support dtype fp8E4M3

@@ -90,7 +90,11 @@ public extension Transformer {
                           kvCache: kvCache)
 
             // ---- MoE FFN ----
-            let gateW = AssemblyHelpers.linear(in: dim, out: nExperts, rng: &rng)
+            // Gate logits stay in FP32 (see real-load path comment).
+            let gateWWeight = AssemblyHelpers.randomTensor([nExperts, dim], rng: &rng, scale: 0.02)
+            let gateW = Linear(inFeatures: dim, outFeatures: nExperts,
+                                weight: gateWWeight, scale: nil,
+                                castOutputToBF16: false)
             let gateBias: Tensor? = i < config.nHashLayers ? nil :
                 AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0)
             let gate = Gate(config: config, layerId: i,
@@ -110,6 +114,7 @@ public extension Transformer {
                 swigluLimit: config.swigluLimit
             )
             let moe = MoEFFN(config: config, gate: gate, experts: experts, shared: sharedExpert)
+            moe.layerId = i
 
             // ---- HC params ----
             let hcAttnFn = AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
@@ -287,8 +292,19 @@ public extension Transformer {
                           kvCache: kvCache)
 
             // ---- MoE FFN ----
+            // Gate logits MUST stay in FP32: model.py:566 spells out
+            //   scores = linear(x.float(), self.weight.float())
+            // i.e. the projection is run in FP32 explicitly. Quantising the
+            // logits to BF16 (~7 mantissa bits) before sqrt(softplus) + topk
+            // perturbs which experts get selected, and on V4-Flash that
+            // perturbation shows up as an 8.4× residual-stream cliff at the
+            // first SCORE-routed layer (= the first layer past
+            // `n_hash_layers`). Hash-routed layers are spared because their
+            // expert indices come from a precomputed token→expert table —
+            // only the weights are affected, not the routing.
             let gateW = try loadLinear(loader, base: "\(lp).ffn.gate",
-                                        inF: dim, outF: nExperts, rng: &rng)
+                                        inF: dim, outF: nExperts,
+                                        castOutputToBF16: false, rng: &rng)
             let gateBias: Tensor? = i < config.nHashLayers ? nil :
                 ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
                  ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
@@ -321,6 +337,7 @@ public extension Transformer {
                 swigluLimit: config.swigluLimit)
             let moe = MoEFFN(config: config, gate: gate,
                              experts: experts, shared: sharedExpert)
+            moe.layerId = i
 
             // ---- HC params ----
             let hcAttnFn = (try loader.tryLoad(["\(lp).hc_attn_fn"]))
@@ -374,8 +391,30 @@ public extension Transformer {
 
 internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
+                         castOutputToBF16: Bool = false,
                          rng: inout MiniRNG) throws -> Linear {
-    if let w = try loader.tryLoad(["\(base).weight"]) {
+    if var w = try loader.tryLoad(["\(base).weight"]) {
+        // V4-Flash-HF stores routed-expert FP4 weights as raw I8/U8
+        // bytes (each byte packs two E2M1 nibbles) because safetensors
+        // has no native FP4 dtype. Our `Linear.callAsFunction` switch
+        // on `.i8` dispatches the W8A16 INT8 kernel, which reads the
+        // bytes as signed [-128, 127] integers and multiplies by an
+        // F16 group scale — completely the wrong math, so expert
+        // outputs blow up to 1e25 and NaN the whole block.
+        //
+        // Reinterpret the tensor as FP4 with the LOGICAL shape (last
+        // dim doubled) when the name matches a routed expert. The
+        // converter's CLI already does the same reinterpretation
+        // (Sources/converter/main.swift:568) — this is just the
+        // inference-side equivalent so we can run the HF checkpoint
+        // directly without converting.
+        if base.contains(".experts.") && (w.dtype == .i8) {
+            let packedLast = w.shape.last ?? 0
+            let logicalShape = Array(w.shape.dropLast()) + [packedLast * 2]
+            w = Tensor(shape: logicalShape, dtype: .fp4E2M1,
+                       buffer: w.buffer, offset: w.offset)
+        }
+
         // Only quantized dtypes carry a `.scale` companion. Asking for
         // one on bf16/f32 paths adds noise to the missing-tensor report
         // and does nothing useful (Linear's switch ignores `scale` for
@@ -385,10 +424,14 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
                       || w.dtype == .i2
                       || w.dtype == .fp8E4M3
                       || w.dtype == .fp4E2M1
+        // Names: post-converter we use `<base>.scale`, but HF-native
+        // FP8/FP4 release stores it as `<base>.weight_scale_inv`. Try
+        // both so the same code path serves both directories.
         let scale: Tensor? = needsScale
-            ? try loader.tryLoad(["\(base).scale"])
+            ? try loader.tryLoad(["\(base).scale", "\(base).weight_scale_inv"])
             : nil
-        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale)
+        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale,
+                      castOutputToBF16: castOutputToBF16)
     }
     return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
 }
@@ -492,10 +535,16 @@ internal enum AssemblyHelpers {
         let coffHeadDim = coff * headDim
         let ape = (try loader.tryLoad(["\(base).ape"]))
             ?? randomTensor([ratio, coffHeadDim], rng: &rng, scale: 0.05)
+        // Compressor's wkv / wgate are FP32 in the reference (model.py:297-298
+        // — the comment notes BF16 storage but FP32 parameters at runtime).
+        // The forward at model.py:322-324 explicitly does `x = x.float()`
+        // before these Linears, so their outputs propagate in FP32.
         let wkv = try loadLinear(loader, base: "\(base).wkv",
-                                  inF: config.dim, outF: coffHeadDim, rng: &rng)
+                                  inF: config.dim, outF: coffHeadDim,
+                                  castOutputToBF16: false, rng: &rng)
         let wgate = try loadLinear(loader, base: "\(base).wgate",
-                                    inF: config.dim, outF: coffHeadDim, rng: &rng)
+                                    inF: config.dim, outF: coffHeadDim,
+                                    castOutputToBF16: false, rng: &rng)
         let norm = RMSNorm(
             weight: (try loader.tryLoad(["\(base).norm.weight"])) ?? onesTensor([headDim]),
             eps: config.normEps)

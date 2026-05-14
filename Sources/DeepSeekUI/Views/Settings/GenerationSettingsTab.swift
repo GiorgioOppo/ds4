@@ -4,7 +4,7 @@ import SwiftUI
 /// same @AppStorage keys ChatView reads, so changes take effect on
 /// the next Send (no restart).
 struct GenerationSettingsTab: View {
-    @AppStorage("deepseek.temperature") private var temperature: Double = 1.0
+    @AppStorage("deepseek.temperature") private var temperature: Double = 0.7
     @AppStorage("deepseek.topK")        private var topK: Int = 0
     @AppStorage("deepseek.topP")        private var topP: Double = 1.0
     @AppStorage("deepseek.repPenalty")  private var repPenalty: Double = 1.0
@@ -16,7 +16,13 @@ struct GenerationSettingsTab: View {
             Section("Sampling") {
                 LabeledContent("Temperature") {
                     HStack {
-                        Slider(value: $temperature, in: 0...2, step: 0.05)
+                        // Clamped to [0.5, 1.0]: temperature=0 makes V4-Flash
+                        // MoE fall into greedy-argmax fixed points (the model
+                        // loops on filler tokens like 好的好的好的…). Anything
+                        // above ~1 over-flattens the routing distribution
+                        // and produces gibberish in a different way. Values
+                        // around 0.7–0.9 give the most coherent samples.
+                        Slider(value: $temperature, in: 0.5...1.0, step: 0.05)
                         Text(String(format: "%.2f", temperature))
                             .frame(width: 48, alignment: .trailing)
                             .font(.system(.body, design: .monospaced))
@@ -64,5 +70,12 @@ struct GenerationSettingsTab: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            // One-shot migration: if the stored value pre-dates the
+            // 0.5–1.0 clamp (older builds used 0…2), pull it into the
+            // new range so the slider doesn't render off-track.
+            if temperature < 0.5 { temperature = 0.5 }
+            if temperature > 1.0 { temperature = 1.0 }
+        }
     }
 }

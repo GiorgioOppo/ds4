@@ -1,0 +1,11 @@
+max_seq_len: 1048576 → 409600 (--max-seq-len override)
+max_batch_size: 4 → 1 (--max-batch-size override)
+system: 16.00 GB unified (CPU + GPU share this pool)
+        9.26 GB effective budget for this process
+        10 cores · GPU rec. working-set 11.84 GB (same pool)
+checkpoint: 46 shards, 148.66 GB total, largest 3.35 GB
+oversubscription: 16.0× of effective budget
+strategy: streaming (auto: total is 16.0× effective budget (cap 10×) — streaming with per-layer madvise hints)
+Indexed 69187 tensors across 46 shard(s).
+model load failed: projected KV cache is 8.36 GB at max_position_embeddings=409600, max_batch_size=1, but only 7.10 GB of unified memory is available to this process. KV caches are dense MTLBuffers, not mmap'd file pages — streaming doesn't help and force-load won't either. Edit config.json:
+  jq '.max_position_embeddings = 4096 | .max_batch_size = 1'       <model-dir>/config.json > /tmp/c.json && mv /tmp/c.json <model-dir>/config.json

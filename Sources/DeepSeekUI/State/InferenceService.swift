@@ -8,6 +8,17 @@ enum GenerationEvent: Sendable {
     case token(String)
     case done(final: Message)
     case status(String)
+    /// Emitted right before the prefill forward pass starts. The UI uses
+    /// it to swap the bubble into a "prefilling" indicator (no text
+    /// streamed yet because no tokens have been sampled).
+    case prefillStart(promptTokens: Int)
+    /// Emitted once the prefill forward completes. `tokPerMin` is the
+    /// throughput of the prefill phase alone (prompt tokens / elapsed).
+    case prefillDone(promptTokens: Int, elapsed: TimeInterval, tokPerMin: Double)
+    /// Periodic + final throughput sample during the decode loop.
+    /// `tokPerMin` is the running rate; emit every ~0.5 s and once at
+    /// the end so the UI can show a live ticker.
+    case generationProgress(generated: Int, elapsed: TimeInterval, tokPerMin: Double)
 }
 
 /// Wraps `DeepSeekKit.Transformer` so the UI can drive it from
@@ -78,11 +89,29 @@ final class InferenceService: @unchecked Sendable {
                     // (Transformer.load will then call .inferred()
                     // and patch from the actual tensor shapes).
                     let configURL = url.appendingPathComponent("config.json")
-                    let cfg: ModelConfig
+                    var cfg: ModelConfig
                     if FileManager.default.fileExists(atPath: configURL.path) {
                         cfg = try ModelConfig.load(from: configURL)
                     } else {
                         cfg = ModelConfig()
+                    }
+
+                    // Apply user overrides from
+                    //   ~/Library/Application Support/<app>/config-overrides.json
+                    // (same file the ModelConfigSettingsTab writes to).
+                    // .inferred() will still patch architectural fields from
+                    // the checkpoint, so only the truly user-tunable fields
+                    // — maxBatchSize and maxSeqLen — actually need merging
+                    // here; the rest survive only if not contradicted by the
+                    // tensors on disk.
+                    if let overrideURL = try? PersistencePaths.conversationsDir()
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("config-overrides.json"),
+                       FileManager.default.fileExists(atPath: overrideURL.path),
+                       let data = try? Data(contentsOf: overrideURL),
+                       let ov = try? JSONDecoder().decode(ModelConfig.self, from: data) {
+                        cfg.maxBatchSize = ov.maxBatchSize
+                        cfg.maxSeqLen    = ov.maxSeqLen
                     }
 
                     let model = try Transformer.load(
@@ -143,31 +172,62 @@ final class InferenceService: @unchecked Sendable {
                         ]))
                     return
                 }
-                continuation.yield(.status(
-                    "Prompt: \(promptIds.count) tokens. Prefilling…"))
-
-                // 2. Prefill.
+                // 2. Prefill. Wrapped in prefillStart / prefillDone so
+                //    the UI can render a dedicated indicator while the
+                //    forward runs (no tokens are streamed yet — prefill
+                //    on a small-RAM Mac can take tens of seconds while
+                //    weights page through the streaming slot).
+                continuation.yield(.prefillStart(promptTokens: promptIds.count))
+                let prefillStart = Date()
                 var logits = model.forward(inputIds: [promptIds], startPos: 0)
+                let prefillElapsed = Date().timeIntervalSince(prefillStart)
+                let prefillTPM = prefillElapsed > 0
+                    ? Double(promptIds.count) / prefillElapsed * 60
+                    : 0
+                continuation.yield(.prefillDone(
+                    promptTokens: promptIds.count,
+                    elapsed: prefillElapsed,
+                    tokPerMin: prefillTPM))
 
                 var opts = options
-                let eos = tok.eosId ?? -1
+                // V4-Flash chat: stop on either `<｜end▁of▁sentence｜>`
+                // (eosId, end of conversation) or `<|EOT|>` (end of
+                // assistant turn). Checking only eosId lets EOT slip
+                // through and the model loops on filler tokens.
+                let stops = tok.stopTokenIds
 
-                // 3. Decode loop.
+                // 3. Decode loop. Emit a generationProgress event roughly
+                //    every 500 ms so the UI ticker updates without
+                //    flooding the actor mailbox.
                 var generated: [Int] = []
                 var generatedText = ""
-                let startTime = Date()
+                let decodeStart = Date()
+                var lastSample = decodeStart
                 for step in 0..<maxTokens {
                     if self.isCancelled() { break }
 
                     let nextId = Sampler.sample(logits,
                                                   history: generated,
                                                   options: &opts)
-                    if nextId == eos { break }
+                    if stops.contains(nextId) { break }
                     generated.append(nextId)
 
                     let piece = tok.decode([nextId])
                     generatedText += piece
                     continuation.yield(.token(piece))
+
+                    let now = Date()
+                    if now.timeIntervalSince(lastSample) >= 0.5 {
+                        let elapsedSoFar = now.timeIntervalSince(decodeStart)
+                        let tpm = elapsedSoFar > 0
+                            ? Double(generated.count) / elapsedSoFar * 60
+                            : 0
+                        continuation.yield(.generationProgress(
+                            generated: generated.count,
+                            elapsed: elapsedSoFar,
+                            tokPerMin: tpm))
+                        lastSample = now
+                    }
 
                     if step == maxTokens - 1 { break }
                     let startPos = promptIds.count + step
@@ -175,11 +235,14 @@ final class InferenceService: @unchecked Sendable {
                                             startPos: startPos)
                 }
 
-                let elapsed = Date().timeIntervalSince(startTime)
-                continuation.yield(.status(String(
-                    format: "Generated %d tokens in %.1fs (%.2f tok/s)",
-                    generated.count, elapsed,
-                    elapsed > 0 ? Double(generated.count) / elapsed : 0)))
+                let elapsed = Date().timeIntervalSince(decodeStart)
+                let genTPM = elapsed > 0
+                    ? Double(generated.count) / elapsed * 60
+                    : 0
+                continuation.yield(.generationProgress(
+                    generated: generated.count,
+                    elapsed: elapsed,
+                    tokPerMin: genTPM))
 
                 // 4. Finalize: re-parse through EncodingDSV4 so any
                 //    `<think>` block is split off into reasoningContent

@@ -45,6 +45,13 @@ public struct ModelConfig: Codable, Sendable {
     public var ropeFactor: Float = 40
     public var betaFast: Int = 32
     public var betaSlow: Int = 1
+    /// YaRN mscale factor. Combined with `ropeFactor > 1` produces the
+    /// attention-softmax rescaling `mscale = 0.1 * mscale * log(factor) + 1`
+    /// that compensates the entropy growth from extending the context
+    /// past the training length. Used as `softmax_scale *= mscale²`.
+    /// Default 1.0 matches the DeepSeek-V3 / V4 reference. Reads
+    /// `mscale` or `rope_scaling.mscale` from config.json.
+    public var mscale: Float = 1.0
 
     // Indexer
     public var indexNHeads: Int = 64
@@ -87,6 +94,7 @@ public struct ModelConfig: Codable, Sendable {
         case ropeFactor = "rope_factor"
         case betaFast = "beta_fast"
         case betaSlow = "beta_slow"
+        case mscale = "mscale"
         case indexNHeads = "index_n_heads"
         case indexHeadDim = "index_head_dim"
         case indexTopk = "index_topk"
@@ -135,6 +143,7 @@ public struct ModelConfig: Codable, Sendable {
         self.ropeFactor         = g(.ropeFactor, 40)
         self.betaFast           = g(.betaFast, 32)
         self.betaSlow           = g(.betaSlow, 1)
+        self.mscale             = g(.mscale, 1.0)
         self.indexNHeads        = g(.indexNHeads, 64)
         self.indexHeadDim       = g(.indexHeadDim, 128)
         self.indexTopk          = g(.indexTopk, 512)
@@ -241,6 +250,7 @@ public struct ModelConfig: Codable, Sendable {
         self.ropeFactor         = getFloat(["rope_factor", "rope_scaling.factor"], 40)
         self.betaFast           = getInt(["beta_fast", "rope_scaling.beta_fast"], 32)
         self.betaSlow           = getInt(["beta_slow", "rope_scaling.beta_slow"], 1)
+        self.mscale             = getFloat(["mscale", "rope_scaling.mscale"], 1.0)
         self.indexNHeads        = getInt(["index_n_heads"], 64)
         self.indexHeadDim       = getInt(["index_head_dim"], 128)
         self.indexTopk          = getInt(["index_topk"], 512)
@@ -390,5 +400,41 @@ public struct ModelConfig: Codable, Sendable {
                 + notes.joined(separator: "\n  ") + "\n").utf8))
         }
         return c
+    }
+
+    /// Multi-line human-readable dump of every config field. For
+    /// `--print-config` diagnostics: lets the caller diff the loaded
+    /// values against config.json field-by-field to catch keys that
+    /// silently fell back to the hard-coded defaults.
+    public var summary: String {
+        var s = ""
+        s += "ModelConfig {\n"
+        s += "  // shape\n"
+        s += "  vocabSize=\(vocabSize) dim=\(dim) maxSeqLen=\(maxSeqLen) maxBatchSize=\(maxBatchSize)\n"
+        s += "  nLayers=\(nLayers) nHashLayers=\(nHashLayers) nMtpLayers=\(nMtpLayers)\n"
+        s += "  nHeads=\(nHeads) headDim=\(headDim) ropeHeadDim=\(ropeHeadDim)\n"
+        s += "  qLoraRank=\(qLoraRank) oLoraRank=\(oLoraRank) oGroups=\(oGroups)\n"
+        s += "  windowSize=\(windowSize)\n"
+        s += "  // MoE\n"
+        s += "  nRoutedExperts=\(nRoutedExperts) nSharedExperts=\(nSharedExperts) nActivatedExperts=\(nActivatedExperts)\n"
+        s += "  moeInterDim=\(moeInterDim) routeScale=\(routeScale) scoreFunc=\"\(scoreFunc)\" swigluLimit=\(swigluLimit)\n"
+        s += "  // dtype + scale\n"
+        s += "  dtype=\"\(dtype)\" scaleDtype=\"\(scaleDtype)\" "
+        s += "expertDtype=\(expertDtype.map { "\"\($0)\"" } ?? "nil") "
+        s += "scaleFmt=\(scaleFmt.map { "\"\($0)\"" } ?? "nil")\n"
+        s += "  // RoPE / YaRN\n"
+        s += "  ropeTheta=\(ropeTheta) compressRopeTheta=\(compressRopeTheta)\n"
+        s += "  ropeFactor=\(ropeFactor) originalSeqLen=\(originalSeqLen)\n"
+        s += "  betaFast=\(betaFast) betaSlow=\(betaSlow) mscale=\(mscale)\n"
+        s += "  // per-layer compress_ratios (count=\(compressRatios.count))\n"
+        s += "  compressRatios=\(compressRatios)\n"
+        s += "  // norms\n"
+        s += "  normEps=\(normEps)\n"
+        s += "  // indexer\n"
+        s += "  indexNHeads=\(indexNHeads) indexHeadDim=\(indexHeadDim) indexTopk=\(indexTopk)\n"
+        s += "  // hyper-connections\n"
+        s += "  hcMult=\(hcMult) hcSinkhornIters=\(hcSinkhornIters) hcEps=\(hcEps)\n"
+        s += "}\n"
+        return s
     }
 }

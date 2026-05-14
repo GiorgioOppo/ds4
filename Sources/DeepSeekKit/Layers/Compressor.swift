@@ -409,10 +409,17 @@ public final class Compressor {
             Hadamard.apply(normed, in: cmd)
             _ = ActQuant(format: .fp4).quant(normed.reshape([tokens, headDim]),
                                               inplace: true, in: cmd)
+        } else {
+            // Non-rotate path (MLA's compressor). Mirrors model.py:372
+            //     act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+            // FP8 QAT round-trip on the nope dims of the compressed KV,
+            // block size 64. Companion to the same call inside MLA forward
+            // on the windowed KV.
+            ActQuant.partialInplaceQuant(
+                normed.reshape([tokens, headDim]),
+                colStart: 0, colEnd: nopeHeadDim,
+                blockSize: Quant.actBlockSizeFP8KVNope, in: cmd)
         }
-        // (Non-rotate FP8 act_quant on nope dims requires a slicing primitive
-        // and is handled in Tier 3 — skipping here is structurally correct
-        // but skips QAT noise.)
         return normed
     }
 

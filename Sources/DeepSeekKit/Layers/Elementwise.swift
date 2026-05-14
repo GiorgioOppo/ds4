@@ -6,8 +6,39 @@ public enum Elementwise {
     private static let axpyP = Device.shared.makePipeline("axpy_f32")
     private static let scaleP = Device.shared.makePipeline("scale_f32")
     private static let addP = Device.shared.makePipeline("add_inplace_f32")
+    private static let bf16RTP = Device.shared.makePipeline("bf16_round_trip_f32_inplace")
 
-    public static func siluMul(_ g: Tensor, _ u: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+    /// In-place F32 → BF16 → F32 round-trip on every element of `x`.
+    ///
+    /// Mirrors the reference's BF16 activation propagation: V4 is trained
+    /// with every sub-layer output cast to BF16 (`torch_dtype: bfloat16`),
+    /// so each block boundary loses ~16 bits of mantissa precision. Our
+    /// forward keeps full F32 through every layer, which is technically
+    /// more precise but takes the activations off the training
+    /// distribution; calling this at the end of each sub-layer (i.e.
+    /// after each `hc.post`) re-injects the missing noise without
+    /// touching the GEMM kernels themselves.
+    public static func bf16RoundTripInplace(_ x: Tensor,
+                                              in cmd: MTLCommandBuffer) {
+        precondition(x.dtype == .f32)
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(bf16RTP)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        var n = UInt32(x.count)
+        enc.setBytes(&n, length: 4, index: 1)
+        dispatch1D(enc, count: x.count)
+        enc.endEncoding()
+    }
+
+    /// SwiGLU body: `y = silu(gate) * up`. When `swigluLimit > 0`, applies
+    /// the V4-Flash clipping (`gate.clamp(max=limit)`, `up.clamp(±limit)`)
+    /// described in Reference/inference/model.py:600-603. Without this
+    /// clipping, activations in deep V4 models compound to ~5000× across
+    /// 43 layers and the final residual stream loses prompt-conditioned
+    /// signal.
+    public static func siluMul(_ g: Tensor, _ u: Tensor,
+                                 swigluLimit: Float = 0.0,
+                                 in cmd: MTLCommandBuffer) -> Tensor {
         precondition(g.shape == u.shape && g.dtype == .f32 && u.dtype == .f32)
         let y = Tensor.empty(shape: g.shape, dtype: .f32)
         let enc = cmd.makeComputeCommandEncoder()!
@@ -17,6 +48,8 @@ public enum Elementwise {
         enc.setBuffer(y.buffer, offset: 0, index: 2)
         var n = UInt32(g.count)
         enc.setBytes(&n, length: 4, index: 3)
+        var lim = swigluLimit
+        enc.setBytes(&lim, length: 4, index: 4)
         dispatch1D(enc, count: g.count)
         enc.endEncoding()
         return y
