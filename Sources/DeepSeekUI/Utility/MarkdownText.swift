@@ -20,7 +20,7 @@ struct MarkdownText: View {
                 case .prose(let text):
                     proseView(text)
                 case .code(let language, let body):
-                    ArtifactCodeBlock(language: language, body: body)
+                    ArtifactCodeBlock(language: language, source: body)
                 }
             }
         }
@@ -141,7 +141,7 @@ enum MarkdownSegmenter {
 /// can read the whole artifact without nested scrolling.
 struct ArtifactCodeBlock: View {
     let language: String
-    let body: String
+    let source: String
 
     @State private var copied: Bool = false
 
@@ -150,7 +150,7 @@ struct ArtifactCodeBlock: View {
             header
             Divider()
             ScrollView(.horizontal, showsIndicators: true) {
-                Text(body)
+                Text(source)
                     .font(.system(.callout, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(10)
@@ -194,7 +194,7 @@ struct ArtifactCodeBlock: View {
         #if canImport(AppKit)
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(body, forType: .string)
+        pb.setString(source, forType: .string)
         #endif
         copied = true
         // Reset the label after a beat so repeated copies still
