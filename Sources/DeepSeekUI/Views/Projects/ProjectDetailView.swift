@@ -97,6 +97,41 @@ struct ProjectDetailView: View {
         return "Re-scan every source and tokenize the discovered files"
     }
 
+    /// Placeholder rendered when a project has zero source paths.
+    /// Promotes the Add actions to large, obvious call-to-action
+    /// buttons so the user isn't left staring at a blank panel.
+    private var emptySourcesHint: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "folder.badge.questionmark")
+                .font(.system(size: 28))
+                .foregroundStyle(.tertiary)
+            Text("No sources yet")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button {
+                    addPath(directory: false)
+                } label: {
+                    Label("Add files…", systemImage: "doc.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                Button {
+                    addPath(directory: true)
+                } label: {
+                    Label("Add folder…", systemImage: "folder.badge.plus")
+                }
+                .controlSize(.regular)
+            }
+            Text("Pick code files or whole directories. The next index pass tokenizes every text file found under them.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+    }
+
     // MARK: - sources
 
     private var sources: some View {
@@ -109,18 +144,16 @@ struct ProjectDetailView: View {
                 } label: {
                     Label("Add file", systemImage: "doc.badge.plus")
                 }
-                .buttonStyle(.borderless)
+                .controlSize(.small)
                 Button {
                     addPath(directory: true)
                 } label: {
                     Label("Add folder", systemImage: "folder.badge.plus")
                 }
-                .buttonStyle(.borderless)
+                .controlSize(.small)
             }
             if project.sourcePaths.isEmpty {
-                Text("No sources yet — add files or folders to be tokenized on the next index run.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                emptySourcesHint
             } else {
                 List {
                     ForEach(project.sourcePaths, id: \.self) { path in

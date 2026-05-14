@@ -32,6 +32,25 @@ struct ProjectsView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
+            // Always-visible header with the "create" action. The
+            // previous revision had only a tiny `+` icon in the
+            // footer that was easy to miss — promoting it to a
+            // bordered button labelled "New project" makes the
+            // entry point obvious even on an empty library.
+            HStack {
+                Text("Projects").font(.headline)
+                Spacer()
+                Button {
+                    showCreate = true
+                } label: {
+                    Label("New project", systemImage: "plus")
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            Divider()
+
             List(selection: $selectedID) {
                 ForEach(library.projects) { p in
                     HStack {
@@ -53,18 +72,7 @@ struct ProjectsView: View {
                     }
                 }
             }
-            Divider()
-            HStack {
-                Button {
-                    showCreate = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("New project")
-                Spacer()
-            }
-            .padding(8)
+            .listStyle(.sidebar)
         }
     }
 
