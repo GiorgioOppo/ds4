@@ -6,7 +6,15 @@ import DeepSeekKit
 /// decoded), or a status note used for progress logging.
 enum GenerationEvent: Sendable {
     case token(String)
-    case done(final: Message)
+    /// Stream completed. `final` is the parsed assistant Message;
+    /// `promptTokens` is the full BPE prompt the model saw (prefix +
+    /// delta) and `generatedTokens` are every sampled id including
+    /// the trailing eos when present. Together they let `ChatStore`
+    /// append to `Conversation.encodedTokens` without re-tokenizing
+    /// anything.
+    case done(final: Message,
+               promptTokens: [Int32],
+               generatedTokens: [Int32])
     case status(String)
     /// Emitted right before the prefill forward pass starts. The UI uses
     /// it to swap the bubble into a "prefilling" indicator (no text
@@ -176,6 +184,50 @@ final class InferenceService: @unchecked Sendable {
     /// `Transformer`'s KV cache is reset between conversations via
     /// `releaseCache()` so two unrelated chats can share the same
     /// loaded weights without cross-talk.
+    /// Tokenize the full chat history through the V4 template. Used
+    /// by `ChatStore` on first turn (or after a mode change) to
+    /// produce the canonical `encodedTokens` baseline.
+    func tokenizeFullHistory(_ history: [Message],
+                              mode: ThinkingMode) async -> [Int32]? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<[Int32]?, Never>) in
+            q.async {
+                guard let tok = self._tokenizer else {
+                    cont.resume(returning: nil); return
+                }
+                let prompt = EncodingDSV4.encodeMessages(history, mode: mode)
+                let ids = tok.encode(prompt).map(Int32.init)
+                cont.resume(returning: ids)
+            }
+        }
+    }
+
+    /// Tokenize the *delta* needed to extend a cached prompt with one
+    /// more user turn: `<User>userContent<Assistant><think_marker>`.
+    /// Bos is intentionally absent here — it's already at the head of
+    /// the cached prefix. Returned tokens are appended verbatim to
+    /// `Conversation.encodedTokens` before the forward.
+    func tokenizeUserTurnDelta(_ userContent: String,
+                                mode: ThinkingMode) async -> [Int32]? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<[Int32]?, Never>) in
+            q.async {
+                guard let tok = self._tokenizer else {
+                    cont.resume(returning: nil); return
+                }
+                let thinkMarker = (mode == .chat)
+                    ? EncodingDSV4.thinkClose
+                    : EncodingDSV4.thinkOpen
+                let deltaText = EncodingDSV4.userToken
+                    + userContent
+                    + EncodingDSV4.assistantToken
+                    + thinkMarker
+                let ids = tok.encode(deltaText).map(Int32.init)
+                cont.resume(returning: ids)
+            }
+        }
+    }
+
     func generate(history: [Message],
                    mode: ThinkingMode,
                    options: SamplingOptions,
@@ -284,7 +336,117 @@ final class InferenceService: @unchecked Sendable {
                 //    and tool_calls into structured ToolCall objects.
                 let final = EncodingDSV4.parseCompletion(generatedText,
                                                            mode: mode)
-                continuation.yield(.done(final: final))
+                let promptOut = promptIds.map(Int32.init)
+                let generatedOut = generated.map(Int32.init)
+                continuation.yield(.done(final: final,
+                                          promptTokens: promptOut,
+                                          generatedTokens: generatedOut))
+                continuation.finish()
+            }
+        }
+    }
+
+    /// Fast-path variant: skip the chat-template encoding step and
+    /// feed a pre-tokenized prompt straight into prefill + decode.
+    /// Callers (currently `ChatStore`) compose `promptTokens` as
+    /// `Conversation.encodedTokens` + `tokenizeUserTurnDelta(...)`,
+    /// so the only BPE work per turn is on the *new* user content.
+    func generateFromPrompt(promptTokens: [Int32],
+                             mode: ThinkingMode,
+                             options: SamplingOptions,
+                             maxTokens: Int
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
+        return AsyncThrowingStream { continuation in
+            q.async { [weak self] in
+                guard let self else { continuation.finish(); return }
+                guard let model = self.transformer,
+                      let tok = self._tokenizer else {
+                    continuation.finish(throwing: NSError(
+                        domain: "InferenceService", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No model loaded yet — pick a folder first."
+                        ]))
+                    return
+                }
+                if promptTokens.isEmpty {
+                    continuation.finish(throwing: NSError(
+                        domain: "InferenceService", code: 2, userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Empty pre-tokenized prompt."
+                        ]))
+                    return
+                }
+                self.resetCancelFlag()
+                model.releaseCache()
+
+                // Prefill.
+                let promptIds = promptTokens.map(Int.init)
+                continuation.yield(.prefillStart(promptTokens: promptIds.count))
+                let prefillStart = Date()
+                var logits = model.forward(inputIds: [promptIds], startPos: 0)
+                let prefillElapsed = Date().timeIntervalSince(prefillStart)
+                let prefillTPM = prefillElapsed > 0
+                    ? Double(promptIds.count) / prefillElapsed * 60
+                    : 0
+                continuation.yield(.prefillDone(
+                    promptTokens: promptIds.count,
+                    elapsed: prefillElapsed,
+                    tokPerMin: prefillTPM))
+
+                var opts = options
+                let stops = tok.stopTokenIds
+
+                var generated: [Int] = []
+                var generatedText = ""
+                let decodeStart = Date()
+                var lastSample = decodeStart
+                for step in 0..<maxTokens {
+                    if self.isCancelled() { break }
+
+                    let nextId = Sampler.sample(logits,
+                                                  history: generated,
+                                                  options: &opts)
+                    if stops.contains(nextId) { break }
+                    generated.append(nextId)
+
+                    let piece = tok.decode([nextId])
+                    generatedText += piece
+                    continuation.yield(.token(piece))
+
+                    let now = Date()
+                    if now.timeIntervalSince(lastSample) >= 0.5 {
+                        let elapsedSoFar = now.timeIntervalSince(decodeStart)
+                        let tpm = elapsedSoFar > 0
+                            ? Double(generated.count) / elapsedSoFar * 60
+                            : 0
+                        continuation.yield(.generationProgress(
+                            generated: generated.count,
+                            elapsed: elapsedSoFar,
+                            tokPerMin: tpm))
+                        lastSample = now
+                    }
+
+                    if step == maxTokens - 1 { break }
+                    let startPos = promptIds.count + step
+                    logits = model.forward(inputIds: [[nextId]],
+                                            startPos: startPos)
+                }
+
+                let elapsed = Date().timeIntervalSince(decodeStart)
+                let genTPM = elapsed > 0
+                    ? Double(generated.count) / elapsed * 60
+                    : 0
+                continuation.yield(.generationProgress(
+                    generated: generated.count,
+                    elapsed: elapsed,
+                    tokPerMin: genTPM))
+
+                let final = EncodingDSV4.parseCompletion(generatedText,
+                                                           mode: mode)
+                let generatedOut = generated.map(Int32.init)
+                continuation.yield(.done(final: final,
+                                          promptTokens: promptTokens,
+                                          generatedTokens: generatedOut))
                 continuation.finish()
             }
         }

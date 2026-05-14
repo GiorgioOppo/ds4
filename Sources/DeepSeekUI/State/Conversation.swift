@@ -10,15 +10,24 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     var content: String
     var reasoningContent: String?
     var toolCalls: [StoredToolCall]
+    /// Number of model tokens this message contributes once rendered
+    /// through the chat template. Populated by the send / generate
+    /// path; nil for messages written before this field existed.
+    /// Purely informational (the UI shows it as "234 tok" in the
+    /// future); the canonical token stream lives in
+    /// `Conversation.encodedTokens`.
+    var tokenCount: Int?
 
     init(id: UUID = UUID(), role: StoredRole, content: String,
          reasoningContent: String? = nil,
-         toolCalls: [StoredToolCall] = []) {
+         toolCalls: [StoredToolCall] = [],
+         tokenCount: Int? = nil) {
         self.id = id
         self.role = role
         self.content = content
         self.reasoningContent = reasoningContent
         self.toolCalls = toolCalls
+        self.tokenCount = tokenCount
     }
 
     static func from(_ m: Message, id: UUID = UUID()) -> StoredMessage {
@@ -83,16 +92,35 @@ struct Conversation: Codable, Identifiable, Hashable {
     /// `.json` files (written before this field existed) as nil, so
     /// no migration is needed.
     var projectID: UUID?
+    /// Tokenized form of the entire conversation up to (and
+    /// including) the last assistant turn's eos. This is the
+    /// canonical chat history — text bodies in `messages` are a
+    /// view onto it. Letting the disk format carry the tokens means
+    /// the next turn only needs to BPE-encode the *delta* (new user
+    /// message + trailing assistant marker) instead of re-rendering
+    /// + re-tokenizing the whole transcript.
+    /// Nil until the first turn has run (or after invalidation —
+    /// see `lastEncodedMode`).
+    var encodedTokens: [Int32]?
+    /// The `ThinkingMode` raw value that produced `encodedTokens`.
+    /// The trailing assistant marker (and, for `.max`, the injected
+    /// system prefix) depend on mode, so a mid-conversation change
+    /// invalidates the cached prompt and forces a full re-encode.
+    var lastEncodedMode: String?
 
     init(id: UUID = UUID(),
          title: String = "New Chat",
          createdAt: Date = .now,
          modelDirPath: String,
          messages: [StoredMessage] = [],
-         projectID: UUID? = nil) {
+         projectID: UUID? = nil,
+         encodedTokens: [Int32]? = nil,
+         lastEncodedMode: String? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
         self.projectID = projectID
+        self.encodedTokens = encodedTokens
+        self.lastEncodedMode = lastEncodedMode
     }
 
     mutating func retitleIfNeeded() {

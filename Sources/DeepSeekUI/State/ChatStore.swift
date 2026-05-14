@@ -105,6 +105,16 @@ final class ChatStore: ObservableObject {
     // ----- streaming -----
 
     /// Send a user message to the currently-selected conversation.
+    ///
+    /// Fast path: when the conversation already carries an
+    /// `encodedTokens` cache produced under the same mode, we only
+    /// BPE-encode the new user turn (the "delta": `<User>text<Assistant>
+    /// <think_marker>`) and concatenate. The model's prefill therefore
+    /// re-runs over the full prompt — that part is unavoidable since
+    /// `releaseCache()` is called per turn — but the *tokenization*
+    /// of the history happens once and is reused turn after turn.
+    /// On mode change or first turn the prompt is rebuilt from
+    /// scratch via `tokenizeFullHistory`.
     func send(text: String,
                mode: ThinkingMode,
                options: SamplingOptions,
@@ -113,31 +123,50 @@ final class ChatStore: ObservableObject {
               let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // Either of these means "generation in flight" — don't accept
-        // another send.
         switch phase(of: id) {
         case .streaming, .prefilling: return
         default: break
         }
 
-        conversations[idx].messages.append(StoredMessage(role: .user, content: trimmed))
+        let modeRaw = mode.rawValue
+        let userMessage = StoredMessage(role: .user, content: trimmed)
+        conversations[idx].messages.append(userMessage)
         conversations[idx].retitleIfNeeded()
         phases[id] = .streaming(buffer: "", status: "Encoding prompt…",
                                  metrics: GenerationMetrics())
         scheduleSave(id)
 
-        let history = conversations[idx].messages.map { $0.asKitMessage() }
         let placeholderId = UUID()
         conversations[idx].messages.append(
             StoredMessage(id: placeholderId, role: .assistant, content: ""))
 
+        // Snapshot the bits we need off the main actor.
+        let cachedPrefix = conversations[idx].encodedTokens
+        let cachedMode   = conversations[idx].lastEncodedMode
+        let canReusePrefix = (cachedPrefix != nil && cachedMode == modeRaw)
+        let historyForFullEncode = conversations[idx].messages.map {
+            $0.asKitMessage()
+        }
+
         Task {
             do {
-                for try await event in service.generate(
-                    history: history, mode: mode,
-                    options: options, maxTokens: maxTokens)
+                let promptTokens = try await buildPromptTokens(
+                    canReusePrefix: canReusePrefix,
+                    cachedPrefix: cachedPrefix,
+                    userText: trimmed,
+                    mode: mode,
+                    fullHistory: historyForFullEncode)
+                for try await event in service.generateFromPrompt(
+                    promptTokens: promptTokens,
+                    mode: mode,
+                    options: options,
+                    maxTokens: maxTokens)
                 {
-                    apply(event: event, to: id, placeholderId: placeholderId)
+                    apply(event: event,
+                           to: id,
+                           placeholderId: placeholderId,
+                           userMessageId: userMessage.id,
+                           mode: modeRaw)
                 }
             } catch {
                 phases[id] = .error((error as? LocalizedError)?.errorDescription
@@ -147,13 +176,52 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Assemble the BPE prompt either by extending the cached prefix
+    /// with the new turn's delta, or — when the cache is missing /
+    /// stale — by re-encoding the whole history once.
+    private func buildPromptTokens(canReusePrefix: Bool,
+                                    cachedPrefix: [Int32]?,
+                                    userText: String,
+                                    mode: ThinkingMode,
+                                    fullHistory: [Message]) async throws
+    -> [Int32] {
+        if canReusePrefix, let prefix = cachedPrefix {
+            guard let delta = await service.tokenizeUserTurnDelta(
+                userText, mode: mode)
+            else {
+                throw NSError(domain: "ChatStore", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Tokenizer unavailable (no model loaded?)."
+                ])
+            }
+            return prefix + delta
+        }
+        // Cold path / mode changed: full re-encode of the entire
+        // conversation. Drops the last message (the just-appended
+        // empty assistant placeholder), then asks for the trailing
+        // assistant marker via mode.
+        let history = fullHistory.dropLast()  // remove the empty placeholder
+        guard let tokens = await service.tokenizeFullHistory(
+            Array(history), mode: mode)
+        else {
+            throw NSError(domain: "ChatStore", code: 11, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Tokenizer unavailable (no model loaded?)."
+            ])
+        }
+        return tokens
+    }
+
+
     func cancel() {
         service.cancelCurrent()
     }
 
     private func apply(event: GenerationEvent,
                         to id: UUID,
-                        placeholderId: UUID) {
+                        placeholderId: UUID,
+                        userMessageId: UUID,
+                        mode: String) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         switch event {
         case .token(let piece):
@@ -195,7 +263,9 @@ final class ChatStore: ObservableObject {
             phases[id] = .streaming(buffer: currentBuffer(of: id),
                                      status: "", metrics: m)
 
-        case .done(let final):
+        case .done(let final, let promptTokens, let generatedTokens):
+            // Finalize the assistant placeholder with the parsed
+            // structure (reasoning + tool calls split out).
             if let mIdx = conversations[idx].messages.firstIndex(
                 where: { $0.id == placeholderId }) {
                 conversations[idx].messages[mIdx] = StoredMessage(
@@ -203,8 +273,24 @@ final class ChatStore: ObservableObject {
                     role: .assistant,
                     content: final.content,
                     reasoningContent: final.reasoningContent,
-                    toolCalls: final.toolCalls.map(StoredToolCall.init))
+                    toolCalls: final.toolCalls.map(StoredToolCall.init),
+                    tokenCount: generatedTokens.count)
             }
+            // Stamp the user message with the share of the prompt it
+            // contributed. Approximation: prompt length minus the
+            // bytes already accounted for by previous messages.
+            if let uIdx = conversations[idx].messages.firstIndex(
+                where: { $0.id == userMessageId }) {
+                let prevPromptTokens = conversations[idx].encodedTokens?.count ?? 0
+                conversations[idx].messages[uIdx].tokenCount =
+                    max(promptTokens.count - prevPromptTokens, 0)
+            }
+            // Persist the canonical tokenized history: full prompt
+            // plus everything we just sampled. Next turn's send()
+            // will append a delta to this — no full re-encode.
+            conversations[idx].encodedTokens = promptTokens + generatedTokens
+            conversations[idx].lastEncodedMode = mode
+
             phases[id] = .idle
             scheduleSave(id)
         }
