@@ -6,7 +6,6 @@ import DeepSeekKit
 struct ChatView: View {
     @ObservedObject var store: ChatStore
     @State private var draft: String = ""
-    @State private var attachments: [DocumentAttachment] = []
 
     @AppStorage("deepseek.temperature")       private var temperature: Double = 0.7
     @AppStorage("deepseek.topK")              private var topK: Int = 0
@@ -81,7 +80,6 @@ struct ChatView: View {
             }
             Divider()
             ComposerView(draft: $draft,
-                          attachments: $attachments,
                           phase: phase,
                           onSend: sendCurrent, onStop: { store.cancel() })
         }
@@ -149,21 +147,19 @@ struct ChatView: View {
     private func sendCurrent() {
         // Bail out without clearing local state if a generation is
         // already running (the TextField's onSubmit still fires while
-        // the Send button is hidden), or if the composed payload would
-        // be empty anyway — losing a half-typed message + attachments
-        // because Return fired at the wrong moment would be obnoxious.
+        // the Send button is hidden), or if the draft is empty —
+        // losing a half-typed message because Return fired at the
+        // wrong moment would be obnoxious.
         if let id = store.selectedID {
             switch store.phase(of: id) {
             case .streaming, .prefilling: return
             default: break
             }
         }
-        let prefix = AttachmentFormatter.prefix(for: attachments)
-        let composed = prefix + draft
-        guard !composed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return }
+        let text = draft
         draft = ""
-        attachments = []
         // Clamp temperature into the supported [0.5, 1.0] range in case
         // an older @AppStorage value (default used to be 1.0, slider
         // used to span 0…2) is still on disk for a user who never
@@ -176,7 +172,7 @@ struct ChatView: View {
         let mode: ThinkingMode = (modeRaw == "max")  ? .max
                                 : (modeRaw == "high") ? .high
                                 : .chat
-        store.send(text: composed, mode: mode,
+        store.send(text: text, mode: mode,
                     options: opts, maxTokens: maxTokens)
     }
 }

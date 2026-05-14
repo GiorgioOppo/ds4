@@ -35,4 +35,38 @@ enum PersistencePaths {
         try conversationsDir()
             .appendingPathComponent("\(id.uuidString).kvcache")
     }
+
+    /// Root for the global "vectorized documents" library — the
+    /// per-document files (.tokens / .vec) plus an index.json that
+    /// `DocumentLibrary` reads at app launch.
+    static func documentsDir() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+            .appendingPathComponent("documents", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// Index file: a JSON array of `VectorizedDocument` entries.
+    static func documentsIndexURL() throws -> URL {
+        try documentsDir().appendingPathComponent("index.json")
+    }
+
+    /// Raw token-id payload for a vectorized document (int32 little-endian,
+    /// one per token). Written by Step 1's import flow.
+    static func documentTokensURL(id: UUID) throws -> URL {
+        try documentsDir().appendingPathComponent("\(id.uuidString).tokens")
+    }
+
+    /// Pre-computed KV cache for a vectorized document. Created by
+    /// Step 3's import pipeline; absent until then.
+    static func documentVecURL(id: UUID) throws -> URL {
+        try documentsDir().appendingPathComponent("\(id.uuidString).vec")
+    }
 }

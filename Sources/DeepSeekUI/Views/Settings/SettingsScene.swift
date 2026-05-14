@@ -1,9 +1,13 @@
 import SwiftUI
 import DeepSeekKit
 
-/// macOS Settings scene (cmd+,). Four tabs covering generation,
-/// loading, the entire ModelConfig surface, and storage.
+/// macOS Settings scene (cmd+,). Five tabs covering generation,
+/// loading, the entire ModelConfig surface, the global documents
+/// library, and storage.
 struct SettingsScene: Scene {
+    @ObservedObject var library: DocumentLibrary
+    let service: InferenceService
+
     var body: some Scene {
         Settings {
             TabView {
@@ -13,6 +17,8 @@ struct SettingsScene: Scene {
                     .tabItem { Label("Loading", systemImage: "tray.and.arrow.down") }
                 ModelConfigSettingsTab()
                     .tabItem { Label("Model Config", systemImage: "gearshape.2") }
+                DocumentsView(library: library, service: service)
+                    .tabItem { Label("Documents", systemImage: "doc.text") }
                 StorageSettingsTab()
                     .tabItem { Label("Storage", systemImage: "externaldrive") }
             }

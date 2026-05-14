@@ -29,9 +29,44 @@ enum GenerationEvent: Sendable {
 /// `q`, and the `async` entry points bridge to it.
 final class InferenceService: @unchecked Sendable {
     private var transformer: Transformer?
-    private var tokenizer: Tokenizer?
+    private var _tokenizer: Tokenizer?
     private(set) var loadedConfig: ModelConfig?
     private(set) var loadedModelDir: URL?
+
+    /// Snapshot of the active tokenizer for read-only use outside the
+    /// generation path (e.g. the document import flow). Reads the
+    /// stored reference on the serial queue so it never races a load.
+    /// Returns nil until a model has been loaded.
+    func currentTokenizer() -> Tokenizer? {
+        q.sync { _tokenizer }
+    }
+
+    /// Snapshot of the active model directory. The document library
+    /// uses it as a fingerprint to detect "different model selected
+    /// since import time".
+    func currentModelDir() -> URL? {
+        q.sync { loadedModelDir }
+    }
+
+    /// Encode `text` into Int32 token ids on the inference serial
+    /// queue. Returns nil when no model has been loaded yet (and
+    /// therefore no tokenizer is available). Used by the document
+    /// import flow so BPE encoding doesn't block the main actor and
+    /// doesn't have to pass a non-Sendable tokenizer across an
+    /// `await`.
+    func tokenize(_ text: String) async -> [Int32]? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<[Int32]?, Never>) in
+            q.async {
+                guard let tok = self._tokenizer else {
+                    cont.resume(returning: nil)
+                    return
+                }
+                let ids = tok.encode(text).map(Int32.init)
+                cont.resume(returning: ids)
+            }
+        }
+    }
 
     private let q = DispatchQueue(label: "deepseek.inference", qos: .userInitiated)
 
@@ -120,7 +155,7 @@ final class InferenceService: @unchecked Sendable {
                         forceLoad: forceLoad)
 
                     self.transformer = model
-                    self.tokenizer = tok
+                    self._tokenizer = tok
                     self.loadedConfig = cfg
                     self.loadedModelDir = url
                     cont.resume(returning: cfg)
@@ -150,7 +185,7 @@ final class InferenceService: @unchecked Sendable {
             q.async { [weak self] in
                 guard let self else { continuation.finish(); return }
                 guard let model = self.transformer,
-                      let tok = self.tokenizer else {
+                      let tok = self._tokenizer else {
                     continuation.finish(throwing: NSError(
                         domain: "InferenceService", code: 1, userInfo: [
                             NSLocalizedDescriptionKey:

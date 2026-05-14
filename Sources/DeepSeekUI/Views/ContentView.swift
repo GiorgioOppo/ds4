@@ -7,12 +7,11 @@ enum AppPhase {
     case ready(URL, ModelConfig)
 }
 
-/// Top-level view. Owns the `InferenceService` (one per app launch)
-/// and routes between picker → loading → ready (chat happy-path lands
-/// in commit 3, for now ready is a placeholder).
+/// Top-level view. Receives the shared `InferenceService` from the
+/// App scene and routes between picker → loading → ready.
 struct ContentView: View {
+    let service: InferenceService
     @State private var phase: AppPhase = .picking
-    private let service = InferenceService()
 
     var body: some View {
         Group {
