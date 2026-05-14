@@ -22,7 +22,17 @@ struct GenerationSettingsTab: View {
                         // above ~1 over-flattens the routing distribution
                         // and produces gibberish in a different way. Values
                         // around 0.7–0.9 give the most coherent samples.
-                        Slider(value: $temperature, in: 0.5...1.0, step: 0.05)
+                        Slider(value: $temperature,
+                                in: 0.5...1.0,
+                                step: 0.05) {
+                            EmptyView()
+                        } minimumValueLabel: {
+                            Text("0.5").font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                        } maximumValueLabel: {
+                            Text("1.0").font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                        }
                         Text(String(format: "%.2f", temperature))
                             .frame(width: 48, alignment: .trailing)
                             .font(.system(.body, design: .monospaced))
