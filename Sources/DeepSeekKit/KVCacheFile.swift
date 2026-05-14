@@ -78,16 +78,18 @@ public final class KVCacheFile {
         // 2) Map the whole file. PROT_READ|WRITE + MAP_SHARED so writes
         //    persist; MADV_RANDOM tells the kernel not to prefetch — the
         //    attention kernel reads scattered rows.
-        //    mmap on failure returns MAP_FAILED ((void *)-1), a non-nil
-        //    sentinel — check against the bit pattern explicitly so we
-        //    don't depend on whether Swift surfaced MAP_FAILED as a
-        //    named constant in this SDK.
+        //    Depending on the SDK, mmap is imported as either an IUO or
+        //    a plain Optional pointer; MAP_FAILED ((void *)-1) is the
+        //    error sentinel either way. Compare against the bit pattern
+        //    so we don't depend on the symbol being surfaced as a
+        //    named constant, and unwrap with `guard let` to satisfy the
+        //    Optional import.
         let mapFailed = UnsafeMutableRawPointer(bitPattern: -1)
-        let raw = mmap(nil, total,
-                        PROT_READ | PROT_WRITE,
-                        MAP_SHARED, fd, 0)
+        let rawOpt = mmap(nil, total,
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0)
         close(fd)  // the mapping holds its own reference
-        if raw == nil || raw == mapFailed {
+        guard let raw = rawOpt, raw != mapFailed else {
             throw KVCacheFileError.mmapFailed(errno: errno, path: url.path)
         }
         madvise(raw, total, MADV_RANDOM)
