@@ -6,10 +6,13 @@ struct ConversationListView: View {
     @ObservedObject var store: ChatStore
 
     var body: some View {
-        List(selection: Binding(
-            get: { store.selectedID },
-            set: { store.selectedID = $0 }
-        )) {
+        // Bind directly to the @Published projected value rather than
+        // a custom Binding(get:set:). A get/set binding's setter is
+        // sometimes invoked during a view update — that write into
+        // `store.selectedID` (a @Published) triggers a publish, which
+        // SwiftUI flags as "Publishing changes from within view
+        // updates is not allowed, this will cause undefined behavior."
+        List(selection: $store.selectedID) {
             ForEach(store.conversations) { c in
                 row(c)
                     .tag(c.id)
