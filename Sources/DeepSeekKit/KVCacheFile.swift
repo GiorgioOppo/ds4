@@ -79,31 +79,27 @@ public final class KVCacheFile {
         //    persist; MADV_RANDOM tells the kernel not to prefetch — the
         //    attention kernel reads scattered rows.
         //
-        //    mmap is imported as `UnsafeMutableRawPointer?` in this SDK
-        //    and MAP_FAILED ((void *)-1) is the error sentinel. We
-        //    validate in two strict, sequential steps and bind the
-        //    result to an explicitly-typed non-optional local — earlier
-        //    attempts to combine "not nil" and "not MAP_FAILED" in one
-        //    guard had Swift's type checker promote the unwrapped value
-        //    back to Optional at the use sites.
-        let mmapResult = mmap(nil, total,
-                               PROT_READ | PROT_WRITE,
-                               MAP_SHARED, fd, 0)
+        //    Bridge through `Int` so no `UnsafeMutableRawPointer?` ever
+        //    appears in this block — every prior attempt to unwrap the
+        //    mmap result inside a `guard let` had the type checker
+        //    re-widen the binding back to Optional at the use sites.
+        //
+        //      Int(bitPattern: pointer?)  →  Int   (nil maps to 0)
+        //      0  → mmap returned NULL
+        //      -1 → mmap returned MAP_FAILED ((void *)-1)
+        //      _  → valid mapping; rebuild a non-optional pointer.
+        let addr = Int(bitPattern: mmap(nil, total,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_SHARED, fd, 0))
         close(fd)  // the mapping holds its own reference
-        // Step 2a: explicit null fallback.
-        guard let nonNull = mmapResult else {
+        if addr == 0 || addr == -1 {
             throw KVCacheFileError.mmapFailed(errno: errno, path: url.path)
         }
-        // Step 2b: explicit MAP_FAILED fallback (bit-pattern compare;
-        // -1 is the universal "((void *)-1)" sentinel and doesn't need
-        // a named constant from the SDK).
-        if Int(bitPattern: nonNull) == -1 {
-            throw KVCacheFileError.mmapFailed(errno: errno, path: url.path)
-        }
-        // Step 2c: hand off to a strictly-typed non-optional local that
-        // everything below uses. The annotation locks the type so the
-        // compiler can't widen it back to Optional in any branch.
-        let raw: UnsafeMutableRawPointer = nonNull
+        // `UnsafeMutableRawPointer(bitPattern:)` is failable only for 0,
+        // which we just rejected — force-unwrap is safe and produces a
+        // strictly non-optional binding the rest of the function uses.
+        let raw: UnsafeMutableRawPointer =
+            UnsafeMutableRawPointer(bitPattern: addr)!
         madvise(raw, total, MADV_RANDOM)
 
         // 3) Wrap as a Metal buffer. Use the full mapping so payload
