@@ -156,8 +156,9 @@ final class ChatStore: ObservableObject {
                     userText: trimmed,
                     mode: mode,
                     fullHistory: historyForFullEncode)
-                for try await event in service.generateFromPrompt(
+                for try await event in service.generateForConversation(
                     promptTokens: promptTokens,
+                    conversationID: id,
                     mode: mode,
                     options: options,
                     maxTokens: maxTokens)

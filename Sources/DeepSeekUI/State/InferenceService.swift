@@ -41,6 +41,21 @@ final class InferenceService: @unchecked Sendable {
     private(set) var loadedConfig: ModelConfig?
     private(set) var loadedModelDir: URL?
 
+    /// Live mirror of what's currently sitting in the model's KV
+    /// cache. When the next `generateForConversation` call hands us a
+    /// `promptTokens` that begins with `tokens` and runs against the
+    /// same `conversationID` / `mode`, we can skip `releaseCache()`
+    /// and prefill *only* the trailing delta — turning the per-turn
+    /// O(history) BPE+forward into O(|new user turn|) forwards.
+    /// Reset whenever we have to call `releaseCache()` (different
+    /// conversation, mode change, or model unload).
+    private struct CacheImage {
+        let conversationID: UUID
+        var tokens: [Int32]
+        var mode: ThinkingMode
+    }
+    private var cacheImage: CacheImage?
+
     /// Snapshot of the active tokenizer for read-only use outside the
     /// generation path (e.g. the document import flow). Reads the
     /// stored reference on the serial queue so it never races a load.
@@ -166,6 +181,10 @@ final class InferenceService: @unchecked Sendable {
                     self._tokenizer = tok
                     self.loadedConfig = cfg
                     self.loadedModelDir = url
+                    // A model swap renders every cached KV state
+                    // invalid (different weight tensors → different
+                    // attention outputs).
+                    self.cacheImage = nil
                     cont.resume(returning: cfg)
                 } catch {
                     cont.resume(throwing: error)
@@ -203,10 +222,21 @@ final class InferenceService: @unchecked Sendable {
     }
 
     /// Tokenize the *delta* needed to extend a cached prompt with one
-    /// more user turn: `<User>userContent<Assistant><think_marker>`.
-    /// Bos is intentionally absent here — it's already at the head of
-    /// the cached prefix. Returned tokens are appended verbatim to
-    /// `Conversation.encodedTokens` before the forward.
+    /// more user turn:
+    ///   `<eos><User>userContent<Assistant><think_marker>`
+    ///
+    /// Why `<eos>` is in front: the decode loop breaks the moment a
+    /// stop token (eos / EOT) is sampled, *before* feeding it back
+    /// into the model. So neither `Conversation.encodedTokens` nor
+    /// the live GPU KV cache contains the eos that closes the
+    /// previous assistant turn. The delta supplies it so the chat
+    /// template is well-formed when re-tokenizing this turn alone.
+    ///
+    /// `BPETokenizer.encode` pre-splits on special tokens before BPE
+    /// merging, so `<eos>` will always emit as a single id regardless
+    /// of what precedes/follows it — the concatenation of the
+    /// previously-cached prefix and this delta is bit-identical to
+    /// what `tokenizeFullHistory` would produce.
     func tokenizeUserTurnDelta(_ userContent: String,
                                 mode: ThinkingMode) async -> [Int32]? {
         await withCheckedContinuation {
@@ -218,7 +248,8 @@ final class InferenceService: @unchecked Sendable {
                 let thinkMarker = (mode == .chat)
                     ? EncodingDSV4.thinkClose
                     : EncodingDSV4.thinkOpen
-                let deltaText = EncodingDSV4.userToken
+                let deltaText = EncodingDSV4.eosToken
+                    + EncodingDSV4.userToken
                     + userContent
                     + EncodingDSV4.assistantToken
                     + thinkMarker
@@ -444,6 +475,191 @@ final class InferenceService: @unchecked Sendable {
                 let final = EncodingDSV4.parseCompletion(generatedText,
                                                            mode: mode)
                 let generatedOut = generated.map(Int32.init)
+                continuation.yield(.done(final: final,
+                                          promptTokens: promptTokens,
+                                          generatedTokens: generatedOut))
+                continuation.finish()
+            }
+        }
+    }
+
+    /// Same as `generateFromPrompt`, but reuses the model's KV cache
+    /// across consecutive turns of the same `conversationID`. When the
+    /// previous turn's tokens are a prefix of the new `promptTokens`
+    /// (and the mode hasn't changed), we skip `releaseCache()` and
+    /// prefill only the *delta*. Mismatch falls back to a full reset
+    /// + multi-token prefill.
+    ///
+    /// Multi-token prefill from `startPos > 0` is blocked by the
+    /// `precondition(S == 1)` in `MLA.callAsFunction`'s decode branch,
+    /// so the incremental prefill runs the delta token-by-token (the
+    /// same path the decode loop already uses). For a typical
+    /// `<eos><User>…<Assistant><think>` delta of ~10-50 tokens this
+    /// is a small fixed cost compared to re-prefilling the full
+    /// transcript every turn.
+    func generateForConversation(promptTokens: [Int32],
+                                  conversationID: UUID,
+                                  mode: ThinkingMode,
+                                  options: SamplingOptions,
+                                  maxTokens: Int
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
+        return AsyncThrowingStream { continuation in
+            q.async { [weak self] in
+                guard let self else { continuation.finish(); return }
+                guard let model = self.transformer,
+                      let tok = self._tokenizer else {
+                    continuation.finish(throwing: NSError(
+                        domain: "InferenceService", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No model loaded yet — pick a folder first."
+                        ]))
+                    return
+                }
+                if promptTokens.isEmpty {
+                    continuation.finish(throwing: NSError(
+                        domain: "InferenceService", code: 2, userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Empty pre-tokenized prompt."
+                        ]))
+                    return
+                }
+                self.resetCancelFlag()
+
+                // Decide reuse vs. full reset. The match is strict:
+                // same conversation + same mode + cached tokens are a
+                // strict prefix of the new prompt. Anything else (a
+                // shorter new prompt = user edited backwards, a
+                // diverging prefix = template changed) goes through
+                // releaseCache() to be safe.
+                let canReuse: Bool
+                let cachedCount: Int
+                if let img = self.cacheImage,
+                   img.conversationID == conversationID,
+                   img.mode == mode,
+                   img.tokens.count > 0,
+                   img.tokens.count < promptTokens.count,
+                   img.tokens[...] == promptTokens.prefix(img.tokens.count)
+                {
+                    canReuse = true
+                    cachedCount = img.tokens.count
+                } else {
+                    canReuse = false
+                    cachedCount = 0
+                    model.releaseCache()
+                    self.cacheImage = nil
+                }
+
+                let deltaTokens = Array(promptTokens.suffix(
+                    promptTokens.count - cachedCount))
+                continuation.yield(.prefillStart(promptTokens: deltaTokens.count))
+                let prefillStart = Date()
+
+                var logits: Tensor
+                if canReuse {
+                    // Incremental prefill: feed the delta one token at
+                    // a time. Same kernel path the decode loop uses,
+                    // so we don't need any new attention codepath.
+                    // Final logits come from the *last* delta token —
+                    // that's the position the sampler reads from to
+                    // produce the assistant's first new token.
+                    var lastLogits: Tensor? = nil
+                    for (i, t) in deltaTokens.enumerated() {
+                        if self.isCancelled() { break }
+                        lastLogits = model.forward(
+                            inputIds: [[Int(t)]],
+                            startPos: cachedCount + i)
+                    }
+                    guard let ll = lastLogits else {
+                        continuation.finish(throwing: NSError(
+                            domain: "InferenceService", code: 3, userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Cancelled before prefill could produce logits."
+                            ]))
+                        return
+                    }
+                    logits = ll
+                } else {
+                    // Cold path: full multi-token prefill from startPos 0.
+                    let ids = deltaTokens.map(Int.init)
+                    logits = model.forward(inputIds: [ids], startPos: 0)
+                }
+
+                let prefillElapsed = Date().timeIntervalSince(prefillStart)
+                let prefillTPM = prefillElapsed > 0
+                    ? Double(deltaTokens.count) / prefillElapsed * 60
+                    : 0
+                continuation.yield(.prefillDone(
+                    promptTokens: deltaTokens.count,
+                    elapsed: prefillElapsed,
+                    tokPerMin: prefillTPM))
+
+                var opts = options
+                let stops = tok.stopTokenIds
+
+                var generated: [Int] = []
+                var generatedText = ""
+                let decodeStart = Date()
+                var lastSample = decodeStart
+                // The decode loop continues from where prefill stopped.
+                // startPos for the *first* sampled token's forward is
+                // promptTokens.count (the cache holds 0..<promptTokens.count
+                // after the prefill step above, regardless of which path
+                // we took).
+                for step in 0..<maxTokens {
+                    if self.isCancelled() { break }
+
+                    let nextId = Sampler.sample(logits,
+                                                  history: generated,
+                                                  options: &opts)
+                    if stops.contains(nextId) { break }
+                    generated.append(nextId)
+
+                    let piece = tok.decode([nextId])
+                    generatedText += piece
+                    continuation.yield(.token(piece))
+
+                    let now = Date()
+                    if now.timeIntervalSince(lastSample) >= 0.5 {
+                        let elapsedSoFar = now.timeIntervalSince(decodeStart)
+                        let tpm = elapsedSoFar > 0
+                            ? Double(generated.count) / elapsedSoFar * 60
+                            : 0
+                        continuation.yield(.generationProgress(
+                            generated: generated.count,
+                            elapsed: elapsedSoFar,
+                            tokPerMin: tpm))
+                        lastSample = now
+                    }
+
+                    if step == maxTokens - 1 { break }
+                    let startPos = promptTokens.count + step
+                    logits = model.forward(inputIds: [[nextId]],
+                                            startPos: startPos)
+                }
+
+                let elapsed = Date().timeIntervalSince(decodeStart)
+                let genTPM = elapsed > 0
+                    ? Double(generated.count) / elapsed * 60
+                    : 0
+                continuation.yield(.generationProgress(
+                    generated: generated.count,
+                    elapsed: elapsed,
+                    tokPerMin: genTPM))
+
+                let final = EncodingDSV4.parseCompletion(generatedText,
+                                                           mode: mode)
+                let generatedOut = generated.map(Int32.init)
+
+                // Stamp the image so the next turn of this same
+                // conversation can extend us. Skipping this on
+                // cancellation would also work, but the cache may
+                // still be coherent up to `promptTokens.count`, so we
+                // keep it — at worst the next turn re-prefills.
+                self.cacheImage = CacheImage(
+                    conversationID: conversationID,
+                    tokens: promptTokens + generatedOut,
+                    mode: mode)
+
                 continuation.yield(.done(final: final,
                                           promptTokens: promptTokens,
                                           generatedTokens: generatedOut))
