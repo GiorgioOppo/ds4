@@ -2,9 +2,25 @@ import Foundation
 import SwiftUI
 import DeepSeekKit
 
+/// Throughput readings the UI shows alongside the streamed text. Both
+/// fields stay at 0 until the corresponding phase produces a sample.
+struct GenerationMetrics: Equatable {
+    var promptTokens: Int = 0
+    var prefillElapsed: TimeInterval = 0
+    var prefillTokPerMin: Double = 0
+    var generatedTokens: Int = 0
+    var generationElapsed: TimeInterval = 0
+    var generationTokPerMin: Double = 0
+}
+
 enum GenerationPhase: Equatable {
     case idle
-    case streaming(buffer: String, status: String)
+    /// The prefill forward is running. `promptTokens` is fixed, `startTime`
+    /// lets the UI animate elapsed seconds while waiting (prefill is a
+    /// single synchronous forward that doesn't stream intermediate
+    /// progress, so live elapsed is the most useful liveness signal).
+    case prefilling(promptTokens: Int, startTime: Date)
+    case streaming(buffer: String, status: String, metrics: GenerationMetrics)
     case error(String)
 }
 
@@ -80,11 +96,17 @@ final class ChatStore: ObservableObject {
               let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if case .streaming = phase(of: id) { return }
+        // Either of these means "generation in flight" — don't accept
+        // another send.
+        switch phase(of: id) {
+        case .streaming, .prefilling: return
+        default: break
+        }
 
         conversations[idx].messages.append(StoredMessage(role: .user, content: trimmed))
         conversations[idx].retitleIfNeeded()
-        phases[id] = .streaming(buffer: "", status: "Encoding prompt…")
+        phases[id] = .streaming(buffer: "", status: "Encoding prompt…",
+                                 metrics: GenerationMetrics())
         scheduleSave(id)
 
         let history = conversations[idx].messages.map { $0.asKitMessage() }
@@ -118,18 +140,43 @@ final class ChatStore: ObservableObject {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         switch event {
         case .token(let piece):
-            guard case .streaming(let buffer, _) = phase(of: id) else { return }
+            // Once tokens start flowing we leave `.prefilling` if we
+            // were still in it (e.g. very small prompts where
+            // prefillDone arrived after the first token sample). Carry
+            // the metrics forward.
+            let m = currentMetrics(of: id)
+            let buffer = currentBuffer(of: id)
             let newBuffer = buffer + piece
-            phases[id] = .streaming(buffer: newBuffer, status: "")
+            phases[id] = .streaming(buffer: newBuffer, status: "", metrics: m)
             if let mIdx = conversations[idx].messages.firstIndex(
                 where: { $0.id == placeholderId }) {
                 conversations[idx].messages[mIdx].content = newBuffer
             }
 
         case .status(let s):
-            if case .streaming(let buffer, _) = phase(of: id) {
-                phases[id] = .streaming(buffer: buffer, status: s)
-            }
+            let m = currentMetrics(of: id)
+            let buffer = currentBuffer(of: id)
+            phases[id] = .streaming(buffer: buffer, status: s, metrics: m)
+
+        case .prefillStart(let promptTokens):
+            phases[id] = .prefilling(promptTokens: promptTokens,
+                                      startTime: Date())
+
+        case .prefillDone(let promptTokens, let elapsed, let tokPerMin):
+            var m = currentMetrics(of: id)
+            m.promptTokens = promptTokens
+            m.prefillElapsed = elapsed
+            m.prefillTokPerMin = tokPerMin
+            phases[id] = .streaming(buffer: currentBuffer(of: id),
+                                     status: "", metrics: m)
+
+        case .generationProgress(let generated, let elapsed, let tokPerMin):
+            var m = currentMetrics(of: id)
+            m.generatedTokens = generated
+            m.generationElapsed = elapsed
+            m.generationTokPerMin = tokPerMin
+            phases[id] = .streaming(buffer: currentBuffer(of: id),
+                                     status: "", metrics: m)
 
         case .done(let final):
             if let mIdx = conversations[idx].messages.firstIndex(
@@ -144,6 +191,16 @@ final class ChatStore: ObservableObject {
             phases[id] = .idle
             scheduleSave(id)
         }
+    }
+
+    private func currentMetrics(of id: UUID) -> GenerationMetrics {
+        if case .streaming(_, _, let m) = phase(of: id) { return m }
+        return GenerationMetrics()
+    }
+
+    private func currentBuffer(of id: UUID) -> String {
+        if case .streaming(let b, _, _) = phase(of: id) { return b }
+        return ""
     }
 
     // ----- persistence -----

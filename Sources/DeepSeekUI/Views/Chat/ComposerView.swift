@@ -18,7 +18,7 @@ struct ComposerView: View {
                 .onSubmit(onSend)
 
             switch phase {
-            case .streaming:
+            case .streaming, .prefilling:
                 Button(action: onStop) {
                     Label("Stop", systemImage: "stop.fill")
                 }
