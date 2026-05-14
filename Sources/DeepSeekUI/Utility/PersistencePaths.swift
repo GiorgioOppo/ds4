@@ -69,4 +69,26 @@ enum PersistencePaths {
     static func documentVecURL(id: UUID) throws -> URL {
         try documentsDir().appendingPathComponent("\(id.uuidString).vec")
     }
+
+    /// Root for the projects library. One JSON index next to it lists
+    /// every project; the per-project token files reuse
+    /// `documentTokensURL(id:)` since project documents live in the
+    /// same `VectorizedDocument` table, tagged with `projectID`.
+    static func projectsDir() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+            .appendingPathComponent("projects", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    static func projectsIndexURL() throws -> URL {
+        try projectsDir().appendingPathComponent("index.json")
+    }
 }

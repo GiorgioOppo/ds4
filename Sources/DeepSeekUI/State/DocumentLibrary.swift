@@ -23,6 +23,14 @@ struct VectorizedDocument: Codable, Identifiable, Hashable {
     var modelFingerprint: String
     /// True once Step 3 has dumped the KV cache into the `.vec` file.
     var hasPrecomputedCache: Bool
+    /// When set, the document is part of a Project's index (not a
+    /// standalone import). The Documents tab filters these out so the
+    /// flat library list stays uncluttered; the Projects tab shows
+    /// them grouped per project.
+    var projectID: UUID?
+    /// Relative path inside the project root (or original absolute
+    /// path for standalone imports). Used purely for display.
+    var displayPath: String?
 
     init(id: UUID = UUID(),
          name: String,
@@ -31,7 +39,9 @@ struct VectorizedDocument: Codable, Identifiable, Hashable {
          tokenCount: Int,
          createdAt: Date = .now,
          modelFingerprint: String,
-         hasPrecomputedCache: Bool = false) {
+         hasPrecomputedCache: Bool = false,
+         projectID: UUID? = nil,
+         displayPath: String? = nil) {
         self.id = id
         self.name = name
         self.sourceFilename = sourceFilename
@@ -40,6 +50,8 @@ struct VectorizedDocument: Codable, Identifiable, Hashable {
         self.createdAt = createdAt
         self.modelFingerprint = modelFingerprint
         self.hasPrecomputedCache = hasPrecomputedCache
+        self.projectID = projectID
+        self.displayPath = displayPath
     }
 }
 
@@ -57,18 +69,23 @@ final class DocumentLibrary: ObservableObject {
 
     /// Append a freshly-imported document and persist the tokens to
     /// disk. Returns the assigned id so callers can immediately attach
-    /// it to a conversation.
+    /// it to a conversation. `projectID` / `displayPath` are set by
+    /// the Project indexer when it pulls files in batch.
     func add(name: String,
               sourceFilename: String,
               byteCount: Int,
               tokens: [Int32],
-              modelFingerprint: String) throws -> VectorizedDocument {
+              modelFingerprint: String,
+              projectID: UUID? = nil,
+              displayPath: String? = nil) throws -> VectorizedDocument {
         let doc = VectorizedDocument(
             name: name,
             sourceFilename: sourceFilename,
             byteCount: byteCount,
             tokenCount: tokens.count,
-            modelFingerprint: modelFingerprint)
+            modelFingerprint: modelFingerprint,
+            projectID: projectID,
+            displayPath: displayPath)
         let url = try PersistencePaths.documentTokensURL(id: doc.id)
         try tokens.withUnsafeBufferPointer { ptr in
             let data = Data(buffer: ptr)
@@ -77,6 +94,42 @@ final class DocumentLibrary: ObservableObject {
         documents.insert(doc, at: 0)
         saveIndex()
         return doc
+    }
+
+    /// All standalone documents (not part of any project). Used by the
+    /// Documents tab's flat list.
+    var standaloneDocuments: [VectorizedDocument] {
+        documents.filter { $0.projectID == nil }
+    }
+
+    /// Documents belonging to a specific project. Sorted by display
+    /// path (then by name) for a stable tree-like ordering.
+    func documents(for projectID: UUID) -> [VectorizedDocument] {
+        documents
+            .filter { $0.projectID == projectID }
+            .sorted {
+                ($0.displayPath ?? $0.name)
+                    .localizedStandardCompare($1.displayPath ?? $1.name)
+                    == .orderedAscending
+            }
+    }
+
+    /// Remove every document tagged with the given projectID. Called
+    /// by the Project library on delete / re-index.
+    func purge(projectID: UUID) {
+        let victims = documents.filter { $0.projectID == projectID }
+        guard !victims.isEmpty else { return }
+        let fm = FileManager.default
+        for d in victims {
+            if let u = try? PersistencePaths.documentTokensURL(id: d.id) {
+                try? fm.removeItem(at: u)
+            }
+            if let u = try? PersistencePaths.documentVecURL(id: d.id) {
+                try? fm.removeItem(at: u)
+            }
+        }
+        documents.removeAll { $0.projectID == projectID }
+        saveIndex()
     }
 
     /// Remove a document and wipe its on-disk payloads. Best-effort:

@@ -46,7 +46,8 @@ struct DocumentsView: View {
 
     @ViewBuilder
     private var list: some View {
-        if library.documents.isEmpty {
+        let standalone = library.standaloneDocuments
+        if standalone.isEmpty {
             VStack(spacing: 6) {
                 Image(systemName: "doc.text.below.ecg")
                     .font(.system(size: 32))
@@ -58,12 +59,17 @@ struct DocumentsView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
+                } else {
+                    Text("Single-file imports show up here. For codebases, see the Projects tab.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List(selection: $selection) {
-                ForEach(library.documents) { d in
+                ForEach(standalone) { d in
                     row(d)
                         .tag(d.id)
                         .contextMenu {
@@ -83,7 +89,9 @@ struct DocumentsView: View {
                    ? "doc.text.fill"
                    : "doc.text")
                 .font(.title2)
-                .foregroundStyle(d.hasPrecomputedCache ? .accentColor : .secondary)
+                .foregroundStyle(d.hasPrecomputedCache
+                                  ? Color.accentColor
+                                  : Color.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(d.name)
                     .font(.body)

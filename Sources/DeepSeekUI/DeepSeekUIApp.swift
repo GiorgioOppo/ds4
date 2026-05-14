@@ -1,9 +1,9 @@
 import SwiftUI
 
 /// SwiftUI entry point for the DeepSeek-V4 macOS chat app. Owns the
-/// long-lived singletons (`InferenceService`, `DocumentLibrary`) and
-/// hands them down both to the chat window and to the Settings scene
-/// so the Documents tab can reach the active tokenizer / model dir.
+/// long-lived singletons (`InferenceService`, `DocumentLibrary`,
+/// `ProjectLibrary`) and hands them down to both the chat window and
+/// the Settings scene.
 @main
 struct DeepSeekUIApp: App {
     /// Reference type, immutable for the lifetime of the app. Held as
@@ -11,11 +11,13 @@ struct DeepSeekUIApp: App {
     /// (its mutating fields are guarded by an internal serial queue),
     /// and SwiftUI's `@StateObject` requires Observable conformance.
     private let service: InferenceService
-    @StateObject private var library: DocumentLibrary
+    @StateObject private var documents: DocumentLibrary
+    @StateObject private var projects: ProjectLibrary
 
     init() {
         self.service = InferenceService()
-        self._library = StateObject(wrappedValue: DocumentLibrary())
+        self._documents = StateObject(wrappedValue: DocumentLibrary())
+        self._projects = StateObject(wrappedValue: ProjectLibrary())
     }
 
     var body: some Scene {
@@ -25,6 +27,8 @@ struct DeepSeekUIApp: App {
         }
         .windowResizability(.contentMinSize)
 
-        SettingsScene(library: library, service: service)
+        SettingsScene(documents: documents,
+                       projects: projects,
+                       service: service)
     }
 }
