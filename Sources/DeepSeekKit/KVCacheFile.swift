@@ -78,23 +78,32 @@ public final class KVCacheFile {
         // 2) Map the whole file. PROT_READ|WRITE + MAP_SHARED so writes
         //    persist; MADV_RANDOM tells the kernel not to prefetch — the
         //    attention kernel reads scattered rows.
-        //    mmap is imported as Optional in this SDK; MAP_FAILED is
-        //    ((void *)-1). Compare against the bit pattern. Force-unwrap
-        //    `UnsafeMutableRawPointer(bitPattern: -1)` is safe because
-        //    the failable initialiser only returns nil for 0 — every
-        //    non-zero Int produces a Some.
-        //    `mapFailed` is annotated non-optional so the `raw != mapFailed`
-        //    branch doesn't promote `raw` to `UnsafeMutableRawPointer?`
-        //    and lose the unwrap performed by `guard let`.
-        let mapFailed: UnsafeMutableRawPointer =
-            UnsafeMutableRawPointer(bitPattern: -1)!
-        let rawOpt = mmap(nil, total,
-                           PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, 0)
+        //
+        //    mmap is imported as `UnsafeMutableRawPointer?` in this SDK
+        //    and MAP_FAILED ((void *)-1) is the error sentinel. We
+        //    validate in two strict, sequential steps and bind the
+        //    result to an explicitly-typed non-optional local — earlier
+        //    attempts to combine "not nil" and "not MAP_FAILED" in one
+        //    guard had Swift's type checker promote the unwrapped value
+        //    back to Optional at the use sites.
+        let mmapResult = mmap(nil, total,
+                               PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd, 0)
         close(fd)  // the mapping holds its own reference
-        guard let raw = rawOpt, raw != mapFailed else {
+        // Step 2a: explicit null fallback.
+        guard let nonNull = mmapResult else {
             throw KVCacheFileError.mmapFailed(errno: errno, path: url.path)
         }
+        // Step 2b: explicit MAP_FAILED fallback (bit-pattern compare;
+        // -1 is the universal "((void *)-1)" sentinel and doesn't need
+        // a named constant from the SDK).
+        if Int(bitPattern: nonNull) == -1 {
+            throw KVCacheFileError.mmapFailed(errno: errno, path: url.path)
+        }
+        // Step 2c: hand off to a strictly-typed non-optional local that
+        // everything below uses. The annotation locks the type so the
+        // compiler can't widen it back to Optional in any branch.
+        let raw: UnsafeMutableRawPointer = nonNull
         madvise(raw, total, MADV_RANDOM)
 
         // 3) Wrap as a Metal buffer. Use the full mapping so payload
