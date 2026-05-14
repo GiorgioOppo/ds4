@@ -78,11 +78,29 @@ final class InferenceService: @unchecked Sendable {
                     // (Transformer.load will then call .inferred()
                     // and patch from the actual tensor shapes).
                     let configURL = url.appendingPathComponent("config.json")
-                    let cfg: ModelConfig
+                    var cfg: ModelConfig
                     if FileManager.default.fileExists(atPath: configURL.path) {
                         cfg = try ModelConfig.load(from: configURL)
                     } else {
                         cfg = ModelConfig()
+                    }
+
+                    // Apply user overrides from
+                    //   ~/Library/Application Support/<app>/config-overrides.json
+                    // (same file the ModelConfigSettingsTab writes to).
+                    // .inferred() will still patch architectural fields from
+                    // the checkpoint, so only the truly user-tunable fields
+                    // — maxBatchSize and maxSeqLen — actually need merging
+                    // here; the rest survive only if not contradicted by the
+                    // tensors on disk.
+                    if let overrideURL = try? PersistencePaths.conversationsDir()
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("config-overrides.json"),
+                       FileManager.default.fileExists(atPath: overrideURL.path),
+                       let data = try? Data(contentsOf: overrideURL),
+                       let ov = try? JSONDecoder().decode(ModelConfig.self, from: data) {
+                        cfg.maxBatchSize = ov.maxBatchSize
+                        cfg.maxSeqLen    = ov.maxSeqLen
                     }
 
                     let model = try Transformer.load(
