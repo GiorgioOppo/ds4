@@ -26,6 +26,7 @@ public final class BPETokenizer: Tokenizer {
     public let invAddedTokens: [Int: String]
     public let bosId: Int?
     public let eosId: Int?
+    public let stopTokenIds: Set<Int>
 
     private let pretokRegex: NSRegularExpression
     private let specialPattern: NSRegularExpression?
@@ -118,6 +119,21 @@ public final class BPETokenizer: Tokenizer {
         if eos == nil { eos = added["<｜end▁of▁sentence｜>"] }
         self.bosId = bos
         self.eosId = eos
+
+        // Build the stop-token set. Always include `eosId` (end-of-
+        // sentence = end-of-conversation). Add `<|EOT|>` when present:
+        // V4-Flash emits this distinct token to close the assistant's
+        // turn — the LM head ranks it highest right after the final
+        // content token. If the decode loop only stops on
+        // `<｜end▁of▁sentence｜>` it silently consumes EOT as a regular
+        // token, the model then samples whatever's next-highest, and
+        // the generation collapses into a self-reinforcing loop of the
+        // last content token (`好的好的好的…`, `_type_type_type…`, etc.).
+        var stops = Set<Int>()
+        if let e = eos { stops.insert(e) }
+        // V4-Flash uppercase ASCII EOT (token 128805 in this vocab).
+        if let eot = added["<|EOT|>"] { stops.insert(eot) }
+        self.stopTokenIds = stops
     }
 
     // MARK: - Encode

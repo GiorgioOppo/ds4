@@ -190,7 +190,11 @@ final class InferenceService: @unchecked Sendable {
                     tokPerMin: prefillTPM))
 
                 var opts = options
-                let eos = tok.eosId ?? -1
+                // V4-Flash chat: stop on either `<｜end▁of▁sentence｜>`
+                // (eosId, end of conversation) or `<|EOT|>` (end of
+                // assistant turn). Checking only eosId lets EOT slip
+                // through and the model loops on filler tokens.
+                let stops = tok.stopTokenIds
 
                 // 3. Decode loop. Emit a generationProgress event roughly
                 //    every 500 ms so the UI ticker updates without
@@ -205,7 +209,7 @@ final class InferenceService: @unchecked Sendable {
                     let nextId = Sampler.sample(logits,
                                                   history: generated,
                                                   options: &opts)
-                    if nextId == eos { break }
+                    if stops.contains(nextId) { break }
                     generated.append(nextId)
 
                     let piece = tok.decode([nextId])

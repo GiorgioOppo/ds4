@@ -379,6 +379,11 @@ print("---")
 fflush(stdout)
 
 let eosId: Int = tokenizer.eosId ?? -1
+// V4-Flash has TWO stop tokens: `<｜end▁of▁sentence｜>` (eosId, ends
+// the whole conversation) and `<|EOT|>` (ends just the assistant
+// turn). The decode loop must break on either, otherwise EOT gets
+// consumed as a regular token and the model loops on filler.
+let stopTokens: Set<Int> = tokenizer.stopTokenIds
 // Generation runs on a background DispatchQueue so the main thread
 // is free to poll memory metrics at fixed intervals. Without this
 // the only memory snapshots we get during a forward are the ones
@@ -410,11 +415,12 @@ inferenceQueue.async {
 
     for step in 0..<maxTokens {
         let nextId = Sampler.sample(logits, history: generatedIds, options: &samplingOpts)
-        if nextId == eosId {
+        if stopTokens.contains(nextId) {
             // Mirrors generate.py:67 — Python appends the EOS token to
             // the completion stream so downstream decoders see a well-
-            // terminated sequence.
-            generatedIds.append(eosId)
+            // terminated sequence. We also keep `<|EOT|>` (and any
+            // future stop ids) on the stream for the same reason.
+            generatedIds.append(nextId)
             break
         }
         generatedIds.append(nextId)
