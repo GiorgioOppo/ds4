@@ -90,9 +90,7 @@ struct MessageView: View {
         } else if isStreaming {
             // Partial markdown parses ugly (open `**` / unclosed code
             // fence). Stay on plain Text + blinking caret until done.
-            Text(message.content + "▌")
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            StreamingCaretText(content: message.content)
         } else {
             // Finalized: render through Markdown + artifact splitter.
             MarkdownText(raw: message.content)
@@ -139,6 +137,25 @@ struct MessageView: View {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             copied = false
+        }
+    }
+}
+
+/// Streaming assistant text with a blinking caret pinned to the end.
+/// The caret toggles between full opacity and clear (instead of being
+/// removed/added) so the trailing layout position never jumps mid-line,
+/// and the surrounding paragraph reflows naturally as tokens arrive.
+private struct StreamingCaretText: View {
+    let content: String
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+            let on = Int(ctx.date.timeIntervalSince1970 * 2)
+                .isMultiple(of: 2)
+            (Text(content)
+             + Text("▌").foregroundColor(on ? .primary : .clear))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

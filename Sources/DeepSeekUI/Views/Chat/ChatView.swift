@@ -38,18 +38,25 @@ struct ChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         ForEach(c.messages) { msg in
+                            // Drop progress indicators where they belong
+                            // in the flow: right between the user prompt
+                            // and the about-to-be-filled assistant turn.
+                            // The placeholder is always the last message
+                            // with empty content while we're prefilling
+                            // or just starting to stream.
+                            if shouldShowInlineProgress(for: msg, in: c, phase: phase) {
+                                inlineProgress(phase)
+                            }
                             MessageView(
                                 message: msg,
                                 isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase))
                             .id(msg.id)
                         }
-                        if case .prefilling(let promptTokens, let startTime) = phase {
-                            PrefillIndicator(promptTokens: promptTokens,
-                                              startTime: startTime)
-                                .padding(.leading, 40)
-                        }
-                        if case .streaming(_, let status, let metrics) = phase {
-                            ThroughputBar(metrics: metrics, status: status)
+                        if case .streaming(_, _, let metrics) = phase {
+                            // Throughput bar stays in the trailing slot
+                            // so the live tok/min readout sits under the
+                            // reply as it grows.
+                            ThroughputBar(metrics: metrics, status: "")
                                 .padding(.leading, 40)
                         }
                         if case .error(let msg) = phase {
@@ -88,6 +95,43 @@ struct ChatView: View {
               msg.role == .assistant,
               msg.id == c.messages.last?.id else { return false }
         return true
+    }
+
+    /// True for the empty assistant placeholder at the tail of the
+    /// conversation while the model is encoding the prompt or running
+    /// the prefill forward — the slot where the inline indicator
+    /// should be drawn (directly above the soon-to-be reply).
+    private func shouldShowInlineProgress(for msg: StoredMessage,
+                                           in c: Conversation,
+                                           phase: GenerationPhase) -> Bool {
+        guard msg.id == c.messages.last?.id,
+              msg.role == .assistant,
+              msg.content.isEmpty else { return false }
+        switch phase {
+        case .prefilling: return true
+        case .streaming(_, let status, _): return !status.isEmpty
+        default: return false
+        }
+    }
+
+    @ViewBuilder
+    private func inlineProgress(_ phase: GenerationPhase) -> some View {
+        switch phase {
+        case .prefilling(let promptTokens, let startTime):
+            PrefillIndicator(promptTokens: promptTokens,
+                              startTime: startTime)
+                .padding(.leading, 40)
+        case .streaming(_, let status, _) where !status.isEmpty:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 40)
+        default:
+            EmptyView()
+        }
     }
 
     private func scrollBufferLength(_ phase: GenerationPhase) -> Int {
