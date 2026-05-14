@@ -7,7 +7,7 @@ struct ChatView: View {
     @ObservedObject var store: ChatStore
     @State private var draft: String = ""
 
-    @AppStorage("deepseek.temperature")       private var temperature: Double = 1.0
+    @AppStorage("deepseek.temperature")       private var temperature: Double = 0.7
     @AppStorage("deepseek.topK")              private var topK: Int = 0
     @AppStorage("deepseek.topP")              private var topP: Double = 1.0
     @AppStorage("deepseek.repPenalty")        private var repPenalty: Double = 1.0
@@ -102,8 +102,13 @@ struct ChatView: View {
     private func sendCurrent() {
         let text = draft
         draft = ""
+        // Clamp temperature into the supported [0.5, 1.0] range in case
+        // an older @AppStorage value (default used to be 1.0, slider
+        // used to span 0…2) is still on disk for a user who never
+        // touched the Settings tab.
+        let clampedT = min(1.0, max(0.5, temperature))
         let opts = SamplingOptions(
-            temperature: Float(temperature),
+            temperature: Float(clampedT),
             topK: topK, topP: Float(topP),
             repetitionPenalty: Float(repPenalty))
         let mode: ThinkingMode = (modeRaw == "max")  ? .max
