@@ -427,13 +427,13 @@ inferenceQueue.async {
         MemoryLogger.snapshot("decode:token-\(String(format: "%03d", step))",
                               force: true)
 
-        // Stream the new token to stdout immediately. In chat mode, we buffer
-        // the whole output and parse <think>...</think> at the end so the
-        // reasoning block doesn't leak before its closing tag.
-        if mode == "raw" {
-            print(tokenizer.decode([nextId]), terminator: "")
-            fflush(stdout)
-        }
+        // Stream the new token to stdout immediately, in both modes. Chat
+        // mode still re-parses the accumulated text at the end (extracting
+        // the `<think>...</think>` block as reasoning), so this only
+        // changes what the user *sees* during decode — the final structured
+        // Message is unchanged.
+        print(tokenizer.decode([nextId]), terminator: "")
+        fflush(stdout)
 
         // Stop after sampling the requested count without doing one more
         // unnecessary forward.
@@ -466,10 +466,15 @@ if let err = inferenceError {
 
 print("")    // newline after streaming
 if mode == "chat" {
+    // The raw stream above includes the `<think>...</think>` block
+    // inline; re-parse here only to surface a tidy reasoning summary
+    // at the end. The content has already been printed so don't
+    // re-print it.
     let combined = tokenizer.decode(generatedIds)
     let msg = EncodingDSV4.parseCompletion(combined, mode: .chat)
     if let r = msg.reasoningContent, !r.isEmpty {
-        print("[reasoning]\n\(r)\n[/reasoning]")
+        print("---")
+        print("[reasoning summary]")
+        print(r)
     }
-    print(msg.content)
 }
