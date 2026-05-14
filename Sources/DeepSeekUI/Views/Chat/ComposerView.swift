@@ -13,6 +13,13 @@ struct ComposerView: View {
     var onSend: () -> Void
     var onStop: () -> Void
 
+    // Explicit focus binding for the TextField. Without it the
+    // paperclip button (the first focusable element in the HStack)
+    // can end up holding the key window's first-responder slot, and
+    // NSOpenPanel dismissal doesn't always hand focus back to the
+    // field — the symptom is "the chat won't let me type any more".
+    @FocusState private var composerFocused: Bool
+
     var body: some View {
         VStack(spacing: 8) {
             if !attachments.isEmpty {
@@ -30,6 +37,7 @@ struct ComposerView: View {
                 TextField("Message the model…", text: $draft, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(1...8)
+                    .focused($composerFocused)
                     .onSubmit(onSend)
 
                 switch phase {
@@ -51,6 +59,16 @@ struct ComposerView: View {
         }
         .padding(12)
         .background(.bar)
+        .onAppear {
+            // Take focus on first mount and after the composer is
+            // re-mounted via a sidebar selection change.
+            composerFocused = true
+        }
+        .onChange(of: phase) { _, newPhase in
+            // When the model finishes (idle), pull focus back into the
+            // field so the next prompt can be typed without a click.
+            if case .idle = newPhase { composerFocused = true }
+        }
     }
 
     private var isGenerating: Bool {
@@ -70,6 +88,10 @@ struct ComposerView: View {
 
     private func pickAttachments() {
         let picked = AttachmentPicker.present()
+        // Always restore focus to the composer after dismissing
+        // NSOpenPanel — even when the user cancelled — otherwise the
+        // text field stays unfocused and key strokes go nowhere.
+        composerFocused = true
         guard !picked.isEmpty else { return }
         attachments.append(contentsOf: picked)
     }
