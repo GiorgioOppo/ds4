@@ -114,6 +114,23 @@ public final class MLA {
         compressor?.releaseState()
     }
 
+    /// Re-allocate the main KV cache from a snapshot blob. Used by
+    /// the KV-cache restore path (Step B2 onward) so a previously-
+    /// computed cache state can be swapped back into a freshly
+    /// loaded model. The compressor's alias slice is intentionally
+    /// left nil — `callAsFunction` re-builds it on the next forward
+    /// (it checks `comp.kvCache == nil` and re-aliases against the
+    /// freshly-set kvCache buffer).
+    public func restoreKVCacheBytes(shape: [Int], dtype: DType, bytes: Data) {
+        precondition(shape == kvCacheShape,
+                      "MLA restore: shape mismatch (got \(shape), expected \(kvCacheShape))")
+        precondition(dtype == kvCacheDType,
+                      "MLA restore: dtype mismatch")
+        let t = Tensor.empty(shape: shape, dtype: dtype)
+        t.writeBytes(bytes)
+        self.kvCache = t
+    }
+
     /// MLA forward. Handles all three cases:
     ///   - prefill startPos == 0, seqlen <= window_size: write whole kv
     ///   - prefill startPos == 0, seqlen > window_size: write last window

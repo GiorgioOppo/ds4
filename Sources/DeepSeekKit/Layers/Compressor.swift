@@ -109,6 +109,18 @@ public final class Compressor {
         kvCache = nil
     }
 
+    /// Restore the rolling decode state from a snapshot. Both tensors
+    /// must match `kvStateShape` / `scoreStateShape` (== what the
+    /// constructor was given) — KVCacheSnapshot enforces that
+    /// upstream by carrying shape + dtype alongside the bytes.
+    /// `kvCache` is intentionally left untouched: it's an alias
+    /// slice of the parent (MLA / Indexer) cache buffer and the
+    /// parent re-wires it on next forward.
+    public func restoreState(kvState: Tensor, scoreState: Tensor) {
+        self.kvState = kvState
+        self.scoreState = scoreState
+    }
+
     /// Forward pass. Returns the compressed KV when one is emitted, else nil.
     /// Prefill (startPos == 0) emits `[B, S/ratio, head_dim]`; decode emits
     /// `[B, 1, head_dim]` only when `(start_pos + 1) % ratio == 0`.

@@ -90,6 +90,33 @@ public final class Tensor {
         return Tensor(shape: newShape, dtype: dtype, buffer: buffer, offset: offset)
     }
 
+    /// Snapshot the tensor's raw bytes into a `Data` blob. Used by
+    /// the KV cache snapshot path; intentionally dtype-agnostic so
+    /// the same code handles f32 / f16 / quantised storage uniformly.
+    /// Apple Silicon `MTLBuffer` is unified-memory, so this is a
+    /// straight `memcpy` from a buffer the GPU may also be reading;
+    /// callers must guarantee no command buffer is in flight.
+    public func readBytes() -> Data {
+        let n = byteCount
+        let ptr = buffer.contents().advanced(by: offset)
+        return Data(bytes: ptr, count: n)
+    }
+
+    /// Reverse of `readBytes`: memcpy a blob back into the tensor's
+    /// memory window. `data.count` must equal `byteCount` — a
+    /// mismatched payload corrupts state and traps loudly here
+    /// instead of producing silent NaNs downstream.
+    public func writeBytes(_ data: Data) {
+        precondition(data.count == byteCount,
+                      "writeBytes size mismatch: have \(data.count), need \(byteCount)")
+        let ptr = buffer.contents().advanced(by: offset)
+        data.withUnsafeBytes { src in
+            if let base = src.baseAddress {
+                memcpy(ptr, base, data.count)
+            }
+        }
+    }
+
     /// Copy contents to a host array of `Float`. For inspection / tests only —
     /// quantized dtypes (fp8/fp4/e8m0) require a dequant pass that has not been
     /// written yet, so this path traps for them.

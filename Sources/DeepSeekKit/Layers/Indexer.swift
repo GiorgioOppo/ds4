@@ -66,6 +66,24 @@ public final class Indexer {
         compressor.releaseState()
     }
 
+    /// Re-allocate the indexer's KV cache from a snapshot blob.
+    /// The indexer's `compressor.kvCache` is a *reference* to the
+    /// same Tensor (Indexer.swift wires `compressor.kvCache = self.kvCache`
+    /// on first forward), so we set both pointers here — the
+    /// compressor's alias would otherwise stay pointing at the
+    /// pre-restore buffer and the next forward would read stale
+    /// data.
+    public func restoreKVCacheBytes(shape: [Int], dtype: DType, bytes: Data) {
+        precondition(shape == kvCacheShape,
+                      "Indexer restore: shape mismatch (got \(shape), expected \(kvCacheShape))")
+        precondition(dtype == kvCacheDType,
+                      "Indexer restore: dtype mismatch")
+        let t = Tensor.empty(shape: shape, dtype: dtype)
+        t.writeBytes(bytes)
+        self.kvCache = t
+        self.compressor.kvCache = t
+    }
+
     /// Returns `[B, S, K]` Int32 indices (with -1 padding for invalid slots).
     public func callAsFunction(_ x: Tensor, qr: Tensor, startPos: Int, offset: Int,
                                 in cmd: MTLCommandBuffer) -> Tensor {
