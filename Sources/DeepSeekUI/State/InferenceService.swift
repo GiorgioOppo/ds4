@@ -5,7 +5,12 @@ import DeepSeekKit
 /// a finalized parsed Message (Reasoning extracted, tool calls
 /// decoded), or a status note used for progress logging.
 enum GenerationEvent: Sendable {
-    case token(String)
+    /// One sampled token. `text` is what the tokenizer decoded for
+    /// this single id; `id` is the raw sample, persisted by
+    /// ChatStore so a crash mid-generation can be resumed bit-
+    /// identically (decoding-then-re-encoding the partial text
+    /// isn't round-trip-safe in BPE).
+    case token(text: String, id: Int32)
     /// Stream completed. `final` is the parsed assistant Message;
     /// `promptTokens` is the full BPE prompt the model saw (prefix +
     /// delta) and `generatedTokens` are every sampled id including
@@ -416,7 +421,7 @@ final class InferenceService: @unchecked Sendable {
 
                     let piece = tok.decode([nextId])
                     generatedText += piece
-                    continuation.yield(.token(piece))
+                    continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {
@@ -526,7 +531,7 @@ final class InferenceService: @unchecked Sendable {
 
                     let piece = tok.decode([nextId])
                     generatedText += piece
-                    continuation.yield(.token(piece))
+                    continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {
@@ -700,7 +705,7 @@ final class InferenceService: @unchecked Sendable {
 
                     let piece = tok.decode([nextId])
                     generatedText += piece
-                    continuation.yield(.token(piece))
+                    continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {

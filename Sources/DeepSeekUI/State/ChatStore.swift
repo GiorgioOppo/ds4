@@ -194,6 +194,19 @@ final class ChatStore: ObservableObject {
                     mode: mode,
                     fullHistory: historyForFullEncode,
                     projectContext: projectContext)
+                // Snapshot the pending turn on disk immediately. If
+                // the app dies during the prefill (which can take
+                // minutes for a project context), the user's prompt
+                // is preserved and the resume path can still pick
+                // up — without any tokens emitted yet.
+                if let cIdx = conversations.firstIndex(where: { $0.id == id }) {
+                    conversations[cIdx].pendingTurn = PendingTurn(
+                        assistantMessageID: placeholderId,
+                        promptTokens: promptTokens,
+                        generatedTokens: [],
+                        mode: modeRaw)
+                    scheduleSave(id)
+                }
                 for try await event in service.generateForConversation(
                     promptTokens: promptTokens,
                     conversationID: id,
@@ -205,6 +218,81 @@ final class ChatStore: ObservableObject {
                            to: id,
                            placeholderId: placeholderId,
                            userMessageId: userMessage.id,
+                           mode: modeRaw)
+                }
+            } catch {
+                phases[id] = .error((error as? LocalizedError)?.errorDescription
+                                     ?? error.localizedDescription)
+                scheduleSave(id)
+            }
+        }
+    }
+
+    /// Restart a generation that was cut short (crash, app-quit,
+    /// power loss). The conversation already carries a `pendingTurn`
+    /// snapshot describing the prompt the model saw and every token
+    /// sampled before the interruption; we feed that prompt+tokens
+    /// back into the model as a fresh prefill so the KV cache is
+    /// rebuilt, then the decode loop picks up from
+    /// `startPos == promptTokens.count + generatedTokens.count`.
+    ///
+    /// Sampling parameters are taken from current Settings (we
+    /// don't persist them per-turn) — the partial text already on
+    /// screen ensures resumed sampling stays consistent enough that
+    /// the user can keep reading without seeing a regressed style.
+    func resumePendingTurn(of id: UUID,
+                             options: SamplingOptions,
+                             maxTokens: Int) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }),
+              let pt = conversations[idx].pendingTurn else { return }
+        switch phase(of: id) {
+        case .streaming, .prefilling: return
+        default: break
+        }
+        // Re-derive ThinkingMode from the persisted raw value. Falls
+        // back to .chat for forward-compat (a future enum case we
+        // don't recognise yet shouldn't lock the user out of
+        // resuming an interrupted reply).
+        let mode = ThinkingMode(rawValue: pt.mode) ?? .chat
+        // Stitch prompt + already-generated ids into one prompt:
+        // the model will prefill the whole thing, the decode loop
+        // then samples token #(generatedTokens.count + 1).
+        let resumedPrompt = pt.promptTokens + pt.generatedTokens
+
+        // Restore the live streaming UI state from the persisted
+        // partial content. Tokens-per-minute resets to zero — we
+        // don't carry it across restarts.
+        let buffer: String
+        if let mIdx = conversations[idx].messages.firstIndex(
+            where: { $0.id == pt.assistantMessageID }) {
+            buffer = conversations[idx].messages[mIdx].content
+        } else {
+            buffer = ""
+        }
+        phases[id] = .streaming(buffer: buffer,
+                                 status: "Resuming…",
+                                 metrics: GenerationMetrics())
+
+        let placeholderId = pt.assistantMessageID
+        let modeRaw = pt.mode
+        // The most recent user message — used by `apply` to stamp
+        // tokenCount once the turn finishes.
+        let userMessageId = conversations[idx].messages
+            .last(where: { $0.role == .user })?.id ?? placeholderId
+
+        Task {
+            do {
+                for try await event in service.generateForConversation(
+                    promptTokens: resumedPrompt,
+                    conversationID: id,
+                    mode: mode,
+                    options: options,
+                    maxTokens: maxTokens)
+                {
+                    apply(event: event,
+                           to: id,
+                           placeholderId: placeholderId,
+                           userMessageId: userMessageId,
                            mode: modeRaw)
                 }
             } catch {
@@ -287,6 +375,18 @@ final class ChatStore: ObservableObject {
         service.cancelCurrent()
     }
 
+    /// User chose to throw away the interrupted assistant turn. The
+    /// partial content stays in the transcript (so they don't lose
+    /// what they already read), but the model's view of the chat
+    /// rolls back to the last completed turn — i.e. `encodedTokens`
+    /// is untouched and the next `send` starts fresh.
+    func discardPendingTurn(of id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }),
+              conversations[idx].pendingTurn != nil else { return }
+        conversations[idx].pendingTurn = nil
+        scheduleSave(id)
+    }
+
     private func apply(event: GenerationEvent,
                         to id: UUID,
                         placeholderId: UUID,
@@ -294,7 +394,7 @@ final class ChatStore: ObservableObject {
                         mode: String) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         switch event {
-        case .token(let piece):
+        case .token(let piece, let tokenId):
             // Once tokens start flowing we leave `.prefilling` if we
             // were still in it (e.g. very small prompts where
             // prefillDone arrived after the first token sample). Carry
@@ -307,6 +407,12 @@ final class ChatStore: ObservableObject {
                 where: { $0.id == placeholderId }) {
                 conversations[idx].messages[mIdx].content = newBuffer
             }
+            // Append the raw id to the on-disk pendingTurn so a
+            // crash mid-stream replays this token exactly. The save
+            // is debounced (~500 ms) so we don't pay disk I/O at
+            // the model's sampling rate.
+            conversations[idx].pendingTurn?.generatedTokens.append(tokenId)
+            scheduleSave(id)
 
         case .status(let s):
             let m = currentMetrics(of: id)
@@ -360,6 +466,9 @@ final class ChatStore: ObservableObject {
             // will append a delta to this — no full re-encode.
             conversations[idx].encodedTokens = promptTokens + generatedTokens
             conversations[idx].lastEncodedMode = mode
+            // The generation completed cleanly; drop the crash-
+            // recovery snapshot so the UI stops offering Resume.
+            conversations[idx].pendingTurn = nil
 
             phases[id] = .idle
             scheduleSave(id)

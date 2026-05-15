@@ -79,11 +79,57 @@ struct ChatView: View {
                     .padding(.bottom, 6)
             }
             Divider()
+            resumeBanner(c: c, phase: phase)
             ComposerView(draft: $draft,
                           phase: phase,
                           onSend: sendCurrent, onStop: { store.cancel() })
         }
         .navigationTitle(c.title)
+    }
+
+    /// Rendered above the composer when a previous generation died
+    /// mid-stream and the conversation carries a `pendingTurn`
+    /// snapshot. Hidden once `phase` becomes `.streaming`/`.prefilling`
+    /// (the resume already kicked off) or `.error`. Tapping Resume
+    /// re-runs the same prompt + accumulated ids through the model
+    /// so the partial reply on screen keeps extending.
+    @ViewBuilder
+    private func resumeBanner(c: Conversation,
+                                phase: GenerationPhase) -> some View {
+        let isIdle: Bool = {
+            switch phase {
+            case .idle, .error: return true
+            default:           return false
+            }
+        }()
+        if let pt = c.pendingTurn, isIdle {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .foregroundStyle(Color.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Generation interrupted")
+                        .font(.callout.bold())
+                    Text("\(pt.generatedTokens.count) tokens already sampled. Resume continues from where it stopped.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Resume") {
+                    resumeCurrent()
+                }
+                .buttonStyle(.borderedProminent)
+                Button {
+                    store.discardPendingTurn(of: c.id)
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Discard the partial reply")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.08))
+        }
     }
 
     private func isStreamingPlaceholder(_ msg: StoredMessage,
@@ -174,6 +220,25 @@ struct ChatView: View {
                                 : .chat
         store.send(text: text, mode: mode,
                     options: opts, maxTokens: maxTokens)
+    }
+
+    /// Restart a previously-interrupted generation. Reuses the same
+    /// sampler / max-tokens that drive `sendCurrent` — there's no
+    /// per-turn sampling settings persistence yet, so resuming an
+    /// old reply with a different temperature than it was started
+    /// at is technically possible. In practice the sampler runs on
+    /// each token independently so this rarely produces a visible
+    /// stylistic seam.
+    private func resumeCurrent() {
+        guard let id = store.selectedID else { return }
+        let clampedT = min(1.0, max(0.5, temperature))
+        let opts = SamplingOptions(
+            temperature: Float(clampedT),
+            topK: topK, topP: Float(topP),
+            repetitionPenalty: Float(repPenalty))
+        store.resumePendingTurn(of: id,
+                                  options: opts,
+                                  maxTokens: maxTokens)
     }
 }
 

@@ -76,6 +76,30 @@ struct StoredToolCall: Codable, Hashable {
     }
 }
 
+/// Crash-recovery snapshot of an in-flight assistant turn. Present
+/// on a `Conversation` only while a generation is actually running;
+/// cleared back to nil at `.done`. If the app dies (or is killed)
+/// mid-stream, the last `.json` save captures both the immutable
+/// prompt the model was given AND every token sampled up to the
+/// last debounced disk write — enough to resume from exactly where
+/// we left off after re-prefilling the same prompt.
+struct PendingTurn: Codable, Hashable {
+    /// Which placeholder assistant message in `Conversation.messages`
+    /// the partial `content` lives in.
+    let assistantMessageID: UUID
+    /// The full prompt fed to `forward(startPos: 0)`. Immutable
+    /// from `send` to `done`. On resume, prepended to
+    /// `generatedTokens` to rebuild the model's view.
+    let promptTokens: [Int32]
+    /// IDs the decode loop has produced so far. Append-only during
+    /// streaming; saved through the same debounce path the message
+    /// body uses, so a crash loses at most ~500 ms of tokens.
+    var generatedTokens: [Int32]
+    /// `ThinkingMode.rawValue`. Needed at resume time to pick the
+    /// correct trailing-think marker / sampling stop tokens.
+    let mode: String
+}
+
 /// One chat thread. Title is auto-generated from the first user
 /// message; falls back to "New Chat" until the user types something.
 struct Conversation: Codable, Identifiable, Hashable {
@@ -107,6 +131,12 @@ struct Conversation: Codable, Identifiable, Hashable {
     /// system prefix) depend on mode, so a mid-conversation change
     /// invalidates the cached prompt and forces a full re-encode.
     var lastEncodedMode: String?
+    /// When non-nil, a generation was in flight at the last on-disk
+    /// save. The UI shows a "Resume" affordance when it sees this,
+    /// and `ChatStore.resumePendingTurn` uses the carried prompt +
+    /// already-sampled ids to restart the model exactly where it
+    /// stopped — see `PendingTurn`. Cleared at `.done`.
+    var pendingTurn: PendingTurn?
 
     init(id: UUID = UUID(),
          title: String = "New Chat",
@@ -115,12 +145,14 @@ struct Conversation: Codable, Identifiable, Hashable {
          messages: [StoredMessage] = [],
          projectID: UUID? = nil,
          encodedTokens: [Int32]? = nil,
-         lastEncodedMode: String? = nil) {
+         lastEncodedMode: String? = nil,
+         pendingTurn: PendingTurn? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
         self.projectID = projectID
         self.encodedTokens = encodedTokens
         self.lastEncodedMode = lastEncodedMode
+        self.pendingTurn = pendingTurn
     }
 
     mutating func retitleIfNeeded() {
