@@ -22,7 +22,9 @@ struct DeepSeekUIApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(service: service, projects: projects)
+            ContentView(service: service,
+                         documents: documents,
+                         projects: projects)
                 .frame(minWidth: 720, minHeight: 480)
         }
         .windowResizability(.contentMinSize)

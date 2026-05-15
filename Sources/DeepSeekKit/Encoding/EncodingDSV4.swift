@@ -14,6 +14,19 @@ public enum EncodingDSV4 {
     public static let thinkClose = "</think>"
     public static let dsmlToken = "｜DSML｜"
 
+    // Project / repo context delimiters. Real added_tokens in the V4
+    // vocab (128815-820 in the reference checkpoint); the BPE
+    // pre-splits on them so each emits exactly one id regardless of
+    // surrounding bytes. Used by the "project attached to chat" flow
+    // to inject a codebase as native structured context — see
+    // `InferenceService.tokenizeProjectContext`.
+    public static let beginOfRepoName = "<｜begin▁of▁repo▁name｜>"
+    public static let endOfRepoName   = "<｜end▁of▁repo▁name｜>"
+    public static let beginOfFileName = "<｜begin▁of▁file▁name｜>"
+    public static let endOfFileName   = "<｜end▁of▁file▁name｜>"
+    public static let beginOfFile     = "<｜begin▁of▁file｜>"
+    public static let endOfFile       = "<｜end▁of▁file｜>"
+
     /// Reasoning instruction prepended to the system message in `.max` mode.
     /// Mirrors REASONING_EFFORT_MAX (encoding_dsv4.py:64-67).
     public static let reasoningEffortMax: String = """

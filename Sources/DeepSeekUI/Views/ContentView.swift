@@ -7,12 +7,15 @@ enum AppPhase {
     case ready(URL, ModelConfig)
 }
 
-/// Top-level view. Receives the shared `InferenceService` and
-/// `ProjectLibrary` from the App scene and routes between picker →
-/// loading → ready. The project library is threaded down so the chat
-/// surface can show / pick the active project.
+/// Top-level view. Receives the shared `InferenceService` and the
+/// document / project libraries from the App scene and routes
+/// between picker → loading → ready. The libraries are threaded
+/// down so the chat surface can pick a project AND so the chat
+/// generation path can splice that project's pre-tokenized files
+/// into the first turn's prompt.
 struct ContentView: View {
     let service: InferenceService
+    @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
     @State private var phase: AppPhase = .picking
 
@@ -40,7 +43,9 @@ struct ContentView: View {
             case .ready(let url, _):
                 ChatContainer(
                     store: ChatStore(modelDirPath: url.path,
-                                      service: service),
+                                      service: service,
+                                      documents: documents,
+                                      projects: projects),
                     projects: projects,
                     onUnload: { phase = .picking })
             }

@@ -36,13 +36,27 @@ final class ChatStore: ObservableObject {
 
     let service: InferenceService
     let modelDirPath: String
+    /// Library references handed down from the App scene. Used at
+    /// "first turn of a chat with a project attached" time to pull
+    /// the project's pre-tokenized files and assemble the prompt
+    /// with native repo/file delimiter tokens. Both are weak-ish
+    /// (unowned semantics implicit via @MainActor reference holding)
+    /// but kept as strong refs to avoid lifetime surprises — the
+    /// libraries live for the whole app session.
+    let documents: DocumentLibrary
+    let projects: ProjectLibrary
 
     private let saveDebounce: TimeInterval = 0.5
     private var pendingSaves: [UUID: Task<Void, Never>] = [:]
 
-    init(modelDirPath: String, service: InferenceService) {
+    init(modelDirPath: String,
+         service: InferenceService,
+         documents: DocumentLibrary,
+         projects: ProjectLibrary) {
         self.modelDirPath = modelDirPath
         self.service = service
+        self.documents = documents
+        self.projects = projects
         loadFromDisk()
         if conversations.isEmpty {
             let first = Conversation(modelDirPath: modelDirPath)
@@ -147,6 +161,29 @@ final class ChatStore: ObservableObject {
         let historyForFullEncode = conversations[idx].messages.map {
             $0.asKitMessage()
         }
+        // First-turn-with-project info: only the very first user
+        // turn of a chat (encodedTokens == nil) ever pays the cost
+        // of injecting the project's whole token stream. Every
+        // subsequent turn extends the cached prefix via the normal
+        // fast-path delta.
+        let projectContext: FirstTurnProjectContext? = {
+            guard cachedPrefix == nil,
+                  let pid = conversations[idx].projectID,
+                  let project = projects.project(id: pid) else { return nil }
+            let docs = documents.documents(for: pid)
+            guard !docs.isEmpty else { return nil }
+            // Snapshot path + tokens off the main actor. tokens(of:)
+            // does a small disk read per file; expected to take ms,
+            // not seconds, even for a multi-hundred-file project —
+            // each `.tokens` blob is just the Int32 payload.
+            var files: [(path: String, tokens: [Int32])] = []
+            files.reserveCapacity(docs.count)
+            for d in docs {
+                guard let toks = try? documents.tokens(of: d.id) else { continue }
+                files.append((path: d.displayPath ?? d.name, tokens: toks))
+            }
+            return FirstTurnProjectContext(name: project.name, files: files)
+        }()
 
         Task {
             do {
@@ -155,7 +192,8 @@ final class ChatStore: ObservableObject {
                     cachedPrefix: cachedPrefix,
                     userText: trimmed,
                     mode: mode,
-                    fullHistory: historyForFullEncode)
+                    fullHistory: historyForFullEncode,
+                    projectContext: projectContext)
                 for try await event in service.generateForConversation(
                     promptTokens: promptTokens,
                     conversationID: id,
@@ -177,15 +215,28 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    /// Assemble the BPE prompt either by extending the cached prefix
-    /// with the new turn's delta, or — when the cache is missing /
-    /// stale — by re-encoding the whole history once.
+    /// Carries the snapshotted project context across the actor hop
+    /// into `buildPromptTokens`. Constructed only when the very
+    /// first turn of a chat with an attached project is about to
+    /// fire (cachedPrefix == nil, projectID != nil, library has
+    /// indexed files).
+    private struct FirstTurnProjectContext {
+        let name: String
+        let files: [(path: String, tokens: [Int32])]
+    }
+
+    /// Assemble the BPE prompt:
+    ///   - fast path: extend cached prefix with the new turn's delta;
+    ///   - first turn with a project attached: emit native repo / file
+    ///     delimiter ids and splice in each file's pre-tokenized stream;
+    ///   - cold path: full re-encode of the entire history.
     private func buildPromptTokens(canReusePrefix: Bool,
                                     cachedPrefix: [Int32]?,
                                     userText: String,
                                     mode: ThinkingMode,
-                                    fullHistory: [Message]) async throws
-    -> [Int32] {
+                                    fullHistory: [Message],
+                                    projectContext: FirstTurnProjectContext?
+    ) async throws -> [Int32] {
         if canReusePrefix, let prefix = cachedPrefix {
             guard let delta = await service.tokenizeUserTurnDelta(
                 userText, mode: mode)
@@ -197,11 +248,29 @@ final class ChatStore: ObservableObject {
             }
             return prefix + delta
         }
+        // First turn with a project: try the structured-context
+        // path. Falls through to the plain full-encode if the
+        // tokenizer can't resolve every special id we need.
+        if let ctx = projectContext {
+            let history = fullHistory.dropLast()
+            let systemText = history
+                .first(where: { $0.role == .system })?
+                .content ?? ""
+            if let tokens = await service.tokenizeFirstTurnWithProject(
+                systemText: systemText,
+                projectName: ctx.name,
+                files: ctx.files,
+                userText: userText,
+                mode: mode)
+            {
+                return tokens
+            }
+        }
         // Cold path / mode changed: full re-encode of the entire
         // conversation. Drops the last message (the just-appended
         // empty assistant placeholder), then asks for the trailing
         // assistant marker via mode.
-        let history = fullHistory.dropLast()  // remove the empty placeholder
+        let history = fullHistory.dropLast()
         guard let tokens = await service.tokenizeFullHistory(
             Array(history), mode: mode)
         else {

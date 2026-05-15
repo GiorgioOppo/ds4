@@ -221,6 +221,90 @@ final class InferenceService: @unchecked Sendable {
         }
     }
 
+    /// Build the BPE prompt of a fresh chat that has a Project
+    /// attached. Emits, in id space (no string concat / re-encode):
+    ///
+    ///   bos
+    ///   system text…
+    ///   ⟨begin_of_repo_name⟩ projectName ⟨end_of_repo_name⟩
+    ///   for each file:
+    ///       ⟨begin_of_file_name⟩ path ⟨end_of_file_name⟩
+    ///       ⟨begin_of_file⟩ <file's pre-tokenized ids> ⟨end_of_file⟩
+    ///   ⟨User⟩ userText ⟨Assistant⟩ ⟨think_marker⟩
+    ///
+    /// The per-file token streams are pulled from
+    /// `DocumentLibrary.tokens(of:)` so we don't re-BPE multi-MB
+    /// source files at chat-time — they were tokenized once when the
+    /// project was indexed.
+    ///
+    /// Returns nil when no model is loaded (no tokenizer to resolve
+    /// the special-token ids with). The "first turn" caller falls
+    /// back to plain tokenizeFullHistory on nil.
+    func tokenizeFirstTurnWithProject(systemText: String,
+                                       projectName: String,
+                                       files: [(path: String, tokens: [Int32])],
+                                       userText: String,
+                                       mode: ThinkingMode) async -> [Int32]? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<[Int32]?, Never>) in
+            q.async {
+                guard let tok = self._tokenizer else {
+                    cont.resume(returning: nil); return
+                }
+                // Resolve every special token to its id via a single
+                // encode call each. `BPETokenizer.encode` pre-splits
+                // on added_tokens, so a string that contains only an
+                // added_token returns `[id]`. Any "0 results" (token
+                // not in vocab) trips a nil return so the caller
+                // falls back to the plain path.
+                func id(_ s: String) -> Int32? {
+                    let ids = tok.encode(s)
+                    guard ids.count == 1 else { return nil }
+                    return Int32(ids[0])
+                }
+                guard let bosId       = id(EncodingDSV4.bosToken),
+                      let userId      = id(EncodingDSV4.userToken),
+                      let assistantId = id(EncodingDSV4.assistantToken),
+                      let beginRepoN  = id(EncodingDSV4.beginOfRepoName),
+                      let endRepoN    = id(EncodingDSV4.endOfRepoName),
+                      let beginFileN  = id(EncodingDSV4.beginOfFileName),
+                      let endFileN    = id(EncodingDSV4.endOfFileName),
+                      let beginFile   = id(EncodingDSV4.beginOfFile),
+                      let endFile     = id(EncodingDSV4.endOfFile)
+                else {
+                    cont.resume(returning: nil); return
+                }
+                let thinkMarker = (mode == .chat)
+                    ? EncodingDSV4.thinkClose
+                    : EncodingDSV4.thinkOpen
+
+                var out: [Int32] = []
+                out.append(bosId)
+                if !systemText.isEmpty {
+                    out.append(contentsOf:
+                        tok.encode(systemText).map(Int32.init))
+                }
+                out.append(beginRepoN)
+                out.append(contentsOf:
+                    tok.encode(projectName).map(Int32.init))
+                out.append(endRepoN)
+                for (path, tokens) in files {
+                    out.append(beginFileN)
+                    out.append(contentsOf: tok.encode(path).map(Int32.init))
+                    out.append(endFileN)
+                    out.append(beginFile)
+                    out.append(contentsOf: tokens)
+                    out.append(endFile)
+                }
+                out.append(userId)
+                out.append(contentsOf: tok.encode(userText).map(Int32.init))
+                out.append(assistantId)
+                out.append(contentsOf: tok.encode(thinkMarker).map(Int32.init))
+                cont.resume(returning: out)
+            }
+        }
+    }
+
     /// Tokenize the *delta* needed to extend a cached prompt with one
     /// more user turn:
     ///   `<eos><User>userContent<Assistant><think_marker>`
