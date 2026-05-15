@@ -352,8 +352,22 @@ public final class Compressor {
             pooledScore = overlapConcat(scoreState, B: B, R: ratio, D: headDim, in: cmd)
         } else {
             axisR = ratio
-            pooledKV = kvState                  // [B, ratio, headDim]
-            pooledScore = scoreState
+            // kvState / scoreState live at full `maxBatchSize` capacity
+            // (Assembly.swift allocates them as [maxBatch, ratio,
+            // headDim]) but only the first B batches are populated
+            // by the per-row blits above. The reshape below expects
+            // exactly `B * ratio * headDim` floats, so alias the
+            // leading B batch slabs onto the same buffer — no copy,
+            // and the row-major layout matches the [B, 1, ratio,
+            // headDim] view weightedSumAxis2 then walks.
+            pooledKV = Tensor(shape: [B, ratio, headDim],
+                              dtype: kvState.dtype,
+                              buffer: kvState.buffer,
+                              offset: kvState.offset)
+            pooledScore = Tensor(shape: [B, ratio, headDim],
+                                  dtype: scoreState.dtype,
+                                  buffer: scoreState.buffer,
+                                  offset: scoreState.offset)
         }
 
         // 4. Softmax along the ratio axis (which is axis=1 of the [B, R, D]
