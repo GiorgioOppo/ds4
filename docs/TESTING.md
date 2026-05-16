@@ -252,8 +252,19 @@ file as `static func referenceCPU(...)`.
 
 ### Desktop app
 
-The `DeepSeekUI` target has no test bundle at all. The recent
-state additions deserve unit coverage:
+`DeepSeekUI` has no test bundle. The recently-added
+`DeepSeekTools` target does — `Tests/DeepSeekToolsTests/`:
+
+  - `ToolRegistryTests.swift` — dispatch happy path on a
+    minimal in-memory tool, plan-mode filter (`.mutating` /
+    `.dangerous` denied without prompting), session permission
+    cache (`allowOnce` → next call doesn't re-prompt), durable
+    `.alwaysAllow` short-circuit.
+  - `SlashCommandTests.swift` — built-in command parser
+    (`/mode plan`, `/skill <name>`, malformed inputs) and the
+    custom command registry path.
+
+What's still uncovered:
 
 - **`OpenRouterClient`** with a mock URLSession:
   - `validateKey` returns 401/403 → throws `unauthorized`.
@@ -283,6 +294,16 @@ state additions deserve unit coverage:
 - **`MCPServerLibrary.importClaudeDesktopJSON`** on a fixture
   payload that exercises both shapes (`{ mcpServers: { … } }` and
   the legacy bare-dict variant).
+- **Each native tool's `run`** on a sandboxed temp directory:
+  `ReadTool` / `WriteTool` / `EditTool` / `ApplyPatchTool` /
+  `GlobTool` / `GrepTool` against a known fixture tree;
+  `RepoOverviewTool` on a fixture with a `Package.swift` +
+  `package.json`. `ShellTool` / `WebFetchTool` / `WebSearchTool`
+  need an injected fake subprocess / `URLProtocol` mock.
+- **`PermissionStore` durable round-trip** — set/get/delete a
+  `<tool>:<category>` rule, ensure it survives an init.
+- **`PlanStore` actor-isolation contract** — concurrent
+  `plan` / `task` / `todo` calls don't corrupt state.
 
 ## 7. How to add a new test
 

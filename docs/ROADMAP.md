@@ -162,6 +162,46 @@ Headline opportunities, none pursued yet:
   in-flight sub-agent (icon, task, streaming buffer, indented by
   depth).
 
+#### Native tools (DeepSeekTools)
+
+- Separate target with the `Tool` protocol, `ToolSchema` builder,
+  `ToolCategory`, `ToolContext`, `ToolError`, an actor-isolated
+  `ToolRegistry` with plan-mode filter + session permission cache,
+  and a `PermissionDelegate` boundary.
+- 14 built-in tools shipped: `read`, `write`, `edit`, `glob`,
+  `grep`, `shell`, `apply_patch`, `webfetch`, `websearch`,
+  `repo_clone`, `repo_overview`, `plan`, `task`, `todo`. `lsp`
+  registered as a stub (throws `.notImplemented`).
+- Smoke tests under `Tests/DeepSeekToolsTests/` for the registry
+  + slash-command parser.
+
+#### Agent operating modes + permission system
+
+- `AgentMode.build` / `.plan` on `AgentConfig`, with the
+  plan-mode filter enforced structurally by
+  `ToolRegistry.availableSchemas(mode:)` (the model never sees
+  the disallowed tools).
+- `PermissionStore` durable map (`<tool>:<category> → ask |
+  alwaysAllow | alwaysDeny`) persisted to `permissions.json`.
+- `PermissionPromptView` SwiftUI modal with three actions
+  (Deny / Allow once / Always allow); "Always allow" writes
+  through to `PermissionStore`.
+- Settings → Permissions tab for editing the durable map +
+  resetting session grants.
+
+#### Skills, slash commands, themes, keybindings
+
+- `SkillLibrary` holds the catalogue (built-ins + custom).
+  `AgentConfig.allowedSkillIDs` restricts which skills the agent
+  can activate.
+- `SlashCommandLibrary` intercepts `/`-prefixed composer input
+  via `SlashCommandPaletteView`. Built-ins: `/mode`, `/tools`,
+  `/permissions`, `/skill`, `/theme`, `/clear`, `/help`.
+- `ThemeStore` drives appearance (light/dark/system + accent +
+  bubble tints) — Settings → Theme tab.
+- `KeybindingStore` overlays per-user shortcuts on top of the
+  built-in `Keybinding` defaults — Settings → Keybindings tab.
+
 #### Projects + Documents
 
 - Per-document tokenisation against the active model's tokenizer
@@ -195,6 +235,42 @@ Headline opportunities, none pursued yet:
 - **Anthropic / OpenAI prompt-caching** via OpenRouter. The
   request body doesn't yet pass the cache-control headers
   Anthropic accepts. Cheap to add, hasn't been a felt need.
+
+- **Wire native tool registry into `InferenceService`.**
+  `NativeToolHost.dispatch` exists but `InferenceService` still
+  only assembles the tools block from MCP. Needs (a) merge of
+  native schemas into the system block / OpenAI `tools` array,
+  (b) routing native names to `NativeToolHost.dispatch`, (c)
+  resolution of `ToolContext.rootDirectory` from the attached
+  project (or the user's home as fallback). Tracked as TODO §8
+  first item.
+
+- **Real `lsp` tool.** Stub registered today; needs to spawn
+  `sourcekit-lsp` for Swift (plus a `pyright` / TS server for the
+  obvious follow-ups), JSON-RPC framing the same way `MCPClient`
+  does it, and operations for `definition` / `hover` /
+  `references` / `diagnostics`.
+
+- **`websearch` real provider.** The default DuckDuckGo lite
+  scraper works but is fragile. Plug Tavily / Brave / Serper /
+  Bing behind a Keychain-stored key.
+
+- **`ShellTool` sandbox profile.** Today the tool can wrap calls
+  in `sandbox-exec` if a profile is provided, but the bundled
+  default profile is deliberately strict. Tuning it for typical
+  dev workflows + flipping the Settings toggle is open.
+
+- **Custom slash commands UI** + per-project `.deepseek/` config
+  (agents / skills / slash commands tracked in the user's repo
+  instead of the global Application Support).
+
+- **Inline keybinding rebind widget** — today Settings → Keys
+  is read-only + reset. Add the key-grab + conflict detection
+  + system-shortcut overwrite confirmation.
+
+- **Custom theme editor** with inline ColorPicker rows for the
+  six theme slots. `ThemeStore` already accepts custom themes
+  via JSON; UI to author them is missing.
 
 #### Engine performance optimisations
 

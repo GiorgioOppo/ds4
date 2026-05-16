@@ -441,6 +441,85 @@ Never written to a plist.
 
 Implementation: `Sources/DeepSeekUI/State/KeychainStore.swift`.
 
+### Native tool
+
+A tool that lives inside the `DeepSeekTools` target and is
+invoked directly by the chat-side `NativeToolHost` (no MCP
+round-trip). Built-ins: `read / write / edit / glob / grep /
+shell / apply_patch / webfetch / websearch / repo_clone /
+repo_overview / lsp (stub) / plan / task / todo`. Compare with
+MCP tools (defined externally, accessed over JSON-RPC).
+
+### Tool category
+
+`enum ToolCategory: readOnly | planning | mutating | dangerous |
+network`. Drives both the plan-mode filter and the permission
+policy. Each tool declares its category on its `ToolSchema`.
+
+### Agent mode (Plan / Build)
+
+`enum AgentMode: build | plan` on `AgentConfig`. Build is the
+historical "every tool eligible, dangerous/mutating ones go
+through consent" stance. Plan filters `.mutating` + `.dangerous`
+tools out of the schema the model sees, leaving the agent
+literally unable to propose them.
+
+Defined in `Sources/DeepSeekTools/AgentMode.swift`; switched per
+chat via the toolbar `ModePickerView` or the `/mode` slash
+command.
+
+### Permission store
+
+Durable `<tool>:<category> → ask | alwaysAllow | alwaysDeny`
+map persisted to `permissions.json`. Consulted by
+`ToolRegistry.dispatch` before the session cache + before the
+modal prompt, so a previously-granted "Always allow" skips the
+sheet.
+
+Implementation: `Sources/DeepSeekUI/State/Tools/PermissionStore.swift`.
+
+### PermissionPromptView
+
+SwiftUI modal sheet the GUI's `PermissionDelegate` opens for
+uncached mutating / dangerous / network tool calls. Three
+actions: **Deny** (one-off refusal), **Allow once** (cache for
+the session), **Always allow** (writes through to
+`PermissionStore`).
+
+### Skill
+
+A reusable bundle of (system prompt addendum, suggested tool
+allowlist, optional default mode). Built-in skills have stable
+UUIDs (`BuiltInSkills`); custom ones can be added under
+Settings → Skills. `AgentConfig.allowedSkillIDs` restricts
+which skills an agent can activate via `/skill <name>`.
+
+### Slash command
+
+User-typed `/`-prefixed text in the composer, intercepted by
+`SlashCommandLibrary` before the inference loop sees it.
+Built-ins: `/mode`, `/tools`, `/permissions`, `/skill`,
+`/theme`, `/clear`, `/help`. The
+`SlashCommandPaletteView` opens inline on `/` keypress.
+
+### NativeToolHost
+
+GUI singleton (`Sources/DeepSeekUI/State/Tools/NativeToolHost.swift`)
+that owns the live `ToolRegistry` + `PlanStore` and bridges the
+registry's `PermissionDelegate` to `PermissionPromptView`. The
+entry point both backends (local + remote) will use to
+dispatch native tools once the InferenceService wiring lands
+(TODO §8 item 1).
+
+### ToolRegistry
+
+Actor in `DeepSeekTools` that holds the active `[Tool]` set +
+the per-`(tool, category)` session permission cache.
+`availableSchemas(mode:)` is the function the chat flow calls to
+populate the tools block sent to the model (plan-mode filter
+applied here); `dispatch(name:input:context:)` is the function
+called when the model emits a tool call.
+
 ## Index (alphabetical)
 
 | Term | One-liner | Defined |
@@ -467,8 +546,17 @@ Implementation: `Sources/DeepSeekUI/State/KeychainStore.swift`.
 | MTLBuffer | Metal's GPU buffer abstraction | §4 |
 | MTP | Multi-Token Prediction speculative head | §1 |
 | Agent (preset) | system prompt + tool allowlist + sampler bundle | §6 |
+| Agent mode (Plan / Build) | coarse build-vs-read-only operating stance | §6 |
 | Cache image | RAM shadow of GPU KV cache for fast-delta | §6 |
 | Delegation | host agent → sub-agent invocation tool | §6 |
+| Native tool | tool that lives in DeepSeekTools (no MCP) | §6 |
+| NativeToolHost | GUI singleton owning ToolRegistry + permission bridge | §6 |
+| PermissionPromptView | modal sheet for tool-call consent | §6 |
+| Permission store | durable always-allow/deny map | §6 |
+| Skill | reusable prompt + tool bundle | §6 |
+| Slash command | composer-intercepted `/`-prefixed command | §6 |
+| Tool category | readOnly / planning / mutating / dangerous / network | §6 |
+| ToolRegistry | actor that filters by mode and dispatches calls | §6 |
 | DSML | DeepSeek markup for tool calls | §5 |
 | Keychain account | per-secret slot under com.deepseek.v4pro | §6 |
 | KV snapshot | value-typed copy of every layer's KV cache | §6 |
