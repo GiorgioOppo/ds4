@@ -1,486 +1,451 @@
 # Istruzioni passo-passo
 
-Guida operativa dal Mac vuoto al primo token generato. Tutto in
-ordine, niente di saltato.
+Guida operativa in italiano dal Mac vuoto al primo token generato.
+Tutto in ordine, niente di saltato.
 
-Se sei già dentro il progetto e cerchi solo i comandi sintetici,
-guarda [`USAGE.md`](USAGE.md). Questa guida è la versione lunga, fatta
-per chi parte da zero.
+Ci sono **tre percorsi** possibili. Scegli quello che fa per te:
+
+- **Solo remoto (OpenRouter)** — la via più veloce. Niente download
+  da 140 GB, niente Apple Silicon richiesta in modo stringente, paghi
+  per token. Vai al [§ 6](#6-percorso-veloce-solo-openrouter).
+- **Solo locale (V4-Flash)** — gira sul Mac, zero costi a regime,
+  serve scaricare i pesi e avere abbastanza RAM. Vai al
+  [§ 2](#2-prepara-i-pesi-del-modello-locale).
+- **Entrambi** — local + remote convivono nello stesso client.
+  L'utente sceglie da un picker nella toolbar al volo. Vai dal
+  [§ 2](#2-prepara-i-pesi-del-modello-locale).
+
+Se sei già dentro il progetto e cerchi solo il riferimento dei
+flag, vai a [`USAGE.md`](USAGE.md). Questa guida è la versione
+lunga, fatta per chi parte da zero.
+
+---
 
 ## Prima di iniziare
 
-Cosa serve avere:
+Cosa serve avere a portata di mano:
 
 - **macOS 14 (Sonoma) o superiore** con processore Apple Silicon
-  (M1, M2, M3, M4 e relative varianti Pro/Max/Ultra). Su Intel Mac il
-  progetto non gira: serve la GPU Apple e il supporto BF16 di Metal 3+.
-- **Xcode 15+** installato. Se non ce l'hai, scaricalo dall'App Store
-  (è gratis), poi apri il Terminale e lancia:
+  (M1, M2, M3, M4 e relative varianti Pro/Max/Ultra). Su Intel Mac
+  il path locale non gira (serve la GPU Apple + supporto BF16 di
+  Metal 3+). Il path OpenRouter funziona comunque.
+- **Xcode 15+** installato. Se non ce l'hai, scaricalo dall'App
+  Store (gratis), poi nel Terminale:
   ```bash
   xcode-select --install
   ```
-- **Spazio libero**: V4-Flash richiede ~140 GB per il release
-  HuggingFace + 140–600 GB per la versione convertita (dipende dal
-  flag `--target-dtype`). Pianifica almeno **300 GB liberi**
-  realisticamente, preferibilmente su un SSD esterno se il tuo disco
-  interno è piccolo.
-- **RAM consigliata**:
-  - 128 GB: V4-Flash gira con paging dal SSD, ~1–3 s/token a regime
-  - 192 GB+: V4-Flash gira fluido, ~0.2–0.5 s/token
-  - Sotto i 64 GB: V4-Flash è troppo grosso. V4-Pro non gira proprio
-    su nessun Mac (è da ~900 GB).
-- **Connessione di rete decente** per scaricare i pesi (~140 GB).
+- **Spazio libero** (solo per il path locale): V4-Flash è ~140 GB
+  in formato HuggingFace nativo. Pianifica almeno **150 GB liberi**,
+  meglio su SSD interno o NVMe esterno veloce.
+- **RAM** (solo per il path locale):
+  - 16 GB: V4-Flash gira con strategia `streaming`, primo token
+    lento (30 s – 3 min), poi tollerabile.
+  - 64 GB: comodo con `mmap`.
+  - 192 GB+: tutto residente (`preload`), velocità massima.
+- **Connessione di rete** decente (per scaricare pesi o usare
+  OpenRouter).
 
-Strumenti aggiuntivi da installare con Homebrew:
+Strumenti aggiuntivi da installare con Homebrew (vai a
+<https://brew.sh> se non ce l'hai):
 
 ```bash
-# Installa Homebrew se non ce l'hai: https://brew.sh
-brew install git-lfs huggingface-cli
-git lfs install
+brew install xcodegen           # serve per generare il progetto Xcode
+brew install huggingface-cli    # serve solo per il download pesi locali
 ```
 
-`git-lfs` serve per scaricare i file grossi del repo HuggingFace.
-`huggingface-cli` è il client ufficiale che gestisce il download dei
-modelli.
+---
 
-## Step 1 — Clona il progetto
+## 1. Clona e compila il progetto
 
-Scegli una cartella di lavoro (l'esempio assume `~/Documents`):
+Scegli una cartella di lavoro (l'esempio usa `~/Documents`):
 
 ```bash
 cd ~/Documents
-git clone https://github.com/giorgiooppo/deepseek-v4-pro-macos.git
-cd deepseek-v4-pro-macos
+git clone https://github.com/giorgiooppo/DeepSeek-V4-Pro-MacOS.git
+cd DeepSeek-V4-Pro-MacOS
 ```
 
-Spostati sul branch con tutte le modifiche più recenti:
-
-```bash
-git checkout claude/convert-to-swift-FJDJC
-```
-
-C'è un piccolo passo manuale: lo script che compila i kernel Metal
-deve essere eseguibile.
+Lo script che compila i kernel Metal deve essere eseguibile (una
+sola volta):
 
 ```bash
 chmod +x Plugins/MetalLibPlugin/build_metallib.sh
 ```
 
-Senza questo, la build successiva fallisce con "Permission denied".
-
-## Step 2 — Compila il progetto
-
-La prima compilazione richiede 5–10 minuti perché Swift deve costruire
-sia il codice Swift sia i 23 file Metal (`.metal`) che vengono
-compilati in `default.metallib`.
+### 1a. Binari CLI
 
 ```bash
 swift build -c release
 ```
 
-Se tutto va bene, vedrai alla fine:
+La prima compilazione è lenta (~5–10 min) perché genera il
+`default.metallib` con tutti gli shader Metal. Produce due binari:
 
-```
-Build complete!
-```
+- `.build/release/deepseek` — inference locale a riga di comando
+- `.build/release/converter` — transcodifica offline dei pesi
 
-Controllo che il file `.metallib` sia stato prodotto:
-
-```bash
-find .build -name "default.metallib"
-```
-
-Deve stamparti almeno un path tipo
-`.build/release/DeepSeekKit_DeepSeekKit.bundle/default.metallib`.
-
-Se viene fuori vuoto, vedi [§Troubleshooting](#troubleshooting) sotto.
-
-A questo punto hai due eseguibili pronti dentro `.build/release/`:
-
-- `converter` — converte il release HuggingFace in formato Mac-friendly
-- `deepseek` — esegue l'inferenza
-
-## Step 3 — Scegli dove salvare il modello
-
-Importantissimo: il modello convertito può essere grande **fino a
-600 GB**. Pianifica dove tenerlo. Tre scenari tipici:
-
-**Scenario A — SSD esterno con tanto spazio**
+### 1b. App GUI (Xcode)
 
 ```bash
-# Esempio: SSD montato in /Volumes/DATA con 1 TB liberi
-INPUT_DIR=/Volumes/DATA/checkpoints/V4-Flash-HF
-OUTPUT_DIR=/Volumes/DATA/checkpoints/V4-Flash-bf16
+./Tools/generate-xcodeproj.sh
+open DeepSeekV4Pro.xcworkspace
 ```
 
-Questo è lo scenario ideale: in più puoi sfruttare al massimo il flag
-`--target-dtype bf16` di default, che è il più veloce in inferenza.
+Nella barra schema in alto a sinistra di Xcode seleziona
+**DeepSeekApp** (NON "DeepSeekUI", che è il target SPM eseguibile).
+Premi ⌘R per compilare e avviare.
 
-**Scenario B — Solo disco interno, poco spazio**
+L'app si apre direttamente sulla schermata della chat. Sopra il
+composer vedi il banner `No model loaded` con l'invito a sceglierne
+uno dalla toolbar — è normale al primo avvio.
 
-Stai sul flag `--target-dtype keep` al momento della conversione
-(output ~140 GB, stessa size dell'input):
+---
 
-```bash
-INPUT_DIR=~/checkpoints/V4-Flash-HF
-OUTPUT_DIR=~/checkpoints/V4-Flash-keep
-```
+## 2. Prepara i pesi del modello locale
 
-L'inferenza sarà più lenta (Metal deve dequantizzare FP4/FP8 ad ogni
-forward), ma funziona.
+> Salta questa sezione se vuoi usare solo OpenRouter — vai al
+> [§ 6](#6-percorso-veloce-solo-openrouter).
 
-**Scenario C — Hai un secondo SSD/Volume**
+### 2.1. Download da HuggingFace
 
-Tieni l'input su un volume e l'output su un altro. Riduci il
-read/write thrashing durante la conversione.
-
-```bash
-INPUT_DIR=/Volumes/DRIVE_A/V4-Flash-HF
-OUTPUT_DIR=/Volumes/DRIVE_B/V4-Flash-bf16
-```
-
-D'ora in avanti uso questi due nomi (`INPUT_DIR`, `OUTPUT_DIR`).
-Sostituisci con i tuoi path concreti.
-
-## Step 4 — Scarica i pesi da HuggingFace
-
-DeepSeek-V4-Flash è ospitato su HuggingFace. Il download è ~140 GB
-suddivisi in ~46 file `.safetensors` più i config e il tokenizer.
+Il checkpoint consigliato è **DeepSeek-V4-Flash** nel formato
+nativo HuggingFace (FP8 + FP4). Il loader Swift legge questo
+formato direttamente, senza conversioni.
 
 ```bash
 huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
-  --local-dir "$INPUT_DIR"
+  --local-dir ~/Downloads/V4-Flash-HF
 ```
 
-Il download impiega 30–60 minuti su una rete media. Puoi interromperlo
-e ri-eseguirlo: `huggingface-cli` riprende automaticamente.
+Il download è di circa 142 GB. Va lasciato lavorare; puoi
+interromperlo e riprenderlo con lo stesso comando.
 
-Verifica che sia andato a buon fine:
+A fine download, nella cartella `~/Downloads/V4-Flash-HF/` devono
+esserci:
 
-```bash
-ls -lh "$INPUT_DIR" | head -20
-```
-
-Devi vedere file come:
-- `config.json` — la configurazione del modello (parametri architetturali)
-- `tokenizer.json` + `tokenizer_config.json` — il tokenizer
-- `model-NNNNN-of-NNNNN.safetensors` — i 46 shard dei pesi (alcuni
-  GB ciascuno)
-
-Se vedi file da **3 byte o 132 byte** invece che da GB, vuol dire che
-`git-lfs` non è configurato e hai scaricato solo i puntatori. Re-fai
-`git lfs install` e ripeti il download.
-
-### Leggi `n_experts` dal config
-
-Il converter ha bisogno di sapere quanti esperti ha il modello (è
-diverso tra V4-Flash e V4-Pro). Sta nel `config.json`:
-
-```bash
-grep -E "n_routed_experts|num_experts" "$INPUT_DIR/config.json"
-```
-
-Per V4-Flash di solito è `256`. Annota il valore — ti serve al passo
-successivo.
-
-## Step 5 — Converti i pesi
-
-Ecco il momento centrale. Il `converter` legge i 46 shard HuggingFace,
-applica i rename (`self_attn → attn` ecc.), fonde i pesi quantizzati
-con le loro scale, e scrive il risultato in shard allineati per layer.
-
-Comando base (default `--target-dtype bf16`, output ~600 GB):
-
-```bash
-.build/release/converter \
-  --hf-ckpt-path "$INPUT_DIR" \
-  --save-path   "$OUTPUT_DIR" \
-  --n-experts   256
-```
-
-Variante per disco piccolo (output ~140 GB, inferenza più lenta):
-
-```bash
-.build/release/converter \
-  --hf-ckpt-path "$INPUT_DIR" \
-  --save-path   "$OUTPUT_DIR" \
-  --n-experts   256 \
-  --target-dtype keep
-```
-
-### Cosa aspettarti durante la conversione
-
-Output tipo:
-
-```
-Converter: 46 input shard(s)
-  target dtype:    bf16 (FP8/FP4+scale fused into native)
-  shard size cap:  5.0 GB
-  sharding:        layer-aligned (top-level + one bucket per layer)
-  note:            FP8 → 2× size, FP4 → 4× size; expect ~3-4× the input footprint.
-Indexing input …
-Collected 69143 tensors plus 44 wo_a scales.
-Discovered structure (from tensor names, no config.json read):
-  top-level tensors:  6
-  layers:             43 (indices 0…42)
-  mtp blocks:         1
-Packing 35020 tensors into 133 shard(s) (layer-aligned; max 5.0 GB/shard)
-  [1/133] model-00001-of-00133.safetensors — 6 tensors, 2.12 GB
-  [2/133] model-00002-of-00133.safetensors — 296 tensors, 5.00 GB
-  …
-Wrote 35020 tensors across 133 shard(s); 567.3 GB total.
-Done.
-```
-
-Tempo di esecuzione:
-- Con `--target-dtype bf16` su M3 Max + SSD esterno veloce: 15–30 minuti.
-- Con `--target-dtype keep`: 5–15 minuti (più veloce, niente fusione).
-- Limite: la velocità di scrittura del SSD di destinazione.
-
-### Se viene interrotto a metà
-
-Pace, il converter è **resume-safe**. Se cade per disk-full,
-ctrl-C, o crash, basta rilanciare lo **stesso comando** con gli
-stessi flag. Vedrai:
-
-```
-Resume: 14/133 shard(s) already on disk (66.0 GB skipped).
-  [15/133] model-00015-of-00133.safetensors — …
-```
-
-Riparte dallo shard 15. **Attenzione**: se cambi `--target-dtype` o
-`--shard-size-gb`, il numero totale di shard cambia e il resume non
-trova match. In quel caso cancella la directory di output e ricomincia.
-
-### Se finisce lo spazio
-
-```
-Swift/ErrorType.swift:254: Fatal error: ... No space left on device
-```
-
-Soluzione: cancella il parziale e ripeti con `--target-dtype keep` (output
-4× più piccolo) o cambia volume di destinazione.
-
-```bash
-rm -rf "$OUTPUT_DIR"
-# poi rilancia il converter con --target-dtype keep o un altro path
-```
-
-## Step 6 — Copia `config.json` nella directory convertita
-
-Il converter copia automaticamente i due file del tokenizer
-(`tokenizer.json`, `tokenizer_config.json`) nella directory di output,
-ma **non** copia `config.json` (perché tecnicamente è opzionale per il
-converter). Il CLI di inferenza invece lo legge, quindi va copiato a
-mano:
-
-```bash
-cp "$INPUT_DIR/config.json" "$OUTPUT_DIR/config.json"
-```
-
-A questo punto `$OUTPUT_DIR/` contiene tutto il necessario:
-
-```bash
-ls "$OUTPUT_DIR"
-```
-
-Devi vedere:
-- `config.json`
-- `tokenizer.json`
-- `tokenizer_config.json`
+- `config.json`, `generation_config.json`
+- `tokenizer.json`, `tokenizer_config.json`
 - `model.safetensors.index.json`
-- ~133 file `model-NNNNN-of-NNNNN.safetensors`
+- 46 shard `model-NNNNN-of-NNNNN.safetensors`
 
-Se vuoi puoi cancellare `$INPUT_DIR/` ora — i pesi convertiti sono
-autosufficienti.
+### 2.2. (Opzionale) Conversione in variante compatta
 
-## Step 7 — Primo run (test di sanità)
+Salta questa sezione se hai abbastanza disco — il path nativo HF è
+più semplice e altrettanto veloce.
 
-Genera un singolo token per verificare che la pipeline funzioni end-to-end:
+Se vuoi una versione INT4 (~160 GB) o INT8 (~290 GB) per risparmiare
+spazio, il binario `converter` la produce:
 
 ```bash
-.build/release/deepseek \
-  "$OUTPUT_DIR" \
-  "Ciao" \
-  --mode chat --max-tokens 1
+.build/release/converter \
+  --hf-ckpt-path ~/Downloads/V4-Flash-HF \
+  --save-path   ~/Downloads/V4-Flash-int4 \
+  --n-experts 256 \
+  --target-dtype int4 \
+  --shard-size-gb 5
 ```
 
-Cosa aspettarti:
+A fine conversione devi copiare manualmente il `config.json` nella
+cartella di output (il converter non lo fa):
 
+```bash
+cp ~/Downloads/V4-Flash-HF/config.json \
+   ~/Downloads/V4-Flash-int4/config.json
 ```
-Loading model … Indexed 35020 tensors across 133 shard(s).
- ready.
-Prompt tokens: 6
+
+Trade-off dei dtype: vedi
+[`USAGE.md § 2.2`](USAGE.md#22-optional-convert-to-a-compact-variant).
+
 ---
-<un singolo token, potrebbe essere quello vero o garbage al primo run>
-```
 
-**Il primo run è il più lento** (10 secondi – 1 minuto), perché l'OS
-deve paginare un sacco di GB dal SSD. I run successivi sono molto più
-veloci perché la page cache è già calda.
+## 3. Carica il modello nella GUI
 
-Se vedi un crash invece dell'output, salta a [§Troubleshooting](#troubleshooting).
+1. Apri l'app (⌘R da Xcode, o doppio-click sull'.app prodotto in
+   `~/Library/Developer/Xcode/DerivedData/.../Build/Products/Debug`).
+2. Nella toolbar in alto, premi il menu **Model** (icona cpu, il
+   primo a sinistra).
+3. Scegli **Choose model folder…** → seleziona la cartella del
+   checkpoint (`~/Downloads/V4-Flash-HF`).
+4. Sopra il composer compare un banner:
+   ```
+   Loading V4-Flash-HF…
+   142 GB across 46 shards · strategy: mmap
+   ```
+   La strategia (`preload` / `mmap` / `streaming`) è scelta
+   automaticamente in base alla RAM disponibile.
+5. Aspetta. Su un Mac da 16 GB il primo caricamento può richiedere
+   diversi minuti perché il sistema deve mappare i pesi dal disco.
+   Quando il banner sparisce, la label del picker mostra il nome
+   della cartella e il pulsante Send si attiva.
+6. La cartella viene ricordata. Al prossimo avvio l'app la
+   ricarica automaticamente.
 
-## Step 8 — Genera testo vero
+Vuoi liberare la RAM senza chiudere l'app? Stesso menu, **Unload
+current model**. La history della chat resta — la chat smette solo
+di rispondere finché non ricarichi un modello.
 
-Adesso il run "serio". 100 token, modalità chat, temperatura 0.7:
+---
 
-```bash
-.build/release/deepseek \
-  "$OUTPUT_DIR" \
-  "Scrivimi una poesia in tre versi sul mare" \
-  --mode chat \
-  --max-tokens 100 \
-  --temperature 0.7
-```
+## 4. Invia il primo messaggio (locale)
 
-In `--mode raw` vedi i token uscire uno alla volta in streaming.
-In `--mode chat` il CLI bufferizza l'intera generazione (per gestire
-correttamente i blocchi `<think>…</think>` se presenti) e poi stampa
-il risultato finale.
+1. Nel composer in basso scrivi una domanda, per esempio:
+   ```
+   Spiegami la fusione nucleare in tre frasi.
+   ```
+2. Premi **Send** (o `⌘↩`).
+3. Sopra il composer compare un indicatore di prefill:
+   ```
+   Prefilling 256 tokens · 12.3s
+   ```
+   Il modello sta elaborando il prompt prima di campionare il primo
+   token. Su Mac da 16 GB con strategia streaming questa fase è
+   lenta (lecture del primo layer da SSD).
+4. I token compaiono uno alla volta nella bolla dell'assistant,
+   con un caret lampeggiante.
+5. Sotto la bolla la **ThroughputBar** mostra:
+   ```
+   Prefill: 256 tok in 8.32s · 1850 tok/min
+   Generation: 42 tok in 9.15s · 275 tok/min
+   ```
+6. Quando il modello finisce, il caret sparisce e compaiono i
+   comandi (Copia, eventuali tool call, eventuale disclosure del
+   reasoning).
 
-Flag che puoi tunare:
+### Cambiare il thinking mode
 
-| Flag | Default | Cosa fa |
+Sopra il composer c'è un picker `🧠 [No think | High | Max]`. Lo
+trovi tra il banner cost e il composer.
+
+- **No think**: il modello risponde direttamente.
+- **High**: il modello produce un blocco `<think>...</think>` prima
+  della risposta. Visibile come disclosure cliccabile (icona
+  cervello).
+- **Max**: come High ma aggiunge anche il blocco `REASONING_EFFORT_MAX`
+  al system prompt.
+
+Il valore è globale (cambia per il prossimo turno) e persistente.
+Se un agente è attaccato alla chat, il picker si blocca sul
+`defaultMode` dell'agente e mostra `🔒 set by <nome agente>`.
+
+### Cambiare i parametri di sampling
+
+Tutti i parametri (temperature, top-K, top-P, ripetition penalty,
+max-tokens) stanno in **Settings (⌘,) → Generation**. Le modifiche
+hanno effetto sul Send successivo.
+
+> **Attenzione.** V4-Flash con `temperature = 0` cade in loop su un
+> singolo token filler. La GUI vincola lo slider a `[0.5, 1.0]`
+> proprio per questo. Il valore consigliato è **0.7**.
+
+---
+
+## 5. Conversazioni multiple e progetti
+
+### Nuova chat
+
+`⌘N` (o clic destro nella sidebar → Nuovo). Ogni chat ha la sua
+storia, indipendente dalle altre.
+
+### Cancellare una chat
+
+Clic destro sulla riga della sidebar → Delete.
+
+### Allegare un "project"
+
+Se vuoi che il modello "ricordi" un set di file di codice o
+documenti in modo permanente per quella chat:
+
+1. **Settings → Documents** → importa i file singoli. L'app li
+   tokenizza una volta sola contro il modello locale corrente.
+2. **Settings → Projects** → crea un project, seleziona i documenti
+   che ti interessano.
+3. Nella toolbar della chat, picker **Project** → scegli il project.
+4. Al primo Send di quella chat, i file del project vengono
+   inseriti nel prompt con i token delimitatori nativi V4 (così il
+   modello li tratta come codice indicizzabile, non come testo
+   libero).
+
+Solo per modelli locali — su OpenRouter i project non sono ancora
+supportati.
+
+---
+
+## 6. Percorso veloce: solo OpenRouter
+
+Se non vuoi scaricare 140 GB di pesi, puoi usare l'app come client
+verso OpenRouter, che ospita Claude, GPT, DeepSeek-R1, Llama, ecc.
+
+### 6.1. Crea una API key
+
+1. Vai su <https://openrouter.ai>, registrati, ricarica credito.
+2. Pagina **Keys** → crea una nuova key. Inizia con `sk-or-...`.
+3. Copiala (sarà visibile solo una volta).
+
+### 6.2. Salvala nell'app
+
+1. App → **⌘,** (Settings) → tab **API Keys**.
+2. Incolla la key nel campo OpenRouter (è un SecureField, non
+   vedrai il contenuto).
+3. **Save**.
+4. (Consigliato) Click su **Test** — chiama `/auth/key` e mostra
+   "Key accepted by OpenRouter" se va tutto bene.
+
+La key viene salvata nel **Keychain di macOS** (servizio
+`com.deepseek.v4pro`, account `openrouter.apiKey`). Non viene mai
+scritta in un plist o in nessun altro file leggibile in chiaro.
+
+### 6.3. Scegli un modello
+
+1. Toolbar della chat → menu **Model** → **Add OpenRouter model…**.
+2. Lo sheet che si apre mostra il catalogo completo di OpenRouter
+   (~300 modelli). La prima volta lo scarica via rete; è cachato in
+   locale per 24 ore.
+3. Usa la barra di ricerca per filtrare: prova `anthropic`,
+   `sonnet`, `deepseek`, `r1`.
+4. Ogni riga mostra: nome, slug provider/modello, dimensione del
+   contesto, prezzi per milione di token (`$X.XX/M in · $Y.YY/M
+   out`) o `free` per i modelli gratuiti.
+5. Click su una riga → l'app valida la API key, poi marca quel
+   modello come attivo. Quasi instantaneo (niente pesi da caricare).
+
+Il modello scelto appare ora sotto **Recent** nel menu Model e
+verrà ricaricato automaticamente al prossimo avvio.
+
+### 6.4. Invia il primo messaggio (remoto)
+
+Identico al flusso locale: scrivi e premi Send. Differenze:
+
+- La latenza del primo token è di 1–3 secondi (dipende dal
+  provider upstream — OpenRouter aggiunge poco overhead).
+- I modelli reasoning (DeepSeek-R1, o-series) emettono il
+  ragionamento in `reasoning_content`, renderizzato nella stessa
+  disclosure cervello dei `<think>` locali.
+- Dopo la risposta, sotto la bolla compare `Turn cost: $0.0042`
+  per quel turno. Sopra il composer un altro banner mostra il
+  totale cumulativo della chat (`Chat total: $0.013`), persistente
+  tra i riavvi.
+
+---
+
+## 7. Agenti e tool
+
+### Definire un agente
+
+1. **Settings → Agents** → premi **+** in basso a sinistra.
+2. Compila:
+   - **Name**: come si chiama (es. `Code reviewer`).
+   - **Summary**: una riga che descrive a cosa serve (es. "Reviews
+     Swift PRs"). Compare nei picker.
+   - **System prompt**: testo libero che diventerà il primo system
+     message di ogni chat a cui questo agente sarà attaccato.
+   - **Default thinking mode**: chat / high / max.
+   - **Sampling defaults**: temperature, top-K, top-P, max-tokens
+     che sovrascrivono gli slider globali.
+   - **Allowed MCP tools**: scegli quali tool MCP questo agente può
+     usare (tutti / nessuno / whitelist esplicita).
+   - Icon + tint per il riconoscimento visivo.
+
+### Attaccare un agente alla chat
+
+Toolbar → picker **Agent** → scegli quello che vuoi. Da quel
+momento, ogni messaggio in quella chat passa attraverso le
+impostazioni dell'agente.
+
+Stacca con **None**.
+
+### Server MCP (Model Context Protocol)
+
+MCP è un protocollo standard per esporre tool al modello (browsing
+filesystem, web search, database, ecc.). Stesso formato config di
+Claude Desktop.
+
+1. **Settings → MCP** → premi **+** in basso a sinistra.
+2. Compila:
+   - **Name**: identificatore arbitrario (es. `filesystem`).
+   - **Command**: es. `npx`.
+   - **Args** (uno per riga): es.
+     ```
+     @modelcontextprotocol/server-filesystem
+     /path/to/files
+     ```
+   - **Env** (chiave=valore, uno per riga): variabili d'ambiente.
+   - **Enabled**: deve essere ON per spawnare il server.
+3. Salva. L'app fa lo spawn del processo, fa l'handshake JSON-RPC,
+   chiede la lista dei tool.
+4. Il footer della riga mostra lo stato: **Connected · N tools**
+   con elenco dei tool disponibili.
+
+Hai un `claude_desktop_config.json` esistente? Importalo con il
+bottone **Import from Claude Desktop config…**.
+
+I tool MCP vengono esposti automaticamente sia ai modelli locali
+(tramite blocchi DSML) che a quelli OpenRouter (tramite array
+`tools` OpenAI-style). Stessa configurazione vale per entrambi.
+
+### Delegation tra agenti
+
+Quando hai due o più agenti registrati, l'agente attaccato a una
+chat riceve automaticamente un tool sintetico chiamato
+`__delegate_to_agent`. Il modello può chiamarlo con
+`{ agent_name: "...", task: "..." }` per affidare un sotto-task a
+un altro agente.
+
+Vedrai la chain di esecuzione in tempo reale in una card sopra il
+composer: ogni livello mostra l'agente target, il task ricevuto, e
+il buffer di risposta che si riempie.
+
+Limiti: nesting massimo 3 livelli, prevenzione cicli automatica
+(un agente già nella chain attiva non può essere richiamato).
+Funziona solo sui modelli locali per ora.
+
+---
+
+## 8. Riepilogo dei menu della toolbar
+
+Da sinistra a destra:
+
+| Icona | Picker | Cosa fa |
 |---|---|---|
-| `--max-tokens N` | 32 | Numero massimo di token generati (si ferma anche su EOS) |
-| `--temperature T` | 1.0 | 0 = greedy (sceglie sempre il più probabile); 0.7–1.0 = sampling con creatività; >1.5 = caotico |
-| `--mode raw\|chat` | chat | `chat` formatta il prompt con BOS + role markers; `raw` lo passa così com'è |
+| cpu / disco / nuvola | **Model** | Cambia backend: cartella locale, modello OpenRouter, Browse, Unload, Add OpenRouter… |
+| variabile | **Agent** | Attacca / stacca un preset agente alla chat corrente. |
+| folder | **Project** | Attacca / stacca un project pre-tokenizzato (solo locale). |
+| bacchetta | **Convert** | Apre lo sheet di quantizzazione offline pesi. |
 
-## Step 9 — Riusa il modello
+---
 
-Ogni volta che vuoi generare di nuovo, basta rilanciare:
+## 9. Risoluzione problemi rapidi
 
-```bash
-.build/release/deepseek "$OUTPUT_DIR" "Una nuova domanda" --mode chat
-```
+| Sintomo | Causa | Soluzione |
+|---|---|---|
+| Build error `MTLLibraryErrorDomain code 6: no default library` | metallib non compilato | rilancia `swift build -c release` e verifica con `find .build -name '*.metallib'` |
+| Build error sui kernel Metal | shell script senza permessi | `chmod +x Plugins/MetalLibPlugin/build_metallib.sh` |
+| Primo token impiega minuti | strategia `streaming` su SSD freddo | normale al primo run; i successivi sono caldi |
+| Il modello locale ripete sempre lo stesso token | sampling con temperature 0 | passa a `--temperature 0.7` da CLI, o la GUI lo vincola già |
+| Chat OpenRouter: "API key not configured" | Keychain vuoto | Settings → API Keys → incolla e Save |
+| OpenRouter 401 / 403 | key invalida / scaduta / credito finito | Settings → API Keys → Test, controlla dashboard OpenRouter |
+| Tool MCP non si eseguono su remoto | server MCP offline | Settings → MCP → controlla che il footer dica "Connected" |
+| Errore "Cannot find type 'MCPClientPool'" dopo `git pull` | xcodeproj fuori sync | rilancia `./Tools/generate-xcodeproj.sh` |
+| Out of memory caricando locale | RAM insufficiente | usa `--load-strategy streaming` o riduci `--max-seq-len 2048` |
 
-Non serve ri-fare la conversione: i file in `$OUTPUT_DIR/` sono
-permanenti.
+Quando qualcosa va male, sopra ogni cosa servono **le ultime ~20
+righe di output prima del crash** e **il comando esatto che hai
+eseguito**.
 
-Se vuoi rendere il comando più ergonomico, aggiungi `.build/release/`
-al PATH della tua shell:
+Lista più completa di errori e cause su
+[`USAGE.md § 6 Troubleshooting`](USAGE.md#6-troubleshooting).
 
-```bash
-# Aggiungi a ~/.zshrc:
-export DEEPSEEK_REPO="$HOME/Documents/deepseek-v4-pro-macos"
-export PATH="$DEEPSEEK_REPO/.build/release:$PATH"
-```
+---
 
-Poi `source ~/.zshrc` e puoi semplicemente fare:
+## 10. Dove continuare
 
-```bash
-deepseek "$OUTPUT_DIR" "Ciao" --mode chat --max-tokens 50
-```
+- [`USAGE.md`](USAGE.md): riferimento conciso di tutti i flag CLI
+  e dei tab Settings.
+- [`EXAMPLES.md`](EXAMPLES.md): ricette pronte all'uso — codice di
+  esempio per estendere l'app.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): come è organizzato il
+  codice (engine + UI + backend).
+- [`MODULES.md`](MODULES.md): mappa file-per-file del progetto.
+- [`DEVELOPING.md`](DEVELOPING.md): convenzioni e workflow per
+  contribuire.
 
-## Troubleshooting
-
-### "no default library was found" / MTLLibraryErrorDomain 6
-
-Il metallib non è stato compilato. Ricontrolla:
-
-```bash
-chmod +x Plugins/MetalLibPlugin/build_metallib.sh
-swift build -c release
-find .build -name "*.metallib"
-```
-
-Se il plugin script non si esegue, può essere un problema di
-permessi macOS — guarda Privacy & Security → Developer Tools nelle
-preferenze di sistema.
-
-### "config.json not found"
-
-Hai dimenticato il passo 6. Copia il file:
-
-```bash
-cp "$INPUT_DIR/config.json" "$OUTPUT_DIR/config.json"
-```
-
-### "all safetensors files … were LFS pointers"
-
-Il `git lfs` non è configurato e hai scaricato solo i puntatori da 3
-righe invece dei veri pesi. Fix:
-
-```bash
-git lfs install
-rm -rf "$INPUT_DIR"
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash --local-dir "$INPUT_DIR"
-```
-
-### "No space left on device"
-
-Sei senza spazio su disco. Cancella il parziale e ripeti con un
-target più compatto o un altro volume.
-
-```bash
-df -h        # vedi quanto spazio hai dove
-rm -rf "$OUTPUT_DIR"
-# Ripeti il converter con --target-dtype keep o cambia --save-path
-```
-
-### "N tensor name(s) were not found"
-
-Alcuni tensor non hanno match nei nomi attesi. Se sono tanti, il
-modello non riuscirà a generare bene (vengono inizializzati random).
-Possibili cause:
-
-- Hai mescolato V4-Flash e V4-Pro nella stessa directory
-- Il release HuggingFace ha cambiato schema di naming
-
-Manda il primo log significativo e si aggiusta `Assembly.swift` con
-fallback aggiuntivi.
-
-### Primo token impiega tantissimo (> 60 secondi)
-
-Normale per la prima run, l'OS deve fault-in i pesi dal SSD. Se
-persiste al secondo run, controlla con Activity Monitor:
-
-- **Memory pressure** > 50% → la RAM è satura, il modello swap-pa di
-  continuo. Soluzione: usa V4-Flash con `--target-dtype keep`
-  invece di bf16 (meno memoria), o se non basta, V4-Flash è troppo
-  grosso per il tuo Mac.
-- **Disk I/O alto continuo** → il SSD è il bottleneck. Se è un SSD
-  esterno via USB-C lento, prova a spostare i pesi su quello interno
-  o uno Thunderbolt.
-
-### Output garbage / loop di un token
-
-Probabili cause:
-
-- `--temperature 0` + prompt strano → il modello entra in loop greedy.
-  Prova `--temperature 0.7`.
-- La conversione è incompleta (vedi "N tensor name(s) were not
-  found"). Le predizioni con pesi random sono sostanzialmente rumore.
-
-### "MLA decode expects seqlen == 1" o altri precondition
-
-Bug nel CLI loop. Manda l'output completo e il comando preciso che
-hai eseguito.
-
-## Cosa puoi fare dopo
-
-- **Sperimenta con il sampling**: `--temperature` da 0 a 1.5,
-  combinazioni di top-K/top-P sono nel codice di
-  `Sources/DeepSeekKit/Sampling.swift`.
-- **Modifica il prompt di sistema**: il CLI usa la modalità chat di
-  default. Per istruzioni più strutturate vedi
-  [`EXAMPLES.md` §7](EXAMPLES.md#7-encode-a-chat-message-with-tool-calls).
-- **Capisci cosa c'è dentro**: parti da
-  [`ARCHITECTURE.md`](ARCHITECTURE.md) e
-  [`GLOSSARY.md`](GLOSSARY.md). Se vuoi modificare codice,
-  [`DEVELOPING.md`](DEVELOPING.md) ha le ricette.
-- **Performance**: il progetto è "correctness-first" — non è ancora
-  ottimizzato. Vedi [`PERFORMANCE.md`](PERFORMANCE.md) per i
-  bottleneck attuali e per dove c'è margine.
-
-## Riferimenti rapidi
-
-| Hai bisogno di… | Vai a |
-|---|---|
-| Tutti i flag del converter / deepseek | [`USAGE.md`](USAGE.md) |
-| Capire un termine (MLA, FP4, RoPE, …) | [`GLOSSARY.md`](GLOSSARY.md) |
-| Capire l'architettura del modello | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
-| Esempi di codice Swift | [`EXAMPLES.md`](EXAMPLES.md) |
-| Mappa file-per-file dei sorgenti | [`MODULES.md`](MODULES.md) |
-| Tutti i passi commit-by-commit | `git log --oneline` |
+Buon hacking.
