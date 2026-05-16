@@ -115,15 +115,21 @@ public enum TokenizerLoader {
                 configModelType = cfg["model_type"] as? String
             }
         }
+        // DSV4 wins over a generic Jinja template even when one is
+        // present: EncodingDSV4 wraps additional logic beyond message
+        // rendering (REASONING_EFFORT_MAX prompt, tools block,
+        // `<｜tool▁outputs｜>` post-processing) that the Jinja-only
+        // path does not reproduce. Future non-V4 models still pick up
+        // their own chat_template.
         let isV4 = isDSV4(modelType: configModelType, tokenizerData: try? Data(contentsOf: tokJSON))
         let template: ChatTemplate
         let templateIsDSV4: Bool
-        if let src = jinjaTemplateSource, !src.isEmpty {
-            template = try JinjaChatTemplate(src)
-            templateIsDSV4 = false
-        } else if isV4 {
+        if isV4 {
             template = DSV4Template()
             templateIsDSV4 = true
+        } else if let src = jinjaTemplateSource, !src.isEmpty {
+            template = try JinjaChatTemplate(src)
+            templateIsDSV4 = false
         } else {
             throw TokenizerError.unsupportedType(
                 "no chat_template in tokenizer_config.json and model is not DSV4"
