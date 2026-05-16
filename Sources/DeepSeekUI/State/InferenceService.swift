@@ -61,6 +61,70 @@ final class InferenceService: @unchecked Sendable {
     }
     private var cacheImage: CacheImage?
 
+    /// Holds the snapshot + CacheImage captured around an active
+    /// sub-agent delegation. The host's KV cache is snapshotted
+    /// into RAM before the sub-agent runs (which would otherwise
+    /// clobber the buffers + invalidate `cacheImage`), and
+    /// restored verbatim when the host resumes — so the host
+    /// agent's next turn keeps the fast-delta path instead of
+    /// paying a cold prefill.
+    ///
+    /// Keyed by an opaque UUID returned to the caller; entries are
+    /// drained on `endDelegation`. The map size stays bounded as
+    /// long as begin/end calls pair up — if the app dies between
+    /// the two, the map is in RAM only and goes away with it.
+    private var savedDelegations: [UUID: (KVCacheSnapshot, CacheImage?)] = [:]
+
+    /// Snapshot the transformer's KV cache + the `cacheImage`
+    /// shadow that tracks it, returning an opaque token to pass to
+    /// `endDelegation` after the sub-agent run is done. Returns
+    /// nil when no model is loaded (caller should run the
+    /// sub-agent un-snapshotted in that case — there's nothing
+    /// to preserve).
+    ///
+    /// O(cache bytes) — for V4 with windowSize 4096 that's a few
+    /// hundred MB of RAM held until `endDelegation`. Only call it
+    /// around real delegations, not as a "save point" pattern.
+    func beginDelegation() async -> UUID? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<UUID?, Never>) in
+            q.async {
+                guard let model = self.transformer else {
+                    cont.resume(returning: nil); return
+                }
+                let snap = model.snapshotKVCache()
+                let token = UUID()
+                self.savedDelegations[token] = (snap, self.cacheImage)
+                cont.resume(returning: token)
+            }
+        }
+    }
+
+    /// Wipe the sub-agent's pollution from the live KV cache and
+    /// re-populate it from the snapshot taken at `beginDelegation`,
+    /// also restoring the `cacheImage` so subsequent fast-path
+    /// matching sees the host's pre-delegation prefix. No-op when
+    /// the token is unknown (e.g. begin returned nil, or the
+    /// caller paired tokens wrong).
+    func endDelegation(_ token: UUID) async {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Void, Never>) in
+            q.async {
+                guard let saved = self.savedDelegations.removeValue(forKey: token)
+                else { cont.resume(returning: ()); return }
+                guard let model = self.transformer else {
+                    // Model was unloaded mid-delegation — nothing
+                    // to restore into. Drop the snapshot.
+                    cont.resume(returning: ()); return
+                }
+                model.releaseCache()
+                model.restoreKVCache(saved.0)
+                self.cacheImage = saved.1
+                cont.resume(returning: ())
+            }
+        }
+    }
+
     /// Snapshot of the active tokenizer for read-only use outside the
     /// generation path (e.g. the document import flow). Reads the
     /// stored reference on the serial queue so it never races a load.

@@ -825,23 +825,34 @@ final class ChatStore: ObservableObject {
         return await runSubAgentToCompletion(agent: agent, task: task)
     }
 
-    /// Drive a sub-agent to completion: keep emitting tool calls
-    /// + tool outputs until the model produces a turn with no
-    /// further calls (= final reply) or the per-delegation cap is
-    /// hit. The sub-agent sees only its own allowed MCP tools —
-    /// no `__delegate_to_agent` schema is injected, so sub-agents
-    /// can't recursively delegate further (no depth-of-depth
-    /// cascade to bound).
+    /// Drive a sub-agent to completion, wrapped in a snapshot /
+    /// restore pair so the host agent's KV cache survives the
+    /// delegation intact. The snapshot path is best-effort — if
+    /// `beginDelegation` returns nil (no model loaded, somehow)
+    /// the run still happens, just without the preservation
+    /// benefit.
     ///
-    /// Mechanics: after every `.done` with non-empty toolCalls we
-    /// invoke the tools through `mcpPool.invokeQualified`, build
-    /// the `<eos><tool_outputs>…<Assistant>` delta with
-    /// `tokenizeToolOutputsDelta`, append to (prompt + generated),
-    /// and loop with the same `subID` so the CacheImage matches
-    /// from the second iteration onwards (only the first round
-    /// pays the cold prefill).
+    /// All exit paths from the inner loop go back through
+    /// `endDelegation` so a thrown / early-returned sub-agent
+    /// doesn't leak the snapshot in `InferenceService.savedDelegations`.
     private func runSubAgentToCompletion(agent: AgentConfig,
                                           task: String) async -> String {
+        let snapToken = await service.beginDelegation()
+        let result = await runSubAgentToCompletionInner(
+            agent: agent, task: task)
+        if let token = snapToken {
+            await service.endDelegation(token)
+        }
+        return result
+    }
+
+    /// Inner loop — see `runSubAgentToCompletion` for the wrapper
+    /// that owns the snapshot/restore around it. Keep this function
+    /// pure in the sense that every exit returns a String (no
+    /// throw, no continuation leak) so the wrapper can always pair
+    /// its `endDelegation`.
+    private func runSubAgentToCompletionInner(agent: AgentConfig,
+                                                task: String) async -> String {
         let mode = ThinkingMode(rawValue: agent.defaultMode) ?? .chat
         let opts = SamplingOptions(
             temperature: Float(min(1.0, max(0.5, agent.temperature))),
