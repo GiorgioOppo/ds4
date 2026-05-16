@@ -206,39 +206,59 @@ struct ChatView: View {
         else { return }
         let text = draft
         draft = ""
-        // Clamp temperature into the supported [0.5, 1.0] range in case
-        // an older @AppStorage value (default used to be 1.0, slider
-        // used to span 0…2) is still on disk for a user who never
-        // touched the Settings tab.
-        let clampedT = min(1.0, max(0.5, temperature))
-        let opts = SamplingOptions(
-            temperature: Float(clampedT),
-            topK: topK, topP: Float(topP),
-            repetitionPenalty: Float(repPenalty))
-        let mode: ThinkingMode = (modeRaw == "max")  ? .max
-                                : (modeRaw == "high") ? .high
-                                : .chat
-        store.send(text: text, mode: mode,
-                    options: opts, maxTokens: maxTokens)
+        let resolved = resolveSampling()
+        store.send(text: text,
+                    mode: resolved.mode,
+                    options: resolved.options,
+                    maxTokens: resolved.maxTokens)
     }
 
     /// Restart a previously-interrupted generation. Reuses the same
-    /// sampler / max-tokens that drive `sendCurrent` — there's no
-    /// per-turn sampling settings persistence yet, so resuming an
-    /// old reply with a different temperature than it was started
-    /// at is technically possible. In practice the sampler runs on
-    /// each token independently so this rarely produces a visible
-    /// stylistic seam.
+    /// sampler / max-tokens that drive `sendCurrent` — including
+    /// the attached agent's defaults when one is set — so a
+    /// resumed reply continues with the same parameters.
     private func resumeCurrent() {
         guard let id = store.selectedID else { return }
-        let clampedT = min(1.0, max(0.5, temperature))
-        let opts = SamplingOptions(
-            temperature: Float(clampedT),
-            topK: topK, topP: Float(topP),
-            repetitionPenalty: Float(repPenalty))
+        let resolved = resolveSampling()
         store.resumePendingTurn(of: id,
-                                  options: opts,
-                                  maxTokens: maxTokens)
+                                  options: resolved.options,
+                                  maxTokens: resolved.maxTokens)
+    }
+
+    /// Compose the sampling configuration for this turn. The
+    /// attached agent (when set) overrides every Generation-tab
+    /// slider — its values were chosen for *this* agent's
+    /// behaviour, and silently mixing them with whatever the user
+    /// last touched in the global tab would produce confusing
+    /// generations. The Generation tab acts as a fallback for
+    /// chats with no agent attached and as the global default for
+    /// fresh chats.
+    private func resolveSampling() -> (mode: ThinkingMode,
+                                         options: SamplingOptions,
+                                         maxTokens: Int) {
+        let agent = store.selectedConversation?.agentID
+            .flatMap { store.agents.agent(id: $0) }
+
+        // Sliders write to AppStorage in a slightly wider range
+        // than the model accepts; clamp into the supported
+        // [0.5, 1.0] window so an out-of-band value from an older
+        // build doesn't crash the sampler.
+        let temp = agent?.temperature ?? temperature
+        let tp   = agent?.topP        ?? topP
+        let tk   = agent?.topK        ?? topK
+        let rp   = agent?.repetitionPenalty ?? repPenalty
+        let mt   = agent?.maxTokens   ?? maxTokens
+        let modeStr = agent?.defaultMode ?? modeRaw
+
+        let clampedT = min(1.0, max(0.5, temp))
+        let options = SamplingOptions(
+            temperature: Float(clampedT),
+            topK: tk, topP: Float(tp),
+            repetitionPenalty: Float(rp))
+        let mode: ThinkingMode = (modeStr == "max")  ? .max
+                                : (modeStr == "high") ? .high
+                                : .chat
+        return (mode, options, mt)
     }
 }
 
