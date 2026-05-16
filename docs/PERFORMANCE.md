@@ -249,6 +249,56 @@ between requests avoids the allocation overhead.
 
 Not on the critical path for the current CLI.
 
+### MLA multi-token forward with `startPos > 0` (high impact for tool-heavy turns)
+
+Today `MLA.callAsFunction` enforces `precondition(S == 1)` when
+`startPos > 0` — the decode path is single-token only. After a
+tool call the chat builds an `<eos><tool_outputs>…<Assistant>`
+delta of ~30-100 tokens and feeds them back through the model. The
+current loop calls the forward N times (~12-15 s on a 50k-context
+chat) instead of one multi-token forward (~1-2 s).
+
+Refactor:
+1. Drop the precondition (or hide it behind an opt-in
+   `Transformer.allowMultiTokenWithOffset` flag for safety).
+2. Add a branch in MLA's KV-blit for `S > 1, startPos > 0`: writes
+   `S` consecutive rows starting at `slot = startPos % windowSize`,
+   wrap-around when needed.
+3. `Compressor.forwardDecode` with `S > 1, startPos > 0`: an inner
+   loop of `S` steps is safe and cheap; a vectorised version is
+   higher-risk.
+4. Verify `SparseAttention.apply` produces the right causal mask
+   for `S > 1, startPos > 0` (likely already correct, but this is
+   the part to validate first).
+
+Estimated effort: 1-2 days. Highest single perf win for
+tool-heavy chats and for the delegation loop (since each
+delegation's tool round-trips also pay this cost).
+
+### KV snapshot/restore (already shipped)
+
+`Transformer.snapshotKVCache` / `restoreKVCache` (B2) wrap each
+sub-agent delegation in `ChatStore.runSubAgentToCompletion`. Cost:
+one `memcpy` per layer's KV buffer per begin (~few hundred MB on
+V4-Flash with `windowSize 4096`), released on end. Saves the cold
+re-prefill the host would otherwise pay when the sub-agent run
+trashes the GPU's KV cache.
+
+No optimisation backlog here — it's not on a hot path
+(delegations are a sub-second-amortised user action).
+
+### KV cache persistence to disk (B3, not started)
+
+Goal: a project-attached chat reopens after an app restart
+without paying the prefill of the project context again.
+
+Design space: file format (parallel to safetensors?), eviction
+policy, model-fingerprint invalidation (a different model
+loaded would render the cache garbage), shard size /
+write-amplification trade-off.
+
+Estimated effort: 1-2 weeks for a sound first cut.
+
 ## 6. Cold vs warm timing
 
 The first forward is fundamentally slower than steady-state because

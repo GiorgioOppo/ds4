@@ -330,6 +330,117 @@ Begin- and end-of-sentence special tokens. In DeepSeek-V4:
 
 Plus the role markers `<｜User｜>` and `<｜Assistant｜>`.
 
+## 6. Desktop app + multi-agent
+
+### MCP — Model Context Protocol
+
+Anthropic-originated protocol for connecting LLMs to external tool
+providers ("servers"). Each server exposes a list of tools with
+JSON-Schema signatures over JSON-RPC 2.0; this app speaks the
+stdio transport (newline-framed JSON). Same config shape as
+Claude Desktop's `mcpServers`.
+
+Implementation: `Sources/DeepSeekUI/State/MCPClient.swift` +
+`Sources/DeepSeekUI/State/MCPServerLibrary.swift`.
+
+### Agent (preset)
+
+Named bundle of (system prompt + MCP tool allowlist + sampling
+defaults + default thinking mode + cosmetics) that can be attached
+to a `Conversation` from the toolbar. When attached, the agent's
+fields override the global Generation-tab sliders for that chat.
+
+Implementation: `Sources/DeepSeekUI/State/AgentLibrary.swift`.
+
+### Sub-agent delegation
+
+When ≥ 2 agents are registered, the chat's host agent receives a
+synthetic tool called `__delegate_to_agent` with a roster of every
+other agent. Calling it spawns a sub-agent run in isolation
+(separate `conversationID`, fresh KV cache after snapshot/restore
+of the host's cache, own bounded tool-call loop). Cap: 3 nesting
+levels, cycle prevention via a chain of in-flight agentIDs.
+
+Implementation: `ChatStore.executeSubAgentDelegation` ▸
+`dispatchDelegation` ▸ `runSubAgentToCompletion`.
+
+### KV snapshot / restore
+
+`Transformer.snapshotKVCache()` produces a value-typed copy of
+every layer's KV cache buffers (~few-hundred-MB RAM); paired
+`restoreKVCache(_:)` writes them back. Used around sub-agent
+delegations so the host doesn't pay a cold re-prefill when the
+sub returns. `InferenceService.beginDelegation` /
+`endDelegation` wrap the snapshot map in a per-token opaque API.
+
+### Cache image (fast-delta path)
+
+In-RAM shadow of what's currently in the GPU KV cache:
+`{ conversationID, tokens, mode }`. When the next prompt starts
+with `tokens` and runs against the same `conversationID + mode`,
+the prefill phase only processes the trailing delta instead of
+re-prefilling the whole prompt. Reset whenever a different
+conversation or mode arrives.
+
+Implementation: `InferenceService.CacheImage`.
+
+### Pending turn (crash resume)
+
+`Conversation.pendingTurn` is a snapshot of an in-flight
+assistant turn (prompt token ids + ids sampled so far + mode).
+Written on every Send, cleared on `.done`. If the app dies
+mid-stream, the chat surface shows a Resume banner that re-fires
+the same generation. Local-only — remote chats just re-send the
+user message.
+
+### OpenRouter
+
+OpenAI-compatible API gateway at `https://openrouter.ai/api/v1`
+that routes to ~300 models from Anthropic / OpenAI / DeepSeek /
+Meta / Mistral / others. The app's remote backend targets it
+specifically.
+
+Implementation: `Sources/DeepSeekUI/State/OpenRouterAPI.swift` +
+`OpenRouterCatalog.swift`.
+
+### SSE — Server-Sent Events
+
+Plain-text streaming protocol over HTTP. OpenRouter streams chat
+completions as `data: { … json … }\n\n` chunks ended by
+`data: [DONE]`. Parsed via `URLSession.bytes(for:).lines` so the
+chat sees the first token without buffering the whole reply.
+
+### Reasoning content
+
+For DeepSeek-R1 and OpenAI o-series, the model emits its
+chain-of-thought in a separate `reasoning_content` field instead
+of inline in the prose. Local models use `<think>...</think>`
+tags; both end up on `Message.reasoningContent` and render through
+the brain-icon disclosure.
+
+### Tool call / tool output
+
+Tool call: structured request from the model
+(`{ name, arguments }`) for the host to invoke an MCP tool or the
+synthetic delegation tool. Tool output: the (textual) reply the
+host splices back into the prompt for the model's next turn.
+
+Local wire format: `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` for
+calls; native `<｜tool▁outputs▁begin｜>…<｜tool▁outputs▁end｜>` for
+outputs.
+Remote wire format: OpenAI `tool_calls: [{ id, function: { name,
+arguments } }]` for calls; `{ role: "tool", tool_call_id, content }`
+messages for outputs.
+
+### Keychain account
+
+This app stores secrets (today: just the OpenRouter API key)
+under the macOS Keychain. Service name `com.deepseek.v4pro`;
+each secret is keyed by a string account (`openrouter.apiKey`).
+Never written to a plist.
+
+Implementation: `Sources/DeepSeekUI/State/KeychainStore.swift`.
+
 ## Index (alphabetical)
 
 | Term | One-liner | Defined |
@@ -355,13 +466,25 @@ Plus the role markers `<｜User｜>` and `<｜Assistant｜>`.
 | MoE | Mixture-of-Experts FFN | §1 |
 | MTLBuffer | Metal's GPU buffer abstraction | §4 |
 | MTP | Multi-Token Prediction speculative head | §1 |
+| Agent (preset) | system prompt + tool allowlist + sampler bundle | §6 |
+| Cache image | RAM shadow of GPU KV cache for fast-delta | §6 |
+| Delegation | host agent → sub-agent invocation tool | §6 |
+| DSML | DeepSeek markup for tool calls | §5 |
+| Keychain account | per-secret slot under com.deepseek.v4pro | §6 |
+| KV snapshot | value-typed copy of every layer's KV cache | §6 |
+| MCP | Model Context Protocol (tool servers) | §6 |
 | nope_head_dim | non-rotary part of each head | §3 |
+| OpenRouter | OpenAI-compatible API gateway | §6 |
+| Pending turn | crash-resume snapshot of an in-flight turn | §6 |
 | QAT | Quantization-Aware Training noise | §2 |
+| Reasoning content | model chain-of-thought field | §6 |
 | RoPE | Rotary Position Embedding | §3 |
 | rope_head_dim | rotary part of each head (64) | §3 |
 | safetensors | HF tensor file format | §4 / [MEMORY](MEMORY.md) |
 | simdgroup_matrix | Metal SIMD matrix instructions | §4 / [PERFORMANCE](PERFORMANCE.md) |
 | Sliding window | KV cache ring of size `window_size` | §1 |
 | Sparse attention | FlashAttention over topk_idxs subset | §1 |
+| SSE | Server-Sent Events streaming | §6 |
+| Tool call / output | structured invoke + reply round-trip | §6 |
 | `ue8m0` | round-to-power-of-2 scale format | §2 |
 | YaRN | RoPE frequency scaling for long context | §3 |

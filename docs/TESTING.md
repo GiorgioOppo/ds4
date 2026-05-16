@@ -215,7 +215,7 @@ file as `static func referenceCPU(...)`.
 
 ## 6. What's NOT tested
 
-These would belong here but aren't yet implemented:
+### Engine
 
 - **End-to-end forward against Python reference** — Tier 3 deferred
   (`docs/ROADMAP.md` T3.4). Needs PyTorch + CUDA to dump activations
@@ -241,6 +241,48 @@ These would belong here but aren't yet implemented:
 - **Sampler.sample** with non-trivial options — the multinomial /
   top-P / top-K paths aren't unit-tested. Empirically validated via
   CLI runs.
+- **`EncodingDSV4` on the golden corpus** under
+  `Reference/encoding/`. Tool-call DSML emit + parse + the
+  `__delegate_to_agent` synthetic schema have no token-by-token
+  comparison vs the Python reference.
+- **`Transformer.snapshotKVCache` / `restoreKVCache`** round-trip —
+  the buffer copy + slot-shape match path isn't covered. Today the
+  proof is "sub-agent delegation works in the chat", which is
+  indirect.
+
+### Desktop app
+
+The `DeepSeekUI` target has no test bundle at all. The recent
+state additions deserve unit coverage:
+
+- **`OpenRouterClient`** with a mock URLSession:
+  - `validateKey` returns 401/403 → throws `unauthorized`.
+  - `fetchModels` deserialises a fixture payload into
+    `[OpenRouterModel]`.
+  - `streamChatCompletion` parses a fixture SSE stream into the
+    right sequence of `OpenAIStreamChunk`s (incl. heartbeats /
+    `[DONE]` / partial JSON skipping).
+- **`MCPClient`** with a Swift-inline mock stdio server:
+  - Handshake (`initialize` + `notifications/initialized` +
+    `tools/list`) finalises `status == .connected(toolCount: N)`
+    with the parsed tools.
+  - `tools/call` round-trip flattens the typed `content` array
+    into a string.
+  - A bogus JSON-RPC error finishes the awaiting continuation
+    with `.rpc(code:message:)`.
+- **`ChatStore.runRemoteLoop`** with a stub backend:
+  - Single-iteration happy path: tool_calls empty → marks idle,
+    stamps `usage.completionTokens` / `usage.total_cost`.
+  - Multi-iteration: emits tool_calls iter 1, MCP returns a
+    canned output, iter 2 finalises. Verifies the placeholder
+    swap + new placeholder append happen in order.
+  - Cap hit: 9 iterations → phase becomes `.error` with the
+    truncation message.
+- **`KeychainStore`** round-trip — set/get/delete/exists on a
+  unique account scoped to the test bundle.
+- **`MCPServerLibrary.importClaudeDesktopJSON`** on a fixture
+  payload that exercises both shapes (`{ mcpServers: { … } }` and
+  the legacy bare-dict variant).
 
 ## 7. How to add a new test
 
