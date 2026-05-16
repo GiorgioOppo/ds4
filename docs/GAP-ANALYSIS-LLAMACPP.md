@@ -366,8 +366,9 @@ potrebbe ragionevolmente avere entrambi installati.
    sblocca integrazione esterna.
 2. **`simdgroup_matrix` BF16 GEMM** — 5–10× su ogni Linear.
 3. **MLA multi-token con `startPos > 0`** — 5–10× sui turn tool-heavy.
-4. **Min-P + frequency/presence penalty** — quick wins di parità
-   sampling.
+4. ✅ **Min-P + frequency/presence penalty + mirostat + tail-free +
+   typical** — chiuso. Vedi `Sources/DeepSeekKit/Sampling.swift` e
+   `Tests/DeepSeekKitTests/SamplerTests.swift`.
 5. **Grammar-constrained decoding (subset JSON schema)** — feature
    killer per output strutturati.
 6. **GPTQ/AWQ calibrato per INT4/INT8** — quality win sulle
@@ -377,5 +378,32 @@ potrebbe ragionevolmente avere entrambi installati.
 8. **KV cache persistence to disk** — già in roadmap (B3).
 9. **FlashAttention tiling per sparse_attn** — 3–5× sull'attention.
 
-Punti 2, 3, 8, 9 sono già in `TODO.md`/`ROADMAP.md`. Punti 1, 4, 5, 6,
-7 sono **nuovi** che emergono dal confronto con llama.cpp.
+Punti 2, 3, 8, 9 sono già in `TODO.md`/`ROADMAP.md`. Punti 1, 5, 6,
+7 sono **nuovi** che emergono dal confronto con llama.cpp. Punto 4
+chiuso.
+
+---
+
+## 17. Stato di chiusura dei gap (post-PR `gap-analysis-llama-cpp`)
+
+Riepilogo dei gap chiusi o portati a MVP da questo branch:
+
+| Area | Stato | File principali |
+|---|---|---|
+| Sampling: min-p / mirostat v2 / tail-free / typical / freq+presence penalty | ✅ Chiuso | `Sources/DeepSeekKit/Sampling.swift`, `Tests/DeepSeekKitTests/SamplerTests.swift` |
+| CLI flags per sampling | ✅ Chiuso | `Sources/deepseek/main.swift` (8 nuovi flag) |
+| Tokenizer dispatcher | ✅ Chiuso | `Sources/DeepSeekKit/Tokenizer.swift` |
+| SentencePiece tokenizer (.model) | ✅ MVP (unigram + byte-fallback, Viterbi) | `Sources/DeepSeekKit/SentencePieceTokenizer.swift` |
+| WordPiece tokenizer | ✅ Chiuso | `Sources/DeepSeekKit/WordPieceTokenizer.swift` |
+| Chat template engine (subset Jinja2) | ✅ Chiuso | `Sources/DeepSeekKit/Encoding/JinjaTemplate.swift` |
+| `ChatTemplate` protocol + `DSV4Template` wrapper byte-identical | ✅ Chiuso | `Sources/DeepSeekKit/Encoding/{ChatTemplate,DSV4Template,JinjaChatTemplate}.swift` |
+| GGUF file format reader | ⚠️ MVP header-only (no dequant kernels) | `Sources/DeepSeekKit/{GGUF,GGUFLoader}.swift`, `docs/GGUF.md` |
+
+Restano aperti (ROI calcolato a parte):
+
+- HTTP server OpenAI-compatible — blocker per integrazione esterna.
+- GBNF / grammar-constrained decoding.
+- Q4_0 / Q4_K / Q8_0 dequant kernels per finire il loader GGUF
+  (vedi `docs/GGUF.md`).
+- Llama / Mistral / Qwen architectures nel forward pass — senza,
+  il loader GGUF è puramente diagnostico.
