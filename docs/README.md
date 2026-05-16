@@ -1,95 +1,102 @@
 # DeepSeek-V4-Pro-MacOS — Documentation
 
-Swift + Metal port of DeepSeek-V4 (Pro & Flash variants) inference for
-Apple Silicon. The model is a 1.6T-param (Pro) / 284B-param (Flash) MoE
-with FP4 + FP8 mixed-precision weights. This project converts the
-HuggingFace checkpoint into a Mac-friendly format, then runs token
-generation natively on Metal.
+Swift + Metal port of DeepSeek-V4 (Pro & Flash variants) for Apple
+Silicon, plus a native SwiftUI desktop client that also drives
+remote OpenAI-compatible models through OpenRouter.
 
-## Quick start
+Where to start depends on what you came here for.
 
-```bash
-# 1. Build (the first time compiles all 23 Metal kernels into default.metallib).
-chmod +x Plugins/MetalLibPlugin/build_metallib.sh
-swift build -c release
+## Reading order
 
-# 2. Convert a HuggingFace checkpoint to BF16 sharded.
-.build/release/converter \
-  --hf-ckpt-path /Volumes/DATA/V4-Flash-HF \
-  --save-path   /Volumes/DATA/V4-Flash-bf16 \
-  --n-experts 256        # from config.json
-
-# 3. Stage config.json for the runtime.
-cp /Volumes/DATA/V4-Flash-HF/config.json /Volumes/DATA/V4-Flash-bf16/
-
-# 4. Run inference.
-.build/release/deepseek /Volumes/DATA/V4-Flash-bf16 \
-  "Ciao" --mode chat --max-tokens 50
-```
-
-**Step-by-step guide from scratch (Italian, tutorial style)**:
-[`ISTRUZIONI.md`](ISTRUZIONI.md). For flag reference + troubleshooting:
-[`USAGE.md`](USAGE.md).
+- **Just want to run it.**
+  [`../README.md`](../README.md) (English) or
+  [`../README.it.md`](../README.it.md) (Italiano) →
+  [`USAGE.md`](USAGE.md) for the flag reference and the OpenRouter
+  setup walkthrough → [`EXAMPLES.md`](EXAMPLES.md) for ready-made
+  recipes.
+- **Want to understand it.**
+  [`ARCHITECTURE.md`](ARCHITECTURE.md) for the big picture (engine
+  layer + desktop app layer + remote backend) →
+  [`GLOSSARY.md`](GLOSSARY.md) for the jargon →
+  [`DTYPES.md`](DTYPES.md) and [`MEMORY.md`](MEMORY.md) for the
+  on-device specifics.
+- **Want to modify it.**
+  [`ARCHITECTURE.md`](ARCHITECTURE.md) → [`MODULES.md`](MODULES.md)
+  for the per-file map → [`DEVELOPING.md`](DEVELOPING.md) →
+  [`TESTING.md`](TESTING.md). Dip into [`PERFORMANCE.md`](PERFORMANCE.md)
+  when a perf concern lands.
 
 ## Document index
-
-Open these in order if you're new to the project; pick directly if you
-already know what you need.
 
 | Doc | When to read |
 |---|---|
 | [`ISTRUZIONI.md`](ISTRUZIONI.md) | **Tutorial passo-passo (italiano)** dal Mac vuoto al primo token. Inizia da qui se è la prima volta. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture: data flow, module dependency graph, memory model, where Metal kernels sit vs Swift wrappers. **Read this before any source file.** |
-| [`GLOSSARY.md`](GLOSSARY.md) | One-stop reference for every domain term used in the source (MLA, MoE, HC, FP4-E2M1, E8M0, RoPE, YaRN, DSML, …). |
-| [`USAGE.md`](USAGE.md) | Reference completo dei flag CLI, resume after crash, troubleshooting checklist. |
-| [`EXAMPLES.md`](EXAMPLES.md) | Code recipes: load a tensor, dispatch a kernel, add a new Layer, generate a token, parse a chat completion. |
-| [`MODULES.md`](MODULES.md) | Per-file reference for `Sources/`. Purpose + public API + dependencies of every Swift file. Use as a directory index. |
+| [`USAGE.md`](USAGE.md) | Operational reference: CLI flags, GUI walkthrough, OpenRouter onboarding, troubleshooting checklist. |
+| [`EXAMPLES.md`](EXAMPLES.md) | Recipes: send a message via OpenRouter, register an MCP server, define an agent that delegates, dispatch a Metal kernel, load a tensor. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture: engine data flow, the macOS app's state graph (`InferenceService` / `ModelState` / `ChatStore`), backend dispatch between local and OpenRouter. **Read this before any source file.** |
+| [`GLOSSARY.md`](GLOSSARY.md) | One-stop reference for every domain term in the source (MLA, MoE, FP4-E2M1, E8M0, RoPE, YaRN, DSML, MCP, …). |
+| [`MODULES.md`](MODULES.md) | Per-file reference for `Sources/`. Purpose + public API + dependencies of every Swift file. |
 | [`KERNELS.md`](KERNELS.md) | Per-kernel reference for `Sources/DeepSeekKit/Kernels/*.metal`. Inputs, outputs, dispatch shape, function-constant indices. |
 | [`DTYPES.md`](DTYPES.md) | Bit layouts of FP8/FP4/E8M0/BF16/F16/F32, conversion math, fusion at convert time. |
 | [`MEMORY.md`](MEMORY.md) | mmap strategy, page-cache behavior, KV cache + Compressor state lifecycle, footprint per phase. |
-| [`TESTING.md`](TESTING.md) | The 15 XCTest files, what each verifies, how to add a new one, tolerance choices. |
-| [`DEVELOPING.md`](DEVELOPING.md) | Contributor guide: setup, conventions, recipes to add kernel/layer/CLI flag, common pitfalls we hit. |
-| [`PERFORMANCE.md`](PERFORMANCE.md) | Where time goes today, profiling instructions, planned optimizations with effort estimates. |
+| [`TESTING.md`](TESTING.md) | The XCTest target — what each file verifies, how to add a new one, tolerance choices. |
+| [`DEVELOPING.md`](DEVELOPING.md) | Contributor guide: setup, conventions, recipes (add a kernel / add a CLI flag / add a remote backend / wire a new MCP transport), common pitfalls. |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | Where time goes today, profiling instructions, planned optimisations with effort estimates. |
 | [`PYTHON-MAPPING.md`](PYTHON-MAPPING.md) | Cross-walk: Swift file → `Reference/inference/{model,kernel,convert}.py` line ranges. |
 | [`ROADMAP.md`](ROADMAP.md) | What's implemented, what's stubbed, what's deferred and why. |
-| [`../TODO.md`](../TODO.md) | Living checklist of outstanding work, grouped by area (parity, runtime, encoding, perf, docs, testing). |
-
-## Reading order
-
-Three paths depending on why you're here:
-
-- **Operativo (just want to run it)**: [README](README.md) →
-  [ISTRUZIONI](ISTRUZIONI.md) (start here, full Italian walkthrough) →
-  [USAGE](USAGE.md) (flag reference) → [EXAMPLES](EXAMPLES.md) →
-  [ROADMAP](ROADMAP.md#known-limitations) for the gotchas.
-- **Architetturale (want to understand it)**: [README](README.md) →
-  [ARCHITECTURE](ARCHITECTURE.md) → [GLOSSARY](GLOSSARY.md) →
-  [DTYPES](DTYPES.md) → [MEMORY](MEMORY.md).
-- **Contributore (want to modify it)**: [README](README.md) →
-  [ARCHITECTURE](ARCHITECTURE.md) → [MODULES](MODULES.md) →
-  [DEVELOPING](DEVELOPING.md) → [TESTING](TESTING.md). When you hit a
-  perf concern, dip into [PERFORMANCE](PERFORMANCE.md).
+| [`../TODO.md`](../TODO.md) | Living checklist of outstanding work, grouped by area. |
 
 ## Repository layout
 
 ```
 DeepSeek-V4-Pro-MacOS/
-├── Package.swift                  SwiftPM manifest, MetalLibPlugin wired in here
+├── Package.swift                  SwiftPM manifest; MetalLibPlugin wired in here
+├── project.yml                    XcodeGen spec for the GUI app target
 ├── Plugins/MetalLibPlugin/        Build-tool plugin that compiles .metal → default.metallib
 ├── Sources/
 │   ├── DeepSeekKit/               Library: all model + tensor + IO logic
-│   │   ├── *.swift                Top-level types (Config, Tensor, Device, ...)
-│   │   ├── Encoding/              Chat encoder (port of encoding_dsv4.py)
+│   │   ├── *.swift                Top-level types (Config, Tensor, Device, KV snapshot, …)
+│   │   ├── Encoding/              Chat encoder / decoder (port of encoding_dsv4.py)
 │   │   ├── Kernels/               Metal shaders (.metal)
 │   │   └── Layers/                Swift wrappers around the kernels + composition
-│   ├── deepseek/                  CLI: token generation
-│   └── converter/                 CLI: HF safetensors → Mac-friendly format
+│   ├── DeepSeekUI/                SwiftUI desktop app
+│   │   ├── State/                 InferenceService, ChatStore, ModelState,
+│   │   │                          AgentLibrary, MCPClientPool, OpenRouter*, …
+│   │   ├── Views/                 Chat surface, Settings tabs, sheets, pickers
+│   │   ├── Utility/               AppSettings, PersistencePaths, MarkdownText
+│   │   └── Resources/             Info.plist, Assets.xcassets
+│   ├── deepseek/                  CLI: local token generation
+│   └── converter/                 CLI: HF safetensors → on-disk variants (BF16/INT8/INT4/INT2)
 ├── Tests/DeepSeekKitTests/        XCTest target; one *Tests.swift per kernel/module
 ├── Reference/                     Upstream Python (read-only, source of truth)
 │   ├── inference/                 model.py, kernel.py, generate.py, convert.py
 │   └── encoding/                  encoding_dsv4.py + golden tests
 └── docs/                          (you are here)
 ```
+
+## Two backends, one chat surface
+
+The desktop app accepts both **local** (Metal) and **remote**
+(OpenRouter HTTP/SSE) endpoints through the same chat. Switching
+between them is a toolbar menu action; conversations don't have to
+care which one they're using, but a few features only work on one
+side:
+
+| | Local | OpenRouter |
+|---|---|---|
+| Token-level KV cache + fast-delta path | ✅ | n/a (provider-side) |
+| Tool calls via MCP | ✅ | ✅ |
+| Sub-agent delegation | ✅ | not yet |
+| KV snapshot/restore around delegation | ✅ | n/a |
+| Reasoning content (`<think>` / `reasoning_content`) | ✅ | ✅ for R1 / o-series |
+| Projects (pre-tokenised codebase splice) | ✅ | n/a |
+| Crash recovery via `pendingTurn` | ✅ | ❌ (resend the message) |
+| Cost banner | n/a | ✅ |
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md#desktop-app-backend-dispatch)
+for how `ChatStore.send` decides which path to take, and
+[`USAGE.md`](USAGE.md#remote-models) for the OpenRouter onboarding
+flow.
 
 ## License
 
