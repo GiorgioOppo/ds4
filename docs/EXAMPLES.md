@@ -13,6 +13,7 @@ For step-by-step CLI workflows (build, convert, run), see
 
 | Recipe | Section | Difficulty |
 |---|---|---|
+| **Engine** | | |
 | Load a Tensor from safetensors | §1 | trivial |
 | Dispatch a Metal kernel manually | §2 | trivial |
 | Linear with f32 / BF16 / FP8 weight | §3 | easy |
@@ -22,6 +23,12 @@ For step-by-step CLI workflows (build, convert, run), see
 | Encode a chat message with tool calls | §7 | easy |
 | Inspect converted output | §8 | easy |
 | FAQ: what if I want to … | §9 | — |
+| **Desktop app** | | |
+| Add an OpenRouter API key from code | §10 | trivial |
+| Stream a one-shot completion via OpenRouter | §11 | easy |
+| Register an MCP server programmatically | §12 | easy |
+| Define an agent that delegates to another agent | §13 | medium |
+| Sources | §14 | — |
 
 ## 1. Load a Tensor from safetensors
 
@@ -536,7 +543,175 @@ swift test -c release
 15 test classes; should all pass. Add yours before submitting
 significant kernel changes.
 
-## 10. Sources
+## 10. Add an OpenRouter API key from code
+
+Normal flow is the Settings → API Keys tab, but the same Keychain
+slot is reachable from `KeychainStore`. Useful for fixtures /
+one-off scripts.
+
+```swift
+import DeepSeekKit
+// (or whichever module-mapping you set up — KeychainStore lives in
+// the app target, so you'd vendor it into a test bundle to use it
+// outside of the app.)
+
+try KeychainStore.set("sk-or-v1-…",
+                       account: KeychainAccount.openRouterAPIKey)
+
+// Read it back from anywhere on the same Mac (the macOS Keychain
+// keeps it per-user, not per-process):
+let key = KeychainStore.get(account: KeychainAccount.openRouterAPIKey)
+
+// Forget it (Settings → API Keys → Delete equivalent):
+try KeychainStore.delete(account: KeychainAccount.openRouterAPIKey)
+```
+
+## 11. Stream a one-shot completion via OpenRouter
+
+Minimal driver: no chat history, no tools. Useful for a quick
+"does this model do what I expect?" probe outside the chat
+surface.
+
+```swift
+let client = OpenRouterClient()
+let body: [String: Any] = [
+    "model": "anthropic/claude-3.5-sonnet",
+    "messages": [
+        ["role": "user", "content": "Write a haiku about Metal shaders."]
+    ],
+    "temperature": 0.7,
+    "max_tokens": 80,
+    "usage": ["include": true]
+]
+
+let stream = client.streamChatCompletion(apiKey: key, body: body)
+
+var buf = ""
+do {
+    for try await chunk in stream {
+        if let delta = chunk.choices.first?.delta?.content {
+            buf.append(delta)
+            print(delta, terminator: "")
+        }
+        if let usage = chunk.usage {
+            print("\n→ cost: $\(usage.totalCost ?? 0)")
+        }
+    }
+} catch {
+    print("openrouter failed: \(error.localizedDescription)")
+}
+```
+
+To validate a key without spending any tokens:
+
+```swift
+try await client.validateKey(key)        // throws on 401/403
+let models = try await client.fetchModels(apiKey: key)
+print("OpenRouter knows \(models.count) models")
+```
+
+## 12. Register an MCP server programmatically
+
+The MCP servers tab does this through the library; the same path
+is reachable from code if you need to scaffold N servers from a
+script (e.g. seeding a clean install).
+
+```swift
+let library = MCPServerLibrary()    // loads mcp.json from disk
+let pool = MCPClientPool()
+pool.attach(to: library)
+
+library.add(MCPServerConfig(
+    name: "filesystem",
+    command: "npx",
+    args: ["@modelcontextprotocol/server-filesystem",
+           "/Users/me/Documents/scratch"],
+    env: [:],
+    enabled: true))
+
+pool.librarySynced(library)
+
+// Wait for the JSON-RPC handshake. In production this is observed
+// reactively in the UI; in a script we poll the pool's per-server
+// status:
+while true {
+    let client = pool.client(forServer: library.servers.first!.id)!
+    if case .connected = client.status { break }
+    try await Task.sleep(nanoseconds: 200_000_000)
+}
+
+let tools = pool.allTools().map(\.qualifiedName)
+print("Exposed: \(tools)")
+```
+
+Importing an existing Claude Desktop config is one call:
+
+```swift
+let json = try Data(contentsOf:
+    URL(fileURLWithPath: "/Users/me/Library/Application Support/Claude/claude_desktop_config.json"))
+let added = try library.importClaudeDesktopJSON(json)
+print("Imported \(added) servers")
+pool.librarySynced(library)
+```
+
+## 13. Define an agent that delegates to another agent
+
+Agents are persisted under `agents.json`. From the GUI this is
+Settings → Agents → +. Programmatically:
+
+```swift
+let agents = AgentLibrary()
+
+// Worker agent: code-search specialist, only filesystem tools.
+let searcher = AgentConfig(
+    name: "Code Searcher",
+    summary: "Greps the user's project files",
+    systemPrompt: """
+        You are a code-search specialist. You can read files from
+        the user's working directory. Always cite the path of any
+        file you reference.
+        """,
+    allowedToolNames: ["filesystem__read_file",
+                       "filesystem__list_directory"],
+    defaultMode: "chat",
+    temperature: 0.5,
+    iconName: "magnifyingglass",
+    tint: "purple")
+agents.add(searcher)
+
+// Orchestrator: no MCP tools (it delegates instead), high reasoning.
+let orchestrator = AgentConfig(
+    name: "Architect",
+    summary: "Designs systems by delegating focused look-ups",
+    systemPrompt: """
+        You are an architect. You don't read files directly —
+        delegate that to "Code Searcher" and synthesise the
+        answer.
+        """,
+    allowedToolNames: [],         // explicit "no MCP tools"
+    defaultMode: "high",
+    temperature: 0.7,
+    iconName: "compass.drawing",
+    tint: "blue")
+agents.add(orchestrator)
+```
+
+In the chat: attach **Architect** from the toolbar picker. When you
+ask it a code question, the system block carries the synthetic
+`__delegate_to_agent` schema with **Code Searcher** as a delegable
+option. The Architect emits
+`{ agent_name: "Code Searcher", task: "List + read every .swift in …" }`,
+the worker runs in isolation through `runSubAgentToCompletion`, its
+reply comes back as a tool output, and the Architect synthesises
+the final answer.
+
+The live delegation appears as a pinned card above the composer
+with the worker's icon + the streaming buffer.
+
+Nesting cap is 3 levels; the chain (`[hostID, agent.id, …]`) is
+checked on every dispatch to refuse cycles.
+
+## 14. Sources
 
 - All recipes here exercise public API documented in
   [MODULES.md](MODULES.md) and kernels listed in [KERNELS.md](KERNELS.md).
