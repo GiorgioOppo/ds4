@@ -31,6 +31,8 @@ struct SettingsScene: Scene {
                     .tabItem { Label("Projects", systemImage: "folder") }
                 MCPServersView(library: mcp, pool: mcpPool)
                     .tabItem { Label("MCP", systemImage: "server.rack") }
+                APIKeysSettingsTab()
+                    .tabItem { Label("API Keys", systemImage: "key") }
                 StorageSettingsTab()
                     .tabItem { Label("Storage", systemImage: "externaldrive") }
             }

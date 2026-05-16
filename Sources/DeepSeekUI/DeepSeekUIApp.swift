@@ -18,6 +18,7 @@ struct DeepSeekUIApp: App {
     @StateObject private var agents: AgentLibrary
     @StateObject private var modelLibrary: ModelLibrary
     @StateObject private var modelState: ModelState
+    @StateObject private var openRouterCatalog: OpenRouterCatalog
 
     init() {
         let service = InferenceService()
@@ -38,6 +39,7 @@ struct DeepSeekUIApp: App {
         self._modelLibrary = StateObject(wrappedValue: lib)
         self._modelState = StateObject(wrappedValue:
             ModelState(service: service, library: lib))
+        self._openRouterCatalog = StateObject(wrappedValue: OpenRouterCatalog())
     }
 
     var body: some Scene {
@@ -48,7 +50,8 @@ struct DeepSeekUIApp: App {
                          mcpPool: mcpPool,
                          agents: agents,
                          modelLibrary: modelLibrary,
-                         modelState: modelState)
+                         modelState: modelState,
+                         openRouterCatalog: openRouterCatalog)
                 .frame(minWidth: 720, minHeight: 480)
                 .task {
                     // Auto-resume the most recently used model on

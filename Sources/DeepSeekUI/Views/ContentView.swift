@@ -17,6 +17,7 @@ struct ContentView: View {
     @ObservedObject var agents: AgentLibrary
     @ObservedObject var modelLibrary: ModelLibrary
     @ObservedObject var modelState: ModelState
+    @ObservedObject var openRouterCatalog: OpenRouterCatalog
 
     var body: some View {
         ChatContainer(
@@ -29,7 +30,8 @@ struct ContentView: View {
             projects: projects,
             agents: agents,
             modelLibrary: modelLibrary,
-            modelState: modelState)
+            modelState: modelState,
+            openRouterCatalog: openRouterCatalog)
     }
 }
 
@@ -42,6 +44,7 @@ struct ChatContainer: View {
     @ObservedObject var agents: AgentLibrary
     @ObservedObject var modelLibrary: ModelLibrary
     @ObservedObject var modelState: ModelState
+    @ObservedObject var openRouterCatalog: OpenRouterCatalog
 
     @State private var showConvert: Bool = false
 
@@ -54,7 +57,8 @@ struct ChatContainer: View {
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
                         ModelPicker(modelState: modelState,
-                                     library: modelLibrary)
+                                     library: modelLibrary,
+                                     catalog: openRouterCatalog)
                     }
                     ToolbarItem(placement: .navigation) {
                         agentPicker
@@ -163,6 +167,9 @@ struct ChatContainer: View {
 private struct ModelPicker: View {
     @ObservedObject var modelState: ModelState
     @ObservedObject var library: ModelLibrary
+    @ObservedObject var catalog: OpenRouterCatalog
+
+    @State private var showAddOpenRouter: Bool = false
 
     var body: some View {
         Menu {
@@ -209,6 +216,11 @@ private struct ModelPicker: View {
                     Label("Choose model folder…",
                            systemImage: "folder.badge.plus")
                 }
+                Button {
+                    showAddOpenRouter = true
+                } label: {
+                    Label("Add OpenRouter model…", systemImage: "cloud")
+                }
                 if modelState.isReady {
                     Button(role: .destructive) {
                         Task { await modelState.unload() }
@@ -230,6 +242,10 @@ private struct ModelPicker: View {
             label
         }
         .help(helpText)
+        .sheet(isPresented: $showAddOpenRouter) {
+            AddOpenRouterModelSheet(catalog: catalog,
+                                     modelState: modelState)
+        }
     }
 
     @ViewBuilder
