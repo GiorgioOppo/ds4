@@ -67,6 +67,17 @@ final class ChatStore: ObservableObject {
     /// failure mode of a model that keeps calling tools forever.
     private var toolRoundtrips: [UUID: Int] = [:]
     private let maxToolRoundtripsPerTurn: Int = 8
+    /// How many *levels* of sub-agent invocation are allowed past
+    /// the host. Cap = N means the host can delegate (level 1),
+    /// that sub can delegate (level 2), … up to level N. A
+    /// sub-agent at level N does NOT receive the
+    /// `__delegate_to_agent` schema in its tools block, so the
+    /// limit is enforced structurally. Cycle prevention via
+    /// `chain` adds a second layer of safety: an agent already in
+    /// the call stack can't be delegated to again, regardless of
+    /// depth. With cap=3 the worst-case memory is 3 KV-snapshots
+    /// in RAM at once (~few-hundred-MB each).
+    private let maxDelegationDepth: Int = 3
     /// Sampler parameters captured at the start of `send`; reused
     /// by `runToolCallsAndContinue` so a tool-output continuation
     /// inherits the same temperature / topK / topP / maxTokens
@@ -622,6 +633,14 @@ final class ChatStore: ObservableObject {
             // and an interleaved fan-out doesn't buy much. Errors
             // are flattened into the output text by `invokeQualified`
             // so this loop never throws.
+            // Seed the cycle-prevention chain with whatever agent
+            // currently drives this conversation — that way a
+            // delegated sub can't loop back and delegate to the
+            // host itself. The chain is then extended at each
+            // nesting level by `runSubAgentToCompletion`.
+            let hostAgentID = self.conversations
+                .first(where: { $0.id == id })?.agentID
+
             var outputs: [String] = []
             outputs.reserveCapacity(calls.count)
             for call in calls {
@@ -629,9 +648,10 @@ final class ChatStore: ObservableObject {
                 if call.name == EncodingDSV4.delegateToolName {
                     // Synthetic "delegate to another agent" tool.
                     // Handled in-process (no MCP server involved) by
-                    // spawning a one-shot sub-agent run.
+                    // spawning a sub-agent run.
                     result = await self.executeSubAgentDelegation(
-                        argsJSON: call.args)
+                        argsJSON: call.args,
+                        hostAgentID: hostAgentID)
                 } else {
                     result = await pool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -794,21 +814,39 @@ final class ChatStore: ObservableObject {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Run one delegation: spawn a sub-agent (isolated
-    /// conversation id, free to use its own MCP tools subject to
-    /// its allowlist, bounded internal tool-call loop) and return
-    /// its final assistant content as the tool output the host
-    /// agent will receive.
+    /// Host-level entry point: invoked from the chat's tool-call
+    /// loop when the model emits `__delegate_to_agent`. Seeds the
+    /// chain with the host's own agentID so cycles back through
+    /// the host are refused, then hands off to `dispatchDelegation`
+    /// — the same helper sub-agents use for their own (nested)
+    /// delegate calls.
+    private func executeSubAgentDelegation(argsJSON: String,
+                                            hostAgentID: UUID?) async -> String {
+        let initialChain: [UUID] = hostAgentID.map { [$0] } ?? []
+        return await dispatchDelegation(argsJSON: argsJSON,
+                                          depth: 1,
+                                          chain: initialChain)
+    }
+
+    /// Parse a delegation tool-call payload (`{ agent_name, task }`),
+    /// resolve the target agent, enforce both the structural
+    /// depth cap and the chain-membership cycle check, and run the
+    /// resolved agent through `runSubAgentToCompletion`. Used by
+    /// both the host (via `executeSubAgentDelegation`) and the
+    /// nested case (sub-agent's loop discovers a delegate call in
+    /// `runSubAgentToCompletionInner`).
     ///
-    /// Trade-off: the sub-agent runs on the same model, sharing
-    /// the single KV cache slot. The CacheImage in InferenceService
-    /// won't match the sub-agent's prompt prefix, so it'll
-    /// releaseCache + cold-prefill the sub-agent — and when the
-    /// host agent resumes, its cached prefix is gone too. A future
-    /// step could snapshot+restore the host's cache around the
-    /// delegation (B2 already gives us the API) but for now we
-    /// accept the extra prefill.
-    private func executeSubAgentDelegation(argsJSON: String) async -> String {
+    /// Errors are flattened into "[error: …]" strings instead of
+    /// thrown so the in-loop tool-output splice always has data
+    /// to feed the model. The model can self-correct on a refused
+    /// delegation by trying a different agent or just answering
+    /// directly.
+    private func dispatchDelegation(argsJSON: String,
+                                     depth: Int,
+                                     chain: [UUID]) async -> String {
+        if depth > maxDelegationDepth {
+            return "[error: max delegation depth (\(maxDelegationDepth)) reached]"
+        }
         guard let data = argsJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
@@ -822,24 +860,38 @@ final class ChatStore: ObservableObject {
         guard let agent = agents.agents.first(where: { $0.name == agentName }) else {
             return "[error: no agent named '\(agentName)' is registered]"
         }
-        return await runSubAgentToCompletion(agent: agent, task: task)
+        if chain.contains(agent.id) {
+            return "[error: agent '\(agentName)' is already in the delegation chain — refused to avoid a cycle]"
+        }
+        return await runSubAgentToCompletion(
+            agent: agent, task: task,
+            depth: depth, chain: chain)
     }
 
     /// Drive a sub-agent to completion, wrapped in a snapshot /
-    /// restore pair so the host agent's KV cache survives the
+    /// restore pair so the caller's KV cache survives the
     /// delegation intact. The snapshot path is best-effort — if
     /// `beginDelegation` returns nil (no model loaded, somehow)
     /// the run still happens, just without the preservation
     /// benefit.
     ///
+    /// `depth` is the level this sub-agent runs at (1 = first
+    /// hop from the host). `chain` is the list of agentIDs
+    /// already live on the call stack; the wrapper extends it
+    /// with `agent.id` before passing to the inner so the
+    /// cycle-prevention check covers the sub-agent itself too.
+    ///
     /// All exit paths from the inner loop go back through
     /// `endDelegation` so a thrown / early-returned sub-agent
     /// doesn't leak the snapshot in `InferenceService.savedDelegations`.
     private func runSubAgentToCompletion(agent: AgentConfig,
-                                          task: String) async -> String {
+                                          task: String,
+                                          depth: Int,
+                                          chain: [UUID]) async -> String {
         let snapToken = await service.beginDelegation()
         let result = await runSubAgentToCompletionInner(
-            agent: agent, task: task)
+            agent: agent, task: task,
+            depth: depth, chain: chain + [agent.id])
         if let token = snapToken {
             await service.endDelegation(token)
         }
@@ -851,8 +903,17 @@ final class ChatStore: ObservableObject {
     /// pure in the sense that every exit returns a String (no
     /// throw, no continuation leak) so the wrapper can always pair
     /// its `endDelegation`.
+    ///
+    /// `chain` here already includes this sub-agent's id (the
+    /// wrapper appended it). When the depth is still under the
+    /// cap, the sub-agent gets its own `__delegate_to_agent`
+    /// schema with the roster of agents *not* in the chain — so
+    /// it can hand off further, but never back through an
+    /// already-active agent.
     private func runSubAgentToCompletionInner(agent: AgentConfig,
-                                                task: String) async -> String {
+                                                task: String,
+                                                depth: Int,
+                                                chain: [UUID]) async -> String {
         let mode = ThinkingMode(rawValue: agent.defaultMode) ?? .chat
         let opts = SamplingOptions(
             temperature: Float(min(1.0, max(0.5, agent.temperature))),
@@ -860,10 +921,15 @@ final class ChatStore: ObservableObject {
             topP: Float(agent.topP),
             repetitionPenalty: Float(agent.repetitionPenalty))
 
-        // Sub-agent sees its own filtered MCP catalogue — no
-        // delegation tool, no project context.
-        let toolJson = mcpPool.toolSchemasJSON(
-            allowedNames: agent.allowedToolNames)
+        // Composed schema: sub-agent's allowed MCP tools, plus the
+        // delegate tool (with a roster of every agent not already
+        // on the call stack) when we haven't hit the depth cap.
+        let delegableAgents: [AgentConfig] = (depth < maxDelegationDepth)
+            ? agents.agents.filter { !chain.contains($0.id) }
+            : []
+        let toolJson = composeToolSchemasJSON(
+            mcpAllowed: agent.allowedToolNames,
+            delegableAgents: delegableAgents)
 
         guard var promptTokens = await service.tokenizeFullHistory(
             [Message(role: .user, content: task)],
@@ -913,14 +979,23 @@ final class ChatStore: ObservableObject {
                 return lastContent
             }
 
-            // Sub-agent emitted tool calls — execute them. Only
-            // MCP routing here; the delegate tool isn't in the
-            // sub-agent's schema set so it can't appear.
+            // Sub-agent emitted tool calls — execute them. Route
+            // delegate calls back through `dispatchDelegation`
+            // (recursive nesting, bounded by depth + chain) and
+            // everything else through the MCP pool.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
             for call in final.toolCalls {
-                let out = await mcpPool.invokeQualified(
-                    call.name, argsJSON: call.args)
+                let out: String
+                if call.name == EncodingDSV4.delegateToolName {
+                    out = await dispatchDelegation(
+                        argsJSON: call.args,
+                        depth: depth + 1,
+                        chain: chain)
+                } else {
+                    out = await mcpPool.invokeQualified(
+                        call.name, argsJSON: call.args)
+                }
                 outputs.append(out)
             }
 
