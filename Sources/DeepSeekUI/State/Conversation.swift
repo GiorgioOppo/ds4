@@ -136,6 +136,12 @@ struct Conversation: Codable, Identifiable, Hashable {
     /// "Generation" sliders still win at send time. Optional for
     /// BWC with older on-disk JSON.
     var agentID: UUID?
+    /// Sum of `usage.total_cost` reported by OpenRouter (in USD)
+    /// across every assistant turn in this chat. Optional for BWC
+    /// with on-disk JSON written before remote support existed;
+    /// nil → "we've never charged anything to a remote provider
+    /// for this chat" (could mean local-only or just brand new).
+    var cumulativeCostUSD: Double?
     /// Tokenized form of the entire conversation up to (and
     /// including) the last assistant turn's eos. This is the
     /// canonical chat history — text bodies in `messages` are a
@@ -165,6 +171,7 @@ struct Conversation: Codable, Identifiable, Hashable {
          messages: [StoredMessage] = [],
          projectID: UUID? = nil,
          agentID: UUID? = nil,
+         cumulativeCostUSD: Double? = nil,
          encodedTokens: [Int32]? = nil,
          lastEncodedMode: String? = nil,
          pendingTurn: PendingTurn? = nil) {
@@ -172,6 +179,7 @@ struct Conversation: Codable, Identifiable, Hashable {
         self.modelDirPath = modelDirPath; self.messages = messages
         self.projectID = projectID
         self.agentID = agentID
+        self.cumulativeCostUSD = cumulativeCostUSD
         self.encodedTokens = encodedTokens
         self.lastEncodedMode = lastEncodedMode
         self.pendingTurn = pendingTurn

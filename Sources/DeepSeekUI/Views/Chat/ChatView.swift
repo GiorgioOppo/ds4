@@ -88,6 +88,21 @@ struct ChatView: View {
             // in progress / load failed). Collapses to EmptyView
             // when a model is ready.
             modelStateBanner
+            // Cumulative-cost banner for remote chats. Hidden for
+            // local chats (cost is nil) and for fresh remote chats
+            // that haven't billed anything yet.
+            if let total = c.cumulativeCostUSD, total > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "dollarsign.circle")
+                        .foregroundStyle(.secondary)
+                    Text("Chat total: \(ThroughputBar.formatUSD(total))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 4)
+            }
             // Live delegation chain: pinned above the composer so
             // the user can watch sub-agents work without losing
             // sight of either the transcript above or the input
@@ -385,7 +400,8 @@ private struct ThroughputBar: View {
         let hasPrefill = metrics.promptTokens > 0
         let hasGen = metrics.generatedTokens > 0
         let hasStatus = !status.isEmpty
-        if hasPrefill || hasGen || hasStatus {
+        let hasCost = metrics.turnCostUSD != nil
+        if hasPrefill || hasGen || hasStatus || hasCost {
             VStack(alignment: .leading, spacing: 2) {
                 if hasPrefill {
                     Text(String(format:
@@ -405,12 +421,30 @@ private struct ThroughputBar: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
+                if let cost = metrics.turnCostUSD {
+                    Text("Turn cost: \(Self.formatUSD(cost))")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 if hasStatus {
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
             }
+        }
+    }
+
+    /// Compact USD formatter that picks enough significant digits
+    /// to make sub-cent costs (typical for tool-call loops on
+    /// cheap models) visible. $0.0042 / $0.13 / $1.27.
+    static func formatUSD(_ value: Double) -> String {
+        if value < 0.01 {
+            return String(format: "$%.4f", value)
+        } else if value < 1.0 {
+            return String(format: "$%.3f", value)
+        } else {
+            return String(format: "$%.2f", value)
         }
     }
 }

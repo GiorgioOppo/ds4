@@ -11,6 +11,11 @@ struct GenerationMetrics: Equatable {
     var generatedTokens: Int = 0
     var generationElapsed: TimeInterval = 0
     var generationTokPerMin: Double = 0
+    /// USD cost of the current turn as reported by the remote
+    /// provider (OpenRouter's `usage.total_cost`). Nil for local
+    /// generations and for remote providers that don't report
+    /// cost. The ThroughputBar surfaces it when non-nil.
+    var turnCostUSD: Double?
 }
 
 enum GenerationPhase: Equatable {
@@ -1160,55 +1165,89 @@ final class ChatStore: ObservableObject {
         toolRoundtrips[id] = 0
         scheduleSave(id)
 
-        // Resolve agent (system prompt + sampling already merged
-        // by the chat view's resolveSampling) so the remote prompt
-        // carries the agent persona.
-        let agentConfig: AgentConfig? = conversations[idx].agentID
-            .flatMap { agents.agent(id: $0) }
-
-        // Build OpenAI messages from the history snapshot taken
-        // up to (but not including) the placeholder we just
-        // appended.
-        let historyForRequest = Array(conversations[idx].messages.dropLast())
-        let openAIMessages = buildOpenAIMessages(
-            history: historyForRequest,
-            agent: agentConfig)
-
-        // Request body. Tools are intentionally omitted here; R3
-        // adds the schema translation + tool-call dispatch loop.
-        var body: [String: Any] = [
-            "model": modelID,
-            "messages": openAIMessages.map { $0.toJSON() },
-            "temperature": Double(options.temperature),
-            "top_p": Double(options.topP),
-            "max_tokens": maxTokens,
-            // OpenRouter: ask for usage stats in the final chunk so
-            // the cost banner has data without a second call.
-            "usage": ["include": true]
-        ]
-        if options.topK > 0 { body["top_k"] = options.topK }
-        // Reasoning effort hint: only some upstream providers
-        // honour it (DeepSeek-R1, o-series, …). Harmless for the
-        // rest — OpenRouter silently drops unsupported fields.
-        switch mode {
-        case .max:  body["reasoning"] = ["effort": "high"]
-        case .high: body["reasoning"] = ["effort": "medium"]
-        case .chat: break
-        }
-
-        let client = OpenRouterClient()
-        let conversationID = id
-        let placeholderID = placeholder.id
         let userMessageID = userMessage.id
+        let firstPlaceholderID = placeholder.id
 
         Task { [weak self] in
             guard let self else { return }
+            await self.runRemoteLoop(conversationID: id,
+                                       initialPlaceholderID: firstPlaceholderID,
+                                       userMessageID: userMessageID,
+                                       modelID: modelID,
+                                       mode: mode,
+                                       options: options,
+                                       maxTokens: maxTokens,
+                                       apiKey: apiKey)
+        }
+    }
+
+    /// Drive a remote chat to completion through (up to)
+    /// `maxToolRoundtripsPerTurn` HTTP round-trips. Each iteration
+    /// snapshots the conversation history, builds the OpenAI
+    /// request, streams the response into the current placeholder,
+    /// and — if the model emitted tool calls — executes them
+    /// through `mcpPool`, appends a fresh placeholder, and loops.
+    /// Bails out cleanly on errors / cap hit / no more tool calls.
+    private func runRemoteLoop(conversationID id: UUID,
+                                 initialPlaceholderID: UUID,
+                                 userMessageID: UUID,
+                                 modelID: String,
+                                 mode: ThinkingMode,
+                                 options: SamplingOptions,
+                                 maxTokens: Int,
+                                 apiKey: String) async {
+        let client = OpenRouterClient()
+        var currentPlaceholderID = initialPlaceholderID
+        var iteration = 0
+
+        while iteration < maxToolRoundtripsPerTurn {
+            iteration += 1
+
+            // Snapshot what the next HTTP call needs from the
+            // store, on the main actor — the conversation could
+            // have been mutated between iterations.
+            let snapshot: (history: [StoredMessage],
+                           agent: AgentConfig?)? = await MainActor.run {
+                guard let idx = self.conversations.firstIndex(where: { $0.id == id })
+                else { return nil }
+                let history = Array(self.conversations[idx]
+                    .messages.dropLast())  // drop the in-progress placeholder
+                let agent = self.conversations[idx].agentID
+                    .flatMap { self.agents.agent(id: $0) }
+                return (history, agent)
+            }
+            guard let snapshot else { return }
+
+            let openAIMessages = self.buildOpenAIMessages(
+                history: snapshot.history,
+                agent: snapshot.agent)
+            let toolsArray = self.composeOpenAITools(
+                mcpAllowed: snapshot.agent?.allowedToolNames)
+
+            var body: [String: Any] = [
+                "model": modelID,
+                "messages": openAIMessages.map { $0.toJSON() },
+                "temperature": Double(options.temperature),
+                "top_p": Double(options.topP),
+                "max_tokens": maxTokens,
+                // OpenRouter: ask for usage stats in the final chunk
+                // so the cost banner has data without a second call.
+                "usage": ["include": true]
+            ]
+            if options.topK > 0 { body["top_k"] = options.topK }
+            if let toolsArray, !toolsArray.isEmpty {
+                body["tools"] = toolsArray
+                body["tool_choice"] = "auto"
+            }
+            switch mode {
+            case .max:  body["reasoning"] = ["effort": "high"]
+            case .high: body["reasoning"] = ["effort": "medium"]
+            case .chat: break
+            }
+
+            // Stream + accumulate.
             let stream = client.streamChatCompletion(
                 apiKey: apiKey, body: body)
-
-            // Accumulators for the streaming chunks. tool_calls
-            // arrive as deltas keyed by `index` so they have to
-            // be reassembled across multiple chunks.
             var contentBuf = ""
             var reasoningBuf = ""
             var toolCallsAccum: [Int: (id: String?, name: String, args: String)] = [:]
@@ -1225,8 +1264,7 @@ final class ChatStore: ObservableObject {
                             generatedTokens += 1
                             await MainActor.run {
                                 self.updateRemoteBuffer(
-                                    conversationID: conversationID,
-                                    buffer: contentBuf)
+                                    conversationID: id, buffer: contentBuf)
                             }
                             let now = Date()
                             if now.timeIntervalSince(lastProgressAt) > 0.5 {
@@ -1237,7 +1275,7 @@ final class ChatStore: ObservableObject {
                                     : 0
                                 await MainActor.run {
                                     self.updateRemoteProgress(
-                                        conversationID: conversationID,
+                                        conversationID: id,
                                         generated: generatedTokens,
                                         elapsed: elapsed,
                                         tokPerMin: tpm)
@@ -1251,7 +1289,7 @@ final class ChatStore: ObservableObject {
                             for tc in tcs {
                                 var existing = toolCallsAccum[tc.index]
                                     ?? (id: nil, name: "", args: "")
-                                if let id = tc.id { existing.id = id }
+                                if let cid = tc.id { existing.id = cid }
                                 if let n = tc.function?.name { existing.name.append(n) }
                                 if let a = tc.function?.arguments { existing.args.append(a) }
                                 toolCallsAccum[tc.index] = existing
@@ -1264,15 +1302,14 @@ final class ChatStore: ObservableObject {
                 let msg = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 await MainActor.run {
-                    self.phases[conversationID] = .error(msg)
-                    self.scheduleSave(conversationID)
+                    self.phases[id] = .error(msg)
+                    self.toolRoundtrips[id] = nil
+                    self.lastSamplingOptions[id] = nil
+                    self.scheduleSave(id)
                 }
                 return
             }
 
-            // Finalize on the main actor: write the placeholder
-            // back out with the parsed content + reasoning + tool
-            // calls, attach token counts from usage, mark idle.
             let toolCalls: [ToolCall] = toolCallsAccum
                 .sorted { $0.key < $1.key }
                 .map { (_, v) in
@@ -1287,14 +1324,71 @@ final class ChatStore: ObservableObject {
                 toolCalls: toolCalls,
                 toolOutputs: [])
             let capturedUsage = usage
+
+            // Finalize this iteration's placeholder + record cost
+            // on the main actor. When toolCalls is empty we also
+            // mark the chat idle and exit the loop.
+            let isFinal = final.toolCalls.isEmpty
             await MainActor.run {
-                self.finalizeRemoteTurn(
-                    conversationID: conversationID,
-                    placeholderID: placeholderID,
+                self.finalizeRemoteIteration(
+                    conversationID: id,
+                    placeholderID: currentPlaceholderID,
                     userMessageID: userMessageID,
                     final: final,
-                    usage: capturedUsage)
+                    usage: capturedUsage,
+                    isFinal: isFinal)
             }
+            if isFinal { return }
+
+            // Execute tool calls. Delegation isn't supported on
+            // remote chats (yet) — that case returns a structured
+            // error string so the model can self-correct on the
+            // next iteration. MCP calls route through the same
+            // pool the local path uses.
+            var outputs: [String] = []
+            outputs.reserveCapacity(final.toolCalls.count)
+            for call in final.toolCalls {
+                let result: String
+                if call.name == EncodingDSV4.delegateToolName {
+                    result = "[error: cross-agent delegation is not yet supported on remote models]"
+                } else {
+                    result = await self.mcpPool.invokeQualified(
+                        call.name, argsJSON: call.args)
+                }
+                outputs.append(result)
+            }
+
+            // Store outputs on the just-finalised placeholder and
+            // append a fresh placeholder for the next iteration's
+            // streaming target.
+            let nextPlaceholderID = await MainActor.run { () -> UUID in
+                guard let idx = self.conversations.firstIndex(where: { $0.id == id })
+                else { return UUID() }
+                if let mIdx = self.conversations[idx].messages.firstIndex(
+                    where: { $0.id == currentPlaceholderID })
+                {
+                    self.conversations[idx].messages[mIdx].toolOutputs = outputs
+                }
+                let next = StoredMessage(role: .assistant, content: "")
+                self.conversations[idx].messages.append(next)
+                self.phases[id] = .streaming(
+                    buffer: "",
+                    status: "Calling \(modelID) again with tool results…",
+                    metrics: GenerationMetrics())
+                self.scheduleSave(id)
+                return next.id
+            }
+            currentPlaceholderID = nextPlaceholderID
+        }
+
+        // Cap hit — surface the truncation via a banner-style
+        // error string so the user knows why the model stopped.
+        await MainActor.run {
+            self.phases[id] = .error(
+                "Reached \(self.maxToolRoundtripsPerTurn) tool-call iterations without a final reply — the model may be looping.")
+            self.toolRoundtrips[id] = nil
+            self.lastSamplingOptions[id] = nil
+            self.scheduleSave(id)
         }
     }
 
@@ -1316,11 +1410,17 @@ final class ChatStore: ObservableObject {
                                  metrics: metrics)
     }
 
-    private func finalizeRemoteTurn(conversationID id: UUID,
-                                     placeholderID: UUID,
-                                     userMessageID: UUID,
-                                     final: Message,
-                                     usage: OpenAIUsage?) {
+    /// Write the finalised assistant turn back to the store,
+    /// stamp token counts + cost on the relevant messages, bump
+    /// the conversation's cumulativeCostUSD, and either mark the
+    /// chat idle (`isFinal == true`) or leave it in a transient
+    /// streaming state ready for the next loop iteration.
+    private func finalizeRemoteIteration(conversationID id: UUID,
+                                          placeholderID: UUID,
+                                          userMessageID: UUID,
+                                          final: Message,
+                                          usage: OpenAIUsage?,
+                                          isFinal: Bool) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         if let mIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == placeholderID })
@@ -1337,19 +1437,68 @@ final class ChatStore: ObservableObject {
         if let uIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == userMessageID })
         {
-            conversations[idx].messages[uIdx].tokenCount = usage?.promptTokens
+            // Stamp prompt-token count on the user message that
+            // kicked off this turn — only the first iteration's
+            // usage carries the real prompt size; later iterations
+            // re-bill the same prompt + tool outputs, but the user
+            // message hasn't changed so we keep the first value.
+            if conversations[idx].messages[uIdx].tokenCount == nil {
+                conversations[idx].messages[uIdx].tokenCount = usage?.promptTokens
+            }
         }
-        // No encodedTokens, no pendingTurn for remote chats —
-        // crash recovery would mean re-issuing the HTTP call,
-        // which is cheap, so we just clear the slot.
+        // Track cost: add to conversation total, surface this
+        // iteration's cost in the metrics for the ThroughputBar.
+        if let cost = usage?.totalCost {
+            conversations[idx].cumulativeCostUSD =
+                (conversations[idx].cumulativeCostUSD ?? 0) + cost
+        }
+        // Reset transient fast-path state — remote never uses it.
         conversations[idx].encodedTokens = nil
         conversations[idx].lastEncodedMode = nil
         conversations[idx].pendingTurn = nil
-        toolRoundtrips[id] = nil
-        lastSamplingOptions[id] = nil
-        phases[id] = .idle
-        // R3 will hook tool-call dispatch + cost recording here.
+        if isFinal {
+            var metrics = currentMetrics(of: id)
+            metrics.turnCostUSD = usage?.totalCost
+            phases[id] = .streaming(buffer: final.content,
+                                     status: "",
+                                     metrics: metrics)
+            toolRoundtrips[id] = nil
+            lastSamplingOptions[id] = nil
+            phases[id] = .idle
+        }
         scheduleSave(id)
+    }
+
+    /// Translate the active MCP tool catalogue (filtered through
+    /// the agent's allowlist, if any) into the OpenAI-shape
+    /// `tools` array OpenRouter expects in the request body.
+    /// Returns nil when no tools should be sent — keeps the JSON
+    /// minimal and avoids triggering tool-aware paths on the
+    /// provider side for chats that don't need them.
+    ///
+    /// Delegation isn't included here: cross-backend sub-agent
+    /// invocation would need a remote sub-agent loop that doesn't
+    /// exist yet. A `__delegate_to_agent` schema would just lure
+    /// the model into calls we have to refuse with an error.
+    private func composeOpenAITools(
+        mcpAllowed: Set<String>?
+    ) -> [[String: Any]]? {
+        if let allowed = mcpAllowed, allowed.isEmpty { return nil }
+        var schemas: [[String: Any]] = []
+        for tool in mcpPool.allTools() {
+            if let allowed = mcpAllowed, !allowed.contains(tool.qualifiedName) {
+                continue
+            }
+            schemas.append([
+                "type": "function",
+                "function": [
+                    "name": tool.qualifiedName,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                ]
+            ])
+        }
+        return schemas.isEmpty ? nil : schemas
     }
 
     /// Convert this app's stored transcript into the OpenAI-style
