@@ -3,10 +3,11 @@ import DeepSeekKit
 
 /// macOS Settings scene (cmd+,). Tabs covering generation, loading,
 /// the entire ModelConfig surface, the global documents library, the
-/// projects library, and storage.
+/// projects library, the MCP server registry, and storage.
 struct SettingsScene: Scene {
     @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
+    @ObservedObject var mcp: MCPServerLibrary
     let service: InferenceService
 
     var body: some Scene {
@@ -24,6 +25,8 @@ struct SettingsScene: Scene {
                               documents: documents,
                               service: service)
                     .tabItem { Label("Projects", systemImage: "folder") }
+                MCPServersView(library: mcp)
+                    .tabItem { Label("MCP", systemImage: "server.rack") }
                 StorageSettingsTab()
                     .tabItem { Label("Storage", systemImage: "externaldrive") }
             }

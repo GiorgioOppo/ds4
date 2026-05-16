@@ -13,11 +13,13 @@ struct DeepSeekUIApp: App {
     private let service: InferenceService
     @StateObject private var documents: DocumentLibrary
     @StateObject private var projects: ProjectLibrary
+    @StateObject private var mcp: MCPServerLibrary
 
     init() {
         self.service = InferenceService()
         self._documents = StateObject(wrappedValue: DocumentLibrary())
         self._projects = StateObject(wrappedValue: ProjectLibrary())
+        self._mcp = StateObject(wrappedValue: MCPServerLibrary())
     }
 
     var body: some Scene {
@@ -31,6 +33,7 @@ struct DeepSeekUIApp: App {
 
         SettingsScene(documents: documents,
                        projects: projects,
+                       mcp: mcp,
                        service: service)
     }
 }

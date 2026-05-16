@@ -91,4 +91,22 @@ enum PersistencePaths {
     static func projectsIndexURL() throws -> URL {
         try projectsDir().appendingPathComponent("index.json")
     }
+
+    /// User-defined MCP (Model Context Protocol) server registry.
+    /// Layout matches the simple-list shape we use for documents and
+    /// projects: one JSON file under Application Support, decoded
+    /// into `[MCPServerConfig]` at app launch. The actual JSON-RPC
+    /// clients are spawned lazily by `MCPClientPool` (Step M2).
+    static func mcpConfigURL() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("mcp.json")
+    }
 }
