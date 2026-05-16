@@ -48,7 +48,10 @@ struct ChatView: View {
                             }
                             MessageView(
                                 message: msg,
-                                isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase))
+                                isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase),
+                                agentResolver: { name in
+                                    store.agents.agents.first(where: { $0.name == name })
+                                })
                             .id(msg.id)
                         }
                         if case .streaming(_, _, let metrics) = phase {

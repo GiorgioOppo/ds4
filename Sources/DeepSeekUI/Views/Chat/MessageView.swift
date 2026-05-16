@@ -15,6 +15,14 @@ struct MessageView: View {
     /// True while this message is the in-progress streaming target so
     /// we can show a blinking caret.
     var isStreaming: Bool = false
+    /// Resolve a `__delegate_to_agent` call's `agent_name` to the
+    /// AgentConfig it targets so the tool row can render the
+    /// delegate's icon + tint instead of a generic wrench. nil
+    /// (the default) makes delegation rows fall back to the
+    /// generic rendering, which is fine when MessageView is used
+    /// in contexts that don't have an AgentLibrary (previews,
+    /// tests, …).
+    var agentResolver: ((String) -> AgentConfig?)? = nil
 
     @State private var copied: Bool = false
 
@@ -114,13 +122,45 @@ struct MessageView: View {
     }
 
     private func toolCallRow(call: StoredToolCall, output: String?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        // Recognise the synthetic delegation tool so the row can
+        // render the *target* agent's identity (icon + tint +
+        // name) instead of the generic wrench, and surface the
+        // sub-task text plainly instead of the `{agent_name, task}`
+        // JSON pair the model emitted.
+        let delegation = parseDelegation(call: call)
+
+        return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.up.right.square")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                Text(call.name)
-                    .font(.callout.monospaced())
+                if let agent = delegation?.agent {
+                    Image(systemName: agent.iconName)
+                        .font(.caption)
+                        .foregroundStyle(AgentTint.color(for: agent.tint))
+                    Text("Delegated to ")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    + Text(agent.name)
+                        .font(.callout.bold())
+                    if !agent.summary.isEmpty {
+                        Text("· \(agent.summary)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                } else if delegation != nil {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .font(.caption)
+                        .foregroundStyle(Color.orange)
+                    Text("Delegation to unknown agent")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                } else {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Text(call.name)
+                        .font(.callout.monospaced())
+                }
                 if output == nil {
                     Spacer()
                     HStack(spacing: 4) {
@@ -131,21 +171,33 @@ struct MessageView: View {
                     }
                 }
             }
-            // Args: try to pretty-print as JSON so the user gets
-            // indented structure instead of a single-line blob; fall
-            // back to raw text if the model emitted something
-            // unparseable.
-            let prettyArgs = MessageView.prettyJSON(call.args)
-            if !prettyArgs.isEmpty {
-                Text(prettyArgs)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+            // Args: for a delegation, drop the JSON envelope and
+            // show the sub-task as plain text — it's the bit the
+            // user actually cares about. For everything else,
+            // pretty-print the JSON args so the structure is legible
+            // (falls back to raw text on parse failure).
+            if let task = delegation?.task, !task.isEmpty {
+                Text(task)
+                    .font(.callout)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(NSColor.textBackgroundColor),
                                  in: RoundedRectangle(cornerRadius: 4))
+            } else {
+                let prettyArgs = MessageView.prettyJSON(call.args)
+                if !prettyArgs.isEmpty {
+                    Text(prettyArgs)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.textBackgroundColor),
+                                     in: RoundedRectangle(cornerRadius: 4))
+                }
             }
             if let out = output, !out.isEmpty {
                 HStack(spacing: 6) {
@@ -167,6 +219,24 @@ struct MessageView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Decode a delegation call's payload into the bits the row
+    /// needs: the resolved target agent (or nil if the name isn't
+    /// registered) and the sub-task text. Returns nil for calls
+    /// that aren't `__delegate_to_agent` so the caller can fall
+    /// through to the generic rendering.
+    private func parseDelegation(call: StoredToolCall)
+        -> (agent: AgentConfig?, task: String)?
+    {
+        guard call.name == EncodingDSV4.delegateToolName else { return nil }
+        let data = call.args.data(using: .utf8) ?? Data()
+        let obj = (try? JSONSerialization.jsonObject(with: data))
+            as? [String: Any] ?? [:]
+        let agentName = (obj["agent_name"] as? String) ?? ""
+        let task = (obj["task"] as? String) ?? ""
+        let agent = agentName.isEmpty ? nil : agentResolver?(agentName)
+        return (agent, task)
     }
 
     private static func prettyJSON(_ raw: String) -> String {
