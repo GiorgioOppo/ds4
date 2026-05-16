@@ -210,16 +210,23 @@ final class InferenceService: @unchecked Sendable {
     /// loaded weights without cross-talk.
     /// Tokenize the full chat history through the V4 template. Used
     /// by `ChatStore` on first turn (or after a mode change) to
-    /// produce the canonical `encodedTokens` baseline.
+    /// produce the canonical `encodedTokens` baseline. When the
+    /// MCP pool has tools, `toolSchemasJSON` is forwarded to
+    /// EncodingDSV4 which folds the tools block into the system
+    /// message — the chat-template's existing mechanism for
+    /// announcing callable tools to the model.
     func tokenizeFullHistory(_ history: [Message],
-                              mode: ThinkingMode) async -> [Int32]? {
+                              mode: ThinkingMode,
+                              toolSchemasJSON: String? = nil) async -> [Int32]? {
         await withCheckedContinuation {
             (cont: CheckedContinuation<[Int32]?, Never>) in
             q.async {
                 guard let tok = self._tokenizer else {
                     cont.resume(returning: nil); return
                 }
-                let prompt = EncodingDSV4.encodeMessages(history, mode: mode)
+                let prompt = EncodingDSV4.encodeMessages(
+                    history, mode: mode,
+                    toolSchemasJSON: toolSchemasJSON)
                 let ids = tok.encode(prompt).map(Int32.init)
                 cont.resume(returning: ids)
             }
@@ -249,7 +256,8 @@ final class InferenceService: @unchecked Sendable {
                                        projectName: String,
                                        files: [(path: String, tokens: [Int32])],
                                        userText: String,
-                                       mode: ThinkingMode) async -> [Int32]? {
+                                       mode: ThinkingMode,
+                                       toolSchemasJSON: String? = nil) async -> [Int32]? {
         await withCheckedContinuation {
             (cont: CheckedContinuation<[Int32]?, Never>) in
             q.async {
@@ -285,9 +293,21 @@ final class InferenceService: @unchecked Sendable {
 
                 var out: [Int32] = []
                 out.append(bosId)
-                if !systemText.isEmpty {
+                // System prefix: same precedence the chat template
+                // uses — tools block first (so the model sees the
+                // contract before the user's instructions), then the
+                // original system text. Keeping the order consistent
+                // with EncodingDSV4.injectSystemAdditions avoids
+                // surprises when comparing first-turn output to a
+                // re-encoded full history later.
+                var systemAug = ""
+                if let schemas = toolSchemasJSON, !schemas.isEmpty {
+                    systemAug += EncodingDSV4.toolsBlock(toolSchemasJSON: schemas)
+                }
+                systemAug += systemText
+                if !systemAug.isEmpty {
                     out.append(contentsOf:
-                        tok.encode(systemText).map(Int32.init))
+                        tok.encode(systemAug).map(Int32.init))
                 }
                 out.append(beginRepoN)
                 out.append(contentsOf:

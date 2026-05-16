@@ -45,6 +45,13 @@ final class ChatStore: ObservableObject {
     /// libraries live for the whole app session.
     let documents: DocumentLibrary
     let projects: ProjectLibrary
+    /// Live MCP pool. Used by `send` to snapshot the current tool
+    /// schemas and fold them into the system block of the prompt.
+    /// Snapshot-on-send semantics means a server enabled mid-chat
+    /// won't appear to the model until the cached prefix is
+    /// invalidated (mode change or new chat) — same trade-off the
+    /// project-context path already makes.
+    let mcpPool: MCPClientPool
 
     private let saveDebounce: TimeInterval = 0.5
     private var pendingSaves: [UUID: Task<Void, Never>] = [:]
@@ -52,11 +59,13 @@ final class ChatStore: ObservableObject {
     init(modelDirPath: String,
          service: InferenceService,
          documents: DocumentLibrary,
-         projects: ProjectLibrary) {
+         projects: ProjectLibrary,
+         mcpPool: MCPClientPool) {
         self.modelDirPath = modelDirPath
         self.service = service
         self.documents = documents
         self.projects = projects
+        self.mcpPool = mcpPool
         loadFromDisk()
         if conversations.isEmpty {
             let first = Conversation(modelDirPath: modelDirPath)
@@ -161,6 +170,12 @@ final class ChatStore: ObservableObject {
         let historyForFullEncode = conversations[idx].messages.map {
             $0.asKitMessage()
         }
+        // Snapshot the MCP tool catalogue once, off the main actor's
+        // critical path. The Task below treats this as immutable
+        // for the duration of the generation — same snapshot
+        // semantics the project-context path uses.
+        let toolSchemasJSON = mcpPool.toolSchemasJSON()
+
         // First-turn-with-project info: only the very first user
         // turn of a chat (encodedTokens == nil) ever pays the cost
         // of injecting the project's whole token stream. Every
@@ -193,7 +208,8 @@ final class ChatStore: ObservableObject {
                     userText: trimmed,
                     mode: mode,
                     fullHistory: historyForFullEncode,
-                    projectContext: projectContext)
+                    projectContext: projectContext,
+                    toolSchemasJSON: toolSchemasJSON)
                 // Snapshot the pending turn on disk immediately. If
                 // the app dies during the prefill (which can take
                 // minutes for a project context), the user's prompt
@@ -318,12 +334,18 @@ final class ChatStore: ObservableObject {
     ///   - first turn with a project attached: emit native repo / file
     ///     delimiter ids and splice in each file's pre-tokenized stream;
     ///   - cold path: full re-encode of the entire history.
+    ///
+    /// `toolSchemasJSON`, when non-nil, only matters on the
+    /// project-first-turn and cold-path branches — those produce
+    /// the system block from scratch. The delta fast path inherits
+    /// whatever system block was in the cached prefix.
     private func buildPromptTokens(canReusePrefix: Bool,
                                     cachedPrefix: [Int32]?,
                                     userText: String,
                                     mode: ThinkingMode,
                                     fullHistory: [Message],
-                                    projectContext: FirstTurnProjectContext?
+                                    projectContext: FirstTurnProjectContext?,
+                                    toolSchemasJSON: String?
     ) async throws -> [Int32] {
         if canReusePrefix, let prefix = cachedPrefix {
             guard let delta = await service.tokenizeUserTurnDelta(
@@ -349,7 +371,8 @@ final class ChatStore: ObservableObject {
                 projectName: ctx.name,
                 files: ctx.files,
                 userText: userText,
-                mode: mode)
+                mode: mode,
+                toolSchemasJSON: toolSchemasJSON)
             {
                 return tokens
             }
@@ -360,7 +383,8 @@ final class ChatStore: ObservableObject {
         // assistant marker via mode.
         let history = fullHistory.dropLast()
         guard let tokens = await service.tokenizeFullHistory(
-            Array(history), mode: mode)
+            Array(history), mode: mode,
+            toolSchemasJSON: toolSchemasJSON)
         else {
             throw NSError(domain: "ChatStore", code: 11, userInfo: [
                 NSLocalizedDescriptionKey:

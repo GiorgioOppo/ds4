@@ -499,6 +499,33 @@ final class MCPClientPool: ObservableObject {
         clients.values.flatMap { $0.tools }
     }
 
+    /// Build the JSON-encoded tools array that the chat template's
+    /// `EncodingDSV4.toolsBlock` expects in the system message.
+    /// Tool names are emitted in qualified form ("<server>__<tool>")
+    /// so the model picks an unambiguous identifier; on execution
+    /// (M3b) we'll split that back into (serverID, toolName).
+    ///
+    /// Returns nil when no enabled server has reported any tool —
+    /// signals to the caller "don't bother injecting the tools
+    /// section at all".
+    func toolSchemasJSON() -> String? {
+        let tools = allTools()
+        if tools.isEmpty { return nil }
+        var payload: [[String: Any]] = []
+        for t in tools {
+            payload.append([
+                "name": t.qualifiedName,
+                "description": t.description,
+                "inputSchema": t.inputSchema
+            ])
+        }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     func disconnectAll() {
         for client in clients.values { client.disconnect() }
         clients = [:]

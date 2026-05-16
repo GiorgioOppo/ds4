@@ -17,6 +17,7 @@ struct ContentView: View {
     let service: InferenceService
     @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
+    @ObservedObject var mcpPool: MCPClientPool
     @State private var phase: AppPhase = .picking
 
     var body: some View {
@@ -45,7 +46,8 @@ struct ContentView: View {
                     store: ChatStore(modelDirPath: url.path,
                                       service: service,
                                       documents: documents,
-                                      projects: projects),
+                                      projects: projects,
+                                      mcpPool: mcpPool),
                     projects: projects,
                     onUnload: { phase = .picking })
             }
