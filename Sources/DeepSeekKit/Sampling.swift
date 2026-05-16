@@ -21,27 +21,81 @@ internal func defaultSamplerSeed() -> UInt64 {
     return seed | 1   // keep odd to avoid degenerate LCG cycles
 }
 
-/// Sampling options collected for one decode step. Mirrors the standard
-/// HF sampling pipeline: temperature → repetition penalty → top-K → top-P
-/// → multinomial. When `temperature == 0` we shortcut to greedy argmax.
+/// Sampling options collected for one decode step. Pipeline order:
+/// temperature → repetition/frequency/presence penalties → top-K → min-P
+/// → tail-free → typical → top-P → (Gumbel-max OR mirostat). When
+/// `temperature == 0` and every filter is disabled, we shortcut to
+/// greedy argmax.
+///
+/// All filter params use "neutral" defaults that disable the step:
+/// `topK=0`, `topP=1`, `minP=0`, `tailFree=1`, `typical=1`,
+/// `repetitionPenalty=1`, `frequencyPenalty=0`, `presencePenalty=0`,
+/// `mirostatTau=0`.
 public struct SamplingOptions {
     public var temperature: Float = 1.0
     public var topK: Int = 0                    // 0 = disabled
     public var topP: Float = 1.0                // 1.0 = disabled
+    /// Filter tokens with probability < `minP × max_prob`. Standard
+    /// llama.cpp range: 0.05 – 0.1. `0` disables.
+    public var minP: Float = 0.0
+    /// Tail-free sampling z-parameter. Cuts the tail when the
+    /// second-derivative of the sorted probs grows past `z`. `1` disables.
+    public var tailFree: Float = 1.0
+    /// Locally-typical sampling p-parameter. Keeps tokens whose
+    /// information content sits within mass `typical` around the
+    /// distribution entropy. `1` disables.
+    public var typical: Float = 1.0
     public var repetitionPenalty: Float = 1.0   // 1.0 = disabled
+    /// OpenAI-style frequency penalty. Subtracts `frequencyPenalty *
+    /// count(token)` from logits. `0` disables.
+    public var frequencyPenalty: Float = 0.0
+    /// OpenAI-style presence penalty. Subtracts `presencePenalty` once
+    /// for any token that appears in history. `0` disables.
+    public var presencePenalty: Float = 0.0
+    /// Mirostat v2 target surprise. `0` disables (falls through to
+    /// Gumbel-max). Typical value: 5.0.
+    public var mirostatTau: Float = 0.0
+    /// Mirostat v2 learning rate. Default 0.1.
+    public var mirostatEta: Float = 0.1
+    /// Mirostat running estimate of surprise. Initialised to
+    /// `2 * mirostatTau` by convention; updated in place across calls.
+    public var mirostatMu: Float = 10.0
     /// Per-instance LCG state. Pass an explicit value for reproducibility;
     /// the default is wall-clock + pid mixed, so distinct runs really
     /// produce distinct streams.
     public var rngState: UInt64 = defaultSamplerSeed()
 
     public init(temperature: Float = 1.0, topK: Int = 0, topP: Float = 1.0,
+                minP: Float = 0.0, tailFree: Float = 1.0, typical: Float = 1.0,
                 repetitionPenalty: Float = 1.0,
+                frequencyPenalty: Float = 0.0, presencePenalty: Float = 0.0,
+                mirostatTau: Float = 0.0, mirostatEta: Float = 0.1,
+                mirostatMu: Float = 10.0,
                 rngState: UInt64 = defaultSamplerSeed()) {
         self.temperature = temperature
         self.topK = topK
         self.topP = topP
+        self.minP = minP
+        self.tailFree = tailFree
+        self.typical = typical
         self.repetitionPenalty = repetitionPenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.mirostatTau = mirostatTau
+        self.mirostatEta = mirostatEta
+        self.mirostatMu = mirostatMu
         self.rngState = rngState
+    }
+
+    /// True iff every filter / penalty is at its disabled default, so the
+    /// caller can shortcut to greedy argmax.
+    @inline(__always)
+    fileprivate var allFiltersDisabled: Bool {
+        return temperature == 0 && topK == 0 && topP == 1.0
+            && minP == 0.0 && tailFree == 1.0 && typical == 1.0
+            && repetitionPenalty == 1.0
+            && frequencyPenalty == 0.0 && presencePenalty == 0.0
+            && mirostatTau == 0.0
     }
 }
 
@@ -93,17 +147,15 @@ public enum Sampler {
         cmd.commit(); cmd.waitUntilCompleted()
     }
 
-    /// Full sampling pipeline: temperature → repetition penalty → top-K
-    /// → top-P → multinomial. Reads the logits buffer to host once and
-    /// performs the rest in pure Swift. Updates `options.rngState` for
-    /// repeatable streams across calls.
+    /// Full sampling pipeline. Reads the logits buffer to host once and
+    /// performs the rest in pure Swift. Updates `options.rngState` and,
+    /// when active, `options.mirostatMu` across calls.
     public static func sample(_ logits: Tensor, history: [Int],
                               options: inout SamplingOptions) -> Int {
         precondition(logits.dtype == .f32 && logits.shape.count == 2 && logits.shape[0] == 1)
         let V = logits.shape[1]
 
-        if options.temperature == 0 && options.repetitionPenalty == 1.0
-            && options.topK == 0 && options.topP == 1.0 {
+        if options.allFiltersDisabled {
             return argmax(logits)
         }
 
@@ -115,13 +167,35 @@ public enum Sampler {
             for i in 0..<V { arr[i] *= inv }
         }
 
-        // 2. Repetition penalty: divide positive logits by penalty (and
-        //    multiply negative logits by it) for tokens already in history.
+        // 2a. Repetition penalty: divide positive logits by penalty (and
+        //     multiply negative logits by it) for tokens already in history.
         if options.repetitionPenalty != 1.0 {
             let p = options.repetitionPenalty
             for id in history where id >= 0 && id < V {
                 arr[id] = arr[id] >= 0 ? arr[id] / p : arr[id] * p
             }
+        }
+
+        // 2b. Frequency + presence penalty (OpenAI-style).
+        //     freq: subtract freq_pen × count(token)
+        //     pres: subtract pres_pen if token appears at all
+        //     Both are additive in logit space, distinct from the
+        //     repetition penalty above.
+        if options.frequencyPenalty != 0.0 || options.presencePenalty != 0.0 {
+            var counts = [Int](repeating: 0, count: V)
+            for id in history where id >= 0 && id < V { counts[id] += 1 }
+            let fp = options.frequencyPenalty
+            let pp = options.presencePenalty
+            for i in 0..<V where counts[i] > 0 {
+                arr[i] -= fp * Float(counts[i])
+                arr[i] -= pp
+            }
+        }
+
+        // Mirostat path: it sets its own filter + sample strategy and
+        // does not use top-K/top-P/min-P/tail-free/typical/Gumbel-max.
+        if options.mirostatTau > 0.0 {
+            return mirostatV2Sample(&arr, vocabSize: V, options: &options)
         }
 
         // 3. Top-K filter.
@@ -130,41 +204,40 @@ public enum Sampler {
             for i in 0..<V where arr[i] < kth { arr[i] = -.infinity }
         }
 
-        // 4. Top-P filter (nucleus).
-        if options.topP < 1.0 {
-            // Stable softmax over the (possibly already filtered) logits.
-            let m = arr.max() ?? 0
-            var sum: Double = 0
-            var probs = [Double](repeating: 0, count: V)
-            for i in 0..<V {
-                let e = exp(Double(arr[i] - m))
-                probs[i] = e
-                sum += e
-            }
-            for i in 0..<V { probs[i] /= sum }
-
-            // Sort indices by descending probability.
-            let order = (0..<V).sorted { probs[$0] > probs[$1] }
-            var cum: Double = 0
-            var threshold = -Double.infinity
-            for idx in order {
-                cum += probs[idx]
-                if cum >= Double(options.topP) {
-                    threshold = probs[idx]
-                    break
-                }
-            }
-            for i in 0..<V where probs[i] < threshold { arr[i] = -.infinity }
+        // 4. Min-P filter. Compute max prob (stable softmax max-shift),
+        //    then keep only tokens with prob >= minP × p_max.
+        if options.minP > 0.0 {
+            applyMinP(&arr, vocabSize: V, minP: options.minP)
         }
 
-        // 5. Multinomial via Gumbel-max trick. argmax(log(p) + g) where
+        // 5. Tail-free sampling. Cuts the tail where the absolute
+        //    second derivative of sorted probs grows past `tailFree`.
+        if options.tailFree < 1.0 && options.tailFree > 0.0 {
+            applyTailFree(&arr, vocabSize: V, z: options.tailFree)
+        }
+
+        // 6. Locally typical sampling. Keeps tokens whose surprise
+        //    `-log(p_i)` is closest to the distribution entropy until
+        //    cumulative mass `typical` is reached.
+        if options.typical < 1.0 && options.typical > 0.0 {
+            applyTypical(&arr, vocabSize: V, p: options.typical)
+        }
+
+        // 7. Top-P filter (nucleus).
+        if options.topP < 1.0 {
+            applyTopP(&arr, vocabSize: V, topP: options.topP)
+        }
+
+        // 8. Multinomial via Gumbel-max trick. argmax(log(p) + g) where
         //    g ~ Gumbel(0,1). Reference: generate.py:19-24.
         var rng = options.rngState
         var bestI = 0
         var bestV = -Float.infinity
         let mLog = arr.max() ?? 0
+        var anyFinite = false
         for i in 0..<V {
             if arr[i] == -.infinity { continue }
+            anyFinite = true
             let u = nextUnit(&rng)
             // Gumbel(0,1) = -log(-log(u)) but the trick equivalently uses
             //   key = log(p_i) + g_i, which here is logit_i (already log
@@ -177,7 +250,161 @@ public enum Sampler {
             if key > bestV { bestV = key; bestI = i }
         }
         options.rngState = rng
+        // Defensive fallback: if every token got filtered out (can happen
+        // with extreme tfs/typical/topP combos), pick the unfiltered argmax
+        // of the original logits to keep generation alive.
+        if !anyFinite { return argmax(logits) }
         return bestI
+    }
+
+    // MARK: - Filter helpers
+
+    /// In-place min-P filter on a logits array.
+    @inline(__always)
+    private static func applyMinP(_ arr: inout [Float], vocabSize V: Int, minP: Float) {
+        let m = arr.max() ?? 0
+        var sum: Double = 0
+        var probs = [Double](repeating: 0, count: V)
+        for i in 0..<V {
+            let e = exp(Double(arr[i] - m))
+            probs[i] = e
+            sum += e
+        }
+        if sum <= 0 { return }
+        var pMax: Double = 0
+        for i in 0..<V {
+            probs[i] /= sum
+            if probs[i] > pMax { pMax = probs[i] }
+        }
+        let threshold = pMax * Double(minP)
+        for i in 0..<V where probs[i] < threshold { arr[i] = -.infinity }
+    }
+
+    /// In-place tail-free filter. The "tail" is defined as the region
+    /// where the second derivative |p_{i+2} − 2p_{i+1} + p_i| of the
+    /// descending-sorted probability curve sums past `z` of its total.
+    @inline(__always)
+    private static func applyTailFree(_ arr: inout [Float], vocabSize V: Int, z: Float) {
+        let probs = softmaxDouble(arr, vocabSize: V)
+        let order = (0..<V).sorted { probs[$0] > probs[$1] }
+        if order.count < 3 { return }
+        var d2 = [Double](repeating: 0, count: order.count - 2)
+        var total: Double = 0
+        for i in 0..<(order.count - 2) {
+            let v = abs(probs[order[i + 2]] - 2.0 * probs[order[i + 1]] + probs[order[i]])
+            d2[i] = v
+            total += v
+        }
+        if total <= 0 { return }
+        var cum: Double = 0
+        var lastKept = order.count - 1
+        for i in 0..<d2.count {
+            cum += d2[i] / total
+            if cum >= Double(z) { lastKept = i + 1; break }
+        }
+        for i in (lastKept + 1)..<order.count { arr[order[i]] = -.infinity }
+    }
+
+    /// In-place locally-typical filter. Keeps the tokens whose
+    /// |surprise − entropy| is smallest until cumulative mass ≥ p.
+    @inline(__always)
+    private static func applyTypical(_ arr: inout [Float], vocabSize V: Int, p: Float) {
+        let probs = softmaxDouble(arr, vocabSize: V)
+        var H: Double = 0
+        for q in probs where q > 0 { H -= q * log(q) }
+        // Sort by absolute deviation of surprise from entropy.
+        let order = (0..<V).sorted { i, j in
+            let si = probs[i] > 0 ? -log(probs[i]) : .infinity
+            let sj = probs[j] > 0 ? -log(probs[j]) : .infinity
+            return abs(si - H) < abs(sj - H)
+        }
+        var cum: Double = 0
+        var cutoff = order.count
+        for (idx, ti) in order.enumerated() {
+            cum += probs[ti]
+            if cum >= Double(p) { cutoff = idx + 1; break }
+        }
+        if cutoff >= order.count { return }
+        for i in cutoff..<order.count { arr[order[i]] = -.infinity }
+    }
+
+    /// In-place top-P (nucleus) filter — factored out from the original
+    /// inline implementation so the pipeline reads linearly.
+    @inline(__always)
+    private static func applyTopP(_ arr: inout [Float], vocabSize V: Int, topP: Float) {
+        let probs = softmaxDouble(arr, vocabSize: V)
+        let order = (0..<V).sorted { probs[$0] > probs[$1] }
+        var cum: Double = 0
+        var threshold = -Double.infinity
+        for idx in order {
+            cum += probs[idx]
+            if cum >= Double(topP) {
+                threshold = probs[idx]
+                break
+            }
+        }
+        for i in 0..<V where probs[i] < threshold { arr[i] = -.infinity }
+    }
+
+    /// Mirostat v2: surprise-controlled top-k where k is implied by the
+    /// running estimate `μ`. After sampling, `μ ← μ − η × (S_t − τ)`.
+    ///
+    /// Reference: Basu et al. 2020 ("Mirostat: A Neural Text Decoding
+    /// Algorithm that Directly Controls Perplexity").
+    @inline(__always)
+    private static func mirostatV2Sample(_ arr: inout [Float], vocabSize V: Int,
+                                         options: inout SamplingOptions) -> Int {
+        let probs = softmaxDouble(arr, vocabSize: V)
+        // Sort indices by descending prob.
+        let order = (0..<V).sorted { probs[$0] > probs[$1] }
+        // Truncate: keep prefix where surprise -log(p_i) < μ.
+        let mu = Double(options.mirostatMu)
+        var keep = 1
+        for (k, idx) in order.enumerated() {
+            let surprise = probs[idx] > 0 ? -log(probs[idx]) : .infinity
+            if surprise > mu { keep = max(1, k); break }
+            keep = k + 1
+        }
+        // Mask the rest.
+        for i in keep..<order.count { arr[order[i]] = -.infinity }
+        // Gumbel-max sample over the kept set.
+        var rng = options.rngState
+        var bestI = order[0]
+        var bestV = -Float.infinity
+        let mLog = arr.max() ?? 0
+        for k in 0..<keep {
+            let i = order[k]
+            let u = nextUnit(&rng)
+            let g = -log(max(-log(max(u, 1e-12)), 1e-30))
+            let key = (arr[i] - mLog) + g
+            if key > bestV { bestV = key; bestI = i }
+        }
+        options.rngState = rng
+        // Update μ ← μ − η × (S_t − τ).
+        let pSel = probs[bestI]
+        let St = pSel > 0 ? -log(pSel) : Double(options.mirostatTau)
+        let err = Float(St) - options.mirostatTau
+        options.mirostatMu = max(0.01, options.mirostatMu - options.mirostatEta * err)
+        return bestI
+    }
+
+    /// Stable softmax → Double[] without mutating the input. Skips
+    /// `-infinity` entries (treats them as zero mass).
+    @inline(__always)
+    private static func softmaxDouble(_ arr: [Float], vocabSize V: Int) -> [Double] {
+        let m = arr.max() ?? 0
+        var sum: Double = 0
+        var probs = [Double](repeating: 0, count: V)
+        for i in 0..<V {
+            if arr[i] == -.infinity { continue }
+            let e = exp(Double(arr[i] - m))
+            probs[i] = e
+            sum += e
+        }
+        if sum > 0 {
+            for i in 0..<V { probs[i] /= sum }
+        }
+        return probs
     }
 
     // MARK: - Pure-Swift helpers

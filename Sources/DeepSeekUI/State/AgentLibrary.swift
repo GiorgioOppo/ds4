@@ -37,7 +37,23 @@ struct AgentConfig: Codable, Identifiable, Hashable {
     var temperature: Double
     var topP: Double
     var topK: Int
+    /// Filter tokens with `prob < minP × max_prob`. `0` disables.
+    var minP: Double
+    /// Tail-free sampling z-parameter. `1` disables.
+    var tailFree: Double
+    /// Locally-typical sampling mass. `1` disables.
+    var typical: Double
     var repetitionPenalty: Double
+    /// OpenAI-style frequency penalty (scales with token count).
+    /// `0` disables.
+    var frequencyPenalty: Double
+    /// OpenAI-style presence penalty (binary in token presence).
+    /// `0` disables.
+    var presencePenalty: Double
+    /// Mirostat v2 target surprise. `0` disables.
+    var mirostatTau: Double
+    /// Mirostat v2 learning rate. Default 0.1.
+    var mirostatEta: Double
     var maxTokens: Int
     /// SF Symbol name + a tint identifier for the sidebar / picker.
     /// `tint` is one of: "blue" "purple" "pink" "red" "orange"
@@ -57,7 +73,14 @@ struct AgentConfig: Codable, Identifiable, Hashable {
          temperature: Double = 0.7,
          topP: Double = 1.0,
          topK: Int = 0,
+         minP: Double = 0.0,
+         tailFree: Double = 1.0,
+         typical: Double = 1.0,
          repetitionPenalty: Double = 1.0,
+         frequencyPenalty: Double = 0.0,
+         presencePenalty: Double = 0.0,
+         mirostatTau: Double = 0.0,
+         mirostatEta: Double = 0.1,
          maxTokens: Int = 4096,
          iconName: String = "person.crop.circle",
          tint: String = "blue",
@@ -71,11 +94,46 @@ struct AgentConfig: Codable, Identifiable, Hashable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.minP = minP
+        self.tailFree = tailFree
+        self.typical = typical
         self.repetitionPenalty = repetitionPenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.presencePenalty = presencePenalty
+        self.mirostatTau = mirostatTau
+        self.mirostatEta = mirostatEta
         self.maxTokens = maxTokens
         self.iconName = iconName
         self.tint = tint
         self.createdAt = createdAt
+    }
+
+    // Backward-compatible decoder: agents persisted before the
+    // advanced sampling fields existed get sensible defaults instead
+    // of failing to decode.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
+        allowedToolNames = try c.decodeIfPresent(Set<String>.self, forKey: .allowedToolNames)
+        defaultMode = try c.decodeIfPresent(String.self, forKey: .defaultMode) ?? "chat"
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0.7
+        topP = try c.decodeIfPresent(Double.self, forKey: .topP) ?? 1.0
+        topK = try c.decodeIfPresent(Int.self, forKey: .topK) ?? 0
+        minP = try c.decodeIfPresent(Double.self, forKey: .minP) ?? 0.0
+        tailFree = try c.decodeIfPresent(Double.self, forKey: .tailFree) ?? 1.0
+        typical = try c.decodeIfPresent(Double.self, forKey: .typical) ?? 1.0
+        repetitionPenalty = try c.decodeIfPresent(Double.self, forKey: .repetitionPenalty) ?? 1.0
+        frequencyPenalty = try c.decodeIfPresent(Double.self, forKey: .frequencyPenalty) ?? 0.0
+        presencePenalty = try c.decodeIfPresent(Double.self, forKey: .presencePenalty) ?? 0.0
+        mirostatTau = try c.decodeIfPresent(Double.self, forKey: .mirostatTau) ?? 0.0
+        mirostatEta = try c.decodeIfPresent(Double.self, forKey: .mirostatEta) ?? 0.1
+        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 4096
+        iconName = try c.decodeIfPresent(String.self, forKey: .iconName) ?? "person.crop.circle"
+        tint = try c.decodeIfPresent(String.self, forKey: .tint) ?? "blue"
+        createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
     }
 }
 
