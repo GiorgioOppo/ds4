@@ -212,8 +212,18 @@ final class AgentLibrary: ObservableObject {
     // MARK: - persistence
 
     private func load() {
-        guard let url = try? PersistencePaths.agentsConfigURL(),
-              let data = try? Data(contentsOf: url) else { return }
+        guard let url = try? PersistencePaths.agentsConfigURL() else { return }
+        guard let data = try? Data(contentsOf: url) else {
+            // First-launch seeding: agents.json doesn't exist yet.
+            // Drop the curated built-in presets into the library and
+            // persist them so edits made through the UI stick. From
+            // this point on the user owns the file — we never
+            // re-seed or auto-update existing entries.
+            agents = BuiltInAgents.defaults()
+                .sorted { $0.createdAt < $1.createdAt }
+            save()
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let entries = try? decoder.decode([AgentConfig].self, from: data) {
