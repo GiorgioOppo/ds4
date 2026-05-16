@@ -115,6 +115,7 @@ struct ChatView: View {
                     .padding(.bottom, 6)
             }
             resumeBanner(c: c, phase: phase)
+            thinkingPicker
             ComposerView(draft: $draft,
                           phase: phase,
                           canSend: modelState.isReady,
@@ -129,6 +130,54 @@ struct ChatView: View {
     /// (the resume already kicked off) or `.error`. Tapping Resume
     /// re-runs the same prompt + accumulated ids through the model
     /// so the partial reply on screen keeps extending.
+    /// Per-chat thinking-mode picker pinned above the composer.
+    /// The selection drives `resolveSampling()` on the next send.
+    /// When an agent is attached to this chat its `defaultMode`
+    /// wins (same precedence as the sampling sliders), so the
+    /// picker reflects the agent's choice as a read-only display
+    /// with a small "locked by …" hint — keeps the user from
+    /// thinking they're changing something they aren't.
+    @ViewBuilder
+    private var thinkingPicker: some View {
+        let agent = store.selectedConversation?.agentID
+            .flatMap { store.agents.agent(id: $0) }
+        let effective = agent?.defaultMode ?? modeRaw
+        HStack(spacing: 8) {
+            Image(systemName: "brain.head.profile")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Thinking", selection: Binding(
+                get: { effective },
+                set: { newValue in
+                    // Agent override: ignore writes — the picker
+                    // is disabled in that case anyway, but the
+                    // setter still has to be valid.
+                    if agent == nil { modeRaw = newValue }
+                })) {
+                Text("No think").tag("chat")
+                Text("High").tag("high")
+                Text("Max").tag("max")
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(agent != nil)
+            .frame(maxWidth: 260)
+            if let a = agent {
+                HStack(spacing: 3) {
+                    Image(systemName: "lock.fill")
+                    Text("set by \(a.name)")
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 4)
+    }
+
     @ViewBuilder
     private var modelStateBanner: some View {
         switch modelState.status {
