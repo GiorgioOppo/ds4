@@ -35,7 +35,18 @@ final class ChatStore: ObservableObject {
     @Published private(set) var phases: [UUID: GenerationPhase] = [:]
 
     let service: InferenceService
-    let modelDirPath: String
+    /// Path of the model currently loaded into `service`, sampled
+    /// fresh every time the store needs to stamp it onto a new
+    /// `Conversation` (creation, switch). Empty when no model is
+    /// loaded — newly-created chats in that state record an empty
+    /// `modelDirPath` and the first send will fail on tokenizer
+    /// lookup until the user picks a model from the toolbar.
+    /// Used to live as a stored `let` populated at init time, back
+    /// when the load step gated the chat UI; in-chat picking
+    /// turns it into a derived value.
+    var modelDirPath: String {
+        service.currentModelDir()?.path ?? ""
+    }
     /// Library references handed down from the App scene. Used at
     /// "first turn of a chat with a project attached" time to pull
     /// the project's pre-tokenized files and assemble the prompt
@@ -94,13 +105,11 @@ final class ChatStore: ObservableObject {
     private var lastSamplingOptions: [UUID: (opts: SamplingOptions,
                                               maxTokens: Int)] = [:]
 
-    init(modelDirPath: String,
-         service: InferenceService,
+    init(service: InferenceService,
          documents: DocumentLibrary,
          projects: ProjectLibrary,
          mcpPool: MCPClientPool,
          agents: AgentLibrary) {
-        self.modelDirPath = modelDirPath
         self.service = service
         self.documents = documents
         self.projects = projects

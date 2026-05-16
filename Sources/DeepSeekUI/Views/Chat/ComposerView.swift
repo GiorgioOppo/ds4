@@ -10,6 +10,11 @@ import DeepSeekKit
 struct ComposerView: View {
     @Binding var draft: String
     let phase: GenerationPhase
+    /// Gated by the chat's model-load state. When false, Send is
+    /// disabled and the TextField shows a "load a model" prompt
+    /// — the user can still type, the draft is preserved, but
+    /// the send path won't fire on an empty service.
+    var canSend: Bool = true
     var onSend: () -> Void
     var onStop: () -> Void
 
@@ -19,13 +24,19 @@ struct ComposerView: View {
     // lands here.
     @FocusState private var composerFocused: Bool
 
+    private var placeholderText: String {
+        canSend
+            ? "Message the model…"
+            : "Load a model from the toolbar to start chatting"
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 12) {
-            TextField("Message the model…", text: $draft, axis: .vertical)
+            TextField(placeholderText, text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...8)
                 .focused($composerFocused)
-                .onSubmit(onSend)
+                .onSubmit { if canSend { onSend() } }
 
             switch phase {
             case .streaming, .prefilling:
@@ -38,7 +49,8 @@ struct ComposerView: View {
                 Button(action: onSend) {
                     Label("Send", systemImage: "paperplane.fill")
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!canSend
+                          || draft.trimmingCharacters(in: .whitespaces).isEmpty)
                 .keyboardShortcut(.return, modifiers: .command)
                 .controlSize(.large)
             }

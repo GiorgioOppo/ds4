@@ -1,72 +1,46 @@
 import SwiftUI
 import DeepSeekKit
+#if canImport(AppKit)
+import AppKit
+#endif
 
-enum AppPhase {
-    case picking
-    case loading(URL)
-    case ready(URL, ModelConfig)
-}
-
-/// Top-level view. Receives the shared `InferenceService` and the
-/// document / project libraries from the App scene and routes
-/// between picker → loading → ready. The libraries are threaded
-/// down so the chat surface can pick a project AND so the chat
-/// generation path can splice that project's pre-tokenized files
-/// into the first turn's prompt.
+/// Top-level view. Always renders the chat container — the model
+/// load step that used to gate this view is now an in-chat
+/// affordance (toolbar picker + status banner) so the user can
+/// browse history, edit agents/projects, and queue draft messages
+/// before a model is even loaded.
 struct ContentView: View {
     let service: InferenceService
     @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
     @ObservedObject var mcpPool: MCPClientPool
     @ObservedObject var agents: AgentLibrary
-    @State private var phase: AppPhase = .picking
+    @ObservedObject var modelLibrary: ModelLibrary
+    @ObservedObject var modelState: ModelState
 
     var body: some View {
-        Group {
-            switch phase {
-            case .picking:
-                ModelPickerView { url in
-                    phase = .loading(url)
-                }
-                .onAppear {
-                    // Auto-resume the previously loaded model if reachable.
-                    if let last = AppSettings.lastModelDir,
-                       FileManager.default.fileExists(atPath: last) {
-                        phase = .loading(URL(fileURLWithPath: last))
-                    }
-                }
-
-            case .loading(let url):
-                LoadingView(modelDir: url,
-                            service: service,
-                            onLoaded: { cfg in phase = .ready(url, cfg) },
-                            onCancel:  { phase = .picking })
-
-            case .ready(let url, _):
-                ChatContainer(
-                    store: ChatStore(modelDirPath: url.path,
-                                      service: service,
-                                      documents: documents,
-                                      projects: projects,
-                                      mcpPool: mcpPool,
-                                      agents: agents),
-                    projects: projects,
-                    agents: agents,
-                    onUnload: { phase = .picking })
-            }
-        }
+        ChatContainer(
+            store: ChatStore(service: service,
+                              documents: documents,
+                              projects: projects,
+                              mcpPool: mcpPool,
+                              agents: agents),
+            projects: projects,
+            agents: agents,
+            modelLibrary: modelLibrary,
+            modelState: modelState)
     }
 }
 
-/// Hosts the `ChatStore` for the lifetime of the .ready phase and
-/// lays out the NavigationSplitView (sidebar + detail). Toolbar
-/// items: convert model, unload, and a project picker that lets the
-/// active conversation reference a `Project` from the library.
-private struct ChatContainer: View {
+/// Hosts the `ChatStore` for the app's lifetime + lays out the
+/// NavigationSplitView (sidebar + detail). Toolbar items: model
+/// picker, agent picker, project picker, convert sheet trigger.
+struct ChatContainer: View {
     @StateObject var store: ChatStore
     @ObservedObject var projects: ProjectLibrary
     @ObservedObject var agents: AgentLibrary
-    var onUnload: () -> Void
+    @ObservedObject var modelLibrary: ModelLibrary
+    @ObservedObject var modelState: ModelState
 
     @State private var showConvert: Bool = false
 
@@ -75,8 +49,12 @@ private struct ChatContainer: View {
             ConversationListView(store: store)
                 .frame(minWidth: 200)
         } detail: {
-            ChatView(store: store)
+            ChatView(store: store, modelState: modelState)
                 .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        ModelPicker(modelState: modelState,
+                                     library: modelLibrary)
+                    }
                     ToolbarItem(placement: .navigation) {
                         agentPicker
                     }
@@ -88,13 +66,6 @@ private struct ChatContainer: View {
                             showConvert = true
                         } label: {
                             Label("Convert model…", systemImage: "wand.and.stars")
-                        }
-                    }
-                    ToolbarItem(placement: .destructiveAction) {
-                        Button {
-                            onUnload()
-                        } label: {
-                            Label("Unload model", systemImage: "eject")
                         }
                     }
                 }
@@ -144,10 +115,6 @@ private struct ChatContainer: View {
 
     @ViewBuilder
     private var projectPicker: some View {
-        // Disabled when there is no active conversation; the menu is
-        // a no-op without a target. The label reads the currently-
-        // attached project (or "No project") so the user can tell at
-        // a glance which context the chat is wired to.
         if let c = store.selectedConversation {
             let attached = c.projectID.flatMap { projects.project(id: $0) }
             Menu {
@@ -184,5 +151,126 @@ private struct ChatContainer: View {
         } else {
             EmptyView()
         }
+    }
+}
+
+/// Toolbar menu that drives `ModelState` from inside the chat.
+/// Shows the currently-loaded model (or "Loading…" / "No model")
+/// as its label, lists recents from `ModelLibrary` for one-click
+/// switching, and exposes the NSOpenPanel-backed Browse action +
+/// an Unload affordance when a model is loaded.
+private struct ModelPicker: View {
+    @ObservedObject var modelState: ModelState
+    @ObservedObject var library: ModelLibrary
+
+    var body: some View {
+        Menu {
+            Section("Current") {
+                switch modelState.status {
+                case .idle:
+                    Label("No model loaded", systemImage: "circle")
+                case .loading(let ep, _):
+                    Label("Loading \(ep.displayName)…", systemImage: "arrow.down.circle")
+                case .loaded(let ep, _):
+                    Label(ep.displayName, systemImage: "checkmark.circle")
+                case .error(let ep, _):
+                    Label("Failed: \(ep.displayName)",
+                           systemImage: "exclamationmark.octagon")
+                }
+            }
+            let recents = library.recents()
+            if !recents.isEmpty {
+                Section("Recent") {
+                    ForEach(recents) { entry in
+                        Button {
+                            Task { await modelState.load(entry.endpoint) }
+                        } label: {
+                            HStack {
+                                Image(systemName: entry.endpoint.iconName)
+                                Text(entry.name)
+                            }
+                        }
+                    }
+                    Divider()
+                    Menu("Forget…") {
+                        ForEach(recents) { entry in
+                            Button(entry.name) {
+                                library.forget(entry.endpoint)
+                            }
+                        }
+                    }
+                }
+            }
+            Section {
+                Button {
+                    browse()
+                } label: {
+                    Label("Choose model folder…",
+                           systemImage: "folder.badge.plus")
+                }
+                if modelState.isReady {
+                    Button(role: .destructive) {
+                        Task { await modelState.unload() }
+                    } label: {
+                        Label("Unload current model",
+                               systemImage: "eject")
+                    }
+                }
+                if case .error = modelState.status {
+                    Button {
+                        Task { await modelState.retryWithForce() }
+                    } label: {
+                        Label("Retry with Force Load",
+                               systemImage: "arrow.clockwise.heavy")
+                    }
+                }
+            }
+        } label: {
+            label
+        }
+        .help(helpText)
+    }
+
+    @ViewBuilder
+    private var label: some View {
+        switch modelState.status {
+        case .idle:
+            Label("No model", systemImage: "cpu")
+        case .loading(let ep, _):
+            Label("Loading \(ep.displayName)",
+                   systemImage: "arrow.down.circle")
+        case .loaded(let ep, _):
+            Label(ep.displayName, systemImage: ep.iconName)
+        case .error(let ep, _):
+            Label("Failed: \(ep.displayName)",
+                   systemImage: "exclamationmark.octagon.fill")
+        }
+    }
+
+    private var helpText: String {
+        switch modelState.status {
+        case .idle:
+            return "No model loaded — choose one to start chatting"
+        case .loading(let ep, _):
+            return "Loading \(ep.subtitle)…"
+        case .loaded(let ep, _):
+            return ep.subtitle
+        case .error(_, let msg):
+            return "Load failed: \(msg)"
+        }
+    }
+
+    private func browse() {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Select the converted DeepSeek model directory."
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { await modelState.load(.localDirectory(path: url.path)) }
+        }
+        #endif
     }
 }

@@ -16,9 +16,12 @@ struct DeepSeekUIApp: App {
     @StateObject private var mcp: MCPServerLibrary
     @StateObject private var mcpPool: MCPClientPool
     @StateObject private var agents: AgentLibrary
+    @StateObject private var modelLibrary: ModelLibrary
+    @StateObject private var modelState: ModelState
 
     init() {
-        self.service = InferenceService()
+        let service = InferenceService()
+        self.service = service
         self._documents = StateObject(wrappedValue: DocumentLibrary())
         self._projects = StateObject(wrappedValue: ProjectLibrary())
         let mcpLibrary = MCPServerLibrary()
@@ -31,6 +34,10 @@ struct DeepSeekUIApp: App {
         self._mcp = StateObject(wrappedValue: mcpLibrary)
         self._mcpPool = StateObject(wrappedValue: pool)
         self._agents = StateObject(wrappedValue: AgentLibrary())
+        let lib = ModelLibrary()
+        self._modelLibrary = StateObject(wrappedValue: lib)
+        self._modelState = StateObject(wrappedValue:
+            ModelState(service: service, library: lib))
     }
 
     var body: some Scene {
@@ -39,8 +46,22 @@ struct DeepSeekUIApp: App {
                          documents: documents,
                          projects: projects,
                          mcpPool: mcpPool,
-                         agents: agents)
+                         agents: agents,
+                         modelLibrary: modelLibrary,
+                         modelState: modelState)
                 .frame(minWidth: 720, minHeight: 480)
+                .task {
+                    // Auto-resume the most recently used model on
+                    // launch. Done from a top-level .task instead
+                    // of `init` so the load runs after the SwiftUI
+                    // window is on screen — that way the loading
+                    // banner is visible from the first frame.
+                    if case .idle = modelState.status,
+                       let last = AppSettings.lastModelDir,
+                       FileManager.default.fileExists(atPath: last) {
+                        await modelState.load(.localDirectory(path: last))
+                    }
+                }
         }
         .windowResizability(.contentMinSize)
 

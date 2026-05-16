@@ -186,6 +186,34 @@ final class InferenceService: @unchecked Sendable {
         return cancelFlag
     }
 
+    /// Tear down whatever model is currently in memory. Releases
+    /// the transformer + tokenizer + cache shadow on the serial
+    /// queue so a generation in flight finishes cleanly before
+    /// the buffers go away. Idempotent — calling on an already-
+    /// empty service is a no-op.
+    ///
+    /// Used by the in-chat model picker's "Unload" affordance and
+    /// implicitly when the user picks a different model from the
+    /// picker (the load path calls unload first so the old
+    /// weights don't linger alongside the new ones).
+    func unloadModel() async {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Void, Never>) in
+            q.async {
+                if let model = self.transformer {
+                    model.releaseCache()
+                }
+                self.transformer = nil
+                self._tokenizer = nil
+                self.loadedConfig = nil
+                self.loadedModelDir = nil
+                self.cacheImage = nil
+                self.savedDelegations.removeAll()
+                cont.resume(returning: ())
+            }
+        }
+    }
+
     /// Probe the filesystem + pre-flight, surface the resulting
     /// `LoadPlan` to the UI via `onPlan`, then load. Returns the
     /// (possibly auto-inferred) `ModelConfig` on success.

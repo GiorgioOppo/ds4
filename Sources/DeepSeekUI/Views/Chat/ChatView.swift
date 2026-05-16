@@ -5,6 +5,7 @@ import DeepSeekKit
 /// `ChatStore` conversation. Reads sampler defaults from `@AppStorage`.
 struct ChatView: View {
     @ObservedObject var store: ChatStore
+    @ObservedObject var modelState: ModelState
     @State private var draft: String = ""
 
     @AppStorage("deepseek.temperature")       private var temperature: Double = 0.7
@@ -82,6 +83,11 @@ struct ChatView: View {
                     .padding(.bottom, 6)
             }
             Divider()
+            // Model-state banner: tells the user that the chat is
+            // alive but inference isn't (no model loaded / load
+            // in progress / load failed). Collapses to EmptyView
+            // when a model is ready.
+            modelStateBanner
             // Live delegation chain: pinned above the composer so
             // the user can watch sub-agents work without losing
             // sight of either the transcript above or the input
@@ -96,6 +102,7 @@ struct ChatView: View {
             resumeBanner(c: c, phase: phase)
             ComposerView(draft: $draft,
                           phase: phase,
+                          canSend: modelState.isReady,
                           onSend: sendCurrent, onStop: { store.cancel() })
         }
         .navigationTitle(c.title)
@@ -107,6 +114,74 @@ struct ChatView: View {
     /// (the resume already kicked off) or `.error`. Tapping Resume
     /// re-runs the same prompt + accumulated ids through the model
     /// so the partial reply on screen keeps extending.
+    @ViewBuilder
+    private var modelStateBanner: some View {
+        switch modelState.status {
+        case .idle:
+            modelBannerRow(
+                icon: "tray",
+                tint: .secondary,
+                title: "No model loaded",
+                subtitle: "Pick one from the model menu in the toolbar to start chatting.",
+                progress: false)
+        case .loading(let ep, let plan):
+            modelBannerRow(
+                icon: "arrow.down.circle",
+                tint: .accentColor,
+                title: "Loading \(ep.displayName)…",
+                subtitle: plan.map(planSummary) ?? "Probing shards on disk…",
+                progress: true)
+        case .error(let ep, let msg):
+            modelBannerRow(
+                icon: "exclamationmark.octagon.fill",
+                tint: .orange,
+                title: "Could not load \(ep.displayName)",
+                subtitle: msg,
+                progress: false)
+        case .loaded:
+            EmptyView()
+        }
+    }
+
+    private func modelBannerRow(icon: String,
+                                 tint: Color,
+                                 title: String,
+                                 subtitle: String,
+                                 progress: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            if progress {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: icon).foregroundStyle(tint)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.callout.bold())
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(tint.opacity(0.08),
+                     in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 6)
+    }
+
+    private func planSummary(_ plan: LoadPlan) -> String {
+        // Light prose extract — the full PreflightSummaryView used
+        // to render this in a dedicated screen; here we just need
+        // enough to reassure the user something is happening.
+        let gb = Double(plan.totalBytes) / 1_073_741_824
+        return String(format: "%.1f GB across %d shards · strategy: %@",
+                       gb, plan.shards.count, plan.strategy.rawValue)
+    }
+
     @ViewBuilder
     private func resumeBanner(c: Conversation,
                                 phase: GenerationPhase) -> some View {

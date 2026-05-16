@@ -92,6 +92,23 @@ enum PersistencePaths {
         try projectsDir().appendingPathComponent("index.json")
     }
 
+    /// Persisted list of model endpoints the user has loaded —
+    /// powers the in-chat model picker's "Recent" submenu. One
+    /// JSON file under Application Support, decoded into
+    /// `[ConfiguredModelEntry]` at app launch.
+    static func modelsConfigURL() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("models.json")
+    }
+
     /// User-defined agent registry. Each agent is a preset of
     /// (system prompt + tool subset + sampling defaults + thinking
     /// mode). One JSON file under Application Support, decoded into
