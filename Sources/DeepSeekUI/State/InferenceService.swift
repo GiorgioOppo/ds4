@@ -43,6 +43,17 @@ enum GenerationEvent: Sendable {
 final class InferenceService: @unchecked Sendable {
     private var transformer: Transformer?
     private var _tokenizer: Tokenizer?
+    /// Resolved chat template for the loaded model. Defaults to
+    /// `DSV4Template()` because the engine is V4-coupled today; the
+    /// dispatcher in `TokenizerLoader.load(tokenizerDir:)` will pick
+    /// `JinjaChatTemplate` for any model directory that ships a
+    /// `tokenizer_config.json` with a `chat_template` field.
+    /// Production V4 flow still goes through `EncodingDSV4.*`
+    /// directly — this property is exposed to callers (sub-agent
+    /// renderers, future remote prompt builders) that want the
+    /// model's official format without a V4 assumption.
+    private(set) var chatTemplate: ChatTemplate = DSV4Template()
+    private(set) var isDSV4Template: Bool = true
     private(set) var loadedConfig: ModelConfig?
     private(set) var loadedModelDir: URL?
 
@@ -237,8 +248,25 @@ final class InferenceService: @unchecked Sendable {
                     onPlan(plan)
 
                     // Tokenizer (cheap, ~30 ms even for 130k-vocab BPE).
+                    // Try the full dispatcher first so a Mistral / Llama /
+                    // Gemma directory loads its `chat_template` Jinja
+                    // automatically. Fall back to the legacy V4 path if
+                    // the directory lacks a chat_template AND isn't V4 —
+                    // this preserves the historical behaviour where
+                    // `TokenizerLoader.load(from:)` accepted any
+                    // `tokenizer.json` and assumed V4.
                     let tokURL = url.appendingPathComponent("tokenizer.json")
-                    let tok = try TokenizerLoader.load(from: tokURL)
+                    let tok: Tokenizer
+                    do {
+                        let loaded = try TokenizerLoader.load(tokenizerDir: url)
+                        tok = loaded.tokenizer
+                        self.chatTemplate = loaded.chatTemplate
+                        self.isDSV4Template = loaded.isDSV4
+                    } catch {
+                        tok = try TokenizerLoader.load(from: tokURL)
+                        self.chatTemplate = DSV4Template()
+                        self.isDSV4Template = true
+                    }
 
                     // Config: prefer on-disk if present, else defaults
                     // (Transformer.load will then call .inferred()
