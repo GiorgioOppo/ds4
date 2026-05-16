@@ -128,6 +128,14 @@ struct Conversation: Codable, Identifiable, Hashable {
     /// `.json` files (written before this field existed) as nil, so
     /// no migration is needed.
     var projectID: UUID?
+    /// Optional reference to an `AgentConfig` in `AgentLibrary`.
+    /// When set, the agent's system prompt is injected as the first
+    /// system message of the prompt, and its `allowedToolNames`
+    /// filter the MCP tool catalogue before the schemas block is
+    /// built. Sampling defaults stay user-controlled — the Settings
+    /// "Generation" sliders still win at send time. Optional for
+    /// BWC with older on-disk JSON.
+    var agentID: UUID?
     /// Tokenized form of the entire conversation up to (and
     /// including) the last assistant turn's eos. This is the
     /// canonical chat history — text bodies in `messages` are a
@@ -156,12 +164,14 @@ struct Conversation: Codable, Identifiable, Hashable {
          modelDirPath: String,
          messages: [StoredMessage] = [],
          projectID: UUID? = nil,
+         agentID: UUID? = nil,
          encodedTokens: [Int32]? = nil,
          lastEncodedMode: String? = nil,
          pendingTurn: PendingTurn? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
         self.projectID = projectID
+        self.agentID = agentID
         self.encodedTokens = encodedTokens
         self.lastEncodedMode = lastEncodedMode
         self.pendingTurn = pendingTurn

@@ -52,6 +52,11 @@ final class ChatStore: ObservableObject {
     /// invalidated (mode change or new chat) — same trade-off the
     /// project-context path already makes.
     let mcpPool: MCPClientPool
+    /// Agent presets. Resolved by `send` via
+    /// `Conversation.agentID` — when matched, the agent's system
+    /// prompt is injected and its `allowedToolNames` filters the
+    /// MCP tool catalogue.
+    let agents: AgentLibrary
 
     private let saveDebounce: TimeInterval = 0.5
     private var pendingSaves: [UUID: Task<Void, Never>] = [:]
@@ -73,12 +78,14 @@ final class ChatStore: ObservableObject {
          service: InferenceService,
          documents: DocumentLibrary,
          projects: ProjectLibrary,
-         mcpPool: MCPClientPool) {
+         mcpPool: MCPClientPool,
+         agents: AgentLibrary) {
         self.modelDirPath = modelDirPath
         self.service = service
         self.documents = documents
         self.projects = projects
         self.mcpPool = mcpPool
+        self.agents = agents
         loadFromDisk()
         if conversations.isEmpty {
             let first = Conversation(modelDirPath: modelDirPath)
@@ -112,6 +119,18 @@ final class ChatStore: ObservableObject {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         guard conversations[idx].projectID != pid else { return }
         conversations[idx].projectID = pid
+        scheduleSave(id)
+    }
+
+    /// Attach (or detach when `aid == nil`) an agent preset to a
+    /// conversation. Affects subsequent turns whose prompt is
+    /// rebuilt — the cached prefix path (fast delta) inherits the
+    /// previous agent setting since the system block is part of
+    /// the cached prefix.
+    func setAgent(_ aid: UUID?, for id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        guard conversations[idx].agentID != aid else { return }
+        conversations[idx].agentID = aid
         scheduleSave(id)
     }
 
@@ -188,11 +207,23 @@ final class ChatStore: ObservableObject {
         let historyForFullEncode = conversations[idx].messages.map {
             $0.asKitMessage()
         }
+        // Resolve the attached agent (if any) so its system prompt
+        // and tool-filter apply to this turn's prompt build. The
+        // snapshot is taken now and treated as immutable for the
+        // turn — editing the agent mid-stream doesn't retroactively
+        // alter the prompt.
+        let agentConfig: AgentConfig? = conversations[idx].agentID
+            .flatMap { agents.agent(id: $0) }
+        let agentSystemPrompt = agentConfig?.systemPrompt
+
         // Snapshot the MCP tool catalogue once, off the main actor's
-        // critical path. The Task below treats this as immutable
-        // for the duration of the generation — same snapshot
-        // semantics the project-context path uses.
-        let toolSchemasJSON = mcpPool.toolSchemasJSON()
+        // critical path. Filtered through the agent's allowlist when
+        // one is in effect (nil = all tools, empty set = none,
+        // explicit set = allowlist of qualified names). The Task
+        // below treats the resulting JSON as immutable for the
+        // duration of the generation.
+        let toolSchemasJSON = mcpPool.toolSchemasJSON(
+            allowedNames: agentConfig?.allowedToolNames)
 
         // First-turn-with-project info: only the very first user
         // turn of a chat (encodedTokens == nil) ever pays the cost
@@ -227,7 +258,8 @@ final class ChatStore: ObservableObject {
                     mode: mode,
                     fullHistory: historyForFullEncode,
                     projectContext: projectContext,
-                    toolSchemasJSON: toolSchemasJSON)
+                    toolSchemasJSON: toolSchemasJSON,
+                    agentSystemPrompt: agentSystemPrompt)
                 // Snapshot the pending turn on disk immediately. If
                 // the app dies during the prefill (which can take
                 // minutes for a project context), the user's prompt
@@ -353,17 +385,18 @@ final class ChatStore: ObservableObject {
     ///     delimiter ids and splice in each file's pre-tokenized stream;
     ///   - cold path: full re-encode of the entire history.
     ///
-    /// `toolSchemasJSON`, when non-nil, only matters on the
-    /// project-first-turn and cold-path branches — those produce
-    /// the system block from scratch. The delta fast path inherits
-    /// whatever system block was in the cached prefix.
+    /// `toolSchemasJSON` and `agentSystemPrompt` only affect the
+    /// non-fast-path branches — those produce the system block
+    /// from scratch. The delta fast path inherits both from the
+    /// cached prefix.
     private func buildPromptTokens(canReusePrefix: Bool,
                                     cachedPrefix: [Int32]?,
                                     userText: String,
                                     mode: ThinkingMode,
                                     fullHistory: [Message],
                                     projectContext: FirstTurnProjectContext?,
-                                    toolSchemasJSON: String?
+                                    toolSchemasJSON: String?,
+                                    agentSystemPrompt: String?
     ) async throws -> [Int32] {
         if canReusePrefix, let prefix = cachedPrefix {
             guard let delta = await service.tokenizeUserTurnDelta(
@@ -381,9 +414,23 @@ final class ChatStore: ObservableObject {
         // tokenizer can't resolve every special id we need.
         if let ctx = projectContext {
             let history = fullHistory.dropLast()
-            let systemText = history
+            // Agent's system prompt wins over a transcript-side
+            // system message. When the agent has none, fall back
+            // to whatever the user wrote into a manual system
+            // turn (typically empty in a fresh chat).
+            let transcriptSystem = history
                 .first(where: { $0.role == .system })?
                 .content ?? ""
+            let systemText: String
+            if let agent = agentSystemPrompt,
+               !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                systemText = transcriptSystem.isEmpty
+                    ? agent
+                    : agent + "\n\n" + transcriptSystem
+            } else {
+                systemText = transcriptSystem
+            }
             if let tokens = await service.tokenizeFirstTurnWithProject(
                 systemText: systemText,
                 projectName: ctx.name,
@@ -402,7 +449,8 @@ final class ChatStore: ObservableObject {
         let history = fullHistory.dropLast()
         guard let tokens = await service.tokenizeFullHistory(
             Array(history), mode: mode,
-            toolSchemasJSON: toolSchemasJSON)
+            toolSchemasJSON: toolSchemasJSON,
+            systemPromptOverride: agentSystemPrompt)
         else {
             throw NSError(domain: "ChatStore", code: 11, userInfo: [
                 NSLocalizedDescriptionKey:

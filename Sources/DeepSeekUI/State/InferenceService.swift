@@ -210,22 +210,46 @@ final class InferenceService: @unchecked Sendable {
     /// loaded weights without cross-talk.
     /// Tokenize the full chat history through the V4 template. Used
     /// by `ChatStore` on first turn (or after a mode change) to
-    /// produce the canonical `encodedTokens` baseline. When the
-    /// MCP pool has tools, `toolSchemasJSON` is forwarded to
-    /// EncodingDSV4 which folds the tools block into the system
-    /// message — the chat-template's existing mechanism for
-    /// announcing callable tools to the model.
+    /// produce the canonical `encodedTokens` baseline.
+    ///
+    /// `toolSchemasJSON` is forwarded to EncodingDSV4 which folds
+    /// the tools block into the system message.
+    ///
+    /// `systemPromptOverride`, when non-nil, is injected as a
+    /// `Message(role: .system, content: …)` at the head of the
+    /// history (or merges with an existing leading system message
+    /// from the transcript) so an Agent's preset prompt shows up
+    /// before the user's first turn.
     func tokenizeFullHistory(_ history: [Message],
                               mode: ThinkingMode,
-                              toolSchemasJSON: String? = nil) async -> [Int32]? {
+                              toolSchemasJSON: String? = nil,
+                              systemPromptOverride: String? = nil) async -> [Int32]? {
         await withCheckedContinuation {
             (cont: CheckedContinuation<[Int32]?, Never>) in
             q.async {
                 guard let tok = self._tokenizer else {
                     cont.resume(returning: nil); return
                 }
+                var effectiveHistory = history
+                if let extra = systemPromptOverride,
+                   !extra.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    if let firstIdx = effectiveHistory.firstIndex(where: {
+                        $0.role == .system
+                    }) {
+                        // Prepend the agent prompt to whatever the
+                        // transcript already had; keeps both visible
+                        // to the model.
+                        effectiveHistory[firstIdx].content =
+                            extra + "\n\n" + effectiveHistory[firstIdx].content
+                    } else {
+                        effectiveHistory.insert(
+                            Message(role: .system, content: extra),
+                            at: 0)
+                    }
+                }
                 let prompt = EncodingDSV4.encodeMessages(
-                    history, mode: mode,
+                    effectiveHistory, mode: mode,
                     toolSchemasJSON: toolSchemasJSON)
                 let ids = tok.encode(prompt).map(Int32.init)
                 cont.resume(returning: ids)

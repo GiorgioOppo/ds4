@@ -510,14 +510,25 @@ final class MCPClientPool: ObservableObject {
     /// Build the JSON-encoded tools array that the chat template's
     /// `EncodingDSV4.toolsBlock` expects in the system message.
     /// Tool names are emitted in qualified form ("<server>__<tool>")
-    /// so the model picks an unambiguous identifier; on execution
-    /// (M3b) we'll split that back into (serverID, toolName).
+    /// so the model picks an unambiguous identifier.
     ///
-    /// Returns nil when no enabled server has reported any tool —
-    /// signals to the caller "don't bother injecting the tools
-    /// section at all".
-    func toolSchemasJSON() -> String? {
-        let tools = allTools()
+    /// `allowedNames`:
+    ///   - nil → expose every connected tool (default);
+    ///   - empty set → return nil (the chat sees no tools section);
+    ///   - non-empty set → return only the tools whose qualified
+    ///     name is in the set. Names that aren't currently
+    ///     connected are silently dropped — an Agent's allowlist
+    ///     may legitimately mention servers that haven't spawned
+    ///     yet.
+    ///
+    /// Returns nil when the resulting tool set is empty so the
+    /// caller can skip injecting the tools block altogether.
+    func toolSchemasJSON(allowedNames: Set<String>? = nil) -> String? {
+        if let allowedNames, allowedNames.isEmpty { return nil }
+        let tools = allTools().filter { tool in
+            guard let allowedNames else { return true }
+            return allowedNames.contains(tool.qualifiedName)
+        }
         if tools.isEmpty { return nil }
         var payload: [[String: Any]] = []
         for t in tools {

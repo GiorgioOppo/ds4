@@ -38,7 +38,8 @@ struct DeepSeekUIApp: App {
             ContentView(service: service,
                          documents: documents,
                          projects: projects,
-                         mcpPool: mcpPool)
+                         mcpPool: mcpPool,
+                         agents: agents)
                 .frame(minWidth: 720, minHeight: 480)
         }
         .windowResizability(.contentMinSize)

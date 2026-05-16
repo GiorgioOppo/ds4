@@ -18,6 +18,7 @@ struct ContentView: View {
     @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
     @ObservedObject var mcpPool: MCPClientPool
+    @ObservedObject var agents: AgentLibrary
     @State private var phase: AppPhase = .picking
 
     var body: some View {
@@ -47,8 +48,10 @@ struct ContentView: View {
                                       service: service,
                                       documents: documents,
                                       projects: projects,
-                                      mcpPool: mcpPool),
+                                      mcpPool: mcpPool,
+                                      agents: agents),
                     projects: projects,
+                    agents: agents,
                     onUnload: { phase = .picking })
             }
         }
@@ -62,6 +65,7 @@ struct ContentView: View {
 private struct ChatContainer: View {
     @StateObject var store: ChatStore
     @ObservedObject var projects: ProjectLibrary
+    @ObservedObject var agents: AgentLibrary
     var onUnload: () -> Void
 
     @State private var showConvert: Bool = false
@@ -73,6 +77,9 @@ private struct ChatContainer: View {
         } detail: {
             ChatView(store: store)
                 .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        agentPicker
+                    }
                     ToolbarItem(placement: .navigation) {
                         projectPicker
                     }
@@ -94,6 +101,44 @@ private struct ChatContainer: View {
         }
         .sheet(isPresented: $showConvert) {
             ConvertSheet()
+        }
+    }
+
+    @ViewBuilder
+    private var agentPicker: some View {
+        if let c = store.selectedConversation {
+            let attached = c.agentID.flatMap { agents.agent(id: $0) }
+            Menu {
+                Button {
+                    store.setAgent(nil, for: c.id)
+                } label: {
+                    if attached == nil {
+                        Label("None", systemImage: "checkmark")
+                    } else {
+                        Text("None")
+                    }
+                }
+                if !agents.agents.isEmpty { Divider() }
+                ForEach(agents.agents) { a in
+                    Button {
+                        store.setAgent(a.id, for: c.id)
+                    } label: {
+                        if attached?.id == a.id {
+                            Label(a.name, systemImage: "checkmark")
+                        } else {
+                            Text(a.name)
+                        }
+                    }
+                }
+            } label: {
+                Label(attached?.name ?? "No agent",
+                       systemImage: attached?.iconName ?? "person.crop.circle")
+            }
+            .help(attached == nil
+                   ? "Attach an agent from Settings → Agents"
+                   : "Agent: \(attached!.name)")
+        } else {
+            EmptyView()
         }
     }
 
