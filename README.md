@@ -27,6 +27,8 @@ The desktop app supports:
 
 🇮🇹 [Versione italiana](README.it.md) · 🏗 [Architecture deep-dive](docs/ARCHITECTURE.md)
 · 🧪 [Testing](docs/TESTING.md) · 🛠 [Developing](docs/DEVELOPING.md)
+· 🧰 [Native tools](docs/TOOLS.md) · 🚦 [Agent modes](docs/AGENT-MODES.md)
+· 🔍 [Gap analysis vs opencode](docs/GAP-ANALYSIS-OPENCODE.md)
 
 ---
 

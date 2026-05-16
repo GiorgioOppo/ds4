@@ -1,4 +1,5 @@
 import SwiftUI
+import DeepSeekTools
 
 /// Modal sheet for creating / editing one `AgentConfig`. Holds a
 /// local editable copy so Cancel discards every change; Save
@@ -14,6 +15,8 @@ struct AgentEditSheet: View {
     @State private var summary: String = ""
     @State private var systemPrompt: String = ""
     @State private var defaultMode: String = "chat"
+    /// Coarse Plan/Build switch. Persists into AgentConfig.agentMode.
+    @State private var agentMode: AgentMode = .build
     @State private var temperature: Double = 0.7
     @State private var topP: Double = 1.0
     @State private var topK: Int = 0
@@ -140,7 +143,20 @@ struct AgentEditSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Sampling defaults").font(.headline)
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("Mode")
+                Text("Agent mode")
+                Picker("", selection: $agentMode) {
+                    ForEach(AgentMode.allCases, id: \.self) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 180)
+                .help(agentMode.summary)
+                Spacer()
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("Thinking")
                 Picker("", selection: $defaultMode) {
                     Text("Chat (no think)").tag("chat")
                     Text("Think High").tag("high")
@@ -249,6 +265,7 @@ struct AgentEditSheet: View {
         summary = initial.summary
         systemPrompt = initial.systemPrompt
         defaultMode = initial.defaultMode
+        agentMode = initial.agentMode
         temperature = initial.temperature
         topP = initial.topP
         topK = initial.topK
@@ -276,6 +293,7 @@ struct AgentEditSheet: View {
         updated.summary = summary.trimmingCharacters(in: .whitespaces)
         updated.systemPrompt = systemPrompt
         updated.defaultMode = defaultMode
+        updated.agentMode = agentMode
         updated.temperature = max(0.5, min(1.0, temperature))
         updated.topP = max(0.0, min(1.0, topP))
         updated.topK = max(0, topK)

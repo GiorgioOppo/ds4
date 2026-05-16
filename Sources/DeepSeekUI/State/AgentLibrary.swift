@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import DeepSeekTools
 
 /// One named preset that pins down how a chat behaves before the
 /// first turn fires: the system prompt to inject, which subset of
@@ -31,6 +32,19 @@ struct AgentConfig: Codable, Identifiable, Hashable {
     var allowedToolNames: Set<String>?
     /// `ThinkingMode.rawValue` — "chat" / "high" / "max".
     var defaultMode: String
+    /// Coarse operating mode: `.build` (full tool access, mutating
+    /// tools only ask once per session) or `.plan` (read-only, every
+    /// mutation is denied, shell always prompts). Defaults to
+    /// `.build` for backwards compatibility — saved agents that
+    /// pre-date this field decode as `.build` via the synthesized
+    /// `init(from:)`. Surface in the agent edit sheet as a segmented
+    /// control next to `defaultMode`.
+    var agentMode: AgentMode = .build
+    /// Names of skills (NOT MCP tool names) the agent is allowed to
+    /// activate via `/skill <name>` or the picker. Empty = no skill
+    /// restriction. Built-in skill ids are stable UUIDs (see
+    /// `BuiltInSkills`).
+    var allowedSkillIDs: Set<UUID> = []
     /// Sampling defaults. The Generation Settings tab still wins
     /// when the user tweaks the global sliders; the agent's values
     /// are picked up on every fresh chat under that agent.
@@ -54,6 +68,8 @@ struct AgentConfig: Codable, Identifiable, Hashable {
          systemPrompt: String = "",
          allowedToolNames: Set<String>? = nil,
          defaultMode: String = "chat",
+         agentMode: AgentMode = .build,
+         allowedSkillIDs: Set<UUID> = [],
          temperature: Double = 0.7,
          topP: Double = 1.0,
          topK: Int = 0,
@@ -68,6 +84,8 @@ struct AgentConfig: Codable, Identifiable, Hashable {
         self.systemPrompt = systemPrompt
         self.allowedToolNames = allowedToolNames
         self.defaultMode = defaultMode
+        self.agentMode = agentMode
+        self.allowedSkillIDs = allowedSkillIDs
         self.temperature = temperature
         self.topP = topP
         self.topK = topK

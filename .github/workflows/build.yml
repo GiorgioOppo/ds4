@@ -1,0 +1,31 @@
+# SwiftPM build + tests on every push / PR.
+#
+# Runs on macOS because DeepSeekKit depends on Metal. The `DeepSeekTools`
+# target is pure Swift / Foundation, so future tests for the tool
+# runtime can also run on macOS-only — there's no point splitting the
+# matrix when the whole project is Apple-Silicon-only anyway.
+name: build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 15
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Test
+        run: swift test --parallel
