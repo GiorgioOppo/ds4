@@ -1,15 +1,31 @@
 # DeepSeek V4 su macOS
 
 Port Swift + Metal del transformer Mixture-of-Experts [DeepSeek-V4](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
-per Apple Silicon. Include un binario da riga di comando (`deepseek`) e
-un'app nativa SwiftUI per macOS, ed è in grado di caricare in streaming
-i pesi di **V4-Flash** (~142 GB) anche su Mac da 16 GB grazie a un
-rotating buffer per-layer.
+per Apple Silicon, più un client desktop SwiftUI nativo che fa anche
+da chat surface generica per qualsiasi modello ospitato su OpenRouter.
+
+L'app desktop supporta:
+
+- **Inference locale** sui pesi V4-Flash (FP8 + FP4 nativi), con
+  streaming del checkpoint da ~142 GB anche su Mac da 16 GB grazie a
+  un rotating buffer per-layer.
+- **Inference remota** tramite OpenRouter — qualsiasi modello
+  OpenAI-compatible (Claude, GPT, DeepSeek-R1, Llama 3, ecc.) con una
+  sola API key.
+- **Server MCP (Model Context Protocol)** come fornitori di tool,
+  con la stessa config di Claude Desktop.
+- **Preset agente**: system prompt + allowlist di tool + sampling
+  defaults + thinking mode fissati per chat. Gli agenti possono
+  delegare sotto-task ad altri agenti (nesting limitato, prevenzione
+  cicli).
+- **Project**: codebase / collezioni di documenti pre-tokenizzati che
+  puoi attaccare a una chat per portare il contesto già al primo turno.
 
 > **Sperimentale.** V4-Pro (1.6T parametri, ~800 GB a FP4) non entra
-> nella memoria unificata di nessun Mac; il target realistico
-> on-device è **DeepSeek-V4-Flash** (284B / 13B attivati). Stesso
-> codice, diversi pesi e `config.json`.
+> nella memoria unificata di nessun Mac; il target on-device realistico
+> è **DeepSeek-V4-Flash** (284B / 13B attivati). L'inference remota
+> tramite OpenRouter è la risposta quando vuoi Claude, GPT, o altri
+> modelli non eseguibili in locale.
 
 🇬🇧 [English version](README.md) · 🏗 [Architettura (dettagli)](docs/ARCHITECTURE.md)
 · 🧪 [Test](docs/TESTING.md) · 🛠 [Sviluppo](docs/DEVELOPING.md)
@@ -18,15 +34,17 @@ rotating buffer per-layer.
 
 ## Requisiti di sistema
 
-| Cosa | Minimo | Consigliato |
+| Cosa | Inference locale | Solo remoto (OpenRouter) |
 |---|---|---|
-| **CPU/GPU** | Apple Silicon (M1, M2, M3, M4…) | M-Ultra / M-Max |
-| **macOS** | 14.0 Sonoma | 15.x |
-| **RAM (unified)** | 16 GB (V4-Flash, streaming) | 64+ GB |
-| **Disco** | 150 GB liberi per i pesi V4-Flash | SSD NVMe |
-| **Tool** | Swift 5.10 / Xcode 15+ | Xcode 16, Homebrew, Python 3 |
+| **CPU/GPU** | Apple Silicon (M1, M2, M3, M4…) | Qualsiasi Mac Apple Silicon |
+| **macOS** | 14.0 Sonoma | 14.0 Sonoma |
+| **RAM (unified)** | 16 GB (V4-Flash, streaming) — consigliati 64+ GB | 8 GB |
+| **Disco** | 150 GB liberi per i pesi V4-Flash | Pochi MB per l'app |
+| **Tool** | Swift 5.10 / Xcode 15+ | Swift 5.10 / Xcode 15+ |
+| **Rete** | opzionale | obbligatoria |
 
-Il loader sceglie automaticamente la strategia in base alla RAM disponibile:
+Il loader sceglie automaticamente la strategia di inference locale in
+base alla RAM disponibile:
 
 | RAM disponibile | Strategia | Comportamento |
 |---|---|---|
@@ -34,9 +52,9 @@ Il loader sceglie automaticamente la strategia in base alla RAM disponibile:
 | 32–192 GB | `mmap` | Il sistema pagina su richiesta, veloce dopo warm-up |
 | 16–32 GB | `streaming` | Un layer alla volta in RAM, primo token più lento |
 
-I Mac Intel non sono supportati (le pipeline Metal richiedono hardware
-con tipo `bfloat`; `Sources/DeepSeekKit/Device.swift` rifiuta di
-inizializzarsi).
+I Mac Intel non sono supportati — le pipeline Metal richiedono
+hardware `bfloat`-capable e `Sources/DeepSeekKit/Device.swift`
+rifiuta di inizializzarsi.
 
 ---
 
@@ -48,36 +66,12 @@ cd DeepSeek-V4-Pro-MacOS
 swift package resolve
 ```
 
-Il repository **non** contiene i pesi del modello né il tokenizer —
-quei file sono nel `.gitignore`. Il passo successivo li scarica
-separatamente.
+Il repo non include pesi del modello, tokenizer o API key — sono
+gitignored / salvati in Keychain.
 
-## 2. Scaricare i pesi
+## 2. Build
 
-Il checkpoint consigliato è **DeepSeek-V4-Flash** nel layout nativo
-HuggingFace (FP8 per l'attention + FP4 per gli expert). Il loader Swift
-legge quel layout direttamente — non serve nessuna conversione.
-
-```bash
-pip install --upgrade huggingface_hub
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
-    --local-dir ~/Downloads/V4-Flash-HF
-```
-
-A download completato, in `~/Downloads/V4-Flash-HF/` devono esserci:
-
-- `config.json`, `generation_config.json`
-- `tokenizer.json`, `tokenizer_config.json`
-- `model.safetensors.index.json`
-- 46 shard `model-NNNNN-of-NNNNN.safetensors` (~142 GB totali)
-
-Il binario `converter` serve **solo** se vuoi transcodificare il
-checkpoint in BF16/INT8/INT4 per varianti più compatte. Vedi
-[`docs/USAGE.md`](docs/USAGE.md) per quel flusso.
-
-## 3. Build
-
-### Solo CLI (più veloce)
+### Solo CLI
 
 ```bash
 swift build -c release
@@ -85,50 +79,306 @@ swift build -c release
 
 Produce:
 
-- `.build/release/deepseek` — CLI di inference
-- `.build/release/converter` — transcoder dei pesi offline
+- `.build/release/deepseek` — CLI di inference locale
+- `.build/release/converter` — transcoder pesi offline
+
+La CLI parla solo a checkpoint locali — non c'è dispatch OpenRouter
+nel `deepseek` stesso; il supporto remoto vive solo nella GUI.
 
 ### App GUI (Xcode)
 
 ```bash
-brew install xcodegen        # una volta sola
+brew install xcodegen        # una sola volta
 ./Tools/generate-xcodeproj.sh
-open DeepSeekV4Pro.xcodeproj
+open DeepSeekV4Pro.xcworkspace
 ```
 
-Seleziona lo scheme **`DeepSeekApp`** (non "DeepSeekUI", che è il target
-SPM eseguibile — entrambi i nomi compaiono perché condividono i sorgenti)
-e premi ⌘R.
+Seleziona lo scheme **`DeepSeekApp`** (il workspace espone anche il
+target SPM `DeepSeekUI` — scegli il target app, non quello) e premi
+⌘R.
+
+L'app si apre subito sulla chat surface. Nessun modello è richiesto
+per partire — puoi sfogliare la history, modificare agenti / project
+/ server MCP, e scrivere un draft prima ancora che un backend sia
+caricato.
 
 ---
 
-## 4. Quick start
+## 3. Usare un modello locale
 
-### CLI
+### Scaricare i pesi
+
+Il checkpoint on-device consigliato è **DeepSeek-V4-Flash** nel layout
+nativo HuggingFace (FP8 per l'attention + FP4 per gli expert). Il
+loader Swift legge quel layout direttamente — non serve nessuna
+conversione.
+
+```bash
+pip install --upgrade huggingface_hub
+huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
+    --local-dir ~/Downloads/V4-Flash-HF
+```
+
+La cartella di destinazione deve contenere:
+
+- `config.json`, `generation_config.json`
+- `tokenizer.json`, `tokenizer_config.json`
+- `model.safetensors.index.json`
+- 46 shard `model-NNNNN-of-NNNNN.safetensors` (~142 GB totali)
+
+Il binario `converter` serve **solo** se vuoi transcodificare il
+checkpoint in BF16 / INT8 / INT4 / INT2 per varianti più compatte —
+vedi [`docs/USAGE.md`](docs/USAGE.md).
+
+### Caricare nella GUI
+
+1. Apri il menu **Model** della toolbar della chat (icona cpu, il
+   primo a sinistra).
+2. **Choose model folder…** → seleziona `~/Downloads/V4-Flash-HF`.
+3. Un banner sopra il composer mostra `Loading <nome>… <gb> GB across
+   <n> shards · strategy: <preload|mmap|streaming>`. Aspetta che
+   scompaia.
+4. La label del model picker diventa il nome della cartella. Il Send
+   è abilitato.
+5. La cartella viene ricordata sotto **Recent** — al prossimo avvio
+   l'app la ricarica automaticamente.
+
+**Unload current model** dallo stesso menu rilascia la RAM senza
+chiudere l'app. La history della chat è indipendente dal modello
+caricato.
+
+### Eseguire dalla CLI
 
 ```bash
 ./.build/release/deepseek ~/Downloads/V4-Flash-HF \
-    "Qual è la capitale del Brasile?" \
+    "Qual è la capitale dell'Italia?" \
     --mode chat --max-tokens 50 --temperature 0.7
 ```
 
-I token vengono streammati su stdout man mano che sono campionati. Il
-primo token può richiedere 30 s – 3 min su un Mac da 16 GB mentre il
-loader streaming scalda la cache; quelli successivi sono molto più
-rapidi.
-
-### GUI
-
-1. Avvia l'app da Xcode (⌘R) oppure aprendo l'`.app` prodotto.
-2. Quando appare il picker, seleziona la cartella del modello
-   (`~/Downloads/V4-Flash-HF`). Le cartelle recenti vengono ricordate.
-3. Attendi che l'indicatore di prefill finisca — mostra i secondi
-   trascorsi in tempo reale.
-4. Scrivi il messaggio nel composer e premi Invia (o ⌘↩).
+Vedi [§ Riferimento CLI](#riferimento-cli) sotto.
 
 ---
 
-## 5. Riferimento CLI
+## 4. Usare un modello remoto tramite OpenRouter
+
+OpenRouter è un gateway API OpenAI-compatible che instrada verso
+~300 modelli di Anthropic, OpenAI, DeepSeek, Meta, Mistral e altri
+con una singola key.
+
+### Configurazione una tantum: aggiungere l'API key
+
+1. Ottieni una key su <https://openrouter.ai/keys>.
+2. Apri il tab **Settings → API Keys**.
+3. Incolla la key nel SecureField OpenRouter. **Save**.
+4. (Opzionale) Click su **Test** — chiama `/auth/key` e mostra un
+   "Key accepted" verde se le credenziali funzionano.
+
+La key è salvata nel **Keychain** di macOS (service
+`com.deepseek.v4pro`, account `openrouter.apiKey`). Non viene mai
+scritta in un plist o altrove leggibile in chiaro.
+
+### Scegliere un modello
+
+1. Menu **Model** della toolbar → **Add OpenRouter model…**.
+2. Lo sheet carica il catalogo completo di OpenRouter (cachato per
+   24 h sotto `Application Support/.../openrouter-catalog.json`).
+   Cerca per provider / nome / slug; ogni riga mostra context length,
+   pricing per-token, breve descrizione.
+3. Click su una riga → `ModelState` valida la key + cambia
+   l'endpoint della chat.
+4. Il modello compare ora sotto **Recent** affianco alle eventuali
+   cartelle locali, e la label della toolbar mostra lo slug (es.
+   `claude-3.5-sonnet`).
+
+### Invia e osserva i costi
+
+- La risposta streamma via SSE come un'inference locale.
+- DeepSeek-R1 e o-series mettono il reasoning in `reasoning_content`
+  che viene renderizzato attraverso la stessa disclosure
+  brain-icon dei blocchi `<think>` locali.
+- La **ThroughputBar** sotto la bolla mostra `Turn cost: $0.0042`
+  per il turno più recente.
+- Un banner separato sopra il composer mostra `Chat total: $0.013`
+  cumulativo per l'intera conversazione, persistito tra i riavvi.
+
+### Cosa funziona su remoto
+
+- Tool MCP (vedi § Agenti & tool): esposti automaticamente come
+  array `tools` OpenAI; il loop di tool-call fa round-trip HTTP fino
+  a 8 iterazioni.
+- Preset agente (system prompt + sampling defaults + tool
+  allowlist): applicati al body della richiesta.
+- Reasoning mode (`high` / `max`): tradotto nell'hint
+  `reasoning: {effort}` di OpenRouter. I provider che non lo
+  supportano (la maggior parte dei non-R1/o-series) lo ignorano
+  silenziosamente.
+- Picker thinking-mode (sopra il composer): rispettato per turno.
+
+### Cosa non funziona ancora su remoto
+
+- **Delegation cross-agente** (`__delegate_to_agent`): non esposto
+  sulle chat remote. Gli agenti locali gestiscono tutto — la variante
+  remota richiederebbe un loop sub-agent remoto non ancora scritto.
+- **Crash recovery**: i turni remoti non snapshottano un
+  `pendingTurn`. Se l'app crasha mid-stream il turno si perde
+  (rinvia il messaggio).
+- **Prompt caching** (sconti Anthropic / OpenAI prompt-cache via
+  OpenRouter): non ancora implementato.
+
+---
+
+## 5. L'app macOS
+
+### Pickers della toolbar
+
+Da sinistra a destra, quattro menu:
+
+| Picker | Icona | Scopo |
+|---|---|---|
+| **Model** | cpu / disco / nuvola | Cambia backend. Cartella locale, modello OpenRouter remoto, browse, unload. |
+| **Agent** | personalizzata per agente | Attacca un preset `AgentConfig` a questa chat. None / lista. |
+| **Project** | folder | Attacca un project pre-tokenizzato per portare quel contesto al primo turno. None / lista. |
+| **Convert** | bacchetta | Apre lo sheet di quantizzazione offline pesi. |
+
+Ogni picker riflette la conversazione attiva; cambiare conversazione
+nel sidebar aggiorna le label.
+
+### Chat surface
+
+Sopra il composer, dall'alto al basso:
+
+1. **Banner stato modello**: nascosto quando ready; altrimenti
+   "Loading …" / "No model" / "Could not load …" con retry /
+   force-load.
+2. **Banner costo cumulativo**: `Chat total: $X.XX` per chat remote
+   che hanno fatturato qualcosa. Nascosto per chat locali.
+3. **Catena delegation live**: card stack per ogni sub-agente in
+   flight (ciascuno con la sua icona + task + reply streaming,
+   indentati per profondità). Stack vuoto si collassa.
+4. **Banner resume**: quando una generazione precedente è morta a
+   metà, lo snapshot `pendingTurn` offre un resume one-click.
+5. **Thinking picker**: segmented control con `No think / High /
+   Max`. Disabilitato con hint a lucchetto quando un agente
+   sovrascrive il mode.
+6. **Composer**: TextField (Cmd+↩ per inviare) + Send/Stop button.
+   Send disabilitato quando non c'è modello caricato.
+
+Durante lo streaming, la bolla assistant in corso mostra un caret
+lampeggiante. La ThroughputBar sotto ticka `tok/min` e (per remoto)
+`Turn cost`. Il reasoning content è ripiegato in una disclosure
+brain-icon; tool call + output sono ripiegati in una disclosure
+wrench-icon sotto la bolla.
+
+### Sidebar
+
+Lista conversazioni con timestamp. Click destro → Delete. Cmd+N crea
+una nuova chat sotto il modello corrente. Un piccolo spinner segna la
+chat che sta generando attivamente.
+
+---
+
+## 6. Agenti e tool
+
+### Agenti (Settings → Agents)
+
+Un **Agente** è un preset che raggruppa:
+
+- `name`, `summary`, icona + tinta;
+- system prompt iniettato prima di ogni turno della chat a cui è
+  attaccato;
+- sampling defaults (`temperature`, `topP`, `topK`, `repPenalty`,
+  `maxTokens`, `defaultMode`) che sovrascrivono gli slider della
+  tab Generation;
+- allowlist di tool MCP (`nil` = tutti i tool, vuoto = nessuno, set
+  esplicito = whitelist di nomi qualificati `<server>__<tool>`).
+
+Attacca uno alla chat dal picker Agent in toolbar; stacca con
+"None". Quando attaccato, il picker thinking si blocca sul
+`defaultMode` dell'agente, e le sampling settings della chat
+provengono dall'agente anche se tocchi gli slider globali.
+
+Definisci gli agenti sotto **Settings → Agents**: master-detail con
+uno sheet di edit per tutto quanto sopra più un segmented control
+per la tool-policy.
+
+### Delegation tra agenti
+
+Quando sono registrati due o più agenti, quello attaccato alla chat
+riceve un tool sintetico chiamato `__delegate_to_agent` il cui
+schema include un elenco di ogni altro agente. Il modello può
+chiamarlo con `{ agent_name, task }`; l'host esegue l'agente
+nominato in isolamento attraverso uno snapshot/restore della KV
+cache e ne restituisce la reply finale come output del tool. Limiti:
+
+- **Cap di nesting**: fino a 3 livelli
+  (`host → sub → sub-sub → sub-sub-sub`). Allo cap il schema non
+  viene iniettato, quindi il modello non può nemmeno provare a
+  delegare oltre.
+- **Prevenzione cicli**: un agente già nella call stack attiva
+  viene rifiutato con una stringa di errore strutturata. Il modello
+  può auto-correggersi scegliendo un agente diverso.
+- **Preservazione cache**: a ogni livello la KV cache viene
+  snapshottata prima dell'esecuzione del sub-agente e ripristinata
+  al ritorno, così l'host non paga un cold re-prefill.
+
+La chat mostra la catena live (con il buffer streaming di ogni
+livello) in una card pinned sopra il composer. La delegation è solo
+per modelli locali per ora.
+
+### Server MCP (Settings → MCP)
+
+Configura server MCP stdio-based esattamente come Claude Desktop:
+command + args + env. Importa da un config JSON di Claude Desktop
+(`mcpServers: { … }`) con un click.
+
+I server abilitati si spawnano all'avvio app attraverso il PATH
+shell dell'utente (homebrew, fnm, pyenv, …) più un fallback esteso
+così l'environment stripped di launchd non rompe la discovery dei
+tool. Il footer di stato di ogni riga mostra lo stato della
+connessione + l'elenco dei tool live. Il bottone Reconnect è
+inline.
+
+I tool sono esposti alla chat attiva tramite il backend su cui è
+(blocchi DSML locali, o array `tools` OpenAI per remoto).
+
+### Project (Settings → Projects) & Documenti (Settings → Documents)
+
+Un **Documento** è un singolo file di testo ingestito una volta e
+pre-tokenizzato contro il tokenizer del modello attivo. Un
+**Project** è una collezione nominata di documenti.
+
+Attacca un project a una chat dal picker Project in toolbar. Al
+primo turno di quella chat i file del project vengono inseriti nel
+prompt con i token nativi di delimitatore repo / file
+(`<｜begin▁of▁repo▁name｜>` ecc.), così il modello li tratta come
+contesto code-aware invece che come testo free-form. Solo per
+modelli locali.
+
+---
+
+## 7. Preferenze
+
+Tutte le tab raggiungibili via `Cmd+,`. Le modifiche hanno effetto
+sul prossimo Send (o, per `Model Config`, al prossimo caricamento
+modello).
+
+| Tab | Cosa controlla |
+|---|---|
+| **Generation** | Temperatura (slider 0.5–1.0, default 0.7), top-K (0 = disabilitato), top-P, max-tokens, thinking mode. Sovrascritto quando un agente è attaccato. |
+| **Loading** | Override strategia loader, toggle force-load, percorso binario converter. |
+| **Model Config** | Ogni campo di `ModelConfig`. Scrive in `~/Library/Application Support/<app>/config-overrides.json`. |
+| **Agents** | CRUD per i preset agente — vedi § Agenti. |
+| **Documents** | Importa singoli documenti (tokenizza contro il modello locale caricato). |
+| **Projects** | Raggruppa documenti in project per injection one-shot di contesto. |
+| **MCP** | Registra server MCP — vedi § MCP. |
+| **API Keys** | API key OpenRouter (Keychain). Save / Test / Delete. |
+| **Storage** | Posizione della history, dimensione su disco, Reveal / Clear all. |
+
+---
+
+## 8. Riferimento CLI
+
+La CLI è solo locale (nessun dispatch OpenRouter).
 
 ```
 deepseek <model-dir> "<prompt>" [opzioni]
@@ -142,8 +392,8 @@ diagnostiche.
 | Flag | Tipo | Default | Cosa fa |
 |---|---|---|---|
 | `--mode` | `raw` \| `chat` | `chat` | `raw` antepone solo BOS; `chat` applica il template chat V4. |
-| `--thinking` | `off` \| `high` \| `max` | `off` | Budget di ragionamento in chat. `off` appende `</think>` e il modello risponde direttamente; `high` appende `<think>` e il modello produce prima un blocco di ragionamento; `max` aggiunge anche il blocco di sistema REASONING_EFFORT_MAX. |
-| `--temperature` | float | `1.0` | Temperatura di sampling. **Imposta `0.7`** — vedi "Valori consigliati" sotto. |
+| `--thinking` | `off` \| `high` \| `max` | `off` | Budget di ragionamento in chat. `off` appende `</think>`; `high` appende `<think>`; `max` aggiunge anche il blocco di sistema REASONING_EFFORT_MAX. |
+| `--temperature` | float | `1.0` | Temperatura di sampling. **Imposta `0.7`** — vedi Valori consigliati. |
 | `--max-tokens` | int | `32` | Numero massimo di token da generare. |
 
 ### Flag loader / memoria
@@ -151,128 +401,72 @@ diagnostiche.
 | Flag | Tipo | Default | Cosa fa |
 |---|---|---|---|
 | `--load-strategy` | `auto` \| `preload` \| `mmap` \| `streaming` | `auto` | Forza una specifica strategia di caricamento pesi. |
-| `--force-load` | flag | off | Bypassa i controlli di sicurezza RAM (shard > 70 % della RAM, totale > 25× RAM). Usalo solo se sai di poter tollerare il paging aggressivo. |
-| `--max-seq-len` | int | da `config.json` | Override delle righe della KV cache per-layer. Più basso = meno RAM, contesto più corto. |
-| `--max-batch-size` | int | da `config.json` | Override della dimensione batch della KV cache. V4-Flash di default è 1. |
+| `--force-load` | flag | off | Bypassa i controlli di sicurezza RAM. |
+| `--max-seq-len` | int | da `config.json` | Override delle righe KV-cache per-layer. Più basso = meno RAM, contesto più corto. |
+| `--max-batch-size` | int | da `config.json` | Override della dimensione batch della KV cache. |
 
 ### Modalità diagnostiche
 
 | Flag | Cosa fa |
 |---|---|
-| `--print-config` | Carica `config.json`, stampa il `ModelConfig` risolto su stderr ed esce. Verifica che ogni chiave sia stata effettivamente letta invece di ricadere silenziosamente su un default. |
-| `--trace-norms` | Stampa L2 norm + min/max/mean + contatori NaN/Inf del residual stream in punti chiave del forward. Utile per individuare il layer in cui le attivazioni divergono. |
-| `--list-tensors [PREFIX]` | Elenca tutti i nomi dei tensor nel checkpoint, eventualmente filtrati per prefisso. Passa `""` come prompt. |
-| `--dump-tensor NAME[:row=R][:cols=A..B]` | Dequantizza una riga di slice del tensor indicato e stampa i valori float uno per riga. Default `row=0`, `cols=0..32`. |
+| `--print-config` | Carica `config.json`, stampa il `ModelConfig` risolto ed esce. |
+| `--trace-norms` | Stampa L2 norm + min/max/mean + contatori NaN/Inf del residual stream. |
+| `--list-tensors [PREFIX]` | Elenca tutti i nomi di tensor nel checkpoint, eventualmente filtrati. |
+| `--dump-tensor NAME[:row=R][:cols=A..B]` | Dequantizza una riga di slice e stampa i valori. |
 
 ### Valori consigliati
 
-- **`--temperature 0.7`**. Sotto greedy argmax (temperature = 0) il
-  routing MoE di V4-Flash cade in punti fissi auto-rinforzanti e la LM
-  head finisce in loop su un singolo token filler (`好的好的好的…`,
-  `_type_type_type…`). Valori intorno a 0.6–0.9 producono i campioni più
-  coerenti. La GUI vincola lo slider all'intervallo `[0.5, 1.0]` per
-  questo motivo.
-- **`--mode chat --thinking off`** per Q&A brevi; `--thinking high` per
-  problemi in cui il modello deve "pensare ad alta voce".
+- **`--temperature 0.7`**. Sotto greedy argmax il routing MoE di
+  V4-Flash cade in loop auto-rinforzanti (`好的好的好的…`). Valori
+  intorno a 0.6–0.9 producono campioni più coerenti. La GUI vincola
+  lo slider a `[0.5, 1.0]` per lo stesso motivo.
+- **`--mode chat --thinking off`** per Q&A brevi; `--thinking high`
+  per problemi in cui il modello deve "pensare ad alta voce".
 
-### Esempio: inference completa
+### Esempio
 
 ```bash
 ./.build/release/deepseek ~/Downloads/V4-Flash-HF \
     "Spiega la fusione nucleare in due frasi." \
-    --mode chat \
-    --thinking off \
-    --temperature 0.7 \
-    --max-tokens 256 \
-    --max-seq-len 4096 \
-    --max-batch-size 1
-```
-
-### Esempio: diagnostica
-
-```bash
-# Verifica cosa il loader ha letto da config.json
-./.build/release/deepseek ~/Downloads/V4-Flash-HF "" --print-config
-
-# Cerca il nome di un tensor
-./.build/release/deepseek ~/Downloads/V4-Flash-HF "" \
-    --list-tensors layers.0.
-
-# Dequantizza la prima riga di un weight expert
-./.build/release/deepseek ~/Downloads/V4-Flash-HF "" \
-    --dump-tensor layers.6.ffn.experts.56.w1.weight:row=0:cols=0..64
+    --mode chat --thinking off \
+    --temperature 0.7 --max-tokens 256
 ```
 
 ---
 
-## 6. L'app macOS
+## 9. Risoluzione problemi
 
-### Picker / loading del modello
+**Il primo token su modello locale impiega minuti.**
+Atteso sotto `streaming` su un Mac da 16 GB — lo shard di ~3 GB di
+ogni layer deve essere letto da disco prima dell'elaborazione. I
+token successivi sono molto più rapidi (il rotating slot resta
+caldo).
 
-Al primo avvio scegli la cartella del modello tramite un classico
-`NSOpenPanel`. Le cartelle usate di recente vengono ricordate
-(Preferenze → Loading). Durante il caricamento vedi il riepilogo
-`LoadPlan` (numero di shard, RAM prevista, strategia scelta) e uno
-spinner di progresso. Se qualcosa va storto il pannello offre
-**Try again**, **Force load** o **Choose another folder**.
+**La chat OpenRouter fallisce con "API key not configured".**
+Settings → API Keys → incolla e Save. Il picker mostra anche un
+warning inline quando la key non è configurata.
 
-### Schermata chat
+**OpenRouter restituisce 401 / 403.**
+La key è invalida, scaduta o senza credito. Premi Test nel tab API
+Keys; controlla limiti di uso sulla dashboard OpenRouter.
 
-- **Sidebar** elenca ogni conversazione, con timestamp e un piccolo
-  spinner accanto a quella che sta generando. Tasto destro → Delete.
-  ⌘N crea una nuova chat.
-- **Indicatore di prefill**: un contatore live
-  (`Prefilling 256 tokens · 12.3s`) mostra che il primo forward sta
-  procedendo.
-- **Barra di throughput** sotto i messaggi mostra due righe monospaced
-  appena inizia il decode:
-  ```
-  Prefill: 256 tok in 8.32s · 1850 tok/min
-  Generation: 42 tok in 9.15s · 275 tok/min
-  ```
-  La riga di generation si aggiorna ogni ~0.5 s.
-- **Streaming dei token**: i token compaiono nella bolla dell'assistant
-  man mano che vengono campionati, come avviene nella CLI.
-- **Blocchi di reasoning**: i contenuti `<think>…</think>` sono
-  renderizzati come disclosure collassabile (icona cervello cliccabile).
-- **Send/Stop**: il bottone Send diventa Stop mentre una generazione è
-  in flight, in coerenza con il gating dentro `ChatStore`.
+**Le tool call non si eseguono su remoto.**
+Verifica che il footer di stato del server MCP mostri
+`Connected · N tools` in Settings → MCP. Il path remoto usa lo
+stesso pool del locale; se il server è offline il modello riceve un
+errore strutturato.
 
-### Preferenze
+**Il reasoning content non appare su remoto.**
+Solo modelli come DeepSeek-R1 e o-series emettono
+`reasoning_content`. Altri modelli includono il reasoning inline in
+`content` (Claude extended-thinking) o non lo emettono affatto
+(Llama). La disclosure brain-icon si renderizza solo quando il
+campo è popolato.
 
-Quattro tab. Le modifiche hanno effetto sul Send successivo (o, per
-`Model Config`, sul prossimo caricamento del modello).
-
-| Tab | Cosa controlla |
-|---|---|
-| **Generation** | Temperatura (slider 0.5–1.0, default 0.7), top-K (0 = disabilitato), top-P, max-tokens, thinking mode. |
-| **Model Config** | Ogni campo di `ModelConfig`. Scrive in `~/Library/Application Support/<app>/config-overrides.json`; il loader ne onora `max_seq_len` e `max_batch_size` al prossimo load. |
-| **Loading** | Override strategia loader, toggle force-load, ultima cartella caricata, cartelle recenti, percorso del binario converter. |
-| **Storage** | Posizione history conversazioni, dimensione su disco, "Reveal in Finder", "Clear all". |
-
-### Convert sheet (quantizzazione offline)
-
-L'azione **Convert model…** nella toolbar apre uno sheet che pilota lo
-stesso binario `converter` usato dalla CLI. Scegli una cartella sorgente
-(formato HF nativo), una destinazione, un target dtype (BF16 / F16 /
-INT8 / INT4 / INT2 / keep) e una shard size. Lo sheet mostra in tempo
-reale progresso e log mentre la conversione gira.
-
----
-
-## 7. Risoluzione problemi
-
-**Il primo token impiega minuti.**
-È atteso sotto la strategia `streaming` su un Mac da 16 GB. Il loader
-deve leggere da disco lo shard di ~3 GB di ogni layer prima di
-elaborarlo. I token successivi sono molto più rapidi — il rotating slot
-resta caldo.
-
-**Errore di build: `precompiled file '…/ModuleCache/…' was compiled with module
+**Errore di build: `precompiled file '…' was compiled with module
 cache path '…'`.**
-I percorsi intermedi cached si sono "stalli", tipicamente perché la
-cartella di progetto è stata spostata (rinominata, sync iCloud,
-Cestino). Pulisci e ricompila:
+Cache Xcode stale, solitamente dopo aver spostato la cartella di
+progetto. Pulisci:
 
 ```bash
 rm -rf .build
@@ -280,29 +474,45 @@ swift package clean
 swift build
 ```
 
-Per Xcode svuota anche `~/Library/Developer/Xcode/DerivedData/DeepSeekV4Pro-*`.
+Per Xcode svuota anche
+`~/Library/Developer/Xcode/DerivedData/DeepSeekV4Pro-*`.
 
-**Il modello continua a ripetere lo stesso token.**
+**Il modello locale continua a ripetere lo stesso token.**
 Stai samplando con `--temperature 0`. V4-Flash richiede sampling
-stocastico — passa `--temperature 0.7`. La GUI lo vincola via slider.
+stocastico — passa `--temperature 0.7`. La GUI lo vincola.
 
 **"No Metal device" / Mac Intel.**
-È richiesto Apple Silicon. Non c'è un fallback.
+Apple Silicon è richiesto per l'inference locale. Il remoto
+(OpenRouter) funziona su qualunque Mac che soddisfi il minimo
+macOS 14.
 
-**Out of memory al caricamento.**
+**Out of memory al caricamento locale.**
 Prova `--load-strategy streaming` per forzare il rotating loader, o
 `--max-seq-len 2048 --max-batch-size 1` per ridurre la KV cache.
 
+**"Cannot find type 'MCPClientPool'" / simile dopo un git pull.**
+Il progetto Xcode è generato da `project.yml`. Rigenera dopo aver
+aggiunto nuovi file:
+
+```bash
+./Tools/generate-xcodeproj.sh
+```
+
+`swift build` non richiede rigenerazione — SPM raccoglie i nuovi
+file automaticamente.
+
 ---
 
-## 8. Licenza e crediti
+## 10. Licenza e crediti
 
-Il codice Swift in questo repository è MIT (vedi [`LICENSE`](LICENSE))
-ed eredita la licenza del modello upstream. I pesi del modello e
-l'implementazione Python di riferimento in `Reference/inference/`
-appartengono a DeepSeek; vedi la loro
-[scheda Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
+Il codice Swift in questo repository è MIT (vedi [`LICENSE`](LICENSE)).
+I pesi del modello DeepSeek e l'implementazione Python di
+riferimento in `Reference/inference/` appartengono a DeepSeek —
+vedi la loro [scheda Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 per i termini di licenza.
+
+OpenRouter è un servizio di terze parti separato; il tuo uso è
+governato dai loro termini.
 
 Se vuoi capire come funziona il port sotto il cofano — mapping dei
 kernel, amplificazione del residual stream, design dello streaming
