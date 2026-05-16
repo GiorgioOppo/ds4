@@ -315,6 +315,274 @@ Deferred: task tokens, response_format injection, latest_reminder
 
 ---
 
+## `Sources/DeepSeekUI/` (desktop app)
+
+The SwiftUI app that drives `DeepSeekKit` locally **and** dispatches
+to remote OpenAI-compatible providers (OpenRouter today). Top-level
+groups:
+
+- `State/` — observable state owned by the App scene.
+- `Views/` — SwiftUI views, grouped by surface area.
+- `Utility/` — small helpers used across the surface.
+
+### State
+
+#### `InferenceService.swift`
+Long-lived, non-ObservableObject (its mutating fields are guarded by
+an internal serial `q`). Holds the loaded `Transformer` + `Tokenizer`
++ a `CacheImage` shadow of what's in the GPU KV cache so the
+next turn's prompt-prefix match enables the fast-delta path.
+
+Public surface used by the chat flow:
+`loadModel(at:strategyOverride:forceLoad:onPlan:)`,
+`unloadModel()`, `tokenizeFullHistory(...)`,
+`tokenizeFirstTurnWithProject(...)`, `tokenizeUserTurnDelta(...)`,
+`tokenizeToolOutputsDelta(...)`, `generateForConversation(...)`,
+`beginDelegation()`, `endDelegation(_:)`,
+`currentModelDir()`, `currentTokenizer()`.
+
+#### `ModelEndpoint.swift`
+`enum ModelEndpoint: Codable, Hashable` with cases `localDirectory(path)`
+and `openRouter(modelID)`. Carries `displayName` / `subtitle` /
+`iconName` / `isRemote` so picker rows can render uniformly across
+backends.
+
+#### `ModelLibrary.swift`
+`@MainActor ObservableObject` persisting `[ConfiguredModelEntry]`
+under `Application Support/.../models.json`. Powers the picker's
+**Recent** submenu (`recents()`), bumped by `touch(_:)` after every
+successful load, drained by `forget(_:)`.
+
+#### `ModelState.swift`
+`@MainActor ObservableObject` façade over `InferenceService`'s load
+lifecycle. Single source of truth for "what model is the chat
+talking to right now". Status enum:
+`.idle / .loading(endpoint, plan?) / .loaded(endpoint, config) /
+.error(endpoint, message)`. Drives `load(_:)`, `unload()`,
+`retryWithForce()`. Dispatches between `loadLocal` and
+`loadRemoteOpenRouter` per endpoint kind.
+
+#### `KeychainStore.swift`
+Generic-password wrapper over Security. Service
+`com.deepseek.v4pro`; entries keyed by `account` string.
+`KeychainAccount.openRouterAPIKey` is the canonical slot today.
+API: `set / get / delete / exists`.
+
+#### `OpenRouterAPI.swift`
+DTOs (`OpenAIMessage`, `OpenAIToolCall`, `OpenAIStreamChunk` +
+deltas, `OpenAIUsage`) + `OpenRouterClient` (URLSession wrapper).
+`streamChatCompletion(apiKey:body:)` returns an
+`AsyncThrowingStream<OpenAIStreamChunk, Error>` driven by
+`URLSession.bytes(for:).lines` so the chat sees the first token
+without buffering the whole reply. `fetchModels` + `validateKey`
+round out the surface.
+
+#### `OpenRouterCatalog.swift`
+`@MainActor ObservableObject` cache of `GET /models`. Persisted
+under `Application Support/.../openrouter-catalog.json`. 24 h
+stale-after; `refresh(apiKey:force:)` for the picker's **Reload**
+button. `model(for:)` lookup so the cost banner / picker can pull
+pricing without re-fetching.
+
+#### `ChatStore.swift`
+The big one — owns the chat history, dispatches sends to the right
+backend, runs the tool-call loop, drives the delegation chain.
+Conversations live as `[Conversation]` (with selection). Phase
+machinery (`@Published phases: [UUID: GenerationPhase]`) is what
+the chat surface reads to render banners / throughput / streaming
+buffer. `send(text:mode:options:maxTokens:)` is the entry point;
+it branches on `modelState.loadedEndpoint`:
+
+- Local → the existing token pipeline (`buildPromptTokens` ▸
+  `service.generateForConversation` ▸ `apply` ▸ on `.done` with
+  tool calls, `runToolCallsAndContinue`).
+- Remote (`.openRouter`) → `sendRemote` ▸ `runRemoteLoop`, an
+  OpenAI/SSE driver that mirrors the local lifecycle into the
+  same phase types but stores no encodedTokens.
+
+Also owns: delegation dispatch (`executeSubAgentDelegation` ▸
+`dispatchDelegation` ▸ `runSubAgentToCompletion` + Inner), with
+KV-cache snapshot/restore around each level via
+`service.beginDelegation` / `endDelegation`; cost tracking
+(`Conversation.cumulativeCostUSD` + `GenerationMetrics.turnCostUSD`).
+
+#### `Conversation.swift`
+`Conversation` struct: id, title, messages, optional `projectID` /
+`agentID`, `cumulativeCostUSD`, `encodedTokens` (local only),
+`pendingTurn` (crash recovery, local only). `StoredMessage` / `StoredToolCall` /
+`StoredRole` / `PendingTurn` mirror the on-disk Codable shape;
+`asKitMessage()` / `.from(Message:)` round-trip to the
+`DeepSeekKit.Message` the engine speaks.
+
+#### `AgentLibrary.swift`
+`@MainActor ObservableObject` over `[AgentConfig]`. Each agent is a
+preset of (name, summary, systemPrompt, allowedToolNames,
+samplingDefaults, defaultMode, iconName, tint). Persisted to
+`Application Support/.../agents.json`. CRUD + `agent(id:)`. `AgentTint`
+enum + `AgentTint.color(for:)` map the on-disk tint identifiers
+("blue", "purple", …) to SwiftUI Colors.
+
+#### `MCPClient.swift`
+Two classes:
+
+- `MCPClient` — one live JSON-RPC client over stdio. Spawns the
+  server through `/usr/bin/env` with a PATH-extended environment,
+  handles the `initialize / initialized / tools/list` handshake,
+  newline-framed JSON-RPC, pending-request map guarded by
+  `NSLock.withLock`. `callTool(_:arguments:)` for invocation.
+- `MCPClientPool` — `@MainActor ObservableObject` keyed by server
+  UUID. Re-syncs with `MCPServerLibrary` on every mutation
+  (`librarySynced(_:)`), spawning newly-enabled / bouncing
+  edited / disconnecting removed clients. `allTools()` flattens
+  every connected server's catalogue;
+  `toolSchemasJSON(allowedNames:)` builds the DSML system-block
+  JSON the local model expects; `invokeQualified(_:argsJSON:)`
+  routes a `<server>__<tool>` call to the matching client.
+
+#### `MCPServerLibrary.swift`
+`@MainActor ObservableObject` storage for `[MCPServerConfig]`
+(name, command, args, env, enabled, createdAt). Persisted to
+`mcp.json`. Includes `importClaudeDesktopJSON(_:)` so users can
+paste their existing Claude Desktop config.
+
+#### `DelegationFrame.swift`
+Per-in-flight-sub-agent UI frame: agent identity (id, name, icon,
+tint), task text, streaming buffer, depth. Pushed/popped by
+`ChatStore.runSubAgentToCompletionInner`; rendered by
+`DelegationStackView`.
+
+#### `DocumentLibrary.swift`
+Persists the user-imported documents (each tokenised once against
+the loaded model's tokenizer). `ModelFingerprint.of(modelDirPath:)`
+detects when a document was tokenised against a different model and
+needs re-import.
+
+#### `ProjectLibrary.swift`
+Groups documents into named "projects" the chat can attach to its
+first turn for context injection. Persisted under
+`Application Support/.../projects/`.
+
+#### `ConvertViewModel.swift`
+Drives the offline converter binary from the Convert sheet — argv
+assembly, child process spawn, stdout/stderr streaming back into
+the SwiftUI sheet.
+
+#### `AppSettings.swift`
+`@AppStorage`-backed user preferences (key names in
+`AppSettingsKey`). Sampler defaults, loading strategy, last + recent
+model dirs.
+
+### Views/
+
+#### `ContentView.swift`
+Top-level router. Always renders `ChatContainer` — the model load
+step no longer gates the surface. `ChatContainer` lays out the
+sidebar + chat detail + four toolbar pickers (`ModelPicker`,
+agent picker, project picker, Convert). `ModelPicker` is a Menu
+showing the current load status, recents (auto-load on click),
+**Choose model folder…**, **Add OpenRouter model…**, **Unload**,
+and **Retry with Force Load** when in `.error`.
+
+#### `Chat/ChatView.swift`
+The single-conversation chat surface. Owns the draft text +
+`@AppStorage` sampling defaults. Layers (top → bottom): scrolling
+transcript with `MessageView`s, `ThroughputBar` while streaming,
+`modelStateBanner`, cumulative-cost banner, `DelegationStackView`,
+resume banner, `thinkingPicker` (segmented control above composer),
+`ComposerView`. `resolveSampling()` merges the agent override (when
+attached) with the global sliders to produce per-send
+`SamplingOptions` + mode + maxTokens.
+
+#### `Chat/ComposerView.swift`
+Text field + Send/Stop button. `canSend: Bool` gates Send and
+rewrites the placeholder ("Load a model from the toolbar…") so a
+chat with no model loaded is visibly inert.
+
+#### `Chat/MessageView.swift`
+One bubble. Renders user / assistant / system roles distinctly;
+assistant grows a `ReasoningDisclosure` for `<think>` /
+`reasoning_content` content and a wrench-icon disclosure for
+`toolCalls + toolOutputs`. Delegation calls (recognised by
+`call.name == EncodingDSV4.delegateToolName`) get a special row
+showing the target agent's icon + name + the bare task text
+instead of the JSON envelope.
+
+#### `Chat/DelegationStackView.swift`
+Live card stack of in-flight sub-agents (`ChatStore.activeDelegations`).
+Each frame shows the agent identity, its task as a quote, and the
+tail of the streaming buffer (clamped to 6 lines so a chatty
+sub-agent doesn't push the composer off-screen). Depth indents
+each level by 14 px.
+
+#### `Chat/ReasoningDisclosure.swift`
+Collapsible brain-icon disclosure for `Message.reasoningContent`.
+
+#### `Sidebar/ConversationListView.swift`
+The chats sidebar — list + selection + delete + new-chat trigger.
+
+#### `AddOpenRouterModelSheet.swift`
+Modal sheet from the toolbar's **Model → Add OpenRouter model…**.
+Search-filters the `OpenRouterCatalog`, renders pricing + context
+length per row, kicks off `ModelState.load(.openRouter(…))` on
+selection. Shows an inline warning when no Keychain key is
+configured.
+
+#### `Settings/SettingsScene.swift`
+The `Cmd+,` scene. Threads every library + service into nine tabs:
+Generation, Loading, Model Config, Agents, Documents, Projects,
+MCP, API Keys, Storage.
+
+#### `Settings/APIKeysSettingsTab.swift`
+SecureField for the OpenRouter key → KeychainStore. Save / Delete /
+Test (hits `/auth/key`).
+
+#### `Settings/GenerationSettingsTab.swift` · `LoadingSettingsTab.swift` · `ModelConfigSettingsTab.swift` · `StorageSettingsTab.swift`
+Tab content for the existing engine-side settings (sampler,
+loader, model overrides, on-disk history). Unchanged surfaces.
+
+#### `Agents/AgentsView.swift` · `Agents/AgentEditSheet.swift`
+Master-detail for the agent registry and the sheet that edits one.
+Tool-policy is a segmented control with three modes (all / none /
+explicit allowlist).
+
+#### `MCP/MCPServersView.swift` · `MCP/MCPServerEditSheet.swift`
+Same pattern for MCP servers. Sidebar status footer is a live
+`StatusRow` observing the matching `MCPClient`.
+
+#### `Projects/ProjectsView.swift` · `Projects/ProjectDetailView.swift` · `Projects/CreateProjectSheet.swift`
+Project CRUD + per-project document picker.
+
+#### `Documents/DocumentsView.swift` · `Documents/ImportDocumentSheet.swift`
+Single-document import: pick a file, choose splitting, tokenise
+against the loaded model.
+
+#### `Convert/ConvertSheet.swift`
+Offline weight quantisation. Driver: `ConvertViewModel`. Streams the
+converter binary's stdout into the sheet's log pane.
+
+#### `Loading/PreflightSummaryView.swift`
+Read-only summary of a `LoadPlan` (shard count, RAM budget, chosen
+strategy). Currently unmounted — kept around for a future
+"Show preflight detail" toggle from the model picker.
+
+### Utility/
+
+#### `PersistencePaths.swift`
+Single source of truth for every Application Support path the app
+writes to (`mcp.json`, `agents.json`, `models.json`,
+`openrouter-catalog.json`, the projects/documents directories, the
+chat history root).
+
+#### `MarkdownText.swift`
+Markdown renderer used by `MessageView` for finalised assistant
+content. Promotes fenced code blocks into separate artifact cards.
+
+#### `ProjectIndexer.swift`
+Helper that tokenises a project's files against the current model
+and writes the per-document token index.
+
+---
+
 ## `Sources/deepseek/main.swift`
 
 CLI for token generation. Flags: `<model-dir> <prompt> [--mode raw|chat]
