@@ -28,7 +28,10 @@ For step-by-step CLI workflows (build, convert, run), see
 | Stream a one-shot completion via OpenRouter | §11 | easy |
 | Register an MCP server programmatically | §12 | easy |
 | Define an agent that delegates to another agent | §13 | medium |
-| Sources | §14 | — |
+| Invoke a native tool through the registry | §14 | easy |
+| Define an agent locked to Plan mode | §15 | trivial |
+| Add a custom slash command | §16 | easy |
+| Sources | §17 | — |
 
 ## 1. Load a Tensor from safetensors
 
@@ -711,7 +714,115 @@ with the worker's icon + the streaming buffer.
 Nesting cap is 3 levels; the chain (`[hostID, agent.id, …]`) is
 checked on every dispatch to refuse cycles.
 
-## 14. Sources
+## 14. Invoke a native tool through the registry
+
+The chat invokes tools through `NativeToolHost.dispatch`; the
+same `ToolRegistry` is reachable from any code that imports
+`DeepSeekTools`. Useful for scripts / fixtures.
+
+```swift
+import DeepSeekTools
+
+// Spin up a registry pre-populated with the built-in tools.
+let registry = ToolRegistry()
+await registry.register(DefaultTools.standard(planStore: PlanStore()))
+
+// Auto-approve every consent prompt for this script (CLI default).
+let delegate = AutoPermissionDelegate(autoAllowDangerous: false)
+
+let ctx = ToolContext(
+    rootDirectory: URL(fileURLWithPath: "/Users/me/code/project"),
+    mode: .build,
+    permissions: delegate,
+    sandbox: .off)
+
+let result = try await registry.dispatch(
+    name: "read",
+    input: ["path": "README.md", "limit": 50],
+    context: ctx)
+
+print(result.output)
+```
+
+`dispatch` throws `ToolError.denied` when:
+
+- the registry filters the tool out by mode
+  (`.plan` + `.mutating` → denied without prompting);
+- `PermissionStore` carries an `alwaysDeny` for that
+  `(tool, category)`;
+- the delegate's prompt returns `.denied`.
+
+To drive the GUI's modal flow from outside the SwiftUI tree
+(tests, debug scripts), implement your own `PermissionDelegate`
+that returns the canned decision.
+
+## 15. Define an agent locked to Plan mode
+
+A read-only-by-default reviewer that can only `read` / `glob` /
+`grep` / `repo_overview`. Plan-mode keeps `.mutating` +
+`.dangerous` tools out of the schema the model sees; the
+`allowedToolNames` set further narrows the MCP catalogue.
+
+```swift
+let agents = AgentLibrary()
+
+let reviewer = AgentConfig(
+    name: "Code Reviewer",
+    summary: "Reviews the project without touching files",
+    systemPrompt: """
+        You are a code reviewer. Inspect files, point out bugs
+        and inconsistencies, propose changes in prose — never
+        edit anything.
+        """,
+    allowedToolNames: [
+        "filesystem__read_file",
+        "filesystem__list_directory"
+    ],
+    defaultMode: "high",          // think hard
+    agentMode: .plan,             // ← Plan mode locks mutating/dangerous
+    allowedSkillIDs: [],          // no skill restriction
+    temperature: 0.5,
+    iconName: "magnifyingglass.circle",
+    tint: "purple")
+agents.add(reviewer)
+```
+
+Attach it to a chat from the toolbar Agent picker; the mode
+picker beside the composer will lock to "Plan" with a 🔒 hint.
+
+## 16. Add a custom slash command
+
+Built-in commands live in `SlashCommandLibrary`'s catalogue.
+Custom commands today are added at registry-construction time;
+a user-facing Settings → Slash Commands tab is on the TODO list.
+
+```swift
+import DeepSeekTools
+
+let standup = SlashCommand(
+    name: "standup",
+    summary: "Insert a daily standup template",
+    expansion: """
+        ## Yesterday
+        - 
+
+        ## Today
+        - 
+
+        ## Blockers
+        - 
+        """)
+
+// SlashCommandLibrary is @MainActor + ObservableObject; the
+// `register(_:)` API extends the live catalogue and persists
+// custom entries to slash_commands.json.
+slashCommands.register(standup)
+```
+
+In the composer: type `/standup`, pick it from the palette, and
+the draft is replaced with the expansion text.
+
+## 17. Sources
 
 - All recipes here exercise public API documented in
   [MODULES.md](MODULES.md) and kernels listed in [KERNELS.md](KERNELS.md).

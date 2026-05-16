@@ -22,6 +22,7 @@ have actually bitten us. Open this before submitting a change.
 | Add a Settings tab | §10 |
 | Add a new MCP transport (HTTP/SSE) | §11 |
 | Wire a new InferenceService method through the chat | §12 |
+| Add a native tool to `DeepSeekTools` | §13 |
 
 ## 1. Dev environment
 
@@ -622,7 +623,79 @@ into the chat looks like:
    restart the app, reopen the chat. Anything that doesn't
    gracefully degrade with `nil` is a migration bug.
 
-## 13. Sources
+## 13. Recipe: add a native tool to `DeepSeekTools`
+
+The tool catalogue is enumerated in
+`Sources/DeepSeekTools/DefaultTools.swift`. To add a new one:
+
+1. **Pick a category.** `readOnly` / `planning` / `mutating` /
+   `dangerous` / `network`. This drives both the plan-mode filter
+   and the permission policy — get this right first.
+
+2. **Drop the implementation under `Sources/DeepSeekTools/Tools/`.**
+   Conform to `Tool`:
+
+   ```swift
+   struct MyNewTool: Tool {
+       let schema: ToolSchema = .build {
+           $0.name = "mytool"
+           $0.summary = "What it does, one line."
+           $0.category = .readOnly
+           $0.parameters = SchemaBuilder.object {
+               $0.required("path")
+               $0.string("path", description: "Absolute or root-relative.")
+               $0.boolean("verbose", defaultValue: false)
+           }
+       }
+
+       func run(input: ToolInput, context: ToolContext)
+           async throws -> ToolResult
+       {
+           let path = try input.string("path")
+           // … do work, respect context.rootDirectory + context.sandbox …
+           return ToolResult(output: "…",
+                              metadata: ["bytesRead": .int(123)])
+       }
+   }
+   ```
+
+3. **Wire it into `DefaultTools.standard(...)`** so the registry
+   sees it on construction. Tests should drive a registry through
+   `register(MyNewTool())` directly so they don't depend on the
+   default order.
+
+4. **Add a smoke test** under `Tests/DeepSeekToolsTests/`. The
+   bare minimum is "dispatching the tool by name returns a
+   non-empty output for a valid input + throws `.invalidInput`
+   for a missing required arg".
+
+5. **Add per-tool persistence (if any)** under
+   `Sources/DeepSeekUI/State/` and add a `PersistencePaths` entry.
+   The plan/task/todo tools share `PlanStore` for this reason —
+   long-lived state lives there, not on the tool struct.
+
+6. **Don't forget the permission story.** Mutating / dangerous /
+   network tools go through `PermissionDelegate.request(...)` the
+   first time per session per `(tool, category)`. The default
+   `AutoPermissionDelegate` auto-allows everything except
+   `.dangerous`; the GUI's `NativeToolHost` bridges to
+   `PermissionPromptView`. If the tool needs unusual handling
+   (e.g. a long-running confirmation), extend the delegate
+   protocol rather than baking it into the tool.
+
+7. **Regenerate the Xcode project** if you added files:
+
+   ```bash
+   ./Tools/generate-xcodeproj.sh
+   ```
+
+   `swift build` picks the new files up automatically.
+
+The existing tools are the template — `ReadTool` for read-only,
+`WriteTool` for mutating, `ShellTool` for dangerous, `WebFetchTool`
+for network. Each is < 200 LOC.
+
+## 14. Sources
 
 - Reference implementation pattern: `Sources/DeepSeekKit/Layers/Hadamard.swift`
 - Test pattern: `Tests/DeepSeekKitTests/HadamardTests.swift`
