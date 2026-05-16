@@ -1001,7 +1001,15 @@ final class ChatStore: ObservableObject {
             temperature: Float(min(1.0, max(0.5, agent.temperature))),
             topK: agent.topK,
             topP: Float(agent.topP),
-            repetitionPenalty: Float(agent.repetitionPenalty))
+            minP: Float(agent.minP),
+            tailFree: Float(agent.tailFree),
+            typical: Float(agent.typical),
+            repetitionPenalty: Float(agent.repetitionPenalty),
+            frequencyPenalty: Float(agent.frequencyPenalty),
+            presencePenalty: Float(agent.presencePenalty),
+            mirostatTau: Float(agent.mirostatTau),
+            mirostatEta: Float(agent.mirostatEta),
+            mirostatMu: Float(2.0 * agent.mirostatTau))
 
         // Push a live UI frame so the user sees the delegation
         // unfolding. The frame stays until this function exits

@@ -4,6 +4,11 @@ import DeepSeekKit
 // CLI: deepseek <model-dir> "<prompt>"
 //                   [--max-tokens N]
 //                   [--temperature T]
+//                   [--top-k K] [--top-p P]
+//                   [--min-p P] [--tfs Z] [--typical P]
+//                   [--repetition-penalty R]
+//                   [--frequency-penalty F] [--presence-penalty P]
+//                   [--mirostat TAU] [--mirostat-eta ETA]
 //                   [--mode raw|chat]
 //                   [--load-strategy auto|preload|mmap]
 //                   [--force-load]
@@ -22,9 +27,26 @@ func usage() -> Never {
     usage: deepseek <model-dir> "<prompt>" \
         [--max-tokens N] [--temperature T] [--mode raw|chat] \
         [--thinking off|high|max] \
+        [--top-k K] [--top-p P] [--min-p P] \
+        [--tfs Z] [--typical P] \
+        [--repetition-penalty R] \
+        [--frequency-penalty F] [--presence-penalty P] \
+        [--mirostat TAU] [--mirostat-eta ETA] \
         [--load-strategy auto|preload|mmap] [--force-load] \
         [--max-seq-len N] [--max-batch-size N] \
         [--dump-tensor NAME[:row=R][:cols=A..B]]
+
+    Sampling flags (all optional, see Sampling.swift for semantics):
+        --top-k K               keep only the top-K logits (0 = disabled)
+        --top-p P               nucleus mass (1.0 = disabled)
+        --min-p P               filter < P × max_prob (0 = disabled)
+        --tfs Z                 tail-free z (1.0 = disabled)
+        --typical P             locally-typical mass (1.0 = disabled)
+        --repetition-penalty R  HuggingFace-style penalty (1.0 = disabled)
+        --frequency-penalty F   OpenAI-style, scales with count
+        --presence-penalty P    OpenAI-style, binary in presence
+        --mirostat TAU          enable mirostat v2 with target surprise TAU
+        --mirostat-eta ETA      mirostat learning rate (default 0.1)
 
     --thinking off|high|max
         Chat-mode thinking budget. Only meaningful with --mode chat.
@@ -100,6 +122,16 @@ if nextArg < args.count, !args[nextArg].hasPrefix("--") {
 }
 var maxTokens = 32
 var temperature: Float = 1.0
+var topK: Int = 0
+var topP: Float = 1.0
+var minP: Float = 0.0
+var tfsZ: Float = 1.0
+var typicalP: Float = 1.0
+var repetitionPenalty: Float = 1.0
+var frequencyPenalty: Float = 0.0
+var presencePenalty: Float = 0.0
+var mirostatTau: Float = 0.0
+var mirostatEta: Float = 0.1
 var mode = "chat"
 var thinking = "off"   // off | high | max — picks the trailing think marker in chat mode
 var loadStrategy: String? = nil
@@ -125,6 +157,36 @@ while i < args.count {
     case "--temperature":
         guard i + 1 < args.count, let t = Float(args[i + 1]) else { usage() }
         temperature = t; i += 2
+    case "--top-k":
+        guard i + 1 < args.count, let n = Int(args[i + 1]), n >= 0 else { usage() }
+        topK = n; i += 2
+    case "--top-p":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        topP = v; i += 2
+    case "--min-p":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        minP = v; i += 2
+    case "--tfs":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        tfsZ = v; i += 2
+    case "--typical":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        typicalP = v; i += 2
+    case "--repetition-penalty":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        repetitionPenalty = v; i += 2
+    case "--frequency-penalty":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        frequencyPenalty = v; i += 2
+    case "--presence-penalty":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        presencePenalty = v; i += 2
+    case "--mirostat":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        mirostatTau = v; i += 2
+    case "--mirostat-eta":
+        guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
+        mirostatEta = v; i += 2
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
@@ -405,9 +467,14 @@ var inferenceError: Error? = nil
 
 inferenceQueue.async {
     defer { done.signal() }
-    var samplingOpts = SamplingOptions(temperature: temperature,
-                                        topK: 0, topP: 1.0,
-                                        repetitionPenalty: 1.0)
+    var samplingOpts = SamplingOptions(
+        temperature: temperature,
+        topK: topK, topP: topP,
+        minP: minP, tailFree: tfsZ, typical: typicalP,
+        repetitionPenalty: repetitionPenalty,
+        frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
+        mirostatTau: mirostatTau, mirostatEta: mirostatEta,
+        mirostatMu: 2.0 * mirostatTau)
 
     // Prefill.
     var logits = model.forward(inputIds: [promptIds], startPos: 0)

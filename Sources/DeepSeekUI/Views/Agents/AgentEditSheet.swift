@@ -20,7 +20,15 @@ struct AgentEditSheet: View {
     @State private var temperature: Double = 0.7
     @State private var topP: Double = 1.0
     @State private var topK: Int = 0
+    @State private var minP: Double = 0.0
+    @State private var tailFree: Double = 1.0
+    @State private var typical: Double = 1.0
     @State private var repPenalty: Double = 1.0
+    @State private var frequencyPenalty: Double = 0.0
+    @State private var presencePenalty: Double = 0.0
+    @State private var mirostatTau: Double = 0.0
+    @State private var mirostatEta: Double = 0.1
+    @State private var showAdvancedSampling: Bool = false
     @State private var maxTokens: Int = 4096
     @State private var iconName: String = "person.crop.circle"
     @State private var tint: String = "blue"
@@ -190,6 +198,47 @@ struct AgentEditSheet: View {
                     value: $repPenalty,
                     range: 1.0...1.5, step: 0.01,
                     fmt: "%.2f")
+
+            DisclosureGroup(isExpanded: $showAdvancedSampling) {
+                VStack(alignment: .leading, spacing: 8) {
+                    slider("Min-P",
+                            value: $minP,
+                            range: 0.0...1.0, step: 0.01,
+                            fmt: "%.2f")
+                    slider("Tail-free z",
+                            value: $tailFree,
+                            range: 0.0...1.0, step: 0.01,
+                            fmt: "%.2f")
+                    slider("Typical p",
+                            value: $typical,
+                            range: 0.0...1.0, step: 0.01,
+                            fmt: "%.2f")
+                    slider("Frequency pen.",
+                            value: $frequencyPenalty,
+                            range: 0.0...2.0, step: 0.05,
+                            fmt: "%.2f")
+                    slider("Presence pen.",
+                            value: $presencePenalty,
+                            range: 0.0...2.0, step: 0.05,
+                            fmt: "%.2f")
+                    slider("Mirostat τ (0 = off)",
+                            value: $mirostatTau,
+                            range: 0.0...10.0, step: 0.1,
+                            fmt: "%.1f")
+                    slider("Mirostat η",
+                            value: $mirostatEta,
+                            range: 0.01...0.5, step: 0.01,
+                            fmt: "%.2f")
+                    Text("Min-P, tail-free and typical alternate with top-K/top-P. Mirostat overrides every tail filter and runs its own dynamic top-k.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.top, 4)
+            } label: {
+                Text("Advanced sampling")
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -269,7 +318,22 @@ struct AgentEditSheet: View {
         temperature = initial.temperature
         topP = initial.topP
         topK = initial.topK
+        minP = initial.minP
+        tailFree = initial.tailFree
+        typical = initial.typical
         repPenalty = initial.repetitionPenalty
+        frequencyPenalty = initial.frequencyPenalty
+        presencePenalty = initial.presencePenalty
+        mirostatTau = initial.mirostatTau
+        mirostatEta = initial.mirostatEta
+        // Auto-expand if any advanced field is non-default so the user
+        // sees the actual configuration without having to click.
+        showAdvancedSampling = (initial.minP != 0.0
+            || initial.tailFree != 1.0
+            || initial.typical != 1.0
+            || initial.frequencyPenalty != 0.0
+            || initial.presencePenalty != 0.0
+            || initial.mirostatTau != 0.0)
         maxTokens = initial.maxTokens
         iconName = initial.iconName.isEmpty ? "person.crop.circle" : initial.iconName
         tint = AgentTint.all.contains(initial.tint) ? initial.tint : "blue"
@@ -297,7 +361,14 @@ struct AgentEditSheet: View {
         updated.temperature = max(0.5, min(1.0, temperature))
         updated.topP = max(0.0, min(1.0, topP))
         updated.topK = max(0, topK)
+        updated.minP = max(0.0, min(1.0, minP))
+        updated.tailFree = max(0.0, min(1.0, tailFree))
+        updated.typical = max(0.0, min(1.0, typical))
         updated.repetitionPenalty = max(1.0, repPenalty)
+        updated.frequencyPenalty = max(0.0, frequencyPenalty)
+        updated.presencePenalty = max(0.0, presencePenalty)
+        updated.mirostatTau = max(0.0, mirostatTau)
+        updated.mirostatEta = max(0.01, mirostatEta)
         updated.maxTokens = max(1, maxTokens)
         updated.iconName = iconName
         updated.tint = tint
