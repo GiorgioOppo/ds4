@@ -92,6 +92,12 @@ targets:
       # SPM target deps automatically.
       - package: DeepSeekKit
         product: DeepSeekConverter
+      # Native tool runtime (read/write/edit/grep/glob/shell/...).
+      # Same xcodegen-vs-SPM caveat — declare explicitly.
+      - package: DeepSeekKit
+        product: DeepSeekTools
+      - package: DeepSeekKit
+        product: DeepSeekIntegrations
     settings:
       base:
         INFOPLIST_FILE: Sources/DeepSeekUI/Resources/Info.plist

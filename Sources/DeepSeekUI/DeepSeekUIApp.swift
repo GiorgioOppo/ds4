@@ -1,4 +1,5 @@
 import SwiftUI
+import DeepSeekTools
 
 /// SwiftUI entry point for the DeepSeek-V4 macOS chat app. Owns the
 /// long-lived singletons (`InferenceService`, `DocumentLibrary`,
@@ -19,6 +20,16 @@ struct DeepSeekUIApp: App {
     @StateObject private var modelLibrary: ModelLibrary
     @StateObject private var modelState: ModelState
     @StateObject private var openRouterCatalog: OpenRouterCatalog
+    // Native tool runtime + adjacent stores. Added when the toolbox
+    // landed (read/write/edit/grep/glob/shell/...). Each store has
+    // its own JSON file under Application Support and is loaded
+    // lazily; the app launches even if these files are absent.
+    @StateObject private var nativeTools: NativeToolHost
+    @StateObject private var permissions: PermissionStore
+    @StateObject private var skills: SkillLibrary
+    @StateObject private var themes: ThemeStore
+    @StateObject private var keybindings: KeybindingStore
+    @StateObject private var slashCommands: SlashCommandLibrary
 
     init() {
         let service = InferenceService()
@@ -40,6 +51,12 @@ struct DeepSeekUIApp: App {
         self._modelState = StateObject(wrappedValue:
             ModelState(service: service, library: lib))
         self._openRouterCatalog = StateObject(wrappedValue: OpenRouterCatalog())
+        self._nativeTools = StateObject(wrappedValue: NativeToolHost())
+        self._permissions = StateObject(wrappedValue: PermissionStore())
+        self._skills = StateObject(wrappedValue: SkillLibrary())
+        self._themes = StateObject(wrappedValue: ThemeStore())
+        self._keybindings = StateObject(wrappedValue: KeybindingStore())
+        self._slashCommands = StateObject(wrappedValue: SlashCommandLibrary())
     }
 
     var body: some Scene {
@@ -53,6 +70,12 @@ struct DeepSeekUIApp: App {
                          modelState: modelState,
                          openRouterCatalog: openRouterCatalog)
                 .frame(minWidth: 720, minHeight: 480)
+                // Theme overrides applied at the WindowGroup root so
+                // every descendant — including modal sheets — sees
+                // them. `preferredColorScheme(nil)` opts back into
+                // the system setting.
+                .preferredColorScheme(themes.preferredColorScheme)
+                .tint(swiftUIColor(hex: themes.active.accent) ?? .accentColor)
                 .task {
                     // Auto-resume the most recently used model on
                     // launch. Done from a top-level .task instead
@@ -73,6 +96,11 @@ struct DeepSeekUIApp: App {
                        mcp: mcp,
                        mcpPool: mcpPool,
                        agents: agents,
-                       service: service)
+                       service: service,
+                       nativeTools: nativeTools,
+                       permissions: permissions,
+                       skills: skills,
+                       themes: themes,
+                       keybindings: keybindings)
     }
 }

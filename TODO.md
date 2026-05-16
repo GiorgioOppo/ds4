@@ -183,6 +183,74 @@ le metriche dettagliate e i mini-spec per ogni voce.
 
 ---
 
+## 7. Code-agent tooling (DeepSeekTools target)
+
+Toolbox nativo per agire su codice. Storia: vedi
+`docs/GAP-ANALYSIS-OPENCODE.md` §6 e `docs/TOOLS.md`.
+
+- [x] **Target `DeepSeekTools`** — protocollo `Tool`, `ToolRegistry`
+  (actor, plan-mode filter, session permission cache), `ToolContext`,
+  permission delegate, agent mode.
+
+- [x] **Tool nativi** read / write / edit / glob / grep / shell /
+  apply_patch / webfetch / repo_clone / repo_overview / plan / task /
+  todo. Test smoke in `Tests/DeepSeekToolsTests/`.
+
+- [~] **Wire tool registry into `InferenceService`**. Il registry
+  esiste in `NativeToolHost`, ma `InferenceService` ancora costruisce
+  il blocco `tools` solo dagli MCP. Mancano:
+  1. Merge degli schemi nativi con quelli MCP nel system block /
+     OpenAI `tools` array (key prefix `native__<name>`?).
+  2. Routing del `tools/call` al `NativeToolHost.dispatch` quando il
+     nome è nativo.
+  3. Resolve `rootDirectory` dal Project attaccato, o dalla home
+     dell'utente come fallback.
+
+- [~] **`websearch`** — il backend di default (DuckDuckGo lite scraper)
+  funziona ma è fragile. Aggiungere provider configurabili (Tavily /
+  Brave / Serper) con API key in `Keychain`.
+
+- [ ] **`lsp` tool**. Stub registrato che ritorna `notImplemented`.
+  Necessita: spawn `sourcekit-lsp` (per Swift) / `pyright` (Python)
+  / `typescript-language-server` per file `.ts`/`.tsx`. Framing
+  JSON-RPC simile a `MCPClient`. Operazioni minime: `definition`,
+  `hover`, `references`, `diagnostics`.
+
+- [ ] **Sandbox `ShellTool`**. `Sources/DeepSeekIntegrations/Sandbox/`
+  scrive un profilo `sandbox-exec` base; `ShellTool(useSandbox:true)`
+  lo cerca a `<root>/sandbox/default.sb`. Il profilo è
+  deliberatamente strict (deny default); tunarlo per workflow di dev
+  e abilitare il toggle nelle Settings.
+
+- [ ] **HTTP recorder wiring**. `Sources/DeepSeekIntegrations/HTTPRecorder/`
+  ha l'API ma non è collegato a `OpenRouterAPI`. Implementare come
+  `URLProtocol` su una sessione opt-in.
+
+- [ ] **Server mode / headless CLI**. Esporre `InferenceService` su
+  `localhost:PORT` con un'API OpenAI-compatible. Sblocca:
+  TUI client esterni, plugin VS Code / Zed, GitHub Actions
+  `agent-review.yml` (oggi placeholder), Slack bot completo.
+
+- [ ] **Slack bot completo**. `Sources/DeepSeekIntegrations/Slack/`
+  ha solo un webhook one-shot. Mancano: Events API listener, OAuth,
+  session keyed by `(team_id, channel_id)`, dipendenza dal server
+  mode sopra.
+
+- [ ] **Per-project `.deepseek/`**. Carica agent / skill / slash
+  command da un percorso versionabile nel repo target, sovrascrivendo
+  i default globali. Pattern di `.opencode/` e `CLAUDE.md`.
+
+- [ ] **Inline rebind di keybinding**. La tab `Keys` è oggi
+  read-only + reset; aggiungere un widget di key-grab + detection
+  conflitti + conferma overwrite delle scorciatoie di sistema.
+
+- [ ] **Custom theme editor**. Oggi `ThemeStore` accetta temi custom
+  via JSON ma non c'è UI per crearli. Aggiungere editor con
+  ColorPicker per i sei slot (accent / background / foreground /
+  bubble assistant / bubble user / appearance).
+
+---
+
 ## Come contribuire
 
 1. Apri un item, controlla `docs/ROADMAP.md` per il contesto
