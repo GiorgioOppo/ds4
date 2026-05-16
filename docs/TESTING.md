@@ -238,9 +238,12 @@ file as `static func referenceCPU(...)`.
 - **Converter output structural correctness** — no automated test
   that the converter produces a checkpoint that
   `Transformer.load(from:)` can consume. Smoke-tested manually.
-- **Sampler.sample** with non-trivial options — the multinomial /
-  top-P / top-K paths aren't unit-tested. Empirically validated via
-  CLI runs.
+- **Sampler.sample** with non-trivial options — partly covered:
+  `Tests/DeepSeekKitTests/SamplerTests.swift` exercises top-K /
+  top-P / min-p / tfs / typical / freq / presence / Mirostat v2
+  on canned distributions, but the full pipeline ordering test
+  (every layer toggled together against a CPU reference) is
+  still open.
 - **`EncodingDSV4` on the golden corpus** under
   `Reference/encoding/`. Tool-call DSML emit + parse + the
   `__delegate_to_agent` synthetic schema have no token-by-token
@@ -249,6 +252,23 @@ file as `static func referenceCPU(...)`.
   the buffer copy + slot-shape match path isn't covered. Today the
   proof is "sub-agent delegation works in the chat", which is
   indirect.
+
+The post-llama.cpp-gap merge added engine-side coverage that
+*does* live in `Tests/DeepSeekKitTests/`:
+
+- `ChatTemplateTests.swift` — dispatcher chooses
+  `DSV4Template` vs `JinjaChatTemplate` from the loaded
+  directory's metadata; both produce the expected prompt for a
+  fixed conversation.
+- `JinjaTemplateTests.swift` — the Jinja2 subset driver against
+  small fixture templates (variable interpolation, for/if/elif,
+  filters, raise_exception).
+- `GGUFTests.swift` — magic + version check, KV metadata
+  parsing, tensor info table, pass-through `load(name:)`,
+  `unsupportedType` for quantised dtypes.
+- `WordPieceTokenizerTests.swift` — encode/decode round-trip
+  + `##` continuation prefix on a BERT vocab.
+- `SamplerTests.swift` — see above.
 
 ### Desktop app
 

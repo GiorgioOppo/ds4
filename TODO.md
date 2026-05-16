@@ -320,6 +320,49 @@ Toolbox nativo per agire su codice. Storia: vedi
 
 ---
 
+## 9. Multi-format / GGUF / chat-template dispatcher
+
+Pezzi scaffoldati nel merge di llama.cpp-gap. Storia: vedi
+`docs/GAP-ANALYSIS-LLAMACPP.md` e `docs/GGUF.md`.
+
+- [x] **`ChatTemplate` protocol + DSV4 + Jinja2 subset
+  (`JinjaChatTemplate`)**. Driver Jinja2 puro Swift ~900 LOC
+  (variabili, for/if/elif/else, filtri base, `raise_exception`).
+  Macro / set / include / inheritance deferred.
+
+- [x] **Tokenizer dispatcher** in `TokenizerLoader.load(tokenizerDir:)`
+  con BPE / SentencePiece / WordPiece.
+
+- [x] **Sampler suite estesa**: min-p, mirostat v2, tail-free
+  sampling, locally-typical, frequency penalty, presence penalty
+  (oltre al precedente top-K / top-P / repetition). CLI espone
+  i flag corrispondenti. Test: `SamplerTests.swift`.
+
+- [x] **GGUF reader MVP**: header parser v2/v3 + tensor info
+  table + zero-copy load per dtype pass-through (`F32 / F16 /
+  BF16 / I32 / I8`). Test: `GGUFTests.swift`.
+
+- [ ] **Kernel dequant per GGUF quantizzati** (`Q4_0`, `Q4_K`,
+  `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`). Senza questi `GGUFFile.load`
+  solleva `unsupportedType`. Pattern di partenza:
+  `int4_gemm.metal` + `int8_gemm.metal`. Ogni formato ~2-3 giorni.
+
+- [ ] **Kernel transformer Llama-style** (MHA + SwiGLU + RMSNorm,
+  no MLA, no MoE, no HC). Pre-requisito perché il dispatcher di
+  template + il reader GGUF facciano *girare* un modello Llama,
+  non solo leggerlo.
+
+- [ ] **GGUF writer**. Simmetrico al reader; permetterebbe al
+  converter di produrre un GGUF leggibile da llama.cpp. Low
+  priority — interop bidirezionale.
+
+- [ ] **`{% macro %}` / `{% set %}` / `include` / inheritance**
+  in `JinjaTemplate.swift`. Nessuno dei template in circolazione
+  ne ha bisogno per ora; il giorno che inciampiamo in uno che li
+  usa, le aggiungiamo.
+
+---
+
 ## Come contribuire
 
 1. Apri un item, controlla `docs/ROADMAP.md` per il contesto

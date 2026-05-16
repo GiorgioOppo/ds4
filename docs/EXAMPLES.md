@@ -31,7 +31,9 @@ For step-by-step CLI workflows (build, convert, run), see
 | Invoke a native tool through the registry | §14 | easy |
 | Define an agent locked to Plan mode | §15 | trivial |
 | Add a custom slash command | §16 | easy |
-| Sources | §17 | — |
+| Read GGUF metadata + a pass-through tensor | §17 | easy |
+| Render a chat with a Jinja2 template | §18 | easy |
+| Sources | §19 | — |
 
 ## 1. Load a Tensor from safetensors
 
@@ -822,7 +824,82 @@ slashCommands.register(standup)
 In the composer: type `/standup`, pick it from the palette, and
 the draft is replaced with the expansion text.
 
-## 17. Sources
+## 17. Read GGUF metadata + a pass-through tensor
+
+`GGUFFile` is a read-only wrapper over a `.gguf` file. Useful
+for inspecting a downloaded checkpoint without booting the chat.
+For unsupported (quantised) dtypes the loader throws — fall
+back to `info(name:)` to get the raw byte range.
+
+```swift
+import DeepSeekKit
+
+let url = URL(fileURLWithPath: "/Volumes/DATA/Llama-3-8B.gguf")
+let gguf = try GGUFFile(url: url)
+
+print("GGUF v\(gguf.header.version) — \(gguf.header.tensorCount) tensors")
+for (key, value) in gguf.header.metadata.prefix(8) {
+    print("  \(key) = \(value)")
+}
+
+// Inspect one tensor.
+let info = try gguf.info(name: "token_embd.weight")
+print("token_embd.weight shape: \(info.shape), type: \(info.type), \(info.byteCount) B")
+
+// Zero-copy view for pass-through dtypes.
+do {
+    let t = try gguf.load(name: "token_embd.weight")
+    print("loaded as \(t.dtype)")
+} catch GGUFError.unsupportedType(let type) {
+    print("\(type) needs a dequant kernel — see GGUF.md")
+}
+```
+
+## 18. Render a chat with a Jinja2 template
+
+When the loaded model directory carries a `tokenizer_config.json`
+with a `chat_template`, the dispatcher wraps it in
+`JinjaChatTemplate`. The same render path is reachable directly
+for diagnostic / preview use:
+
+```swift
+import DeepSeekKit
+
+let templateSource = """
+{%- for m in messages -%}
+{{ '<|' + m.role + '|>\n' + m.content + '<|end|>\n' }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{ '<|assistant|>\n' }}{%- endif -%}
+"""
+
+let template = try JinjaChatTemplate(source: templateSource)
+
+let messages: [Message] = [
+    Message(role: .system,    content: "You are a code reviewer."),
+    Message(role: .user,      content: "Review this snippet."),
+]
+
+let opts = ChatTemplateOptions(
+    mode: .chat,
+    addGenerationPrompt: true,
+    toolSchemasJSON: nil)
+
+let prompt = try template.render(messages: messages, options: opts)
+print(prompt)
+```
+
+For a real model, prefer:
+
+```swift
+let template = service.chatTemplate      // resolved at load time
+let prompt = try template.render(messages: messages, options: opts)
+```
+
+That way the V4 path keeps using `DSV4Template` (fast, no Jinja
+interpretation) and the Llama / Mistral / Qwen path picks up the
+model's own format automatically.
+
+## 19. Sources
 
 - All recipes here exercise public API documented in
   [MODULES.md](MODULES.md) and kernels listed in [KERNELS.md](KERNELS.md).

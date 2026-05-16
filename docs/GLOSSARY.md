@@ -520,11 +520,98 @@ populate the tools block sent to the model (plan-mode filter
 applied here); `dispatch(name:input:context:)` is the function
 called when the model emits a tool call.
 
+### GGUF
+
+Single-file checkpoint format used by llama.cpp. Header carries
+key/value metadata + a tensor info table (`name, n_dims, shape,
+ggml_type, offset`) + the raw weight bytes at the end. This
+project's `GGUFFile` reads v2 and v3.
+
+### GGML type / quantized dtype
+
+Per-tensor dtype labels GGUF uses: `F32 / F16 / BF16 / I32 / I8`
+(pass-through) plus the quantised families `Q4_0 / Q4_K /
+Q4_K_M / Q5_K / Q6_K / Q8_0` etc., each with its own block
+layout and scale strategy. The pass-through dtypes round-trip
+into a regular `Tensor`; the quantised ones need a dedicated
+dequant kernel that doesn't exist yet — `GGUFFile.load` raises
+`GGUFError.unsupportedType` for them.
+
+### Jinja chat template
+
+The `chat_template` string HuggingFace models ship in
+`tokenizer_config.json`. A Jinja2 subset that turns a messages
+array into the prompt string the model expects. This project
+implements the subset HF templates actually use in
+`Sources/DeepSeekKit/Encoding/JinjaTemplate.swift`; full
+Jinja2 (macros / set / include / inheritance) is deferred.
+
+### SentencePiece
+
+Tokenizer family used by Llama / Mistral / Gemma. Reads a binary
+`tokenizer.model` protobuf; Unigram language model with `▁` as
+the whitespace marker; SP normalization (NFC / NFD / NMT) before
+the merge step. Implementation:
+`Sources/DeepSeekKit/SentencePieceTokenizer.swift`.
+
+### WordPiece
+
+BERT-style sub-word tokenizer. Greedy longest-match resolution
+against a `vocab.txt` with `##` as the continuation prefix.
+Used by embedding-only / classification models. Implementation:
+`Sources/DeepSeekKit/WordPieceTokenizer.swift`.
+
+### Min-p sampling
+
+Sampler that drops tokens whose probability is below `min_p ×
+max_p` after the temperature softmax. Useful as a softer
+nucleus alternative (top-P) that adapts to the entropy of the
+distribution.
+
+### Tail-free sampling (TFS)
+
+Sampler that keeps the head of the distribution where the second
+derivative of the sorted-prob curve is still significant —
+trimming the long "tail" of equally-unlikely tokens. Parameter
+`z` (`1.0` = disabled).
+
+### Locally-typical sampling
+
+Sampler that keeps tokens close to the expected per-token
+surprise (`-Σ p_i log p_i`) of the distribution. Parameter `p`
+is the mass to keep (`1.0` = disabled).
+
+### Mirostat v2
+
+Adaptive sampler that targets a fixed average per-token surprise
+`τ` by adjusting a top-K cutoff online via the learning rate
+`η`. Replaces the (top-K / top-P / min-p / tfs / typical) block
+when enabled. State carried in `SamplingOptions` across decode
+steps.
+
+### Frequency / presence penalty
+
+OpenAI-style logit shifts: frequency penalty subtracts `f ×
+count` from every token's logit (scales with how often it
+appeared); presence penalty subtracts `p` once per token that's
+appeared at least once (binary on presence). Both default to 0.
+
 ## Index (alphabetical)
 
 | Term | One-liner | Defined |
 |---|---|---|
 | `attn_sink` | per-head softmax-denominator bias | §1 |
+| Frequency penalty | OpenAI-style scales-with-count logit shift | §6 |
+| GGML type | per-tensor dtype label inside a GGUF file | §6 |
+| GGUF | llama.cpp single-file checkpoint format | §6 |
+| Jinja chat template | HF chat_template string evaluated by JinjaTemplate | §6 |
+| Locally-typical | sampler keeping mass near expected surprise | §6 |
+| Min-p | sampler dropping p < min_p × max_p | §6 |
+| Mirostat v2 | adaptive sampler targeting fixed avg surprise τ | §6 |
+| Presence penalty | OpenAI-style binary-on-presence logit shift | §6 |
+| SentencePiece | Unigram protobuf tokenizer (Llama / Mistral / Gemma) | §6 |
+| Tail-free sampling (TFS) | sampler trimming the distribution tail by 2nd derivative | §6 |
+| WordPiece | BERT-style vocab.txt + greedy longest-match tokenizer | §6 |
 | `beta_fast`/`beta_slow` | YaRN correction-range bounds | §3 |
 | BF16 | F32 truncated to top 16 bits | [DTYPES](DTYPES.md) |
 | BOS / EOS | sentence markers in tokenizer | §5 |

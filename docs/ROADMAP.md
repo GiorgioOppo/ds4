@@ -30,7 +30,11 @@ the "single token per invocation" prototype are removed.
 ### ✅ Tier 2 — UX completeness (done)
 
 - `Sampler.sample(_:history:options:)` — temperature, repetition
-  penalty, top-K, top-P, Gumbel-max multinomial.
+  penalty, top-K, top-P, min-p, tail-free, locally-typical,
+  frequency / presence penalties, Mirostat v2, Gumbel-max
+  multinomial. Pipeline order documented in
+  [`USAGE.md`](USAGE.md#sampler-flags-all-default-to-disabled);
+  coverage in `Tests/DeepSeekKitTests/SamplerTests.swift`.
 - `EncodingDSV4` — port of the practical chat-with-tools surface:
   BOS/role markers, EOS, `<think>...</think>` reasoning blocks,
   REASONING_EFFORT_MAX system prompt, tool_calls DSML emit + parse,
@@ -41,6 +45,29 @@ the "single token per invocation" prototype are removed.
 - `Transformer.snapshotKVCache` / `restoreKVCache` — value-typed
   KV snapshots that ChatStore uses around sub-agent delegations
   so the host doesn't pay a cold re-prefill on return.
+
+### ✅ Tier 2.5 — Multi-format scaffolding (done)
+
+Building blocks for *future* non-V4 local backends. The forward
+pass itself is still V4-only — these pieces just keep the
+loader / prompt / tokenizer paths from hard-coding it.
+
+- `ChatTemplate` protocol with two implementations:
+  `DSV4Template` (DSV4 native) + `JinjaChatTemplate` (Jinja2
+  subset, ~900 LOC, fits the templates HuggingFace models ship
+  in `tokenizer_config.json`).
+- `TokenizerLoader.load(tokenizerDir:)` dispatcher across
+  `BPETokenizer` (HF `tokenizer.json`), `SentencePieceTokenizer`
+  (Llama / Mistral / Gemma protobuf), `WordPieceTokenizer`
+  (BERT-style `vocab.txt`).
+- GGUF reader MVP — `GGUFFile` parses v2/v3 metadata + the
+  tensor info table, returns zero-copy `Tensor` for
+  `F32 / F16 / BF16 / I32 / I8`. Quantised dtypes raise
+  `GGUFError.unsupportedType`. Full status in
+  [`GGUF.md`](GGUF.md).
+- `Tests/DeepSeekKitTests/` grows `ChatTemplateTests`,
+  `JinjaTemplateTests`, `GGUFTests`, `WordPieceTokenizerTests`,
+  `SamplerTests`.
 
 ### ⏳ Tier 3 — Parity with Python reference (partial)
 
@@ -87,6 +114,22 @@ Headline opportunities, none pursued yet:
 - KV cache pool → matters for multi-session serving.
 - **KV cache persistence to disk** (B3) → reopen the same project
   chat after a restart without paying the cold prefill again.
+
+#### Multi-format inference (planned, not started)
+
+- **GGUF quantised dtype kernels** — `Q4_0 / Q4_K_M / Q5_K /
+  Q6_K / Q8_0` dequant + GEMM. Today `GGUFFile.load` raises
+  `unsupportedType` for these. Plan: mirror `int4_gemm.metal` /
+  `int8_gemm.metal` with the GGML block layouts. ~2-3 days per
+  format.
+- **Llama-style transformer kernels** — the standard MHA / SwiGLU
+  / RMSNorm stack. Different shape from MLA + MoE, so requires
+  a separate `Block` variant and assembly entry. Pre-requisite
+  for the chat template dispatcher + GGUF reader to *actually*
+  run a Llama model.
+- **GGUF writer** — symmetric to the reader. Would let the
+  converter produce a GGUF a llama.cpp could consume; useful for
+  bidirectional ecosystem interop. Low priority.
 
 ---
 
