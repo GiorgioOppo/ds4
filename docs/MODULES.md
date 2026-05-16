@@ -315,6 +315,135 @@ Deferred: task tokens, response_format injection, latest_reminder
 
 ---
 
+## `Sources/DeepSeekTools/` (native code-agent toolbox)
+
+Separate Swift target that owns the tools the model can invoke
+directly (no MCP round-trip): file ops, shell, web fetch, repo
+overview, planning notes, and the protocols + registry around
+them. Imported by `DeepSeekUI/State/Tools/NativeToolHost.swift`
+(GUI side) and intended to be reusable by a future headless CLI
+server.
+
+### Core protocols
+
+#### `Tool.swift`
+The base protocol every tool conforms to: a `schema: ToolSchema`,
+a `category: ToolCategory`, and an `async throws run(input:context:)`
+that returns a `ToolResult { output, metadata }`. Tools are value
+types where possible; long-lived state lives on the registry's
+stores (e.g. `PlanStore`).
+
+#### `ToolSchema.swift`
+JSON-schema fragment describing one tool's input. Includes the
+`SchemaBuilder` helpers (`string`, `number`, `boolean`, `array`,
+`object`, `oneOf`, with `required: [...]`) so tool authors don't
+hand-write the JSON.
+
+#### `ToolCategory.swift`
+`enum ToolCategory: readOnly | planning | mutating | dangerous |
+network`. Drives both the plan-mode filter and the permission
+policy.
+
+#### `ToolContext.swift`
+Per-call context: `rootDirectory` (the project / cwd root),
+`mode: AgentMode`, `permissions: PermissionDelegate`, `sandbox`
+flags. Tools never reach outside this.
+
+#### `ToolError.swift`
+Structured failures (`notImplemented`, `denied`, `invalidInput`,
+`runtime`, `cancelled`, …). The dispatcher converts these to a
+short string the model sees as the tool output.
+
+#### `ToolRegistry.swift`
+Actor that owns the active `[Tool]`, the plan-mode filter
+(`availableSchemas(mode:)`), and the per-`(tool, category)`
+session permission cache. `dispatch(name:input:context:)` is the
+single entry point both backends call. Re-emits the
+`PermissionDelegate.request(...)` for any uncached
+mutating/dangerous/network call.
+
+#### `Permission.swift`
+`PermissionDecision` enum (`allowOnce / alwaysAllow / alwaysDeny`)
++ `PermissionDelegate` protocol. The GUI host wires this to a
+SwiftUI sheet; the CLI default (`AutoPermissionDelegate`)
+auto-allows everything except `.dangerous` unless flagged.
+
+#### `AgentMode.swift`
+`enum AgentMode: build | plan`. Plan-mode hides `.mutating` +
+`.dangerous` tools from the schema list the model sees, which is
+the structural enforcement; the registry also rejects late-
+arriving calls with `denied` if the mode changes mid-stream.
+
+#### `SlashCommand.swift`
+Built-in slash commands the composer intercepts before the
+inference loop sees the text: `/mode`, `/tools`, `/permissions`,
+`/skill`, `/theme`, `/clear`, `/help`. The library is extendable
+at runtime (user-defined commands come in a follow-up step).
+
+#### `Theme.swift`
+Theme descriptor (light/dark/system + accent + bubble tints +
+appearance). Built-in catalogue plus a `decode(_:)` for custom
+JSON themes.
+
+#### `Keybinding.swift`
+Configurable keyboard shortcuts addressable by stable action ids
+(`composer.send`, `composer.stop`, `mode.toggle`,
+`palette.open`, …). The library returns a default mapping; the
+UI's `KeybindingStore` overlays per-user overrides.
+
+#### `DefaultTools.swift`
+`DefaultTools.standard(...)` returns the built-in tool set
+populated into a fresh `ToolRegistry`. Single source of truth for
+which tools ship today; new tools land here.
+
+### `Tools/` — built-in tools
+
+Each file is one `Tool` implementation. Category in brackets.
+
+- `ReadTool.swift` (readOnly) — line-numbered UTF-8 file read with
+  optional offset/limit.
+- `WriteTool.swift` (mutating) — atomic create-or-overwrite.
+- `EditTool.swift` (mutating) — exact-match string replace; refuses
+  on non-unique match unless `replaceAll`.
+- `ApplyPatchTool.swift` (mutating) — minimal unified-diff applier
+  (create / delete / in-place, reverse-order hunks, exact context).
+- `GlobTool.swift` (readOnly) — walk the agent root, match by glob,
+  sort by recent mtime.
+- `GrepTool.swift` (readOnly) — `NSRegularExpression` search across
+  files matched by an inner glob.
+- `ShellTool.swift` (dangerous) — subprocess via `/bin/zsh -c`,
+  combined output, 32 KB cap, watchdog timeout, optional
+  `sandbox-exec` wrap.
+- `WebFetchTool.swift` (network) — `URLSession` GET; HTML → plain
+  text unless `raw=true`. 1 MB cap.
+- `WebSearchTool.swift` (network) — DuckDuckGo lite scraper as the
+  default backend. Fragile by design; replace with a real API for
+  serious use.
+- `RepoCloneTool.swift` (dangerous) — shallow `git clone` via
+  subprocess. Uses the user's local git auth.
+- `RepoOverviewTool.swift` (readOnly) — tree (depth-capped) +
+  extension histogram + content of conventional manifests
+  (`Package.swift`, `Cargo.toml`, `package.json`, …).
+- `LSPTool.swift` (readOnly) — stub; registers a schema but
+  `run` throws `.notImplemented`. Pending: spawn `sourcekit-lsp`,
+  JSON-RPC framing, definition / hover / references / diagnostics.
+- `TaskTool.swift` (planning) — list / set / update the active
+  task list. Backed by `PlanStore`.
+- `TodoTool.swift` (planning) — cross-task TODO bag.
+- `PlanTool.swift` (planning) — read / replace the high-level
+  plan note.
+- `PlanStore.swift` — actor that owns plan + tasks + todos. Held
+  inside `NativeToolHost` so the three planning tools share the
+  same data.
+
+### `Skills/Skill.swift`
+A reusable bundle of (system prompt addendum, suggested tool
+allowlist, optional default mode). Built-in skills declared at
+stable UUIDs in `BuiltInSkills`; user can layer custom skills on
+top.
+
+---
+
 ## `Sources/DeepSeekUI/` (desktop app)
 
 The SwiftUI app that drives `DeepSeekKit` locally **and** dispatches
@@ -472,6 +601,45 @@ the SwiftUI sheet.
 `AppSettingsKey`). Sampler defaults, loading strategy, last + recent
 model dirs.
 
+#### `Tools/NativeToolHost.swift`
+Singleton that owns the `ToolRegistry` + `PlanStore` for the GUI.
+Bridges the registry's `PermissionDelegate` to a SwiftUI sheet
+(`PermissionPromptView`) so the model's mutating / dangerous /
+network calls produce a modal instead of being auto-denied.
+`dispatch(name:input:mode:rootDirectory:)` is the entry point the
+chat-flow side calls when wiring through `InferenceService` lands
+(TODO §8). Today the host is constructed at app launch and
+plumbed into the relevant Settings views.
+
+#### `Tools/PermissionStore.swift`
+`@MainActor ObservableObject` over the durable
+`<tool>:<category> → ask | alwaysAllow | alwaysDeny` map.
+Persisted to `permissions.json`. Read by the registry before the
+session cache so a previously-granted "Always allow" skips the
+modal.
+
+#### `SkillLibrary.swift`
+`@MainActor ObservableObject` over the catalogue of skills
+(`Skill` from DeepSeekTools). Built-in entries from
+`BuiltInSkills` are merged with the user's custom ones; the
+Agents tab uses this for the per-agent `allowedSkillIDs` editor.
+
+#### `SlashCommandLibrary.swift`
+Library of `SlashCommand`s the composer intercepts. Today only
+the built-in catalogue is exposed; custom command CRUD is
+scaffolded for a future Settings tab.
+
+#### `ThemeStore.swift`
+`@MainActor ObservableObject` that owns the active theme +
+appearance preference. Reads `themes.json` (custom themes) +
+yields the built-in catalogue. Drives the Theme Settings tab.
+
+#### `KeybindingStore.swift`
+Per-user keybinding overrides on top of the `Keybinding`
+defaults. Persisted to `keybindings.json`. Read by the
+Keybindings tab and by the SwiftUI views that bind action ids to
+`KeyboardShortcut`.
+
 ### Views/
 
 #### `ContentView.swift`
@@ -528,17 +696,62 @@ selection. Shows an inline warning when no Keychain key is
 configured.
 
 #### `Settings/SettingsScene.swift`
-The `Cmd+,` scene. Threads every library + service into nine tabs:
-Generation, Loading, Model Config, Agents, Documents, Projects,
+The `Cmd+,` scene. Threads every library + service through the
+full tab set: Generation, Loading, Model Config, Agents, **Tools,
+Permissions, Skills, Theme, Keybindings**, Documents, Projects,
 MCP, API Keys, Storage.
 
 #### `Settings/APIKeysSettingsTab.swift`
 SecureField for the OpenRouter key → KeychainStore. Save / Delete /
 Test (hits `/auth/key`).
 
+#### `Settings/ToolsSettingsTab.swift`
+Read-only inventory of every native tool the registry knows about.
+Groups by `ToolCategory`, shows the JSON schema's name + summary
++ whether the tool is reachable under Plan and Build modes. No
+edit — tools are code-defined, not user-configured.
+
+#### `Settings/PermissionsSettingsTab.swift`
+Editor for `PermissionStore`. List of every (tool, category)
+default with a segmented control `ask | alwaysAllow | alwaysDeny`.
+Reset-all button for session grants.
+
+#### `Settings/SkillsSettingsTab.swift`
+CRUD for `SkillLibrary`. Built-in skills appear as read-only
+rows; custom skills get the full edit sheet (name, instructions,
+suggested tools, default mode).
+
+#### `Settings/ThemeSettingsTab.swift`
+Theme picker + appearance toggle (light / dark / system). Custom
+themes from `ThemeStore` listed below the built-ins; a future
+editor (TODO §8) will add inline ColorPicker rows.
+
+#### `Settings/KeybindingsSettingsTab.swift`
+Read-only list of every bindable action with its current
+shortcut. Reset-to-defaults button. The inline rebind widget is
+on the roadmap.
+
 #### `Settings/GenerationSettingsTab.swift` · `LoadingSettingsTab.swift` · `ModelConfigSettingsTab.swift` · `StorageSettingsTab.swift`
 Tab content for the existing engine-side settings (sampler,
 loader, model overrides, on-disk history). Unchanged surfaces.
+
+#### `Tools/ModePickerView.swift`
+Segmented `Build / Plan` control pinned in the chat above the
+composer. Reads the current conversation's effective mode (agent
+default + per-chat override) and writes it back on change.
+Disabled with a 🔒 hint when the attached agent locks the mode.
+
+#### `Tools/PermissionPromptView.swift`
+Modal sheet presented by `NativeToolHost` when the registry hits
+an unresolved mutating / dangerous / network call. Three actions:
+**Deny**, **Allow once**, **Always allow**. The Always-allow
+choice writes through to `PermissionStore`.
+
+#### `Tools/SlashCommandPaletteView.swift`
+Inline picker that opens when the user types `/` in the composer.
+Shows filtered matches from `SlashCommandLibrary`; on selection,
+replaces the draft with the command's expansion (or fires the
+command directly when there are no args).
 
 #### `Agents/AgentsView.swift` · `Agents/AgentEditSheet.swift`
 Master-detail for the agent registry and the sheet that edits one.
@@ -569,9 +782,11 @@ strategy). Currently unmounted — kept around for a future
 
 #### `PersistencePaths.swift`
 Single source of truth for every Application Support path the app
-writes to (`mcp.json`, `agents.json`, `models.json`,
-`openrouter-catalog.json`, the projects/documents directories, the
-chat history root).
+writes to. Today's slots: chat history root (`conversations/`),
+projects + documents directories, `mcp.json`, `agents.json`,
+`models.json`, `openrouter-catalog.json`, `permissions.json`,
+`skills.json`, `themes.json`, `keybindings.json`, per-conversation
+KV-cache snapshot (`<id>.kvcache`, B3 reserved).
 
 #### `MarkdownText.swift`
 Markdown renderer used by `MessageView` for finalised assistant

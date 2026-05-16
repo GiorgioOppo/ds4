@@ -246,6 +246,15 @@ DeepSeekUIApp
  │     ▲
  │     └── MCPClientPool         (live JSON-RPC clients, Published per-server status)
  │
+ ├── NativeToolHost              (DeepSeekTools registry + PlanStore)
+ │     ▲ owns ToolRegistry + bridges PermissionDelegate to a SwiftUI sheet
+ │     └── PermissionStore       (durable always-allow/deny defaults)
+ │
+ ├── SkillLibrary                (skill catalogue, built-in + custom)
+ ├── SlashCommandLibrary         (composer-intercepted commands)
+ ├── ThemeStore                  (active theme + appearance pref)
+ ├── KeybindingStore             (per-user keyboard-shortcut overrides)
+ │
  └── OpenRouterCatalog           (cached /models response)
 ```
 
@@ -352,6 +361,87 @@ re-prefill when the sub-agent returns.
 Nesting is capped at 3 levels; cycle prevention is a `chain: [UUID]`
 threaded through every nested call so an agent already on the stack
 can't be re-entered.
+
+### Native tool subsystem (DeepSeekTools)
+
+Separate target. Owns the protocols + the built-in tool catalogue
+the model can invoke directly without going through MCP.
+
+```
+ChatStore.send (local or remote)
+    │
+    │   tools available to the model =
+    │     MCP catalogue (filtered by agent.allowedToolNames)
+    │   ∪ NativeToolHost.registry.availableSchemas(mode:)        [TODO §8 wire]
+    │
+    ▼
+Model emits tool call { name, arguments }
+    │
+    ▼
+ChatStore tool-call branch
+    │
+    ├── name has MCP "server__tool" prefix → MCPClientPool.invokeQualified
+    └── otherwise → NativeToolHost.dispatch
+                       │
+                       ▼
+                  ToolRegistry.dispatch(name, input, context)
+                       │
+                       ▼
+              ┌─────────────────────────────────────────┐
+              │  Mode filter                            │
+              │    plan + (mutating | dangerous) → DENY │
+              └─────────────────────────────────────────┘
+                       │
+                       ▼
+              ┌─────────────────────────────────────────┐
+              │  PermissionStore durable default        │
+              │    alwaysAllow → run                    │
+              │    alwaysDeny  → return ToolError.denied│
+              │    ask         → ↓                      │
+              └─────────────────────────────────────────┘
+                       │
+                       ▼
+              ┌─────────────────────────────────────────┐
+              │  Session cache (in-actor)               │
+              │    cached → run                         │
+              │    miss   → ↓                           │
+              └─────────────────────────────────────────┘
+                       │
+                       ▼
+              ┌─────────────────────────────────────────┐
+              │  PermissionPromptView (SwiftUI modal)   │
+              │    Deny | Allow once | Always allow     │
+              └─────────────────────────────────────────┘
+                       │
+                       ▼
+              ToolResult { output, metadata }
+                       │
+                       ▼
+ChatStore splices output into the next prompt and re-fires generate.
+```
+
+Today the `MCPClientPool.invokeQualified` branch is wired through
+both backends; the `NativeToolHost.dispatch` branch is scaffolded
+on the GUI side but the inference loop doesn't yet merge native
+tool schemas into the request body — see TODO §8 "Wire tool
+registry into InferenceService". Once that lands, both branches
+share the same `phases[id]` lifecycle the chat surface already
+reads.
+
+`PlanStore` is the shared backing for the three planning tools
+(`plan`, `task`, `todo`) — it lives inside `NativeToolHost` so
+all three see the same actor-isolated state across calls.
+
+### Slash commands
+
+`/`-prefixed text in the composer is intercepted by
+`SlashCommandLibrary` before the inference loop sees it. Built-in
+commands include `/mode plan|build`, `/tools`, `/permissions`,
+`/skill <name>`, `/theme`, `/clear`. The slash command palette
+(`SlashCommandPaletteView`) opens inline; selecting an entry
+either replaces the draft with an expansion or fires an action
+(toggle mode, open a Settings sheet, etc.) without sending a
+message to the model.
 
 ### Crash recovery (local only)
 
