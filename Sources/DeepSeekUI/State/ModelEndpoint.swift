@@ -16,52 +16,72 @@ enum ModelEndpoint: Codable, Hashable {
     /// the wrapped URL.
     case localDirectory(path: String)
 
-    // case remoteAPI(baseURL: URL, modelName: String,
-    //                 apiKeyKeychainID: String?)
-    //
-    // Reserved for the next iteration. Each remote endpoint will
-    // need an inference backend that translates `generateForConversation`
-    // events into HTTP/SSE chunks, plus a keychain hookup for the
-    // API key. Keeping the case as a comment so the surrounding
-    // code already accepts a Codable representation without a
-    // migration when the case lands.
+    /// Remote OpenAI-compatible model hosted through OpenRouter.
+    /// `modelID` is the slug from `GET /api/v1/models` (e.g.
+    /// "anthropic/claude-3.5-sonnet", "deepseek/deepseek-r1").
+    /// The API key lives in the Keychain under
+    /// `KeychainAccount.openRouterAPIKey`; not embedded here so
+    /// rotating the key doesn't invalidate every persisted
+    /// `ConfiguredModelEntry`.
+    case openRouter(modelID: String)
 
     /// Stable identifier for SwiftUI ForEach / set membership.
-    /// Built from the case payload so two `.localDirectory` values
-    /// for the same path compare equal.
+    /// Built from the case payload so two values targeting the
+    /// same model compare equal.
     var id: String {
         switch self {
-        case .localDirectory(let path): return "local::\(path)"
+        case .localDirectory(let path):   return "local::\(path)"
+        case .openRouter(let modelID):    return "openrouter::\(modelID)"
         }
     }
 
     /// User-facing label. For local directories it's the trailing
-    /// folder name (the part the user actually picked in Finder).
+    /// folder name; for OpenRouter it's the slug minus the
+    /// provider prefix ("claude-3.5-sonnet" rather than the full
+    /// "anthropic/claude-3.5-sonnet" so the picker stays readable).
     var displayName: String {
         switch self {
         case .localDirectory(let path):
             let url = URL(fileURLWithPath: path)
             let name = url.lastPathComponent
             return name.isEmpty ? path : name
+        case .openRouter(let modelID):
+            if let slash = modelID.firstIndex(of: "/") {
+                return String(modelID[modelID.index(after: slash)...])
+            }
+            return modelID
         }
     }
 
     /// Long-form description used in tooltips and the picker
-    /// secondary label. For local directories shows the full path
-    /// so the user can disambiguate two folders with the same
-    /// trailing name.
+    /// secondary label. For local directories shows the full path;
+    /// for OpenRouter shows the full slug so the provider stays
+    /// visible.
     var subtitle: String {
         switch self {
-        case .localDirectory(let path): return path
+        case .localDirectory(let path):   return path
+        case .openRouter(let modelID):    return "openrouter · \(modelID)"
         }
     }
 
     /// SF Symbol the toolbar picker uses for this endpoint kind.
-    /// Distinct symbols make the (eventual) local-vs-remote
-    /// distinction obvious at a glance.
+    /// Distinct symbols make the local-vs-remote distinction
+    /// obvious at a glance.
     var iconName: String {
         switch self {
         case .localDirectory: return "internaldrive"
+        case .openRouter:     return "cloud"
+        }
+    }
+
+    /// True when the endpoint represents a remote backend — used
+    /// by the chat path to bypass the token-level fast-delta cache
+    /// (it's pointless when the actual KV cache lives on the
+    /// provider's GPU, not in this process).
+    var isRemote: Bool {
+        switch self {
+        case .localDirectory: return false
+        case .openRouter:     return true
         }
     }
 }

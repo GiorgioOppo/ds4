@@ -92,6 +92,25 @@ enum PersistencePaths {
         try projectsDir().appendingPathComponent("index.json")
     }
 
+    /// Cached snapshot of OpenRouter's `/models` response. Lives
+    /// alongside `models.json` so the "Add OpenRouter model"
+    /// picker has instant autocompletion at app launch instead of
+    /// waiting on a network round-trip. Refreshed by the catalog
+    /// loader after 24 h, or on demand via the picker's reload
+    /// button.
+    static func openRouterCatalogURL() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("openrouter-catalog.json")
+    }
+
     /// Persisted list of model endpoints the user has loaded —
     /// powers the in-chat model picker's "Recent" submenu. One
     /// JSON file under Application Support, decoded into
