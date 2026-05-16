@@ -252,7 +252,7 @@ Stime di speedup — vedi `docs/PERFORMANCE.md` per le metriche.
 
 ---
 
-## 7. Code-agent tooling (DeepSeekTools target)
+## 8. Code-agent tooling (DeepSeekTools target)
 
 Toolbox nativo per agire su codice. Storia: vedi
 `docs/GAP-ANALYSIS-OPENCODE.md` §6 e `docs/TOOLS.md`.

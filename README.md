@@ -11,11 +11,22 @@ The desktop app supports:
   ~142 GB checkpoint on 16 GB Macs through a per-layer rotating buffer.
 - **Remote inference** through OpenRouter — any OpenAI-compatible model
   (Claude, GPT, DeepSeek-R1, Llama 3, etc.) with one API key.
-- **MCP (Model Context Protocol) servers** as tool providers, identical
-  config to Claude Desktop.
-- **Agent presets**: system prompt + tool allowlist + sampling defaults +
-  thinking mode pinned per chat. Agents can delegate sub-tasks to other
-  agents (bounded nesting, cycle prevention).
+- **Native code-agent tools** (read / write / edit / glob / grep / shell /
+  apply_patch / webfetch / websearch / repo_clone / repo_overview /
+  plan / task / todo) usable by either backend without round-tripping
+  through MCP.
+- **MCP (Model Context Protocol) servers** as additional tool providers,
+  identical config to Claude Desktop.
+- **Agent presets**: system prompt + tool allowlist + skills + sampling
+  defaults + thinking mode pinned per chat, with **Plan / Build** modes
+  that gate dangerous / mutating tools. Agents can delegate sub-tasks
+  to other agents (bounded nesting, cycle prevention).
+- **Permission system**: every dangerous / mutating / network tool call
+  goes through a per-session sheet with **Deny / Allow once / Always
+  allow**, persisted across launches.
+- **Skills** and **slash commands** picker (`/mode`, `/tools`,
+  `/permissions`, `/skill <name>`, …) in the composer.
+- **Themes** and **keybindings** customisation in Settings.
 - **Projects**: pre-tokenised codebases / document collections you can
   attach to a chat so the first turn already carries the context.
 
@@ -248,10 +259,14 @@ Pinned above the composer, top → bottom:
    depth). Empty stack collapses.
 4. **Resume banner**: when a prior generation died mid-stream the
    `pendingTurn` snapshot offers a one-click resume.
-5. **Thinking picker**: segmented control with `No think / High /
-   Max`. Disabled with a lock hint when an agent overrides the mode.
-6. **Composer**: TextField (Cmd+↩ to send) + Send/Stop button. Send
-   disables when no model is loaded.
+5. **Mode + thinking pickers**: two segmented controls — `Build /
+   Plan` for the agent operating mode (locks read-only when Plan),
+   and `No think / High / Max` for reasoning effort. Both lock to
+   the attached agent's values with a 🔒 hint when the agent
+   pins them.
+6. **Composer**: TextField (Cmd+↩ to send) + Send/Stop button.
+   Type `/` to open the slash-command palette (mode, tools,
+   permissions, skills, …). Send disables when no model is loaded.
 
 While streaming, the in-progress assistant bubble shows a blinking
 caret. The ThroughputBar below it ticks `tok/min` and (for remote)
@@ -340,7 +355,66 @@ free-form text. Local-model only.
 
 ---
 
-## 7. Preferences
+## 7. Native tools, Plan / Build, skills
+
+The `DeepSeekTools` target ships a code-agent toolbox the model can
+invoke directly — no MCP round-trip. Inspired by opencode's tool
+catalogue. Full reference in [`docs/TOOLS.md`](docs/TOOLS.md).
+
+### Catalogue
+
+| Category | Tools |
+|---|---|
+| **readOnly** | `read`, `glob`, `grep`, `repo_overview`, `lsp` (stub) |
+| **planning** | `plan`, `task`, `todo` |
+| **mutating** | `write`, `edit`, `apply_patch` |
+| **dangerous** | `shell`, `repo_clone` |
+| **network** | `webfetch`, `websearch` |
+
+The `lsp` tool is registered as a stub today; spawning a real
+`sourcekit-lsp` client is on the roadmap.
+
+### Plan vs Build agent mode
+
+Every agent operates in one of two coarse modes (full reference:
+[`docs/AGENT-MODES.md`](docs/AGENT-MODES.md)):
+
+- **Build** — every tool eligible. Mutating / dangerous / network
+  tools go through the permission policy.
+- **Plan** — `.mutating` + `.dangerous` tools are filtered out of
+  the schema the model sees, so it can't even propose them.
+  `.network` tools still need consent.
+
+Switching between modes is three places:
+
+1. Per-agent default in **Settings → Agents** → edit → "Agent mode"
+   segmented control (persisted into `agents.json`).
+2. Per-conversation flip from the toolbar's mode picker.
+3. Inline `/mode plan` or `/mode build` slash command.
+
+### Permission flow
+
+Tool dispatch passes through, in order: mode filter →
+`PermissionStore` durable defaults (`alwaysAllow / alwaysDeny / ask`)
+→ session cache → `PermissionPromptView` modal with three actions:
+**Deny**, **Allow once**, **Always allow**. The "always" grants are
+edited under **Settings → Permissions**.
+
+### Skills and slash commands
+
+A **Skill** is a named instruction template the agent can opt into.
+Built-in skill ids are stable UUIDs; agents declare which ones they
+allow via `allowedSkillIDs`. Activate one inline with `/skill <name>`
+or from the slash-command palette.
+
+`/`-prefixed text in the composer opens the slash-command palette.
+Built-ins include `/mode`, `/tools`, `/permissions`, `/skill`,
+`/clear`, `/theme`. Custom commands can be added under
+**Settings → Slash Commands** (when implemented — see TODO).
+
+---
+
+## 8. Preferences
 
 All tabs are reachable via `Cmd+,`. Changes take effect on the next
 Send (or, for `Model Config`, the next model load).
@@ -350,16 +424,21 @@ Send (or, for `Model Config`, the next model load).
 | **Generation** | Temperature (slider 0.5–1.0, default 0.7), top-K (0 = disabled), top-P, max-tokens, thinking mode. Overridden when an agent is attached. |
 | **Loading** | Loader strategy override, force-load toggle, converter binary path. |
 | **Model Config** | Every field of `ModelConfig`. Writes to `~/Library/Application Support/<app>/config-overrides.json`. |
-| **Agents** | CRUD for agent presets — see § Agents. |
+| **Agents** | CRUD for agent presets — Plan/Build mode, thinking mode, system prompt, skill allowlist, MCP tool allowlist, sampling defaults. |
+| **Tools** | Read-only inventory of every native tool the agent can invoke + Plan/Build availability matrix. |
+| **Permissions** | Per-(tool, category) "ask / always allow / always deny" defaults consulted before every dispatch. |
+| **Skills** | Manage the skill library — built-ins, custom, allowlist editor surfaced from the Agents tab. |
+| **Theme** | Appearance (light / dark / system), accent + bubble tinting, custom theme import. |
+| **Keybindings** | Read-only inventory + reset to defaults. Inline rebind UI is on the roadmap. |
 | **Documents** | Import single documents (tokenises against the loaded local model). |
 | **Projects** | Group documents into projects for one-shot context injection. |
-| **MCP** | Register MCP servers — see § MCP. |
+| **MCP** | Register MCP servers — see § Agents and tools. |
 | **API Keys** | OpenRouter API key (Keychain). Save / Test / Delete. |
 | **Storage** | Conversation history location, size on disk, Reveal / Clear all. |
 
 ---
 
-## 8. CLI reference
+## 9. CLI reference
 
 The CLI is local-only (no OpenRouter dispatch).
 
@@ -416,7 +495,7 @@ Two positionals, the second optional only in diagnostic modes.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **First token takes minutes on a local model.**
 Expected under `streaming` on a 16 GB Mac — each layer's ~3 GB shard
@@ -480,7 +559,7 @@ automatically.
 
 ---
 
-## 10. License and credits
+## 11. License and credits
 
 The Swift code in this repository is MIT-licensed (see [`LICENSE`](LICENSE)).
 The DeepSeek model weights and the Python reference implementation in
