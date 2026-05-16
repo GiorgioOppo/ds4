@@ -219,11 +219,18 @@ final class ChatStore: ObservableObject {
         // Snapshot the MCP tool catalogue once, off the main actor's
         // critical path. Filtered through the agent's allowlist when
         // one is in effect (nil = all tools, empty set = none,
-        // explicit set = allowlist of qualified names). The Task
-        // below treats the resulting JSON as immutable for the
-        // duration of the generation.
-        let toolSchemasJSON = mcpPool.toolSchemasJSON(
-            allowedNames: agentConfig?.allowedToolNames)
+        // explicit set = allowlist of qualified names).
+        //
+        // The composed JSON also includes a synthetic
+        // `__delegate_to_agent` tool whenever there's more than one
+        // registered agent the model could hand off to — the
+        // attached agent is filtered out so it can't recurse into
+        // itself. Snapshot semantics: edits to the AgentLibrary
+        // mid-turn don't affect the in-flight generation.
+        let delegableAgents = agents.agents.filter { $0.id != agentConfig?.id }
+        let toolSchemasJSON = composeToolSchemasJSON(
+            mcpAllowed: agentConfig?.allowedToolNames,
+            delegableAgents: delegableAgents)
 
         // First-turn-with-project info: only the very first user
         // turn of a chat (encodedTokens == nil) ever pays the cost
@@ -618,8 +625,17 @@ final class ChatStore: ObservableObject {
             var outputs: [String] = []
             outputs.reserveCapacity(calls.count)
             for call in calls {
-                let result = await pool.invokeQualified(
-                    call.name, argsJSON: call.args)
+                let result: String
+                if call.name == EncodingDSV4.delegateToolName {
+                    // Synthetic "delegate to another agent" tool.
+                    // Handled in-process (no MCP server involved) by
+                    // spawning a one-shot sub-agent run.
+                    result = await self.executeSubAgentDelegation(
+                        argsJSON: call.args)
+                } else {
+                    result = await pool.invokeQualified(
+                        call.name, argsJSON: call.args)
+                }
                 outputs.append(result)
             }
 
@@ -710,6 +726,141 @@ final class ChatStore: ObservableObject {
                 self.scheduleSave(id)
             }
         }
+    }
+
+    /// Build the JSON tools array that goes into the system block:
+    /// every connected MCP tool the agent is allowed to see, plus a
+    /// synthetic `__delegate_to_agent` schema when there's at least
+    /// one other agent the model could hand work off to.
+    ///
+    /// Returns nil when the resulting set is empty (no MCP tools
+    /// allowed AND no other agents) so the chat template can skip
+    /// the tools block entirely.
+    private func composeToolSchemasJSON(
+        mcpAllowed: Set<String>?,
+        delegableAgents: [AgentConfig]
+    ) -> String? {
+        var schemas: [[String: Any]] = []
+
+        // MCP tools (already filtered by agent allowlist semantics
+        // when `mcpAllowed` is non-nil).
+        if let allowed = mcpAllowed, allowed.isEmpty {
+            // explicit "no tools" set — skip MCP entirely
+        } else {
+            for tool in mcpPool.allTools() {
+                if let allowed = mcpAllowed,
+                   !allowed.contains(tool.qualifiedName) { continue }
+                schemas.append([
+                    "name": tool.qualifiedName,
+                    "description": tool.description,
+                    "inputSchema": tool.inputSchema
+                ])
+            }
+        }
+
+        if !delegableAgents.isEmpty {
+            let roster = delegableAgents
+                .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
+                .joined(separator: "\n")
+            schemas.append([
+                "name": EncodingDSV4.delegateToolName,
+                "description":
+                    """
+                    Delegate a focused sub-task to another agent. The named agent will run independently with its own system prompt and produce a single textual reply that becomes this tool's output. Use it when a sub-task is better handled by a specialist agent. Available agents:
+                    \(roster)
+                    """,
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "agent_name": [
+                            "type": "string",
+                            "description": "Exact name of the agent to invoke."
+                        ],
+                        "task": [
+                            "type": "string",
+                            "description": "Self-contained instructions for the sub-agent. Include everything it needs — it doesn't see this conversation's history."
+                        ]
+                    ],
+                    "required": ["agent_name", "task"]
+                ]
+            ])
+        }
+
+        if schemas.isEmpty { return nil }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: schemas,
+            options: [.prettyPrinted, .sortedKeys])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Run one delegation: spawn a sub-agent (isolated
+    /// conversation id, no tools of its own, single forward
+    /// + decode) and return its final assistant content as the
+    /// tool output the host agent will receive.
+    ///
+    /// Trade-off: the sub-agent runs on the same model, sharing
+    /// the single KV cache slot. The CacheImage in InferenceService
+    /// won't match the sub-agent's prompt prefix, so it'll
+    /// releaseCache + cold-prefill the sub-agent — and when the
+    /// host agent resumes, its cached prefix is gone too. A future
+    /// step could snapshot+restore the host's cache around the
+    /// delegation (B2 already gives us the API) but for now we
+    /// accept the extra prefill.
+    private func executeSubAgentDelegation(argsJSON: String) async -> String {
+        guard let data = argsJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return "[error: malformed delegation arguments]"
+        }
+        let agentName = (obj["agent_name"] as? String) ?? ""
+        let task = (obj["task"] as? String) ?? ""
+        guard !agentName.isEmpty, !task.isEmpty else {
+            return "[error: delegation requires non-empty agent_name and task]"
+        }
+        guard let agent = agents.agents.first(where: { $0.name == agentName }) else {
+            return "[error: no agent named '\(agentName)' is registered]"
+        }
+        let mode = ThinkingMode(rawValue: agent.defaultMode) ?? .chat
+        let opts = SamplingOptions(
+            temperature: Float(min(1.0, max(0.5, agent.temperature))),
+            topK: agent.topK,
+            topP: Float(agent.topP),
+            repetitionPenalty: Float(agent.repetitionPenalty))
+        // The sub-agent runs prose-only (no tools of its own and
+        // no further delegation). Keeping it tool-less means
+        // exactly one forward+decode, no nested loop to bound, no
+        // recursion to manage. Wider versions of this can come
+        // later.
+        guard let prompt = await service.tokenizeFullHistory(
+            [Message(role: .user, content: task)],
+            mode: mode,
+            toolSchemasJSON: nil,
+            systemPromptOverride: agent.systemPrompt)
+        else {
+            return "[error: tokenizer unavailable]"
+        }
+        let subID = UUID() // isolated cacheImage namespace
+        var reply = ""
+        do {
+            for try await event in service.generateForConversation(
+                promptTokens: prompt,
+                conversationID: subID,
+                mode: mode,
+                options: opts,
+                maxTokens: agent.maxTokens)
+            {
+                if case .done(let final, _, _) = event {
+                    reply = final.content
+                }
+            }
+        } catch {
+            return "[error: sub-agent generation failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)]"
+        }
+        if reply.isEmpty {
+            return "[sub-agent '\(agentName)' produced an empty reply]"
+        }
+        return reply
     }
 
     private func currentMetrics(of id: UUID) -> GenerationMetrics {

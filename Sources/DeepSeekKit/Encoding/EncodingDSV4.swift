@@ -36,6 +36,13 @@ public enum EncodingDSV4 {
     public static let endToolOutput    = "<｜tool▁output▁end｜>"
     public static let toolSep          = "<｜tool▁sep｜>"
 
+    /// Name of the synthetic "delegate to another agent" tool the
+    /// host injects when more than one Agent is registered. Lives
+    /// in the same namespace as the MCP qualified names
+    /// ("server__tool"), with double leading underscores so it
+    /// can't collide with a real MCP server called "delegate".
+    public static let delegateToolName = "__delegate_to_agent"
+
     /// Reasoning instruction prepended to the system message in `.max` mode.
     /// Mirrors REASONING_EFFORT_MAX (encoding_dsv4.py:64-67).
     public static let reasoningEffortMax: String = """
