@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(name: "DeepSeekKit", targets: ["DeepSeekKit"]),
         .library(name: "DeepSeekConverter", targets: ["DeepSeekConverter"]),
+        .library(name: "DeepSeekTraining", targets: ["DeepSeekTraining"]),
         .library(name: "DeepSeekTools", targets: ["DeepSeekTools"]),
         .library(name: "DeepSeekIntegrations", targets: ["DeepSeekIntegrations"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
@@ -37,6 +38,17 @@ let package = Package(
             name: "DeepSeekConverter",
             dependencies: ["DeepSeekKit"],
             path: "Sources/DeepSeekConverter"
+        ),
+        // Fine-tuning / retraining scaffold. Mirrors DeepSeekConverter
+        // in shape (Spec + Progress + Runner + public entry-point
+        // enum). The current runner is a stub — it validates the
+        // spec and emits a plan, then throws `FineTuneNotImplemented`
+        // because the Metal engine has no backward kernels yet. The
+        // UI in DeepSeekUI binds to the same surface area so when a
+        // real backend lands the swap is local to FineTuneRunner.
+        .target(
+            name: "DeepSeekTraining",
+            path: "Sources/DeepSeekTraining"
         ),
         // Pure-Swift, model-agnostic toolbox: native code-agent tools
         // (read/write/edit/grep/glob/shell/apply_patch/...), permission
@@ -68,6 +80,7 @@ let package = Package(
             dependencies: [
                 "DeepSeekKit",
                 "DeepSeekConverter",
+                "DeepSeekTraining",
                 "DeepSeekTools",
                 "DeepSeekIntegrations",
             ],

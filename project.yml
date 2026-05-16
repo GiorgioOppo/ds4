@@ -92,6 +92,11 @@ targets:
       # SPM target deps automatically.
       - package: DeepSeekKit
         product: DeepSeekConverter
+      # Fine-tuning scaffold (Spec + Progress + Runner + public entry
+      # point). FineTuneSheet.swift / FineTuneViewModel.swift import
+      # this for `FineTuner.run` and the FineTuneSpec / dtype enums.
+      - package: DeepSeekKit
+        product: DeepSeekTraining
       # Native tool runtime (read/write/edit/grep/glob/shell/...).
       # Same xcodegen-vs-SPM caveat — declare explicitly.
       - package: DeepSeekKit
