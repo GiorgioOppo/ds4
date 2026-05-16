@@ -156,6 +156,31 @@ cp ~/Downloads/V4-Flash-HF/config.json \
 Trade-off dei dtype: vedi
 [`USAGE.md § 2.2`](USAGE.md#22-optional-convert-to-a-compact-variant).
 
+### 2.3. Modelli non-V4 (preview)
+
+L'engine è ottimizzato per DeepSeek-V4 (lo stack MLA + MoE + HC
+è specifico per quell'architettura). Tre pezzi servono per
+prepararsi a futuri modelli locali diversi:
+
+- **Chat template dispatcher**: il loader sceglie tra il
+  template DSV4 nativo e un driver Jinja2 (subset) se trova un
+  `chat_template` in `tokenizer_config.json`. Funziona per
+  Llama / Mistral / Qwen / ChatML.
+- **Tokenizer multi-formato**: `TokenizerLoader.load` distingue
+  BPE (HuggingFace `tokenizer.json`), SentencePiece (Llama /
+  Mistral / Gemma — `tokenizer.model`), WordPiece (BERT-style —
+  `vocab.txt`).
+- **Lettore GGUF (MVP)**: il file `.gguf` di llama.cpp si apre,
+  l'header viene parsato, i tensor con dtype non quantizzati
+  (`F32`, `F16`, `BF16`, `I32`, `I8`) sono accessibili
+  zero-copy. I dtype quantizzati (`Q4_0`, `Q4_K_M`, ecc.) non
+  sono ancora supportati. Dettagli in [`GGUF.md`](GGUF.md).
+
+L'inferenza vera e propria su questi modelli **non** gira oggi
+(mancano i kernel Metal per i transformer Llama-style e per il
+dequant dei dtype GGUF). Quando ci arriveremo, l'orchestrazione
+sopra è già scritta.
+
 ---
 
 ## 3. Carica il modello nella GUI

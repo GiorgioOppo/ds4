@@ -148,7 +148,27 @@ last successful model (`AppSettings.lastModelDir`).
 Use **Unload current model** from the same menu to free RAM
 without quitting.
 
-### 2.4. Run on the CLI
+### 2.4. Non-V4 local models (preview)
+
+The engine targets DeepSeek-V4 (the MLA + MoE + HC stack only
+matches that architecture). Pieces that make *other* local
+models a future possibility are now in place:
+
+- **Chat template dispatcher**: drops the loaded model's
+  Jinja2 chat template (Llama / Mistral / Qwen / ChatML) into
+  the prompt path via `JinjaChatTemplate`.
+- **Multi-format tokenizers**: BPE / SentencePiece / WordPiece
+  resolved by `TokenizerLoader.load(tokenizerDir:)` from the
+  files actually present in the folder.
+- **GGUF reader (MVP)**: `GGUFFile` parses v2/v3 headers and
+  returns zero-copy `Tensor` views for `F32 / F16 / BF16 / I32 /
+  I8`. Quantized dtypes raise `GGUFError.unsupportedType`.
+
+Inference for those models won't run today (no Llama transformer
+kernels, no quant dequant kernels). See [`GGUF.md`](GGUF.md) for
+what's missing.
+
+### 2.5. Run on the CLI
 
 ```bash
 .build/release/deepseek ~/Downloads/V4-Flash-HF \
@@ -165,6 +185,26 @@ without quitting.
 | `--thinking off\|high\|max` | `off` | Reasoning budget for chat mode. |
 | `--temperature T` | `1.0` | **Set to 0.7** — see § Sampling caveat. |
 | `--max-tokens N` | `32` | Stops earlier on EOS. |
+
+**Sampler flags (all default to "disabled")**
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--top-k K` | `0` | Keep only the top-K logits. |
+| `--top-p P` | `1.0` | Nucleus mass. |
+| `--min-p P` | `0.0` | Drop `p < P × max_p`. |
+| `--tfs Z` | `1.0` | Tail-free sampling. |
+| `--typical P` | `1.0` | Locally-typical mass. |
+| `--repetition-penalty R` | `1.0` | HuggingFace-style on history ids. |
+| `--frequency-penalty F` | `0.0` | OpenAI-style, scales with count. |
+| `--presence-penalty P` | `0.0` | OpenAI-style, binary on presence. |
+| `--mirostat TAU` | off | Mirostat v2 with target surprise τ. |
+| `--mirostat-eta ETA` | `0.1` | Mirostat learning rate. |
+
+The pipeline order matches `Sampler.sample`: temperature →
+repetition → freq/presence → top-K → top-P → min-p → tfs →
+typical → (Mirostat replaces the K/P/min-p/tfs/typical block
+when enabled) → Gumbel-max multinomial.
 
 **Loader flags**
 

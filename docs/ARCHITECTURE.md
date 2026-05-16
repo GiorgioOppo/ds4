@@ -443,6 +443,69 @@ either replaces the draft with an expansion or fires an action
 (toggle mode, open a Settings sheet, etc.) without sending a
 message to the model.
 
+### Chat template dispatcher
+
+V4 has a one-off chat format (`EncodingDSV4`). Every other model
+ships its own Jinja2 template in `tokenizer_config.json.chat_template`
+(Llama / Mistral / Qwen / ChatML / hundreds of HF checkpoints).
+Hard-coding V4 everywhere would have made non-V4 local backends
+impossible.
+
+The `ChatTemplate` protocol resolves the split:
+
+```
+TokenizerLoader.load(tokenizerDir:)
+   │
+   ├── inspects the directory
+   │     · tokenizer.json + DeepSeek vocab signature → BPETokenizer
+   │     · tokenizer.model (SentencePiece protobuf) → SentencePieceTokenizer
+   │     · vocab.txt                               → WordPieceTokenizer
+   │
+   └── inspects tokenizer_config.json.chat_template
+         · DSV4 marker (or default for DeepSeek vocab)  → DSV4Template
+         · Jinja string                                 → JinjaChatTemplate
+   ▼
+InferenceService.{ _tokenizer, chatTemplate }
+```
+
+`InferenceService.chatTemplate` is exposed publicly so future
+callers (sub-agent renderers, remote prompt builders that mirror
+the model's official format) can render messages without
+assuming V4. The chat-flow side currently still calls
+`EncodingDSV4.*` directly for V4 chats (faster path, no Jinja
+interpretation cost); the dispatcher is the bridge for "another
+model is loaded locally" scenarios.
+
+`JinjaTemplate` is a hand-rolled Swift subset of Jinja2: variable
+interpolation, control flow (`{% for %}` / `{% if %}` /
+`{% elif %}` / `{% else %}`), the filters HF templates actually
+use (`trim`, `length`, `tojson`, `default`, …), and the
+`raise_exception` builtin templates use to abort on malformed
+input. `{% macro %}` / `{% set %}` / template inheritance are
+deferred — none of the chat templates in the wild need them.
+
+### GGUF reader (MVP)
+
+`GGUFFile` parses the GGUF v2/v3 metadata format used by
+llama.cpp. Today it's read-only and only supports the
+pass-through dtypes (`F32 / F16 / BF16 / I32 / I8`); quantized
+tensors (`Q4_0 / Q4_K_M / Q8_0 / …`) raise
+`GGUFError.unsupportedType` and are left to the caller as raw
+bytes via `info(name:)`.
+
+This exists for two reasons:
+
+1. **Non-V4 local backends.** Combined with the chat template
+   dispatcher + the tokenizer dispatcher, the engine has the
+   pieces it needs to consume a Llama/Mistral GGUF — once the
+   matching Metal dequant kernels land.
+2. **Diagnostic / convert path.** The converter can already read
+   non-quantized GGUF metadata. Writing a GGUF output (so a V4
+   checkpoint becomes loadable by llama.cpp) is the symmetric
+   direction and lives on the roadmap.
+
+Full status + roadmap in [`GGUF.md`](GGUF.md).
+
 ### Crash recovery (local only)
 
 Every local `Send` writes a `PendingTurn { promptTokens,

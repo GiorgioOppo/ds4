@@ -71,21 +71,59 @@ Streaming writer used by the converter. Three source types:
 - `.compute(byteCount:closure)` — lazy producer, called when the writer
   reaches that tensor
 
+### `GGUF.swift`
+Parser for the GGUF v2/v3 metadata format used by llama.cpp.
+Reads the magic + version, the key/value metadata block (all
+GGUF value types incl. arrays), the tensor info table
+(`name / n_dims / shape / ggml_type / offset`), and the global
+alignment padding. `GGUFHeader` exposes the parsed result;
+`GGUFTensorInfo` carries enough to compute the absolute offset
++ byte count of each tensor.
+
+### `GGUFLoader.swift`
+mmap-backed wrapper over a `.gguf` file. Same pattern as
+`SafeTensorsFile`: `init(url:)` parses the header, `info(name:)`
+inspects, `load(name:) -> Tensor` returns a zero-copy `Tensor`
+view for the supported pass-through dtypes (`F32`, `F16`, `BF16`,
+`I32`, `I8`). Quantized dtypes (`Q4_0 / Q4_K_M / …`) raise
+`GGUFError.unsupportedType` — see [`GGUF.md`](GGUF.md) for the
+roadmap.
+
 ### `WeightLoader.swift`
 Walks a directory of `.safetensors` shards, builds a flat name → shard
 index, exposes `load(_:)` and `tryLoad(_:[fallbackNames])`. Skips LFS
 pointer files (< 1 KB). Used by `Transformer.load(from:)`.
 
 ### `Tokenizer.swift`
-Protocol `Tokenizer { encode/decode/bosId/eosId }` and
-`TokenizerLoader.load(from:)` that constructs a `BPETokenizer` from a
-`tokenizer.json` file.
+Protocol `Tokenizer { encode/decode/bosId/eosId }` plus
+`TokenizerLoader.load(tokenizerDir:)` — a dispatcher that
+detects the format on disk and picks the matching impl:
+
+- `tokenizer.json` (HuggingFace) → `BPETokenizer`.
+- `tokenizer.model` (SentencePiece protobuf) →
+  `SentencePieceTokenizer`.
+- `vocab.txt` (+ optional `tokenizer.json`) → `WordPieceTokenizer`.
+
+Also resolves the active `ChatTemplate` (DSV4 vs Jinja) by
+inspecting `tokenizer_config.json.chat_template`.
 
 ### `BPETokenizer.swift`
 Byte-level BPE compatible with HuggingFace `tokenizer.json`. Parses
 `model.vocab`, `model.merges`, `added_tokens`, plus the pre-tokenizer
 regex. GPT-2 byte-to-unicode map for UTF-8 round-trip. Greedy
 lowest-rank merge BPE.
+
+### `SentencePieceTokenizer.swift`
+Reads the binary `tokenizer.model` protobuf used by Llama /
+Mistral / Gemma. Unigram language model with `▁` whitespace
+encoding; supports SP normalization (NFC / NFD / NMT) + BOS/EOS
+control tokens.
+
+### `WordPieceTokenizer.swift`
+BERT-style WordPiece (`vocab.txt` + greedy longest-match
+sub-token resolution with `##` continuation prefix). Used by the
+embedding-only / classification models the GGUF reader will
+eventually load.
 
 ### `KVCache.swift`
 Allocators for per-layer KV caches and a `CacheBank` aggregating them.
@@ -95,11 +133,25 @@ populated in assembly.
 ### `Sampling.swift`
 - `Sampler.argmax(_:)` — GPU-side reduction, returns a single Int.
 - `Sampler.applyTemperature(_:)` — in-place GPU scaling.
-- `Sampler.sample(_:history:options:)` — full pipeline (temperature →
-  repetition penalty → top-K → top-P → Gumbel-max multinomial), done
-  host-side after a single CPU-GPU sync.
-- `SamplingOptions` struct carries the parameters + RNG state across
-  decode steps.
+- `Sampler.sample(_:history:options:)` — full pipeline applied
+  host-side after a single CPU-GPU sync. Order:
+  1. temperature (skipped at `T == 0`, falls to argmax).
+  2. repetition penalty (HF-style) on history-id logits.
+  3. frequency + presence penalties (OpenAI-style).
+  4. top-K truncation.
+  5. top-P (nucleus) cutoff.
+  6. min-p — drop tokens with `p < min_p × max_p`.
+  7. tail-free sampling — keep the mass that flattens the
+     second derivative.
+  8. locally-typical sampling — keep tokens close to the
+     average per-token surprise.
+  9. Mirostat v2 (when enabled) — replaces the (top-K /
+     top-P / min-p / tfs / typical) layer with an adaptive
+     surprise-target loop driven by `mirostatTau` + `mirostatEta`.
+  10. Gumbel-max multinomial.
+- `SamplingOptions` struct carries every parameter + the RNG
+  state + Mirostat's running estimate across decode steps. Tests
+  in `Tests/DeepSeekKitTests/SamplerTests.swift`.
 
 ### `Generation.swift`
 `Generator` + `GenerationOptions` are the OO wrapper around the
@@ -296,6 +348,32 @@ Not yet wired into the CLI (Tier 2 building block, integration deferred).
 ### `Message.swift`
 `Role`, `Message`, `ToolCall`, `ThinkingMode` data types.
 
+### `ChatTemplate.swift`
+`ChatTemplate` protocol — render a `[Message]` into the prompt
+string the model expects. Two implementations:
+
+- **`DSV4Template.swift`** — wraps `EncodingDSV4.encodeMessages`.
+  Used for every DeepSeek-V4 checkpoint (the only one with
+  native MLA + MoE the engine actually runs today).
+- **`JinjaChatTemplate.swift`** — wraps the Jinja2 subset
+  driver below. Used when the loaded model's
+  `tokenizer_config.json` carries a `chat_template` field
+  (Llama / Mistral / Qwen / ChatML / any HuggingFace model).
+
+`ChatTemplateOptions` carries the mode + add-generation-prompt
+flag + tool-schema JSON. `ChatTemplateError` reports unsupported
+features or template parse failures.
+
+### `JinjaTemplate.swift`
+Pure-Swift implementation of the Jinja2 subset HuggingFace chat
+templates actually use. ~900 LOC. Supports: variable
+interpolation (`{{ var }}`), `{% for %}` / `{% if %}` /
+`{% elif %}` / `{% else %}`, filters (`trim`, `length`, `lower`,
+`upper`, `default`, `tojson`, …), the `raise_exception` builtin,
+nested context scopes. Not a full Jinja2 — `{% macro %}` /
+`{% set %}` / `include` / inheritance are deferred until
+something needs them.
+
 ### `EncodingDSV4.swift`
 Port of `Reference/encoding/encoding_dsv4.py`. Covers:
 
@@ -469,6 +547,14 @@ Public surface used by the chat flow:
 `tokenizeToolOutputsDelta(...)`, `generateForConversation(...)`,
 `beginDelegation()`, `endDelegation(_:)`,
 `currentModelDir()`, `currentTokenizer()`.
+
+Carries the active `chatTemplate: ChatTemplate` (defaults to
+`DSV4Template()`; the loader swaps in `JinjaChatTemplate` when
+the model directory ships a `tokenizer_config.json` with a
+`chat_template`). The V4 prompt path still calls
+`EncodingDSV4.*` directly — the dispatcher lets future
+non-DeepSeek local backends speak their own template through the
+same `InferenceService` surface.
 
 #### `ModelEndpoint.swift`
 `enum ModelEndpoint: Codable, Hashable` with cases `localDirectory(path)`
