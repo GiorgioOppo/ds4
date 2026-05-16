@@ -330,6 +330,43 @@ final class InferenceService: @unchecked Sendable {
         }
     }
 
+    /// Tokenize the *delta* that splices tool execution results
+    /// back onto the cached prefix and re-opens the assistant
+    /// turn so the model can keep going:
+    ///
+    ///   `<eos>` (closes the just-finished assistant turn —
+    ///           the decode loop breaks before sampling its eos)
+    ///   `<｜tool▁outputs▁begin｜>` …per-output frames…
+    ///                          `<｜tool▁outputs▁end｜>`
+    ///   `<Assistant><think_marker>` (re-opens for the next turn)
+    ///
+    /// The per-output frames carry the qualified tool name via
+    /// `<｜tool▁sep｜>` so the model can disambiguate when several
+    /// tools were called in one turn.
+    func tokenizeToolOutputsDelta(callNames: [String],
+                                   outputs: [String],
+                                   mode: ThinkingMode) async -> [Int32]? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<[Int32]?, Never>) in
+            q.async {
+                guard let tok = self._tokenizer else {
+                    cont.resume(returning: nil); return
+                }
+                let thinkMarker = (mode == .chat)
+                    ? EncodingDSV4.thinkClose
+                    : EncodingDSV4.thinkOpen
+                let block = EncodingDSV4.encodeToolOutputs(
+                    callNames: callNames, outputs: outputs)
+                let deltaText = EncodingDSV4.eosToken
+                    + block
+                    + EncodingDSV4.assistantToken
+                    + thinkMarker
+                let ids = tok.encode(deltaText).map(Int32.init)
+                cont.resume(returning: ids)
+            }
+        }
+    }
+
     /// Tokenize the *delta* needed to extend a cached prompt with one
     /// more user turn:
     ///   `<eos><User>userContent<Assistant><think_marker>`

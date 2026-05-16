@@ -531,6 +531,54 @@ final class MCPClientPool: ObservableObject {
         clients = [:]
     }
 
+    /// Route a model-emitted tool call to the right MCPClient and
+    /// return its flattened textual output. The name argument is
+    /// the qualified form produced by `toolSchemasJSON` —
+    /// "<server>__<tool>" — and the implementation strips the
+    /// server prefix to find both the connection and the bare tool
+    /// name to send over the wire.
+    ///
+    /// Args come in as the model's JSON string (taken from
+    /// `ToolCall.args`); we parse it into a dictionary here so the
+    /// caller doesn't have to. Empty / unparseable args become an
+    /// empty `arguments: {}` payload.
+    ///
+    /// Errors are flattened to a human-readable string (no throws)
+    /// so the chat loop can always emit *some* tool_output and
+    /// keep going — letting the model self-correct on a bad call
+    /// is more useful than aborting the whole turn.
+    func invokeQualified(_ qualifiedName: String,
+                          argsJSON: String) async -> String {
+        guard let sep = qualifiedName.range(of: "__") else {
+            return "[error: tool name not qualified as <server>__<tool>: \(qualifiedName)]"
+        }
+        let serverName = String(qualifiedName[..<sep.lowerBound])
+        let toolName = String(qualifiedName[sep.upperBound...])
+        guard let client = clients.values.first(where: {
+            $0.config.name == serverName
+        }) else {
+            return "[error: no MCP server named \(serverName)]"
+        }
+        // Parse arguments. The DSML decoder produces a JSON object
+        // string (matching what `encodeArguments` round-trips). If
+        // parsing fails — model emitted a malformed payload — we
+        // still call with an empty argument set so the server can
+        // either succeed or return a structured error of its own.
+        var argsDict: [String: Any] = [:]
+        if !argsJSON.isEmpty,
+           let data = argsJSON.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            argsDict = parsed
+        }
+        do {
+            return try await client.callTool(toolName, arguments: argsDict)
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            return "[error: \(msg)]"
+        }
+    }
+
     // MARK: - private
 
     private func sync(with servers: [MCPServerConfig]) {

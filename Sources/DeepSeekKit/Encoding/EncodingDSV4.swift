@@ -27,6 +27,15 @@ public enum EncodingDSV4 {
     public static let beginOfFile     = "<｜begin▁of▁file｜>"
     public static let endOfFile       = "<｜end▁of▁file｜>"
 
+    // Native tool-output delimiters (V4 added_tokens 128810-814).
+    // Used to splice the host-executed tool results back into the
+    // prompt right after the assistant turn that emitted the calls.
+    public static let beginToolOutputs = "<｜tool▁outputs▁begin｜>"
+    public static let endToolOutputs   = "<｜tool▁outputs▁end｜>"
+    public static let beginToolOutput  = "<｜tool▁output▁begin｜>"
+    public static let endToolOutput    = "<｜tool▁output▁end｜>"
+    public static let toolSep          = "<｜tool▁sep｜>"
+
     /// Reasoning instruction prepended to the system message in `.max` mode.
     /// Mirrors REASONING_EFFORT_MAX (encoding_dsv4.py:64-67).
     public static let reasoningEffortMax: String = """
@@ -97,6 +106,11 @@ public enum EncodingDSV4 {
                     out += encodeToolCalls(msg.toolCalls)
                 }
                 out += eosToken
+                if !msg.toolOutputs.isEmpty {
+                    out += encodeToolOutputs(
+                        callNames: msg.toolCalls.map(\.name),
+                        outputs: msg.toolOutputs)
+                }
             }
         }
         // Trailing assistant turn (the one the model fills in). Mirrors
@@ -134,6 +148,28 @@ public enum EncodingDSV4 {
         } else {
             msgs.insert(Message(role: .system, content: prepend), at: 0)
         }
+    }
+
+    /// Encode a list of host-executed tool results as the native
+    /// `<｜tool▁outputs▁begin｜>…<｜tool▁outputs▁end｜>` block. Each
+    /// result is wrapped in `<｜tool▁output▁begin｜>` / `<｜tool▁output▁end｜>`,
+    /// optionally prefixed with `name<｜tool▁sep｜>` so the model can
+    /// match each result back to the call by index. `callNames` may
+    /// be shorter than `outputs` (e.g. when reconstructing from a
+    /// raw log) — in that case the missing names are simply omitted.
+    public static func encodeToolOutputs(callNames: [String],
+                                          outputs: [String]) -> String {
+        var out = beginToolOutputs
+        for (idx, body) in outputs.enumerated() {
+            out += beginToolOutput
+            if idx < callNames.count {
+                out += callNames[idx] + toolSep
+            }
+            out += body
+            out += endToolOutput
+        }
+        out += endToolOutputs
+        return out
     }
 
     /// Encode an array of tool calls as a single DSML `<｜DSML｜tool_calls>`

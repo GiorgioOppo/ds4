@@ -55,6 +55,19 @@ final class ChatStore: ObservableObject {
 
     private let saveDebounce: TimeInterval = 0.5
     private var pendingSaves: [UUID: Task<Void, Never>] = [:]
+    /// Per-conversation count of how many tool-call -> generate
+    /// continuations have fired since the latest user turn. Cleared
+    /// the moment a `.done` arrives without tool calls (= final
+    /// reply) or the cap is hit. The cap prevents the obvious
+    /// failure mode of a model that keeps calling tools forever.
+    private var toolRoundtrips: [UUID: Int] = [:]
+    private let maxToolRoundtripsPerTurn: Int = 8
+    /// Sampler parameters captured at the start of `send`; reused
+    /// by `runToolCallsAndContinue` so a tool-output continuation
+    /// inherits the same temperature / topK / topP / maxTokens
+    /// the user picked for the current turn.
+    private var lastSamplingOptions: [UUID: (opts: SamplingOptions,
+                                              maxTokens: Int)] = [:]
 
     init(modelDirPath: String,
          service: InferenceService,
@@ -157,6 +170,11 @@ final class ChatStore: ObservableObject {
         conversations[idx].retitleIfNeeded()
         phases[id] = .streaming(buffer: "", status: "Encoding prompt…",
                                  metrics: GenerationMetrics())
+        // Tool-call continuations (M3b) re-use these — capture them
+        // before the Task that drives the model run is spawned so
+        // the value is stable for the whole multi-roundtrip turn.
+        lastSamplingOptions[id] = (options, maxTokens)
+        toolRoundtrips[id] = 0
         scheduleSave(id)
 
         let placeholderId = UUID()
@@ -494,8 +512,150 @@ final class ChatStore: ObservableObject {
             // recovery snapshot so the UI stops offering Resume.
             conversations[idx].pendingTurn = nil
 
+            // Model asked to call one or more tools? Run them, splice
+            // the outputs back into the prompt, and let the model
+            // continue. The iteration guard stops the obvious
+            // infinite-recursion failure mode (model keeps emitting
+            // calls without ever producing a final reply).
+            if !final.toolCalls.isEmpty,
+               toolRoundtrips[id, default: 0] < maxToolRoundtripsPerTurn {
+                toolRoundtrips[id, default: 0] += 1
+                runToolCallsAndContinue(
+                    conversationID: id,
+                    finishedMessageID: placeholderId,
+                    calls: final.toolCalls,
+                    mode: mode)
+                scheduleSave(id)
+                return
+            }
+            toolRoundtrips[id] = nil
+            lastSamplingOptions[id] = nil
+
             phases[id] = .idle
             scheduleSave(id)
+        }
+    }
+
+    /// Dispatch every tool call the model just emitted to MCPClientPool,
+    /// stash the outputs on the originating assistant message, then
+    /// build the `<eos>…<tool_outputs>…<Assistant>` delta and feed
+    /// the model the result of its own work so it can finish the
+    /// reply (or call more tools, bounded by `maxToolRoundtripsPerTurn`).
+    private func runToolCallsAndContinue(conversationID id: UUID,
+                                          finishedMessageID: UUID,
+                                          calls: [ToolCall],
+                                          mode: ThinkingMode) {
+        // Surface that we're between turns — the buffer is empty
+        // (the previous placeholder is finalised), and the next
+        // streaming view-state will be created by the
+        // generateForConversation stream below.
+        phases[id] = .streaming(buffer: "",
+                                 status: "Running \(calls.count) tool\(calls.count == 1 ? "" : "s")…",
+                                 metrics: currentMetrics(of: id))
+
+        // Capture references the detached Task needs.
+        let pool = self.mcpPool
+
+        Task { [weak self] in
+            guard let self else { return }
+            // Run sequentially — most MCP servers are single-process
+            // and an interleaved fan-out doesn't buy much. Errors
+            // are flattened into the output text by `invokeQualified`
+            // so this loop never throws.
+            var outputs: [String] = []
+            outputs.reserveCapacity(calls.count)
+            for call in calls {
+                let result = await pool.invokeQualified(
+                    call.name, argsJSON: call.args)
+                outputs.append(result)
+            }
+
+            // Persist the outputs on the assistant turn that asked
+            // for them — that's what the chat template's
+            // tool_outputs block hangs off.
+            if let cIdx = self.conversations.firstIndex(where: { $0.id == id }),
+               let mIdx = self.conversations[cIdx].messages.firstIndex(
+                where: { $0.id == finishedMessageID })
+            {
+                self.conversations[cIdx].messages[mIdx].toolOutputs = outputs
+            }
+
+            // Build the delta to feed the model. Same shape as the
+            // user-turn fast path, but instead of `<User>...` we
+            // splice the tool_outputs block between `<eos>` and the
+            // re-opened `<Assistant>` turn. The cache prefix already
+            // includes everything up to (and including) the call-
+            // emitting assistant content, so cacheImage will match
+            // and the model continues with only the new delta
+            // tokens to chew on.
+            guard let cachedPrefix = self.conversations.first(where: { $0.id == id })?
+                .encodedTokens else {
+                self.phases[id] = .error(
+                    "Tool-call continuation: missing cached prefix")
+                self.toolRoundtrips[id] = nil
+                self.scheduleSave(id)
+                return
+            }
+            guard let delta = await self.service.tokenizeToolOutputsDelta(
+                callNames: calls.map(\.name),
+                outputs: outputs,
+                mode: mode)
+            else {
+                self.phases[id] = .error(
+                    "Tokenizer unavailable while building tool-output delta")
+                self.toolRoundtrips[id] = nil
+                self.scheduleSave(id)
+                return
+            }
+            let promptTokens = cachedPrefix + delta
+
+            // Append a fresh placeholder for the model's next reply
+            // and re-arm pendingTurn so a crash here is recoverable.
+            let newPlaceholderId = UUID()
+            if let cIdx = self.conversations.firstIndex(where: { $0.id == id }) {
+                self.conversations[cIdx].messages.append(
+                    StoredMessage(id: newPlaceholderId,
+                                   role: .assistant,
+                                   content: ""))
+                self.conversations[cIdx].pendingTurn = PendingTurn(
+                    assistantMessageID: newPlaceholderId,
+                    promptTokens: promptTokens,
+                    generatedTokens: [],
+                    mode: mode.rawValue)
+                self.scheduleSave(id)
+            }
+
+            // Reuse the same sampling parameters the user picked for
+            // this turn (captured in `lastSamplingOptions` at the
+            // start of `send`). Fallback to sensible-but-tame
+            // defaults if somehow the slot was cleared mid-flight.
+            let stored = self.lastSamplingOptions[id]
+            let opts = stored?.opts ?? SamplingOptions(
+                temperature: 0.7,
+                topK: 0, topP: 1.0,
+                repetitionPenalty: 1.0)
+            let maxTok = stored?.maxTokens ?? 4096
+            do {
+                for try await event in self.service.generateForConversation(
+                    promptTokens: promptTokens,
+                    conversationID: id,
+                    mode: mode,
+                    options: opts,
+                    maxTokens: maxTok)
+                {
+                    self.apply(event: event,
+                                to: id,
+                                placeholderId: newPlaceholderId,
+                                userMessageId: finishedMessageID,
+                                mode: mode.rawValue)
+                }
+            } catch {
+                self.phases[id] = .error(
+                    (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription)
+                self.toolRoundtrips[id] = nil
+                self.scheduleSave(id)
+            }
         }
     }
 

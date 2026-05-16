@@ -17,17 +17,27 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     /// future); the canonical token stream lives in
     /// `Conversation.encodedTokens`.
     var tokenCount: Int?
+    /// Results of executing this assistant turn's `toolCalls`,
+    /// captured by `ChatStore` when the MCP pool ran them. Empty
+    /// (or nil for messages persisted before the field existed)
+    /// when no execution happened. Encoded into the prompt as the
+    /// native `<｜tool▁outputs▁begin｜>…<｜tool▁outputs▁end｜>` block on
+    /// re-tokenisation so the model sees the tool answers on its
+    /// next turn.
+    var toolOutputs: [String]?
 
     init(id: UUID = UUID(), role: StoredRole, content: String,
          reasoningContent: String? = nil,
          toolCalls: [StoredToolCall] = [],
-         tokenCount: Int? = nil) {
+         tokenCount: Int? = nil,
+         toolOutputs: [String]? = nil) {
         self.id = id
         self.role = role
         self.content = content
         self.reasoningContent = reasoningContent
         self.toolCalls = toolCalls
         self.tokenCount = tokenCount
+        self.toolOutputs = toolOutputs
     }
 
     static func from(_ m: Message, id: UUID = UUID()) -> StoredMessage {
@@ -35,14 +45,16 @@ struct StoredMessage: Codable, Identifiable, Hashable {
                        role: StoredRole(m.role),
                        content: m.content,
                        reasoningContent: m.reasoningContent,
-                       toolCalls: m.toolCalls.map(StoredToolCall.init))
+                       toolCalls: m.toolCalls.map(StoredToolCall.init),
+                       toolOutputs: m.toolOutputs.isEmpty ? nil : m.toolOutputs)
     }
 
     func asKitMessage() -> Message {
         Message(role: role.asKitRole(),
                  content: content,
                  reasoningContent: reasoningContent,
-                 toolCalls: toolCalls.map { $0.asKitToolCall() })
+                 toolCalls: toolCalls.map { $0.asKitToolCall() },
+                 toolOutputs: toolOutputs ?? [])
     }
 }
 
