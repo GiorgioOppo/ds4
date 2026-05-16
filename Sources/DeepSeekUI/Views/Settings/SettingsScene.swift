@@ -9,6 +9,7 @@ struct SettingsScene: Scene {
     @ObservedObject var projects: ProjectLibrary
     @ObservedObject var mcp: MCPServerLibrary
     @ObservedObject var mcpPool: MCPClientPool
+    @ObservedObject var agents: AgentLibrary
     let service: InferenceService
 
     var body: some Scene {
@@ -20,6 +21,8 @@ struct SettingsScene: Scene {
                     .tabItem { Label("Loading", systemImage: "tray.and.arrow.down") }
                 ModelConfigSettingsTab()
                     .tabItem { Label("Model Config", systemImage: "gearshape.2") }
+                AgentsView(library: agents, mcpPool: mcpPool)
+                    .tabItem { Label("Agents", systemImage: "person.2") }
                 DocumentsView(library: documents, service: service)
                     .tabItem { Label("Documents", systemImage: "doc.text") }
                 ProjectsView(library: projects,

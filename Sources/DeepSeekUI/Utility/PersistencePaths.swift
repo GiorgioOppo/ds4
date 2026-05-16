@@ -92,6 +92,23 @@ enum PersistencePaths {
         try projectsDir().appendingPathComponent("index.json")
     }
 
+    /// User-defined agent registry. Each agent is a preset of
+    /// (system prompt + tool subset + sampling defaults + thinking
+    /// mode). One JSON file under Application Support, decoded into
+    /// `[AgentConfig]` at app launch.
+    static func agentsConfigURL() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("agents.json")
+    }
+
     /// User-defined MCP (Model Context Protocol) server registry.
     /// Layout matches the simple-list shape we use for documents and
     /// projects: one JSON file under Application Support, decoded

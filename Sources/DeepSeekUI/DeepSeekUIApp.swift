@@ -15,6 +15,7 @@ struct DeepSeekUIApp: App {
     @StateObject private var projects: ProjectLibrary
     @StateObject private var mcp: MCPServerLibrary
     @StateObject private var mcpPool: MCPClientPool
+    @StateObject private var agents: AgentLibrary
 
     init() {
         self.service = InferenceService()
@@ -29,6 +30,7 @@ struct DeepSeekUIApp: App {
         pool.librarySynced(mcpLibrary)
         self._mcp = StateObject(wrappedValue: mcpLibrary)
         self._mcpPool = StateObject(wrappedValue: pool)
+        self._agents = StateObject(wrappedValue: AgentLibrary())
     }
 
     var body: some Scene {
@@ -45,6 +47,7 @@ struct DeepSeekUIApp: App {
                        projects: projects,
                        mcp: mcp,
                        mcpPool: mcpPool,
+                       agents: agents,
                        service: service)
     }
 }
