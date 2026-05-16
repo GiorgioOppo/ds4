@@ -216,6 +216,156 @@ The converter has three modes:
 See [`USAGE.md`](USAGE.md) for trade-offs, and `Sources/converter/main.swift`
 for the implementation.
 
+## Desktop app architecture
+
+`DeepSeekKit` is the inference library. The macOS app
+(`Sources/DeepSeekUI/`) sits on top of it and adds: chat history,
+multiple backends (local + remote OpenAI-compatible), MCP tool
+servers, agent presets, sub-agent delegation, and the SwiftUI
+surface.
+
+### State graph
+
+Three long-lived `@StateObject` / `let` singletons + a handful of
+libraries hang off the App scene:
+
+```
+DeepSeekUIApp
+ │
+ ├── InferenceService            (non-Observable, internal serial queue)
+ │     ▲ owns Transformer + Tokenizer + CacheImage shadow
+ │
+ ├── ModelLibrary                (recents persistence)
+ │     ▲
+ │     └── ModelState            (load lifecycle, Published status)
+ │
+ ├── DocumentLibrary
+ ├── ProjectLibrary
+ ├── AgentLibrary
+ ├── MCPServerLibrary            (mcp.json on disk)
+ │     ▲
+ │     └── MCPClientPool         (live JSON-RPC clients, Published per-server status)
+ │
+ └── OpenRouterCatalog           (cached /models response)
+```
+
+`ChatStore` is constructed inside `ChatContainer` (one per app run)
+and holds **references** to every singleton above plus
+`ModelState`. It owns the conversations list + selection + the
+per-conversation `phases` map the chat surface reads. There's no
+explicit dependency injection container — the App scene's `init` is
+the wiring point.
+
+### Backend dispatch
+
+The chat surface treats inference as an event stream
+(`AsyncThrowingStream<GenerationEvent, Error>`), regardless of where
+the events come from. `ChatStore.send` branches at the top:
+
+```
+ChatStore.send(text, mode, options, maxTokens)
+ │
+ ├── modelState.loadedEndpoint == .openRouter(modelID) ?
+ │      │
+ │      └─ YES → sendRemote(text, modelID, mode, options, maxTokens)
+ │                │
+ │                ▼
+ │            runRemoteLoop:
+ │              • OpenAI body { messages, tools, sampler }
+ │              • OpenRouterClient.streamChatCompletion (SSE)
+ │              • accumulate delta.content / reasoning_content / tool_calls
+ │              • finalize on .done
+ │              • if final.toolCalls non-empty: invoke via mcpPool,
+ │                splice tool messages, re-fire HTTP, loop (≤ 8)
+ │
+ └─ NO (local or none) →
+        buildPromptTokens
+          ▼
+        service.generateForConversation(promptTokens, …)
+          ▼
+        apply each event (token / done / progress …)
+          ▼
+        on .done with tool calls:
+          • per-call: mcpPool.invokeQualified or
+                      executeSubAgentDelegation
+          • tokenizeToolOutputsDelta → fast-path delta append
+          • re-issue generateForConversation
+          • loop (≤ 8 roundtrips per turn)
+```
+
+Both branches surface the same `GenerationPhase` enum
+(`.idle / .prefilling / .streaming(buffer, status, metrics) / .error`)
+so the UI doesn't care which path produced the events.
+
+### Local-only state that doesn't exist for remote
+
+| Local | Remote (OpenRouter) |
+|---|---|
+| `CacheImage` shadow → fast-delta tokenization | n/a (cache is server-side) |
+| `Conversation.encodedTokens` | always `nil` |
+| `Conversation.pendingTurn` (crash resume) | always `nil` (re-send to resume) |
+| `runSubAgentToCompletion` (delegation loop) | n/a — delegate schema is not injected |
+| KV snapshot/restore via `Transformer.snapshotKVCache` | n/a |
+
+The chat UI reads these fields opportunistically — when they're
+`nil` the relevant affordances (resume banner, delegation chain)
+just collapse.
+
+### Where MCP plumbing lives
+
+`MCPClient` is one persistent JSON-RPC connection over stdio to a
+child process spawned through `/usr/bin/env`. `MCPClientPool` keys
+clients by `MCPServerConfig.id`, syncing the live set against the
+library every time the library is mutated. The pool exposes:
+
+- `allTools()` — flattened catalogue across every connected server.
+- `toolSchemasJSON(allowedNames:)` — the DSML JSON the local chat
+  template expects (used by the agent filter to drop disallowed
+  tools).
+- `invokeQualified(_:argsJSON:)` — routes a `<server>__<tool>` call
+  to the right client and returns the flattened textual output the
+  chat splices back into the prompt.
+
+Both backends call the same `invokeQualified`. The translation to
+each backend's wire shape happens upstream — the local path emits
+DSML tool blocks, the remote path emits the OpenAI `tools` array.
+
+### Agents, delegation, KV snapshots
+
+`AgentConfig` is a preset (system prompt + tool allowlist +
+sampling defaults + thinking mode + cosmetics) that hides under
+`Conversation.agentID` when attached. `ChatStore.send` resolves it
+to prepend the agent's system prompt and filter the MCP tools
+before composing the request.
+
+When more than one agent is registered, the local chat injects a
+synthetic `__delegate_to_agent` schema with a roster of every other
+agent. The model can call it with `{ agent_name, task }`;
+`ChatStore.executeSubAgentDelegation` dispatches through
+`dispatchDelegation` → `runSubAgentToCompletion` →
+`runSubAgentToCompletionInner`. Each level snapshots the live KV
+cache via `InferenceService.beginDelegation` (a single-process map
+of UUID → `KVCacheSnapshot`) and restores it on the way back up
+through `endDelegation`. That's why the host doesn't pay a cold
+re-prefill when the sub-agent returns.
+
+Nesting is capped at 3 levels; cycle prevention is a `chain: [UUID]`
+threaded through every nested call so an agent already on the stack
+can't be re-entered.
+
+### Crash recovery (local only)
+
+Every local `Send` writes a `PendingTurn { promptTokens,
+generatedTokens, mode }` snapshot onto the active `Conversation`.
+The chat UI shows a Resume banner whenever that field is non-nil
+and the chat is idle. Clicking Resume feeds the same prompt +
+already-sampled ids back through `service.generateForConversation`
+so the bubble keeps extending exactly where it left off.
+
+The snapshot is also re-armed during a tool-call continuation
+(`runToolCallsAndContinue`) so a crash between two iterations of the
+tool loop is still resumable.
+
 ## What's not implemented
 
 See [`ROADMAP.md`](ROADMAP.md) for the feature roadmap and
