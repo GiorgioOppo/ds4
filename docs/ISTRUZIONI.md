@@ -400,7 +400,90 @@ Funziona solo sui modelli locali per ora.
 
 ---
 
-## 8. Riepilogo dei menu della toolbar
+## 8. Tool nativi, Plan / Build, slash command
+
+Oltre ai server MCP, il target `DeepSeekTools` fornisce una
+toolbox di tool nativi (`read`, `write`, `edit`, `glob`, `grep`,
+`shell`, `apply_patch`, `webfetch`, `websearch`, `repo_clone`,
+`repo_overview`, `plan`, `task`, `todo`) che il modello può
+chiamare senza passare per MCP. Riferimento dettagliato:
+[`TOOLS.md`](TOOLS.md).
+
+### Modalità Plan / Build
+
+Ogni agente ha una modalità di esercizio coarse:
+
+- **Build** (default) — tutti i tool eleggibili. I tool
+  `.mutating` / `.dangerous` / `.network` chiedono conferma la
+  prima volta per sessione.
+- **Plan** — i tool `.mutating` e `.dangerous` sono nascosti
+  dallo schema che il modello vede; lui letteralmente non può
+  proporli. I `.network` chiedono comunque consenso.
+
+Tre modi per cambiare la modalità:
+
+1. **Settings → Agents → edit → Agent mode** — default
+   persistente sull'agente.
+2. **Mode picker** sulla toolbar della chat — override
+   per-conversazione, non tocca l'agente salvato.
+3. **`/mode plan`** / **`/mode build`** — slash command inline.
+
+### Permission
+
+Quando il modello chiede di eseguire un tool dangerous /
+mutating / network, parte un flusso a quattro step:
+
+1. Filtro modalità: in Plan, mutating + dangerous sono già
+   filtrati via dallo schema.
+2. Default durabile in `PermissionStore`: se hai già messo
+   "Sempre permetti" o "Sempre nega" per quel (tool, categoria),
+   risposta immediata.
+3. Cache di sessione: se hai già detto "permetti una volta" in
+   questa sessione, il prossimo passa.
+4. Sheet modale `PermissionPromptView`: tre bottoni — **Deny**,
+   **Allow once**, **Always allow**. "Always allow" si memorizza
+   in `PermissionStore` per le sessioni future.
+
+Modifica i default in **Settings → Permissions**.
+
+### Slash command
+
+Digita `/` nel composer per aprire la palette degli slash
+command. Built-in disponibili:
+
+| Comando | Cosa fa |
+|---|---|
+| `/mode plan` · `/mode build` | Cambia la modalità della chat. |
+| `/tools` | Apre la tab Tools. |
+| `/permissions` | Apre la tab Permissions. |
+| `/skill <nome>` | Attiva una skill (vedi sotto). |
+| `/theme` | Apre la tab Theme. |
+| `/clear` | Svuota la draft corrente (non cancella la chat). |
+| `/help` | Lista i comandi disponibili. |
+
+### Skill
+
+Una **Skill** è un piccolo bundle di (system prompt aggiuntivo,
+tool suggeriti, modalità default). Servono per chiedere all'agente
+"ora comportati come un X". Gestione: **Settings → Skills**.
+
+Gli agenti dichiarano quali skill consentire via il campo
+"Allowed skills" nell'edit sheet. Lista vuota = nessuna
+restrizione.
+
+### Nuove tab Settings
+
+| Tab | Cosa controlla |
+|---|---|
+| **Tools** | Inventario read-only dei tool nativi + matrice di disponibilità Plan/Build. |
+| **Permissions** | Editor dei default ask / alwaysAllow / alwaysDeny. |
+| **Skills** | CRUD della libreria delle skill. |
+| **Theme** | Tema chiaro / scuro / system, accent, tinting bolle, import custom. |
+| **Keybindings** | Lista read-only di azioni + scorciatoie. Reset ai default. |
+
+---
+
+## 9. Riepilogo dei menu della toolbar
 
 Da sinistra a destra:
 
@@ -411,9 +494,16 @@ Da sinistra a destra:
 | folder | **Project** | Attacca / stacca un project pre-tokenizzato (solo locale). |
 | bacchetta | **Convert** | Apre lo sheet di quantizzazione offline pesi. |
 
+Sopra il composer trovi inoltre:
+
+| Picker | Cosa fa |
+|---|---|
+| **Mode** (Build / Plan) | Override per-conversazione della modalità agente. Bloccato 🔒 se l'agente attached lo fissa. |
+| **Thinking** (No think / High / Max) | Reasoning effort per il prossimo turno. Stesso lock sull'agente. |
+
 ---
 
-## 9. Risoluzione problemi rapidi
+## 10. Risoluzione problemi rapidi
 
 | Sintomo | Causa | Soluzione |
 |---|---|---|
@@ -436,7 +526,7 @@ Lista più completa di errori e cause su
 
 ---
 
-## 10. Dove continuare
+## 11. Dove continuare
 
 - [`USAGE.md`](USAGE.md): riferimento conciso di tutti i flag CLI
   e dei tab Settings.

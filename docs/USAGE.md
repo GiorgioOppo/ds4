@@ -272,7 +272,99 @@ DeepSeek-R1 and o-series respect it.
 
 ---
 
-## 4. The macOS app: tab-by-tab Settings reference
+## 4. Native tools, Plan / Build, slash commands
+
+The `DeepSeekTools` target ships a code-agent toolbox the model
+can call directly (no MCP round-trip required). Full catalogue
+in [`TOOLS.md`](TOOLS.md); the operating-mode gate that filters
+mutating / dangerous tools is in [`AGENT-MODES.md`](AGENT-MODES.md).
+
+### 4.1. Tool catalogue (today)
+
+| Category | Tools |
+|---|---|
+| readOnly | `read`, `glob`, `grep`, `repo_overview`, `lsp` (stub) |
+| planning | `plan`, `task`, `todo` |
+| mutating | `write`, `edit`, `apply_patch` |
+| dangerous | `shell`, `repo_clone` |
+| network | `webfetch`, `websearch` |
+
+Categories drive both the plan-mode filter and the permission
+policy.
+
+### 4.2. Plan vs Build
+
+Every agent's `agentMode` is either `.build` (historical) or
+`.plan` (read-only stance):
+
+| Mode | readOnly | planning | mutating | dangerous | network |
+|---|---|---|---|---|---|
+| build | allowed | allowed | allowed (consent) | allowed (consent) | allowed (consent) |
+| plan  | allowed | allowed | **denied** | **denied** | allowed (consent) |
+
+Three entry points to switch:
+
+1. **Settings → Agents → edit → Agent mode** segmented control
+   (persists into `agents.json`).
+2. **Toolbar Mode picker** in the chat — flips the active
+   conversation's mode without editing the saved agent.
+3. **`/mode plan`** / **`/mode build`** slash command in the
+   composer.
+
+### 4.3. Permission gate
+
+Dispatching a mutating / dangerous / network tool walks this
+ladder until it gets an answer:
+
+```
+mode filter
+   ↓ (passes only if the mode allows the category)
+PermissionStore durable default
+   alwaysAllow → run
+   alwaysDeny  → return ToolError.denied
+   ask         → ↓
+session cache (ToolRegistry)
+   cached → run
+   miss   → ↓
+PermissionPromptView (modal)
+   Deny | Allow once | Always allow
+```
+
+"Always allow" writes through to `PermissionStore` so the next
+launch starts from the same answer. Reset all session grants
+from **Settings → Permissions → Reset session**.
+
+### 4.4. Slash commands
+
+`/`-prefixed text in the composer opens
+`SlashCommandPaletteView`. Built-in commands:
+
+| Command | What it does |
+|---|---|
+| `/mode plan` / `/mode build` | Flip the current chat's `AgentMode`. |
+| `/tools` | Open the Tools settings tab. |
+| `/permissions` | Open the Permissions settings tab. |
+| `/skill <name>` | Activate one of the agent's allowed skills inline. |
+| `/theme` | Open the Theme settings tab. |
+| `/clear` | Clear the current chat's draft (does not delete history). |
+| `/help` | List the available commands. |
+
+Custom slash commands per-project / per-agent are on the roadmap.
+
+### 4.5. Skills
+
+A **Skill** is a reusable bundle of (system prompt addendum,
+suggested tool allowlist, optional default mode). Built-in
+skills declared at stable UUIDs in `BuiltInSkills`; the agent
+edit sheet's "Allowed skills" multi-pick stores `[UUID]` so the
+agent can fall back to "no skill restriction" by leaving the
+list empty.
+
+Custom skills are CRUD-able under **Settings → Skills**.
+
+---
+
+## 5. The macOS app: tab-by-tab Settings reference
 
 Reachable via `Cmd+,`. Most changes apply on the next Send; the
 exceptions are noted per tab.
@@ -282,7 +374,12 @@ exceptions are noted per tab.
 | **Generation** | Temperature (slider 0.5–1.0, default 0.7), top-K (0 = disabled), top-P, max-tokens, thinking mode. Overridden when an agent is attached to the chat. |
 | **Loading** | Loader strategy override (`auto`/`preload`/`mmap`/`streaming`), force-load toggle, converter binary path. Apply at the next model load. |
 | **Model Config** | Every field of `ModelConfig`. Writes to `~/Library/Application Support/<app>/config-overrides.json`. The loader honours `max_seq_len` / `max_batch_size` on the next load. |
-| **Agents** | CRUD for agent presets — name, summary, system prompt, MCP tool allowlist, sampling defaults, icon + tint. |
+| **Agents** | CRUD for agent presets — name, summary, system prompt, **Plan/Build mode**, thinking mode, **allowed skills**, MCP tool allowlist, sampling defaults, icon + tint. |
+| **Tools** | Read-only inventory of every native tool the registry knows + a Plan/Build availability matrix. |
+| **Permissions** | Per-(tool, category) `ask` / `alwaysAllow` / `alwaysDeny` defaults consulted before every dispatch. Reset session grants. |
+| **Skills** | Manage the skill library — built-in entries are read-only; custom ones get a full edit sheet. |
+| **Theme** | Appearance (light / dark / system), accent + bubble tints, custom theme import. |
+| **Keybindings** | Read-only list of every action + its shortcut + a Reset-to-defaults button. Inline rebind UI is on the roadmap. |
 | **Documents** | Import single text files; each is tokenised once against the loaded local model's tokenizer. |
 | **Projects** | Group documents into projects for one-shot context injection in the chat (local only). |
 | **MCP** | Register Model Context Protocol servers (stdio). Import from Claude Desktop config JSON. Live status per server. |
@@ -291,7 +388,7 @@ exceptions are noted per tab.
 
 ---
 
-## 5. Resume after crash
+## 6. Resume after crash
 
 The local path snapshots a `PendingTurn` on every Send (prompt
 tokens + sampled-so-far ids + mode). If the app dies mid-stream,
@@ -304,7 +401,7 @@ cheap, just re-send the message.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
