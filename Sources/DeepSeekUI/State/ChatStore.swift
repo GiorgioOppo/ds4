@@ -520,11 +520,16 @@ final class ChatStore: ObservableObject {
             if !final.toolCalls.isEmpty,
                toolRoundtrips[id, default: 0] < maxToolRoundtripsPerTurn {
                 toolRoundtrips[id, default: 0] += 1
+                // `mode` arrives here as the raw String (so `apply`
+                // can be called from `send` and from the resume
+                // path with the same signature). Round-trip it
+                // back to the enum the continuation needs.
+                let modeEnum = ThinkingMode(rawValue: mode) ?? .chat
                 runToolCallsAndContinue(
                     conversationID: id,
                     finishedMessageID: placeholderId,
                     calls: final.toolCalls,
-                    mode: mode)
+                    mode: modeEnum)
                 scheduleSave(id)
                 return
             }

@@ -85,23 +85,31 @@ final class MCPClient: ObservableObject {
     @Published private(set) var status: MCPConnectionStatus = .idle
     @Published private(set) var tools: [MCPToolSchema] = []
 
-    private var process: Process?
-    private var stdinHandle: FileHandle?
-    private var stdoutHandle: FileHandle?
-    private var stderrHandle: FileHandle?
+    // Handles + Process need to be touched from both the main
+    // actor (spawn / terminate) and the GCD readabilityHandler /
+    // stdin write callbacks running on Foundation's internal
+    // queues. Marked nonisolated(unsafe) and guarded by the
+    // discipline that mutations only happen in `spawn` / `terminate`
+    // (both MainActor-isolated) — the stdin write itself is
+    // threadsafe inside Foundation's FileHandle.
+    nonisolated(unsafe) private var process: Process?
+    nonisolated(unsafe) private var stdinHandle: FileHandle?
+    nonisolated(unsafe) private var stdoutHandle: FileHandle?
+    nonisolated(unsafe) private var stderrHandle: FileHandle?
 
     /// Accumulator for inbound stdout bytes. The reader callback
     /// appends here on a background queue and slices off complete
-    /// `\n`-terminated frames.
+    /// `\n`-terminated frames. NSLock-guarded; the lock itself is
+    /// Sendable so it doesn't need a `nonisolated(unsafe)` tag.
     nonisolated(unsafe) private var inboundBuffer = Data()
-    nonisolated(unsafe) private let inboundLock = NSLock()
+    private let inboundLock = NSLock()
 
     /// Request id → continuation. The reader matches responses
     /// against this map. NSLock-guarded because reads happen on the
     /// stdout queue and writes happen on the main actor / call site.
     nonisolated(unsafe) private var pending:
         [Int: CheckedContinuation<[String: Any], Error>] = [:]
-    nonisolated(unsafe) private let pendingLock = NSLock()
+    private let pendingLock = NSLock()
     nonisolated(unsafe) private var nextRequestID: Int = 1
 
     /// JSON-RPC request timeout. `npx`/`uvx` first-run installs can
@@ -206,24 +214,22 @@ final class MCPClient: ObservableObject {
         return try await withThrowingTaskGroup(of: [String: Any].self) { group in
             group.addTask {
                 try await withCheckedThrowingContinuation { cont in
-                    self.pendingLock.lock()
-                    self.pending[id] = cont
-                    self.pendingLock.unlock()
+                    self.pendingLock.withLock { self.pending[id] = cont }
                     do {
                         try self.writeFrame(data)
                     } catch {
-                        self.pendingLock.lock()
-                        let stillPending = self.pending.removeValue(forKey: id)
-                        self.pendingLock.unlock()
+                        let stillPending = self.pendingLock.withLock {
+                            self.pending.removeValue(forKey: id)
+                        }
                         stillPending?.resume(throwing: error)
                     }
                 }
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                self.pendingLock.lock()
-                let stillPending = self.pending.removeValue(forKey: id)
-                self.pendingLock.unlock()
+                let stillPending = self.pendingLock.withLock {
+                    self.pending.removeValue(forKey: id)
+                }
                 stillPending?.resume(throwing: MCPError.timeout(method: method))
                 throw MCPError.timeout(method: method)
             }
@@ -251,11 +257,11 @@ final class MCPClient: ObservableObject {
     }
 
     nonisolated private static func nextID(in client: MCPClient) -> Int {
-        client.pendingLock.lock()
-        defer { client.pendingLock.unlock() }
-        let id = client.nextRequestID
-        client.nextRequestID += 1
-        return id
+        client.pendingLock.withLock {
+            let id = client.nextRequestID
+            client.nextRequestID += 1
+            return id
+        }
     }
 
     /// Process one complete JSON frame received on stdout. Routes
@@ -271,9 +277,7 @@ final class MCPClient: ObservableObject {
             return
         }
         if let id = obj["id"] as? Int {
-            pendingLock.lock()
-            let cont = pending.removeValue(forKey: id)
-            pendingLock.unlock()
+            let cont = pendingLock.withLock { pending.removeValue(forKey: id) }
             guard let cont else {
                 // Server-to-client request — currently unsupported
                 // (would need sampling/createMessage etc.). Drop.
@@ -335,23 +339,26 @@ final class MCPClient: ObservableObject {
                 self.onChildExited()
                 return
             }
-            self.inboundLock.lock()
-            self.inboundBuffer.append(chunk)
-            while let nl = self.inboundBuffer.firstIndex(of: 0x0A) {
-                let frame = self.inboundBuffer.subdata(
-                    in: self.inboundBuffer.startIndex..<nl)
-                self.inboundBuffer.removeSubrange(
-                    self.inboundBuffer.startIndex...nl)
-                if !frame.isEmpty {
-                    // Release the lock before handling the frame —
-                    // handleFrame takes pendingLock, and holding
-                    // both at once would risk an ordering bug.
-                    self.inboundLock.unlock()
-                    self.handleFrame(frame)
-                    self.inboundLock.lock()
+            // Drain every complete `\n`-terminated frame out of the
+            // shared inbound buffer under the lock, then dispatch
+            // them outside the critical section — `handleFrame`
+            // takes pendingLock and holding both at once would
+            // risk a lock-ordering bug.
+            let frames = self.inboundLock.withLock { () -> [Data] in
+                self.inboundBuffer.append(chunk)
+                var out: [Data] = []
+                while let nl = self.inboundBuffer.firstIndex(of: 0x0A) {
+                    let frame = self.inboundBuffer.subdata(
+                        in: self.inboundBuffer.startIndex..<nl)
+                    self.inboundBuffer.removeSubrange(
+                        self.inboundBuffer.startIndex...nl)
+                    if !frame.isEmpty { out.append(frame) }
                 }
+                return out
             }
-            self.inboundLock.unlock()
+            for frame in frames {
+                self.handleFrame(frame)
+            }
         }
 
         // stderr reader: just log to stderr for now so users can
@@ -392,10 +399,11 @@ final class MCPClient: ObservableObject {
         stderrHandle = nil
         // Resume every pending continuation so callers don't hang
         // forever waiting for a response that will never arrive.
-        pendingLock.lock()
-        let drained = pending
-        pending = [:]
-        pendingLock.unlock()
+        let drained = pendingLock.withLock { () -> [Int: CheckedContinuation<[String: Any], Error>] in
+            let snap = pending
+            pending = [:]
+            return snap
+        }
         for (_, cont) in drained {
             cont.resume(throwing: MCPError.notConnected)
         }
