@@ -34,6 +34,8 @@ Where to start depends on what you came here for.
 | [`USAGE.md`](USAGE.md) | Operational reference: CLI flags, GUI walkthrough, OpenRouter onboarding, troubleshooting checklist. |
 | [`TOOLS.md`](TOOLS.md) | The native code-agent toolbox (`read / write / edit / shell / apply_patch / webfetch / …`). Categories, statuses, how to add a new one. |
 | [`AGENT-MODES.md`](AGENT-MODES.md) | Plan vs Build operating modes, the permission flow that gates dangerous / mutating tools, and where the mode is switched. |
+| [`GGUF.md`](GGUF.md) | GGUF reader MVP — supported / unsupported dtypes, what `GGUFFile` can do today, the path to a full inference loader. |
+| [`GAP-ANALYSIS-LLAMACPP.md`](GAP-ANALYSIS-LLAMACPP.md) | Structured comparison vs llama.cpp — chat-template dispatcher, tokenizer formats, GGUF support, sampling, what still differs. |
 | [`EXAMPLES.md`](EXAMPLES.md) | Recipes: send a message via OpenRouter, register an MCP server, define an agent that delegates, invoke a native tool, dispatch a Metal kernel, load a tensor. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture: engine data flow, the macOS app's state graph (`InferenceService` / `ModelState` / `ChatStore` / `NativeToolHost`), backend dispatch between local and OpenRouter. **Read this before any source file.** |
 | [`GLOSSARY.md`](GLOSSARY.md) | One-stop reference for every domain term in the source (MLA, MoE, FP4-E2M1, E8M0, RoPE, YaRN, DSML, MCP, Plan/Build mode, Skill, Slash command, Permission, …). |
@@ -88,7 +90,11 @@ side:
 | | Local | OpenRouter |
 |---|---|---|
 | Token-level KV cache + fast-delta path | ✅ | n/a (provider-side) |
-| Native tools (DeepSeekTools) | ✅ (scaffolded; wiring tracked in TODO §7) | ✅ (same) |
+| DSV4 chat template | ✅ (default) | n/a (provider builds the prompt) |
+| Jinja2 chat templates (Llama / Mistral / Qwen / …) | ✅ via dispatcher | n/a |
+| GGUF reader (header + pass-through dtypes) | ✅ MVP — see [`GGUF.md`](GGUF.md) | n/a |
+| Extended sampler suite (min-p / mirostat / tail-free / typical / freq / presence) | ✅ | partial — what OpenRouter accepts in the body |
+| Native tools (DeepSeekTools) | ✅ (scaffolded; wiring tracked in TODO §8) | ✅ (same) |
 | Tool calls via MCP | ✅ | ✅ |
 | Plan / Build agent mode + permission gate | ✅ | ✅ |
 | Sub-agent delegation | ✅ | not yet |

@@ -12,6 +12,19 @@ L'app desktop supporta:
 - **Inference remota** tramite OpenRouter — qualsiasi modello
   OpenAI-compatible (Claude, GPT, DeepSeek-R1, Llama 3, ecc.) con una
   sola API key.
+- **Dispatcher di chat template**: template nativo DSV4 + driver
+  Jinja2 (subset) per modelli non-DeepSeek (Llama / Mistral / Qwen
+  / qualsiasi `tokenizer_config.json` con un `chat_template`).
+- **Tokenizer multi-formato**: byte-level BPE (V4), SentencePiece
+  (Llama / Mistral), WordPiece (BERT-style). Routing in
+  `TokenizerLoader.load`.
+- **Lettore GGUF (MVP)** — parser header + dtype pass-through
+  (`F32 / F16 / BF16 / I32 / I8`). I dtype GGUF quantizzati
+  (`Q4_0 / Q4_K_M / …`) non sono ancora supportati. Dettagli in
+  [`docs/GGUF.md`](docs/GGUF.md).
+- **Sampler suite estesa**: top-K / top-P / min-p / tail-free /
+  locally-typical / Mirostat v2 / repetition / frequency /
+  presence penalty.
 - **Tool nativi code-agent** (read / write / edit / glob / grep /
   shell / apply_patch / webfetch / websearch / repo_clone /
   repo_overview / plan / task / todo) utilizzabili da entrambi i
@@ -41,7 +54,9 @@ L'app desktop supporta:
 🇬🇧 [English version](README.md) · 🏗 [Architettura (dettagli)](docs/ARCHITECTURE.md)
 · 🧪 [Test](docs/TESTING.md) · 🛠 [Sviluppo](docs/DEVELOPING.md)
 · 🧰 [Tool nativi](docs/TOOLS.md) · 🚦 [Modalità agente](docs/AGENT-MODES.md)
+· 📦 [Lettore GGUF](docs/GGUF.md)
 · 🔍 [Gap analysis vs opencode](docs/GAP-ANALYSIS-OPENCODE.md)
+· 🔍 [Gap analysis vs llama.cpp](docs/GAP-ANALYSIS-LLAMACPP.md)
 
 ---
 
@@ -475,9 +490,24 @@ diagnostiche.
 | Flag | Tipo | Default | Cosa fa |
 |---|---|---|---|
 | `--mode` | `raw` \| `chat` | `chat` | `raw` antepone solo BOS; `chat` applica il template chat V4. |
-| `--thinking` | `off` \| `high` \| `max` | `off` | Budget di ragionamento in chat. `off` appende `</think>`; `high` appende `<think>`; `max` aggiunge anche il blocco di sistema REASONING_EFFORT_MAX. |
+| `--thinking` | `off` \| `high` \| `max` | `off` | Budget di ragionamento in chat. `off` appende `</think>`; `high` appende `<think>`; `max` aggiunge anche il blocco REASONING_EFFORT_MAX. |
 | `--temperature` | float | `1.0` | Temperatura di sampling. **Imposta `0.7`** — vedi Valori consigliati. |
 | `--max-tokens` | int | `32` | Numero massimo di token da generare. |
+
+### Flag sampler (tutti default "disabilitato")
+
+| Flag | Tipo | Default | Cosa fa |
+|---|---|---|---|
+| `--top-k` | int | `0` | Mantiene solo i top-K logit. |
+| `--top-p` | float | `1.0` | Cutoff nucleus. |
+| `--min-p` | float | `0.0` | Scarta token con `p < min_p × max_p`. |
+| `--tfs` | float | `1.0` | Tail-free sampling, parametro `z`. |
+| `--typical` | float | `1.0` | Locally-typical mass. |
+| `--repetition-penalty` | float | `1.0` | Penalty stile HuggingFace su id in history. |
+| `--frequency-penalty` | float | `0.0` | Stile OpenAI, scala con la count. |
+| `--presence-penalty` | float | `0.0` | Stile OpenAI, binario sulla presenza. |
+| `--mirostat` | float | off | Abilita Mirostat v2 con surprise target τ. |
+| `--mirostat-eta` | float | `0.1` | Learning rate Mirostat. |
 
 ### Flag loader / memoria
 
