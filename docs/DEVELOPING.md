@@ -8,6 +8,7 @@ have actually bitten us. Open this before submitting a change.
 
 | Task | Section |
 |---|---|
+| **Engine** | |
 | Set up your dev environment | §1 |
 | Where things live, naming conventions | §2 |
 | Add a new Metal kernel | §3 |
@@ -16,6 +17,11 @@ have actually bitten us. Open this before submitting a change.
 | Support a new weight-name layout | §6 |
 | Debug a forward pass | §7 |
 | Common pitfalls (real ones we've hit) | §8 |
+| **Desktop app** | |
+| Add a new `ModelEndpoint` backend (e.g. Anthropic direct) | §9 |
+| Add a Settings tab | §10 |
+| Add a new MCP transport (HTTP/SSE) | §11 |
+| Wire a new InferenceService method through the chat | §12 |
 
 ## 1. Dev environment
 
@@ -458,13 +464,173 @@ different `--shard-size-gb` or `--target-dtype`, the totals don't
 match and resume bails. Wipe the output directory before changing
 flags.
 
-## 9. Sources
+## 9. Recipe: add a new `ModelEndpoint` backend
+
+OpenRouter is the only remote backend today. The dispatch points
+that need to grow when a second one lands (Anthropic direct, OpenAI
+direct, a local Ollama-style server, …) are:
+
+1. **`ModelEndpoint` case** in `Sources/DeepSeekUI/State/ModelEndpoint.swift`.
+   Add a `case` for the new backend with whatever it needs to be
+   addressed (`baseURL`, model id, etc. — `apiKey` does NOT live
+   here, it lives in Keychain). Update `id`, `displayName`,
+   `subtitle`, `iconName`, `isRemote`. Both switches that consume
+   the enum will then refuse to compile until you handle the new
+   case.
+
+2. **`KeychainStore` account** in
+   `Sources/DeepSeekUI/State/KeychainStore.swift`. Add a new
+   `KeychainAccount.<backend>APIKey` constant. Decide whether to
+   reuse a single account or namespace per-baseURL — for OpenRouter
+   we used a single account because the slug carries the model
+   identity.
+
+3. **`ModelState.load(_:)` dispatch** in
+   `Sources/DeepSeekUI/State/ModelState.swift`. Add a `case .new`
+   branch that calls a new private `loadRemote<Backend>` mirroring
+   `loadRemoteOpenRouter` — unload the current local model, mark
+   `.loading`, validate the key with whatever the backend exposes,
+   mark `.loaded` on success / `.error` on failure.
+
+4. **`ChatStore.send` dispatch** in
+   `Sources/DeepSeekUI/State/ChatStore.swift`. Add a `case .new`
+   branch (right next to the existing `.openRouter` one) that calls
+   a new private `sendVia<Backend>`. Most of the existing remote
+   plumbing in `runRemoteLoop` — `buildOpenAIMessages`,
+   `composeOpenAITools`, the per-iteration finalize logic — is
+   reusable if the backend speaks the OpenAI Chat Completions
+   shape. If not, write a parallel driver and keep the same
+   `phases[id]` lifecycle so the chat view doesn't need to know
+   which backend produced the events.
+
+5. **HTTP client** (only if the new backend isn't OpenAI-compatible).
+   Mirror `OpenRouterAPI.swift`'s shape: typed DTOs for the
+   response payloads (Decodable structs are fine — the request body
+   is built as `[String: Any]` so optional fields don't all become
+   Optional in the type), one `Client` class with
+   `validateKey(_:) async throws`, `fetchModels(apiKey:)` if
+   applicable, and an `AsyncThrowingStream<…, Error>` factory for
+   the streaming completion.
+
+6. **UI surfaces.** `ContentView.ModelPicker` already shows recents
+   by endpoint icon — add a new "Add … model" menu entry next to
+   "Add OpenRouter model…", plus a sheet to pick the slug from the
+   backend's catalog (mirror `AddOpenRouterModelSheet`).
+   `APIKeysSettingsTab` grows a new SecureField + Save/Test/Delete
+   row.
+
+The chat view itself should need no changes — it consumes
+`GenerationPhase` and `Conversation.cumulativeCostUSD`, both of
+which are backend-agnostic. The cost banner reads
+`GenerationMetrics.turnCostUSD` which any backend can populate.
+
+## 10. Recipe: add a Settings tab
+
+```swift
+struct MyNewSettingsTab: View {
+    var body: some View {
+        Form { … }
+            .formStyle(.grouped)
+            .padding(20)
+    }
+}
+```
+
+Then in `Sources/DeepSeekUI/Views/Settings/SettingsScene.swift`:
+
+```swift
+MyNewSettingsTab()
+    .tabItem { Label("My thing", systemImage: "sf.symbol.name") }
+```
+
+If the tab needs to read or write a library (`AgentLibrary`,
+`ModelLibrary`, etc.), thread the `@ObservedObject` through
+`SettingsScene` and the App scene that owns it — the existing
+tabs are the template.
+
+`@AppStorage`-backed settings live in
+`Sources/DeepSeekUI/State/AppSettings.swift`; add the key to
+`AppSettingsKey` so the storage namespace stays discoverable.
+
+After adding new files, regenerate the Xcode project so the GUI
+target compiles:
+
+```bash
+./Tools/generate-xcodeproj.sh
+```
+
+(`swift build` does not need regeneration.)
+
+## 11. Recipe: add a new MCP transport
+
+Today `MCPClient` is hard-wired to stdio: it spawns a child
+`Process` and frames JSON-RPC over its stdin/stdout pipes.
+Supporting HTTP/SSE or WebSocket requires extracting the framing
++ I/O behind a protocol.
+
+Suggested shape:
+
+```swift
+protocol MCPTransport: AnyObject {
+    func start() async throws
+    func send(_ frame: Data) throws
+    func setIncomingHandler(_ handler: @escaping (Data) -> Void)
+    func stop()
+}
+
+final class StdioMCPTransport: MCPTransport { … existing stdio code … }
+final class HTTPSSETransport: MCPTransport { … URLSession.bytes + POST … }
+```
+
+`MCPClient` then takes an `MCPTransport` in init instead of
+constructing a `Process` directly. `MCPClientPool.sync(with:)`
+inspects the `MCPServerConfig.command` (or a new
+`MCPServerConfig.transport` enum) to decide which transport to
+construct.
+
+The JSON-RPC layer (request id allocation, pending continuation
+map, frame routing) lives above the transport in
+`MCPClient.sendRequest` / `handleFrame` and doesn't need to know
+which transport carried the bytes.
+
+## 12. Recipe: wire a new InferenceService method through the chat
+
+When you add a method to `InferenceService` (e.g. a new sampling
+hook, a new prompt-encoding shortcut, a new diagnostic), the wiring
+into the chat looks like:
+
+1. Add the method to `Sources/DeepSeekUI/State/InferenceService.swift`.
+   Mark it `func` (not `nonisolated`) and dispatch the body onto
+   the internal `q` serial queue — every other method does this so
+   the cache + tokenizer aren't touched from two threads.
+
+2. Surface it on `ChatStore` only if the chat surface needs to call
+   it. The pattern: a thin wrapper that knows which conversation /
+   which mode applies, then forwards to `service`.
+
+3. If the method changes the `phases[id]` lifecycle (e.g.
+   introduces a new `GenerationPhase` case), update both branches
+   of `ChatStore.send` (local and remote) so the UI gets the same
+   case from both backends. The chat view reads `phase(of:)` and
+   shouldn't have to special-case backend.
+
+4. If the method affects what's on disk (a new field on
+   `Conversation`), add the field with `Optional` for BWC and an
+   `init(... = nil)` so old `.json` files still decode.
+
+5. Test by manually round-tripping a conversation: save to disk,
+   restart the app, reopen the chat. Anything that doesn't
+   gracefully degrade with `nil` is a migration bug.
+
+## 13. Sources
 
 - Reference implementation pattern: `Sources/DeepSeekKit/Layers/Hadamard.swift`
 - Test pattern: `Tests/DeepSeekKitTests/HadamardTests.swift`
 - Build plugin: `Plugins/MetalLibPlugin/MetalLibPlugin.swift`
 - Function-constant reservations: [KERNELS.md](KERNELS.md#conventions)
 - Recipe-style examples (more concrete code): [EXAMPLES.md](EXAMPLES.md)
+- Desktop-app module map: [MODULES.md](MODULES.md#sourcesdeepseekui-desktop-app)
+- Desktop-app data flow: [ARCHITECTURE.md](ARCHITECTURE.md#desktop-app-architecture)
 
 See also [TESTING.md](TESTING.md) for the test surface and tolerance
 guidance.
