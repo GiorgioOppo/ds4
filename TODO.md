@@ -299,6 +299,7 @@ Toolbox nativo per agire su codice. Storia: vedi
   `localhost:PORT` con un'API OpenAI-compatible. Sblocca:
   TUI client esterni, plugin VS Code / Zed, GitHub Actions
   `agent-review.yml` (oggi placeholder), Slack bot completo.
+  **Piano dettagliato in §10.1 (T1).**
 
 - [ ] **Slack bot completo**. `Sources/DeepSeekIntegrations/Slack/`
   ha solo un webhook one-shot. Mancano: Events API listener, OAuth,
@@ -346,11 +347,12 @@ Pezzi scaffoldati nel merge di llama.cpp-gap. Storia: vedi
   `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`). Senza questi `GGUFFile.load`
   solleva `unsupportedType`. Pattern di partenza:
   `int4_gemm.metal` + `int8_gemm.metal`. Ogni formato ~2-3 giorni.
+  **Piano dettagliato in §10.2 (T2).**
 
 - [ ] **Kernel transformer Llama-style** (MHA + SwiGLU + RMSNorm,
   no MLA, no MoE, no HC). Pre-requisito perché il dispatcher di
   template + il reader GGUF facciano *girare* un modello Llama,
-  non solo leggerlo.
+  non solo leggerlo. **Piano dettagliato in §10.2 (T2).**
 
 - [ ] **GGUF writer**. Simmetrico al reader; permetterebbe al
   converter di produrre un GGUF leggibile da llama.cpp. Low
@@ -360,6 +362,146 @@ Pezzi scaffoldati nel merge di llama.cpp-gap. Storia: vedi
   in `JinjaTemplate.swift`. Nessuno dei template in circolazione
   ne ha bisogno per ora; il giorno che inciampiamo in uno che li
   usa, le aggiungiamo.
+
+---
+
+## 10. Standard LLM compatibility — piano di implementazione
+
+Piano consolidato dopo la review critica sugli standard LLM (branch
+`claude/review-llm-standards-UuG3Y`). Cinque track ordinati per ROI:
+T1 (server) sblocca testabilità esterna di tutti gli altri; T2 (GGUF
+forward) è il più grosso ed è parallelizzabile. Effort stimati a
+"uomo-settimana" single developer focused.
+
+### 10.1 Server HTTP OpenAI-compatible — T1 (~2 settimane)
+
+Blocker per integrazione esterna (VS Code / Zed / TUI / Slack /
+GitHub Actions). Sostituisce e dettaglia la voce "Server mode" in §8.
+
+- [ ] **`LocalServer` actor**. SwiftNIO o `URLSession` server APIs;
+  bind su `localhost:PORT`, configurabile. ~3d. Nuovo file:
+  `Sources/DeepSeekUI/State/LocalServer.swift`.
+- [ ] **`POST /v1/chat/completions` non-streaming**. Mapping
+  `OpenAIRequest → InferenceService.generateForConversation`.
+  Tokenizer attivo dal modello caricato. ~2d.
+- [ ] **SSE streaming (`stream: true`)**. Delta chunks
+  `data: {choices:[{delta:{...}}]}\n\n`, terminatore `data: [DONE]`.
+  ~2d.
+- [ ] **`GET /v1/models`**. Catalogo dal modello locale caricato +
+  modelli OpenRouter conosciuti (opt-in). ~0.5d.
+- [ ] **`tools[]` passthrough**. Array OpenAI → MCP/native registry;
+  emissione `tool_calls` nella response. Riusa logica `ChatStore`.
+  ~2d.
+- [ ] **Settings → Server tab**. Port, bind addr, enable toggle,
+  optional bearer token. ~1d. Nuovo file:
+  `Sources/DeepSeekUI/Views/Settings/ServerSettingsTab.swift`.
+- [ ] **Test integrazione + curl recipe**. `LocalServerTests.swift`
+  + sezione in `docs/EXAMPLES.md`. ~1d.
+
+### 10.2 GGUF run-forward (dequant + Llama) — T2 (~3 settimane)
+
+Estende §9 "Kernel dequant" + "Kernel transformer Llama-style" con
+piano sequenziato. Senza questo, il lavoro post-merge llama.cpp-gap
+(GGUF reader, Jinja, multi-tokenizer) è inerte.
+
+- [ ] **Q8_0 dequant kernel**. Simmetrico a `int8_gemm.metal` ma su
+  blocchi GGUF da 32 elementi + scala F16. ~2d. Nuovo:
+  `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`.
+- [ ] **Q4_0 + Q4_K_M dequant kernels**. Q4_K_M è super-block 256
+  con 8 scale F16 + min F16. ~4d.
+- [ ] **`GGUFFile.load` → BF16 staging tensor**. Sostituisce
+  `unsupportedType` in `GGUFLoader.swift`. ~1d.
+- [ ] **`LlamaDecoderLayer`** (MHA + RoPE + SwiGLU + RMSNorm). ~3d.
+  Nuovo: `Sources/DeepSeekKit/Layers/LlamaDecoderLayer.swift`.
+- [ ] **`LlamaModel` wrapper + `ModelArchitecture` dispatcher**.
+  ~2d. Nuovi: `Sources/DeepSeekKit/{LlamaModel,ModelArchitecture}.swift`.
+- [ ] **Tokenizer auto-detect** da GGUF metadata
+  (`tokenizer.ggml.model` = "llama" / "gpt2" / "bert"). ~1d.
+- [ ] **End-to-end test con TinyLlama-1.1B Q4_K_M**. Greedy decoding
+  match vs llama.cpp reference. ~2d. Nuovo:
+  `Tests/DeepSeekKitTests/LlamaForwardTests.swift`.
+
+### 10.3 Constrained decoding (JSON schema) — T3 (~1.5 settimane)
+
+Output JSON garantito — gap killer dopo "no server". Subset
+`response_format: {type:"json_schema"}` di OpenAI Structured Outputs.
+
+- [ ] **JSON-Schema → token-mask compiler**. Subset: `type`,
+  `enum`, `oneOf`, `anyOf`, `properties`, `items`, `pattern`
+  (regex semplice). ~4d. Nuovo:
+  `Sources/DeepSeekKit/Sampling/SchemaCompiler.swift`.
+- [ ] **Mask injection in `Sampling.swift`**. Nuovo campo
+  `Sampler.schemaMask: SchemaMask?`, applicato stage 0 prima di
+  temperature/top-K. Stato automa avanzato per token. ~2d. Nuovo:
+  `Sources/DeepSeekKit/Sampling/SchemaMask.swift`.
+- [ ] **API binding `response_format: {type:"json_schema"}`**. Sia
+  su `LocalServer` (§10.1) che su CLI. ~1d.
+- [ ] **CLI flag `--json-schema <path>`** in
+  `Sources/deepseek/main.swift`. ~0.5d.
+- [ ] **Test golden con 5 schemi** (object, array, enum, oneOf,
+  pattern). ~1d.
+
+Stretch: **GBNF parser** stile llama.cpp per grammar arbitrarie. Non
+bloccante — JSON Schema copre ~90 % dei casi d'uso.
+
+### 10.4 Driver provider nativi — T4 (~3 giorni)
+
+Smette di pagare il margine OpenRouter sui modelli più usati e abilita
+prompt caching Anthropic (oggi non passabile via OpenRouter, vedi
+§4 "Prompt-caching Anthropic via OpenRouter").
+
+- [ ] **`AnthropicAPI`** client (Messages API + SSE streaming). ~1d.
+  Nuovo: `Sources/DeepSeekUI/State/AnthropicAPI.swift`.
+- [ ] **`ModelEndpoint.anthropic` case** + Settings → API Keys
+  Anthropic field. ~0.5d.
+- [ ] **Format translation** OpenAI `tools[]` ↔ Anthropic
+  `tool_use`/`tool_result` blocks. ~1d.
+- [ ] **`cache_control` auto-injection** sul system block + ultimo
+  tool result. Chiude voce §4 "Prompt-caching Anthropic via
+  OpenRouter". ~0.5d.
+
+Stretch: driver **Ollama localhost** (`/api/chat`). Utile per chi
+gira llama.cpp via Ollama in parallelo al nostro engine. Stessa
+struttura, no auth.
+
+### 10.5 Sampler residui — T5 (~2 giorni)
+
+- [ ] **DRY sampler** — penalty moltiplicativa su token che
+  estenderebbero n-gram già visti. Parametri standard: `multiplier`,
+  `base`, `allowed_length`. ~1d. In `Sources/DeepSeekKit/Sampling.swift`.
+- [ ] **`logitBias: [Int32: Float]`** in `Sampler`. Stage 0
+  (additivo prima di softmax). ~0.3d.
+- [ ] **Mirostat v1** — algoritmo originale (oggi solo v2). ~0.5d.
+- [ ] **CLI flag + test golden**. ~0.2d.
+
+### 10.6 Sequenziamento consigliato
+
+```
+Settimana 1-2:  T1 (server)
+Settimana 3:    T4 + T5 in parallelo (cheap, indipendenti)
+Settimana 4-6:  T2 (GGUF + Llama) — può forkare in parallelo a T1
+                 se 2 dev
+Settimana 7-8:  T3 (constrained) — più valore quando T1 è on
+```
+
+### 10.7 Out-of-scope deliberato
+
+Standard identificati nella review ma fuori scope per scelta
+strategica. Da rivalutare solo se cambia il target del progetto:
+
+- **Multimodale** (vision/audio in/out). V4-Flash non ha encoder.
+- **LoRA / QLoRA / PEFT**. Fine-tuning + serving non è il target.
+- **Embedding / reranker**. Modelli architetturalmente diversi.
+- **Mamba / RWKV / SSM**. State-space, non transformer.
+- **Driver Gemini / Cohere / Bedrock nativi**. OpenRouter li copre.
+- **GGUF writer**. Solo se serve interop bidirezionale.
+- **A2A protocol** (Google). MCP è sufficiente.
+- **EXL2/EXL3, MLX, ONNX, AWQ/GPTQ packed**. Non target
+  Apple-Silicon-Metal o richiedono runtime separato.
+- **Continuous batching / paged attention**. Single-user offline è
+  l'attuale modo d'uso; rivalutare se §10.1 prende traffico serio.
+- **DRY / XTC** in versione completa con tutte le tunable di
+  koboldcpp. Subset minimo in T5.
 
 ---
 
