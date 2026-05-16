@@ -47,6 +47,7 @@ struct ChatContainer: View {
     @ObservedObject var openRouterCatalog: OpenRouterCatalog
 
     @State private var showConvert: Bool = false
+    @State private var showFineTune: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -73,10 +74,20 @@ struct ChatContainer: View {
                             Label("Convert model…", systemImage: "wand.and.stars")
                         }
                     }
+                    ToolbarItem {
+                        Button {
+                            showFineTune = true
+                        } label: {
+                            Label("Fine-tune model…", systemImage: "graduationcap")
+                        }
+                    }
                 }
         }
         .sheet(isPresented: $showConvert) {
             ConvertSheet()
+        }
+        .sheet(isPresented: $showFineTune) {
+            FineTuneSheet()
         }
     }
 
