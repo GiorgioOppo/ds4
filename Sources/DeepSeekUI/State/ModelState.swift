@@ -81,6 +81,36 @@ final class ModelState: ObservableObject {
         switch endpoint {
         case .localDirectory(let path):
             await loadLocal(path: path, endpoint: endpoint, force: force)
+        case .openRouter(let modelID):
+            await loadRemoteOpenRouter(modelID: modelID, endpoint: endpoint)
+        }
+    }
+
+    /// Activate a remote OpenRouter endpoint. No weights to map
+    /// and nothing to probe, but we still drop any locally-loaded
+    /// model (so the chat unambiguously talks to one backend),
+    /// validate that the Keychain holds a key, and ping
+    /// `/auth/key` so an invalid token fails here instead of on
+    /// the first send. `library.touch` bumps the recents.
+    private func loadRemoteOpenRouter(modelID: String,
+                                        endpoint: ModelEndpoint) async {
+        await service.unloadModel()
+        status = .loading(endpoint: endpoint, plan: nil)
+        guard let key = KeychainStore.get(
+            account: KeychainAccount.openRouterAPIKey), !key.isEmpty
+        else {
+            status = .error(endpoint: endpoint,
+                             message: "Add an OpenRouter API key under Settings → API Keys first.")
+            return
+        }
+        do {
+            try await OpenRouterClient().validateKey(key)
+            library.touch(endpoint)
+            status = .loaded(endpoint: endpoint, config: ModelConfig())
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            status = .error(endpoint: endpoint, message: msg)
         }
     }
 
