@@ -14,12 +14,21 @@ struct DeepSeekUIApp: App {
     @StateObject private var documents: DocumentLibrary
     @StateObject private var projects: ProjectLibrary
     @StateObject private var mcp: MCPServerLibrary
+    @StateObject private var mcpPool: MCPClientPool
 
     init() {
         self.service = InferenceService()
         self._documents = StateObject(wrappedValue: DocumentLibrary())
         self._projects = StateObject(wrappedValue: ProjectLibrary())
-        self._mcp = StateObject(wrappedValue: MCPServerLibrary())
+        let mcpLibrary = MCPServerLibrary()
+        let pool = MCPClientPool()
+        // Wire the pool to the library at construction time so
+        // already-saved enabled servers start spawning on launch
+        // without waiting for the user to open the Settings tab.
+        pool.attach(to: mcpLibrary)
+        pool.librarySynced(mcpLibrary)
+        self._mcp = StateObject(wrappedValue: mcpLibrary)
+        self._mcpPool = StateObject(wrappedValue: pool)
     }
 
     var body: some Scene {
@@ -34,6 +43,7 @@ struct DeepSeekUIApp: App {
         SettingsScene(documents: documents,
                        projects: projects,
                        mcp: mcp,
+                       mcpPool: mcpPool,
                        service: service)
     }
 }

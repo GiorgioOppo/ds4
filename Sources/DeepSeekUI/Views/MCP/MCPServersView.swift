@@ -9,6 +9,7 @@ import AppKit
 /// "Idle" for every row until that client lands.
 struct MCPServersView: View {
     @ObservedObject var library: MCPServerLibrary
+    @ObservedObject var pool: MCPClientPool
 
     @State private var selectedID: UUID?
     @State private var editing: MCPServerConfig?
@@ -31,6 +32,7 @@ struct MCPServersView: View {
                 } else {
                     library.add(updated)
                 }
+                pool.librarySynced(library)
                 if selectedID == nil { selectedID = updated.id }
             }
         }
@@ -96,6 +98,7 @@ struct MCPServersView: View {
                     .contextMenu {
                         Button(s.enabled ? "Disable" : "Enable") {
                             library.setEnabled(s.id, !s.enabled)
+                            pool.librarySynced(library)
                         }
                         Button("Edit…") {
                             editing = s
@@ -103,6 +106,7 @@ struct MCPServersView: View {
                         Divider()
                         Button("Delete", role: .destructive) {
                             library.delete(s.id)
+                            pool.librarySynced(library)
                             if selectedID == s.id { selectedID = nil }
                         }
                     }
@@ -163,7 +167,10 @@ struct MCPServersView: View {
             Spacer()
             Toggle("Enabled", isOn: Binding(
                 get: { s.enabled },
-                set: { library.setEnabled(s.id, $0) }))
+                set: {
+                    library.setEnabled(s.id, $0)
+                    pool.librarySynced(library)
+                }))
                 .toggleStyle(.switch)
             Button("Edit…") { editing = s }
         }
@@ -227,17 +234,109 @@ struct MCPServersView: View {
         }
     }
 
+    @ViewBuilder
     private func statusFooter(_ s: MCPServerConfig) -> some View {
-        // Step M1 has no live client yet. Every row shows "Idle"
-        // until M2's MCPClientPool lands. The colour cue here is
-        // intentionally dim so it doesn't look like a real status
-        // indicator before it can report anything real.
-        HStack(spacing: 6) {
-            Image(systemName: "circle")
-                .foregroundStyle(Color.secondary)
-            Text("Idle — connection pool not implemented yet")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+        if let client = pool.client(forServer: s.id) {
+            StatusRow(observing: client)
+        } else if !s.enabled {
+            HStack(spacing: 6) {
+                Image(systemName: "circle.slash")
+                    .foregroundStyle(Color.secondary)
+                Text("Disabled — flip the switch above to spawn the server")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "circle")
+                    .foregroundStyle(Color.secondary)
+                Text("Not connected yet")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// Live status line that observes one MCPClient and re-renders
+    /// when its @Published `status` / `tools` change.
+    private struct StatusRow: View {
+        @ObservedObject var observing: MCPClient
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    iconAndLabel
+                    Spacer()
+                    Button("Reconnect") {
+                        Task {
+                            observing.disconnect()
+                            await observing.connect()
+                        }
+                    }
+                    .controlSize(.small)
+                }
+                if case .connected = observing.status, !observing.tools.isEmpty {
+                    toolList
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var iconAndLabel: some View {
+            switch observing.status {
+            case .idle:
+                HStack(spacing: 6) {
+                    Image(systemName: "circle")
+                        .foregroundStyle(Color.secondary)
+                    Text("Idle").foregroundStyle(.secondary).font(.caption)
+                }
+            case .connecting:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Connecting…").font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            case .connected(let n):
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.green)
+                    Text("Connected · \(n) tool\(n == 1 ? "" : "s")")
+                        .font(.caption)
+                }
+            case .error(let msg):
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.octagon.fill")
+                        .foregroundStyle(Color.red)
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+
+        @ViewBuilder
+        private var toolList: some View {
+            DisclosureGroup("Tools (\(observing.tools.count))") {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(observing.tools, id: \.self) { t in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(t.toolName)
+                                .font(.callout.monospaced())
+                            if !t.description.isEmpty {
+                                Text(t.description)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                .padding(.leading, 8)
+            }
+            .font(.caption)
         }
     }
 
@@ -256,6 +355,8 @@ struct MCPServersView: View {
             let n = try library.importClaudeDesktopJSON(data)
             if n == 0 {
                 importError = "No new servers found in that file. (Existing names are skipped.)"
+            } else {
+                pool.librarySynced(library)
             }
         } catch {
             importError = "Import failed: \(error.localizedDescription)"

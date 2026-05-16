@@ -8,6 +8,7 @@ struct SettingsScene: Scene {
     @ObservedObject var documents: DocumentLibrary
     @ObservedObject var projects: ProjectLibrary
     @ObservedObject var mcp: MCPServerLibrary
+    @ObservedObject var mcpPool: MCPClientPool
     let service: InferenceService
 
     var body: some Scene {
@@ -25,7 +26,7 @@ struct SettingsScene: Scene {
                               documents: documents,
                               service: service)
                     .tabItem { Label("Projects", systemImage: "folder") }
-                MCPServersView(library: mcp)
+                MCPServersView(library: mcp, pool: mcpPool)
                     .tabItem { Label("MCP", systemImage: "server.rack") }
                 StorageSettingsTab()
                     .tabItem { Label("Storage", systemImage: "externaldrive") }
