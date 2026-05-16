@@ -82,6 +82,17 @@ struct ChatView: View {
                     .padding(.bottom, 6)
             }
             Divider()
+            // Live delegation chain: pinned above the composer so
+            // the user can watch sub-agents work without losing
+            // sight of either the transcript above or the input
+            // below. Empty stack collapses to EmptyView, no
+            // padding cost.
+            let frames = store.activeDelegations[c.id] ?? []
+            if !frames.isEmpty {
+                DelegationStackView(frames: frames)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 6)
+            }
             resumeBanner(c: c, phase: phase)
             ComposerView(draft: $draft,
                           phase: phase,

@@ -78,6 +78,15 @@ final class ChatStore: ObservableObject {
     /// depth. With cap=3 the worst-case memory is 3 KV-snapshots
     /// in RAM at once (~few-hundred-MB each).
     private let maxDelegationDepth: Int = 3
+
+    /// Per-conversation stack of live delegations. Top of the
+    /// stack is the deepest sub-agent currently running. The UI
+    /// reads this to render the live delegation chain (target
+    /// agent's identity + the task it was handed + a streaming
+    /// buffer that grows as the sub-agent's tokens arrive). Empty
+    /// when no delegation is in flight; cleared on the way back
+    /// up as each frame's `runSubAgentToCompletionInner` returns.
+    @Published private(set) var activeDelegations: [UUID: [DelegationFrame]] = [:]
     /// Sampler parameters captured at the start of `send`; reused
     /// by `runToolCallsAndContinue` so a tool-output continuation
     /// inherits the same temperature / topK / topP / maxTokens
@@ -651,7 +660,8 @@ final class ChatStore: ObservableObject {
                     // spawning a sub-agent run.
                     result = await self.executeSubAgentDelegation(
                         argsJSON: call.args,
-                        hostAgentID: hostAgentID)
+                        hostAgentID: hostAgentID,
+                        hostConvID: id)
                 } else {
                     result = await pool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -819,13 +829,44 @@ final class ChatStore: ObservableObject {
     /// chain with the host's own agentID so cycles back through
     /// the host are refused, then hands off to `dispatchDelegation`
     /// — the same helper sub-agents use for their own (nested)
-    /// delegate calls.
+    /// delegate calls. `hostConvID` is forwarded so the UI's
+    /// `activeDelegations` stack is keyed against the right
+    /// conversation as the chain pushes / pops frames.
     private func executeSubAgentDelegation(argsJSON: String,
-                                            hostAgentID: UUID?) async -> String {
+                                            hostAgentID: UUID?,
+                                            hostConvID: UUID) async -> String {
         let initialChain: [UUID] = hostAgentID.map { [$0] } ?? []
         return await dispatchDelegation(argsJSON: argsJSON,
                                           depth: 1,
-                                          chain: initialChain)
+                                          chain: initialChain,
+                                          hostConvID: hostConvID)
+    }
+
+    // MARK: - delegation UI frame helpers
+
+    /// Push a fresh `DelegationFrame` onto the conversation's
+    /// stack and return its id so the caller can later update
+    /// the buffer + pop the frame from the same actor hop.
+    private func pushDelegationFrame(_ frame: DelegationFrame,
+                                       hostConvID: UUID) {
+        activeDelegations[hostConvID, default: []].append(frame)
+    }
+
+    private func appendDelegationBuffer(hostConvID: UUID,
+                                         frameID: UUID,
+                                         text: String) {
+        guard var stack = activeDelegations[hostConvID],
+              let idx = stack.firstIndex(where: { $0.id == frameID })
+        else { return }
+        stack[idx].buffer.append(text)
+        activeDelegations[hostConvID] = stack
+    }
+
+    private func popDelegationFrame(hostConvID: UUID, frameID: UUID) {
+        activeDelegations[hostConvID]?.removeAll { $0.id == frameID }
+        if activeDelegations[hostConvID]?.isEmpty == true {
+            activeDelegations[hostConvID] = nil
+        }
     }
 
     /// Parse a delegation tool-call payload (`{ agent_name, task }`),
@@ -843,7 +884,8 @@ final class ChatStore: ObservableObject {
     /// directly.
     private func dispatchDelegation(argsJSON: String,
                                      depth: Int,
-                                     chain: [UUID]) async -> String {
+                                     chain: [UUID],
+                                     hostConvID: UUID) async -> String {
         if depth > maxDelegationDepth {
             return "[error: max delegation depth (\(maxDelegationDepth)) reached]"
         }
@@ -865,7 +907,8 @@ final class ChatStore: ObservableObject {
         }
         return await runSubAgentToCompletion(
             agent: agent, task: task,
-            depth: depth, chain: chain)
+            depth: depth, chain: chain,
+            hostConvID: hostConvID)
     }
 
     /// Drive a sub-agent to completion, wrapped in a snapshot /
@@ -887,11 +930,13 @@ final class ChatStore: ObservableObject {
     private func runSubAgentToCompletion(agent: AgentConfig,
                                           task: String,
                                           depth: Int,
-                                          chain: [UUID]) async -> String {
+                                          chain: [UUID],
+                                          hostConvID: UUID) async -> String {
         let snapToken = await service.beginDelegation()
         let result = await runSubAgentToCompletionInner(
             agent: agent, task: task,
-            depth: depth, chain: chain + [agent.id])
+            depth: depth, chain: chain + [agent.id],
+            hostConvID: hostConvID)
         if let token = snapToken {
             await service.endDelegation(token)
         }
@@ -913,13 +958,29 @@ final class ChatStore: ObservableObject {
     private func runSubAgentToCompletionInner(agent: AgentConfig,
                                                 task: String,
                                                 depth: Int,
-                                                chain: [UUID]) async -> String {
+                                                chain: [UUID],
+                                                hostConvID: UUID) async -> String {
         let mode = ThinkingMode(rawValue: agent.defaultMode) ?? .chat
         let opts = SamplingOptions(
             temperature: Float(min(1.0, max(0.5, agent.temperature))),
             topK: agent.topK,
             topP: Float(agent.topP),
             repetitionPenalty: Float(agent.repetitionPenalty))
+
+        // Push a live UI frame so the user sees the delegation
+        // unfolding. The frame stays until this function exits
+        // (popped in the defer below); buffer grows on every
+        // token event.
+        let frame = DelegationFrame(
+            agentID: agent.id,
+            agentName: agent.name,
+            agentIconName: agent.iconName,
+            agentTint: agent.tint,
+            task: task,
+            depth: depth)
+        let frameID = frame.id
+        pushDelegationFrame(frame, hostConvID: hostConvID)
+        defer { popDelegationFrame(hostConvID: hostConvID, frameID: frameID) }
 
         // Composed schema: sub-agent's allowed MCP tools, plus the
         // delegate tool (with a roster of every agent not already
@@ -960,10 +1021,21 @@ final class ChatStore: ObservableObject {
                     options: opts,
                     maxTokens: agent.maxTokens)
                 {
-                    if case .done(let f, let p, let g) = event {
+                    switch event {
+                    case .token(let text, _):
+                        // Stream every decoded token into the live
+                        // UI frame so the user can watch the
+                        // sub-agent write its reply in real time.
+                        appendDelegationBuffer(
+                            hostConvID: hostConvID,
+                            frameID: frameID,
+                            text: text)
+                    case .done(let f, let p, let g):
                         finalMessage = f
                         capturedPrompt = p
                         capturedGenerated = g
+                    default:
+                        break
                     }
                 }
             } catch {
@@ -991,7 +1063,8 @@ final class ChatStore: ObservableObject {
                     out = await dispatchDelegation(
                         argsJSON: call.args,
                         depth: depth + 1,
-                        chain: chain)
+                        chain: chain,
+                        hostConvID: hostConvID)
                 } else {
                     out = await mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
