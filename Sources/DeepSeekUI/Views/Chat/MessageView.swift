@@ -74,10 +74,111 @@ struct MessageView: View {
                     ReasoningDisclosure(reasoning: r)
                 }
                 assistantContent
+                if !message.toolCalls.isEmpty {
+                    toolCallSection
+                }
             }
             Spacer(minLength: 0)
         }
         .padding(.vertical, 4)
+    }
+
+    /// Wrench-icon disclosure with one row per (call, output)
+    /// pair. Rendered below the assistant prose because the calls
+    /// chronologically fire *after* the model writes its text /
+    /// reasoning. Output is shown plain because most MCP servers
+    /// return raw text or JSON — running it through MarkdownText
+    /// would mangle a JSON blob with stray code-block heuristics.
+    private var toolCallSection: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(message.toolCalls.enumerated()), id: \.offset) { idx, call in
+                    toolCallRow(call: call,
+                                 output: message.toolOutputs?
+                                    .indices.contains(idx) == true
+                                    ? message.toolOutputs![idx]
+                                    : nil)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.caption)
+                Text("\(message.toolCalls.count) tool call\(message.toolCalls.count == 1 ? "" : "s")")
+                    .font(.caption)
+            }
+            .foregroundStyle(.secondary)
+        }
+        .padding(.top, 6)
+    }
+
+    private func toolCallRow(call: StoredToolCall, output: String?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Text(call.name)
+                    .font(.callout.monospaced())
+                if output == nil {
+                    Spacer()
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("running…")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            // Args: try to pretty-print as JSON so the user gets
+            // indented structure instead of a single-line blob; fall
+            // back to raw text if the model emitted something
+            // unparseable.
+            let prettyArgs = MessageView.prettyJSON(call.args)
+            if !prettyArgs.isEmpty {
+                Text(prettyArgs)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.textBackgroundColor),
+                                 in: RoundedRectangle(cornerRadius: 4))
+            }
+            if let out = output, !out.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.left.square")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Text("output")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(out)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.textBackgroundColor),
+                                 in: RoundedRectangle(cornerRadius: 4))
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private static func prettyJSON(_ raw: String) -> String {
+        guard !raw.isEmpty,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let out = try? JSONSerialization.data(
+                withJSONObject: obj,
+                options: [.prettyPrinted, .sortedKeys]),
+              let str = String(data: out, encoding: .utf8)
+        else { return raw }
+        return str
     }
 
     @ViewBuilder
