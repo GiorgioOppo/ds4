@@ -795,9 +795,10 @@ final class ChatStore: ObservableObject {
     }
 
     /// Run one delegation: spawn a sub-agent (isolated
-    /// conversation id, no tools of its own, single forward
-    /// + decode) and return its final assistant content as the
-    /// tool output the host agent will receive.
+    /// conversation id, free to use its own MCP tools subject to
+    /// its allowlist, bounded internal tool-call loop) and return
+    /// its final assistant content as the tool output the host
+    /// agent will receive.
     ///
     /// Trade-off: the sub-agent runs on the same model, sharing
     /// the single KV cache slot. The CacheImage in InferenceService
@@ -821,46 +822,112 @@ final class ChatStore: ObservableObject {
         guard let agent = agents.agents.first(where: { $0.name == agentName }) else {
             return "[error: no agent named '\(agentName)' is registered]"
         }
+        return await runSubAgentToCompletion(agent: agent, task: task)
+    }
+
+    /// Drive a sub-agent to completion: keep emitting tool calls
+    /// + tool outputs until the model produces a turn with no
+    /// further calls (= final reply) or the per-delegation cap is
+    /// hit. The sub-agent sees only its own allowed MCP tools —
+    /// no `__delegate_to_agent` schema is injected, so sub-agents
+    /// can't recursively delegate further (no depth-of-depth
+    /// cascade to bound).
+    ///
+    /// Mechanics: after every `.done` with non-empty toolCalls we
+    /// invoke the tools through `mcpPool.invokeQualified`, build
+    /// the `<eos><tool_outputs>…<Assistant>` delta with
+    /// `tokenizeToolOutputsDelta`, append to (prompt + generated),
+    /// and loop with the same `subID` so the CacheImage matches
+    /// from the second iteration onwards (only the first round
+    /// pays the cold prefill).
+    private func runSubAgentToCompletion(agent: AgentConfig,
+                                          task: String) async -> String {
         let mode = ThinkingMode(rawValue: agent.defaultMode) ?? .chat
         let opts = SamplingOptions(
             temperature: Float(min(1.0, max(0.5, agent.temperature))),
             topK: agent.topK,
             topP: Float(agent.topP),
             repetitionPenalty: Float(agent.repetitionPenalty))
-        // The sub-agent runs prose-only (no tools of its own and
-        // no further delegation). Keeping it tool-less means
-        // exactly one forward+decode, no nested loop to bound, no
-        // recursion to manage. Wider versions of this can come
-        // later.
-        guard let prompt = await service.tokenizeFullHistory(
+
+        // Sub-agent sees its own filtered MCP catalogue — no
+        // delegation tool, no project context.
+        let toolJson = mcpPool.toolSchemasJSON(
+            allowedNames: agent.allowedToolNames)
+
+        guard var promptTokens = await service.tokenizeFullHistory(
             [Message(role: .user, content: task)],
             mode: mode,
-            toolSchemasJSON: nil,
+            toolSchemasJSON: toolJson,
             systemPromptOverride: agent.systemPrompt)
         else {
             return "[error: tokenizer unavailable]"
         }
+
         let subID = UUID() // isolated cacheImage namespace
-        var reply = ""
-        do {
-            for try await event in service.generateForConversation(
-                promptTokens: prompt,
-                conversationID: subID,
-                mode: mode,
-                options: opts,
-                maxTokens: agent.maxTokens)
-            {
-                if case .done(let final, _, _) = event {
-                    reply = final.content
+        let maxIterations = 8
+        var iteration = 0
+        var lastContent = ""
+
+        while iteration < maxIterations {
+            iteration += 1
+
+            var finalMessage: Message?
+            var capturedPrompt: [Int32] = []
+            var capturedGenerated: [Int32] = []
+
+            do {
+                for try await event in service.generateForConversation(
+                    promptTokens: promptTokens,
+                    conversationID: subID,
+                    mode: mode,
+                    options: opts,
+                    maxTokens: agent.maxTokens)
+                {
+                    if case .done(let f, let p, let g) = event {
+                        finalMessage = f
+                        capturedPrompt = p
+                        capturedGenerated = g
+                    }
                 }
+            } catch {
+                return "[error: sub-agent generation failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)]"
             }
-        } catch {
-            return "[error: sub-agent generation failed: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)]"
+
+            guard let final = finalMessage else {
+                return "[sub-agent generation didn't finalize]"
+            }
+            lastContent = final.content
+
+            if final.toolCalls.isEmpty {
+                return lastContent
+            }
+
+            // Sub-agent emitted tool calls — execute them. Only
+            // MCP routing here; the delegate tool isn't in the
+            // sub-agent's schema set so it can't appear.
+            var outputs: [String] = []
+            outputs.reserveCapacity(final.toolCalls.count)
+            for call in final.toolCalls {
+                let out = await mcpPool.invokeQualified(
+                    call.name, argsJSON: call.args)
+                outputs.append(out)
+            }
+
+            guard let delta = await service.tokenizeToolOutputsDelta(
+                callNames: final.toolCalls.map(\.name),
+                outputs: outputs,
+                mode: mode)
+            else {
+                return "[error: failed to build tool-output delta in sub-agent]"
+            }
+            promptTokens = capturedPrompt + capturedGenerated + delta
         }
-        if reply.isEmpty {
-            return "[sub-agent '\(agentName)' produced an empty reply]"
+
+        if !lastContent.isEmpty {
+            return lastContent
+                + "\n\n[note: sub-agent hit \(maxIterations) tool-call iterations and was cut off]"
         }
-        return reply
+        return "[sub-agent hit \(maxIterations) tool-call iterations without producing a final reply]"
     }
 
     private func currentMetrics(of id: UUID) -> GenerationMetrics {
