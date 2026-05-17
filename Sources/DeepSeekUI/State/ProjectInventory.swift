@@ -11,18 +11,18 @@ import Foundation
 ///   direttamente nello stream del prompt (con marker
 ///   `<｜begin▁of▁file▁…｜>`). Mantenuto come opt-in per chi vuole
 ///   il time-to-first-token ridotto.
-public enum ProjectContextMode: String, Codable, Sendable, CaseIterable {
+enum ProjectContextMode: String, Codable, Sendable, CaseIterable {
     case pathsOnly
     case indexedContent
 
-    public var displayName: String {
+    var displayName: String {
         switch self {
         case .pathsOnly:      return "Paths only (lazy tools)"
         case .indexedContent: return "Indexed content (eager)"
         }
     }
 
-    public var summary: String {
+    var summary: String {
         switch self {
         case .pathsOnly:
             return "Inject only file paths as a tree. The model uses " +
@@ -37,14 +37,14 @@ public enum ProjectContextMode: String, Codable, Sendable, CaseIterable {
 
 /// Singola entry dell'inventario: path relativo (con prefisso
 /// root display name), dimensione, mtime opzionale.
-public struct ProjectFileEntry: Sendable, Equatable {
-    public let relativePath: String
-    public let byteCount: Int
-    public let lastModified: Date?
+struct ProjectFileEntry: Sendable, Equatable {
+    let relativePath: String
+    let byteCount: Int
+    let lastModified: Date?
 
-    public init(relativePath: String,
-                byteCount: Int,
-                lastModified: Date? = nil) {
+    init(relativePath: String,
+         byteCount: Int,
+         lastModified: Date? = nil) {
         self.relativePath = relativePath
         self.byteCount = byteCount
         self.lastModified = lastModified
@@ -54,22 +54,22 @@ public struct ProjectFileEntry: Sendable, Equatable {
 /// Snapshot strutturato di un progetto pronto per essere
 /// renderizzato in markdown nel system prompt. Costruito al
 /// volo da `ProjectInventoryBuilder`; non persistito.
-public struct ProjectInventory: Sendable {
-    public let projectName: String
-    public let entries: [ProjectFileEntry]
+struct ProjectInventory: Sendable {
+    let projectName: String
+    let entries: [ProjectFileEntry]
     /// True se `entries.count < totalDiscovered` perché la cap
     /// per-progetto ha troncato la lista.
-    public let truncated: Bool
-    public let totalDiscovered: Int
+    let truncated: Bool
+    let totalDiscovered: Int
     /// Le directory radice di cui è composto il progetto, per la
     /// nota finale al modello su dove guardare con `glob`.
-    public let rootDisplayNames: [String]
+    let rootDisplayNames: [String]
 
-    public init(projectName: String,
-                entries: [ProjectFileEntry],
-                truncated: Bool,
-                totalDiscovered: Int,
-                rootDisplayNames: [String]) {
+    init(projectName: String,
+         entries: [ProjectFileEntry],
+         truncated: Bool,
+         totalDiscovered: Int,
+         rootDisplayNames: [String]) {
         self.projectName = projectName
         self.entries = entries
         self.truncated = truncated
@@ -107,7 +107,7 @@ extension ProjectInventory {
     /// `maxDepth` taglia i livelli più profondi e li sostituisce
     /// con `…/` sotto il parent. Default 3 (allineato con
     /// `repo_overview` tool).
-    public func renderTree(maxDepth: Int = 3) -> String {
+    func renderTree(maxDepth: Int = 3) -> String {
         var out = "## Project: \(projectName)\n\n"
 
         let countLine: String
@@ -217,14 +217,14 @@ extension ProjectInventory {
 /// `ProjectIndexer.scan(_:)` e applica la cap configurata
 /// (per-progetto o globale). Non tokenizza nulla — è il path
 /// che salta il tokenizer della modalità `indexedContent`.
-public enum ProjectInventoryBuilder {
+enum ProjectInventoryBuilder {
 
     /// Cap di default sul numero di file mostrati nell'albero.
-    public static let defaultMaxFiles = 500
+    static let defaultMaxFiles = 500
 
     /// Default `maxDepth` allineato con il pattern di
     /// `repo_overview` tool.
-    public static let defaultMaxDepth = 3
+    static let defaultMaxDepth = 3
 
     static func build(_ project: Project,
                       maxFiles: Int,

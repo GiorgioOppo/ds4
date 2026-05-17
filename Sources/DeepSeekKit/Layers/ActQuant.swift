@@ -26,8 +26,12 @@ public final class ActQuant {
         // Function constants veicolati attraverso `PipelineConstants`
         // così la pipeline viene cachata da `Device.shared.makePipeline`
         // e condivisa fra istanze con gli stessi parametri.
+        //
+        // `let` locale per evitare la cattura di `self` nella closure
+        // builder (vedi MoE Gate per la stessa accortezza).
+        let bs = self.blockSize
         let constants = PipelineConstants { c in
-            c.setUInt32(UInt32(self.blockSize),
+            c.setUInt32(UInt32(bs),
                         at: format == .fp8 ? 0 : 1)
         }
         self.pipeline = Device.shared.makePipeline(name, constants: constants)

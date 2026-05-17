@@ -45,9 +45,14 @@ public final class Gate {
         // scale. Veicolati attraverso `PipelineConstants` per condividere
         // la pipeline fra istanze con gli stessi parametri (vedi
         // `Device.makePipeline` cache).
+        //
+        // Pullati nei `let` locali per evitare di catturare `self` nella
+        // closure builder mentre `self.pipeline` non e' ancora inizializzato.
+        let scoreFuncRaw = self.scoreFunc.rawValue
+        let routeScaleValue = self.routeScale
         let consts = PipelineConstants { c in
-            c.setUInt32(UInt32(self.scoreFunc.rawValue), at: 2)
-            c.setFloat(self.routeScale, at: 3)
+            c.setUInt32(UInt32(scoreFuncRaw), at: 2)
+            c.setFloat(routeScaleValue, at: 3)
         }
         self.pipeline = Device.shared.makePipeline("moe_gate",
                                                     constants: consts)
