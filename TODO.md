@@ -532,6 +532,16 @@ Settimana 4-6:  T2 (GGUF + Llama) — può forkare in parallelo a T1
 Settimana 7-8:  T3 (constrained) — più valore quando T1 è on
 ```
 
+### 10.6.bis Vocab pruning italiano-only (in scope)
+
+- [x] **Vocab pruning** per use case italiano-only / latino-only:
+  riduce le matrici `embed.weight` e `head.weight` da ~129k a
+  ~32-50k token senza fine-tuning. Implementato come target SPM
+  separato `DeepSeekVocabPruner` + CLI `vocab_pruner`. Vedi
+  `docs/VOCAB-PRUNING.md`. Risparmio atteso: ~1-1.5 GB per
+  checkpoint V4-Flash a bf16. **Fine-tuning resta fuori scope**
+  (vedi §10.7); il pruning non lo richiede.
+
 ### 10.7 Out-of-scope deliberato
 
 Standard identificati nella review ma fuori scope per scelta

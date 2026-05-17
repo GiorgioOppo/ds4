@@ -12,8 +12,10 @@ let package = Package(
         .library(name: "DeepSeekTraining", targets: ["DeepSeekTraining"]),
         .library(name: "DeepSeekTools", targets: ["DeepSeekTools"]),
         .library(name: "DeepSeekIntegrations", targets: ["DeepSeekIntegrations"]),
+        .library(name: "DeepSeekVocabPruner", targets: ["DeepSeekVocabPruner"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
         .executable(name: "converter", targets: ["converter"]),
+        .executable(name: "vocab_pruner", targets: ["vocab_pruner"]),
         .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
     ],
     targets: [
@@ -75,6 +77,25 @@ let package = Package(
             dependencies: ["DeepSeekKit", "DeepSeekConverter"],
             path: "Sources/converter"
         ),
+        // Italiano-only (o multilingua latino) vocab pruner: legge un
+        // checkpoint convertito + un corpus, calcola i token effettivamente
+        // usati, e riscrive embed.weight + head.weight + tokenizer.json
+        // + config.json con il vocab ridotto. Non tocca i pesi del
+        // transformer e non richiede fine-tuning. Vedi
+        // `docs/VOCAB-PRUNING.md`.
+        .target(
+            name: "DeepSeekVocabPruner",
+            // DeepSeekConverter dep per riuso di `CancellationToken`
+            // (ConversionProgress.swift) — stesso pattern condiviso
+            // con i facade `Converter` / `FineTuner`.
+            dependencies: ["DeepSeekKit", "DeepSeekConverter"],
+            path: "Sources/DeepSeekVocabPruner"
+        ),
+        .executableTarget(
+            name: "vocab_pruner",
+            dependencies: ["DeepSeekKit", "DeepSeekConverter", "DeepSeekVocabPruner"],
+            path: "Sources/vocab_pruner"
+        ),
         .executableTarget(
             name: "DeepSeekUI",
             dependencies: [
@@ -115,6 +136,11 @@ let package = Package(
             name: "DeepSeekToolsTests",
             dependencies: ["DeepSeekTools"],
             path: "Tests/DeepSeekToolsTests"
+        ),
+        .testTarget(
+            name: "DeepSeekVocabPrunerTests",
+            dependencies: ["DeepSeekVocabPruner", "DeepSeekKit"],
+            path: "Tests/DeepSeekVocabPrunerTests"
         ),
     ]
 )

@@ -53,6 +53,7 @@ The desktop app supports:
 · 🧪 [Testing](docs/TESTING.md) · 🛠 [Developing](docs/DEVELOPING.md)
 · 🧰 [Native tools](docs/TOOLS.md) · 🚦 [Agent modes](docs/AGENT-MODES.md)
 · 📦 [GGUF reader](docs/GGUF.md)
+· ✂️ [Vocab pruning (IT-only)](docs/VOCAB-PRUNING.md)
 · 🔍 [Gap analysis vs opencode](docs/GAP-ANALYSIS-OPENCODE.md)
 · 🔍 [Gap analysis vs llama.cpp](docs/GAP-ANALYSIS-LLAMACPP.md)
 
