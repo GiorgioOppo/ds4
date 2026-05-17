@@ -18,15 +18,28 @@ public final class DemoLoggerPlugin: PluginBase, @unchecked Sendable {
         super.init(name: "demo.logger", version: "0.1.0")
     }
 
-    public override func bootstrap(host: PluginHost) async throws {
+    // `NSLock.lock/unlock` non sono disponibili da contesti async
+    // in Swift 6. Stesso pattern di
+    // `Sources/DeepSeekTraining/FineTuneProgress.swift:115` —
+    // metodi sync che il caller async invoca.
+
+    private func recordBootstrap() {
         lock.lock(); defer { lock.unlock() }
         _bootstrapCount += 1
     }
 
-    public override func observe(envelope: any MessageEnvelope) async {
+    private func recordObservation(kind: String) {
         lock.lock(); defer { lock.unlock() }
         _observedCount += 1
-        _observedKinds.append(envelope.kind)
+        _observedKinds.append(kind)
+    }
+
+    public override func bootstrap(host: PluginHost) async throws {
+        recordBootstrap()
+    }
+
+    public override func observe(envelope: any MessageEnvelope) async {
+        recordObservation(kind: envelope.kind)
     }
 
     public var observedCount: Int {
