@@ -173,10 +173,29 @@ Il pruner è puro Swift, in-process, no subprocess. Riusa:
 | CLI args parsing manuale                      | `Sources/converter/main.swift`                  |
 | Schema `model.safetensors.index.json`         | `Sources/converter/main.swift`                  |
 
-## Roadmap
+## UI (DeepSeekApp)
 
-- [ ] Wire della UI in DeepSeekUI per lanciare il pruner via sheet (come
-  `ConvertSheet`).
+La UI espone il pruner via un bottone "Prune vocab…" (icona forbici)
+nella toolbar accanto a "Convert model…" e "Fine-tune model…". Apre
+un sheet modale (`VocabPrunerSheet`) con la stessa struttura di
+`ConvertSheet`:
+
+- **Source**: directory del checkpoint convertito.
+- **Destination**: directory di output (deve essere diversa).
+- **Corpus**: file `.txt`/`.jsonl` o directory.
+- **Coverage**: slider 0.99..1.0, default 0.9995.
+- **Options**: toggle `Dry-run`.
+
+Mentre il job gira la form si blocca, una progress bar mostra
+l'avanzamento per shard, e una banner sopra il log riporta in tempo
+reale `vocab: N → K (coverage XX.XX%)`. Il bottone "Cancel" segnala
+il `CancellationToken` interno.
+
+Lo stato vive in un `@StateObject VocabPrunerViewModel` locale al
+sheet — niente persistenza fra apertura e chiusura (stesso pattern
+di Converter / FineTuner).
+
+## Roadmap
 - [ ] Support per `--keep-ids` con json prodotto da uno script Python
   esterno (es. analisi su corpus enorme HF dataset).
 - [ ] Validazione che il pruned checkpoint round-trippi su una manciata di

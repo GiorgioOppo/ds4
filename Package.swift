@@ -104,6 +104,7 @@ let package = Package(
                 "DeepSeekTraining",
                 "DeepSeekTools",
                 "DeepSeekIntegrations",
+                "DeepSeekVocabPruner",
             ],
             path: "Sources/DeepSeekUI",
             exclude: ["Resources/Info.plist"],

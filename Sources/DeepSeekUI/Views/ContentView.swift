@@ -48,6 +48,7 @@ struct ChatContainer: View {
 
     @State private var showConvert: Bool = false
     @State private var showFineTune: Bool = false
+    @State private var showVocabPruner: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -81,6 +82,13 @@ struct ChatContainer: View {
                             Label("Fine-tune model…", systemImage: "graduationcap")
                         }
                     }
+                    ToolbarItem {
+                        Button {
+                            showVocabPruner = true
+                        } label: {
+                            Label("Prune vocab…", systemImage: "scissors")
+                        }
+                    }
                 }
         }
         .sheet(isPresented: $showConvert) {
@@ -88,6 +96,9 @@ struct ChatContainer: View {
         }
         .sheet(isPresented: $showFineTune) {
             FineTuneSheet()
+        }
+        .sheet(isPresented: $showVocabPruner) {
+            VocabPrunerSheet()
         }
     }
 

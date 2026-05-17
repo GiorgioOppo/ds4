@@ -103,6 +103,11 @@ targets:
         product: DeepSeekTools
       - package: DeepSeekKit
         product: DeepSeekIntegrations
+      # Vocab pruner: nuovo target (italiano-only checkpoint slimming).
+      # Stesso pattern di DeepSeekConverter — la sheet UI lo lancia
+      # in-process tramite la facade `VocabPruner.run(...)`.
+      - package: DeepSeekKit
+        product: DeepSeekVocabPruner
     settings:
       base:
         INFOPLIST_FILE: Sources/DeepSeekUI/Resources/Info.plist
