@@ -13,7 +13,7 @@ public final class DemoStubMCPTransport: MCPTransportBase,
     private let inbound: AsyncStream<Data>
     private let inboundContinuation: AsyncStream<Data>.Continuation
 
-    public init(transportName: String = "demo.stub") {
+    public override init(transportName: String = "demo.stub") {
         let pair = AsyncStream<Data>.makeStream()
         self.inbound = pair.stream
         self.inboundContinuation = pair.continuation
