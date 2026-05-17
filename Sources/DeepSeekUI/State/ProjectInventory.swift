@@ -239,8 +239,13 @@ enum ProjectInventoryBuilder {
         let trimmed = Array(sorted.prefix(maxFiles))
         let fm = FileManager.default
         let entries = trimmed.map { c -> ProjectFileEntry in
-            let mtime = (try? fm.attributesOfItem(atPath: c.url.path))?
-                [.modificationDate] as? Date
+            // Split in due statement: la concatenazione
+            // `(try? fm.attributesOfItem(...))?[.modificationDate]`
+            // confonde l'inferenza di tipo sull'enum key. La forma
+            // esplicita `attrs?[FileAttributeKey.modificationDate]`
+            // risolve.
+            let attrs = try? fm.attributesOfItem(atPath: c.url.path)
+            let mtime = attrs?[FileAttributeKey.modificationDate] as? Date
             return ProjectFileEntry(
                 relativePath: c.displayPath,
                 byteCount: c.byteCount,
