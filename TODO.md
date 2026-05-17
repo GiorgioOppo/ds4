@@ -182,7 +182,22 @@ Stime di speedup — vedi `docs/PERFORMANCE.md` per le metriche.
 
 - [ ] **Persistent MoE dispatch kernel** → ~2× per layer MoE.
 
-- [ ] **Pipeline state caching** → ~10-50 ms / inference call.
+- [x] **Pipeline state caching** → ~10-50 ms / inference call.
+  `Device.shared.makePipeline(_:)` ora cacha le pipeline e
+  espone una variante `makePipeline(_:constants:)` per i kernel
+  con function constants (vedi
+  `Sources/DeepSeekKit/PipelineTuning.swift`). Hit identico
+  cross-istanza per ActQuant/MoE.Gate/HCSinkhorn.
+
+- [~] **Threadgroup sizing dinamico** ai siti `dispatchThreads`
+  "free" (no SLM, no contratto kernel). Implementato via
+  `MTLComputePipelineState.tunedThreadgroup(forGrid:)` su
+  Linear (FP8/FP4/INT8/INT4/INT2), Elementwise (`dispatch1D`),
+  HyperConnections (broadcast/collapse/compose), Compressor
+  (5 siti), Indexer (2 siti), AttentionIndicesGPU.window,
+  Attention.broadcast_row_mul. I siti a contratto (simdgroup
+  32×1, riduzioni 256×1, SLM-bound) restano hardcoded — vedi
+  commento di testata in `PipelineTuning.swift`.
 
 - [ ] **KV cache pool** → multi-session serving.
 

@@ -97,4 +97,70 @@ public enum SystemProbe {
         if avail == 0 { return physCap }
         return min(avail, physCap)
     }
+
+    // MARK: - GPU identification
+
+    /// Marketing string esposta da `MTLDevice.name`. Su Apple Silicon
+    /// è la forma "Apple M<N> [Pro|Max|Ultra]" o "Apple M<N>".
+    public static func gpuName() -> String {
+        Device.shared.mtl.name
+    }
+
+    /// Tabella interna chip → numero di GPU core, esposta `internal`
+    /// per i test. Match per prefisso (vedi `gpuCoreCount()`): la
+    /// prima entry il cui prefisso matcha `name` vince. Ordinata
+    /// dal più specifico (Pro/Max/Ultra) al più generico (base
+    /// "Apple M<N>") per evitare false partite.
+    static let _internalCoreTable: [(prefix: String, cores: Int)] = [
+        ("Apple M1 Ultra", 64),
+        ("Apple M1 Max",   32),
+        ("Apple M1 Pro",   16),
+        ("Apple M1",        8),
+        ("Apple M2 Ultra", 76),
+        ("Apple M2 Max",   38),
+        ("Apple M2 Pro",   19),
+        ("Apple M2",       10),
+        ("Apple M3 Ultra", 80),
+        ("Apple M3 Max",   40),
+        ("Apple M3 Pro",   18),
+        ("Apple M3",       10),
+        ("Apple M4 Max",   40),
+        ("Apple M4 Pro",   20),
+        ("Apple M4",       10),
+    ]
+
+    /// Numero di GPU core, in base alla tabella interna. `nil` se
+    /// il chip non è riconosciuto (es. M5+ futuri, GPU non Apple).
+    /// Il caller decide cosa fare con il nil — tipicamente loggare
+    /// un warning e cadere su `gpuCoreCountOrFallback()`.
+    ///
+    /// Logica:
+    ///   - prova ogni entry della tabella in ordine, restituisce
+    ///     la prima il cui `prefix` è un prefisso esatto di `name`,
+    ///   - per evitare match parziali (es. "Apple M3" che matcha
+    ///     "Apple M3 Max"), la tabella ordina i nomi specifici
+    ///     PRIMA dei generici.
+    public static func gpuCoreCount() -> Int? {
+        return _coreCount(forDeviceName: gpuName())
+    }
+
+    /// Variante deterministica: usa il fallback `cpuCount() * 2`
+    /// quando il chip non è in tabella. Non emette warning — è
+    /// pensata per i call site che non possono gestire `nil`.
+    public static func gpuCoreCountOrFallback() -> Int {
+        if let n = gpuCoreCount() { return n }
+        return cpuCount() * 2
+    }
+
+    /// Risolve un nome arbitrario (utile nei test, dove vogliamo
+    /// passare stringhe sintetiche senza dipendere dal device
+    /// reale). Internal per non esporre l'API ai consumer esterni.
+    static func _coreCount(forDeviceName name: String) -> Int? {
+        for entry in _internalCoreTable {
+            if name.hasPrefix(entry.prefix) {
+                return entry.cores
+            }
+        }
+        return nil
+    }
 }

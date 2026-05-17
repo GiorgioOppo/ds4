@@ -95,6 +95,13 @@ Fix: a library-wide cache keyed by `(kernel_name, constantValues)`.
 Save once at app start, look up on each `init`. Estimated 10-50 ms
 saved on the first token.
 
+**Status: implementato.** `Device.shared.makePipeline(_:)` ora cacha
+internamente (`Sources/DeepSeekKit/Device.swift`); la variante
+`makePipeline(_:constants:)` (`Sources/DeepSeekKit/PipelineTuning.swift`)
+estende il caching ai kernel con function constants (ActQuant,
+MoE.Gate, HCSinkhorn). Le pipeline sono ora condivise fra istanze
+dello stesso layer con gli stessi parametri.
+
 ## 3. Hardware sizing
 
 Expected single-token decode time for **V4-Flash, current naive
@@ -233,13 +240,18 @@ the same expert is active for many tokens.
 
 Estimated effort: 2-3 days.
 
-### Pipeline state cache (low impact, low effort)
+### Pipeline state cache (low impact, low effort) — implementato
 
-Singleton dict `[name: MTLComputePipelineState]` populated lazily on
-`Device.shared.makePipeline(_:)`. Function-constant-specialised
-variants keyed by `(name, hash(constantValues))`.
+Singleton dict `[PipelineCacheKey: MTLComputePipelineState]` popolato
+lazy in `Device.shared.makePipeline(_:)` /
+`makePipeline(_:constants:)`. La chiave include il nome del kernel
+e — per i kernel con function constants — un wrapper Hashable
+(`PipelineConstants`) dei `(type, raw-bytes, index)` con cui si
+ricostruisce `MTLFunctionConstantValues`.
 
-Estimated effort: half a day.
+Vedi `Sources/DeepSeekKit/Device.swift` +
+`Sources/DeepSeekKit/PipelineTuning.swift`. ActQuant, MoE.Gate e
+HCSinkhorn sono migrati al routing centralizzato.
 
 ### KV cache pool (low impact in current single-batch workflow)
 

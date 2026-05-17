@@ -28,8 +28,9 @@ public enum AttnIndicesGPU {
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 1)
         var sp = Int32(startPos)
         enc.setBytes(&sp, length: MemoryLayout<Int32>.size, index: 2)
-        enc.dispatchThreads(MTLSize(width: kWin, height: S, depth: B),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+        let grid = MTLSize(width: kWin, height: S, depth: B)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pWindow.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 

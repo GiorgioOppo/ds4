@@ -41,19 +41,16 @@ public final class Gate {
         self.bias = bias
         self.tid2eid = tid2eid
 
-        // Specialise the moe_gate kernel with this gate's score func + scale.
-        let consts = MTLFunctionConstantValues()
-        var sc = UInt32(self.scoreFunc.rawValue)
-        var rs = self.routeScale
-        consts.setConstantValue(&sc, type: .uint, index: 2)
-        consts.setConstantValue(&rs, type: .float, index: 3)
-        let lib = Device.shared.library
-        do {
-            let fn = try lib.makeFunction(name: "moe_gate", constantValues: consts)
-            self.pipeline = try Device.shared.mtl.makeComputePipelineState(function: fn)
-        } catch {
-            fatalError("Gate pipeline failed: \(error)")
+        // Specialise the moe_gate kernel with this gate's score func +
+        // scale. Veicolati attraverso `PipelineConstants` per condividere
+        // la pipeline fra istanze con gli stessi parametri (vedi
+        // `Device.makePipeline` cache).
+        let consts = PipelineConstants { c in
+            c.setUInt32(UInt32(self.scoreFunc.rawValue), at: 2)
+            c.setFloat(self.routeScale, at: 3)
         }
+        self.pipeline = Device.shared.makePipeline("moe_gate",
+                                                    constants: consts)
     }
 
     /// Returns `(weights, indices)` of shape `[N, topK]` each.

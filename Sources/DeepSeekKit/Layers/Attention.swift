@@ -222,8 +222,9 @@ public final class MLA {
             enc.setBuffer(qRsqrt.buffer, offset: 0, index: 1)
             var dims = SIMD2<UInt32>(UInt32(B * S * nHeads), UInt32(headDim))
             enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-            enc.dispatchThreads(MTLSize(width: headDim, height: B * S * nHeads, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            let grid = MTLSize(width: headDim, height: B * S * nHeads, depth: 1)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: bcastP.tunedThreadgroup(forGrid: grid))
             enc.endEncoding()
         }
 

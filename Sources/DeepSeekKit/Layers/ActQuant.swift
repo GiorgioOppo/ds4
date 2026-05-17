@@ -22,17 +22,15 @@ public final class ActQuant {
     public init(format: Format) {
         self.format = format
         self.blockSize = format == .fp8 ? Quant.actBlockSizeFP8 : Quant.actBlockSizeFP4
-        let consts = MTLFunctionConstantValues()
-        var bs = UInt32(self.blockSize)
-        consts.setConstantValue(&bs, type: .uint, index: format == .fp8 ? 0 : 1)
-        let lib = Device.shared.library
         let name = format == .fp8 ? "act_quant_fp8" : "act_quant_fp4"
-        do {
-            let fn = try lib.makeFunction(name: name, constantValues: consts)
-            self.pipeline = try Device.shared.mtl.makeComputePipelineState(function: fn)
-        } catch {
-            fatalError("ActQuant pipeline failed for \(name): \(error)")
+        // Function constants veicolati attraverso `PipelineConstants`
+        // così la pipeline viene cachata da `Device.shared.makePipeline`
+        // e condivisa fra istanze con gli stessi parametri.
+        let constants = PipelineConstants { c in
+            c.setUInt32(UInt32(self.blockSize),
+                        at: format == .fp8 ? 0 : 1)
         }
+        self.pipeline = Device.shared.makePipeline(name, constants: constants)
     }
 
     public struct Output {

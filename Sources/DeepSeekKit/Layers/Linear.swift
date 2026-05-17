@@ -163,8 +163,9 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
 
-        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        let grid = MTLSize(width: outFeatures, height: M, depth: 1)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: Self.pFP8.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 
@@ -186,8 +187,9 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
 
-        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        let grid = MTLSize(width: outFeatures, height: M, depth: 1)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: Self.pFP4.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 
@@ -229,8 +231,9 @@ public final class Linear {
             enc.dispatchThreadgroups(MTLSize(width: gx, height: gy, depth: 1),
                                      threadsPerThreadgroup: tg)
         } else {
-            enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            let grid = MTLSize(width: outFeatures, height: M, depth: 1)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pipeline.tunedThreadgroup(forGrid: grid))
         }
         enc.endEncoding()
     }
@@ -260,8 +263,9 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 4)
 
-        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        let grid = MTLSize(width: outFeatures, height: M, depth: 1)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pipeline.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 
@@ -289,8 +293,9 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 4)
 
-        enc.dispatchThreads(MTLSize(width: outFeatures, height: M, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        let grid = MTLSize(width: outFeatures, height: M, depth: 1)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pipeline.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 }

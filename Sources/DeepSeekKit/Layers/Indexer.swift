@@ -155,8 +155,9 @@ public final class Indexer {
             enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
             var misc = SIMD2<UInt32>(UInt32(ratio), startPos == 0 ? 1 : 0)
             enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 4)
-            enc.dispatchThreads(MTLSize(width: T, height: S, depth: B),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            let grid = MTLSize(width: T, height: S, depth: B)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pScoreReduce.tunedThreadgroup(forGrid: grid))
             enc.endEncoding()
         }
 
@@ -175,8 +176,9 @@ public final class Indexer {
             enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 1)
             var misc = SIMD3<UInt32>(UInt32(ratio), UInt32(offset), startPos == 0 ? 1 : 0)
             enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 2)
-            enc.dispatchThreads(MTLSize(width: k, height: S, depth: B),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            let grid = MTLSize(width: k, height: S, depth: B)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pTopKPostproc.tunedThreadgroup(forGrid: grid))
             enc.endEncoding()
         }
 

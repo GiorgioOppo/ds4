@@ -463,8 +463,9 @@ public final class Compressor {
         enc.setBuffer(ape.buffer, offset: apeOff, index: 1)
         var dims = SIMD4<UInt32>(UInt32(B), 1, 1, UInt32(C))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-        enc.dispatchThreads(MTLSize(width: C, height: 1, depth: B),
-                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        let grid = MTLSize(width: C, height: 1, depth: B)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pBroadcastAdd.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 
@@ -491,8 +492,9 @@ public final class Compressor {
         enc.setBuffer(out.buffer, offset: 0, index: 1)
         var dims = SIMD3<UInt32>(UInt32(B), UInt32(R), UInt32(D))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-        enc.dispatchThreads(MTLSize(width: D, height: 2 * R, depth: B),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        let grid = MTLSize(width: D, height: 2 * R, depth: B)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pOverlapConcat.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
         return out
     }
@@ -508,8 +510,9 @@ public final class Compressor {
         enc.setBuffer(tmp.buffer, offset: 0, index: 1)
         var dims = SIMD3<UInt32>(UInt32(B), UInt32(R), UInt32(twoD))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-        enc.dispatchThreads(MTLSize(width: twoD, height: R, depth: B),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        let grid = MTLSize(width: twoD, height: R, depth: B)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pStateShift.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
         // Now copy tmp back into state[:, :R, :]
         let blit = cmd.makeBlitCommandEncoder()!
@@ -535,8 +538,9 @@ public final class Compressor {
         enc.setBuffer(w.buffer, offset: w.offset, index: 1)
         var dims = SIMD4<UInt32>(UInt32(B), UInt32(NS), UInt32(R), UInt32(C))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-        enc.dispatchThreads(MTLSize(width: C, height: R, depth: B * NS),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        let grid = MTLSize(width: C, height: R, depth: B * NS)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pBroadcastAdd.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 
@@ -550,8 +554,9 @@ public final class Compressor {
         enc.setBuffer(out.buffer, offset: 0, index: 2)
         var dims = SIMD4<UInt32>(UInt32(B), UInt32(NS), UInt32(R), UInt32(C))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
-        enc.dispatchThreads(MTLSize(width: C, height: NS, depth: B),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+        let grid = MTLSize(width: C, height: NS, depth: B)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pWeightedSum.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
     }
 

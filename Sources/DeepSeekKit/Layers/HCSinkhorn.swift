@@ -16,21 +16,16 @@ public final class HCSinkhorn {
         self.sinkhornIters = sinkhornIters
         self.hcEps = hcEps
 
-        let constants = MTLFunctionConstantValues()
-        var hc = UInt32(hcMult)
-        var iters = UInt32(sinkhornIters)
-        var eps = hcEps
-        constants.setConstantValue(&hc, type: .uint, index: 4)
-        constants.setConstantValue(&iters, type: .uint, index: 5)
-        constants.setConstantValue(&eps, type: .float, index: 6)
-
-        let lib = Device.shared.library
-        do {
-            let fn = try lib.makeFunction(name: "hc_split_sinkhorn_f32", constantValues: constants)
-            self.pipeline = try Device.shared.mtl.makeComputePipelineState(function: fn)
-        } catch {
-            fatalError("HCSinkhorn pipeline failed: \(error)")
+        // Function constants veicolati attraverso `PipelineConstants`
+        // così la pipeline viene cachata da `Device.shared.makePipeline`
+        // e condivisa fra istanze con gli stessi parametri.
+        let constants = PipelineConstants { c in
+            c.setUInt32(UInt32(hcMult), at: 4)
+            c.setUInt32(UInt32(sinkhornIters), at: 5)
+            c.setFloat(hcEps, at: 6)
         }
+        self.pipeline = Device.shared.makePipeline(
+            "hc_split_sinkhorn_f32", constants: constants)
     }
 
     public struct Output {

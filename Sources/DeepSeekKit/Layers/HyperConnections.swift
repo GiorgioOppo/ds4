@@ -85,8 +85,9 @@ public final class HyperConnections {
             enc.setBuffer(rsqrt.buffer, offset: 0, index: 1)
             var dims = SIMD2<UInt32>(UInt32(N), UInt32(mixHc))
             enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 2)
-            enc.dispatchThreads(MTLSize(width: mixHc, height: N, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            let grid = MTLSize(width: mixHc, height: N, depth: 1)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pBroadcastMul.tunedThreadgroup(forGrid: grid))
             enc.endEncoding()
         }
 
@@ -103,8 +104,9 @@ public final class HyperConnections {
             enc.setBuffer(y.buffer, offset: 0, index: 2)
             var dims = SIMD3<UInt32>(UInt32(N), UInt32(hc), UInt32(d))
             enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
-            enc.dispatchThreads(MTLSize(width: d, height: N, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            let grid = MTLSize(width: d, height: N, depth: 1)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pCollapse.tunedThreadgroup(forGrid: grid))
             enc.endEncoding()
         }
 
@@ -134,8 +136,9 @@ public final class HyperConnections {
         enc.setBuffer(y.buffer, offset: 0, index: 4)
         var dims = SIMD3<UInt32>(UInt32(N), UInt32(hc), UInt32(d))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
-        enc.dispatchThreads(MTLSize(width: d, height: hc, depth: N),
-                            threadsPerThreadgroup: MTLSize(width: 16, height: 4, depth: 4))
+        let grid = MTLSize(width: d, height: hc, depth: N)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pCompose.tunedThreadgroup(forGrid: grid))
         enc.endEncoding()
         return y
     }

@@ -26,7 +26,7 @@ public enum Elementwise {
         enc.setBuffer(x.buffer, offset: x.offset, index: 0)
         var n = UInt32(x.count)
         enc.setBytes(&n, length: 4, index: 1)
-        dispatch1D(enc, count: x.count)
+        dispatch1D(enc, pipeline: bf16RTP, count: x.count)
         enc.endEncoding()
     }
 
@@ -50,7 +50,7 @@ public enum Elementwise {
         enc.setBytes(&n, length: 4, index: 3)
         var lim = swigluLimit
         enc.setBytes(&lim, length: 4, index: 4)
-        dispatch1D(enc, count: g.count)
+        dispatch1D(enc, pipeline: siluMulP, count: g.count)
         enc.endEncoding()
         return y
     }
@@ -65,7 +65,7 @@ public enum Elementwise {
         enc.setBytes(&a, length: 4, index: 2)
         var n = UInt32(y.count)
         enc.setBytes(&n, length: 4, index: 3)
-        dispatch1D(enc, count: y.count)
+        dispatch1D(enc, pipeline: axpyP, count: y.count)
         enc.endEncoding()
     }
 
@@ -79,7 +79,7 @@ public enum Elementwise {
         enc.setBytes(&a, length: 4, index: 2)
         var n = UInt32(x.count)
         enc.setBytes(&n, length: 4, index: 3)
-        dispatch1D(enc, count: x.count)
+        dispatch1D(enc, pipeline: scaleP, count: x.count)
         enc.endEncoding()
         return y
     }
@@ -92,13 +92,18 @@ public enum Elementwise {
         enc.setBuffer(x.buffer, offset: x.offset, index: 1)
         var n = UInt32(y.count)
         enc.setBytes(&n, length: 4, index: 2)
-        dispatch1D(enc, count: y.count)
+        dispatch1D(enc, pipeline: addP, count: y.count)
         enc.endEncoding()
     }
 
-    private static func dispatch1D(_ enc: MTLComputeCommandEncoder, count: Int) {
-        let tg = MTLSize(width: 256, height: 1, depth: 1)
+    /// TG calcolato dinamicamente in funzione della pipeline
+    /// (`threadExecutionWidth`, `maxTotalThreadsPerThreadgroup`). Vedi
+    /// `Sources/DeepSeekKit/PipelineTuning.swift`.
+    private static func dispatch1D(_ enc: MTLComputeCommandEncoder,
+                                    pipeline: MTLComputePipelineState,
+                                    count: Int) {
         let grid = MTLSize(width: count, height: 1, depth: 1)
-        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.dispatchThreads(grid,
+                            threadsPerThreadgroup: pipeline.tunedThreadgroup(forGrid: grid))
     }
 }
