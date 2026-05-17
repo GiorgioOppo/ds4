@@ -176,7 +176,7 @@ private enum JLex {
 
 // MARK: - AST
 
-private indirect enum JNode {
+private indirect enum JNode: Sendable {
     case literal(String)
     case expr(JExpr)
     case ifNode([(JExpr, [JNode])], [JNode]?)    // (cond, body)* + optional else body
@@ -184,7 +184,7 @@ private indirect enum JNode {
     case setNode(name: String, value: JExpr)
 }
 
-private indirect enum JExpr {
+private indirect enum JExpr: Sendable {
     case literal(JinjaValue)
     case variable(String)                 // bare identifier
     case attr(JExpr, String)              // a.b
@@ -371,7 +371,7 @@ private struct JExprParser {
     }
 
     private mutating func parseCompare() throws -> JExpr {
-        var lhs = try parseAddSub()
+        let lhs = try parseAddSub()
         skipWS()
         // Multi-char compare ops first.
         let ops = ["==", "!=", "<=", ">=", "<", ">"]
@@ -643,7 +643,7 @@ private struct JExprParser {
 
 // MARK: - Renderer
 
-public struct JinjaTemplate {
+public struct JinjaTemplate: Sendable {
     private let nodes: [JNode]
 
     public init(_ source: String) throws {

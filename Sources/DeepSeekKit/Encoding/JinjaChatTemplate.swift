@@ -22,7 +22,7 @@ public struct JinjaChatTemplate: ChatTemplate {
         ]
         scope["messages"] = .list(messages.map(messageToJinja))
         if let tools = options.tools {
-            scope["tools"] = .list(tools.map { dictToJinja($0) })
+            scope["tools"] = .list(tools.map(jsonToJinja))
         }
         return try template.render(context: scope)
     }
@@ -53,19 +53,20 @@ public struct JinjaChatTemplate: ChatTemplate {
         return .dict(dict)
     }
 
-    private func dictToJinja(_ d: [String: Any]) -> JinjaValue {
-        var out: [String: JinjaValue] = [:]
-        for (k, v) in d { out[k] = anyToJinja(v) }
-        return .dict(out)
-    }
-
-    private func anyToJinja(_ v: Any) -> JinjaValue {
-        if let b = v as? Bool          { return .bool(b) }
-        if let i = v as? Int           { return .int(i) }
-        if let d = v as? Double        { return .double(d) }
-        if let s = v as? String        { return .string(s) }
-        if let l = v as? [Any]         { return .list(l.map(anyToJinja)) }
-        if let d = v as? [String: Any] { return dictToJinja(d) }
-        return .null
+    /// Converte un `JSONValue` ricorsivo in `JinjaValue`. Pattern
+    /// uno-a-uno fra i case dei due tipi.
+    private func jsonToJinja(_ v: JSONValue) -> JinjaValue {
+        switch v {
+        case .null:           return .null
+        case .bool(let b):    return .bool(b)
+        case .int(let i):     return .int(i)
+        case .double(let d):  return .double(d)
+        case .string(let s):  return .string(s)
+        case .array(let a):   return .list(a.map(jsonToJinja))
+        case .object(let o):
+            var out: [String: JinjaValue] = [:]
+            for (k, val) in o { out[k] = jsonToJinja(val) }
+            return .dict(out)
+        }
     }
 }

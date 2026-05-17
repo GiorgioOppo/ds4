@@ -27,16 +27,18 @@ public struct ChatTemplateOptions: Sendable {
     /// path uses `tools` instead.
     public var toolSchemasJSON: String?
     /// OpenAI-style tool array exposed to Jinja templates as
-    /// `tools`. Each entry is a `[String: Any]` JSON-compatible dict
-    /// (typically with `name`, `description`, `parameters`).
-    public var tools: [[String: Any]]?
+    /// `tools`. Ogni entry è un `JSONValue.object(...)` con i
+    /// campi attesi dal template (tipicamente `name`,
+    /// `description`, `parameters`). Tipizzato su `JSONValue`
+    /// perché `[String: Any]` non è `Sendable` in Swift 6.
+    public var tools: [JSONValue]?
     public var bosToken: String
     public var eosToken: String
 
     public init(addGenerationPrompt: Bool = true,
                 thinkingMode: ThinkingMode = .chat,
                 toolSchemasJSON: String? = nil,
-                tools: [[String: Any]]? = nil,
+                tools: [JSONValue]? = nil,
                 bosToken: String = "",
                 eosToken: String = "") {
         self.addGenerationPrompt = addGenerationPrompt

@@ -89,8 +89,14 @@ final class ChatTemplateTests: XCTestCase {
         let template = try JinjaChatTemplate(src)
         let opts = ChatTemplateOptions(
             tools: [
-                ["name": "echo", "description": "Echo back"],
-                ["name": "now",  "description": "Current time"],
+                .object([
+                    "name": .string("echo"),
+                    "description": .string("Echo back"),
+                ]),
+                .object([
+                    "name": .string("now"),
+                    "description": .string("Current time"),
+                ]),
             ])
         let out = try template.render(messages: [], options: opts)
         XCTAssertEqual(out, "echo=Echo back;now=Current time;")
