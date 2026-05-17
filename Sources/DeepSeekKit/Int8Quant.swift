@@ -66,7 +66,7 @@ public func shouldQuantizeToInt8(_ renamedName: String, lastDim: Int) -> Bool {
 }
 
 @inline(__always)
-private func floatToF16Local(_ f: Float) -> UInt16 {
+internal func floatToF16Local(_ f: Float) -> UInt16 {
     // Same algorithm as `floatToF16` in main.swift; duplicated here so this
     // file is self-contained and can be unit-tested in isolation.
     let bits = f.bitPattern
@@ -99,7 +99,7 @@ private func floatToF16Local(_ f: Float) -> UInt16 {
 }
 
 @inline(__always)
-private func bf16ToFloat(_ b: UInt16) -> Float {
+internal func bf16ToFloat(_ b: UInt16) -> Float {
     return Float(bitPattern: UInt32(b) << 16)
 }
 

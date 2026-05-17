@@ -13,7 +13,11 @@ import Metal
 ///                         to be repacked to E8M0 once we have a pipeline
 ///                         that consumes E8M0 directly).
 public final class ActQuant {
-    public enum Format { case fp8, fp4 }
+    /// `int8` aggiunto per il path W8A8 (vedi
+    /// `Sources/DeepSeekKit/Kernels/int8_gemm_w8a8.metal` e
+    /// `Linear.useW8A8Activations`). Output qbytes = int8 [M, N], scales
+    /// = f32 [M, N/128] non-pow2-rounded.
+    public enum Format { case fp8, fp4, int8 }
 
     public let format: Format
     public let blockSize: Int
@@ -21,8 +25,18 @@ public final class ActQuant {
 
     public init(format: Format) {
         self.format = format
-        self.blockSize = format == .fp8 ? Quant.actBlockSizeFP8 : Quant.actBlockSizeFP4
-        let name = format == .fp8 ? "act_quant_fp8" : "act_quant_fp4"
+        switch format {
+        case .fp8:  self.blockSize = Quant.actBlockSizeFP8
+        case .fp4:  self.blockSize = Quant.actBlockSizeFP4
+        case .int8: self.blockSize = Quant.actBlockSizeINT8
+        }
+        let name: String
+        let constantIndex: Int
+        switch format {
+        case .fp8:  name = "act_quant_fp8";  constantIndex = 0
+        case .fp4:  name = "act_quant_fp4";  constantIndex = 1
+        case .int8: name = "act_quant_int8"; constantIndex = 7
+        }
         // Function constants veicolati attraverso `PipelineConstants`
         // così la pipeline viene cachata da `Device.shared.makePipeline`
         // e condivisa fra istanze con gli stessi parametri.
@@ -31,8 +45,7 @@ public final class ActQuant {
         // builder (vedi MoE Gate per la stessa accortezza).
         let bs = self.blockSize
         let constants = PipelineConstants { c in
-            c.setUInt32(UInt32(bs),
-                        at: format == .fp8 ? 0 : 1)
+            c.setUInt32(UInt32(bs), at: constantIndex)
         }
         self.pipeline = Device.shared.makePipeline(name, constants: constants)
     }
@@ -56,8 +69,9 @@ public final class ActQuant {
             qbytes = nil
         } else {
             switch format {
-            case .fp8: qbytes = Tensor.empty(shape: [M, N], dtype: .i8)
-            case .fp4: qbytes = Tensor.empty(shape: [M, N / 2], dtype: .i8)
+            case .fp8:  qbytes = Tensor.empty(shape: [M, N], dtype: .i8)
+            case .fp4:  qbytes = Tensor.empty(shape: [M, N / 2], dtype: .i8)
+            case .int8: qbytes = Tensor.empty(shape: [M, N], dtype: .i8)
             }
         }
         let scales = Tensor.empty(shape: [M, blocksPerRow], dtype: .f32)
@@ -145,6 +159,31 @@ public final class ActQuant {
         precondition(row.count % blockSize == 0)
         var out = [Float](repeating: 0, count: row.count)
         var scales = [Float](repeating: 0, count: row.count / blockSize)
+
+        // INT8 path: scale lineare `amax / 127`, simmetrico, no
+        // pow2-rounding. Diverso dai path FP8/FP4 (che usano scala
+        // pow2 round-up tipica E8M0). Vedi `act_quant_int8` in
+        // `Sources/DeepSeekKit/Kernels/act_quant.metal`.
+        if format == .int8 {
+            for b in 0..<scales.count {
+                let lo = b * blockSize
+                let hi = lo + blockSize
+                var amax: Float = 0
+                for i in lo..<hi { amax = max(amax, abs(row[i])) }
+                amax = max(amax, 1e-5)
+                let scale = amax / 127.0
+                let invScale = 127.0 / amax
+                scales[b] = scale
+                for i in lo..<hi {
+                    let q = row[i] * invScale
+                    let r = q.rounded(.toNearestOrEven)
+                    let clamped = max(-127.0, min(127.0, r))
+                    out[i] = Float(Int(clamped)) * scale
+                }
+            }
+            return (out, scales)
+        }
+
         let maxV: Float = format == .fp8 ? 448.0 : 6.0
         let amaxFloor: Float = format == .fp8 ? 1e-4 : 6.0 * pow(2.0, -126)
 
@@ -171,6 +210,12 @@ public final class ActQuant {
                     rounded = roundToE4M3(clipped)
                 case .fp4:
                     rounded = roundToE2M1(clipped)
+                case .int8:
+                    // Unreachable: il branch int8 ha già fatto early return
+                    // prima del loop FP-format. Fatalerror per compiler
+                    // exhaustiveness e per segnalare un bug se si arriva
+                    // qui per errore.
+                    fatalError("ActQuant.referenceCPU: int8 reached FP-format switch")
                 }
                 out[i] = rounded * scale
             }

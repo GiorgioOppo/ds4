@@ -32,6 +32,10 @@ public enum Quant {
     /// `official/DeepSeek-V4-Flash/inference/model.py:372,506` call
     /// `act_quant(kv[..., :-rd], 64, ...)` — block 64, not the 128 default.
     public static let actBlockSizeFP8KVNope = 64
+    /// INT8 W8A8 activation quant block size — must match the K-grouping
+    /// used by INT8 weight quantization (`kInt8GroupK = 128`) so the
+    /// W8A8 GEMM can apply both scales at the same block boundary.
+    public static let actBlockSizeINT8 = 128
 
     /// FP8-E4M3 numeric range.
     public static let fp8Min: Float = -448.0

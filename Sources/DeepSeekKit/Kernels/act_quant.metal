@@ -156,6 +156,7 @@ inline float e2m1_to_f32(uchar b) {
 //   4  HC             (hc_sinkhorn.metal)
 //   5  SINKHORN_ITERS (hc_sinkhorn.metal)
 //   6  HC_EPS         (hc_sinkhorn.metal)
+//   7  BLOCK_SIZE_INT8
 constant uint BLOCK_SIZE_FP8 [[function_constant(0)]];
 
 kernel void act_quant_fp8(
@@ -317,4 +318,79 @@ kernel void act_quant_fp8_partial_inplace(
     float clipped = clamp(v / scale, -448.0f, 448.0f);
     uchar qb = f32_to_e4m3(clipped);
     x[idx] = e4m3_to_f32(qb) * scale;
+}
+
+// ---------- INT8 W8A8 activation quant -----------------------------------
+//
+// Block-wise INT8 RTN activation quantization. Mirrors `act_quant_fp8`/`fp4`
+// but produces symmetric int8 with [-127, 127] range and an f32 scale per
+// block. Used by the W8A8 path (`gemm_int8_w8a8_*`).
+//
+// Layout:
+//   x_in     [M, N]                  f32 activations
+//   y_q      [M, N]                  char (int8), -127..127 (slot -128 unused)
+//   y_ip     [M, N]                  f32 round-trip when inplace_flag != 0
+//   scales   [M, N/BLOCK_SIZE_INT8]  f32  (NOT pow2-rounded — full f32 scale)
+//
+// The scale is computed from the per-block absmax: `scale = amax / 127`.
+// This is symmetric quantization, no zero-point. The W8A8 GEMM kernels
+// rescale at block boundary by `a_scale * w_scale`.
+
+constant uint BLOCK_SIZE_INT8 [[function_constant(7)]];
+
+inline char f32_to_int8_symmetric(float x, float inv_scale) {
+    if (!isfinite(inv_scale)) return 0;
+    float q = rint(x * inv_scale);
+    q = clamp(q, -127.0f, 127.0f);
+    return char(int(q));
+}
+
+kernel void act_quant_int8(
+    device const float* x_in     [[buffer(0)]],
+    device char*        y_q      [[buffer(1)]],
+    device float*       y_ip     [[buffer(2)]],
+    device float*       scales   [[buffer(3)]],
+    constant uint2&     dims     [[buffer(4)]],   // (M, N)
+    constant uint&      inplace  [[buffer(5)]],
+    threadgroup float*  shared_  [[threadgroup(0)]],
+    uint2 tg      [[threadgroup_position_in_grid]],
+    uint2 tidv    [[thread_position_in_threadgroup]],
+    uint2 tgsv    [[threads_per_threadgroup]]
+) {
+    uint M = dims.x, N = dims.y;
+    uint blkSize = BLOCK_SIZE_INT8;
+    uint row = tg.x;
+    uint blkIdx = tg.y;
+    uint tid = tidv.x;
+    uint tgsize = tgsv.x;
+    uint blockStart = blkIdx * blkSize;
+    if (row >= M || blockStart >= N) return;
+
+    uint idx = row * N + blockStart + tid;
+    float v = x_in[idx];
+    float a = fabs(v);
+
+    // Absmax reduction in TGM.
+    shared_[tid] = a;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgsize / 2u; stride > 0u; stride >>= 1) {
+        if (tid < stride) shared_[tid] = max(shared_[tid], shared_[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Floor on amax avoids div-by-zero / 0-scale blocks (which would clamp
+    // everything in the block to 0). 1e-5 is below any meaningful FP32
+    // activation magnitude in the model.
+    float amax = max(shared_[0], 1e-5f);
+    float scale = amax / 127.0f;
+    float inv_scale = 127.0f / amax;
+
+    if (tid == 0u) scales[row * (N / blkSize) + blkIdx] = scale;
+
+    char qb = f32_to_int8_symmetric(v, inv_scale);
+
+    if (inplace != 0u) {
+        y_ip[idx] = float(int(qb)) * scale;
+    } else {
+        y_q[idx] = qb;
+    }
 }

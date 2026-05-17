@@ -25,18 +25,51 @@ Legenda: `[ ]` open · `[~]` partial · `[x]` done · `[!]` blocked
 - [x] **`--target-dtype int2`** — INT2 sperimentale. `Int2Quant.swift`
   + scelte di scala più conservative.
 
-- [ ] **W8A8 (activations INT8)**. Follow-up di W8A16. Richiede:
-  1. nuovo formato in `ActQuant` per quantizzare le attivazioni a
-     INT8 con scala per-token o per-128;
-  2. GEMM `int8 × int8 → int32` con rescale finale (Apple Silicon
-     ha `simd_matrix<char,...>`, sfruttabile);
-  3. branch alternativo in `Linear.int8Forward`.
-  Beneficio atteso: throughput memory-bound dimezzato.
+- [x] **W8A8 (activations INT8)**. Follow-up di W8A16, opt-in per
+  layer via `Linear(useW8A8Activations: true)`. Implementato:
+  - `ActQuant.Format.int8` + kernel `act_quant_int8` in
+    `Sources/DeepSeekKit/Kernels/act_quant.metal` (per-row,
+    per-128, simmetrico `[-127, 127]`, scale f32 = amax/127).
+  - Coppia di GEMM in `Sources/DeepSeekKit/Kernels/int8_gemm_w8a8.metal`:
+    `gemm_int8_w8a8_to_f32` (naive, int32 accumulator,
+    rescale per-block) e `gemm_int8_w8a8_to_f32_sg`
+    (simdgroup_matrix<bfloat> dopo dequant-on-stage di entrambi
+    i lati int8 → bfloat in TGM — Apple Silicon non espone int8
+    matrix MMA).
+  - `Linear.int8W8A8Forward` con stessi gating SG/naive di W8A16.
+  - Test: `Int8ActQuantTests` (round-trip + scale exact),
+    `Int8W8A8GemmTests` (naive + SG vs CPU dequant reference).
+  Trade-off: throughput memory-bound ~2× (metà bandwidth letta
+  per le activations); quantization-noise aggiuntiva — opt-in
+  per layer dove la perdita è accettabile (default off).
 
-- [ ] **Quantizzazione calibrata (GPTQ / AWQ / SmoothQuant)** sui
+- [~] **Quantizzazione calibrata (GPTQ / AWQ / SmoothQuant)** sui
   pesi INT8/INT4. RTN attuale è il baseline; calibrazione recupera
-  ~1-2 punti di perplexity. Struttura di `Int8Quant.swift` lascia
-  spazio per `quantizeBF16ToInt8Calibrated`.
+  ~1-2 punti di perplexity. Scaffold in
+  `Sources/DeepSeekKit/CalibratedQuant.swift`:
+  - `QuantMethod` enum (`.rtn` / `.awq` / `.smoothQuant` / `.gptq`).
+  - `CalibrationStats` struct (per-channel absmax + opzionalmente mean).
+  - `ActivationObserver` (hook accumulatore per il forward pass —
+    NON ancora wirato in `Linear.swift`).
+  - `quantizeBF16ToInt8Calibrated(method:stats:)` entry point:
+    - `.rtn` → delega a `quantizeBF16ToInt8` esistente (no-op).
+    - `.awq` → implementazione preview (smoothing per-canale
+      `s = (act_amax^α · w_amax^(1-α))/geomMean` → moltiplica i
+      pesi → RTN). **Limite documentato**: manca l'inverse-scale
+      sulle activations a runtime — vedi nota in
+      `awqQuantizeBF16ToInt8`.
+    - `.smoothQuant` / `.gptq` → `throw QuantNotImplemented` stub.
+  Follow-up necessari per la chiusura completa:
+  1. Wire `ActivationObserver` in `Linear.forward` (capture
+     opzionale durante calibration runs).
+  2. Aggiungere `inverseChannelScale: Tensor?` a `Linear` + pre-mul
+     nel forward, così l'AWQ smoothing si bilancia esattamente.
+  3. Implementare SmoothQuant (più semplice di GPTQ — solo
+     smoothing per-canale come AWQ ma con `α` fisso 0.5 e nessun
+     activation re-scale runtime). Stub già in posto.
+  4. Implementare GPTQ (algoritmo OBS layer-by-layer con Hessian
+     approssimata — il più costoso). Stub già in posto.
+  5. Wire `--quant-method awq|gptq|...` nel converter CLI.
 
 ---
 
