@@ -288,28 +288,41 @@ final class ChatStore: ObservableObject {
             mcpAllowed: agentConfig?.allowedToolNames,
             delegableAgents: delegableAgents)
 
-        // First-turn-with-project info: only the very first user
-        // turn of a chat (encodedTokens == nil) ever pays the cost
-        // of injecting the project's whole token stream. Every
-        // subsequent turn extends the cached prefix via the normal
-        // fast-path delta.
+        // First-turn-with-project info: solo la prima user turn
+        // di una chat (encodedTokens == nil) paga il costo di
+        // costruzione del contesto progetto. Le turn successive
+        // estendono il prefisso cached via fast-path delta.
         let projectContext: FirstTurnProjectContext? = {
             guard cachedPrefix == nil,
                   let pid = conversations[idx].projectID,
                   let project = projects.project(id: pid) else { return nil }
-            let docs = documents.documents(for: pid)
-            guard !docs.isEmpty else { return nil }
-            // Snapshot path + tokens off the main actor. tokens(of:)
-            // does a small disk read per file; expected to take ms,
-            // not seconds, even for a multi-hundred-file project —
-            // each `.tokens` blob is just the Int32 payload.
-            var files: [(path: String, tokens: [Int32])] = []
-            files.reserveCapacity(docs.count)
-            for d in docs {
-                guard let toks = try? documents.tokens(of: d.id) else { continue }
-                files.append((path: d.displayPath ?? d.name, tokens: toks))
+            switch project.effectiveContextMode {
+            case .indexedContent:
+                let docs = documents.documents(for: pid)
+                if !docs.isEmpty {
+                    var files: [(path: String, tokens: [Int32])] = []
+                    files.reserveCapacity(docs.count)
+                    for d in docs {
+                        guard let toks = try? documents.tokens(of: d.id)
+                        else { continue }
+                        files.append((path: d.displayPath ?? d.name,
+                                      tokens: toks))
+                    }
+                    return .indexedContent(name: project.name, files: files)
+                }
+                // Indexed mode ma nessun doc indicizzato (utente non
+                // ha mai indicizzato il progetto): fall-through al
+                // path inventory così il modello ha comunque
+                // qualcosa di concreto su cui ragionare.
+                fallthrough
+            case .pathsOnly:
+                let inventory = ProjectInventoryBuilder.build(
+                    project,
+                    maxFiles: project.effectiveMaxInventoryFiles)
+                return inventory.entries.isEmpty
+                    ? nil
+                    : .pathsOnly(inventory: inventory)
             }
-            return FirstTurnProjectContext(name: project.name, files: files)
         }()
 
         Task {
@@ -435,11 +448,18 @@ final class ChatStore: ObservableObject {
     /// Carries the snapshotted project context across the actor hop
     /// into `buildPromptTokens`. Constructed only when the very
     /// first turn of a chat with an attached project is about to
-    /// fire (cachedPrefix == nil, projectID != nil, library has
-    /// indexed files).
-    private struct FirstTurnProjectContext {
-        let name: String
-        let files: [(path: String, tokens: [Int32])]
+    /// fire (cachedPrefix == nil, projectID != nil).
+    ///
+    /// Due varianti:
+    /// - `.indexedContent`: vecchio comportamento — splice di token
+    ///   pre-calcolati per ogni documento indicizzato (richiede
+    ///   docs in `DocumentLibrary`).
+    /// - `.pathsOnly`: nuovo default — albero gerarchico di path
+    ///   nel system prompt; il modello esplora con tool.
+    private enum FirstTurnProjectContext {
+        case indexedContent(name: String,
+                             files: [(path: String, tokens: [Int32])])
+        case pathsOnly(inventory: ProjectInventory)
     }
 
     /// Assemble the BPE prompt:
@@ -472,36 +492,73 @@ final class ChatStore: ObservableObject {
             }
             return prefix + delta
         }
-        // First turn with a project: try the structured-context
-        // path. Falls through to the plain full-encode if the
-        // tokenizer can't resolve every special id we need.
+        // First turn con un progetto attaccato: scegli la
+        // strategia in base alla modalità del progetto.
         if let ctx = projectContext {
-            let history = fullHistory.dropLast()
-            // Agent's system prompt wins over a transcript-side
-            // system message. When the agent has none, fall back
-            // to whatever the user wrote into a manual system
-            // turn (typically empty in a fresh chat).
-            let transcriptSystem = history
-                .first(where: { $0.role == .system })?
-                .content ?? ""
-            let systemText: String
-            if let agent = agentSystemPrompt,
-               !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            {
-                systemText = transcriptSystem.isEmpty
-                    ? agent
-                    : agent + "\n\n" + transcriptSystem
-            } else {
-                systemText = transcriptSystem
-            }
-            if let tokens = await service.tokenizeFirstTurnWithProject(
-                systemText: systemText,
-                projectName: ctx.name,
-                files: ctx.files,
-                userText: userText,
-                mode: mode,
-                toolSchemasJSON: toolSchemasJSON)
-            {
+            switch ctx {
+            case .indexedContent(let name, let files):
+                // Path legacy: splice nativo dei token pre-calcolati.
+                let history = fullHistory.dropLast()
+                let transcriptSystem = history
+                    .first(where: { $0.role == .system })?
+                    .content ?? ""
+                let systemText: String
+                if let agent = agentSystemPrompt,
+                   !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    systemText = transcriptSystem.isEmpty
+                        ? agent
+                        : agent + "\n\n" + transcriptSystem
+                } else {
+                    systemText = transcriptSystem
+                }
+                if let tokens = await service.tokenizeFirstTurnWithProject(
+                    systemText: systemText,
+                    projectName: name,
+                    files: files,
+                    userText: userText,
+                    mode: mode,
+                    toolSchemasJSON: toolSchemasJSON)
+                {
+                    return tokens
+                }
+                // Fall through al cold path se i token speciali
+                // non sono risolvibili.
+
+            case .pathsOnly(let inventory):
+                // Path nuovo default: prepend l'albero al system
+                // prompt e usa il cold path standard. Il modello
+                // dovrà invocare `read`/`glob`/`grep` per leggere
+                // i singoli file.
+                let inventoryBlock = inventory.renderTree()
+                let history = fullHistory.dropLast()
+                let transcriptSystem = history
+                    .first(where: { $0.role == .system })?
+                    .content ?? ""
+                let baseSystem: String
+                if let agent = agentSystemPrompt?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !agent.isEmpty
+                {
+                    baseSystem = transcriptSystem.isEmpty
+                        ? agent
+                        : agent + "\n\n" + transcriptSystem
+                } else {
+                    baseSystem = transcriptSystem
+                }
+                let combinedSystem: String = baseSystem.isEmpty
+                    ? inventoryBlock
+                    : inventoryBlock + "\n" + baseSystem
+                guard let tokens = await service.tokenizeFullHistory(
+                    Array(history), mode: mode,
+                    toolSchemasJSON: toolSchemasJSON,
+                    systemPromptOverride: combinedSystem)
+                else {
+                    throw NSError(domain: "ChatStore", code: 11, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Tokenizer unavailable (no model loaded?)."
+                    ])
+                }
                 return tokens
             }
         }
@@ -1208,6 +1265,22 @@ final class ChatStore: ObservableObject {
         var currentPlaceholderID = initialPlaceholderID
         var iteration = 0
 
+        // Costruisci l'inventario di progetto una sola volta per
+        // tutta la durata della loop tool-roundtrip. Per il path
+        // remoto la modalità `indexedContent` non è applicabile —
+        // un modello remoto non può ricevere splice di token native
+        // — quindi si fa sempre fallback a `pathsOnly`.
+        let projectInventory: ProjectInventory? = await MainActor.run {
+            guard let idx = self.conversations.firstIndex(where: { $0.id == id }),
+                  let pid = self.conversations[idx].projectID,
+                  let project = self.projects.project(id: pid)
+            else { return nil }
+            let inventory = ProjectInventoryBuilder.build(
+                project,
+                maxFiles: project.effectiveMaxInventoryFiles)
+            return inventory.entries.isEmpty ? nil : inventory
+        }
+
         while iteration < maxToolRoundtripsPerTurn {
             iteration += 1
 
@@ -1228,7 +1301,8 @@ final class ChatStore: ObservableObject {
 
             let openAIMessages = self.buildOpenAIMessages(
                 history: snapshot.history,
-                agent: snapshot.agent)
+                agent: snapshot.agent,
+                projectInventory: projectInventory)
             let toolsArray = self.composeOpenAITools(
                 mcpAllowed: snapshot.agent?.allowedToolNames)
 
@@ -1518,7 +1592,10 @@ final class ChatStore: ObservableObject {
     /// tool_call_id, content}` message so the upstream model can
     /// thread the answer back to its original call.
     private func buildOpenAIMessages(history: [StoredMessage],
-                                       agent: AgentConfig?) -> [OpenAIMessage] {
+                                       agent: AgentConfig?,
+                                       projectInventory: ProjectInventory? = nil)
+        -> [OpenAIMessage]
+    {
         var out: [OpenAIMessage] = []
 
         let agentSystem = agent?.systemPrompt
@@ -1534,6 +1611,14 @@ final class ChatStore: ObservableObject {
         if !transcriptSystem.isEmpty {
             if !systemContent.isEmpty { systemContent += "\n\n" }
             systemContent += transcriptSystem
+        }
+        // Prepend l'albero dei path del progetto. Il modello dovrà
+        // usare i tool (read/glob/grep) per ottenere il contenuto.
+        if let inventory = projectInventory {
+            let block = inventory.renderTree()
+            systemContent = systemContent.isEmpty
+                ? block
+                : block + "\n" + systemContent
         }
         if !systemContent.isEmpty {
             out.append(OpenAIMessage(role: "system", content: systemContent))

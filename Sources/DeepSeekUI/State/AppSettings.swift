@@ -11,6 +11,17 @@ enum AppSettingsKey {
     /// Filesystem path to the `converter` CLI binary, used by
     /// ConvertSheet. Empty → ConverterRunner auto-discovers.
     static let converterBinaryPath = "deepseek.converterBinaryPath"
+
+    /// Default `ProjectContextMode` per nuovi progetti (e per i
+    /// progetti che non hanno override). Valori:
+    /// "pathsOnly" | "indexedContent". Default: "pathsOnly".
+    static let projectContextMode = "deepseek.projectContextMode"
+
+    /// Cap globale sul numero di file inclusi nell'albero
+    /// dell'inventario per i progetti in modalità `pathsOnly`.
+    /// Default: 500. Override per-progetto in
+    /// `Project.maxInventoryFiles`.
+    static let projectInventoryMaxFiles = "deepseek.projectInventoryMaxFiles"
 }
 
 /// Helper for code paths that need to read defaults without going
@@ -53,6 +64,40 @@ enum AppSettings {
         let arr = recentDirs().filter { $0 != path }
         if let data = try? JSONEncoder().encode(arr) {
             UserDefaults.standard.set(data, forKey: AppSettingsKey.recentModelDirs)
+        }
+    }
+
+    // MARK: - Project context
+
+    /// Default mode per i progetti che non hanno override. Nuovi
+    /// progetti partono da qui. Default: `.pathsOnly`.
+    static var projectContextMode: ProjectContextMode {
+        get {
+            let raw = UserDefaults.standard.string(
+                forKey: AppSettingsKey.projectContextMode)
+            return raw.flatMap(ProjectContextMode.init(rawValue:))
+                ?? .pathsOnly
+        }
+        set {
+            UserDefaults.standard.set(
+                newValue.rawValue,
+                forKey: AppSettingsKey.projectContextMode)
+        }
+    }
+
+    /// Cap globale (override per-progetto via
+    /// `Project.maxInventoryFiles`). 0 → usa default
+    /// `ProjectInventoryBuilder.defaultMaxFiles`.
+    static var projectInventoryMaxFiles: Int {
+        get {
+            let v = UserDefaults.standard.integer(
+                forKey: AppSettingsKey.projectInventoryMaxFiles)
+            return v > 0 ? v : ProjectInventoryBuilder.defaultMaxFiles
+        }
+        set {
+            UserDefaults.standard.set(
+                max(0, newValue),
+                forKey: AppSettingsKey.projectInventoryMaxFiles)
         }
     }
 }

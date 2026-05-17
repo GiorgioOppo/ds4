@@ -21,18 +21,47 @@ struct Project: Codable, Identifiable, Hashable {
     var lastIndexedAt: Date?
     var modelFingerprint: String?
 
+    /// Override per-progetto del modo di presentazione al modello.
+    /// `nil` → usa `AppSettings.projectContextMode` (default
+    /// `.pathsOnly`). Campo opzionale per retro-compatibilità coi
+    /// progetti già persistiti.
+    var contextMode: ProjectContextMode?
+
+    /// Override per-progetto del cap sull'inventario in modalità
+    /// `pathsOnly`. `nil` → usa
+    /// `AppSettings.projectInventoryMaxFiles`. 0 = senza limite
+    /// (sconsigliato per progetti grandi).
+    var maxInventoryFiles: Int?
+
     init(id: UUID = UUID(),
          name: String,
          sourcePaths: [String] = [],
          createdAt: Date = .now,
          lastIndexedAt: Date? = nil,
-         modelFingerprint: String? = nil) {
+         modelFingerprint: String? = nil,
+         contextMode: ProjectContextMode? = nil,
+         maxInventoryFiles: Int? = nil) {
         self.id = id
         self.name = name
         self.sourcePaths = sourcePaths
         self.createdAt = createdAt
         self.lastIndexedAt = lastIndexedAt
         self.modelFingerprint = modelFingerprint
+        self.contextMode = contextMode
+        self.maxInventoryFiles = maxInventoryFiles
+    }
+
+    /// Modalità effettiva (override per-progetto o default
+    /// globale).
+    var effectiveContextMode: ProjectContextMode {
+        contextMode ?? AppSettings.projectContextMode
+    }
+
+    /// Cap effettivo per l'inventario (override per-progetto o
+    /// default globale).
+    var effectiveMaxInventoryFiles: Int {
+        if let n = maxInventoryFiles { return n }
+        return AppSettings.projectInventoryMaxFiles
     }
 }
 
