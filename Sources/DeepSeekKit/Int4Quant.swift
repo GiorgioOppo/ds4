@@ -46,43 +46,8 @@ public func shouldQuantizeToInt4(_ renamedName: String, lastDim: Int) -> Bool {
     return linearLeaves.contains(leaf)
 }
 
-@inline(__always)
-private func floatToF16Local(_ f: Float) -> UInt16 {
-    // Duplicated from Int8Quant.swift / main.swift so this file is
-    // self-contained (and unit-testable in isolation).
-    let bits = f.bitPattern
-    let sign = (bits >> 31) & 1
-    let exp = (bits >> 23) & 0xFF
-    let mant = bits & 0x7FFFFF
-    if exp == 0 { return UInt16(truncatingIfNeeded: sign << 15) }
-    if exp == 0xFF {
-        let m: UInt32 = mant != 0 ? 0x200 : 0
-        return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10) | m)
-    }
-    let unbiased = Int(exp) - 127
-    if unbiased > 15 { return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10)) }
-    if unbiased < -14 {
-        let shift = -14 - unbiased + 13
-        if shift > 24 { return UInt16(truncatingIfNeeded: sign << 15) }
-        let full = (mant | 0x800000) >> (shift - 1)
-        let halfMant = (full + 1) >> 1
-        return UInt16(truncatingIfNeeded: (sign << 15) | halfMant)
-    }
-    let halfExp = UInt32(unbiased + 15)
-    let halfMant = (mant + 0x1000) >> 13
-    if halfMant >= 0x400 {
-        if halfExp + 1 >= 0x1F {
-            return UInt16(truncatingIfNeeded: (sign << 15) | (0x1F << 10))
-        }
-        return UInt16(truncatingIfNeeded: (sign << 15) | ((halfExp + 1) << 10))
-    }
-    return UInt16(truncatingIfNeeded: (sign << 15) | (halfExp << 10) | halfMant)
-}
-
-@inline(__always)
-private func bf16ToFloat(_ b: UInt16) -> Float {
-    return Float(bitPattern: UInt32(b) << 16)
-}
+// `floatToF16Local` e `bf16ToFloat` vivono in
+// `Sources/DeepSeekKit/QuantHelpers.swift`.
 
 /// F16 → Float. Mirrors the inverse of `floatToF16Local` above.
 /// Used by `quantizeInt8ToInt4` to read back the source
