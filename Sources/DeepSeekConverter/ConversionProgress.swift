@@ -99,4 +99,11 @@ public final class CancellationToken: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return _flag
     }
+
+    /// Convenience: throws `ConversionCancelled` se il flag è on.
+    /// Da chiamare ai safe point nei loop di lavoro così il caller
+    /// che chiama `cancel()` ottiene effettivo bail-out.
+    public func throwIfCancelled() throws {
+        if isCancelled { throw ConversionCancelled() }
+    }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import DeepSeekKit
+import DeepSeekConverter   // `CancellationToken`
 
 /// Fase 2: data una `KeepDecision`, riscrive il checkpoint pruned
 /// in `outputDir`. Slicing riga-wise di `embed.weight` /
@@ -22,6 +23,7 @@ public enum VocabRewriter {
         outputDir: URL,
         decision: KeepDecision,
         alreadyCompletedShards: Set<String> = [],
+        cancellation: CancellationToken? = nil,
         onShardDone: ((String) -> Void)? = nil,
         onEvent: (VocabPruneEvent) -> Void
     ) throws -> (bytesIn: UInt64, bytesOut: UInt64) {
@@ -58,6 +60,7 @@ public enum VocabRewriter {
         var newWeightMap: [String: String] = [:]
 
         for (i, shardName) in shards.enumerated() {
+            try cancellation?.throwIfCancelled()
             let inURL = inputDir.appendingPathComponent(shardName)
             let outURL = outputDir.appendingPathComponent(shardName)
 

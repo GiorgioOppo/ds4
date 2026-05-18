@@ -124,6 +124,7 @@ public enum VocabPruner {
                 inFlightFile: inFlight,
                 chunkedFile: checkpoint?.analyzer?.chunkedFile,
                 tokenBatchThreshold: 10_000,
+                cancellation: cancellation,
                 onFileDone: { path, lines, tokens, counts in
                     store.recordAnalyzerFile(
                         path: path,
@@ -158,10 +159,7 @@ public enum VocabPruner {
                           "(new vocab_size = \(decision.newVocabSize))"))
             store.markPhase2(decision: decision)
 
-            if cancellation.isCancelled {
-                throw NSError(domain: "VocabPruner", code: 99,
-                              userInfo: [NSLocalizedDescriptionKey: "cancelled"])
-            }
+            try cancellation.throwIfCancelled()
         }
 
         if spec.dryRun {
@@ -196,6 +194,7 @@ public enum VocabPruner {
             outputDir: spec.outputDir,
             decision: decision,
             alreadyCompletedShards: alreadyCompleted,
+            cancellation: cancellation,
             onShardDone: { name in
                 store.recordCompletedShard(name)
             },

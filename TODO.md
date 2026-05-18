@@ -241,6 +241,20 @@ Stime di speedup — vedi `docs/PERFORMANCE.md` per le metriche.
   project-attached dopo un riavvio senza ri-prefilare il contesto
   del project.
 
+- [ ] **Shader precompilation warmup (low priority)**. Le pipeline
+  Metal sono già cache singleton (`Device.pipelineCache`) e
+  always-in-memory una volta create, quindi questo NON sblocca
+  use case nuovi — è solo una smoothing del primo turn. Idea:
+  un `pipelineWarmupTask` background lanciato post-`loadModel`
+  che precompila tutte le pipeline note (RoPE, SoftmaxAxis, TopK
+  con tutti i `k` usati, GEMM bf16→f32, ecc.) **mentre l'utente
+  sta scrivendo il prompt**. Al primo forward tutte le PSO sono
+  già nella cache, niente JIT compile pause da 10-50ms su
+  specializzazione mai vista. Stima: ~50 LOC in `Device.swift`
+  + chiamata in `InferenceService.loadModel` post-success. Da
+  fare con `Task.detached(priority: .background)` per non
+  ostacolare l'UI.
+
 ---
 
 ## 6. Documentazione

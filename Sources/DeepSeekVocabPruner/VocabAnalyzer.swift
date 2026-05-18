@@ -1,5 +1,6 @@
 import Foundation
 import DeepSeekKit
+import DeepSeekConverter   // `CancellationToken`
 
 /// Preview di un singolo token droppato dall'analyzer. Il content
 /// è la stringa byte-encoded come appare nel vocab originale (es.
@@ -126,6 +127,7 @@ public enum VocabAnalyzer {
         inFlightFile: PruneCheckpoint.InFlightFile? = nil,
         chunkedFile: PruneCheckpoint.ChunkedFileState? = nil,
         tokenBatchThreshold: Int = 10_000,
+        cancellation: CancellationToken? = nil,
         onFileDone: ((String, Int, Int, [Int: Int]) -> Void)? = nil,
         onTokenBatch: ((String, Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onChunkedFileStart: ((String, UInt64, [Int]) -> Void)? = nil,
@@ -181,6 +183,7 @@ public enum VocabAnalyzer {
             // Path sequenziale: supporta save intra-file ogni
             // `tokenBatchThreshold` token via `onTokenBatch`.
             for file in files {
+                try cancellation?.throwIfCancelled()
                 let path = file.url.path
                 let matchesInFlight = (inFlightFile?.path == path)
                 let resumeOffset = matchesInFlight ? (inFlightFile?.lineOffset ?? 0) : 0
@@ -285,6 +288,7 @@ public enum VocabAnalyzer {
                 tokenizer: tokenizer,
                 concurrency: concurrency,
                 resumeFromCompletedChunks: resumeChunks,
+                cancellation: cancellation,
                 onBoundariesReady: { fileSize, boundaries in
                     // Setup PRIMA del dispatch: il caller registra
                     // lo state nel checkpoint così
@@ -338,6 +342,11 @@ public enum VocabAnalyzer {
             var caught: Error? = nil
 
             DispatchQueue.concurrentPerform(iterations: files.count) { idx in
+                // Cancellation check all'inizio di ogni file. I file
+                // già in volo non possono essere interrotti a metà
+                // (read-then-tokenize è già su un singolo thread del
+                // pool), ma evitiamo di iniziarne di nuovi.
+                if cancellation?.isCancelled == true { return }
                 let file = files[idx]
                 do {
                     let (lc, tc, localCounts) = try Self.countTokensInFile(
@@ -362,6 +371,7 @@ public enum VocabAnalyzer {
             lines = agg.lines
             tokens = agg.tokens
         }
+        try cancellation?.throwIfCancelled()
         onEvent(.scanned(lines: lines, tokens: tokens))
 
         // 3) Force-include: addedTokens, byte-level base 256, ASCII,
@@ -660,6 +670,7 @@ public enum VocabAnalyzer {
         tokenizer: BPETokenizer,
         concurrency: Int,
         resumeFromCompletedChunks: Set<Int> = [],
+        cancellation: CancellationToken? = nil,
         onBoundariesReady: ((UInt64, [Int]) -> Void)? = nil,
         onChunkDone: ((Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onProgress: ((Int, Int) -> Void)? = nil
@@ -712,6 +723,11 @@ public enum VocabAnalyzer {
         var lastProgressEmit = Date.distantPast
 
         DispatchQueue.concurrentPerform(iterations: actualChunks) { idx in
+            // Cancellation cooperativa: niente nuovi chunk dopo
+            // cancel(). Quelli già in volo finiscono (un chunk dura
+            // 1-10s a seconda del tokenizer + bytes), poi il controllo
+            // ritorna al caller che fa rethrow.
+            if cancellation?.isCancelled == true { return }
             // Resume: skippa i chunk già completati in una run
             // precedente (i loro counts sono già nel checkpoint, e
             // il caller li ha pre-popolati nei counts globali).
@@ -759,6 +775,7 @@ public enum VocabAnalyzer {
             }
         }
         if let caught { throw caught }
+        try cancellation?.throwIfCancelled()
 
         // 4) Merge finale dei chunk results (solo i chunk processati
         // in QUESTA run; i resumed sono già nei counts del caller).
