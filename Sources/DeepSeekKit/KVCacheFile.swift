@@ -377,14 +377,40 @@ public final class KVCacheFile {
 
     /// Returns a Metal buffer + byte offset describing a sub-region
     /// of the payload. Layers compose a `Tensor` over this by passing
-    /// `buffer:` and `offset:` to `Tensor.init`. Step 2 will add a
-    /// `Tensor.mapped(file:offset:shape:dtype:)` convenience.
+    /// `buffer:` and `offset:` to `Tensor.init`.
     public func region(offset: Int, length: Int) -> (MTLBuffer, Int) {
         precondition(offset >= 0)
         precondition(length > 0)
         precondition(offset + length <= payloadBytes,
                       "region [\(offset), \(offset+length)) exceeds payload size \(payloadBytes)")
         return (payloadBuffer, payloadOffset + offset)
+    }
+
+    /// Costruisce un `Tensor` che vive nel payload del cache file.
+    /// Niente alloc — è un wrapper della stessa storage GPU-visibile
+    /// del file mmappato. Tutti i write tramite questo tensor finiscono
+    /// direttamente nel file su disco (storageModeShared + MAP_SHARED).
+    ///
+    /// Usato dal wiring fisico cross-restart per allocare Compressor.
+    /// kvState/scoreState e Attention.kvCache come slice del KVCacheFile
+    /// invece che come MTLBuffer indipendenti. Significa che alla
+    /// chiusura dell'app lo stato resta su disco; al riavvio basta
+    /// riaprire il file e ricostruire i wrapper Tensor con gli stessi
+    /// offset → KV cache automaticamente "restored".
+    public func tensor(at region: KVCacheLayout.Region,
+                        shape: [Int], dtype: DType) -> Tensor {
+        let elementBytes = (dtype.bitsPerElement + 7) / 8
+        let expectedBytes = shape.reduce(1, *) * elementBytes
+        precondition(expectedBytes <= region.bytes,
+                      "tensor shape \(shape) dtype \(dtype) needs " +
+                      "\(expectedBytes) bytes but region has \(region.bytes)")
+        precondition(region.offset >= 0
+                      && region.offset + region.bytes <= payloadBytes,
+                      "region [\(region.offset), \(region.offset + region.bytes)) " +
+                      "out of payload [0, \(payloadBytes))")
+        return Tensor(shape: shape, dtype: dtype,
+                       buffer: payloadBuffer,
+                       offset: payloadOffset + region.offset)
     }
 
     // ---- internals ----

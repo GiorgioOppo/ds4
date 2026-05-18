@@ -153,13 +153,26 @@ public extension Transformer {
                       strategyOverride: String? = nil,
                       forceLoad: Bool = false,
                       warmupOnLoad: Bool = false,
-                      useMapSharedWeights: Bool = false) throws -> Transformer {
+                      useMapSharedWeights: Bool = false,
+                      kvCacheFile: KVCacheFile? = nil) throws -> Transformer {
         MemoryLogger.snapshot("load:start", force: true)
         let plan = try LoadPlan.decide(modelDir: weightsDir,
                                         override: strategyOverride,
                                         forceLoad: forceLoad)
         FileHandle.standardError.write(Data(plan.summary().utf8))
         let loader = try WeightLoader(plan: plan, useMapShared: useMapSharedWeights)
+
+        // Layout del KV cache cross-restart: se fornito un KVCacheFile,
+        // calcola gli offset per ogni layer e li usa per allocare i
+        // Tensor di stato sui slice del file mmappato. Senza file →
+        // path classico Tensor.empty (KV solo in memoria, perso al
+        // restart).
+        let kvLayout: KVCacheLayout? = kvCacheFile != nil
+            ? KVCacheLayout.compute(config: config)
+            : nil
+        if let l = kvLayout {
+            FileHandle.standardError.write(Data(l.summary().utf8))
+        }
         MemoryLogger.snapshot("load:after-mmap", force: true)
 
         // Optional ds4-style pages warmup: pre-fault tutte le pagine
@@ -273,24 +286,60 @@ public extension Transformer {
             let ratio = config.compressRatios[i]
             var compressor: Compressor? = nil
             var indexer: Indexer? = nil
+
+            // Backing fisico opzionale: se KVCacheFile fornito,
+            // estrai gli offset dal layout per questo layer e wrappali
+            // come backing per Compressor / Indexer / kvCache.
+            let layerOffs = kvLayout?.layers[i]
+            var compBacking: AssemblyHelpers.CompressorBacking? = nil
+            var idxBacking: AssemblyHelpers.IndexerBacking? = nil
+            if let kvFile = kvCacheFile,
+               let off = layerOffs
+            {
+                if let ks = off.compressorKVState,
+                   let ss = off.compressorScoreState
+                {
+                    compBacking = AssemblyHelpers.CompressorBacking(
+                        file: kvFile, kvState: ks, scoreState: ss)
+                }
+                if let ikv = off.indexerKVCache,
+                   let iks = off.indexerCompressorKVState,
+                   let iss = off.indexerCompressorScoreState
+                {
+                    idxBacking = AssemblyHelpers.IndexerBacking(
+                        file: kvFile,
+                        kvCache: ikv,
+                        compressor: AssemblyHelpers.CompressorBacking(
+                            file: kvFile, kvState: iks, scoreState: iss))
+                }
+            }
+
             if ratio > 0 {
                 compressor = try AssemblyHelpers.loadCompressor(
                     loader, base: "\(lp).attn.compressor",
                     config: config, ratio: ratio, headDim: config.headDim,
-                    rotate: false, rng: &rng)
+                    rotate: false, rng: &rng,
+                    backing: compBacking)
                 if ratio == 4 {
                     indexer = try AssemblyHelpers.loadIndexer(
                         loader, base: "\(lp).attn.indexer",
-                        config: config, ratio: ratio, rng: &rng)
+                        config: config, ratio: ratio, rng: &rng,
+                        backing: idxBacking)
                 }
             }
 
             let kvCacheRows = config.windowSize +
                 (ratio > 0 ? config.maxSeqLen / ratio : 0)
-            let kvCache = Tensor.empty(shape: [config.maxBatchSize,
-                                                max(kvCacheRows, 1),
-                                                config.headDim],
-                                        dtype: .f32)
+            let kvCacheShape = [config.maxBatchSize,
+                                 max(kvCacheRows, 1),
+                                 config.headDim]
+            let kvCache: Tensor
+            if let kvFile = kvCacheFile, let off = layerOffs {
+                kvCache = kvFile.tensor(at: off.attnKVCache,
+                                         shape: kvCacheShape, dtype: .f32)
+            } else {
+                kvCache = Tensor.empty(shape: kvCacheShape, dtype: .f32)
+            }
 
             let rope = RoPE(ropeHeadDim: config.ropeHeadDim,
                             freqs: RoPE.makeFreqs(config: config, useYarn: ratio > 0))
@@ -505,18 +554,47 @@ internal enum AssemblyHelpers {
         return Linear(inFeatures: inFeatures, outFeatures: outFeatures, weight: w, scale: nil)
     }
 
+    /// Backing storage opzionale per il KV state del Compressor.
+    /// Quando fornito, `kvState` e `scoreState` vengono allocati come
+    /// slice del KVCacheFile invece di MTLBuffer indipendenti — abilita
+    /// cross-restart resume. Vedi `KVCacheLayout` per il layout
+    /// binario.
+    struct CompressorBacking {
+        let file: KVCacheFile
+        let kvState: KVCacheLayout.Region
+        let scoreState: KVCacheLayout.Region
+    }
+
     static func makeCompressor(config: ModelConfig, ratio: Int, headDim: Int,
-                               rotate: Bool, rng: inout MiniRNG) -> Compressor {
+                               rotate: Bool, rng: inout MiniRNG,
+                               backing: CompressorBacking? = nil) -> Compressor {
         let coff = ratio == 4 ? 2 : 1
         let coffHeadDim = coff * headDim
         let ape = randomTensor([ratio, coffHeadDim], rng: &rng, scale: 0.05)
         let wkv = linear(in: config.dim, out: coffHeadDim, rng: &rng)
         let wgate = linear(in: config.dim, out: coffHeadDim, rng: &rng)
         let norm = RMSNorm(weight: onesTensor([headDim]), eps: config.normEps)
-        let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                    dtype: .f32)
-        let scoreState = Compressor.makeScoreState(
-            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
+        let stateShape = [config.maxBatchSize, coff * ratio, coffHeadDim]
+        let kvState: Tensor
+        let scoreState: Tensor
+        if let b = backing {
+            // KVCacheFile-backed: zero-copy slice del payload mmappato.
+            kvState = b.file.tensor(at: b.kvState,
+                                     shape: stateShape, dtype: .f32)
+            // Per scoreState, il backing buffer è zeroed dal sizing del
+            // file ma noi vogliamo -inf (semantica makeScoreState).
+            // Inizializziamo CPU-side via storageModeShared.
+            scoreState = b.file.tensor(at: b.scoreState,
+                                         shape: stateShape, dtype: .f32)
+            let n = scoreState.count
+            let p = scoreState.buffer.contents()
+                .advanced(by: scoreState.offset)
+                .bindMemory(to: Float.self, capacity: n)
+            for i in 0..<n { p[i] = -Float.infinity }
+        } else {
+            kvState = Tensor.empty(shape: stateShape, dtype: .f32)
+            scoreState = Compressor.makeScoreState(shape: stateShape)
+        }
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)
@@ -542,7 +620,8 @@ internal enum AssemblyHelpers {
 
     static func loadCompressor(_ loader: WeightLoader, base: String,
                                config: ModelConfig, ratio: Int, headDim: Int,
-                               rotate: Bool, rng: inout MiniRNG) throws -> Compressor {
+                               rotate: Bool, rng: inout MiniRNG,
+                               backing: CompressorBacking? = nil) throws -> Compressor {
         let coff = ratio == 4 ? 2 : 1
         let coffHeadDim = coff * headDim
         let ape = (try loader.tryLoad(["\(base).ape"]))
@@ -560,18 +639,39 @@ internal enum AssemblyHelpers {
         let norm = RMSNorm(
             weight: (try loader.tryLoad(["\(base).norm.weight"])) ?? onesTensor([headDim]),
             eps: config.normEps)
-        let kvState = Tensor.empty(shape: [config.maxBatchSize, coff * ratio, coffHeadDim],
-                                    dtype: .f32)
-        let scoreState = Compressor.makeScoreState(
-            shape: [config.maxBatchSize, coff * ratio, coffHeadDim])
+        let stateShape = [config.maxBatchSize, coff * ratio, coffHeadDim]
+        let kvState: Tensor
+        let scoreState: Tensor
+        if let b = backing {
+            kvState = b.file.tensor(at: b.kvState,
+                                     shape: stateShape, dtype: .f32)
+            scoreState = b.file.tensor(at: b.scoreState,
+                                         shape: stateShape, dtype: .f32)
+            let n = scoreState.count
+            let p = scoreState.buffer.contents()
+                .advanced(by: scoreState.offset)
+                .bindMemory(to: Float.self, capacity: n)
+            for i in 0..<n { p[i] = -Float.infinity }
+        } else {
+            kvState = Tensor.empty(shape: stateShape, dtype: .f32)
+            scoreState = Compressor.makeScoreState(shape: stateShape)
+        }
         return Compressor(config: config, compressRatio: ratio, headDim: headDim, rotate: rotate,
                           ape: ape, wkv: wkv, wgate: wgate, norm: norm,
                           kvState: kvState, scoreState: scoreState)
     }
 
+    /// Backing storage opzionale per l'Indexer: kvCache + sub-compressor.
+    struct IndexerBacking {
+        let file: KVCacheFile
+        let kvCache: KVCacheLayout.Region
+        let compressor: CompressorBacking
+    }
+
     static func loadIndexer(_ loader: WeightLoader, base: String,
                             config: ModelConfig, ratio: Int,
-                            rng: inout MiniRNG) throws -> Indexer {
+                            rng: inout MiniRNG,
+                            backing: IndexerBacking? = nil) throws -> Indexer {
         let wqB = try loadLinear(loader, base: "\(base).wq_b",
                                   inF: config.qLoraRank,
                                   outF: config.indexNHeads * config.indexHeadDim, rng: &rng)
@@ -580,10 +680,18 @@ internal enum AssemblyHelpers {
         let compressor = try loadCompressor(loader, base: "\(base).compressor",
                                              config: config, ratio: ratio,
                                              headDim: config.indexHeadDim,
-                                             rotate: true, rng: &rng)
-        let kvCache = Tensor.empty(shape: [config.maxBatchSize,
-                                            config.maxSeqLen / ratio,
-                                            config.indexHeadDim], dtype: .f32)
+                                             rotate: true, rng: &rng,
+                                             backing: backing?.compressor)
+        let kvCacheShape = [config.maxBatchSize,
+                             config.maxSeqLen / ratio,
+                             config.indexHeadDim]
+        let kvCache: Tensor
+        if let b = backing {
+            kvCache = b.file.tensor(at: b.kvCache,
+                                     shape: kvCacheShape, dtype: .f32)
+        } else {
+            kvCache = Tensor.empty(shape: kvCacheShape, dtype: .f32)
+        }
         return Indexer(config: config, compressRatio: ratio,
                        wqB: wqB, weightsProj: weightsProj,
                        compressor: compressor, kvCache: kvCache)
