@@ -114,6 +114,33 @@ public final class MLA {
         compressor?.releaseState()
     }
 
+    /// Rewind dello stato KV a una position arbitraria. Propaga al
+    /// `Compressor` (che gestisce kvState/scoreState rolling) e
+    /// LASCIA la `kvCache` principale invariata — i suoi entry
+    /// alle position oltre `pos` saranno sovrascritti dal forward
+    /// successivo (entry alle position 0..pos restano valide, sono
+    /// il vero prefix preservato).
+    ///
+    /// `pos` deve essere multiplo del `compressRatio` (se il
+    /// compressor è presente) per garantire rewind safe a window
+    /// boundary. Per i layer puramente sliding-window (no
+    /// compressor), qualsiasi `pos` è OK.
+    ///
+    /// - Returns: `true` se il rewind è riuscito (state coerente
+    ///   con position `pos`), `false` se non possibile (caller
+    ///   deve fare `releaseCache()` + cold-prefill).
+    @discardableResult
+    public func rewindKVTo(pos: Int) -> Bool {
+        guard pos >= 0 else { return false }
+        if let comp = compressor {
+            return comp.rewindStateTo(pos: pos)
+        }
+        // No compressor → puramente sliding window. Niente state
+        // rolling da resettare; il ring buffer si auto-overwrite
+        // al prossimo forward.
+        return true
+    }
+
     /// Re-allocate the main KV cache from a snapshot blob. Used by
     /// the KV-cache restore path (Step B2 onward) so a previously-
     /// computed cache state can be swapped back into a freshly

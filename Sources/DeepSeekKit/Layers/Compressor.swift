@@ -109,6 +109,56 @@ public final class Compressor {
         kvCache = nil
     }
 
+    /// Rewind dello stato accumulato a una position arbitraria `pos`,
+    /// **richiesta multiplo di `compressRatio`** (inizio-window).
+    ///
+    /// Reasoning:
+    /// - Lo `scoreState` / `kvState` rolling accumula valori durante
+    ///   la window [k*ratio, k*ratio + ratio - 1]; emette al
+    ///   (k+1)*ratio - 1 e (con overlap) shift down.
+    /// - Per rewind safe, `pos` deve coincidere con un confine di
+    ///   window: cioè all'inizio della window successiva a un emit.
+    ///   In quel momento lo stato è "pulito" (gli slot dovrebbero
+    ///   essere -inf per scoreState e zero per kvState, riempiti
+    ///   sequenzialmente dal prossimo forward).
+    /// - Se `pos % compressRatio != 0`, rewind impossibile → ritorna
+    ///   `false` (il caller deve fare release+cold-prefill).
+    ///
+    /// Quando ritorna `true`: lo stato è stato resettato. Il
+    /// successivo `forwardDecode(x, startPos: pos)` riempirà gli
+    /// slot da zero in modo coerente.
+    ///
+    /// NB: la kvCache principale (alias slice della parent MLA) NON
+    /// viene toccata — è la MLA che decide quando re-aliasarla.
+    /// Le posizioni `kvCache[(0..pos/ratio)]` restano valide (sono
+    /// dei vecchi emit del prefix che NON è cambiato). Le posizioni
+    /// oltre (cioè `kvCache[pos/ratio..]`) sono stale, ma il forward
+    /// pass le sovrascriverà al prossimo emit.
+    @discardableResult
+    public func rewindStateTo(pos: Int) -> Bool {
+        guard pos >= 0 else { return false }
+        if pos % compressRatio != 0 {
+            // Non aligned al window boundary: rewind non possibile
+            // senza ricostruire mid-window state. Caller fa release.
+            return false
+        }
+        // Reset kvState → 0, scoreState → -inf. Tocca direttamente
+        // la storage CPU-side; storageModeShared sul Apple Silicon
+        // unified memory garantisce visibility immediata alla GPU
+        // al prossimo dispatch.
+        if let s = scoreState {
+            let n = s.count
+            let p = s.buffer.contents().bindMemory(to: Float.self, capacity: n)
+            for i in 0..<n { p[i] = -Float.infinity }
+        }
+        if let s = kvState {
+            let n = s.count
+            let p = s.buffer.contents().bindMemory(to: Float.self, capacity: n)
+            for i in 0..<n { p[i] = 0 }
+        }
+        return true
+    }
+
     /// Restore the rolling decode state from a snapshot. Both tensors
     /// must match `kvStateShape` / `scoreStateShape` (== what the
     /// constructor was given) — KVCacheSnapshot enforces that

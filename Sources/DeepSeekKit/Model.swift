@@ -321,4 +321,41 @@ public final class Transformer {
             m.block.attn.indexer?.releaseCache()
         }
     }
+
+    /// Rewind dello stato KV di tutti i layer a una position `pos`,
+    /// permettendo un prefill incrementale `startPos=pos` invece di
+    /// un full reset + cold prefill. Ispirato alla "common-prefix
+    /// match" di ds4: l'utente edita il proprio last message, il
+    /// prefisso comune ha length P → rewind a P → prefill solo del
+    /// delta.
+    ///
+    /// **Constraint**: `pos` deve essere multiplo del LCM dei
+    /// `compressRatio` di tutti i layer per essere valido in tutti.
+    /// Per V4 (ratios 0/4/128), LCM = 128. Il caller deve già
+    /// passare un valore round-down al LCM.
+    ///
+    /// - Returns: `true` se TUTTI i layer hanno rewindato con
+    ///   successo. `false` se ANCHE UNO ha rifiutato (in quel caso
+    ///   lo stato è incoerente parziale; il caller deve
+    ///   `releaseCache()` per rimettere tutto a zero).
+    @discardableResult
+    public func rewindKVTo(pos: Int) -> Bool {
+        for block in layers {
+            if !block.attn.rewindKVTo(pos: pos) { return false }
+            // Indexer.compressor è un compressor separato col
+            // proprio rolling state — anche quello va rewindato.
+            if let idx = block.attn.indexer,
+               !idx.compressor.rewindStateTo(pos: pos) {
+                return false
+            }
+        }
+        for m in mtp {
+            if !m.block.attn.rewindKVTo(pos: pos) { return false }
+            if let idx = m.block.attn.indexer,
+               !idx.compressor.rewindStateTo(pos: pos) {
+                return false
+            }
+        }
+        return true
+    }
 }

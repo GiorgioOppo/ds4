@@ -72,26 +72,40 @@ final class InferenceService: @unchecked Sendable {
     }
     private var cacheImage: CacheImage?
 
-    /// EXPERIMENTAL: quando true, `generateForConversation` accetta
-    /// anche common-prefix match (non solo strict-prefix). Cioè se
-    /// il nuovo prompt diverge dal cached dopo K token (K > 0),
-    /// invece di full reset+reprefill, riusa la KV cache fino a K
-    /// e prefilla solo i tokens dopo K.
+    /// LCM dei `compressRatio` di tutti i layer del modello V4
+    /// (ratios 0/4/128). Per fare rewind safe della KV cache a una
+    /// position `P`, `P` deve essere multiplo di `compressRatioLCM`
+    /// così tutti i compressor (ratio=4 e ratio=128) trovano un
+    /// inizio-window valido al P. Hard-coded per V4; per modelli
+    /// con altri ratio, andrebbe calcolato dinamicamente dal
+    /// `ModelConfig.compressRatios`.
+    static let compressRatioLCM = 128
+
+    /// Quando true, `generateForConversation` accetta anche
+    /// common-prefix match (non solo strict-prefix). Se il nuovo
+    /// prompt diverge dal cached dopo K token (K > 0), il
+    /// `model.rewindKVTo` resetta esplicitamente kvState/scoreState
+    /// di tutti i compressor al window boundary più vicino
+    /// (pSafe = round_down(K, 128)). Il forward successivo
+    /// ricostruisce coerentemente da pSafe in poi.
     ///
     /// **Caso d'uso**: user edita il proprio ultimo messaggio. Il
-    /// prefisso (system + history messages + i primi token del
-    /// last user message edited) è comune fra cached e nuovo.
+    /// prefisso comune (system + history + first user msg tokens)
+    /// viene preservato.
     ///
-    /// **Rischio**: la KV cache fisica (Compressor.scoreState,
-    /// Attention sliding window) non viene esplicitamente "rewound"
-    /// — affidiamo all'invariante che il forward con `startPos=K`
-    /// SOVRASCRIVE correttamente gli slot alle position K..K+S-1.
-    /// Se l'invariante non regge per qualche edge case (es. window
-    /// boundary mid-rewind, scoreState cross-window accumulation),
-    /// l'output può degradare silenziosamente.
+    /// **Window boundary**: round-down al LCM(compressRatios)=128
+    /// per V4. Significa che common=200 → riusa 128 token e
+    /// ri-prefilla 72; common=150 → riusa 128 e ri-prefilla 22.
+    /// L'overhead è < ratio_max=128 tokens nel caso peggiore.
     ///
-    /// Default OFF per safety. Abilita solo se hai testato a fondo
-    /// il caso d'uso specifico contro un baseline cold-prefill.
+    /// **Safety**: il rewind è esplicito (zero kvState, -inf
+    /// scoreState ai window boundary). Niente "silent degrade"
+    /// da forward overwrite implicito. Se ANCHE UN layer rifiuta
+    /// il rewind, fallback automatico a `releaseCache()` + cold
+    /// prefill.
+    ///
+    /// Default OFF perché non testato end-to-end su GPU reale.
+    /// Quando attivato, monitorare l'output per regressioni.
     public var enableCommonPrefixRewind: Bool = false
 
     /// Holds the snapshot + CacheImage captured around an active
@@ -890,20 +904,39 @@ final class InferenceService: @unchecked Sendable {
                         canReuse = true
                         cachedCount = img.tokens.count
                     } else if self.enableCommonPrefixRewind
-                                && common >= 16
+                                && common >= 128
                                 && common < promptTokens.count
                     {
-                        // Common-prefix con rewind sperimentale.
-                        // Soglia 16: sotto questa il costo del rewind
-                        // (forward path con startPos > 0) supera il
-                        // guadagno vs cold prefill multi-token.
-                        canReuse = true
-                        cachedCount = common
-                        let savedTokens = img.tokens.count - common
-                        continuation.yield(.status(
-                            "Common-prefix rewind: keeping \(common) cached tokens, " +
-                            "discarding \(savedTokens) stale (forward pass will " +
-                            "overwrite). Cold prefill avoided for \(common) tokens."))
+                        // Common-prefix con rewind robusto. Round down
+                        // al multiplo del LCM dei compressRatio del
+                        // modello (= 128 per V4: ratios 0/4/128).
+                        // Inizio-window garantito per tutti i layer →
+                        // `rewindKVTo` può zerare scoreState/kvState
+                        // senza orfani mid-window.
+                        let lcm = Self.compressRatioLCM
+                        let pSafe = (common / lcm) * lcm
+                        if pSafe >= lcm
+                            && model.rewindKVTo(pos: pSafe)
+                        {
+                            canReuse = true
+                            cachedCount = pSafe
+                            let discarded = img.tokens.count - pSafe
+                            let extra = common - pSafe
+                            continuation.yield(.status(
+                                "Common-prefix rewind: keep \(pSafe) cached " +
+                                "tokens (rounded down from \(common) to " +
+                                "multiple of \(lcm)), discard \(discarded) " +
+                                "stale, re-prefill \(extra) extra tokens " +
+                                "to realign window boundary."))
+                        } else {
+                            // Rewind rifiutato da uno o più layer →
+                            // stato potenzialmente parziale, force
+                            // cold reset.
+                            canReuse = false
+                            cachedCount = 0
+                            model.releaseCache()
+                            self.cacheImage = nil
+                        }
                     } else {
                         canReuse = false
                         cachedCount = 0
