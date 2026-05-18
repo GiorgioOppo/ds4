@@ -57,25 +57,57 @@ public struct KVCacheSnapshot {
     /// Disk format magic: 'KVS1' (little-endian uint32).
     public static let diskMagic: UInt32 = 0x4B565331
 
-    /// File version (bump on incompatible format change).
-    public static let diskVersion: UInt32 = 1
+    /// File version. v1 = no compression. v2 = aggiunge `diskDtype`
+    /// per slot per supportare salvataggi quantizzati (F16, BF16,
+    /// ecc.). Reader auto-detects la versione.
+    public static let diskVersionV1: UInt32 = 1
+    public static let diskVersionV2: UInt32 = 2
+
+    /// Compressione opt-in per il salvataggio su disco. La memoria
+    /// in-process resta nei dtype originali (es. F32 per kvState);
+    /// la quantizzazione avviene solo al `save` e la dequantize al
+    /// `load`. Niente kernel Metal richiesto — tutto CPU-side
+    /// (Float16 nativo Swift su Apple Silicon).
+    ///
+    /// Trade-off:
+    ///   - `.f32`: lossless, file size = original.
+    ///   - `.f16`: half precision (11-bit mantissa). ~2× compression.
+    ///     Range overflow possibile su valori > 65504; il save
+    ///     satura silenziosamente. Per KV cache la perdita è
+    ///     percettivamente nulla.
+    ///   - `.bf16`: brain-float16 (7-bit mantissa, stesso esponente
+    ///     di F32). 2× compression, range completo F32 ma
+    ///     precisione ridotta. Implementato via shift bit (no
+    ///     hardware Apple Silicon, ma trivial in Swift).
+    ///
+    /// FP8 / INT8 / INT4 richiedono scale per riga e sono più
+    /// invasive; lasciate come future enhancement.
+    public enum DiskCompression: UInt8, Codable, Sendable {
+        case f32  = 0
+        case f16  = 1
+        case bf16 = 2
+    }
 
     /// Serializza l'intero snapshot in formato binario, scrivibile
-    /// atomicamente a disco. Layout:
+    /// atomicamente a disco. Layout v2:
     ///
-    ///   [ u32 magic 'KVS1' ][ u32 version ][ u32 slotCount ][ u32 reserved ]
+    ///   [u32 magic 'KVS1'][u32 version=2][u32 slotCount][u32 reserved]
     ///   per slot:
-    ///     [ u32 layerIndex ][ u8 isMTP ][ u8 role ][ u8 dtype ][ u8 rank ]
-    ///     [ rank × i32 shape ][ u64 bytesLen ][ bytesLen × u8 raw ]
-    ///   [ u32 endMagic 'KVS1' ]  // sanity check
+    ///     [u32 layerIndex][u8 isMTP][u8 role][u8 origDtype][u8 diskDtype]
+    ///     [u8 rank][3 byte pad][rank × u32 shape dims]
+    ///     [u64 bytesLen][bytesLen × u8 raw]
+    ///   [u32 endMagic 'KVS1']
     ///
-    /// `role` è codificato come ordinal di `SlotRole.allCases` (FUTURE:
-    /// più robusto come stringa, ma per ora ordinal compact).
-    /// `dtype` codificato similarmente.
-    public func encodeForDisk() -> Data {
+    /// `origDtype` è il dtype dell'in-memory tensor (es. F32).
+    /// `diskDtype` è quello effettivamente sul disco (può essere
+    /// uguale o un formato quantizzato). Al load, se diversi, viene
+    /// applicata la dequantizzazione per ripristinare `origDtype`.
+    public func encodeForDisk(compression: DiskCompression = .f32) -> Data {
+        let useV2 = compression != .f32
+        let version = useV2 ? Self.diskVersionV2 : Self.diskVersionV1
         var data = Data(capacity: 16 + totalBytes + slots.count * 32)
         appendUInt32LE(&data, Self.diskMagic)
-        appendUInt32LE(&data, Self.diskVersion)
+        appendUInt32LE(&data, version)
         appendUInt32LE(&data, UInt32(slots.count))
         appendUInt32LE(&data, 0)  // reserved
         for slot in slots {
@@ -83,21 +115,44 @@ public struct KVCacheSnapshot {
             data.append(slot.isMTP ? 1 : 0)
             data.append(UInt8(Self.encodeRole(slot.role)))
             data.append(UInt8(Self.encodeDType(slot.dtype)))
+            if useV2 {
+                // diskDtype byte (1 = F16, 2 = BF16, 0 = same as
+                // origDtype). Applichiamo solo agli slot F32 in
+                // memoria; gli altri restano verbatim.
+                let useDiskCompression = (slot.dtype == .f32) && (compression != .f32)
+                let diskByte: UInt8 = useDiskCompression
+                    ? UInt8(Self.encodeDiskCompression(compression))
+                    : 0
+                data.append(diskByte)
+            }
             data.append(UInt8(slot.shape.count))
+            if useV2 {
+                // Pad 3 bytes per allineamento u32 della shape
+                data.append(0); data.append(0); data.append(0)
+            }
             for d in slot.shape {
                 appendUInt32LE(&data, UInt32(d))
             }
-            appendUInt64LE(&data, UInt64(slot.bytes.count))
-            data.append(slot.bytes)
+            let payload: Data
+            if useV2 && slot.dtype == .f32 && compression != .f32 {
+                payload = Self.quantizeF32Bytes(slot.bytes,
+                                                  to: compression)
+            } else {
+                payload = slot.bytes
+            }
+            appendUInt64LE(&data, UInt64(payload.count))
+            data.append(payload)
         }
         appendUInt32LE(&data, Self.diskMagic)
         return data
     }
 
     /// Salva atomicamente a `url`. Tmp + rename per consistency.
-    public func save(to url: URL) throws {
+    public func save(to url: URL,
+                      compression: DiskCompression = .f32) throws {
         let tmp = url.appendingPathExtension("tmp")
-        try encodeForDisk().write(to: tmp, options: .atomic)
+        try encodeForDisk(compression: compression)
+            .write(to: tmp, options: .atomic)
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
             _ = try fm.replaceItemAt(url, withItemAt: tmp)
@@ -115,7 +170,8 @@ public struct KVCacheSnapshot {
               data.count >= 20 else { return nil }
         var cursor = 0
         guard let magic = readUInt32LE(data, &cursor), magic == diskMagic,
-              let version = readUInt32LE(data, &cursor), version == diskVersion,
+              let version = readUInt32LE(data, &cursor),
+              version == diskVersionV1 || version == diskVersionV2,
               let slotCount = readUInt32LE(data, &cursor),
               let _reserved = readUInt32LE(data, &cursor)
         else { return nil }
@@ -127,10 +183,22 @@ public struct KVCacheSnapshot {
                   let mtpByte = readUInt8(data, &cursor),
                   let roleByte = readUInt8(data, &cursor),
                   let dtypeByte = readUInt8(data, &cursor),
-                  let rank = readUInt8(data, &cursor),
                   let role = decodeRole(Int(roleByte)),
                   let dtype = decodeDType(Int(dtypeByte))
             else { return nil }
+            var diskCompression: DiskCompression = .f32
+            if version == diskVersionV2 {
+                guard let diskByte = readUInt8(data, &cursor),
+                      let comp = decodeDiskCompression(Int(diskByte))
+                else { return nil }
+                diskCompression = comp
+            }
+            guard let rank = readUInt8(data, &cursor) else { return nil }
+            if version == diskVersionV2 {
+                // Skip 3 pad bytes.
+                guard cursor + 3 <= data.count else { return nil }
+                cursor += 3
+            }
             var shape: [Int] = []
             shape.reserveCapacity(Int(rank))
             for _ in 0..<rank {
@@ -140,8 +208,15 @@ public struct KVCacheSnapshot {
             }
             guard let bytesLen = readUInt64LE(data, &cursor) else { return nil }
             guard cursor + Int(bytesLen) <= data.count else { return nil }
-            let bytes = data.subdata(in: cursor..<(cursor + Int(bytesLen)))
+            let rawBytes = data.subdata(in: cursor..<(cursor + Int(bytesLen)))
             cursor += Int(bytesLen)
+            // Dequantize se il disk dtype differisce dall'orig dtype.
+            let bytes: Data
+            if diskCompression != .f32 && dtype == .f32 {
+                bytes = dequantizeToF32Bytes(rawBytes, from: diskCompression)
+            } else {
+                bytes = rawBytes
+            }
             slots.append(Slot(layerIndex: Int(layerIdx),
                                isMTP: mtpByte != 0,
                                role: role, shape: shape,
@@ -152,6 +227,89 @@ public struct KVCacheSnapshot {
               endMagic == diskMagic
         else { return nil }
         return KVCacheSnapshot(slots: slots)
+    }
+
+    // ---- Codifica DiskCompression ----
+
+    private static func encodeDiskCompression(_ c: DiskCompression) -> Int {
+        return Int(c.rawValue)
+    }
+
+    private static func decodeDiskCompression(_ i: Int) -> DiskCompression? {
+        return DiskCompression(rawValue: UInt8(i))
+    }
+
+    // ---- Quantize / dequantize CPU-side ----
+
+    /// Converte un blob F32 in F16 o BF16. Per F16 usa il tipo Swift
+    /// nativo (hardware-accelerated su Apple Silicon). Per BF16 usa
+    /// bit-shift manuale (F32 → BF16 = truncate dei 16 bit bassi
+    /// della mantissa).
+    static func quantizeF32Bytes(_ src: Data,
+                                   to compression: DiskCompression) -> Data {
+        let count = src.count / MemoryLayout<Float>.stride
+        guard count > 0 else { return Data() }
+        return src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
+            let srcPtr = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+            switch compression {
+            case .f32:
+                return src   // no-op
+            case .f16:
+                var out = Data(count: count * 2)
+                out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                    let dst = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<count {
+                        dst[i] = Float16(srcPtr[i])
+                    }
+                }
+                return out
+            case .bf16:
+                var out = Data(count: count * 2)
+                out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                    let dst = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<count {
+                        // F32 → BF16: prendi i 16 bit alti (sign + exp + 7 mantissa).
+                        // Rounding nearest-even sarebbe più accurato; per ora
+                        // truncate (RTZ) — sufficienti per KV cache.
+                        let bits = srcPtr[i].bitPattern
+                        dst[i] = UInt16(truncatingIfNeeded: bits >> 16)
+                    }
+                }
+                return out
+            }
+        }
+    }
+
+    /// Converte un blob F16 o BF16 in F32 (espansione 2×). Usato al
+    /// load dello snapshot per restore in memoria al dtype originale.
+    static func dequantizeToF32Bytes(_ src: Data,
+                                       from compression: DiskCompression) -> Data {
+        let count = src.count / 2
+        guard count > 0 else { return Data() }
+        return src.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
+            var out = Data(count: count * MemoryLayout<Float>.stride)
+            out.withUnsafeMutableBytes { (rawOut: UnsafeMutableRawBufferPointer) in
+                let dst = rawOut.baseAddress!.assumingMemoryBound(to: Float.self)
+                switch compression {
+                case .f32:
+                    // Identity (shouldn't happen but defensive)
+                    let srcF = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+                    for i in 0..<count { dst[i] = srcF[i] }
+                case .f16:
+                    let srcH = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
+                    for i in 0..<count { dst[i] = Float(srcH[i]) }
+                case .bf16:
+                    let srcU = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<count {
+                        // BF16 → F32: shift back into the high half,
+                        // low 16 bits stay zero.
+                        let bits = UInt32(srcU[i]) << 16
+                        dst[i] = Float(bitPattern: bits)
+                    }
+                }
+            }
+            return out
+        }
     }
 
     // ---- Codifica role/dtype ----
