@@ -39,17 +39,36 @@ public struct VocabPruneSpec: Sendable {
     /// statistica di copertura, senza scrivere nulla in `outputDir`.
     public var dryRun: Bool = false
 
+    /// Numero di thread paralleli per la Fase 1 (analyzer). 1 =
+    /// sequenziale (default). Su corpus grossi (molti file)
+    /// scalare a `cpuCount * 2` riduce sensibilmente il tempo.
+    /// `BPETokenizer` è thread-safe (tutte le stored properties
+    /// `let`, NSRegularExpression thread-safe), quindi il parallel
+    /// dispatch è sicuro.
+    public var concurrency: Int = 1
+
+    /// Quando true (default), legge il checkpoint da
+    /// `<outputDir>/.vocab_pruner_checkpoint.json` se esiste e
+    /// coincide col current spec, e riprende da dove si era
+    /// interrotto il job precedente. Quando false, cancella il
+    /// checkpoint e ricomincia da zero.
+    public var resume: Bool = true
+
     public init(inputDir: URL,
                 outputDir: URL,
                 corpus: URL? = nil,
                 coverage: Double = 0.9995,
                 keepIdsFile: URL? = nil,
-                dryRun: Bool = false) {
+                dryRun: Bool = false,
+                concurrency: Int = 1,
+                resume: Bool = true) {
         self.inputDir = inputDir
         self.outputDir = outputDir
         self.corpus = corpus
         self.coverage = coverage
         self.keepIdsFile = keepIdsFile
         self.dryRun = dryRun
+        self.concurrency = concurrency
+        self.resume = resume
     }
 }

@@ -20,6 +20,11 @@ final class VocabPrunerViewModel: ObservableObject {
     @Published var coverage: Double = 0.9995
     /// Se true, solo Fase 1 + statistica copertura; niente scrittura.
     @Published var dryRun: Bool = false
+    /// Numero di thread paralleli per la Fase 1. Default 1.
+    /// Range raccomandato in UI: 1..cpuCount.
+    @Published var concurrency: Int = 1
+    /// Se true (default), riprende dal checkpoint se compatibile.
+    @Published var resumeEnabled: Bool = true
 
     // ---- Runtime state ----
     @Published var status: VocabPruneStatus = VocabPruneStatus()
@@ -29,6 +34,20 @@ final class VocabPrunerViewModel: ObservableObject {
     /// Popolato dalla Fase 1 (analyze) appena prima della Fase 2.
     /// La UI lo legge per la tabella "Dropped tokens preview".
     @Published var lastDecision: KeepDecision? = nil
+
+    /// Info su un checkpoint precedente trovato in `outputDir` con
+    /// spec compatibile (= se eseguiamo "Start" ora, riprenderemo
+    /// invece di ripartire da zero). Aggiornato ad ogni cambio dei
+    /// campi che influenzano l'hash dello spec.
+    @Published var checkpointInfo: CheckpointInfo? = nil
+
+    struct CheckpointInfo: Equatable {
+        let phase: String
+        let savedAt: Date
+        let analyzerFiles: Int
+        let analyzerLines: Int
+        let rewriterShards: Int
+    }
 
     /// Riferimento alla history (passato dal sheet). Nuovi record
     /// sono aggiunti su `.finished`.
@@ -67,7 +86,9 @@ final class VocabPrunerViewModel: ObservableObject {
             corpus: corp,
             coverage: coverage,
             keepIdsFile: nil,
-            dryRun: dryRun)
+            dryRun: dryRun,
+            concurrency: concurrency,
+            resume: resumeEnabled)
 
         isRunning = true
         lastError = nil
@@ -125,5 +146,42 @@ final class VocabPrunerViewModel: ObservableObject {
 
     func cancel() {
         cancellation?.cancel()
+    }
+
+    // MARK: - Checkpoint info
+
+    /// Aggiorna `checkpointInfo` leggendo dal disco. Chiamato dal
+    /// sheet su appear e quando i campi che invalidano l'hash dello
+    /// spec cambiano. Costo: una lettura JSON piccola, idempotente.
+    func refreshCheckpointInfo() {
+        guard let dst = outputDir,
+              let src = inputDir else {
+            checkpointInfo = nil
+            return
+        }
+        let specHash = PruneCheckpoint.computeSpecHash(
+            inputDir: src,
+            corpus: corpus,
+            coverage: coverage)
+        guard let existing = PruneCheckpoint.load(from: dst),
+              existing.specHash == specHash
+        else {
+            checkpointInfo = nil
+            return
+        }
+        checkpointInfo = CheckpointInfo(
+            phase: existing.phase.rawValue,
+            savedAt: existing.savedAt,
+            analyzerFiles: existing.analyzer?.processedFiles.count ?? 0,
+            analyzerLines: existing.analyzer?.linesScanned ?? 0,
+            rewriterShards: existing.rewriter?.completedShards.count ?? 0)
+    }
+
+    /// Cancella il checkpoint dal disco. Usato dal bottone
+    /// "Reset checkpoint" nella UI.
+    func resetCheckpoint() {
+        guard let dst = outputDir else { return }
+        PruneCheckpoint.delete(from: dst)
+        checkpointInfo = nil
     }
 }

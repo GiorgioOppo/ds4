@@ -17,7 +17,13 @@ import Foundation
 ///   - regex split uses NSRegularExpression with the most-common ByteLevel
 ///     pattern; if a tokenizer specifies a different `pretokenizer.pattern.Regex`
 ///     we fall back to that pattern verbatim
-public final class BPETokenizer: Tokenizer {
+/// Tutte le stored properties sono `let` (incluse le
+/// `NSRegularExpression`, thread-safe per concurrent use secondo
+/// la docs Apple). La classe è effettivamente immutabile dopo
+/// `init`; la marca `@unchecked Sendable` permette di chiamare
+/// `encode(_:)` da più thread in parallelo, come fa il
+/// `VocabAnalyzer` quando `concurrency > 1`.
+public final class BPETokenizer: Tokenizer, @unchecked Sendable {
 
     public let vocab: [String: Int]              // token (in byte-encoded unicode) -> id
     public let invVocab: [Int: String]

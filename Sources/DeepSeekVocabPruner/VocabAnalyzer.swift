@@ -101,14 +101,34 @@ public enum VocabAnalyzer {
     /// Esegue l'analisi: tokenizza il corpus, costruisce la curva
     /// cumulativa di copertura, applica i force-include e i
     /// force-exclude, restituisce un `KeepDecision`.
+    ///
+    /// - Parameter concurrency: numero di thread paralleli per la
+    ///   tokenizzazione del corpus. Default 1 (sequenziale). Se >1,
+    ///   i file vengono distribuiti via `DispatchQueue.concurrentPerform`;
+    ///   `BPETokenizer.encode` viene chiamato da più thread (sicuro
+    ///   perché tutte le stored properties sono `let`).
+    /// - Parameter alreadyProcessed: file già contati in una run
+    ///   precedente (resume). Saltati.
+    /// - Parameter partialCounts: count map parziale da una run
+    ///   precedente. Punto di partenza dell'aggregato. Usato insieme
+    ///   ad `alreadyProcessed` per il resume.
+    /// - Parameter onFileDone: callback chiamato dopo aver
+    ///   processato un singolo file. Riceve il path del file più le
+    ///   stats accumulate; usato per scrivere il checkpoint
+    ///   incrementale dal caller.
     public static func analyze(
         tokenizerJSON: URL,
         corpus: URL,
         coverage: Double,
-        onEvent: (VocabPruneEvent) -> Void
+        concurrency: Int = 1,
+        alreadyProcessed: Set<String> = [],
+        partialCounts: [Int: Int] = [:],
+        onFileDone: ((String, Int, Int, [Int: Int]) -> Void)? = nil,
+        onEvent: @escaping (VocabPruneEvent) -> Void
     ) throws -> KeepDecision {
         precondition(coverage > 0 && coverage <= 1.0,
                      "coverage must be in (0, 1]")
+        precondition(concurrency >= 1, "concurrency must be >= 1")
 
         // 1) Carica il tokenizer originale.
         let tokenizer = try Self.loadTokenizer(at: tokenizerJSON)
@@ -116,21 +136,67 @@ public enum VocabAnalyzer {
                               tokenizer.invAddedTokens.keys.max() ?? 0) + 1
 
         // 2) Scan + count: conta le occorrenze di ogni token id.
-        var counts = [Int: Int]()
-        counts.reserveCapacity(totalVocab / 4)
+        let files = try Self.listCorpusFiles(corpus)
+            .filter { !alreadyProcessed.contains($0.url.path) }
+
+        // Inizializza con i partial counts da una run precedente.
+        var counts = partialCounts
+        counts.reserveCapacity(max(counts.count, totalVocab / 4))
         var lines = 0
         var tokens = 0
 
-        try Self.walkCorpus(corpus) { line in
-            let ids = tokenizer.encode(line)
-            for id in ids {
-                counts[id, default: 0] += 1
-                tokens += 1
-            }
-            lines += 1
-            if lines % 5_000 == 0 {
+        if concurrency == 1 || files.count <= 1 {
+            // Path sequenziale (default).
+            for file in files {
+                let (lc, tc, localCounts) = try Self.countTokensInFile(
+                    file.url, isJsonl: file.isJsonl, tokenizer: tokenizer)
+                Self.mergeCounts(localCounts, into: &counts)
+                lines += lc
+                tokens += tc
+                onFileDone?(file.url.path, lc, tc, localCounts)
                 onEvent(.scanned(lines: lines, tokens: tokens))
             }
+        } else {
+            // Path parallelo: DispatchQueue.concurrentPerform su index
+            // file. Ogni thread costruisce il proprio map locale,
+            // merge sotto lock.
+            let lock = NSLock()
+            // Snapshot mutable via class wrapper per condividerlo fra
+            // thread (il `inout` non funziona attraverso closure
+            // concurrentPerform).
+            final class Aggregate: @unchecked Sendable {
+                var counts: [Int: Int]
+                var lines: Int = 0
+                var tokens: Int = 0
+                init(counts: [Int: Int]) { self.counts = counts }
+            }
+            let agg = Aggregate(counts: counts)
+            var caught: Error? = nil
+
+            DispatchQueue.concurrentPerform(iterations: files.count) { idx in
+                let file = files[idx]
+                do {
+                    let (lc, tc, localCounts) = try Self.countTokensInFile(
+                        file.url, isJsonl: file.isJsonl, tokenizer: tokenizer)
+                    lock.lock()
+                    Self.mergeCounts(localCounts, into: &agg.counts)
+                    agg.lines += lc
+                    agg.tokens += tc
+                    let snapshotLines = agg.lines
+                    let snapshotTokens = agg.tokens
+                    lock.unlock()
+                    onFileDone?(file.url.path, lc, tc, localCounts)
+                    onEvent(.scanned(lines: snapshotLines, tokens: snapshotTokens))
+                } catch {
+                    lock.lock()
+                    if caught == nil { caught = error }
+                    lock.unlock()
+                }
+            }
+            if let caught { throw caught }
+            counts = agg.counts
+            lines = agg.lines
+            tokens = agg.tokens
         }
         onEvent(.scanned(lines: lines, tokens: tokens))
 
@@ -243,12 +309,17 @@ public enum VocabAnalyzer {
         return try BPETokenizer(jsonData: data)
     }
 
-    /// Cammina il corpus emettendo le linee al consumer. Supporta:
-    /// - file `.txt` (una linea per record),
-    /// - file `.jsonl` (`{"text": "..."}` per record),
-    /// - directory (walk ricorsivo per `.txt`/`.jsonl`).
-    static func walkCorpus(_ root: URL,
-                            line consumer: (String) throws -> Void) throws {
+    /// Descrittore di un file del corpus.
+    struct CorpusFile: Sendable {
+        let url: URL
+        let isJsonl: Bool
+    }
+
+    /// Elenca i file del corpus senza processarli. Supporta:
+    /// - file singolo `.txt` / `.jsonl`,
+    /// - directory walkata ricorsivamente per `.txt`/`.jsonl`.
+    /// Ritorna l'elenco ordinato per stabilità del resume.
+    static func listCorpusFiles(_ root: URL) throws -> [CorpusFile] {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else {
@@ -256,42 +327,67 @@ public enum VocabAnalyzer {
                           userInfo: [NSLocalizedDescriptionKey:
                                       "Corpus path does not exist: \(root.path)"])
         }
+        var out: [CorpusFile] = []
         if isDir.boolValue {
             guard let it = fm.enumerator(at: root,
                                           includingPropertiesForKeys: nil,
                                           options: [.skipsHiddenFiles]) else {
-                return
+                return []
             }
             for case let url as URL in it {
                 let ext = url.pathExtension.lowercased()
                 if ext == "txt" || ext == "jsonl" {
-                    try Self.readLines(url, consumer: consumer, isJsonl: ext == "jsonl")
+                    out.append(CorpusFile(url: url, isJsonl: ext == "jsonl"))
                 }
             }
         } else {
             let ext = root.pathExtension.lowercased()
-            try Self.readLines(root, consumer: consumer, isJsonl: ext == "jsonl")
+            out.append(CorpusFile(url: root, isJsonl: ext == "jsonl"))
         }
+        out.sort { $0.url.path < $1.url.path }
+        return out
     }
 
-    private static func readLines(_ url: URL,
-                                    consumer: (String) throws -> Void,
-                                    isJsonl: Bool) throws {
+    /// Tokenizza un singolo file e ritorna le statistiche locali.
+    /// Non emette eventi — il caller aggrega e sceglie quando
+    /// notificare.
+    static func countTokensInFile(_ url: URL,
+                                    isJsonl: Bool,
+                                    tokenizer: BPETokenizer)
+        throws -> (lines: Int, tokens: Int, counts: [Int: Int])
+    {
         let data = try Data(contentsOf: url)
         guard let s = String(data: data, encoding: .utf8) else {
-            return  // file binario / encoding non utf-8: skip silently
+            return (0, 0, [:])
         }
+        var counts: [Int: Int] = [:]
+        var lines = 0
+        var tokens = 0
         for raw in s.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = String(raw)
+            let text: String
             if isJsonl {
-                if let bytes = line.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-                   let text = obj["text"] as? String {
-                    try consumer(text)
-                }
+                guard let bytes = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+                      let t = obj["text"] as? String else { continue }
+                text = t
             } else {
-                try consumer(line)
+                text = line
             }
+            let ids = tokenizer.encode(text)
+            for id in ids {
+                counts[id, default: 0] += 1
+                tokens += 1
+            }
+            lines += 1
+        }
+        return (lines, tokens, counts)
+    }
+
+    /// Merge in-place di un count map locale dentro l'aggregato.
+    static func mergeCounts(_ local: [Int: Int], into aggregate: inout [Int: Int]) {
+        for (k, v) in local {
+            aggregate[k, default: 0] += v
         }
     }
 

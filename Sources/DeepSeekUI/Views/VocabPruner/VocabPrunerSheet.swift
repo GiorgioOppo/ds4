@@ -45,7 +45,12 @@ struct VocabPrunerSheet: View {
         .frame(minWidth: 960, minHeight: 700)
         .onAppear {
             vm.history = history
+            vm.refreshCheckpointInfo()
         }
+        .onChange(of: vm.inputDir) { _, _ in vm.refreshCheckpointInfo() }
+        .onChange(of: vm.outputDir) { _, _ in vm.refreshCheckpointInfo() }
+        .onChange(of: vm.corpus) { _, _ in vm.refreshCheckpointInfo() }
+        .onChange(of: vm.coverage) { _, _ in vm.refreshCheckpointInfo() }
     }
 
     // ---- Header ----
@@ -181,6 +186,67 @@ struct VocabPrunerSheet: View {
                 Toggle("Dry-run (solo analisi, nessun output)",
                        isOn: $vm.dryRun)
                     .disabled(vm.isRunning)
+
+                HStack {
+                    Text("Concurrency (Fase 1)")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Stepper(value: $vm.concurrency,
+                             in: 1...max(1, ProcessInfo.processInfo.activeProcessorCount * 2),
+                             step: 1) {
+                        Text("\(vm.concurrency) thread\(vm.concurrency == 1 ? "" : "s")")
+                            .font(.system(.body, design: .monospaced))
+                            .frame(width: 110, alignment: .trailing)
+                    }
+                    .disabled(vm.isRunning)
+                }
+                Text("Tokenizzazione del corpus in parallelo (un thread " +
+                     "per file). 1 = sequenziale. Suggerito \(ProcessInfo.processInfo.activeProcessorCount) " +
+                     "su questo host.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+
+                Toggle("Resume from checkpoint when compatible",
+                       isOn: $vm.resumeEnabled)
+                    .disabled(vm.isRunning)
+                Text("Quando attivo, legge `<output>/.vocab_pruner_checkpoint.json` " +
+                     "e riprende invece di ricominciare. Lo spec hash protegge " +
+                     "da resume con corpus / coverage diversi.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            // Banner che mostra il checkpoint compatibile se trovato.
+            if let info = vm.checkpointInfo {
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "arrow.clockwise.circle.fill")
+                            .foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Checkpoint compatibile trovato").font(.callout.bold())
+                            Text("Phase: \(info.phase). Saved: " +
+                                 "\(info.savedAt.formatted(date: .abbreviated, time: .shortened)).")
+                                .font(.caption)
+                            if info.analyzerFiles > 0 {
+                                Text("Analyzer progress: \(info.analyzerFiles) files, " +
+                                     "\(info.analyzerLines) lines")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if info.rewriterShards > 0 {
+                                Text("Rewriter progress: \(info.rewriterShards) shard(s)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Button("Reset") {
+                            vm.resetCheckpoint()
+                        }
+                        .controlSize(.small)
+                        .disabled(vm.isRunning)
+                    }
+                    .padding(.vertical, 4)
+                }
             }
         }
         .formStyle(.grouped)

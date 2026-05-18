@@ -10,10 +10,19 @@ public enum VocabRewriter {
     /// Esegue il rewriting completo. Idempotente: rifiuta se
     /// `inputDir == outputDir`. Emette `.shardWritten` per ogni
     /// shard processato.
+    ///
+    /// - Parameter alreadyCompletedShards: nomi dei file shard
+    ///   completati in una run precedente (resume). Vengono saltati
+    ///   (read del solo size per accumulare `bytesOut`).
+    /// - Parameter onShardDone: callback chiamato dopo aver scritto
+    ///   con successo uno shard. Riceve il nome del file. Usato dal
+    ///   caller per aggiornare il `PruneCheckpoint` incrementale.
     public static func rewrite(
         inputDir: URL,
         outputDir: URL,
         decision: KeepDecision,
+        alreadyCompletedShards: Set<String> = [],
+        onShardDone: ((String) -> Void)? = nil,
         onEvent: (VocabPruneEvent) -> Void
     ) throws -> (bytesIn: UInt64, bytesOut: UInt64) {
 
@@ -55,12 +64,21 @@ public enum VocabRewriter {
             let attrs = try fm.attributesOfItem(atPath: inURL.path)
             if let sz = attrs[.size] as? UInt64 { bytesIn += sz }
 
-            try rewriteShard(inURL: inURL,
-                              outURL: outURL,
-                              decision: decision)
-
-            let outAttrs = try fm.attributesOfItem(atPath: outURL.path)
-            if let sz = outAttrs[.size] as? UInt64 { bytesOut += sz }
+            if alreadyCompletedShards.contains(shardName)
+                && fm.fileExists(atPath: outURL.path)
+            {
+                // Skip: il shard è già stato scritto in una run
+                // precedente. Conta i bytes per il reporting.
+                if let sz = (try? fm.attributesOfItem(atPath: outURL.path))?
+                    [.size] as? UInt64 { bytesOut += sz }
+            } else {
+                try rewriteShard(inURL: inURL,
+                                  outURL: outURL,
+                                  decision: decision)
+                let outAttrs = try fm.attributesOfItem(atPath: outURL.path)
+                if let sz = outAttrs[.size] as? UInt64 { bytesOut += sz }
+                onShardDone?(shardName)
+            }
 
             // Aggiorna la weight_map per il nuovo index (i nomi non
             // cambiano, restano negli stessi shard).
