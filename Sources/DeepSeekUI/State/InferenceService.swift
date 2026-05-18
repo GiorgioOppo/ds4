@@ -72,14 +72,20 @@ final class InferenceService: @unchecked Sendable {
     }
     private var cacheImage: CacheImage?
 
-    /// LCM dei `compressRatio` di tutti i layer del modello V4
-    /// (ratios 0/4/128). Per fare rewind safe della KV cache a una
-    /// position `P`, `P` deve essere multiplo di `compressRatioLCM`
-    /// così tutti i compressor (ratio=4 e ratio=128) trovano un
-    /// inizio-window valido al P. Hard-coded per V4; per modelli
-    /// con altri ratio, andrebbe calcolato dinamicamente dal
-    /// `ModelConfig.compressRatios`.
-    static let compressRatioLCM = 128
+    /// Default fallback se nessun modello è ancora caricato (es.
+    /// chiamata prematura). Per V4 con ratios `[0,0,4,128,4,128,4,0]`
+    /// il LCM = 128. Il valore vero viene letto runtime da
+    /// `self.loadedConfig.compressRatioLCM` quando disponibile.
+    static let defaultCompressRatioLCM = 128
+
+    /// LCM dei compressRatios del modello correntemente caricato.
+    /// Letto dinamicamente da `loadedConfig` così supportiamo
+    /// modelli con configurazione diversa da V4 standard senza
+    /// bisogno di hard-code.
+    private var currentCompressRatioLCM: Int {
+        return self.loadedConfig?.compressRatioLCM
+            ?? Self.defaultCompressRatioLCM
+    }
 
     /// Quando true, `generateForConversation` accetta anche
     /// common-prefix match (non solo strict-prefix). Se il nuovo
@@ -904,16 +910,17 @@ final class InferenceService: @unchecked Sendable {
                         canReuse = true
                         cachedCount = img.tokens.count
                     } else if self.enableCommonPrefixRewind
-                                && common >= 128
+                                && common >= self.currentCompressRatioLCM
                                 && common < promptTokens.count
                     {
                         // Common-prefix con rewind robusto. Round down
                         // al multiplo del LCM dei compressRatio del
-                        // modello (= 128 per V4: ratios 0/4/128).
+                        // modello (letto dinamicamente dal config:
+                        // 128 per V4 standard 0/4/128 ratios).
                         // Inizio-window garantito per tutti i layer →
                         // `rewindKVTo` può zerare scoreState/kvState
                         // senza orfani mid-window.
-                        let lcm = Self.compressRatioLCM
+                        let lcm = self.currentCompressRatioLCM
                         let pSafe = (common / lcm) * lcm
                         if pSafe >= lcm
                             && model.rewindKVTo(pos: pSafe)

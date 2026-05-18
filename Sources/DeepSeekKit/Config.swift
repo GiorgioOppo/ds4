@@ -437,4 +437,34 @@ public struct ModelConfig: Codable, Sendable {
         s += "}\n"
         return s
     }
+
+    /// LCM dei `compressRatios` non-zero. Usato dal KV-cache rewind:
+    /// per rewindare safely a una position `P` su tutti i layer, `P`
+    /// deve essere multiplo di questo LCM (così tutti i compressor
+    /// — ratio=4, ratio=128, ecc. — trovano un inizio-window valido).
+    ///
+    /// Layer con ratio=0 (pure sliding window, no compressor) non
+    /// vincolano il LCM perché non hanno rolling state da rewindare.
+    /// Se TUTTI i layer hanno ratio=0, ritorna 1 (qualsiasi P è
+    /// valida).
+    ///
+    /// Per V4 con ratios `[0, 0, 4, 128, 4, 128, 4, 0]` → LCM = 128.
+    public var compressRatioLCM: Int {
+        let nonZero = Set(compressRatios.filter { $0 > 0 })
+        if nonZero.isEmpty { return 1 }
+        return nonZero.reduce(1) { Self.lcm($0, $1) }
+    }
+
+    @inline(__always)
+    private static func gcd(_ a: Int, _ b: Int) -> Int {
+        var (x, y) = (abs(a), abs(b))
+        while y != 0 { (x, y) = (y, x % y) }
+        return x
+    }
+
+    @inline(__always)
+    private static func lcm(_ a: Int, _ b: Int) -> Int {
+        if a == 0 || b == 0 { return 0 }
+        return a / gcd(a, b) * b
+    }
 }
