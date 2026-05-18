@@ -13,19 +13,84 @@ struct ProjectsView: View {
     @State private var showCreate: Bool = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .frame(width: 200)
-                .background(Color(NSColor.controlBackgroundColor))
+        VStack(spacing: 0) {
+            globalDefaults
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             Divider()
-            detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack(spacing: 0) {
+                sidebar
+                    .frame(width: 200)
+                    .background(Color(NSColor.controlBackgroundColor))
+                Divider()
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .sheet(isPresented: $showCreate) {
             CreateProjectSheet(library: library) { newID in
                 selectedID = newID
             }
         }
+    }
+
+    // MARK: - global defaults
+
+    /// Default applicato a tutti i progetti che non hanno override.
+    /// Persistito via `@AppStorage` su `AppSettingsKey.projectContextMode`
+    /// e `projectInventoryMaxFiles`. Visibile anche quando nessun
+    /// progetto è selezionato (è una preferenza di livello library).
+    @AppStorage(AppSettingsKey.projectContextMode)
+    private var defaultContextModeRaw: String = ProjectContextMode.pathsOnly.rawValue
+
+    @AppStorage(AppSettingsKey.projectInventoryMaxFiles)
+    private var defaultMaxFiles: Int = 0   // 0 → builder default
+
+    @ViewBuilder
+    private var globalDefaults: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape")
+                    .foregroundStyle(.secondary)
+                Text("Project defaults").font(.subheadline.bold())
+                Spacer()
+            }
+            HStack(spacing: 12) {
+                Picker("Context mode", selection: globalContextModeBinding) {
+                    ForEach(ProjectContextMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 280)
+
+                Text("max files:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Stepper(value: $defaultMaxFiles, in: 0...10_000, step: 50) {
+                    Text(defaultMaxFiles == 0
+                          ? "auto (\(ProjectInventoryBuilder.defaultMaxFiles))"
+                          : "\(defaultMaxFiles)")
+                        .font(.system(.callout, design: .monospaced))
+                        .frame(width: 110, alignment: .trailing)
+                }
+                Spacer()
+            }
+            .controlSize(.small)
+            Text(currentGlobalMode.summary)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var currentGlobalMode: ProjectContextMode {
+        ProjectContextMode(rawValue: defaultContextModeRaw) ?? .pathsOnly
+    }
+
+    private var globalContextModeBinding: Binding<ProjectContextMode> {
+        Binding(
+            get: { currentGlobalMode },
+            set: { defaultContextModeRaw = $0.rawValue })
     }
 
     // MARK: - sidebar

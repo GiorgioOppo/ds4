@@ -26,6 +26,8 @@ struct ProjectDetailView: View {
             Divider()
             sources
             Divider()
+            contextModeSection
+            Divider()
             documentsSection
         }
         .padding(16)
@@ -179,6 +181,92 @@ struct ProjectDetailView: View {
                 .frame(minHeight: 80, maxHeight: 140)
             }
         }
+    }
+
+    // MARK: - context mode (paths-only vs indexed-content)
+
+    /// Sezione di configurazione del `ProjectContextMode` per-progetto.
+    /// Override del default globale (`AppSettings.projectContextMode`).
+    /// Vedi `docs/PROJECTS.md` / `Sources/DeepSeekUI/State/ProjectInventory.swift`.
+    @ViewBuilder
+    private var contextModeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Context mode").font(.headline)
+            Text("Come il progetto viene presentato al modello sulla prima " +
+                 "turn di una chat: paths-only (esplorazione via tool) o " +
+                 "indexed-content (legacy, token injection).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 12) {
+                Picker("Mode", selection: contextModeBinding) {
+                    Text("Use global default")
+                        .tag(Optional<ProjectContextMode>.none)
+                    ForEach(ProjectContextMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName)
+                            .tag(Optional<ProjectContextMode>.some(mode))
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 320)
+                Text("(effective: \(project.effectiveContextMode.displayName))")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+
+            // Mostra il cap solo quando il path-only è effettivamente
+            // attivo (override esplicito o default globale).
+            if project.effectiveContextMode == .pathsOnly {
+                HStack(spacing: 8) {
+                    Text("Max files in inventory:")
+                        .frame(width: 180, alignment: .leading)
+                    Stepper(value: maxFilesBinding,
+                             in: 50...10_000, step: 50) {
+                        Text("\(project.effectiveMaxInventoryFiles)")
+                            .font(.system(.body, design: .monospaced))
+                            .frame(width: 80, alignment: .trailing)
+                    }
+                    if project.maxInventoryFiles != nil {
+                        Button("Reset to global") {
+                            var p = project
+                            p.maxInventoryFiles = nil
+                            library.update(p)
+                        }
+                        .controlSize(.small)
+                    }
+                    Spacer()
+                }
+                .font(.callout)
+            }
+
+            // Spiega cosa fa la modalità effettiva.
+            Text(project.effectiveContextMode.summary)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.top, 4)
+        }
+    }
+
+    /// Binding bidirezionale che salva nel `library` ad ogni modifica.
+    private var contextModeBinding: Binding<ProjectContextMode?> {
+        Binding(
+            get: { project.contextMode },
+            set: { newValue in
+                var p = project
+                p.contextMode = newValue
+                library.update(p)
+            })
+    }
+
+    private var maxFilesBinding: Binding<Int> {
+        Binding(
+            get: { project.effectiveMaxInventoryFiles },
+            set: { newValue in
+                var p = project
+                p.maxInventoryFiles = newValue
+                library.update(p)
+            })
     }
 
     // MARK: - indexed documents
