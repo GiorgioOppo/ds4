@@ -22,6 +22,14 @@ enum AppSettingsKey {
     /// Default: 500. Override per-progetto in
     /// `Project.maxInventoryFiles`.
     static let projectInventoryMaxFiles = "deepseek.projectInventoryMaxFiles"
+
+    /// Preferenza globale per il W8A8 path: quando true (e i pesi
+    /// sono int8), `Linear` quantizza l'attivazione a int8 e usa il
+    /// kernel `gemm_int8_w8a8_*` invece del W8A16 standard. Letta
+    /// dal model loader al momento della costruzione dei Linear —
+    /// non ha effetto a runtime sui modelli già caricati. Default
+    /// false. Vedi `Sources/DeepSeekKit/Layers/Linear.swift`.
+    static let useW8A8Activations = "deepseek.useW8A8Activations"
 }
 
 /// Helper for code paths that need to read defaults without going

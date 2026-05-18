@@ -27,6 +27,8 @@ struct SettingsScene: Scene {
                     .tabItem { Label("Loading", systemImage: "tray.and.arrow.down") }
                 ModelConfigSettingsTab()
                     .tabItem { Label("Model Config", systemImage: "gearshape.2") }
+                QuantizationSettingsTab()
+                    .tabItem { Label("Quantization", systemImage: "rectangle.compress.vertical") }
                 AgentsView(library: agents, mcpPool: mcpPool)
                     .tabItem { Label("Agents", systemImage: "person.2") }
                 ToolsSettingsTab(host: nativeTools)
