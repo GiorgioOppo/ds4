@@ -49,6 +49,7 @@ struct ChatContainer: View {
     @State private var showConvert: Bool = false
     @State private var showFineTune: Bool = false
     @State private var showVocabPruner: Bool = false
+    @State private var showPlayground: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -89,6 +90,13 @@ struct ChatContainer: View {
                             Label("Prune vocab…", systemImage: "scissors")
                         }
                     }
+                    ToolbarItem {
+                        Button {
+                            showPlayground = true
+                        } label: {
+                            Label("OOP playground", systemImage: "puzzlepiece.extension")
+                        }
+                    }
                 }
         }
         .sheet(isPresented: $showConvert) {
@@ -99,6 +107,9 @@ struct ChatContainer: View {
         }
         .sheet(isPresented: $showVocabPruner) {
             VocabPrunerSheet()
+        }
+        .sheet(isPresented: $showPlayground) {
+            PlaygroundSheet()
         }
     }
 
