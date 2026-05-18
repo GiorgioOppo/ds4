@@ -201,6 +201,7 @@ public enum VocabAnalyzer {
                     tokenizer: tokenizer,
                     startLineOffset: resumeOffset,
                     tokenBatchThreshold: tokenBatchThreshold,
+                    cancellation: cancellation,
                     onTokenBatch: { batchLines, batchTokens, deltaCounts,
                                     totalLinesInFile, _ in
                         fileLineOffset = totalLinesInFile
@@ -350,7 +351,8 @@ public enum VocabAnalyzer {
                 let file = files[idx]
                 do {
                     let (lc, tc, localCounts) = try Self.countTokensInFile(
-                        file.url, isJsonl: file.isJsonl, tokenizer: tokenizer)
+                        file.url, isJsonl: file.isJsonl, tokenizer: tokenizer,
+                        cancellation: cancellation)
                     lock.lock()
                     Self.mergeCounts(localCounts, into: &agg.counts)
                     agg.lines += lc
@@ -544,6 +546,7 @@ public enum VocabAnalyzer {
         tokenizer: BPETokenizer,
         startLineOffset: Int = 0,
         tokenBatchThreshold: Int? = nil,
+        cancellation: CancellationToken? = nil,
         onTokenBatch: ((Int, Int, [Int: Int], Int, Int) -> Void)? = nil
     ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
         // mmap esplicito: file > qualche GB non vengono caricati in
@@ -570,7 +573,18 @@ public enum VocabAnalyzer {
             ? allLines.dropFirst(startLineOffset)
             : allLines[allLines.startIndex...]
 
+        var sinceLastCancelCheck = 0
         for raw in toProcess {
+            // Cancellation check ogni 1k linee — indipendente dal
+            // batch threshold (che è opzionale e non usato nel path
+            // parallel multi-file). 1k linee = ~50-500ms su un
+            // tokenizer BPE realistico, sufficiente per cancel
+            // responsive.
+            sinceLastCancelCheck &+= 1
+            if sinceLastCancelCheck >= 1000 {
+                try cancellation?.throwIfCancelled()
+                sinceLastCancelCheck = 0
+            }
             let line = String(raw)
             let text: String
             if isJsonl {
@@ -607,6 +621,10 @@ public enum VocabAnalyzer {
                 batchCounts.removeAll(keepingCapacity: true)
                 batchLines = 0
                 batchTokens = 0
+                // Cancellation check ai flush boundary: gli unici punti
+                // dove il batch è coerente e possiamo bail-out senza
+                // perdere dati parzialmente accumulati.
+                try cancellation?.throwIfCancelled()
             }
         }
         // Flush finale residuo (può essere < threshold).
@@ -745,6 +763,7 @@ public enum VocabAnalyzer {
                     isJsonl: isJsonl,
                     tokenizer: tokenizer,
                     chunkResult: r,
+                    cancellation: cancellation,
                     onTokenProgress: {
                         // Debounce: chiama onProgress al massimo ogni
                         // 200ms (evita storm di callback durante
@@ -831,6 +850,7 @@ public enum VocabAnalyzer {
         isJsonl: Bool,
         tokenizer: BPETokenizer,
         chunkResult: AnalyzerChunkSlot,
+        cancellation: CancellationToken? = nil,
         onTokenProgress: (() -> Void)? = nil
     ) throws {
         var localCounts: [Int: Int] = [:]
@@ -841,6 +861,11 @@ public enum VocabAnalyzer {
         // Inizializza i contatori del chunk a 0 (nel caso di retry).
         chunkResult.lines = 0
         chunkResult.tokens = 0
+
+        // La closure di `withUnsafeBytes` è non-throwing, quindi non
+        // possiamo throw direttamente. Settiamo un flag e lo
+        // controlliamo all'uscita.
+        var cancelled = false
 
         // Body non throws (try? JSONSerialization e' interno), quindi
         // niente `try` esterno; il `throws` della funzione resta per
@@ -882,14 +907,24 @@ public enum VocabAnalyzer {
                 }
                 pos = lineEnd &+ 1   // skip il \n
 
-                // Flush periodico nel chunkResult + progress callback.
+                // Flush periodico nel chunkResult + progress callback +
+                // cancellation check (~ogni 50k token: bilanciamento tra
+                // overhead del check e responsiveness del cancel).
                 if localTokens - lastFlush > 50_000 {
                     chunkResult.lines = localLines
                     chunkResult.tokens = localTokens
                     lastFlush = localTokens
                     onTokenProgress?()
+                    if cancellation?.isCancelled == true {
+                        cancelled = true
+                        return  // esce dal `withUnsafeBytes` closure
+                    }
                 }
             }
+        }
+
+        if cancelled {
+            try cancellation?.throwIfCancelled()
         }
 
         // Final flush dei counts del chunk.
