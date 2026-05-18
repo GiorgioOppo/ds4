@@ -69,8 +69,14 @@ public enum VocabRewriter {
             {
                 // Skip: il shard è già stato scritto in una run
                 // precedente. Conta i bytes per il reporting.
-                if let sz = (try? fm.attributesOfItem(atPath: outURL.path))?
-                    [.size] as? UInt64 { bytesOut += sz }
+                // Split in due statement per evitare l'ambiguità di
+                // type inference su `FileAttributeKey.size`
+                // attraverso optional chaining (stesso pattern di
+                // `ProjectInventoryBuilder.build`).
+                let outAttrs = try? fm.attributesOfItem(atPath: outURL.path)
+                if let sz = outAttrs?[FileAttributeKey.size] as? UInt64 {
+                    bytesOut += sz
+                }
             } else {
                 try rewriteShard(inURL: inURL,
                                   outURL: outURL,
