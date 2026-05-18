@@ -144,7 +144,8 @@ public final class KVCacheFile {
     /// Stamps a brand-new header into the file. Use this when the
     /// cache contents become invalid (model swap, config change, hash
     /// mismatch) — the payload bytes stay on disk but readers will
-    /// treat the cache as empty.
+    /// treat the cache as empty. Cancella anche il manifest companion
+    /// (i token IDs salvati non corrispondono più a niente di valido).
     public func resetHeader(modelPathHash: UInt64) {
         let h = Header(
             version: 1,
@@ -154,6 +155,7 @@ public final class KVCacheFile {
             historyHashHigh: 0,
             modelPathHash: modelPathHash)
         writeHeader(h)
+        deleteManifest()
     }
 
     /// Bumps the prefill checkpoint after a generation step has
@@ -171,6 +173,204 @@ public final class KVCacheFile {
         h.historyHashHigh = historyHashHigh
         h.modelPathHash = modelPathHash
         writeHeader(h)
+    }
+
+    /// Tronca il prefill checkpoint ad `N` token senza zeroare il
+    /// payload. Usato dal prefix-matching: quando il nuovo prompt
+    /// condivide solo `N` token col cache salvato, scartiamo
+    /// virtualmente quelli oltre `N` senza dover invalidare l'intero
+    /// cache. Le pagine del payload oltre `N` saranno sovrascritte
+    /// dal prossimo prefill (qualunque sia il loro contenuto attuale).
+    public func truncatePrefilledTo(_ newCount: UInt64,
+                                      historyHashLow: UInt64,
+                                      historyHashHigh: UInt64) {
+        var h = currentHeader()
+        guard h.version != 0, newCount <= h.prefilledTokens else {
+            return
+        }
+        h.prefilledTokens = newCount
+        h.historyHashLow = historyHashLow
+        h.historyHashHigh = historyHashHigh
+        writeHeader(h)
+    }
+
+    // ---- token manifest (companion file) ----
+
+    /// URL del file companion che memorizza la lista dei token IDs
+    /// dei `prefilledTokens` del cache. Layout binario:
+    ///
+    ///   [ u32 magic 'KVM1' ][ u32 version=1 ][ u64 count ][ count × i32 token_ids ]
+    ///
+    /// File separato dal `KVCacheFile` principale per evitare
+    /// vincoli di alignment col payload (Metal buffer page-aligned)
+    /// e per permettere update atomico via tmp+rename indipendente.
+    public var manifestURL: URL {
+        url.appendingPathExtension("manifest")
+    }
+
+    /// Magic identifier per il manifest file: 'KVM1' big-endian.
+    public static let manifestMagic: UInt32 = 0x4B564D31
+
+    /// Carica la lista dei token IDs dal manifest companion. Ritorna
+    /// `nil` se il manifest non esiste, è corrotto, o ha versione
+    /// incompatibile. Letto in un colpo solo (file piccolo: 32k token
+    /// = 128 KB).
+    public func readManifest() -> [Int32]? {
+        guard let data = try? Data(contentsOf: manifestURL),
+              data.count >= 16 else {
+            return nil
+        }
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> [Int32]? in
+            guard let base = raw.baseAddress else { return nil }
+            let magic = base.load(fromByteOffset: 0, as: UInt32.self)
+            let version = base.load(fromByteOffset: 4, as: UInt32.self)
+            let count = base.load(fromByteOffset: 8, as: UInt64.self)
+            guard magic == Self.manifestMagic,
+                  version == 1,
+                  16 + Int(count) * 4 <= data.count
+            else { return nil }
+            let tokenPtr = base.advanced(by: 16)
+                .assumingMemoryBound(to: Int32.self)
+            return Array(UnsafeBufferPointer(start: tokenPtr, count: Int(count)))
+        }
+    }
+
+    /// Scrive (sovrascrive atomicamente) il manifest dei token IDs
+    /// che corrispondono al payload attuale. Da chiamare ogni volta
+    /// che `prefilledTokens` cambia. Atomic via tmp+rename per non
+    /// lasciare il manifest in stato incoerente se il processo crasha
+    /// durante la scrittura.
+    public func writeManifest(_ tokens: [Int32]) throws {
+        var data = Data(capacity: 16 + tokens.count * 4)
+        var magic = Self.manifestMagic.littleEndian
+        var version = UInt32(1).littleEndian
+        var count = UInt64(tokens.count).littleEndian
+        withUnsafeBytes(of: &magic)   { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &version) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &count)   { data.append(contentsOf: $0) }
+        tokens.withUnsafeBufferPointer { p in
+            let byteCount = p.count * MemoryLayout<Int32>.stride
+            let bytePtr = UnsafeRawPointer(p.baseAddress!)
+                .assumingMemoryBound(to: UInt8.self)
+            data.append(bytePtr, count: byteCount)
+        }
+        let tmp = manifestURL.appendingPathExtension("tmp")
+        try data.write(to: tmp, options: .atomic)
+        // .atomic write già garantisce atomicità su un singolo path;
+        // ma noi usiamo un companion `.tmp` perché vogliamo che il
+        // rename finale sia esplicito (tracciabile in case di crash
+        // mid-rename) e perché Foundation potrebbe usare una strategia
+        // diversa per file piccoli. Sostituzione atomica via
+        // FileManager.replaceItem se il path esiste.
+        let fm = FileManager.default
+        if fm.fileExists(atPath: manifestURL.path) {
+            _ = try fm.replaceItemAt(manifestURL, withItemAt: tmp)
+        } else {
+            try fm.moveItem(at: tmp, to: manifestURL)
+        }
+    }
+
+    /// Cancella il manifest. Usato quando il cache viene resettato
+    /// (es. `resetHeader`).
+    public func deleteManifest() {
+        try? FileManager.default.removeItem(at: manifestURL)
+    }
+
+    /// Calcola la lunghezza del prefisso comune fra i token salvati
+    /// nel manifest e `newTokens`. Ritorna 0 se il manifest non
+    /// esiste o se il primo token differisce. O(min(savedCount,
+    /// newTokens.count)) — un singolo scan lineare.
+    ///
+    /// Caso d'uso: chat multi-turn. La nuova turn dell'utente ha
+    /// in testa il system prompt + tutti i message precedenti
+    /// (identici al cache salvato) e termina con il nuovo user
+    /// message + new assistant message-start. Il common prefix è
+    /// "tutto fino al new user message" — possiamo skippare il
+    /// prefill di quei token e ripartire da lì.
+    public func commonPrefixLength(with newTokens: [Int32]) -> Int {
+        guard let saved = readManifest() else { return 0 }
+        let limit = min(saved.count, newTokens.count)
+        var i = 0
+        while i < limit && saved[i] == newTokens[i] {
+            i += 1
+        }
+        return i
+    }
+
+    /// Outcome del tentativo di resume da cache.
+    public enum ResumeOutcome: Equatable {
+        /// Nessun manifest, hash mismatch, o common prefix sotto la
+        /// soglia minima. Cache da considerare invalida; ripartire
+        /// da zero (prefill di tutti i `newTokens`).
+        case invalid
+        /// Match parziale: i primi `tokens` del nuovo prompt sono
+        /// coperti dal cache. Il caller deve fare prefill solo dei
+        /// rimanenti `newTokens[tokens..<]`.
+        case partial(tokens: Int)
+        /// Match esatto: tutti i nuovi token sono già nel cache.
+        /// Stato raro (la nuova turn ha esattamente lo stesso prompt
+        /// della precedente) ma valido — il caller può saltare il
+        /// prefill interamente.
+        case full
+    }
+
+    /// Tenta il resume da un cache salvato. Combina la validazione
+    /// degli hash globali (modelPathHash) + lookup del prefix
+    /// matching nel manifest + truncate del checkpoint al common
+    /// prefix.
+    ///
+    /// - Parameter newTokens: la sequenza di token che vogliamo
+    ///   processare in questa turn (dal system prompt al new message
+    ///   start, incluso).
+    /// - Parameter modelPathHash: hash della path del modello
+    ///   attuale; deve corrispondere a quanto nel cache.
+    /// - Parameter minPrefixTokens: numero minimo di token in
+    ///   prefisso comune per considerare il resume utile. Default 16:
+    ///   sotto questa soglia il cost di lookup supera il guadagno.
+    /// - Returns: outcome che dice quanti token sono già coperti.
+    ///   Se `.partial`, il header viene già aggiornato (truncate)
+    ///   per riflettere il nuovo prefilledTokens; il caller può
+    ///   procedere col prefill del resto.
+    public func attemptResume(newTokens: [Int32],
+                                modelPathHash: UInt64,
+                                minPrefixTokens: Int = 16)
+        -> ResumeOutcome
+    {
+        let h = readHeader()
+        guard h.version == 1,
+              h.modelPathHash == modelPathHash,
+              h.payloadBytes == UInt64(payloadBytes),
+              h.prefilledTokens > 0
+        else {
+            return .invalid
+        }
+        let common = commonPrefixLength(with: newTokens)
+        if common == 0 || common < minPrefixTokens {
+            return .invalid
+        }
+        // Compute new history hash for the truncated prefix using
+        // a simple FNV-1a 128-bit-like roll over the first `common`
+        // tokens. La caller può riusare il valore al successivo
+        // writeManifest per coerenza.
+        var hLow: UInt64 = 0xcbf29ce484222325
+        var hHigh: UInt64 = 0x84222325cbf29ce4
+        for i in 0..<common {
+            let t = UInt64(bitPattern: Int64(newTokens[i]))
+            hLow ^= t
+            hLow = hLow &* 0x100000001b3
+            hHigh ^= t.byteSwapped
+            hHigh = hHigh &* 0x100000001b3
+        }
+        if common == newTokens.count {
+            truncatePrefilledTo(UInt64(common),
+                                 historyHashLow: hLow,
+                                 historyHashHigh: hHigh)
+            return .full
+        }
+        truncatePrefilledTo(UInt64(common),
+                             historyHashLow: hLow,
+                             historyHashHigh: hHigh)
+        return .partial(tokens: common)
     }
 
     // ---- payload access ----
