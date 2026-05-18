@@ -51,6 +51,7 @@ public enum VocabPruner {
             onEvent(.coverage(pct: decision.coveragePct,
                               kept: decision.keepIds.count,
                               total: decision.oldVocabSize))
+            onEvent(.decisionReady(decision))
         } else {
             guard let corpus = spec.corpus else {
                 throw NSError(domain: "VocabPruner", code: 2,
@@ -64,6 +65,7 @@ public enum VocabPruner {
                 corpus: corpus,
                 coverage: spec.coverage,
                 onEvent: onEvent)
+            onEvent(.decisionReady(decision))
             onEvent(.log("Phase 1 done: kept \(decision.keepIds.count) " +
                           "of \(decision.oldVocabSize) " +
                           "(new vocab_size = \(decision.newVocabSize))"))

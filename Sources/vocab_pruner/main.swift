@@ -141,6 +141,17 @@ final class StatusPrinter: @unchecked Sendable {
             let line = "  coverage: \(pctStr) — keeping \(kept) of \(total) tokens"
             FileHandle.standardError.write("\n\(line)\n".data(using: .utf8)!)
             lastScannedLine = ""
+        case .decisionReady(let decision):
+            // CLI: log compatto del top-5 dropped per dare visibilità
+            // del prunin a chi non guarda la GUI.
+            let preview = decision.previewDropped.prefix(5)
+            if !preview.isEmpty {
+                let head = preview.map { "  - '\($0.content)' (id=\($0.id), count=\($0.count))" }
+                    .joined(separator: "\n")
+                FileHandle.standardError.write(
+                    "  top-5 dropped tokens (by frequency):\n\(head)\n"
+                        .data(using: .utf8)!)
+            }
         case .shardWritten(let i, let total):
             lastShardLine = "  shard \(i)/\(total)"
             FileHandle.standardError.write("\r\(lastShardLine)".data(using: .utf8)!)

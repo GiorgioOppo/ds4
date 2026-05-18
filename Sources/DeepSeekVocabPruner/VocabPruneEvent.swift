@@ -17,6 +17,13 @@ public enum VocabPruneEvent: Sendable {
     /// vocabolario originale.
     case coverage(pct: Double, kept: Int, total: Int)
 
+    /// Fase 1 — decisione completa pronta. Pubblicato subito dopo
+    /// `coverage` e prima del primo `shardWritten`. Permette alla
+    /// UI di leggere `previewDropped` per la tabella "anteprima
+    /// dei token tagliati" e di mostrare i count di vocab/merges
+    /// senza dover aprire il `keep_ids.json` scritto su disco.
+    case decisionReady(KeepDecision)
+
     /// Fase 2 — uno shard di safetensors scritto. `i` è 1-based.
     case shardWritten(i: Int, total: Int)
 
@@ -56,6 +63,10 @@ public struct VocabPruneStatus: Sendable, Equatable {
             coveragePct = pct
             keptVocab = kept
             totalVocab = total
+        case .decisionReady:
+            // La status non tiene il decision (e' pesante); chi lo
+            // vuole sottoscrive l'evento direttamente.
+            break
         case .shardWritten(let i, let total):
             shardsWritten = i
             shardsTotal = total

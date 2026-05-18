@@ -26,6 +26,14 @@ final class VocabPrunerViewModel: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var lastError: String? = nil
 
+    /// Popolato dalla Fase 1 (analyze) appena prima della Fase 2.
+    /// La UI lo legge per la tabella "Dropped tokens preview".
+    @Published var lastDecision: KeepDecision? = nil
+
+    /// Riferimento alla history (passato dal sheet). Nuovi record
+    /// sono aggiunti su `.finished`.
+    weak var history: VocabPruneHistory? = nil
+
     private var task: Task<Void, Never>? = nil
     private var cancellation: CancellationToken? = nil
 
@@ -67,14 +75,16 @@ final class VocabPrunerViewModel: ObservableObject {
         let token = CancellationToken()
         self.cancellation = token
 
+        // Capture references for the closure (sendable hop).
+        let specCopy = spec
         self.task = Task { [weak self] in
             do {
                 try await VocabPruner.run(
-                    spec: spec,
+                    spec: specCopy,
                     cancellation: token,
                     onEvent: { [weak self] event in
                         Task { @MainActor in
-                            self?.status.apply(event)
+                            self?.handle(event: event, spec: specCopy)
                         }
                     })
                 await MainActor.run { [weak self] in
@@ -89,6 +99,27 @@ final class VocabPrunerViewModel: ObservableObject {
                         ?? error.localizedDescription
                 }
             }
+        }
+    }
+
+    private func handle(event: VocabPruneEvent, spec: VocabPruneSpec) {
+        status.apply(event)
+        switch event {
+        case .decisionReady(let decision):
+            self.lastDecision = decision
+        case .finished(let bytesIn, let bytesOut, let vIn, let vOut):
+            history?.add(VocabPruneRecord(
+                inputDir: spec.inputDir.path,
+                outputDir: spec.outputDir.path,
+                corpus: spec.corpus?.path,
+                coverage: spec.coverage,
+                oldVocabSize: vIn,
+                newVocabSize: vOut,
+                bytesIn: bytesIn,
+                bytesOut: bytesOut,
+                dryRun: spec.dryRun))
+        default:
+            break
         }
     }
 

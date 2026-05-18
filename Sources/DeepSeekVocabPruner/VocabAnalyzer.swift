@@ -1,6 +1,20 @@
 import Foundation
 import DeepSeekKit
 
+/// Preview di un singolo token droppato dall'analyzer. Il content
+/// è la stringa byte-encoded come appare nel vocab originale (es.
+/// `ĠBuongiorno` per "Buongiorno" preceduto da spazio).
+public struct DroppedTokenPreview: Sendable, Codable, Equatable {
+    public let id: Int
+    public let content: String
+    public let count: Int
+    public init(id: Int, content: String, count: Int) {
+        self.id = id
+        self.content = content
+        self.count = count
+    }
+}
+
 /// Decisione di pruning prodotta da `VocabAnalyzer`: chi tiene,
 /// chi va via, e la mappatura old→new ID.
 public struct KeepDecision: Sendable, Codable {
@@ -21,22 +35,33 @@ public struct KeepDecision: Sendable, Codable {
     /// Copertura cumulativa raggiunta (0..1).
     public let coveragePct: Double
 
+    /// Top-N (default 50) dei token che sono stati droppati ma che
+    /// AVEVANO una frequenza nel corpus. Utile come "anteprima
+    /// dell'impatto" nella UI / dry-run. Non include i token che
+    /// sono stati droppati dal force-exclude (script foreign) e che
+    /// avevano count 0 nel corpus — quelli sono virtualmente
+    /// infiniti e poco informativi.
+    public let previewDropped: [DroppedTokenPreview]
+
     public init(keepIds: [Int],
                 oldToNew: [Int: Int],
                 newVocabSize: Int,
                 oldVocabSize: Int,
-                coveragePct: Double) {
+                coveragePct: Double,
+                previewDropped: [DroppedTokenPreview] = []) {
         self.keepIds = keepIds
         self.oldToNew = oldToNew
         self.newVocabSize = newVocabSize
         self.oldVocabSize = oldVocabSize
         self.coveragePct = coveragePct
+        self.previewDropped = previewDropped
     }
 
     // Codable custom per `[Int: Int]` (Codable di default usa
     // String keys; lo serializziamo come due array paralleli).
     private enum CodingKeys: String, CodingKey {
-        case keepIds, oldToNewKeys, oldToNewValues, newVocabSize, oldVocabSize, coveragePct
+        case keepIds, oldToNewKeys, oldToNewValues, newVocabSize,
+             oldVocabSize, coveragePct, previewDropped
     }
 
     public init(from decoder: Decoder) throws {
@@ -50,6 +75,8 @@ public struct KeepDecision: Sendable, Codable {
         self.newVocabSize = try c.decode(Int.self, forKey: .newVocabSize)
         self.oldVocabSize = try c.decode(Int.self, forKey: .oldVocabSize)
         self.coveragePct = try c.decode(Double.self, forKey: .coveragePct)
+        self.previewDropped = (try? c.decode([DroppedTokenPreview].self,
+                                              forKey: .previewDropped)) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -61,6 +88,7 @@ public struct KeepDecision: Sendable, Codable {
         try c.encode(newVocabSize, forKey: .newVocabSize)
         try c.encode(oldVocabSize, forKey: .oldVocabSize)
         try c.encode(coveragePct, forKey: .coveragePct)
+        try c.encode(previewDropped, forKey: .previewDropped)
     }
 }
 
@@ -160,12 +188,26 @@ public enum VocabAnalyzer {
             totalVocab: totalVocab)
 
         let newVocabSize = (oldToNew.values.max() ?? -1) + 1
+
+        // Top-N dropped per UI / dry-run preview.
+        let droppedIds = Set(counts.keys).subtracting(finalKeep)
+        let preview: [DroppedTokenPreview] = droppedIds
+            .compactMap { id -> DroppedTokenPreview? in
+                guard let count = counts[id],
+                      let token = tokenizer.invVocab[id] else { return nil }
+                return DroppedTokenPreview(id: id, content: token, count: count)
+            }
+            .sorted { $0.count > $1.count }
+            .prefix(50)
+            .map { $0 }
+
         return KeepDecision(
             keepIds: finalKeep.sorted(),
             oldToNew: oldToNew,
             newVocabSize: newVocabSize,
             oldVocabSize: totalVocab,
-            coveragePct: pct)
+            coveragePct: pct,
+            previewDropped: preview)
     }
 
     /// Costruisce la mappa oldId→newId. Gli ID in `preserveIds`

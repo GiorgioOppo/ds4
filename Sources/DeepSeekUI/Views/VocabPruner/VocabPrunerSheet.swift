@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import DeepSeekVocabPruner
 
 /// Modal sheet per il vocab pruning italiano-only. Tre pannelli:
@@ -11,26 +12,40 @@ import DeepSeekVocabPruner
 /// nessun environment object necessario.
 struct VocabPrunerSheet: View {
     @StateObject private var vm = VocabPrunerViewModel()
+    @StateObject private var history = VocabPruneHistory()
     @Environment(\.dismiss) private var dismiss
+    @State private var corpusDropTargeted: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                form
-                    .padding(20)
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ScrollView {
+                        form
+                            .padding(20)
+                    }
+                    .frame(minHeight: 280)
+                    Divider()
+                    progressArea
+                        .padding(16)
+                        .frame(minHeight: 240)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                historyPane
+                    .frame(width: 240)
+                    .background(Color(NSColor.controlBackgroundColor))
             }
-            .frame(minHeight: 280)
-            Divider()
-            progressArea
-                .padding(16)
-                .frame(minHeight: 220)
             Divider()
             footer
                 .padding(12)
         }
-        .frame(minWidth: 720, minHeight: 640)
+        .frame(minWidth: 960, minHeight: 700)
+        .onAppear {
+            vm.history = history
+        }
     }
 
     // ---- Header ----
@@ -111,7 +126,7 @@ struct VocabPrunerSheet: View {
             Section("Corpus") {
                 LabeledContent("Path") {
                     HStack {
-                        Text(vm.corpus?.path ?? "—")
+                        Text(vm.corpus?.path ?? (corpusDropTargeted ? "Drop here…" : "—"))
                             .font(.system(.body, design: .monospaced))
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -122,9 +137,27 @@ struct VocabPrunerSheet: View {
                         }
                         .disabled(vm.isRunning)
                     }
+                    .padding(4)
+                    .background(corpusDropTargeted
+                                 ? Color.accentColor.opacity(0.18)
+                                 : Color.clear)
+                    .cornerRadius(4)
+                    .onDrop(of: [.fileURL],
+                            isTargeted: $corpusDropTargeted) { providers in
+                        guard let provider = providers.first, !vm.isRunning
+                        else { return false }
+                        _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                            guard let url = url else { return }
+                            DispatchQueue.main.async {
+                                vm.corpus = url
+                            }
+                        }
+                        return true
+                    }
                 }
                 Text("File `.txt` / `.jsonl` o directory walkata ricorsivamente. " +
-                     "Per JSONL ci si aspetta `{\"text\": \"...\"}` per linea.")
+                     "Per JSONL ci si aspetta `{\"text\": \"...\"}` per linea. " +
+                     "Anche drag-and-drop da Finder.")
                     .font(.caption).foregroundStyle(.tertiary)
             }
 
@@ -215,8 +248,148 @@ struct VocabPrunerSheet: View {
                     .padding(.top, 4)
             }
 
+            // Tabella preview dei token droppati (top-N dal corpus).
+            if let decision = vm.lastDecision, !decision.previewDropped.isEmpty {
+                droppedTokensTable(decision: decision)
+            }
+
             // Log.
             logView
+        }
+    }
+
+    @ViewBuilder
+    private func droppedTokensTable(decision: KeepDecision) -> some View {
+        DisclosureGroup {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(decision.previewDropped.prefix(20), id: \.id) { entry in
+                        HStack(spacing: 8) {
+                            Text("'\(entry.content)'")
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                            Spacer()
+                            Text("id=\(entry.id)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                            Text("×\(entry.count)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 60, alignment: .trailing)
+                        }
+                    }
+                    if decision.previewDropped.count > 20 {
+                        Text("…and \(decision.previewDropped.count - 20) more")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 160)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "trash.slash")
+                Text("Top \(min(20, decision.previewDropped.count)) " +
+                     "dropped tokens by frequency")
+                    .font(.callout)
+            }
+        }
+    }
+
+    // ---- History pane ----
+
+    @ViewBuilder
+    private var historyPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("History").font(.subheadline.bold())
+                Spacer()
+                if !history.records.isEmpty {
+                    Button {
+                        history.clear()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("Clear history")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            Divider()
+
+            if history.records.isEmpty {
+                VStack(spacing: 4) {
+                    Image(systemName: "clock.badge.questionmark")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.tertiary)
+                    Text("No prior runs")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(history.records) { rec in
+                            historyRow(rec)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func historyRow(_ rec: VocabPruneRecord) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(rec.timestamp.formatted(date: .abbreviated,
+                                              time: .shortened))
+                    .font(.caption.bold())
+                Spacer()
+                if rec.dryRun {
+                    Text("dry")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 4)
+                        .background(Color.gray.opacity(0.2))
+                        .cornerRadius(3)
+                }
+            }
+            Text((rec.outputDir as NSString).lastPathComponent)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+            HStack(spacing: 4) {
+                Text("\(rec.oldVocabSize)").font(.caption2.monospaced())
+                Image(systemName: "arrow.right").font(.system(size: 8))
+                Text("\(rec.newVocabSize)").font(.caption2.monospaced())
+                Spacer()
+                if rec.bytesOut > 0 {
+                    Text(formatBytes(rec.bytesOut))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(6)
+        .background(Color(NSColor.textBackgroundColor))
+        .cornerRadius(4)
+        .contextMenu {
+            Button("Reuse paths") {
+                vm.inputDir = URL(fileURLWithPath: rec.inputDir)
+                vm.outputDir = URL(fileURLWithPath: rec.outputDir)
+                if let c = rec.corpus {
+                    vm.corpus = URL(fileURLWithPath: c)
+                }
+                vm.coverage = rec.coverage
+            }
+            Button("Remove", role: .destructive) {
+                history.remove(rec.id)
+            }
         }
     }
 
