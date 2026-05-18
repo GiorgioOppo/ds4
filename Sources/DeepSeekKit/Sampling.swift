@@ -232,10 +232,14 @@ public enum Sampler {
 
         var arr = logits.toFloatArray()
 
-        // 1. Temperature.
+        // 1. Temperature — vectorized via vDSP_vsmul (~3-5× faster
+        //    than the per-element Swift loop for V=130k).
         if options.temperature > 0 && options.temperature != 1.0 {
-            let inv = 1.0 / max(options.temperature, 1e-5)
-            for i in 0..<V { arr[i] *= inv }
+            var inv = 1.0 / max(options.temperature, 1e-5)
+            arr.withUnsafeMutableBufferPointer { p in
+                vDSP_vsmul(p.baseAddress!, 1, &inv,
+                            p.baseAddress!, 1, vDSP_Length(V))
+            }
         }
 
         // 2a. Repetition penalty: divide positive logits by penalty (and
@@ -340,9 +344,24 @@ public enum Sampler {
         arr.withUnsafeBufferPointer { p in
             vDSP_maxv(p.baseAddress!, 1, &m, vDSP_Length(V))
         }
-        // shifted[i] = Double(arr[i] - m); -infinity passa through.
+        // shifted[i] = Double(arr[i] - m), vectorized in due pass
+        // SIMD (vDSP_vsadd shift Float + vDSP_vspdp Float→Double).
+        // -infinity passa through entrambi i pass.
+        let n64 = vDSP_Length(V)
+        var negM = -m
+        var shiftedF = [Float](repeating: 0, count: V)
+        arr.withUnsafeBufferPointer { src in
+            shiftedF.withUnsafeMutableBufferPointer { dst in
+                vDSP_vsadd(src.baseAddress!, 1, &negM,
+                            dst.baseAddress!, 1, n64)
+            }
+        }
         var shifted = [Double](repeating: 0, count: V)
-        for i in 0..<V { shifted[i] = Double(arr[i] - m) }
+        shiftedF.withUnsafeBufferPointer { srcF in
+            shifted.withUnsafeMutableBufferPointer { dstD in
+                vDSP_vspdp(srcF.baseAddress!, 1, dstD.baseAddress!, 1, n64)
+            }
+        }
 
         var probs = [Double](repeating: 0, count: V)
         var n = Int32(V)
@@ -495,12 +514,26 @@ public enum Sampler {
             vDSP_maxv(p.baseAddress!, 1, &m, vDSP_Length(V))
         }
 
-        // 2) shifted[i] = Double(arr[i] - m). Per i = -infinity in
-        //    arr, shifted[i] resta -infinity (così vvexp ritorna 0,
-        //    semantica del vecchio loop "treats as zero mass").
+        // 2) shifted[i] = Double(arr[i] - m), vectorized in due
+        //    pass SIMD: (a) `vDSP_vsadd` per la shift Float, (b)
+        //    `vDSP_vspdp` per promozione Float→Double. Per
+        //    -infinity in input: lo shift preserva -infinity,
+        //    la promozione preserva -infinity → vvexp ritorna 0
+        //    (semantica del vecchio loop "treats as zero mass").
+        let n64 = vDSP_Length(V)
+        var negM = -m
+        var shiftedF = [Float](repeating: 0, count: V)
+        arr.withUnsafeBufferPointer { src in
+            shiftedF.withUnsafeMutableBufferPointer { dst in
+                vDSP_vsadd(src.baseAddress!, 1, &negM,
+                            dst.baseAddress!, 1, n64)
+            }
+        }
         var shifted = [Double](repeating: 0, count: V)
-        for i in 0..<V {
-            shifted[i] = Double(arr[i] - m)
+        shiftedF.withUnsafeBufferPointer { srcF in
+            shifted.withUnsafeMutableBufferPointer { dstD in
+                vDSP_vspdp(srcF.baseAddress!, 1, dstD.baseAddress!, 1, n64)
+            }
         }
 
         // 3) exp per-element via vForce.
