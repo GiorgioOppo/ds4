@@ -262,7 +262,10 @@ struct VocabPrunerSheet: View {
             HStack {
                 Text("Progress").font(.headline)
                 Spacer()
-                if vm.isRunning {
+                if vm.isCancelling {
+                    Label("Cancelling…", systemImage: "xmark.circle")
+                        .foregroundStyle(.orange)
+                } else if vm.isRunning {
                     ProgressView().controlSize(.small)
                 } else if vm.status.finishedAt != nil {
                     Label("Done", systemImage: "checkmark.seal.fill")
@@ -271,12 +274,17 @@ struct VocabPrunerSheet: View {
             }
 
             // Progress bar: significativa solo in Fase 2 (shard).
+            // Durante il cancel la mostriamo dimmed per segnalare
+            // visivamente che è "frozen" — gli eventi continuano ad
+            // arrivare ma `handle()` li scarta finché il task non
+            // rilascia.
             if vm.status.shardsTotal > 0 {
                 ProgressView(value: vm.progressFraction)
+                    .opacity(vm.isCancelling ? 0.4 : 1)
             } else {
                 ProgressView()
                     .progressViewStyle(.linear)
-                    .opacity(vm.isRunning ? 1 : 0.25)
+                    .opacity(vm.isCancelling ? 0.4 : (vm.isRunning ? 1 : 0.25))
             }
 
             // Status one-liner.
@@ -471,7 +479,9 @@ struct VocabPrunerSheet: View {
                  "\(vm.status.tokensScanned) tokens")
                 .font(.callout.monospacedDigit())
         } else {
-            Text(vm.isRunning ? "starting…" : "idle")
+            Text(vm.isCancelling
+                  ? "cancelling…"
+                  : (vm.isRunning ? "starting…" : "idle"))
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -509,10 +519,12 @@ struct VocabPrunerSheet: View {
         HStack {
             Spacer()
             if vm.isRunning {
-                Button("Cancel", role: .destructive) {
+                Button(vm.isCancelling ? "Cancelling…" : "Cancel",
+                        role: .destructive) {
                     vm.cancel()
                 }
                 .keyboardShortcut(.cancelAction)
+                .disabled(vm.isCancelling)
             } else {
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)

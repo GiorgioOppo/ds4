@@ -30,6 +30,16 @@ final class VocabPrunerViewModel: ObservableObject {
     // ---- Runtime state ----
     @Published var status: VocabPruneStatus = VocabPruneStatus()
     @Published var isRunning: Bool = false
+    /// True dal momento in cui l'utente preme Cancel finché il task
+    /// background non rilascia (può durare 1-30s perché il cancel
+    /// è cooperativo: i thread/chunk già in volo finiscono prima
+    /// di rilasciare il controllo). Quando true:
+    ///   - il bottone Cancel diventa disabled + label "Cancelling…"
+    ///   - la ProgressView mostra il testo di cancel in corso
+    ///   - i nuovi `VocabPruneEvent` non aggiornano più `progressFraction`
+    ///     così la barra resta visivamente "ferma" al punto di
+    ///     cancel invece di continuare ad avanzare
+    @Published var isCancelling: Bool = false
     @Published var lastError: String? = nil
 
     /// Popolato dalla Fase 1 (analyze) appena prima della Fase 2.
@@ -92,6 +102,7 @@ final class VocabPrunerViewModel: ObservableObject {
             resume: resumeEnabled)
 
         isRunning = true
+        isCancelling = false
         lastError = nil
         status = VocabPruneStatus()
         let token = CancellationToken()
@@ -111,20 +122,38 @@ final class VocabPrunerViewModel: ObservableObject {
                     })
                 await MainActor.run { [weak self] in
                     self?.isRunning = false
+                    self?.isCancelling = false
                 }
             } catch {
                 await MainActor.run { [weak self] in
+                    let wasCancelling = self?.isCancelling ?? false
                     self?.isRunning = false
+                    self?.isCancelling = false
                     let cancelMsg = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String
-                    self?.lastError = (error as? LocalizedError)?.errorDescription
-                        ?? cancelMsg
-                        ?? error.localizedDescription
+                    // Se il task è stato terminato da un cancel
+                    // esplicito dell'utente, non mostriamo l'errore
+                    // come fallimento — è UX previsto. Per gli altri
+                    // errori (file I/O, parse, etc.) mostriamo il
+                    // messaggio.
+                    if wasCancelling {
+                        self?.lastError = nil
+                    } else {
+                        self?.lastError = (error as? LocalizedError)?.errorDescription
+                            ?? cancelMsg
+                            ?? error.localizedDescription
+                    }
                 }
             }
         }
     }
 
     private func handle(event: VocabPruneEvent, spec: VocabPruneSpec) {
+        // Quando l'utente ha cancellato, congeliamo la UI sul punto
+        // raggiunto. Gli eventi continuano ad arrivare per qualche
+        // secondo (i thread in volo non si interrompono mid-chunk),
+        // ma li scartiamo così la progress bar non avanza più e
+        // l'utente capisce che il cancel è stato accettato.
+        if isCancelling { return }
         status.apply(event)
         switch event {
         case .decisionReady(let decision):
@@ -146,6 +175,9 @@ final class VocabPrunerViewModel: ObservableObject {
     }
 
     func cancel() {
+        // Idempotente: doppi click sul bottone non fanno danni.
+        guard isRunning, !isCancelling else { return }
+        isCancelling = true
         cancellation?.cancel()
     }
 
