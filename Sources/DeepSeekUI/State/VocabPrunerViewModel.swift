@@ -20,9 +20,10 @@ final class VocabPrunerViewModel: ObservableObject {
     @Published var coverage: Double = 0.9995
     /// Se true, solo Fase 1 + statistica copertura; niente scrittura.
     @Published var dryRun: Bool = false
-    /// Numero di thread paralleli per la Fase 1. Default 1.
-    /// Range raccomandato in UI: 1..cpuCount.
-    @Published var concurrency: Int = 1
+    /// Numero di thread paralleli per la Fase 1. Default = 80% dei
+    /// core attivi (vedi `VocabPruneSpec.defaultConcurrency`). 1 =
+    /// sequenziale con save intra-file ogni 10k token.
+    @Published var concurrency: Int = VocabPruneSpec.defaultConcurrency
     /// Se true (default), riprende dal checkpoint se compatibile.
     @Published var resumeEnabled: Bool = true
 

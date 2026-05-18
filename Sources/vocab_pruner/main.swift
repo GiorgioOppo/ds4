@@ -35,8 +35,9 @@ func usage() -> Never {
                                   la statistica di copertura. Niente
                                   scrittura di output.
             --concurrency <N>     Numero di thread paralleli per la Fase 1.
-                                  Default 1 (sequenziale). Suggerito:
-                                  cpuCount per corpus con molti file.
+                                  Default \(VocabPruneSpec.defaultConcurrency)
+                                  (= 80% dei core attivi su questo host).
+                                  1 = sequenziale (con save intra-file ogni 10k token).
             --no-resume           Disabilita il resume dal checkpoint.
                                   Default: legge `<output>/.vocab_pruner_checkpoint.json`
                                   e riprende se lo spec corrisponde.
@@ -61,7 +62,7 @@ var corpus: String?
 var coverage: Double = 0.9995
 var keepIdsFile: String?
 var dryRun = false
-var concurrency = 1
+var concurrency = VocabPruneSpec.defaultConcurrency   // 80% dei core attivi
 var resume = true
 
 var args = Array(CommandLine.arguments.dropFirst())

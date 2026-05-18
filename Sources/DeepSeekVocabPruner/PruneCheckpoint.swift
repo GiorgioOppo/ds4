@@ -55,19 +55,30 @@ public struct PruneCheckpoint: Codable, Sendable {
         public var linesScanned: Int
         public var tokensScanned: Int
 
+        /// File attualmente in elaborazione e progressi intra-file
+        /// (solo per `concurrency == 1`). Save periodico ogni
+        /// ~`tokenBatchThreshold` token. Al resume, l'analyzer
+        /// riprende dalla `lineOffset+1` di questo file con i
+        /// `partialCountsForFile` già accumulati. `nil` quando
+        /// l'analyzer non sta processando un file specifico
+        /// (es. fra un file e l'altro, o appena prima del primo).
+        public var inFlightFile: InFlightFile?
+
         public init(processedFiles: [String] = [],
                     partialCounts: [Int: Int] = [:],
                     linesScanned: Int = 0,
-                    tokensScanned: Int = 0) {
+                    tokensScanned: Int = 0,
+                    inFlightFile: InFlightFile? = nil) {
             self.processedFiles = processedFiles
             self.partialCounts = partialCounts
             self.linesScanned = linesScanned
             self.tokensScanned = tokensScanned
+            self.inFlightFile = inFlightFile
         }
 
         private enum CodingKeys: String, CodingKey {
             case processedFiles, countsKeys, countsValues,
-                 linesScanned, tokensScanned
+                 linesScanned, tokensScanned, inFlightFile
         }
 
         public init(from decoder: Decoder) throws {
@@ -81,6 +92,8 @@ public struct PruneCheckpoint: Codable, Sendable {
             self.partialCounts = map
             self.linesScanned = try c.decode(Int.self, forKey: .linesScanned)
             self.tokensScanned = try c.decode(Int.self, forKey: .tokensScanned)
+            self.inFlightFile = try? c.decode(InFlightFile.self,
+                                                forKey: .inFlightFile)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -91,6 +104,53 @@ public struct PruneCheckpoint: Codable, Sendable {
             try c.encode(pairs.map { $0.value }, forKey: .countsValues)
             try c.encode(linesScanned, forKey: .linesScanned)
             try c.encode(tokensScanned, forKey: .tokensScanned)
+            try c.encodeIfPresent(inFlightFile, forKey: .inFlightFile)
+        }
+    }
+
+    /// Progresso intra-file per un singolo file (Fase 1
+    /// sequential). `lineOffset` indica fino a quale linea
+    /// (esclusiva) i `partialCountsForFile` coprono.
+    public struct InFlightFile: Codable, Sendable {
+        public var path: String
+        public var lineOffset: Int
+        public var tokensInFile: Int
+        public var partialCountsForFile: [Int: Int]
+
+        public init(path: String,
+                    lineOffset: Int = 0,
+                    tokensInFile: Int = 0,
+                    partialCountsForFile: [Int: Int] = [:]) {
+            self.path = path
+            self.lineOffset = lineOffset
+            self.tokensInFile = tokensInFile
+            self.partialCountsForFile = partialCountsForFile
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case path, lineOffset, tokensInFile, countsKeys, countsValues
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.path = try c.decode(String.self, forKey: .path)
+            self.lineOffset = try c.decode(Int.self, forKey: .lineOffset)
+            self.tokensInFile = try c.decode(Int.self, forKey: .tokensInFile)
+            let ks = try c.decode([Int].self, forKey: .countsKeys)
+            let vs = try c.decode([Int].self, forKey: .countsValues)
+            var map: [Int: Int] = [:]
+            for (k, v) in zip(ks, vs) { map[k] = v }
+            self.partialCountsForFile = map
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(path, forKey: .path)
+            try c.encode(lineOffset, forKey: .lineOffset)
+            try c.encode(tokensInFile, forKey: .tokensInFile)
+            let pairs = partialCountsForFile.sorted { $0.key < $1.key }
+            try c.encode(pairs.map { $0.key }, forKey: .countsKeys)
+            try c.encode(pairs.map { $0.value }, forKey: .countsValues)
         }
     }
 

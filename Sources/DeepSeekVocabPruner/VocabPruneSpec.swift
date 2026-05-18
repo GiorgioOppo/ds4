@@ -60,7 +60,7 @@ public struct VocabPruneSpec: Sendable {
                 coverage: Double = 0.9995,
                 keepIdsFile: URL? = nil,
                 dryRun: Bool = false,
-                concurrency: Int = 1,
+                concurrency: Int? = nil,
                 resume: Bool = true) {
         self.inputDir = inputDir
         self.outputDir = outputDir
@@ -68,7 +68,14 @@ public struct VocabPruneSpec: Sendable {
         self.coverage = coverage
         self.keepIdsFile = keepIdsFile
         self.dryRun = dryRun
-        self.concurrency = concurrency
+        self.concurrency = concurrency ?? Self.defaultConcurrency
         self.resume = resume
+    }
+
+    /// Default per `concurrency`: 80% dei core attivi, minimo 1.
+    /// Lascia margine al sistema operativo e a eventuali processi
+    /// concorrenti. Calcolato dinamicamente, non hard-coded.
+    public static var defaultConcurrency: Int {
+        max(1, Int(Double(ProcessInfo.processInfo.activeProcessorCount) * 0.8))
     }
 }

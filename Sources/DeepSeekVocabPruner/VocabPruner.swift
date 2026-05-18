@@ -103,13 +103,17 @@ public enum VocabPruner {
             // Inizia da partial state se disponibile.
             let alreadyProc = Set(checkpoint?.analyzer?.processedFiles ?? [])
             let partial = checkpoint?.analyzer?.partialCounts ?? [:]
+            let inFlight = checkpoint?.analyzer?.inFlightFile
             if !alreadyProc.isEmpty {
                 onEvent(.log("Resume: \(alreadyProc.count) file " +
                               "già processati, ripartenza dal prossimo."))
             }
+            if let infl = inFlight {
+                onEvent(.log("Resume intra-file: '\(infl.path)' " +
+                              "dalla linea \(infl.lineOffset) " +
+                              "(\(infl.tokensInFile) token già contati)."))
+            }
 
-            // Snapshot di outputDir + cancellation per la closure.
-            let dir = spec.outputDir
             decision = try VocabAnalyzer.analyze(
                 tokenizerJSON: tokenizerURL,
                 corpus: corpus,
@@ -117,11 +121,21 @@ public enum VocabPruner {
                 concurrency: spec.concurrency,
                 alreadyProcessed: alreadyProc,
                 partialCounts: partial,
+                inFlightFile: inFlight,
+                tokenBatchThreshold: 10_000,
                 onFileDone: { path, lines, tokens, counts in
                     store.recordAnalyzerFile(
-                        path: path, lines: lines,
-                        tokens: tokens, counts: counts)
-                    _ = dir   // capture intentional; store già lega dir
+                        path: path,
+                        totalLinesInFile: lines,
+                        totalTokensInFile: tokens,
+                        fullFileCounts: counts)
+                },
+                onTokenBatch: { path, lineOffset, tokensInFile, _, cumulCounts in
+                    store.recordAnalyzerPartial(
+                        path: path,
+                        newLineOffset: lineOffset,
+                        newTokensInFile: tokensInFile,
+                        cumulativeCountsForFile: cumulCounts)
                 },
                 onEvent: onEvent)
             onEvent(.decisionReady(decision))
@@ -207,18 +221,66 @@ fileprivate final class CheckpointStore: @unchecked Sendable {
         }
     }
 
+    /// File completato. Sposta i `counts` cumulativi del file (incl.
+    /// eventuali partial counts del resume) dentro `partialCounts`
+    /// aggregato, aggiunge al `processedFiles`, e — se il file era
+    /// quello in-flight — pulisce `inFlightFile`. Aggiorna anche
+    /// `linesScanned/tokensScanned` con il delta non ancora
+    /// contabilizzato (cioè totale del file meno quanto già
+    /// riportato dai partial save intra-file).
     func recordAnalyzerFile(path: String,
-                              lines: Int,
-                              tokens: Int,
-                              counts: [Int: Int]) {
+                              totalLinesInFile: Int,
+                              totalTokensInFile: Int,
+                              fullFileCounts: [Int: Int]) {
         lock.lock(); defer { lock.unlock() }
         var a = state.analyzer ?? PruneCheckpoint.AnalyzerState()
-        a.processedFiles.append(path)
-        a.linesScanned += lines
-        a.tokensScanned += tokens
-        for (k, v) in counts {
+
+        // Se il file completato era in-flight, gli incrementi
+        // intra-file sono già stati contabilizzati in
+        // linesScanned/tokensScanned. Ci serve il *delta* fra il
+        // totale del file e quanto era già stato salvato.
+        var lineDelta = totalLinesInFile
+        var tokenDelta = totalTokensInFile
+        if let infl = a.inFlightFile, infl.path == path {
+            lineDelta -= infl.lineOffset
+            tokenDelta -= infl.tokensInFile
+            a.inFlightFile = nil
+        }
+
+        if !a.processedFiles.contains(path) {
+            a.processedFiles.append(path)
+        }
+        for (k, v) in fullFileCounts {
             a.partialCounts[k, default: 0] += v
         }
+        a.linesScanned += max(0, lineDelta)
+        a.tokensScanned += max(0, tokenDelta)
+        state.analyzer = a
+        state.savedAt = Date()
+        try? state.save(to: outputDir)
+    }
+
+    /// Save intra-file: aggiorna lo stato del file in-flight
+    /// senza spostarlo nei `processedFiles`. `cumulativeCountsForFile`
+    /// è il count del file dall'inizio (linea 0) fino a `newLineOffset`
+    /// — non un delta. Same per `newTokensInFile`.
+    func recordAnalyzerPartial(path: String,
+                                 newLineOffset: Int,
+                                 newTokensInFile: Int,
+                                 cumulativeCountsForFile: [Int: Int]) {
+        lock.lock(); defer { lock.unlock() }
+        var a = state.analyzer ?? PruneCheckpoint.AnalyzerState()
+        let prevLineOffset = a.inFlightFile?.lineOffset ?? 0
+        let prevTokensInFile = a.inFlightFile?.tokensInFile ?? 0
+        let lineDelta = max(0, newLineOffset - prevLineOffset)
+        let tokenDelta = max(0, newTokensInFile - prevTokensInFile)
+        a.inFlightFile = PruneCheckpoint.InFlightFile(
+            path: path,
+            lineOffset: newLineOffset,
+            tokensInFile: newTokensInFile,
+            partialCountsForFile: cumulativeCountsForFile)
+        a.linesScanned += lineDelta
+        a.tokensScanned += tokenDelta
         state.analyzer = a
         state.savedAt = Date()
         try? state.save(to: outputDir)

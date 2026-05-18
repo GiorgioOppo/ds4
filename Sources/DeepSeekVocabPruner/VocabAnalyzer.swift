@@ -123,12 +123,17 @@ public enum VocabAnalyzer {
         concurrency: Int = 1,
         alreadyProcessed: Set<String> = [],
         partialCounts: [Int: Int] = [:],
+        inFlightFile: PruneCheckpoint.InFlightFile? = nil,
+        tokenBatchThreshold: Int = 10_000,
         onFileDone: ((String, Int, Int, [Int: Int]) -> Void)? = nil,
+        onTokenBatch: ((String, Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onEvent: @escaping (VocabPruneEvent) -> Void
     ) throws -> KeepDecision {
         precondition(coverage > 0 && coverage <= 1.0,
                      "coverage must be in (0, 1]")
         precondition(concurrency >= 1, "concurrency must be >= 1")
+        precondition(tokenBatchThreshold >= 1,
+                     "tokenBatchThreshold must be positive")
 
         // 1) Carica il tokenizer originale.
         let tokenizer = try Self.loadTokenizer(at: tokenizerJSON)
@@ -145,16 +150,55 @@ public enum VocabAnalyzer {
         var lines = 0
         var tokens = 0
 
+        // Pre-popola counts globali col partial del file in-flight
+        // (così la `counts` aggregata rispetta l'invariante:
+        // counts == partialCounts + inFlight.partialCountsForFile in
+        // ogni momento).
+        if let infl = inFlightFile {
+            Self.mergeCounts(infl.partialCountsForFile, into: &counts)
+            tokens += infl.tokensInFile
+            lines += infl.lineOffset
+        }
+
         if concurrency == 1 || files.count <= 1 {
-            // Path sequenziale (default).
+            // Path sequenziale: supporta save intra-file ogni
+            // `tokenBatchThreshold` token via `onTokenBatch`.
             for file in files {
-                let (lc, tc, localCounts) = try Self.countTokensInFile(
-                    file.url, isJsonl: file.isJsonl, tokenizer: tokenizer)
-                Self.mergeCounts(localCounts, into: &counts)
-                lines += lc
-                tokens += tc
-                onFileDone?(file.url.path, lc, tc, localCounts)
-                onEvent(.scanned(lines: lines, tokens: tokens))
+                let path = file.url.path
+                let matchesInFlight = (inFlightFile?.path == path)
+                let resumeOffset = matchesInFlight ? (inFlightFile?.lineOffset ?? 0) : 0
+                let resumeCounts = matchesInFlight ? (inFlightFile?.partialCountsForFile ?? [:]) : [:]
+                let resumeTokens = matchesInFlight ? (inFlightFile?.tokensInFile ?? 0) : 0
+
+                // Stato cumulativo del file durante questa esecuzione.
+                var fileCounts = resumeCounts
+                var fileTokens = resumeTokens
+                var fileLineOffset = resumeOffset
+
+                let (_, _, scannedCounts) = try Self.countTokensInFile(
+                    file.url,
+                    isJsonl: file.isJsonl,
+                    tokenizer: tokenizer,
+                    startLineOffset: resumeOffset,
+                    tokenBatchThreshold: tokenBatchThreshold,
+                    onTokenBatch: { batchLines, batchTokens, deltaCounts,
+                                    totalLinesInFile, _ in
+                        fileLineOffset = totalLinesInFile
+                        fileTokens += batchTokens
+                        Self.mergeCounts(deltaCounts, into: &fileCounts)
+                        Self.mergeCounts(deltaCounts, into: &counts)
+                        tokens += batchTokens
+                        lines += batchLines
+                        onTokenBatch?(path, fileLineOffset,
+                                      fileTokens, batchTokens, fileCounts)
+                        onEvent(.scanned(lines: lines, tokens: tokens))
+                    })
+                // Edge case: file senza alcun token (vuoto o tutto
+                // skippato per JSONL malformato). `onTokenBatch` non
+                // viene chiamato, `scannedCounts` è vuoto, gli
+                // accumulator stanno a zero. fileCounts == resumeCounts.
+                _ = scannedCounts  // ignorato: counts globali già aggiornati nel callback
+                onFileDone?(path, fileLineOffset, fileTokens, fileCounts)
             }
         } else {
             // Path parallelo: DispatchQueue.concurrentPerform su index
@@ -351,25 +395,59 @@ public enum VocabAnalyzer {
     /// Tokenizza un singolo file e ritorna le statistiche locali.
     /// Non emette eventi — il caller aggrega e sceglie quando
     /// notificare.
-    static func countTokensInFile(_ url: URL,
-                                    isJsonl: Bool,
-                                    tokenizer: BPETokenizer)
-        throws -> (lines: Int, tokens: Int, counts: [Int: Int])
-    {
+    ///
+    /// - Parameter startLineOffset: numero di linee da skippare in
+    ///   testa al file. Usato per il resume intra-file (continua dal
+    ///   punto in cui il batch precedente aveva salvato).
+    /// - Parameter tokenBatchThreshold: emette `onTokenBatch` ogni
+    ///   ~`threshold` token cumulati nel batch corrente. Usato dal
+    ///   caller per scrivere un checkpoint intermedio. Se `nil` o
+    ///   il callback è `nil`, non c'è batching e si processa tutto
+    ///   il file in un colpo solo.
+    /// - Parameter onTokenBatch: callback `(linesInBatch,
+    ///   tokensInBatch, deltaCounts, totalLinesSoFar,
+    ///   totalTokensSoFar)`. `totalLinesSoFar` include
+    ///   `startLineOffset`.
+    static func countTokensInFile(
+        _ url: URL,
+        isJsonl: Bool,
+        tokenizer: BPETokenizer,
+        startLineOffset: Int = 0,
+        tokenBatchThreshold: Int? = nil,
+        onTokenBatch: ((Int, Int, [Int: Int], Int, Int) -> Void)? = nil
+    ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
         let data = try Data(contentsOf: url)
         guard let s = String(data: data, encoding: .utf8) else {
             return (0, 0, [:])
         }
         var counts: [Int: Int] = [:]
-        var lines = 0
+        var lines = startLineOffset
         var tokens = 0
-        for raw in s.split(separator: "\n", omittingEmptySubsequences: true) {
+
+        // Batch accumulators (per il save intra-file).
+        var batchCounts: [Int: Int] = [:]
+        var batchLines = 0
+        var batchTokens = 0
+
+        // Iterazione: split poi drop dei primi `startLineOffset`
+        // record. Costo O(N) sul prefix da skippare, accettabile per
+        // file di qualche GB (il bottleneck è la tokenization).
+        let allLines = s.split(separator: "\n", omittingEmptySubsequences: true)
+        let toProcess = startLineOffset > 0
+            ? allLines.dropFirst(startLineOffset)
+            : allLines[allLines.startIndex...]
+
+        for raw in toProcess {
             let line = String(raw)
             let text: String
             if isJsonl {
                 guard let bytes = line.data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-                      let t = obj["text"] as? String else { continue }
+                      let t = obj["text"] as? String else {
+                    lines += 1
+                    batchLines += 1
+                    continue
+                }
                 text = t
             } else {
                 text = line
@@ -377,9 +455,30 @@ public enum VocabAnalyzer {
             let ids = tokenizer.encode(text)
             for id in ids {
                 counts[id, default: 0] += 1
+                batchCounts[id, default: 0] += 1
                 tokens += 1
+                batchTokens += 1
             }
             lines += 1
+            batchLines += 1
+
+            // Flush periodico ogni ~threshold token. Verifica DOPO
+            // aver completato una linea — non spezziamo la
+            // tokenizzazione di una linea a metà (semantica più
+            // pulita per il resume).
+            if let threshold = tokenBatchThreshold,
+               let cb = onTokenBatch,
+               batchTokens >= threshold
+            {
+                cb(batchLines, batchTokens, batchCounts, lines, tokens)
+                batchCounts.removeAll(keepingCapacity: true)
+                batchLines = 0
+                batchTokens = 0
+            }
+        }
+        // Flush finale residuo (può essere < threshold).
+        if batchTokens > 0, let cb = onTokenBatch {
+            cb(batchLines, batchTokens, batchCounts, lines, tokens)
         }
         return (lines, tokens, counts)
     }

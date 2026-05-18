@@ -200,8 +200,10 @@ struct VocabPrunerSheet: View {
                     .disabled(vm.isRunning)
                 }
                 Text("Tokenizzazione del corpus in parallelo (un thread " +
-                     "per file). 1 = sequenziale. Suggerito \(ProcessInfo.processInfo.activeProcessorCount) " +
-                     "su questo host.")
+                     "per file). 1 = sequenziale con save intra-file ogni " +
+                     "10k token. Default = \(VocabPruneSpec.defaultConcurrency) " +
+                     "(80% dei \(ProcessInfo.processInfo.activeProcessorCount) " +
+                     "core attivi).")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
 
