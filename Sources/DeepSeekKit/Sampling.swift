@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import Accelerate
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -329,23 +330,35 @@ public enum Sampler {
 
     // MARK: - Filter helpers
 
-    /// In-place min-P filter on a logits array.
+    /// In-place min-P filter on a logits array. Vectorizzato con
+    /// Accelerate analogamente a `softmaxDouble` — `vvexp` per
+    /// l'esponenziazione SIMD, `vDSP_*` per max/sum/normalize.
     @inline(__always)
     private static func applyMinP(_ arr: inout [Float], vocabSize V: Int, minP: Float) {
-        let m = arr.max() ?? 0
-        var sum: Double = 0
+        // max(arr) via vDSP_maxv.
+        var m: Float = 0
+        arr.withUnsafeBufferPointer { p in
+            vDSP_maxv(p.baseAddress!, 1, &m, vDSP_Length(V))
+        }
+        // shifted[i] = Double(arr[i] - m); -infinity passa through.
+        var shifted = [Double](repeating: 0, count: V)
+        for i in 0..<V { shifted[i] = Double(arr[i] - m) }
+
         var probs = [Double](repeating: 0, count: V)
-        for i in 0..<V {
-            let e = exp(Double(arr[i] - m))
-            probs[i] = e
-            sum += e
-        }
+        var n = Int32(V)
+        vvexp(&probs, shifted, &n)
+
+        var sum: Double = 0
+        vDSP_sveD(probs, 1, &sum, vDSP_Length(V))
         if sum <= 0 { return }
+
+        var inv = 1.0 / sum
+        vDSP_vsmulD(probs, 1, &inv, &probs, 1, vDSP_Length(V))
+
+        // pMax = max(probs).
         var pMax: Double = 0
-        for i in 0..<V {
-            probs[i] /= sum
-            if probs[i] > pMax { pMax = probs[i] }
-        }
+        vDSP_maxvD(probs, 1, &pMax, vDSP_Length(V))
+
         let threshold = pMax * Double(minP)
         for i in 0..<V where probs[i] < threshold { arr[i] = -.infinity }
     }
@@ -460,21 +473,53 @@ public enum Sampler {
 
     /// Stable softmax → Double[] without mutating the input. Skips
     /// `-infinity` entries (treats them as zero mass).
+    ///
+    /// Implementazione vettorizzata con Accelerate:
+    ///   1. max-reduce via `vDSP_maxv` (Float, single SIMD scan)
+    ///   2. shift + Float→Double convert con loop scalare (gestisce
+    ///      `-infinity` esplicitamente: lo mappa a -INF in Double
+    ///      così `vvexp` ritorna 0 lì, semantica identica al loop
+    ///      originale che skippava la entry)
+    ///   3. exp per-element via `vvexp` (SIMD vForce)
+    ///   4. sum via `vDSP_sveD`
+    ///   5. divisione in-place via `vDSP_vsmulD` con `1/sum`
+    ///
+    /// Speedup atteso vs il loop Swift puro: ~3-5× per V=130k
+    /// (vForce vvexp è il guadagno principale).
     @inline(__always)
     private static func softmaxDouble(_ arr: [Float], vocabSize V: Int) -> [Double] {
-        let m = arr.max() ?? 0
-        var sum: Double = 0
-        var probs = [Double](repeating: 0, count: V)
+        // 1) max(arr) — vDSP_maxv ignora -infinity correttamente
+        //    (lo confronta con `>` invece di `>=`).
+        var m: Float = 0
+        arr.withUnsafeBufferPointer { p in
+            vDSP_maxv(p.baseAddress!, 1, &m, vDSP_Length(V))
+        }
+
+        // 2) shifted[i] = Double(arr[i] - m). Per i = -infinity in
+        //    arr, shifted[i] resta -infinity (così vvexp ritorna 0,
+        //    semantica del vecchio loop "treats as zero mass").
+        var shifted = [Double](repeating: 0, count: V)
         for i in 0..<V {
-            if arr[i] == -.infinity { continue }
-            let e = exp(Double(arr[i] - m))
-            probs[i] = e
-            sum += e
+            shifted[i] = Double(arr[i] - m)
         }
+
+        // 3) exp per-element via vForce.
+        var exps = [Double](repeating: 0, count: V)
+        var n = Int32(V)
+        vvexp(&exps, shifted, &n)
+
+        // 4) sum (Double precision per stabilità numerica).
+        var sum: Double = 0
+        vDSP_sveD(exps, 1, &sum, vDSP_Length(V))
+
+        // 5) normalize in-place. `vDSP_vsmulD` non gestisce sum<=0
+        //    (divisione per zero); ritorniamo gli exp non normalizzati
+        //    (tutto 0 se -INF dominante) come fallback safe.
         if sum > 0 {
-            for i in 0..<V { probs[i] /= sum }
+            var inv = 1.0 / sum
+            vDSP_vsmulD(exps, 1, &inv, &exps, 1, vDSP_Length(V))
         }
-        return probs
+        return exps
     }
 
     // MARK: - Pure-Swift helpers
