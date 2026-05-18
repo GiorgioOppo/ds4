@@ -665,7 +665,7 @@ public enum VocabAnalyzer {
     ///
     /// L'iterazione è byte-level via `withUnsafeBytes`: niente
     /// `String.split`, niente `Substring` alloc.
-    static func processByteRange(
+    fileprivate static func processByteRange(
         data: Data,
         start: Int,
         end: Int,
