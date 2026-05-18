@@ -218,7 +218,7 @@ public enum VocabRewriter {
                       row.count == bytesPerRow else {
                     fatalError("vocab tensor slice: short read at oldId=\(oldId)")
                 }
-                row.withUnsafeBytes { src in
+                row.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Void in
                     memcpy(dstBase.advanced(by: newId * bytesPerRow),
                            src.baseAddress!,
                            bytesPerRow)

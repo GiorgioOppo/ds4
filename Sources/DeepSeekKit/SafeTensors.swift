@@ -107,9 +107,9 @@ public final class SafeTensorsFile {
         // semantico osservabile (es. throughput diverso).
         var raw = mmap(nil, alignedSize, PROT_READ, mapFlags, fd, 0)
         if raw == MAP_FAILED && useMapShared {
-            FileHandle.standardError.write(Data(
-                "[mmap] MAP_SHARED failed for \(url.lastPathComponent), " +
-                "falling back to MAP_PRIVATE\n".utf8))
+            let msg = "[mmap] MAP_SHARED failed for \(url.lastPathComponent), "
+                + "falling back to MAP_PRIVATE\n"
+            FileHandle.standardError.write(Data(msg.utf8))
             let fallbackFlags = mapNoCache ? (MAP_PRIVATE | MAP_NOCACHE) : MAP_PRIVATE
             raw = mmap(nil, alignedSize, PROT_READ, fallbackFlags, fd, 0)
         }

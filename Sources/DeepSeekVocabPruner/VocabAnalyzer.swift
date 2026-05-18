@@ -825,7 +825,10 @@ public enum VocabAnalyzer {
         chunkResult.lines = 0
         chunkResult.tokens = 0
 
-        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+        // Body non throws (try? JSONSerialization e' interno), quindi
+        // niente `try` esterno; il `throws` della funzione resta per
+        // futura espansione e per la simmetria con `processFileParallel`.
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
 
             var pos = start
