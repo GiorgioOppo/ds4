@@ -61,8 +61,15 @@ public enum TopK {
         enc.setBuffer(indices.buffer, offset: 0, index: 2)
         var dims = SIMD3<UInt32>(UInt32(N), UInt32(V), UInt32(k))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
+
+        // Threadgroup size = almeno un simdgroup intero (32 su Apple
+        // GPU). Per N<simdWidth, alcune lane fanno `if (row >= N)
+        // return` ma il simdgroup viene comunque schedulato in modo
+        // coerente (no partial-warp penalty).
+        let simdWidth = pipelineSmall.threadExecutionWidth
+        let tgSize = max(simdWidth, min(N, 256))
         enc.dispatchThreads(MTLSize(width: N, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: min(N, 64), height: 1, depth: 1))
+                            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
         enc.endEncoding()
         return Output(values: values, indices: indices)
     }
@@ -75,10 +82,24 @@ public enum TopK {
 
         // The kernel pads V to the next power of two; pick a thread
         // count proportional to that so each thread covers a constant
-        // chunk of compares per stage (Vp / T). Capped at the Metal
-        // threadgroup limit.
+        // chunk of compares per stage (Vp / T). Capped al limite hw
+        // del pipeline (= 1024 su Apple GPU, ma leggiamo runtime per
+        // portabilità), e arrotondato al simdWidth più vicino per
+        // evitare lane SIMD parzialmente sprecate.
         let vPadded = nextPowerOfTwo(max(V, 2))
-        let threads = min(vPadded, maxBitonicThreads)
+        let simdWidth = pipelineLarge.threadExecutionWidth
+        let maxTG = min(maxBitonicThreads,
+                         pipelineLarge.maxTotalThreadsPerThreadgroup)
+        let raw = min(vPadded, maxTG)
+        // Round-down al multiplo di simdWidth più vicino, ma almeno 1
+        // simdgroup. Per V molto piccolo (raw < simdWidth) lasciamo
+        // raw così com'è — non perdiamo nulla.
+        let threads: Int
+        if raw >= simdWidth {
+            threads = (raw / simdWidth) * simdWidth
+        } else {
+            threads = raw
+        }
 
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipelineLarge)
@@ -88,6 +109,11 @@ public enum TopK {
         var dims = SIMD3<UInt32>(UInt32(N), UInt32(V), UInt32(k))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
         // One threadgroup per row → row id = threadgroup z index.
+        // Limitazione architetturale: per N piccolo (es. decode-time
+        // single-token) abbiamo pochi threadgroup attivi e la GPU
+        // resta sotto-utilizzata. Un vero fix richiede un tile/merge
+        // multi-pass; al momento la bitonic single-row resta sotto i
+        // 100µs su V≤4096 e non è il bottleneck inference dominante.
         let tgCount = MTLSize(width: 1, height: 1, depth: N)
         let tgSize  = MTLSize(width: threads, height: 1, depth: 1)
         enc.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
