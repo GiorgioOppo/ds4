@@ -197,9 +197,16 @@ public final class KVCacheFile {
     // ---- token manifest (companion file) ----
 
     /// URL del file companion che memorizza la lista dei token IDs
-    /// dei `prefilledTokens` del cache. Layout binario:
+    /// dei `prefilledTokens` del cache + metadata opzionale di
+    /// checkpoint (logits ultimo step, chunk alignment).
     ///
-    ///   [ u32 magic 'KVM1' ][ u32 version=1 ][ u64 count ][ count × i32 token_ids ]
+    /// Layout v1 (compatibile):
+    ///   [u32 magic 'KVM1'][u32 version=1][u64 count][count × i32 token_ids]
+    ///
+    /// Layout v2 (esteso, retro-compatibile in lettura):
+    ///   [u32 magic 'KVM1'][u32 version=2][u64 count][count × i32 token_ids]
+    ///   [u32 logitsLen][logitsLen × f32 last_logits]   // 0 = absent
+    ///   [u32 chunkAlignment]                            // 0 = no align
     ///
     /// File separato dal `KVCacheFile` principale per evitare
     /// vincoli di alignment col payload (Metal buffer page-aligned)
@@ -208,31 +215,85 @@ public final class KVCacheFile {
         url.appendingPathExtension("manifest")
     }
 
+    /// Manifest esteso: oltre ai token IDs, opzionalmente porta i
+    /// logits dell'ultimo sample (per riprodurre il sampling
+    /// deterministico al resume) e il chunk alignment usato al
+    /// save (utile per detect retokenization mismatch).
+    public struct ManifestData: Sendable {
+        public let tokens: [Int32]
+        public let lastLogits: [Float]?      // nil = non salvato
+        public let chunkAlignment: Int?      // nil = no alignment specifico
+
+        public init(tokens: [Int32],
+                    lastLogits: [Float]? = nil,
+                    chunkAlignment: Int? = nil) {
+            self.tokens = tokens
+            self.lastLogits = lastLogits
+            self.chunkAlignment = chunkAlignment
+        }
+    }
+
     /// Magic identifier per il manifest file: 'KVM1' big-endian.
     public static let manifestMagic: UInt32 = 0x4B564D31
 
     /// Carica la lista dei token IDs dal manifest companion. Ritorna
     /// `nil` se il manifest non esiste, è corrotto, o ha versione
-    /// incompatibile. Letto in un colpo solo (file piccolo: 32k token
-    /// = 128 KB).
+    /// incompatibile. Compatibilità con v1 (solo tokens) e v2
+    /// (tokens + logits + chunkAlignment).
     public func readManifest() -> [Int32]? {
+        return readManifestFull()?.tokens
+    }
+
+    /// Read completo del manifest (token IDs + opzionali logits +
+    /// chunk alignment). Auto-detects la versione del file.
+    public func readManifestFull() -> ManifestData? {
         guard let data = try? Data(contentsOf: manifestURL),
               data.count >= 16 else {
             return nil
         }
-        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> [Int32]? in
-            guard let base = raw.baseAddress else { return nil }
-            let magic = base.load(fromByteOffset: 0, as: UInt32.self)
-            let version = base.load(fromByteOffset: 4, as: UInt32.self)
-            let count = base.load(fromByteOffset: 8, as: UInt64.self)
-            guard magic == Self.manifestMagic,
-                  version == 1,
-                  16 + Int(count) * 4 <= data.count
-            else { return nil }
-            let tokenPtr = base.advanced(by: 16)
+        var cursor = 0
+        guard let magic = readManifestUInt32(data, &cursor), magic == Self.manifestMagic,
+              let version = readManifestUInt32(data, &cursor),
+              version == 1 || version == 2,
+              let count = readManifestUInt64(data, &cursor)
+        else { return nil }
+        guard cursor + Int(count) * 4 <= data.count else { return nil }
+        let tokenPtr = data.withUnsafeBytes {
+            $0.baseAddress!.advanced(by: cursor)
                 .assumingMemoryBound(to: Int32.self)
-            return Array(UnsafeBufferPointer(start: tokenPtr, count: Int(count)))
         }
+        let tokens = Array(UnsafeBufferPointer(start: tokenPtr, count: Int(count)))
+        cursor += Int(count) * 4
+
+        // v1 si ferma qui.
+        if version == 1 {
+            return ManifestData(tokens: tokens,
+                                 lastLogits: nil,
+                                 chunkAlignment: nil)
+        }
+
+        // v2: prosegui con logits + chunkAlignment.
+        guard let logitsLen = readManifestUInt32(data, &cursor) else {
+            return ManifestData(tokens: tokens,
+                                 lastLogits: nil,
+                                 chunkAlignment: nil)
+        }
+        var logits: [Float]? = nil
+        if logitsLen > 0 {
+            guard cursor + Int(logitsLen) * 4 <= data.count else { return nil }
+            let logitsPtr = data.withUnsafeBytes {
+                $0.baseAddress!.advanced(by: cursor)
+                    .assumingMemoryBound(to: Float.self)
+            }
+            logits = Array(UnsafeBufferPointer(start: logitsPtr,
+                                                count: Int(logitsLen)))
+            cursor += Int(logitsLen) * 4
+        }
+        let alignRaw = readManifestUInt32(data, &cursor) ?? 0
+        let chunkAlignment = alignRaw > 0 ? Int(alignRaw) : nil
+        return ManifestData(tokens: tokens,
+                             lastLogits: logits,
+                             chunkAlignment: chunkAlignment)
     }
 
     /// Scrive (sovrascrive atomicamente) il manifest dei token IDs
@@ -241,18 +302,42 @@ public final class KVCacheFile {
     /// lasciare il manifest in stato incoerente se il processo crasha
     /// durante la scrittura.
     public func writeManifest(_ tokens: [Int32]) throws {
-        var data = Data(capacity: 16 + tokens.count * 4)
+        try writeManifestFull(ManifestData(tokens: tokens))
+    }
+
+    /// Scrive il manifest esteso (v1 se solo tokens, v2 se logits o
+    /// chunkAlignment sono settati). Atomic via tmp+rename.
+    public func writeManifestFull(_ md: ManifestData) throws {
+        let hasExtras = md.lastLogits != nil || md.chunkAlignment != nil
+        let version: UInt32 = hasExtras ? 2 : 1
+        var data = Data(capacity: 16 + md.tokens.count * 4 +
+                                   (md.lastLogits?.count ?? 0) * 4 + 8)
         var magic = Self.manifestMagic.littleEndian
-        var version = UInt32(1).littleEndian
-        var count = UInt64(tokens.count).littleEndian
-        withUnsafeBytes(of: &magic)   { data.append(contentsOf: $0) }
-        withUnsafeBytes(of: &version) { data.append(contentsOf: $0) }
-        withUnsafeBytes(of: &count)   { data.append(contentsOf: $0) }
-        tokens.withUnsafeBufferPointer { p in
+        var verLE = version.littleEndian
+        var count = UInt64(md.tokens.count).littleEndian
+        withUnsafeBytes(of: &magic) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &verLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
+        md.tokens.withUnsafeBufferPointer { p in
             let byteCount = p.count * MemoryLayout<Int32>.stride
             let bytePtr = UnsafeRawPointer(p.baseAddress!)
                 .assumingMemoryBound(to: UInt8.self)
             data.append(bytePtr, count: byteCount)
+        }
+        if hasExtras {
+            // Logits length (0 se assenti).
+            let logits = md.lastLogits ?? []
+            var logitsLen = UInt32(logits.count).littleEndian
+            withUnsafeBytes(of: &logitsLen) { data.append(contentsOf: $0) }
+            logits.withUnsafeBufferPointer { p in
+                let byteCount = p.count * MemoryLayout<Float>.stride
+                let bytePtr = UnsafeRawPointer(p.baseAddress!)
+                    .assumingMemoryBound(to: UInt8.self)
+                data.append(bytePtr, count: byteCount)
+            }
+            // Chunk alignment (0 = no alignment).
+            var align = UInt32(md.chunkAlignment ?? 0).littleEndian
+            withUnsafeBytes(of: &align) { data.append(contentsOf: $0) }
         }
         let tmp = manifestURL.appendingPathExtension("tmp")
         try data.write(to: tmp, options: .atomic)
@@ -274,6 +359,24 @@ public final class KVCacheFile {
     /// (es. `resetHeader`).
     public func deleteManifest() {
         try? FileManager.default.removeItem(at: manifestURL)
+    }
+
+    /// Cold-save alignment: arrotonda `tokenCount` AL BASSO al
+    /// multiplo di `chunkSize` (default 2048, come ds4). Tronca i
+    /// "trailing tokens" oltre l'ultimo chunk boundary perché
+    /// salvarli ESPONE A RETOKENIZATION MISMATCH al resume (i token
+    /// finali sono spesso boundary-sensitive). Vedi ds4 README
+    /// "cold-save alignment to prefill chunk boundaries".
+    ///
+    /// Esempio: tokenCount=2300, chunkSize=2048 → aligned=2048
+    /// (scarta i 252 token oltre il primo boundary; sono regenerabili
+    /// al resume tramite re-prefill dell'ultima frazione di prompt).
+    ///
+    /// - Returns: numero di token aligned, sempre ≤ `tokenCount`.
+    public static func coldSaveAlignedCount(_ tokenCount: Int,
+                                              chunkSize: Int = 2048) -> Int {
+        precondition(chunkSize > 0, "chunkSize must be positive")
+        return (tokenCount / chunkSize) * chunkSize
     }
 
     /// Calcola la lunghezza del prefisso comune fra i token salvati
@@ -492,6 +595,26 @@ public enum KVCacheFileError: Error, LocalizedError {
 private func roundUp(_ x: Int, to multiple: Int) -> Int {
     let r = x % multiple
     return r == 0 ? x : x + (multiple - r)
+}
+
+@inline(__always)
+private func readManifestUInt32(_ data: Data, _ cursor: inout Int) -> UInt32? {
+    guard cursor + 4 <= data.count else { return nil }
+    let v = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt32 in
+        raw.load(fromByteOffset: cursor, as: UInt32.self)
+    }
+    cursor += 4
+    return UInt32(littleEndian: v)
+}
+
+@inline(__always)
+private func readManifestUInt64(_ data: Data, _ cursor: inout Int) -> UInt64? {
+    guard cursor + 8 <= data.count else { return nil }
+    let v = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt64 in
+        raw.load(fromByteOffset: cursor, as: UInt64.self)
+    }
+    cursor += 8
+    return UInt64(littleEndian: v)
 }
 
 @inline(__always)
