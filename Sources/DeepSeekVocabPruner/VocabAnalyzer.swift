@@ -150,17 +150,31 @@ public enum VocabAnalyzer {
         var lines = 0
         var tokens = 0
 
-        // Pre-popola counts globali col partial del file in-flight
-        // (così la `counts` aggregata rispetta l'invariante:
-        // counts == partialCounts + inFlight.partialCountsForFile in
-        // ogni momento).
-        if let infl = inFlightFile {
-            Self.mergeCounts(infl.partialCountsForFile, into: &counts)
-            tokens += infl.tokensInFile
-            lines += infl.lineOffset
-        }
+        // L'in-flight resume è SUPPORTATO SOLO nel path sequenziale.
+        // Il path sequenziale skippa le `lineOffset` linee già fatte
+        // e parte dai `partialCountsForFile` cumulativi del file.
+        //
+        // Nei path parallel (single-file chunked o multi-file), il
+        // file in-flight verrebbe processato DA CAPO (i thread non
+        // sanno gestire un resume parziale), quindi se pre-popolassimo
+        // `counts` qui avremmo un DOPPIO CONTEGGIO: una volta dai
+        // partialCountsForFile, una seconda dai counts FRESH del file
+        // ri-processato.
+        //
+        // Strategia: pre-popola SOLO nel branch sequenziale. Nei
+        // branch parallel, logga un warning e ignora l'inflight
+        // (il file verrà processato da capo, i counts saranno
+        // corretti). Il `CheckpointStore.recordAnalyzerFile`
+        // gestisce poi la pulizia dell'inflight quando il file
+        // completa, mantenendo lo stato del checkpoint consistente.
 
         if concurrency == 1 {
+            // Pre-popola per il path sequenziale (gestisce inflight).
+            if let infl = inFlightFile {
+                Self.mergeCounts(infl.partialCountsForFile, into: &counts)
+                tokens += infl.tokensInFile
+                lines += infl.lineOffset
+            }
             // Path sequenziale: supporta save intra-file ogni
             // `tokenBatchThreshold` token via `onTokenBatch`.
             for file in files {
@@ -211,11 +225,22 @@ public enum VocabAnalyzer {
             // modalità — il checkpoint viene aggiornato solo al
             // termine dell'intero file. Per save intra-file usa
             // concurrency=1.
+            //
+            // Resume da inFlightFile: il file viene processato da capo
+            // (i thread non sanno saltare a `lineOffset` e ripartire
+            // dal partial counts). Il `CheckpointStore.recordAnalyzerFile`
+            // sottrarrà `inFlightFile.lineOffset/tokensInFile` dai
+            // delta delle stats per evitare doppio conteggio nelle
+            // metriche; il `partialCounts` aggregato del checkpoint
+            // riceve i `fullFileCounts` FRESH (non i partial precedenti),
+            // quindi resta consistente.
             let file = files[0]
             if let infl = inFlightFile, infl.path == file.url.path {
                 onEvent(.log("Warning: intra-file checkpoint trovato " +
-                              "ma single-file chunking parallelo non lo " +
-                              "supporta. Ripartendo dal file da capo."))
+                              "(\(infl.tokensInFile) token già contati) " +
+                              "ma single-file chunking parallelo non " +
+                              "supporta il resume parziale. " +
+                              "Ripartendo dal file da capo."))
             }
             onEvent(.log("Single-file parallel mode: chunking " +
                           "'\(file.url.path)' in \(concurrency) range " +
@@ -234,9 +259,22 @@ public enum VocabAnalyzer {
             tokens += tc
             onFileDone?(file.url.path, lc, tc, fileCounts)
         } else {
-            // Path parallelo: DispatchQueue.concurrentPerform su index
-            // file. Ogni thread costruisce il proprio map locale,
-            // merge sotto lock.
+            // Path parallelo per-file: DispatchQueue.concurrentPerform
+            // su index file. Ogni thread costruisce il proprio map
+            // locale, merge sotto lock.
+            //
+            // Resume da inFlightFile: il file puntato dall'inflight
+            // (se ancora presente in `files`) sarà processato da capo
+            // da uno dei thread, stesso meccanismo del branch
+            // chunked sopra. Vedi commento.
+            if let infl = inFlightFile,
+               files.contains(where: { $0.url.path == infl.path }) {
+                onEvent(.log("Warning: intra-file checkpoint trovato " +
+                              "(\(infl.tokensInFile) token già contati " +
+                              "su '\(infl.path)') ma multi-file parallel " +
+                              "non supporta il resume parziale. " +
+                              "Quel file verrà processato da capo."))
+            }
             let lock = NSLock()
             // Snapshot mutable via class wrapper per condividerlo fra
             // thread (il `inout` non funziona attraverso closure
