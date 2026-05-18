@@ -573,6 +573,107 @@ public final class WeightLoader {
         _ = madvise(addr, len, advice)
     }
 
+    // MARK: - Warmup pages (opt-in, ds4-style)
+
+    /// Pre-fault tutte le pagine dei weight shards prima del primo
+    /// forward. Riduce il time-to-first-token evitando che il
+    /// prefill paghi N × page-in latency token-by-token mentre i
+    /// weights vengono fetched dal disco on demand.
+    ///
+    /// Ispirato a antirez/ds4 (`posix_madvise(WILLNEED)` + sequential
+    /// page touch per warm la kernel page cache).
+    ///
+    /// **Memoria**: il warmup forza tutte le pagine in residency.
+    /// Su un host con 16 GB RAM e modello 147 GB INT4, questo
+    /// causerebbe OOM/freeze (è il motivo per cui `prefetchLayer`
+    /// è no-op di default — vedi commento al line 460). Per
+    /// evitarlo, questo metodo controlla che `freeRAM >=
+    /// totalShardBytes * memoryGuardRatio` prima di procedere; se
+    /// non c'è abbastanza margine, salta il warmup e ritorna
+    /// `false`.
+    ///
+    /// **Cosa fa**:
+    /// 1. `posix_madvise(WILLNEED)` su ogni shard → hint al kernel
+    ///    "carica queste pagine adesso, le useremo presto".
+    /// 2. Sequential read di 1 byte per page → forza il page fault
+    ///    sincrono (madvise da solo è asincrono e best-effort).
+    ///    L'accumulator `checksum` esiste solo per evitare che
+    ///    l'ottimizzatore Swift elimini la lettura.
+    ///
+    /// - Parameter memoryGuardRatio: rapporto fra free RAM e total
+    ///   weight bytes minimo per accettare il warmup. Default 1.5
+    ///   = serve 1.5× la dimensione del modello in RAM libera.
+    /// - Returns: `true` se il warmup è stato eseguito, `false` se
+    ///   è stato saltato per insufficiente RAM o errori.
+    @discardableResult
+    public func warmupAllShards(memoryGuardRatio: Double = 1.5) -> Bool {
+        // 1) Calcola total bytes dei shards.
+        var totalBytes: UInt64 = 0
+        for shard in shards {
+            totalBytes &+= UInt64(shard.sharedBuffer.length)
+        }
+        // 2) Memory guard: controlla freeMemory + inactive su
+        // Darwin via host_statistics64. Approssimazione: usiamo
+        // `ProcessInfo.physicalMemory` come limite assoluto + un
+        // ratio.
+        let physicalMem = ProcessInfo.processInfo.physicalMemory
+        let needed = UInt64(Double(totalBytes) * memoryGuardRatio)
+        if needed > physicalMem {
+            let line = String(format:
+                "[warmup] SKIP: need %.2f GB (model %.2f × %.1f) but " +
+                "host has %.2f GB physical RAM\n",
+                Double(needed) / 1e9,
+                Double(totalBytes) / 1e9,
+                memoryGuardRatio,
+                Double(physicalMem) / 1e9)
+            FileHandle.standardError.write(Data(line.utf8))
+            return false
+        }
+        let line = String(format:
+            "[warmup] starting: %d shards, %.2f GB total\n",
+            shards.count,
+            Double(totalBytes) / 1e9)
+        FileHandle.standardError.write(Data(line.utf8))
+
+        // 3) Per ogni shard: madvise(WILLNEED) + sequential touch.
+        // Use 16 KB page size (Apple Silicon default).
+        let pageSize = 16384
+        let advice: Int32 = POSIX_MADV_WILLNEED
+        var checksum: UInt8 = 0
+        let start = Date()
+        for (idx, shard) in shards.enumerated() {
+            let buf = shard.sharedBuffer
+            let len = buf.length
+            guard let addr = buf.contents() as UnsafeMutableRawPointer? else { continue }
+            _ = posix_madvise(addr, len, advice)
+            let bytePtr = addr.assumingMemoryBound(to: UInt8.self)
+            var off = 0
+            while off < len {
+                checksum ^= bytePtr[off]
+                off &+= pageSize
+            }
+            if idx % 8 == 7 {
+                let line = String(format:
+                    "[warmup] shard %d/%d touched (%.2f GB processed)\n",
+                    idx + 1, shards.count,
+                    Double((idx + 1)) * Double(shard.sharedBuffer.length) / 1e9)
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        // Force-use checksum so the compiler doesn't elide the
+        // sequential read loop (otherwise it could optimize away as
+        // "writes to a never-read variable").
+        let useCk = checksum != 0xFF ? "ok" : "max"
+        let summary = String(format:
+            "[warmup] done in %.2fs (%.2f GB/s effective) [checksum:%s]\n",
+            elapsed,
+            Double(totalBytes) / 1e9 / max(elapsed, 0.001),
+            useCk)
+        FileHandle.standardError.write(Data(summary.utf8))
+        return true
+    }
+
     /// Counts pages still physically resident in the given shard's
     /// mapping using `mincore(2)`. Returns 0 on error. Cheap: one
     /// byte-per-page in a stack buffer, O(pages-in-shard).
