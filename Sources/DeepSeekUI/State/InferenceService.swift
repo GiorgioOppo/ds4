@@ -172,14 +172,14 @@ final class InferenceService: @unchecked Sendable {
                         chunkAlignment: alignedCount.map { _ in 2048 })
                     try manifestData.write(to: manifestURL, options: .atomic)
 
-                    FileHandle.standardError.write(Data(
-                        "[kvcache] saved (\(trigger.rawValue)): " +
-                        "\(savedTokens) tokens, \(snap.totalBytes) bytes" +
-                        " (\(compRaw))\n".utf8))
+                    let logMsg = "[kvcache] saved (\(trigger.rawValue)): "
+                        + "\(savedTokens) tokens, \(snap.totalBytes) bytes"
+                        + " (\(compRaw))\n"
+                    FileHandle.standardError.write(Data(logMsg.utf8))
                 } catch {
-                    FileHandle.standardError.write(Data(
-                        "[kvcache] save failed (\(trigger.rawValue)): " +
-                        "\(error.localizedDescription)\n".utf8))
+                    let errMsg = "[kvcache] save failed (\(trigger.rawValue)): "
+                        + "\(error.localizedDescription)\n"
+                    FileHandle.standardError.write(Data(errMsg.utf8))
                 }
                 cont.resume()
             }
@@ -262,13 +262,14 @@ final class InferenceService: @unchecked Sendable {
                                                      count: Int(n)))
             // Restore in memory.
             model.restoreKVCache(snap)
-            FileHandle.standardError.write(Data(
-                "[kvcache] restored from disk: " +
-                "\(tokens.count) tokens, \(snap.totalBytes) bytes\n".utf8))
+            let okMsg = "[kvcache] restored from disk: "
+                + "\(tokens.count) tokens, \(snap.totalBytes) bytes\n"
+            FileHandle.standardError.write(Data(okMsg.utf8))
             return tokens
         } catch {
-            FileHandle.standardError.write(Data(
-                "[kvcache] restore failed: \(error.localizedDescription)\n".utf8))
+            let failMsg = "[kvcache] restore failed: "
+                + "\(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(failMsg.utf8))
             return nil
         }
     }
