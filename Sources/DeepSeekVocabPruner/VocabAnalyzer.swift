@@ -160,7 +160,7 @@ public enum VocabAnalyzer {
             lines += infl.lineOffset
         }
 
-        if concurrency == 1 || files.count <= 1 {
+        if concurrency == 1 {
             // Path sequenziale: supporta save intra-file ogni
             // `tokenBatchThreshold` token via `onTokenBatch`.
             for file in files {
@@ -200,6 +200,39 @@ public enum VocabAnalyzer {
                 _ = scannedCounts  // ignorato: counts globali già aggiornati nel callback
                 onFileDone?(path, fileLineOffset, fileTokens, fileCounts)
             }
+        } else if files.count == 1 {
+            // Single-file parallel: divide il file in `concurrency`
+            // range di byte allineati al newline e li processa in
+            // parallel. Necessario perché il path "per-file parallel"
+            // qui sotto userebbe 1 sola iterazione (= 1 thread).
+            //
+            // Limitazione: il save intra-file (granularità 10k token
+            // del path sequenziale) NON è supportato in questa
+            // modalità — il checkpoint viene aggiornato solo al
+            // termine dell'intero file. Per save intra-file usa
+            // concurrency=1.
+            let file = files[0]
+            if let infl = inFlightFile, infl.path == file.url.path {
+                onEvent(.log("Warning: intra-file checkpoint trovato " +
+                              "ma single-file chunking parallelo non lo " +
+                              "supporta. Ripartendo dal file da capo."))
+            }
+            onEvent(.log("Single-file parallel mode: chunking " +
+                          "'\(file.url.path)' in \(concurrency) range " +
+                          "allineati al newline."))
+            let (lc, tc, fileCounts) = try Self.processFileParallel(
+                file.url,
+                isJsonl: file.isJsonl,
+                tokenizer: tokenizer,
+                concurrency: concurrency,
+                onProgress: { liveLines, liveTokens in
+                    onEvent(.scanned(lines: lines + liveLines,
+                                      tokens: tokens + liveTokens))
+                })
+            Self.mergeCounts(fileCounts, into: &counts)
+            lines += lc
+            tokens += tc
+            onFileDone?(file.url.path, lc, tc, fileCounts)
         } else {
             // Path parallelo: DispatchQueue.concurrentPerform su index
             // file. Ogni thread costruisce il proprio map locale,
@@ -416,7 +449,10 @@ public enum VocabAnalyzer {
         tokenBatchThreshold: Int? = nil,
         onTokenBatch: ((Int, Int, [Int: Int], Int, Int) -> Void)? = nil
     ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
-        let data = try Data(contentsOf: url)
+        // mmap esplicito: file > qualche GB non vengono caricati in
+        // RAM contiguamente, le pagine sono fetched on demand dal
+        // kernel. Critico per corpora grandi.
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
         guard let s = String(data: data, encoding: .utf8) else {
             return (0, 0, [:])
         }
@@ -488,6 +524,219 @@ public enum VocabAnalyzer {
         for (k, v) in local {
             aggregate[k, default: 0] += v
         }
+    }
+
+    /// Tokenizza un SINGOLO file in parallelo dividendolo in
+    /// `concurrency` range di byte allineati al newline (`\n`,
+    /// 0x0A). Ogni range gira su un thread separato via
+    /// `DispatchQueue.concurrentPerform`, accumula counts locali in
+    /// un dictionary privato (no lock contention sull'hot path), e
+    /// poi il main thread fa il merge finale.
+    ///
+    /// Usa `Data(contentsOf:options: .alwaysMapped)` → il file
+    /// viene mmappato dal kernel, le pagine vengono caricate on
+    /// demand. RAM footprint = footprint reale del working set,
+    /// non l'intero file.
+    ///
+    /// - Parameter onProgress: callback con `(liveLines,
+    ///   liveTokens)` aggregato fra i thread; chiamato ogni ~1s
+    ///   o ogni 50k token (max throughput).
+    static func processFileParallel(
+        _ url: URL,
+        isJsonl: Bool,
+        tokenizer: BPETokenizer,
+        concurrency: Int,
+        onProgress: ((Int, Int) -> Void)? = nil
+    ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
+        precondition(concurrency >= 1, "concurrency must be >= 1")
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let fileSize = data.count
+        if fileSize == 0 { return (0, 0, [:]) }
+
+        // 1) Calcola i boundary di chunk. Target = fileSize / N;
+        // ogni boundary viene "snappato" al successivo \n perché
+        // non possiamo iniziare a metà di una linea.
+        let nChunks = max(1, min(concurrency, fileSize / 1024 + 1))
+        var boundaries: [Int] = [0]
+        let chunkSize = fileSize / nChunks
+        for i in 1..<nChunks {
+            let target = chunkSize * i
+            let nl = Self.findNewline(after: target, in: data)
+            // +1 per iniziare DOPO il \n (la riga corrente "appartiene"
+            // al chunk precedente). Se non trova un \n, il chunk
+            // precedente si estende fino a fileSize.
+            if nl < fileSize, nl + 1 > (boundaries.last ?? 0) {
+                boundaries.append(nl + 1)
+            }
+        }
+        boundaries.append(fileSize)
+        let actualChunks = boundaries.count - 1
+
+        // 2) Strutture per chunk-local results. Una `AnalyzerChunkSlot`
+        // per chunk; ogni thread scrive solo nel proprio slot
+        // (nessun lock contention sull'hot path).
+        let results: [AnalyzerChunkSlot] = (0..<actualChunks)
+            .map { _ in AnalyzerChunkSlot() }
+        let lock = NSLock()
+        var caught: Error? = nil
+
+        // 3) Progress reporting (debounced).
+        let progressLock = NSLock()
+        var lastProgressEmit = Date.distantPast
+
+        DispatchQueue.concurrentPerform(iterations: actualChunks) { idx in
+            let startByte = boundaries[idx]
+            let endByte = boundaries[idx + 1]
+            let r = results[idx]
+            do {
+                try Self.processByteRange(
+                    data: data,
+                    start: startByte,
+                    end: endByte,
+                    isJsonl: isJsonl,
+                    tokenizer: tokenizer,
+                    chunkResult: r,
+                    onTokenProgress: {
+                        // Debounce: chiama onProgress al massimo ogni
+                        // 200ms (evita storm di callback durante
+                        // tokenization veloce).
+                        guard let cb = onProgress else { return }
+                        progressLock.lock()
+                        let now = Date()
+                        let shouldEmit = now.timeIntervalSince(lastProgressEmit) > 0.2
+                        if shouldEmit { lastProgressEmit = now }
+                        progressLock.unlock()
+                        if shouldEmit {
+                            lock.lock()
+                            let totalLines = results.reduce(0) { $0 + $1.lines }
+                            let totalTokens = results.reduce(0) { $0 + $1.tokens }
+                            lock.unlock()
+                            cb(totalLines, totalTokens)
+                        }
+                    })
+            } catch {
+                lock.lock()
+                if caught == nil { caught = error }
+                lock.unlock()
+            }
+        }
+        if let caught { throw caught }
+
+        // 4) Merge finale dei chunk results.
+        var totalLines = 0
+        var totalTokens = 0
+        // Pre-alloca conservativamente per evitare rehashing.
+        var totalCounts: [Int: Int] = [:]
+        let estCap = results.map { $0.counts.count }.max() ?? 0
+        totalCounts.reserveCapacity(estCap * 2)
+        for r in results {
+            totalLines += r.lines
+            totalTokens += r.tokens
+            for (k, v) in r.counts {
+                totalCounts[k, default: 0] += v
+            }
+        }
+        return (totalLines, totalTokens, totalCounts)
+    }
+
+    /// Trova l'offset del primo `\n` a partire da `offset` (incluso).
+    /// Ritorna `data.count` se non trova nulla (fine file).
+    /// Usa `withUnsafeBytes` per iterare sui byte senza overhead di
+    /// `Data` subscript (che fa bounds check su ogni accesso).
+    static func findNewline(after offset: Int, in data: Data) -> Int {
+        if offset >= data.count { return data.count }
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            let limit = data.count
+            var i = offset
+            while i < limit {
+                if base[i] == 0x0A { return i }
+                i &+= 1
+            }
+            return limit
+        }
+    }
+
+    /// Processa un range di byte `[start, end)` dentro `data`,
+    /// iterando linea per linea e tokenizzando ciascuna. Riempie
+    /// `chunkResult.{lines, tokens, counts}` direttamente — nessun
+    /// lock necessario perché ogni chunk ha il suo `ChunkResult`
+    /// privato.
+    ///
+    /// L'iterazione è byte-level via `withUnsafeBytes`: niente
+    /// `String.split`, niente `Substring` alloc.
+    static func processByteRange(
+        data: Data,
+        start: Int,
+        end: Int,
+        isJsonl: Bool,
+        tokenizer: BPETokenizer,
+        chunkResult: AnalyzerChunkSlot,
+        onTokenProgress: (() -> Void)? = nil
+    ) throws {
+        var localCounts: [Int: Int] = [:]
+        localCounts.reserveCapacity(1024)
+        var localLines = 0
+        var localTokens = 0
+
+        // Inizializza i contatori del chunk a 0 (nel caso di retry).
+        chunkResult.lines = 0
+        chunkResult.tokens = 0
+
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+
+            var pos = start
+            var lastFlush = 0
+            while pos < end {
+                // Trova la fine della linea corrente (newline o
+                // confine del range).
+                var lineEnd = pos
+                while lineEnd < end && base[lineEnd] != 0x0A {
+                    lineEnd &+= 1
+                }
+                if lineEnd > pos {
+                    // Estrai la linea come Data slice (zero-copy view).
+                    let lineSlice = data[pos..<lineEnd]
+                    let text: String?
+                    if isJsonl {
+                        if let obj = try? JSONSerialization.jsonObject(with: lineSlice) as? [String: Any],
+                           let t = obj["text"] as? String {
+                            text = t
+                        } else {
+                            text = nil
+                        }
+                    } else {
+                        text = String(data: lineSlice, encoding: .utf8)
+                    }
+                    if let text = text, !text.isEmpty {
+                        let ids = tokenizer.encode(text)
+                        for id in ids {
+                            localCounts[id, default: 0] += 1
+                            localTokens &+= 1
+                        }
+                        localLines &+= 1
+                    }
+                }
+                pos = lineEnd &+ 1   // skip il \n
+
+                // Flush periodico nel chunkResult + progress callback.
+                if localTokens - lastFlush > 50_000 {
+                    chunkResult.lines = localLines
+                    chunkResult.tokens = localTokens
+                    lastFlush = localTokens
+                    onTokenProgress?()
+                }
+            }
+        }
+
+        // Final flush dei counts del chunk.
+        chunkResult.lines = localLines
+        chunkResult.tokens = localTokens
+        for (k, v) in localCounts {
+            chunkResult.counts[k, default: 0] += v
+        }
+        onTokenProgress?()
     }
 
     // MARK: - Force-include / force-exclude predicates
@@ -647,4 +896,15 @@ public enum VocabAnalyzer {
         }
         return (b2u, u2b)
     }
+}
+
+/// Slot per i risultati di un chunk durante il single-file parallel
+/// tokenization. Ogni thread riempie il proprio slot (un per chunk);
+/// nessun lock necessario perché non c'è condivisione fra slot.
+/// `@unchecked Sendable` perché la mutazione è confinata al thread
+/// owner — l'invariante è garantita dal pattern `concurrentPerform`.
+fileprivate final class AnalyzerChunkSlot: @unchecked Sendable {
+    var lines: Int = 0
+    var tokens: Int = 0
+    var counts: [Int: Int] = [:]
 }
