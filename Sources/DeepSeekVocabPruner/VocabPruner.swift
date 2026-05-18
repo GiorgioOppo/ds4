@@ -122,6 +122,7 @@ public enum VocabPruner {
                 alreadyProcessed: alreadyProc,
                 partialCounts: partial,
                 inFlightFile: inFlight,
+                chunkedFile: checkpoint?.analyzer?.chunkedFile,
                 tokenBatchThreshold: 10_000,
                 onFileDone: { path, lines, tokens, counts in
                     store.recordAnalyzerFile(
@@ -136,6 +137,19 @@ public enum VocabPruner {
                         newLineOffset: lineOffset,
                         newTokensInFile: tokensInFile,
                         cumulativeCountsForFile: cumulCounts)
+                },
+                onChunkedFileStart: { path, fileSize, boundaries in
+                    store.setupChunkedState(path: path,
+                                             fileSize: fileSize,
+                                             boundaries: boundaries)
+                },
+                onChunkDone: { path, chunkIdx, chunkLines, chunkTokens, chunkCounts in
+                    store.recordChunkedChunkDone(
+                        path: path,
+                        chunkIdx: chunkIdx,
+                        chunkLines: chunkLines,
+                        chunkTokens: chunkTokens,
+                        chunkCounts: chunkCounts)
                 },
                 onEvent: onEvent)
             onEvent(.decisionReady(decision))
@@ -235,13 +249,40 @@ fileprivate final class CheckpointStore: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         var a = state.analyzer ?? PruneCheckpoint.AnalyzerState()
 
-        // Se il file completato era in-flight, gli incrementi
-        // intra-file sono già stati contabilizzati in
-        // linesScanned/tokensScanned. Ci serve il *delta* fra il
-        // totale del file e quanto era già stato salvato.
+        // Determina quali counts spostare a partialCounts e i delta
+        // delle stats, in base al tipo di stato in-flight per questo
+        // file:
+        //
+        //   - chunked: `fullFileCounts` ricevuti = solo i chunk FRESH
+        //     processati in questa run. Il TOTALE del file (FRESH +
+        //     resumed) è già aggregato in `chunkedFile.partialCountsForFile`
+        //     (aggiornato chunk-per-chunk da recordChunkedChunkDone).
+        //     Usiamo direttamente quello per evitare di mancare i
+        //     counts dei chunk resumed. linesScanned/tokensScanned
+        //     sono già stati aggiornati dai chunk callback → delta=0.
+        //
+        //   - sequential (inFlight): `fullFileCounts` = TOTALE del
+        //     file (resume + fresh, accumulati da onTokenBatch).
+        //     linesScanned/tokensScanned aggiornati incrementalmente
+        //     da recordAnalyzerPartial → delta = totale - last saved ≈ 0.
+        //
+        //   - né chunked né inFlight (multi-file parallel, file fresco
+        //     in sequential): `fullFileCounts` = TOTALE del file, e
+        //     linesScanned/tokensScanned non sono stati aggiornati
+        //     incrementalmente per questo file → delta = totale.
         var lineDelta = totalLinesInFile
         var tokenDelta = totalTokensInFile
-        if let infl = a.inFlightFile, infl.path == path {
+        var countsToAggregate = fullFileCounts
+
+        if let ck = a.chunkedFile, ck.path == path {
+            // Chunked: usa il totale dal chunked state.
+            countsToAggregate = ck.partialCountsForFile
+            lineDelta -= ck.linesInFile
+            tokenDelta -= ck.tokensInFile
+            a.chunkedFile = nil
+        } else if let infl = a.inFlightFile, infl.path == path {
+            // Sequential resume: i counts incremental sono già stati
+            // sommati. Sottrai il last-saved offset.
             lineDelta -= infl.lineOffset
             tokenDelta -= infl.tokensInFile
             a.inFlightFile = nil
@@ -250,7 +291,7 @@ fileprivate final class CheckpointStore: @unchecked Sendable {
         if !a.processedFiles.contains(path) {
             a.processedFiles.append(path)
         }
-        for (k, v) in fullFileCounts {
+        for (k, v) in countsToAggregate {
             a.partialCounts[k, default: 0] += v
         }
         a.linesScanned += max(0, lineDelta)
@@ -281,6 +322,83 @@ fileprivate final class CheckpointStore: @unchecked Sendable {
             partialCountsForFile: cumulativeCountsForFile)
         a.linesScanned += lineDelta
         a.tokensScanned += tokenDelta
+        state.analyzer = a
+        state.savedAt = Date()
+        try? state.save(to: outputDir)
+    }
+
+    /// Setup iniziale del `chunkedFile` state per il save per-chunk
+    /// in modalità single-file chunked. Chiamato dall'analyzer
+    /// PRIMA del dispatch dei chunk; popola path + fileSize +
+    /// boundaries per permettere al resume successivo di verificare
+    /// che la configurazione sia compatibile.
+    ///
+    /// Se esiste già un `chunkedFile` con lo stesso path + fileSize
+    /// + boundaries, NON viene reset (preserva i chunk completati
+    /// dalle run precedenti). Se differiscono o non esiste, crea
+    /// uno nuovo vuoto.
+    func setupChunkedState(path: String,
+                            fileSize: UInt64,
+                            boundaries: [Int]) {
+        lock.lock(); defer { lock.unlock() }
+        var a = state.analyzer ?? PruneCheckpoint.AnalyzerState()
+        if let existing = a.chunkedFile,
+           existing.path == path,
+           existing.fileSize == fileSize,
+           existing.boundaries == boundaries
+        {
+            // Compatibile: preserva il progress esistente.
+            return
+        }
+        a.chunkedFile = PruneCheckpoint.ChunkedFileState(
+            path: path,
+            fileSize: fileSize,
+            boundaries: boundaries)
+        // Pulisce eventuale inFlightFile residuo: i due stati sono
+        // mutually exclusive per un dato file (sequenziale vs chunked).
+        if a.inFlightFile?.path == path {
+            a.inFlightFile = nil
+        }
+        state.analyzer = a
+        state.savedAt = Date()
+        try? state.save(to: outputDir)
+    }
+
+    /// Save di un singolo chunk completato durante il single-file
+    /// chunked mode. Chiamato dal thread del chunk; lock-protected
+    /// perché più chunk possono completarsi quasi-simultaneamente
+    /// (su macchine multi-core con concurrency alta).
+    ///
+    /// I `chunkCounts` sono i counts del singolo chunk (non
+    /// cumulativi del file). Vengono mergiati in
+    /// `chunkedFile.partialCountsForFile` per costituire il
+    /// cumulativo, e l'indice viene aggiunto a `completedChunks`.
+    func recordChunkedChunkDone(path: String,
+                                  chunkIdx: Int,
+                                  chunkLines: Int,
+                                  chunkTokens: Int,
+                                  chunkCounts: [Int: Int]) {
+        lock.lock(); defer { lock.unlock() }
+        var a = state.analyzer ?? PruneCheckpoint.AnalyzerState()
+        guard var ck = a.chunkedFile, ck.path == path else {
+            // Setup mancante o path mismatch: skip silenziosamente
+            // (l'analyzer comunque emetterà il file done a fine
+            // processing che ricostruisce lo stato finale).
+            return
+        }
+        if ck.completedChunks.contains(chunkIdx) {
+            return  // già registrato — guard against duplicate calls
+        }
+        ck.completedChunks.append(chunkIdx)
+        ck.completedChunks.sort()
+        for (k, v) in chunkCounts {
+            ck.partialCountsForFile[k, default: 0] += v
+        }
+        ck.tokensInFile += chunkTokens
+        ck.linesInFile += chunkLines
+        a.chunkedFile = ck
+        a.linesScanned += chunkLines
+        a.tokensScanned += chunkTokens
         state.analyzer = a
         state.savedAt = Date()
         try? state.save(to: outputDir)

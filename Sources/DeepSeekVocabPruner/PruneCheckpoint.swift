@@ -64,21 +64,32 @@ public struct PruneCheckpoint: Codable, Sendable {
         /// (es. fra un file e l'altro, o appena prima del primo).
         public var inFlightFile: InFlightFile?
 
+        /// File in elaborazione nel branch single-file chunked
+        /// (`concurrency > 1` con un solo file nel corpus). Tiene
+        /// traccia dei chunk completati per permettere il resume
+        /// chunk-per-chunk (i chunk già completati vengono saltati
+        /// al rilancio; solo i restanti vengono processati).
+        /// `inFlightFile` e `chunkedFile` sono mutually exclusive
+        /// — al massimo uno dei due è settato per un dato file.
+        public var chunkedFile: ChunkedFileState?
+
         public init(processedFiles: [String] = [],
                     partialCounts: [Int: Int] = [:],
                     linesScanned: Int = 0,
                     tokensScanned: Int = 0,
-                    inFlightFile: InFlightFile? = nil) {
+                    inFlightFile: InFlightFile? = nil,
+                    chunkedFile: ChunkedFileState? = nil) {
             self.processedFiles = processedFiles
             self.partialCounts = partialCounts
             self.linesScanned = linesScanned
             self.tokensScanned = tokensScanned
             self.inFlightFile = inFlightFile
+            self.chunkedFile = chunkedFile
         }
 
         private enum CodingKeys: String, CodingKey {
             case processedFiles, countsKeys, countsValues,
-                 linesScanned, tokensScanned, inFlightFile
+                 linesScanned, tokensScanned, inFlightFile, chunkedFile
         }
 
         public init(from decoder: Decoder) throws {
@@ -94,6 +105,8 @@ public struct PruneCheckpoint: Codable, Sendable {
             self.tokensScanned = try c.decode(Int.self, forKey: .tokensScanned)
             self.inFlightFile = try? c.decode(InFlightFile.self,
                                                 forKey: .inFlightFile)
+            self.chunkedFile = try? c.decode(ChunkedFileState.self,
+                                              forKey: .chunkedFile)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -105,6 +118,81 @@ public struct PruneCheckpoint: Codable, Sendable {
             try c.encode(linesScanned, forKey: .linesScanned)
             try c.encode(tokensScanned, forKey: .tokensScanned)
             try c.encodeIfPresent(inFlightFile, forKey: .inFlightFile)
+            try c.encodeIfPresent(chunkedFile, forKey: .chunkedFile)
+        }
+    }
+
+    /// Stato per il save intra-file in modalità single-file chunked
+    /// (`concurrency > 1` con un solo file).
+    ///
+    /// Il file viene diviso in N chunk di byte, allineati al newline.
+    /// Ogni chunk è processato in parallel da un thread; quando un
+    /// thread completa il proprio chunk, fa save al checkpoint
+    /// aggiornando `completedChunks` + `partialCountsForFile`.
+    ///
+    /// Al resume:
+    /// - L'analyzer ricalcola i boundary dato `concurrency` corrente.
+    /// - Se `fileSize` e `boundaries` corrispondono ai salvati,
+    ///   skippa i chunk in `completedChunks` (i loro counts sono
+    ///   già in `partialCountsForFile`) e processa i restanti.
+    /// - Se non corrispondono (file modificato o concurrency
+    ///   cambiata), invalida il checkpoint e riparte da capo.
+    public struct ChunkedFileState: Codable, Sendable {
+        public var path: String
+        public var fileSize: UInt64
+        public var boundaries: [Int]
+        public var completedChunks: [Int]
+        public var partialCountsForFile: [Int: Int]
+        public var tokensInFile: Int
+        public var linesInFile: Int
+
+        public init(path: String,
+                    fileSize: UInt64,
+                    boundaries: [Int],
+                    completedChunks: [Int] = [],
+                    partialCountsForFile: [Int: Int] = [:],
+                    tokensInFile: Int = 0,
+                    linesInFile: Int = 0) {
+            self.path = path
+            self.fileSize = fileSize
+            self.boundaries = boundaries
+            self.completedChunks = completedChunks
+            self.partialCountsForFile = partialCountsForFile
+            self.tokensInFile = tokensInFile
+            self.linesInFile = linesInFile
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case path, fileSize, boundaries, completedChunks,
+                 countsKeys, countsValues, tokensInFile, linesInFile
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.path = try c.decode(String.self, forKey: .path)
+            self.fileSize = try c.decode(UInt64.self, forKey: .fileSize)
+            self.boundaries = try c.decode([Int].self, forKey: .boundaries)
+            self.completedChunks = try c.decode([Int].self, forKey: .completedChunks)
+            let ks = try c.decode([Int].self, forKey: .countsKeys)
+            let vs = try c.decode([Int].self, forKey: .countsValues)
+            var map: [Int: Int] = [:]
+            for (k, v) in zip(ks, vs) { map[k] = v }
+            self.partialCountsForFile = map
+            self.tokensInFile = try c.decode(Int.self, forKey: .tokensInFile)
+            self.linesInFile = try c.decode(Int.self, forKey: .linesInFile)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(path, forKey: .path)
+            try c.encode(fileSize, forKey: .fileSize)
+            try c.encode(boundaries, forKey: .boundaries)
+            try c.encode(completedChunks, forKey: .completedChunks)
+            let pairs = partialCountsForFile.sorted { $0.key < $1.key }
+            try c.encode(pairs.map { $0.key }, forKey: .countsKeys)
+            try c.encode(pairs.map { $0.value }, forKey: .countsValues)
+            try c.encode(tokensInFile, forKey: .tokensInFile)
+            try c.encode(linesInFile, forKey: .linesInFile)
         }
     }
 

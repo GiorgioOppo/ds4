@@ -124,9 +124,12 @@ public enum VocabAnalyzer {
         alreadyProcessed: Set<String> = [],
         partialCounts: [Int: Int] = [:],
         inFlightFile: PruneCheckpoint.InFlightFile? = nil,
+        chunkedFile: PruneCheckpoint.ChunkedFileState? = nil,
         tokenBatchThreshold: Int = 10_000,
         onFileDone: ((String, Int, Int, [Int: Int]) -> Void)? = nil,
         onTokenBatch: ((String, Int, Int, Int, [Int: Int]) -> Void)? = nil,
+        onChunkedFileStart: ((String, UInt64, [Int]) -> Void)? = nil,
+        onChunkDone: ((String, Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onEvent: @escaping (VocabPruneEvent) -> Void
     ) throws -> KeepDecision {
         precondition(coverage > 0 && coverage <= 1.0,
@@ -220,44 +223,90 @@ public enum VocabAnalyzer {
             // parallel. Necessario perché il path "per-file parallel"
             // qui sotto userebbe 1 sola iterazione (= 1 thread).
             //
-            // Limitazione: il save intra-file (granularità 10k token
-            // del path sequenziale) NON è supportato in questa
-            // modalità — il checkpoint viene aggiornato solo al
-            // termine dell'intero file. Per save intra-file usa
-            // concurrency=1.
+            // **Save intra-file** (granularità per-chunk completato):
+            // ogni chunk completato triggera un save al checkpoint
+            // via `onChunkDone`. Per concurrency=8 e fileSize=5GB,
+            // chunkSize=~640MB → save ogni ~30-60s di processing
+            // (vs prima: save solo a fine file dopo ~5-10 min).
             //
-            // Resume da inFlightFile: il file viene processato da capo
-            // (i thread non sanno saltare a `lineOffset` e ripartire
-            // dal partial counts). Il `CheckpointStore.recordAnalyzerFile`
-            // sottrarrà `inFlightFile.lineOffset/tokensInFile` dai
-            // delta delle stats per evitare doppio conteggio nelle
-            // metriche; il `partialCounts` aggregato del checkpoint
-            // riceve i `fullFileCounts` FRESH (non i partial precedenti),
-            // quindi resta consistente.
+            // **Resume**: se il checkpoint ha un `chunkedFile` per
+            // questo path con gli stessi boundary, i chunk completati
+            // vengono saltati e i loro counts (salvati in
+            // `partialCountsForFile`) pre-popolati nei counts globali.
+            // Se boundary o fileSize differiscono (file modificato o
+            // concurrency cambiata), si riparte da capo.
+            //
+            // **Resume da inFlightFile (sequential)**: ignorato. Se
+            // l'utente passa da concurrency=1 a >1, il file viene
+            // processato da capo (warning loggato).
             let file = files[0]
             if let infl = inFlightFile, infl.path == file.url.path {
-                onEvent(.log("Warning: intra-file checkpoint trovato " +
-                              "(\(infl.tokensInFile) token già contati) " +
-                              "ma single-file chunking parallelo non " +
-                              "supporta il resume parziale. " +
-                              "Ripartendo dal file da capo."))
+                onEvent(.log("Warning: intra-file checkpoint sequential " +
+                              "trovato (\(infl.tokensInFile) token già " +
+                              "contati su '\(infl.path)') ma chunked mode " +
+                              "non lo supporta. Quel checkpoint verrà " +
+                              "ignorato; il file riparte da capo."))
+            }
+            // Resume da chunkedFile: verifica match path + fileSize
+            // + boundaries con quanto sta per essere ricalcolato.
+            // Se OK, pre-popola counts globali e skippa i chunk.
+            var resumeChunks: Set<Int> = []
+            if let ck = chunkedFile, ck.path == file.url.path {
+                // Ricalcola fileSize per verifica.
+                let fileSize: UInt64
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: file.url.path),
+                   let sz = attrs[FileAttributeKey.size] as? UInt64 {
+                    fileSize = sz
+                } else {
+                    fileSize = 0
+                }
+                if ck.fileSize == fileSize, !ck.completedChunks.isEmpty {
+                    // Match: pre-popola i counts globali con il
+                    // partial già fatto + segna i chunk da skippare.
+                    Self.mergeCounts(ck.partialCountsForFile, into: &counts)
+                    tokens += ck.tokensInFile
+                    lines += ck.linesInFile
+                    resumeChunks = Set(ck.completedChunks)
+                    onEvent(.log("Resume chunked: \(ck.completedChunks.count) " +
+                                  "chunk già completati su '\(ck.path)' " +
+                                  "(\(ck.tokensInFile) token), processo i restanti."))
+                } else if ck.fileSize != fileSize {
+                    onEvent(.log("Warning: chunked checkpoint trovato ma " +
+                                  "fileSize cambiata (\(ck.fileSize) → " +
+                                  "\(fileSize)). Riparto da capo."))
+                }
             }
             onEvent(.log("Single-file parallel mode: chunking " +
                           "'\(file.url.path)' in \(concurrency) range " +
                           "allineati al newline."))
-            let (lc, tc, fileCounts) = try Self.processFileParallel(
+            let result = try Self.processFileParallel(
                 file.url,
                 isJsonl: file.isJsonl,
                 tokenizer: tokenizer,
                 concurrency: concurrency,
+                resumeFromCompletedChunks: resumeChunks,
+                onBoundariesReady: { fileSize, boundaries in
+                    // Setup PRIMA del dispatch: il caller registra
+                    // lo state nel checkpoint così
+                    // recordChunkedChunkDone (chiamato dai thread
+                    // sotto) può trovare il `chunkedFile` valido.
+                    onChunkedFileStart?(file.url.path, fileSize, boundaries)
+                },
+                onChunkDone: { idx, chunkLines, chunkTokens, chunkCounts in
+                    // Callback dal thread del chunk. Notifica al
+                    // caller (VocabPruner) per save al checkpoint.
+                    // Il caller deve gestire concorrenza (lock interno).
+                    onChunkDone?(file.url.path, idx,
+                                  chunkLines, chunkTokens, chunkCounts)
+                },
                 onProgress: { liveLines, liveTokens in
                     onEvent(.scanned(lines: lines + liveLines,
                                       tokens: tokens + liveTokens))
                 })
-            Self.mergeCounts(fileCounts, into: &counts)
-            lines += lc
-            tokens += tc
-            onFileDone?(file.url.path, lc, tc, fileCounts)
+            Self.mergeCounts(result.counts, into: &counts)
+            lines += result.lines
+            tokens += result.tokens
+            onFileDone?(file.url.path, result.lines, result.tokens, result.counts)
         } else {
             // Path parallelo per-file: DispatchQueue.concurrentPerform
             // su index file. Ogni thread costruisce il proprio map
@@ -564,6 +613,18 @@ public enum VocabAnalyzer {
         }
     }
 
+    /// Risultato di `processFileParallel`. Include i boundary
+    /// effettivamente usati per permettere al caller di salvare il
+    /// `ChunkedFileState` nel checkpoint coerente con quanto
+    /// processato.
+    struct ParallelFileResult {
+        let lines: Int
+        let tokens: Int
+        let counts: [Int: Int]
+        let boundaries: [Int]
+        let fileSize: UInt64
+    }
+
     /// Tokenizza un SINGOLO file in parallelo dividendolo in
     /// `concurrency` range di byte allineati al newline (`\n`,
     /// 0x0A). Ogni range gira su un thread separato via
@@ -576,20 +637,40 @@ public enum VocabAnalyzer {
     /// demand. RAM footprint = footprint reale del working set,
     /// non l'intero file.
     ///
-    /// - Parameter onProgress: callback con `(liveLines,
-    ///   liveTokens)` aggregato fra i thread; chiamato ogni ~1s
-    ///   o ogni 50k token (max throughput).
+    /// **Resume support (single-file chunked checkpoint)**:
+    /// - `resumeFromCompletedChunks`: indici di chunk già processati
+    ///   in una run precedente. Vengono saltati (e i loro `result`
+    ///   restano zero — i loro counts devono già essere in
+    ///   `partialCountsForFile` del checkpoint, pre-popolati nei
+    ///   counts globali dal caller).
+    /// - I boundary vengono ricalcolati a partire da `concurrency`
+    ///   corrente; il caller verifica che corrispondano a quelli
+    ///   salvati prima di passare `resumeFromCompletedChunks`.
+    ///
+    /// - Parameter onChunkDone: callback chiamato dopo che un
+    ///   thread completa il proprio chunk. Riceve `(chunkIdx,
+    ///   lines, tokens, counts)`. Usato dal caller per save al
+    ///   checkpoint. Eseguito sul thread del chunk — il caller deve
+    ///   gestire concorrenza (lock interno).
+    /// - Parameter onProgress: callback con `(liveLines, liveTokens)`
+    ///   aggregato; chiamato ogni ~200ms (debounce).
     static func processFileParallel(
         _ url: URL,
         isJsonl: Bool,
         tokenizer: BPETokenizer,
         concurrency: Int,
+        resumeFromCompletedChunks: Set<Int> = [],
+        onBoundariesReady: ((UInt64, [Int]) -> Void)? = nil,
+        onChunkDone: ((Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onProgress: ((Int, Int) -> Void)? = nil
-    ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
+    ) throws -> ParallelFileResult {
         precondition(concurrency >= 1, "concurrency must be >= 1")
         let data = try Data(contentsOf: url, options: .alwaysMapped)
         let fileSize = data.count
-        if fileSize == 0 { return (0, 0, [:]) }
+        if fileSize == 0 {
+            return ParallelFileResult(lines: 0, tokens: 0, counts: [:],
+                                       boundaries: [0], fileSize: 0)
+        }
 
         // 1) Calcola i boundary di chunk. Target = fileSize / N;
         // ogni boundary viene "snappato" al successivo \n perché
@@ -610,6 +691,14 @@ public enum VocabAnalyzer {
         boundaries.append(fileSize)
         let actualChunks = boundaries.count - 1
 
+        // Notifica al caller i boundary calcolati PRIMA del dispatch
+        // dei thread, così il caller può fare setup del checkpoint
+        // state ed essere pronto a ricevere gli `onChunkDone`
+        // callback. Critico per il save intra-file in chunked mode
+        // — senza questo setup, recordChunkedChunkDone non sa dove
+        // mettere i counts.
+        onBoundariesReady?(UInt64(fileSize), boundaries)
+
         // 2) Strutture per chunk-local results. Una `AnalyzerChunkSlot`
         // per chunk; ogni thread scrive solo nel proprio slot
         // (nessun lock contention sull'hot path).
@@ -623,6 +712,12 @@ public enum VocabAnalyzer {
         var lastProgressEmit = Date.distantPast
 
         DispatchQueue.concurrentPerform(iterations: actualChunks) { idx in
+            // Resume: skippa i chunk già completati in una run
+            // precedente (i loro counts sono già nel checkpoint, e
+            // il caller li ha pre-popolati nei counts globali).
+            if resumeFromCompletedChunks.contains(idx) {
+                return
+            }
             let startByte = boundaries[idx]
             let endByte = boundaries[idx + 1]
             let r = results[idx]
@@ -652,6 +747,11 @@ public enum VocabAnalyzer {
                             cb(totalLines, totalTokens)
                         }
                     })
+                // Chunk completato: notifica al caller per save
+                // intermedio del checkpoint. Eseguito sul thread del
+                // chunk — il caller (CheckpointStore) ha il proprio
+                // lock interno.
+                onChunkDone?(idx, r.lines, r.tokens, r.counts)
             } catch {
                 lock.lock()
                 if caught == nil { caught = error }
@@ -660,10 +760,10 @@ public enum VocabAnalyzer {
         }
         if let caught { throw caught }
 
-        // 4) Merge finale dei chunk results.
+        // 4) Merge finale dei chunk results (solo i chunk processati
+        // in QUESTA run; i resumed sono già nei counts del caller).
         var totalLines = 0
         var totalTokens = 0
-        // Pre-alloca conservativamente per evitare rehashing.
         var totalCounts: [Int: Int] = [:]
         let estCap = results.map { $0.counts.count }.max() ?? 0
         totalCounts.reserveCapacity(estCap * 2)
@@ -674,7 +774,11 @@ public enum VocabAnalyzer {
                 totalCounts[k, default: 0] += v
             }
         }
-        return (totalLines, totalTokens, totalCounts)
+        return ParallelFileResult(lines: totalLines,
+                                    tokens: totalTokens,
+                                    counts: totalCounts,
+                                    boundaries: boundaries,
+                                    fileSize: UInt64(fileSize))
     }
 
     /// Trova l'offset del primo `\n` a partire da `offset` (incluso).
