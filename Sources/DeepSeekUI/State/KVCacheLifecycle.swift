@@ -25,8 +25,12 @@ import DeepSeekKit
 /// caller (InferenceService, ChatStore, AppDelegate) invoca al
 /// momento opportuno. La classe NON osserva eventi autonomamente
 /// per restare deterministic e testabile.
-@MainActor
-public final class KVCacheLifecycle {
+///
+/// `@unchecked Sendable` perché lo stato mutabile (last save
+/// timestamp/token count) è protetto da `NSLock` interno per
+/// permettere chiamate da queue arbitrarie (es. il queue dedicato
+/// di `InferenceService.q`).
+public final class KVCacheLifecycle: @unchecked Sendable {
 
     /// Trigger di save. Documenta il "perché" del save corrente per
     /// logging e metric.
@@ -47,6 +51,7 @@ public final class KVCacheLifecycle {
     /// che UN solo throttle sia soddisfatto per saltare.
     public var continuedSaveMinInterval: TimeInterval = 5.0
 
+    private let stateLock = NSLock()
     private var lastContinuedSaveTokenCount: Int = 0
     private var lastContinuedSaveAt: Date = Date.distantPast
 
@@ -66,24 +71,28 @@ public final class KVCacheLifecycle {
     /// Sempre forza il save (nessun throttle).
     public func triggerCold() async {
         await safeCall(.cold)
+        stateLock.lock()
         lastContinuedSaveTokenCount = 0
         lastContinuedSaveAt = Date()
+        stateLock.unlock()
     }
 
     /// Da chiamare durante decode quando il count cumulativo di
     /// token raggiunge un window boundary. Throttle applicato:
     /// non salva se sotto la soglia di token o tempo dal last save.
     public func triggerContinued(currentTokenCount: Int) async {
+        stateLock.lock()
         let tokensDelta = currentTokenCount - lastContinuedSaveTokenCount
         let timeDelta = Date().timeIntervalSince(lastContinuedSaveAt)
-        guard tokensDelta >= continuedSaveTokenThreshold
-                || timeDelta >= continuedSaveMinInterval
-        else {
-            return
-        }
+        let shouldSave = tokensDelta >= continuedSaveTokenThreshold
+                          || timeDelta >= continuedSaveMinInterval
+        stateLock.unlock()
+        if !shouldSave { return }
         await safeCall(.continued)
+        stateLock.lock()
         lastContinuedSaveTokenCount = currentTokenCount
         lastContinuedSaveAt = Date()
+        stateLock.unlock()
     }
 
     /// Da chiamare prima di un model swap o cambio conversation.
@@ -102,8 +111,10 @@ public final class KVCacheLifecycle {
     /// conversation così il prossimo `continued` non viene
     /// "antichizzato" dallo stato della conversation precedente.
     public func reset() {
+        stateLock.lock()
         lastContinuedSaveTokenCount = 0
         lastContinuedSaveAt = Date.distantPast
+        stateLock.unlock()
     }
 
     // MARK: - Internal

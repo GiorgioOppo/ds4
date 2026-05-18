@@ -54,6 +54,20 @@ enum AppSettingsKey {
     /// `MAP_PRIVATE` se mmap fallisce. Default false per safety
     /// contro Darwin VM accounting issues su setup esotici.
     static let useMapSharedWeights = "deepseek.useMapSharedWeights"
+
+    /// Cross-restart KV cache persistente. Quando attivo, l'app
+    /// salva lo snapshot della KV cache su disco a 4 trigger
+    /// (cold/continued/evict/shutdown) tramite `KVCacheLifecycle`,
+    /// e al rientro in una conversation prova a ripristinare lo
+    /// stato dal file `.kvcache` invece di fare cold prefill.
+    /// Default false. Vedi `InferenceService.kvLifecycle`.
+    static let crossRestartKVCache = "deepseek.crossRestartKVCache"
+
+    /// Compression del KV cache snapshot sul disco. "f32" (default,
+    /// lossless), "f16" (2× compression), "bf16" (2× compression,
+    /// range completo F32). Letta solo se `crossRestartKVCache`
+    /// attivo.
+    static let kvCacheCompression = "deepseek.kvCacheCompression"
 }
 
 /// Helper for code paths that need to read defaults without going

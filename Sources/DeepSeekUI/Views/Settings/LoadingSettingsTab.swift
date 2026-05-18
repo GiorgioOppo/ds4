@@ -15,6 +15,10 @@ struct LoadingSettingsTab: View {
     private var commonPrefixRewind: Bool = false
     @AppStorage(AppSettingsKey.useMapSharedWeights)
     private var useMapSharedWeights: Bool = false
+    @AppStorage(AppSettingsKey.crossRestartKVCache)
+    private var crossRestartKVCache: Bool = false
+    @AppStorage(AppSettingsKey.kvCacheCompression)
+    private var kvCacheCompression: String = "f32"
 
     var body: some View {
         Form {
@@ -64,6 +68,32 @@ struct LoadingSettingsTab: View {
                      "per safety vs Darwin VM panic.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Toggle("Cross-restart KV cache persistence",
+                        isOn: $crossRestartKVCache)
+                Text("Salva la KV cache su disco a 4 trigger " +
+                     "(cold/continued/evict/shutdown). Al rientro " +
+                     "in una conversation, ripristina dallo snapshot " +
+                     "invece di fare cold prefill. Comporta I/O " +
+                     "periodico durante decode (throttle a 128 token " +
+                     "o 5s). Default OFF.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if crossRestartKVCache {
+                    Picker("KV cache compression",
+                            selection: $kvCacheCompression) {
+                        Text("F32 (lossless)").tag("f32")
+                        Text("F16 (2× compression, half precision)").tag("f16")
+                        Text("BF16 (2× compression, F32 range)").tag("bf16")
+                    }
+                    .pickerStyle(.menu)
+                    Text("F16 raccomandato: 2× file più piccolo " +
+                         "senza perdita percettiva. BF16 utile se " +
+                         "le attivazioni hanno range estremo (>65k).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("Last loaded model") {
                 if lastModelDir.isEmpty {

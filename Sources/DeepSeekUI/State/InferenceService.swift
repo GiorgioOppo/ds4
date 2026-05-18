@@ -87,6 +87,206 @@ final class InferenceService: @unchecked Sendable {
             ?? Self.defaultCompressRatioLCM
     }
 
+    // MARK: - Cross-restart KV cache (ds4-style)
+
+    /// Conversation attualmente "live" (l'ultima il cui state KV è
+    /// nei MTLBuffer del modello). Aggiornata da
+    /// `generateForConversation` ad ogni turn. `nil` significa
+    /// "nessuna conversation specifica" (per es. dopo
+    /// `releaseCache()` o prima del primo turn).
+    private var activeConversationID: UUID? = nil
+
+    /// Lifecycle del KV cache persistente. Setup in `loadModel` se
+    /// `crossRestartKVCache` AppStorage flag è ON. Niente se OFF.
+    private var kvLifecycle: KVCacheLifecycle? = nil
+
+    /// Tokens attualmente nel KV cache (= `cacheImage.tokens` di
+    /// solito, ma conservato qui per essere accessibile al lifecycle
+    /// save closure senza dover hop al main).
+    private var kvLiveTokens: [Int32] = []
+
+    /// Setup `kvLifecycle` + closure di save se il flag AppStorage
+    /// `crossRestartKVCache` è ON. Chiamato da `loadModel` dopo che
+    /// transformer + tokenizer sono ready. Niente in caso di flag OFF.
+    fileprivate func setupKVLifecycle() {
+        let enabled = UserDefaults.standard.bool(
+            forKey: AppSettingsKey.crossRestartKVCache)
+        guard enabled else {
+            self.kvLifecycle = nil
+            return
+        }
+        let lifecycle = KVCacheLifecycle()
+        // weak self per evitare retain cycle (lifecycle può
+        // sopravvivere all'unload del modello durante shutdown).
+        lifecycle.save = { [weak self] trigger in
+            guard let self = self else { return }
+            await self.persistKVCache(trigger: trigger)
+        }
+        self.kvLifecycle = lifecycle
+    }
+
+    /// Salva lo snapshot della KV cache + manifest su disco.
+    /// Chiamato dalle closure del lifecycle. Eseguita sul queue
+    /// dedicato di inferenza (`q`) per non confliggere col forward
+    /// in corso.
+    fileprivate func persistKVCache(trigger: KVCacheLifecycle.SaveTrigger) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            self.q.async { [weak self] in
+                guard let self = self,
+                      let model = self.transformer,
+                      let convID = self.activeConversationID
+                else {
+                    cont.resume(); return
+                }
+                do {
+                    let url = try PersistencePaths.kvCacheURL(id: convID)
+                    let snap = model.snapshotKVCache()
+
+                    // Leggi compression dal AppStorage.
+                    let compRaw = UserDefaults.standard.string(
+                        forKey: AppSettingsKey.kvCacheCompression) ?? "f32"
+                    let compression: KVCacheSnapshot.DiskCompression = {
+                        switch compRaw {
+                        case "f16":  return .f16
+                        case "bf16": return .bf16
+                        default:     return .f32
+                        }
+                    }()
+
+                    try snap.save(to: url, compression: compression)
+
+                    // Manifest v2: tokens + chunk alignment.
+                    // Per il `cold` trigger applichiamo cold-save
+                    // alignment a 2048 token (ds4 convention).
+                    let tokens = self.kvLiveTokens
+                    let alignedCount: Int? = trigger == .cold
+                        ? min(KVCacheFile.coldSaveAlignedCount(tokens.count),
+                              tokens.count)
+                        : nil
+                    let savedTokens = alignedCount ?? tokens.count
+                    let alignedSlice = Array(tokens.prefix(savedTokens))
+
+                    let manifestURL = url.appendingPathExtension("manifest")
+                    let manifestData = self.buildManifestData(
+                        tokens: alignedSlice,
+                        chunkAlignment: alignedCount.map { _ in 2048 })
+                    try manifestData.write(to: manifestURL, options: .atomic)
+
+                    FileHandle.standardError.write(Data(
+                        "[kvcache] saved (\(trigger.rawValue)): " +
+                        "\(savedTokens) tokens, \(snap.totalBytes) bytes" +
+                        " (\(compRaw))\n".utf8))
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        "[kvcache] save failed (\(trigger.rawValue)): " +
+                        "\(error.localizedDescription)\n".utf8))
+                }
+                cont.resume()
+            }
+        }
+    }
+
+    /// Costruisce il blob binario del manifest v2 in-line (evita di
+    /// dover esporre `KVCacheFile.ManifestData` come Codable
+    /// pubblico). Layout: vedi `KVCacheFile.writeManifestFull`.
+    private func buildManifestData(tokens: [Int32],
+                                     chunkAlignment: Int?) -> Data {
+        let useV2 = chunkAlignment != nil
+        let version: UInt32 = useV2 ? 2 : 1
+        var data = Data()
+        var magic = KVCacheFile.manifestMagic.littleEndian
+        var verLE = version.littleEndian
+        var count = UInt64(tokens.count).littleEndian
+        withUnsafeBytes(of: &magic) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &verLE) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
+        tokens.withUnsafeBufferPointer { p in
+            let byteCount = p.count * MemoryLayout<Int32>.stride
+            let bytePtr = UnsafeRawPointer(p.baseAddress!)
+                .assumingMemoryBound(to: UInt8.self)
+            data.append(bytePtr, count: byteCount)
+        }
+        if useV2 {
+            var logitsLen: UInt32 = 0  // logits non salvati qui
+            withUnsafeBytes(of: &logitsLen) { data.append(contentsOf: $0) }
+            var align = UInt32(chunkAlignment ?? 0).littleEndian
+            withUnsafeBytes(of: &align) { data.append(contentsOf: $0) }
+        }
+        return data
+    }
+
+    /// Prova a ripristinare la KV cache di una conversation dal
+    /// disco (se esiste un file `.kvcache` valido + manifest il cui
+    /// hash dei token iniziale matcha). Ritorna `nil` se non c'è
+    /// match o se il restore fallisce. Quando ritorna non-nil, il
+    /// modello è stato `restoreKVCache(_:)` con lo snapshot e
+    /// `activeConversationID` + `kvLiveTokens` sono settati.
+    /// Caller può fare prefill solo del delta (`promptTokens -
+    /// returnedTokens`) invece di cold prefill.
+    ///
+    /// Eseguito sul queue di inferenza dal chiamante.
+    fileprivate func tryRestoreKVCache(for convID: UUID,
+                                         model: Transformer)
+        -> [Int32]?
+    {
+        guard self.kvLifecycle != nil else { return nil }
+        do {
+            let url = try PersistencePaths.kvCacheURL(id: convID)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return nil
+            }
+            guard let snap = KVCacheSnapshot.load(from: url) else {
+                return nil
+            }
+            // Leggi il manifest per ottenere i token IDs.
+            let manifestURL = url.appendingPathExtension("manifest")
+            guard let mdata = try? Data(contentsOf: manifestURL),
+                  mdata.count >= 16 else {
+                return nil
+            }
+            var cursor = 0
+            guard let m1 = readU32(mdata, &cursor),
+                  m1 == KVCacheFile.manifestMagic,
+                  let _ver = readU32(mdata, &cursor),
+                  _ver == 1 || _ver == 2,
+                  let n = readU64(mdata, &cursor)
+            else { return nil }
+            _ = _ver
+            let needed = Int(n) * 4
+            guard cursor + needed <= mdata.count else { return nil }
+            let tokenPtr = mdata.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                raw.baseAddress!.advanced(by: cursor)
+                    .assumingMemoryBound(to: Int32.self)
+            }
+            let tokens = Array(UnsafeBufferPointer(start: tokenPtr,
+                                                     count: Int(n)))
+            // Restore in memory.
+            model.restoreKVCache(snap)
+            FileHandle.standardError.write(Data(
+                "[kvcache] restored from disk: " +
+                "\(tokens.count) tokens, \(snap.totalBytes) bytes\n".utf8))
+            return tokens
+        } catch {
+            FileHandle.standardError.write(Data(
+                "[kvcache] restore failed: \(error.localizedDescription)\n".utf8))
+            return nil
+        }
+    }
+
+    /// Triggera shutdown sync — chiamato da app delegate quando l'app
+    /// termina. Eseguito synchronously per garantire che il save
+    /// finisca prima dell'exit.
+    public func saveKVCacheOnShutdown() {
+        guard let lifecycle = self.kvLifecycle else { return }
+        let group = DispatchGroup()
+        group.enter()
+        Task {
+            await lifecycle.triggerShutdown()
+            group.leave()
+        }
+        _ = group.wait(timeout: .now() + 5.0)
+    }
+
     /// Quando true, `generateForConversation` accetta anche
     /// common-prefix match (non solo strict-prefix). Se il nuovo
     /// prompt diverge dal cached dopo K token (K > 0), il
@@ -364,6 +564,10 @@ final class InferenceService: @unchecked Sendable {
                     // invalid (different weight tensors → different
                     // attention outputs).
                     self.cacheImage = nil
+                    // Setup del cross-restart KV cache (se abilitato)
+                    // — instantiate il lifecycle e inietta la save
+                    // closure. Niente se il flag è OFF.
+                    self.setupKVLifecycle()
                     cont.resume(returning: cfg)
                 } catch {
                     cont.resume(throwing: error)
@@ -874,6 +1078,41 @@ final class InferenceService: @unchecked Sendable {
                 self.enableCommonPrefixRewind = UserDefaults.standard.bool(
                     forKey: AppSettingsKey.commonPrefixRewind)
 
+                // Aggiorna `activeConversationID` per il lifecycle save
+                // closure. Se cambia (evict trigger condizione), salva
+                // lo stato della conversation precedente prima del
+                // releaseCache.
+                let previousConvID = self.activeConversationID
+                if previousConvID != conversationID,
+                   let lifecycle = self.kvLifecycle,
+                   previousConvID != nil
+                {
+                    let group = DispatchGroup()
+                    group.enter()
+                    Task {
+                        await lifecycle.triggerEvict()
+                        group.leave()
+                    }
+                    _ = group.wait(timeout: .now() + 5.0)
+                    lifecycle.reset()
+                }
+                self.activeConversationID = conversationID
+
+                // Cross-restart resume tentative: se non c'è
+                // cacheImage live (= primo turn in questa session)
+                // e il flag crossRestartKVCache è attivo, prova a
+                // ripristinare da disco.
+                if self.cacheImage == nil, self.kvLifecycle != nil {
+                    if let restoredTokens = self.tryRestoreKVCache(
+                        for: conversationID, model: model)
+                    {
+                        self.cacheImage = CacheImage(
+                            conversationID: conversationID,
+                            tokens: restoredTokens,
+                            mode: mode)
+                    }
+                }
+
                 // Decide reuse vs. full reset.
                 //
                 // **Strict-prefix** (always supported): cached tokens
@@ -1006,6 +1245,20 @@ final class InferenceService: @unchecked Sendable {
                     elapsed: prefillElapsed,
                     tokPerMin: prefillTPM))
 
+                // Cold-save trigger: dopo il primo prefill, salva lo
+                // snapshot della KV cache su disco. Skip se il flag
+                // crossRestartKVCache è OFF (lifecycle nil).
+                self.kvLiveTokens = promptTokens
+                if let lifecycle = self.kvLifecycle {
+                    let group = DispatchGroup()
+                    group.enter()
+                    Task {
+                        await lifecycle.triggerCold()
+                        group.leave()
+                    }
+                    _ = group.wait(timeout: .now() + 10.0)
+                }
+
                 var opts = options
                 let stops = tok.stopTokenIds
 
@@ -1042,6 +1295,25 @@ final class InferenceService: @unchecked Sendable {
                             elapsed: elapsedSoFar,
                             tokPerMin: tpm))
                         lastSample = now
+
+                        // Continued-save trigger: la lifecycle ha il
+                        // suo throttle interno (default 128 token o 5s);
+                        // qui chiamiamo a ogni progress tick ma il save
+                        // vero parte solo se la threshold è raggiunta.
+                        // kvLiveTokens aggiornato col delta corrente
+                        // (= promptTokens originali + token generati).
+                        if let lifecycle = self.kvLifecycle {
+                            let liveCount = promptTokens.count + generated.count
+                            self.kvLiveTokens = promptTokens + generated
+                                .map { Int32($0) }
+                            // Task fire-and-forget — il save è async,
+                            // throttle dentro il lifecycle. Non bloccare
+                            // il decode loop sul I/O.
+                            Task {
+                                await lifecycle.triggerContinued(
+                                    currentTokenCount: liveCount)
+                            }
+                        }
                     }
 
                     if step == maxTokens - 1 { break }
@@ -1080,4 +1352,26 @@ final class InferenceService: @unchecked Sendable {
             }
         }
     }
+}
+
+// MARK: - Byte parsing helpers for KV cache restore
+
+@inline(__always)
+fileprivate func readU32(_ data: Data, _ cursor: inout Int) -> UInt32? {
+    guard cursor + 4 <= data.count else { return nil }
+    let v = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt32 in
+        raw.load(fromByteOffset: cursor, as: UInt32.self)
+    }
+    cursor += 4
+    return UInt32(littleEndian: v)
+}
+
+@inline(__always)
+fileprivate func readU64(_ data: Data, _ cursor: inout Int) -> UInt64? {
+    guard cursor + 8 <= data.count else { return nil }
+    let v = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> UInt64 in
+        raw.load(fromByteOffset: cursor, as: UInt64.self)
+    }
+    cursor += 8
+    return UInt64(littleEndian: v)
 }
