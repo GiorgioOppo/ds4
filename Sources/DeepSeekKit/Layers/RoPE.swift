@@ -47,8 +47,31 @@ public final class RoPE {
         var misc = SIMD2<UInt32>(UInt32(startPos), inverse ? 1 : 0)
         enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 3)
         let half = ropeHeadDim / 2
+
+        // ---- Threadgroup sizing tuned per occupancy ----
+        // Il vecchio piano `min(T,4)×min(H,4)×min(half,16) = 256`
+        // capava il threadgroup a 256 thread e con la `z` non
+        // multipla di 32 sprecava lane SIMD. Riconfiguriamo
+        // leggendo i limiti hardware del pipeline (su Apple GPU
+        // simdWidth = 32, maxTotal = 1024).
+        //
+        // Layout: il thread (gid.z) indirizza il pair index `i`, e
+        // ogni thread accede a `x[base + 2*i]` / `x[base + 2*i+1]`.
+        // Gli accessi sono contigui in memoria quando `z` varia →
+        // mettiamo simdWidth thread nella dimensione `z` per
+        // ottenere coalescenza.
+        let simdWidth = pipeline.threadExecutionWidth
+        let maxTotal = pipeline.maxTotalThreadsPerThreadgroup
+        let tgZ = max(1, min(half, simdWidth))
+        // Target ~256 thread per blocco prima di considerare `x`
+        // (T-dim) per non strozzare la occupancy a regime memory-bound.
+        let tgY = max(1, min(H, max(1, 256 / max(1, tgZ))))
+        // Riempi con tgX fino al maxTotal del pipeline.
+        let remaining = max(1, maxTotal / max(1, tgY * tgZ))
+        let tgX = max(1, min(T, remaining))
+
         let grid = MTLSize(width: T, height: H, depth: half)
-        let tg = MTLSize(width: min(T, 4), height: min(H, 4), depth: min(half, 16))
+        let tg = MTLSize(width: tgX, height: tgY, depth: tgZ)
         enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
         enc.endEncoding()
     }
