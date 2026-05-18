@@ -342,14 +342,19 @@ final class InferenceService: @unchecked Sendable {
                     // Leggi le preference che influenzano il load.
                     // `warmupOnLoad` da AppStorage; saltato automaticamente
                     // dal loader se la RAM disponibile è insufficiente.
+                    // `useMapShared` esperimentale, fallback a MAP_PRIVATE
+                    // se mmap fallisce.
                     let warmup = UserDefaults.standard.bool(
                         forKey: AppSettingsKey.warmupOnLoad)
+                    let useShared = UserDefaults.standard.bool(
+                        forKey: AppSettingsKey.useMapSharedWeights)
 
                     let model = try Transformer.load(
                         config: cfg, from: url,
                         strategyOverride: strategyOverride,
                         forceLoad: forceLoad,
-                        warmupOnLoad: warmup)
+                        warmupOnLoad: warmup,
+                        useMapSharedWeights: useShared)
 
                     self.transformer = model
                     self._tokenizer = tok

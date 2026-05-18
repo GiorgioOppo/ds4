@@ -53,7 +53,8 @@ public final class SafeTensorsFile {
     ///   apps + the model share unified memory; the cost is that
     ///   re-faulting a page after `MADV_FREE_REUSABLE` hits disk
     ///   directly instead of a warm cache.
-    public init(url: URL, mapNoCache: Bool = false) throws {
+    public init(url: URL, mapNoCache: Bool = false,
+                useMapShared: Bool = false) throws {
         self.url = url
 
         let fd = open(url.path, O_RDONLY)
@@ -77,14 +78,42 @@ public final class SafeTensorsFile {
         // pages fault in on first read, but the kernel maintains a
         // page table for the whole region from the moment mmap
         // returns — non-trivial overhead for multi-GB ranges.
+        //
+        // **MAP_PRIVATE vs MAP_SHARED su Apple Silicon** (default
+        // PRIVATE, opt-in SHARED via `useMapShared`):
+        // - MAP_PRIVATE (default): le pagine sono mappate copy-on-write.
+        //   Per puro PROT_READ niente copia avviene mai (lo dice il
+        //   manual page POSIX). Storicamente più safe contro Darwin
+        //   VM accounting panics; lo usano sia noi che ds4 sul CPU
+        //   path.
+        // - MAP_SHARED (opt-in): le pagine sono direttamente la
+        //   memoria mappata del file, niente COW. ds4 lo usa per
+        //   il path Metal mapping (zero-copy MTLBuffer wrap).
+        //   Su APFS + unified memory dovrebbe essere safe; fallback
+        //   automatico a PRIVATE se mmap fallisce.
+        let flagDesc = mapNoCache
+            ? (useMapShared ? "SHARED NOCACHE" : "PRIVATE NOCACHE")
+            : (useMapShared ? "SHARED" : "PRIVATE")
         MemoryLogger.willAllocate(bytes: alignedSize,
-                                   label: "mmap \(url.lastPathComponent)\(mapNoCache ? " NOCACHE" : "")")
-        var mapFlags: Int32 = MAP_PRIVATE
+                                   label: "mmap \(url.lastPathComponent) \(flagDesc)")
+        var mapFlags: Int32 = useMapShared ? MAP_SHARED : MAP_PRIVATE
         if mapNoCache {
             mapFlags |= MAP_NOCACHE
         }
-        guard let raw = mmap(nil, alignedSize, PROT_READ, mapFlags, fd, 0),
-              raw != MAP_FAILED else {
+        // Tenta MAP_SHARED se richiesto; al fallimento ricade su
+        // MAP_PRIVATE per resilienza (alcuni filesystem rifiutano
+        // SHARED, e qualche driver Metal su esotici setup potrebbe
+        // non gradire). Il fallback è LOG-ato perché è un cambio
+        // semantico osservabile (es. throughput diverso).
+        var raw = mmap(nil, alignedSize, PROT_READ, mapFlags, fd, 0)
+        if raw == MAP_FAILED && useMapShared {
+            FileHandle.standardError.write(Data(
+                "[mmap] MAP_SHARED failed for \(url.lastPathComponent), " +
+                "falling back to MAP_PRIVATE\n".utf8))
+            let fallbackFlags = mapNoCache ? (MAP_PRIVATE | MAP_NOCACHE) : MAP_PRIVATE
+            raw = mmap(nil, alignedSize, PROT_READ, fallbackFlags, fd, 0)
+        }
+        guard raw != MAP_FAILED, let mapped = raw else {
             throw NSError(domain: "SafeTensors", code: 12, userInfo: [
                 NSLocalizedDescriptionKey: "mmap failed for \(url.path)"
             ])
@@ -95,17 +124,17 @@ public final class SafeTensorsFile {
         }
         let device = Device.shared.mtl
         guard let buf = device.makeBuffer(
-                bytesNoCopy: raw, length: alignedSize,
+                bytesNoCopy: mapped, length: alignedSize,
                 options: .storageModeShared,
                 deallocator: dealloc) else {
-            munmap(raw, alignedSize)
+            munmap(mapped, alignedSize)
             throw Self.bufferCreationError(url: url, fileSize: fileSize,
                                             alignedSize: alignedSize,
                                             pageSize: pageSize)
         }
         self.sharedBuffer = buf
 
-        let parsed = try Self.parseHeader(at: raw)
+        let parsed = try Self.parseHeader(at: mapped)
         self.entries = parsed.entries
         self.dataStart = parsed.dataStart
     }

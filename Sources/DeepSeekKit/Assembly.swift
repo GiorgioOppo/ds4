@@ -152,13 +152,14 @@ public extension Transformer {
     static func load(config: ModelConfig, from weightsDir: URL,
                       strategyOverride: String? = nil,
                       forceLoad: Bool = false,
-                      warmupOnLoad: Bool = false) throws -> Transformer {
+                      warmupOnLoad: Bool = false,
+                      useMapSharedWeights: Bool = false) throws -> Transformer {
         MemoryLogger.snapshot("load:start", force: true)
         let plan = try LoadPlan.decide(modelDir: weightsDir,
                                         override: strategyOverride,
                                         forceLoad: forceLoad)
         FileHandle.standardError.write(Data(plan.summary().utf8))
-        let loader = try WeightLoader(plan: plan)
+        let loader = try WeightLoader(plan: plan, useMapShared: useMapSharedWeights)
         MemoryLogger.snapshot("load:after-mmap", force: true)
 
         // Optional ds4-style pages warmup: pre-fault tutte le pagine

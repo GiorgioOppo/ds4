@@ -13,6 +13,8 @@ struct LoadingSettingsTab: View {
     @AppStorage(AppSettingsKey.warmupOnLoad) private var warmupOnLoad: Bool = false
     @AppStorage(AppSettingsKey.commonPrefixRewind)
     private var commonPrefixRewind: Bool = false
+    @AppStorage(AppSettingsKey.useMapSharedWeights)
+    private var useMapSharedWeights: Bool = false
 
     var body: some View {
         Form {
@@ -45,10 +47,21 @@ struct LoadingSettingsTab: View {
                         isOn: $commonPrefixRewind)
                 Text("Riusa la KV cache anche quando l'utente edita " +
                      "il proprio ultimo messaggio (common-prefix " +
-                     "match invece di strict-prefix). Sperimentale: " +
-                     "la KV fisica oltre il common viene sovrascritta " +
-                     "dal forward senza esplicito rewind. " +
+                     "match invece di strict-prefix). Reset esplicito " +
+                     "di scoreState al window boundary (round-down a " +
+                     "LCM dei compressRatio del modello). " +
                      "Default OFF; abilita solo dopo testing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("MAP_SHARED for Metal weights (experimental)",
+                        isOn: $useMapSharedWeights)
+                Text("Usa `MAP_SHARED` invece di `MAP_PRIVATE` per " +
+                     "l'mmap dei weight shards. Su Apple Silicon + " +
+                     "APFS dovrebbe permettere zero-copy MTLBuffer " +
+                     "wrap (come ds4). Fallback automatico a " +
+                     "MAP_PRIVATE se mmap fallisce. Default OFF " +
+                     "per safety vs Darwin VM panic.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

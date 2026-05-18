@@ -46,6 +46,14 @@ enum AppSettingsKey {
     /// viene sovrascritta dal forward pass senza esplicito rewind.
     /// Default false. Vedi `InferenceService.enableCommonPrefixRewind`.
     static let commonPrefixRewind = "deepseek.commonPrefixRewind"
+
+    /// EXPERIMENTAL. Usa `MAP_SHARED` invece di `MAP_PRIVATE` per
+    /// l'mmap dei weight shards in modalità `.mmap`. Su Apple Silicon
+    /// (APFS + unified memory) dovrebbe permettere zero-copy
+    /// MTLBuffer wrap (ds4 lo usa così). Fallback automatico a
+    /// `MAP_PRIVATE` se mmap fallisce. Default false per safety
+    /// contro Darwin VM accounting issues su setup esotici.
+    static let useMapSharedWeights = "deepseek.useMapSharedWeights"
 }
 
 /// Helper for code paths that need to read defaults without going

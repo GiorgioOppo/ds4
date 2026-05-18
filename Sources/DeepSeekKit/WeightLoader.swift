@@ -45,7 +45,12 @@ public final class WeightLoader {
     /// just opens them. Preload is parallelized via
     /// `DispatchQueue.concurrentPerform`; mmap stays sequential (the
     /// VM-mapping syscall is microseconds, parallelism is noise).
-    public init(plan: LoadPlan) throws {
+    ///
+    /// - Parameter useMapShared: opt-in `MAP_SHARED` per i mmap dei
+    ///   shards (default `MAP_PRIVATE`). Vedi `SafeTensorsFile.init`
+    ///   per i caveat. Solo applicato al path `.mmap`; il path
+    ///   `.preload` non usa mmap.
+    public init(plan: LoadPlan, useMapShared: Bool = false) throws {
         guard let first = plan.shards.first else {
             throw NSError(domain: "WeightLoader", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "LoadPlan has no shards"
@@ -56,7 +61,7 @@ public final class WeightLoader {
         switch plan.strategy {
         case .mmap:
             for (url, _) in plan.shards {
-                let f = try SafeTensorsFile(url: url)
+                let f = try SafeTensorsFile(url: url, useMapShared: useMapShared)
                 let shardIdx = shards.count
                 shards.append(f)
                 for name in f.entries.keys { index[name] = shardIdx }
