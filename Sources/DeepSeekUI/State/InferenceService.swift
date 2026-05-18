@@ -319,10 +319,17 @@ final class InferenceService: @unchecked Sendable {
                         cfg.maxSeqLen    = ov.maxSeqLen
                     }
 
+                    // Leggi le preference che influenzano il load.
+                    // `warmupOnLoad` da AppStorage; saltato automaticamente
+                    // dal loader se la RAM disponibile è insufficiente.
+                    let warmup = UserDefaults.standard.bool(
+                        forKey: AppSettingsKey.warmupOnLoad)
+
                     let model = try Transformer.load(
                         config: cfg, from: url,
                         strategyOverride: strategyOverride,
-                        forceLoad: forceLoad)
+                        forceLoad: forceLoad,
+                        warmupOnLoad: warmup)
 
                     self.transformer = model
                     self._tokenizer = tok
@@ -836,6 +843,11 @@ final class InferenceService: @unchecked Sendable {
                     return
                 }
                 self.resetCancelFlag()
+                // Sync user preference for common-prefix rewind. Letta
+                // ogni turn così l'utente può abilitarla/disabilitarla
+                // dal Settings senza riavviare.
+                self.enableCommonPrefixRewind = UserDefaults.standard.bool(
+                    forKey: AppSettingsKey.commonPrefixRewind)
 
                 // Decide reuse vs. full reset.
                 //

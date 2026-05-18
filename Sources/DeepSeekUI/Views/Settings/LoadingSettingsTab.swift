@@ -10,6 +10,9 @@ struct LoadingSettingsTab: View {
     @AppStorage(AppSettingsKey.lastModelDir) private var lastModelDir: String = ""
     @AppStorage(AppSettingsKey.converterBinaryPath)
     private var converterPath: String = ""
+    @AppStorage(AppSettingsKey.warmupOnLoad) private var warmupOnLoad: Bool = false
+    @AppStorage(AppSettingsKey.commonPrefixRewind)
+    private var commonPrefixRewind: Bool = false
 
     var body: some View {
         Form {
@@ -24,6 +27,28 @@ struct LoadingSettingsTab: View {
                 Toggle("Bypass RAM-safety refusals (--force-load)",
                         isOn: $forceLoad)
                 Text("Auto picks streaming when the checkpoint is more than 10× the effective unified-memory budget — between-layer madvise hints keep the working set bounded so the OS doesn't freeze. Force-load skips the 50% shard cap entirely. Preload copies everything to a fresh MTLBuffer (rare on small Macs).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Performance tweaks (ds4-inspired)") {
+                Toggle("Warm pages on load",
+                        isOn: $warmupOnLoad)
+                Text("Pre-fault tutte le pagine dei weight shards al " +
+                     "model load. Riduce il time-to-first-token. " +
+                     "Skip automatico se model size > RAM × 1.5 " +
+                     "(safe su Mac con memoria limitata).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Common-prefix rewind (experimental)",
+                        isOn: $commonPrefixRewind)
+                Text("Riusa la KV cache anche quando l'utente edita " +
+                     "il proprio ultimo messaggio (common-prefix " +
+                     "match invece di strict-prefix). Sperimentale: " +
+                     "la KV fisica oltre il common viene sovrascritta " +
+                     "dal forward senza esplicito rewind. " +
+                     "Default OFF; abilita solo dopo testing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -30,6 +30,22 @@ enum AppSettingsKey {
     /// non ha effetto a runtime sui modelli già caricati. Default
     /// false. Vedi `Sources/DeepSeekKit/Layers/Linear.swift`.
     static let useW8A8Activations = "deepseek.useW8A8Activations"
+
+    /// Pre-fault tutte le pagine dei weight shards al model load.
+    /// Riduce il time-to-first-token (no page-in latency staccato
+    /// sul primo prefill) ma alloca subito tutto in RAM, quindi
+    /// utile solo se il modello sta in memoria. Skip automatico se
+    /// model size > RAM × 1.5. Default false. Vedi
+    /// `WeightLoader.warmupAllShards`.
+    static let warmupOnLoad = "deepseek.warmupOnLoad"
+
+    /// EXPERIMENTAL. Rilassa il match strict-prefix della KV cache
+    /// in-memory a common-prefix, supportando il caso "user edita
+    /// il proprio ultimo messaggio" senza full reset. Rischio basso
+    /// ma non-zero — la KV cache fisica oltre il common-prefix
+    /// viene sovrascritta dal forward pass senza esplicito rewind.
+    /// Default false. Vedi `InferenceService.enableCommonPrefixRewind`.
+    static let commonPrefixRewind = "deepseek.commonPrefixRewind"
 }
 
 /// Helper for code paths that need to read defaults without going

@@ -151,7 +151,8 @@ public extension Transformer {
     /// pruned checkpoint still produce a forward pass.
     static func load(config: ModelConfig, from weightsDir: URL,
                       strategyOverride: String? = nil,
-                      forceLoad: Bool = false) throws -> Transformer {
+                      forceLoad: Bool = false,
+                      warmupOnLoad: Bool = false) throws -> Transformer {
         MemoryLogger.snapshot("load:start", force: true)
         let plan = try LoadPlan.decide(modelDir: weightsDir,
                                         override: strategyOverride,
@@ -159,6 +160,16 @@ public extension Transformer {
         FileHandle.standardError.write(Data(plan.summary().utf8))
         let loader = try WeightLoader(plan: plan)
         MemoryLogger.snapshot("load:after-mmap", force: true)
+
+        // Optional ds4-style pages warmup: pre-fault tutte le pagine
+        // dei shards prima del primo forward, riduce il
+        // time-to-first-token. Skip automaticamente se la model size
+        // > physical RAM × 1.5 (vedi `WeightLoader.warmupAllShards`).
+        // Default off — opt-in via flag.
+        if warmupOnLoad {
+            loader.warmupAllShards()
+            MemoryLogger.snapshot("load:after-warmup", force: true)
+        }
         FileHandle.standardError.write(Data(
             "Indexed \(loader.totalKnownNames) tensors across \(loader.shardCount) shard(s).\n".utf8))
 
