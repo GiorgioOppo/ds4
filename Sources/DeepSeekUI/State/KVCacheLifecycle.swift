@@ -124,9 +124,9 @@ public final class KVCacheLifecycle: @unchecked Sendable {
         do {
             try await save(trigger)
         } catch {
-            FileHandle.standardError.write(Data(
-                "[kvlifecycle] save(\(trigger.rawValue)) failed: " +
-                "\(error.localizedDescription)\n".utf8))
+            let msg = "[kvlifecycle] save(\(trigger.rawValue)) failed: "
+                + "\(error.localizedDescription)\n"
+            FileHandle.standardError.write(Data(msg.utf8))
         }
     }
 }
