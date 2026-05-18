@@ -72,6 +72,28 @@ final class InferenceService: @unchecked Sendable {
     }
     private var cacheImage: CacheImage?
 
+    /// EXPERIMENTAL: quando true, `generateForConversation` accetta
+    /// anche common-prefix match (non solo strict-prefix). Cioè se
+    /// il nuovo prompt diverge dal cached dopo K token (K > 0),
+    /// invece di full reset+reprefill, riusa la KV cache fino a K
+    /// e prefilla solo i tokens dopo K.
+    ///
+    /// **Caso d'uso**: user edita il proprio ultimo messaggio. Il
+    /// prefisso (system + history messages + i primi token del
+    /// last user message edited) è comune fra cached e nuovo.
+    ///
+    /// **Rischio**: la KV cache fisica (Compressor.scoreState,
+    /// Attention sliding window) non viene esplicitamente "rewound"
+    /// — affidiamo all'invariante che il forward con `startPos=K`
+    /// SOVRASCRIVE correttamente gli slot alle position K..K+S-1.
+    /// Se l'invariante non regge per qualche edge case (es. window
+    /// boundary mid-rewind, scoreState cross-window accumulation),
+    /// l'output può degradare silenziosamente.
+    ///
+    /// Default OFF per safety. Abilita solo se hai testato a fondo
+    /// il caso d'uso specifico contro un baseline cold-prefill.
+    public var enableCommonPrefixRewind: Bool = false
+
     /// Holds the snapshot + CacheImage captured around an active
     /// sub-agent delegation. The host's KV cache is snapshotted
     /// into RAM before the sub-agent runs (which would otherwise
@@ -815,23 +837,67 @@ final class InferenceService: @unchecked Sendable {
                 }
                 self.resetCancelFlag()
 
-                // Decide reuse vs. full reset. The match is strict:
-                // same conversation + same mode + cached tokens are a
-                // strict prefix of the new prompt. Anything else (a
-                // shorter new prompt = user edited backwards, a
-                // diverging prefix = template changed) goes through
-                // releaseCache() to be safe.
+                // Decide reuse vs. full reset.
+                //
+                // **Strict-prefix** (always supported): cached tokens
+                // are an exact prefix of the new prompt. Same
+                // conversation + same mode + new is longer than cached
+                // → reuse all cachedCount tokens, prefill the delta.
+                //
+                // **Common-prefix** (opt-in, `enableCommonPrefixRewind`):
+                // even when cached diverges from new at some
+                // position K (e.g., user edited their last message),
+                // reuse the first K tokens and prefill `new[K..<]`
+                // starting from startPos=K. The KV cache slots at
+                // K..cached.count-1 will be silently overwritten by
+                // the new forward pass. Risky for edge cases (see
+                // class doc on `enableCommonPrefixRewind`).
+                //
+                // Mismatch on any axis (different conversation, mode
+                // change, empty cache, common < threshold) → full
+                // reset + cold prefill.
                 let canReuse: Bool
                 let cachedCount: Int
                 if let img = self.cacheImage,
                    img.conversationID == conversationID,
                    img.mode == mode,
-                   img.tokens.count > 0,
-                   img.tokens.count < promptTokens.count,
-                   img.tokens[...] == promptTokens.prefix(img.tokens.count)
+                   img.tokens.count > 0
                 {
-                    canReuse = true
-                    cachedCount = img.tokens.count
+                    // Compute common prefix length once.
+                    let limit = min(img.tokens.count, promptTokens.count)
+                    var common = 0
+                    while common < limit && img.tokens[common] == promptTokens[common] {
+                        common += 1
+                    }
+                    let isStrictPrefix =
+                        common == img.tokens.count
+                        && img.tokens.count < promptTokens.count
+
+                    if isStrictPrefix {
+                        // Caso preferito: niente rewind, solo append.
+                        canReuse = true
+                        cachedCount = img.tokens.count
+                    } else if self.enableCommonPrefixRewind
+                                && common >= 16
+                                && common < promptTokens.count
+                    {
+                        // Common-prefix con rewind sperimentale.
+                        // Soglia 16: sotto questa il costo del rewind
+                        // (forward path con startPos > 0) supera il
+                        // guadagno vs cold prefill multi-token.
+                        canReuse = true
+                        cachedCount = common
+                        let savedTokens = img.tokens.count - common
+                        continuation.yield(.status(
+                            "Common-prefix rewind: keeping \(common) cached tokens, " +
+                            "discarding \(savedTokens) stale (forward pass will " +
+                            "overwrite). Cold prefill avoided for \(common) tokens."))
+                    } else {
+                        canReuse = false
+                        cachedCount = 0
+                        model.releaseCache()
+                        self.cacheImage = nil
+                    }
                 } else {
                     canReuse = false
                     cachedCount = 0
