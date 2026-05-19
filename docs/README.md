@@ -14,22 +14,38 @@ Where to start depends on what you came here for.
   [`USAGE.md`](USAGE.md) for the flag reference and the OpenRouter
   setup walkthrough → [`EXAMPLES.md`](EXAMPLES.md) for ready-made
   recipes.
-- **Want to understand it.**
+- **Want to understand the model itself.**
+  [`MODEL.md`](MODEL.md) (or [`MODEL.it.md`](MODEL.it.md) in italiano)
+  is the canonical reference for the DeepSeek-V4 architecture: MLA,
+  MoE, Hyper-Connections, Compressor, Indexer, MTP, RoPE/YaRN, the
+  forward pass, the dtypes and the KV cache.
+- **Want to understand a specific subsystem around the model.**
+  [`SAMPLING.md`](SAMPLING.md) (logits → next id),
+  [`TOKENIZERS.md`](TOKENIZERS.md) (text ↔ ids and chat templates),
+  [`LOADING.md`](LOADING.md) (disk → resident `Transformer`),
+  [`CONVERTER.md`](CONVERTER.md) (HF release → on-disk dtype). Each
+  has an `.it.md` counterpart.
+- **Want to understand how the runtime and the app are built around it.**
   [`ARCHITECTURE.md`](ARCHITECTURE.md) for the big picture (engine
-  layer + desktop app layer + remote backend) →
+  data flow + desktop app + remote backend) →
   [`GLOSSARY.md`](GLOSSARY.md) for the jargon →
   [`DTYPES.md`](DTYPES.md) and [`MEMORY.md`](MEMORY.md) for the
   on-device specifics.
 - **Want to modify it.**
-  [`ARCHITECTURE.md`](ARCHITECTURE.md) → [`MODULES.md`](MODULES.md)
-  for the per-file map → [`DEVELOPING.md`](DEVELOPING.md) →
-  [`TESTING.md`](TESTING.md). Dip into [`PERFORMANCE.md`](PERFORMANCE.md)
-  when a perf concern lands.
+  [`MODEL.md`](MODEL.md) → [`ARCHITECTURE.md`](ARCHITECTURE.md) →
+  [`MODULES.md`](MODULES.md) for the per-file map →
+  [`DEVELOPING.md`](DEVELOPING.md) → [`TESTING.md`](TESTING.md). Dip
+  into [`PERFORMANCE.md`](PERFORMANCE.md) when a perf concern lands.
 
 ## Document index
 
 | Doc | When to read |
 |---|---|
+| [`MODEL.md`](MODEL.md) · [`MODEL.it.md`](MODEL.it.md) | **Canonical model reference**. Every component of the DeepSeek-V4 transformer: ModelConfig, MLA, MoE, HyperConnections, Compressor, Indexer, MTP, RoPE/YaRN, the forward pass, dtypes per-component, weight naming, KV cache lifecycle, snapshot/restore. Italian counterpart available. |
+| [`SAMPLING.md`](SAMPLING.md) · [`SAMPLING.it.md`](SAMPLING.it.md) | The sampler. Ten-stage host-side pipeline (temperature, repetition/frequency/presence penalties, top-K, min-P, tail-free, locally-typical, top-P, Mirostat v2, Gumbel-max), the GPU argmax shortcut, vectorised Accelerate kernels, per-instance RNG state, recommended values. |
+| [`TOKENIZERS.md`](TOKENIZERS.md) · [`TOKENIZERS.it.md`](TOKENIZERS.it.md) | Tokenizers + chat templates. BPE / SentencePiece / WordPiece, the `TokenizerLoader` dispatcher, the DSV4 native template (`EncodingDSV4`), the Jinja2 subset for Llama/Mistral/Qwen, DSML tool-call format, project / document tokenisation. |
+| [`LOADING.md`](LOADING.md) · [`LOADING.it.md`](LOADING.it.md) | Loading the model. `LoadPlan.decide`, the three strategies (preload / mmap / streaming), the StreamingPool with its modular sub-slot assignment, KV cache budget projection, cross-restart KV persistence via `KVCacheFile` / `KVCacheLayout`, warm-up. |
+| [`CONVERTER.md`](CONVERTER.md) · [`CONVERTER.it.md`](CONVERTER.it.md) | Converter CLI. Tensor renaming, FP8/FP4 + E8M0 → BF16/F16 fusion, INT8/INT4/INT2 symmetric RTN quantisation with per-row group scales, layer-aligned re-sharding, resume-safe write loop, the GUI driver. |
 | [`ISTRUZIONI.md`](ISTRUZIONI.md) | **Tutorial passo-passo (italiano)** dal Mac vuoto al primo token. Inizia da qui se è la prima volta. |
 | [`USAGE.md`](USAGE.md) | Operational reference: CLI flags, GUI walkthrough, OpenRouter onboarding, troubleshooting checklist. |
 | [`TOOLS.md`](TOOLS.md) | The native code-agent toolbox (`read / write / edit / shell / apply_patch / webfetch / …`). Categories, statuses, how to add a new one. |
@@ -37,7 +53,7 @@ Where to start depends on what you came here for.
 | [`GGUF.md`](GGUF.md) | GGUF reader MVP — supported / unsupported dtypes, what `GGUFFile` can do today, the path to a full inference loader. |
 | [`GAP-ANALYSIS-LLAMACPP.md`](GAP-ANALYSIS-LLAMACPP.md) | Structured comparison vs llama.cpp — chat-template dispatcher, tokenizer formats, GGUF support, sampling, what still differs. |
 | [`EXAMPLES.md`](EXAMPLES.md) | Recipes: send a message via OpenRouter, register an MCP server, define an agent that delegates, invoke a native tool, dispatch a Metal kernel, load a tensor. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture: engine data flow, the macOS app's state graph (`InferenceService` / `ModelState` / `ChatStore` / `NativeToolHost`), backend dispatch between local and OpenRouter. **Read this before any source file.** |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Big picture of the *engine* + *desktop app* around the model: engine data flow, the macOS app's state graph (`InferenceService` / `ModelState` / `ChatStore` / `NativeToolHost`), backend dispatch between local and OpenRouter. Defers to [`MODEL.md`](MODEL.md) for the model internals. **Read this before any source file.** |
 | [`GLOSSARY.md`](GLOSSARY.md) | One-stop reference for every domain term in the source (MLA, MoE, FP4-E2M1, E8M0, RoPE, YaRN, DSML, MCP, Plan/Build mode, Skill, Slash command, Permission, …). |
 | [`MODULES.md`](MODULES.md) | Per-file reference for `Sources/`. Purpose + public API + dependencies of every Swift file (engine + UI + DeepSeekTools). |
 | [`KERNELS.md`](KERNELS.md) | Per-kernel reference for `Sources/DeepSeekKit/Kernels/*.metal`. Inputs, outputs, dispatch shape, function-constant indices. |
