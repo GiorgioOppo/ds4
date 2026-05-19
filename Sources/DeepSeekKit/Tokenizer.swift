@@ -140,6 +140,128 @@ public enum TokenizerLoader {
                                isDSV4: templateIsDSV4)
     }
 
+    // MARK: - GGUF auto-detect (T2)
+
+    /// Construct a `Tokenizer` straight from a GGUF file's embedded
+    /// vocabulary, mirroring `llama.cpp`'s `gguf_init_from_file` →
+    /// `LLM_TOKENIZER_BPE` path. The GGUF format stores both the
+    /// tokenizer kind (`tokenizer.ggml.model`) and the entire vocab
+    /// (`tokenizer.ggml.tokens` + `tokenizer.ggml.merges` for BPE) in
+    /// metadata; we read those and synthesize the equivalent
+    /// `tokenizer.json` shape so the existing `BPETokenizer` decoder
+    /// can ingest it without a separate code path.
+    ///
+    /// Today's coverage:
+    ///   - "gpt2" / "llama" → BPE (byte-level merges) — works for
+    ///     every Llama 1/2/3, Mistral, Qwen, CodeLlama GGUF.
+    ///   - "bert"           → WordPiece. Not yet wired (T2
+    ///     follow-up) — throws `unsupportedType`.
+    ///
+    /// Returns a `LoadedTokenizer` with a Jinja-resolved chat
+    /// template if the GGUF carries `tokenizer.chat_template`, else
+    /// a placeholder template that emits plain `User: …\nAssistant:`
+    /// turns (good enough for one-off greedy tests, not for
+    /// agent flows).
+    public static func loadFromGGUF(_ gguf: GGUFFile) throws -> LoadedTokenizer {
+        let meta = gguf.header.metadata
+        guard case .string(let kind)? = meta["tokenizer.ggml.model"] else {
+            throw TokenizerError.unsupportedType(
+                "GGUF: missing tokenizer.ggml.model metadata")
+        }
+        let lowerKind = kind.lowercased()
+        let tokenizer: Tokenizer
+        switch lowerKind {
+        case "gpt2", "llama":
+            tokenizer = try buildBPEFromGGUF(meta: meta)
+        case "bert":
+            throw TokenizerError.unsupportedType(
+                "GGUF: WordPiece (bert) tokenizer reconstruction not yet implemented")
+        default:
+            throw TokenizerError.unsupportedType(
+                "GGUF: unknown tokenizer.ggml.model '\(kind)'")
+        }
+
+        // Chat template: prefer the embedded `tokenizer.chat_template`
+        // if present, else fall back to a minimal Jinja shim that
+        // produces the bare-bones role-prefixed format. Production
+        // chat flows should always ship a real chat_template.
+        let template: ChatTemplate
+        if case .string(let src)? = meta["tokenizer.chat_template"],
+           !src.isEmpty
+        {
+            template = try JinjaChatTemplate(src)
+        } else {
+            template = try JinjaChatTemplate(
+                "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}Assistant: ")
+        }
+
+        return LoadedTokenizer(tokenizer: tokenizer,
+                                chatTemplate: template,
+                                isDSV4: false)
+    }
+
+    /// Helper: build a BPE tokenizer from the GGUF vocab/merges
+    /// metadata. Synthesizes a HuggingFace-shaped `tokenizer.json`
+    /// blob and reuses `BPETokenizer(jsonData:)` so we don't drift
+    /// from the parser used by the safetensors path.
+    private static func buildBPEFromGGUF(
+        meta: [String: GGUFValue]) throws -> Tokenizer
+    {
+        guard case .array(let tokValues)? = meta["tokenizer.ggml.tokens"]
+        else {
+            throw TokenizerError.malformed(
+                "GGUF: tokenizer.ggml.tokens array missing")
+        }
+        var vocabDict: [String: Int] = [:]
+        vocabDict.reserveCapacity(tokValues.count)
+        for (id, value) in tokValues.enumerated() {
+            if case .string(let s) = value {
+                vocabDict[s] = id
+            }
+        }
+
+        var merges: [String] = []
+        if case .array(let mergeValues)? = meta["tokenizer.ggml.merges"] {
+            merges.reserveCapacity(mergeValues.count)
+            for v in mergeValues {
+                if case .string(let s) = v { merges.append(s) }
+            }
+        }
+
+        // Added tokens (special / control). GGUF stores per-id flags
+        // in parallel arrays under `tokenizer.ggml.token_type` —
+        // 1=normal, 2=unknown, 3=control, 4=user-defined, 5=unused,
+        // 6=byte. We surface only the control + user-defined ones as
+        // added_tokens so `BPETokenizer` recognises them as atomic.
+        var addedTokens: [[String: Any]] = []
+        if case .array(let typeValues)? = meta["tokenizer.ggml.token_type"] {
+            for (id, tval) in typeValues.enumerated() where id < tokValues.count {
+                guard case .int64(let ttype) = tval else { continue }
+                let isAdded = (ttype == 3) || (ttype == 4)
+                guard isAdded else { continue }
+                if case .string(let s) = tokValues[id] {
+                    addedTokens.append([
+                        "id": id,
+                        "content": s,
+                        "special": ttype == 3,
+                    ])
+                }
+            }
+        }
+
+        let json: [String: Any] = [
+            "model": [
+                "type": "BPE",
+                "vocab": vocabDict,
+                "merges": merges,
+            ],
+            "added_tokens": addedTokens,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: json,
+                                                options: [])
+        return try BPETokenizer(jsonData: data)
+    }
+
     // MARK: - Helpers
 
     /// Returns the `model.type` field of a tokenizer.json, or "" if
