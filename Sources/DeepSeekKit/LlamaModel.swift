@@ -42,6 +42,19 @@ public struct LlamaConfig: Sendable {
     }
 }
 
+/// Common surface shared by `LlamaModel` (weights materialized
+/// up front) and `LlamaStreamingModel` (weights dequantized lazily
+/// per forward). Lets `deepseek_gguf` and any future consumer pick
+/// the strategy at construction time without if-letting through
+/// every call site.
+public protocol LlamaForwardModel: AnyObject {
+    var config: LlamaConfig { get }
+    func forward(inputIds: [[Int]], startPos: Int) -> Tensor
+    func releaseCache()
+}
+
+extension LlamaModel: LlamaForwardModel {}
+
 /// Llama-family transformer (TODO §10.2 / T2). Embedding + N decoder
 /// layers + final RMSNorm + LM head. Matches the structure shipped
 /// by every Llama / Mistral / Qwen / CodeLlama checkpoint after the

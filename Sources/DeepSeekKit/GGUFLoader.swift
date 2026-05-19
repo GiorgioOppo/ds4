@@ -29,11 +29,53 @@ public final class GGUFFile {
     public let url: URL
     public let header: GGUFHeader
     private let infoByName: [String: GGUFTensorInfo]
+    /// MTLBuffer backing every tensor view returned by `load(...)`.
+    /// For `.mmap` / `.streaming` this wraps the mmap region; for
+    /// `.preload` it's a freshly allocated buffer we read the file
+    /// into. Tensor views use offsets within this buffer.
     private let sharedBuffer: MTLBuffer
+    /// Strategy the loader picked. Affects `load(...)` behavior only
+    /// at the margin (currently a logging concern); the per-layer
+    /// streaming hints live on `LlamaStreamingModel`.
+    public let strategy: LoadStrategy
+    /// Raw mmap pointer + length, kept for `madvise` calls. Nil
+    /// when `strategy == .preload` (the buffer is owned by Metal,
+    /// not mmap).
+    private let mmapPointer: UnsafeMutableRawPointer?
+    private let mmapLength: Int
 
-    /// mmap-backed reader.
-    public init(url: URL) throws {
+    /// Open a GGUF file.
+    ///
+    /// `strategy` mirrors the safetensors `LoadStrategy` semantics:
+    ///   - `.mmap` (default): `mmap(PROT_READ, MAP_PRIVATE)`, OS
+    ///     pages on demand. Lowest steady-state RSS.
+    ///   - `.preload`: open + `read(2)` the whole file into a
+    ///     freshly allocated MTLBuffer. No per-page faults during
+    ///     inference, full size resident immediately.
+    ///   - `.streaming`: mmap (same byte layout as `.mmap`) plus a
+    ///     contract with `LlamaStreamingModel` to advise
+    ///     `MADV_DONTNEED` per layer between forward passes. Same
+    ///     init path as `.mmap`; the per-layer hints land at use
+    ///     time, not here.
+    ///
+    /// `useMapShared` swaps `MAP_PRIVATE` for `MAP_SHARED` on the
+    /// mmap variants. On Apple Silicon's unified-memory APFS this
+    /// is slightly faster (direct page reuse, no copy-on-write
+    /// shadow); on exotic filesystems / network mounts MAP_SHARED
+    /// can fail at `mmap()` time and we fall back to `MAP_PRIVATE`
+    /// silently.
+    ///
+    /// `warmup` triggers `posix_madvise(POSIX_MADV_WILLNEED)` on
+    /// the whole mmap range right after creation. The kernel
+    /// prefetches the file into the page cache asynchronously,
+    /// removing the first-forward "cold mmap" latency at the cost
+    /// of upfront I/O. No-op for `.preload`.
+    public init(url: URL,
+                strategy: LoadStrategy = .mmap,
+                useMapShared: Bool = false,
+                warmup: Bool = false) throws {
         self.url = url
+        self.strategy = strategy
 
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else {
@@ -49,29 +91,73 @@ public final class GGUFFile {
         let pageSize = Int(sysconf(_SC_PAGESIZE))
         let alignedSize = ((fileSize + pageSize - 1) / pageSize) * pageSize
 
-        guard let raw = mmap(nil, alignedSize, PROT_READ, MAP_PRIVATE, fd, 0),
-              raw != MAP_FAILED else {
-            throw GGUFError.io("mmap failed: \(url.path)")
-        }
-        let dealloc: (UnsafeMutableRawPointer, Int) -> Void = { p, n in
-            munmap(p, n)
-        }
         let device = Device.shared.mtl
-        guard let buf = device.makeBuffer(
-            bytesNoCopy: raw, length: alignedSize,
-            options: .storageModeShared,
-            deallocator: dealloc) else {
-            munmap(raw, alignedSize)
-            throw GGUFError.io("MTLBuffer makeBuffer(bytesNoCopy:) failed")
+        let backingBuffer: MTLBuffer
+        var mmapPtr: UnsafeMutableRawPointer? = nil
+        var mmapLen: Int = 0
+
+        switch strategy {
+        case .preload:
+            // Read the whole file into a fresh MTLBuffer. No mmap
+            // involved — Metal owns the pages. RSS bumps by the
+            // full file size at init time; trade-off for predictable
+            // forward latency.
+            guard let buf = device.makeBuffer(length: fileSize,
+                                               options: .storageModeShared)
+            else {
+                throw GGUFError.io("preload MTLBuffer alloc failed (\(fileSize) bytes)")
+            }
+            var off = 0
+            let dst = buf.contents()
+            while off < fileSize {
+                let n = read(fd, dst.advanced(by: off), fileSize - off)
+                if n <= 0 {
+                    throw GGUFError.io("preload read failed at offset \(off)")
+                }
+                off += n
+            }
+            backingBuffer = buf
+
+        case .mmap, .streaming:
+            let mapFlags: Int32 = useMapShared
+                ? MAP_SHARED : MAP_PRIVATE
+            var raw = mmap(nil, alignedSize, PROT_READ, mapFlags, fd, 0)
+            if raw == MAP_FAILED && useMapShared {
+                // Fall back to MAP_PRIVATE on filesystems that
+                // refuse MAP_SHARED on read-only mmaps (rare, but
+                // happens on some FUSE / network mounts). Matches
+                // SafeTensorsFile's recovery path.
+                raw = mmap(nil, alignedSize, PROT_READ, MAP_PRIVATE, fd, 0)
+            }
+            guard let raw, raw != MAP_FAILED else {
+                throw GGUFError.io("mmap failed: \(url.path)")
+            }
+            mmapPtr = raw
+            mmapLen = alignedSize
+            let dealloc: (UnsafeMutableRawPointer, Int) -> Void = { p, n in
+                munmap(p, n)
+            }
+            guard let buf = device.makeBuffer(
+                bytesNoCopy: raw, length: alignedSize,
+                options: .storageModeShared,
+                deallocator: dealloc)
+            else {
+                munmap(raw, alignedSize)
+                throw GGUFError.io("MTLBuffer makeBuffer(bytesNoCopy:) failed")
+            }
+            backingBuffer = buf
         }
-        self.sharedBuffer = buf
+        self.sharedBuffer = backingBuffer
+        self.mmapPointer = mmapPtr
+        self.mmapLength = mmapLen
 
         // Parse only the leading metadata region into the header.
         // Cap the parse window at a generous 256 MB — even the largest
         // GGUF metadata blobs (tens of thousands of tensors) come in
         // well under that.
         let parseWindow = min(fileSize, 256 * 1024 * 1024)
-        let raw_buf = UnsafeRawBufferPointer(start: raw, count: parseWindow)
+        let raw_buf = UnsafeRawBufferPointer(
+            start: backingBuffer.contents(), count: parseWindow)
         let parsed = try GGUFHeader.parse(buffer: raw_buf)
         self.header = parsed
 
@@ -79,6 +165,14 @@ public final class GGUFFile {
         byName.reserveCapacity(parsed.tensors.count)
         for t in parsed.tensors { byName[t.name] = t }
         self.infoByName = byName
+
+        if warmup, let p = mmapPtr {
+            // POSIX_MADV_WILLNEED asks the kernel to prefetch
+            // asynchronously. We don't wait for completion — just
+            // give the hint so the next read() / mmap touch is more
+            // likely to be in the page cache.
+            _ = posix_madvise(p, mmapLen, POSIX_MADV_WILLNEED)
+        }
     }
 
     /// Tensor names present in this file, in declaration order.
@@ -209,5 +303,47 @@ public final class GGUFFile {
         cmd.commit()
         cmd.waitUntilCompleted()
         return out
+    }
+
+    // MARK: - Streaming hints
+
+    /// Apply a `posix_madvise` to a sub-range of the mmap.
+    /// Used by `LlamaStreamingModel` to evict / prefetch a layer's
+    /// bytes between forward passes. No-op for `.preload` (no mmap
+    /// to advise). The kernel may ignore the advice — it's a hint,
+    /// not a guarantee.
+    public func madviseRange(offset: Int, length: Int, advice: Int32) {
+        guard let base = mmapPointer, length > 0 else { return }
+        let pageSize = Int(sysconf(_SC_PAGESIZE))
+        // Round inward so a layer's madvise doesn't evict pages
+        // that straddle the boundary with an adjacent layer's
+        // tensors we still want resident. The edge pages (up to
+        // ~one page on each side, typically 16 KB on macOS) stay
+        // touched — negligible vs. the multi-MB layer interior.
+        let end = offset + length
+        let alignedStart = ((offset + pageSize - 1) / pageSize) * pageSize
+        let alignedEnd   = (end / pageSize) * pageSize
+        guard alignedEnd > alignedStart,
+              alignedStart >= 0,
+              alignedEnd <= mmapLength
+        else { return }
+        let ptr = base.advanced(by: alignedStart)
+        _ = posix_madvise(ptr, alignedEnd - alignedStart, advice)
+    }
+
+    /// Total byte range a layer's tensors occupy in the mmap.
+    /// Spans from the lowest `absoluteOffset` of any tensor whose
+    /// name starts with `prefix` to the highest `absoluteOffset +
+    /// byteCount`. Used by `LlamaStreamingModel` to emit one
+    /// madvise per layer rather than one per tensor.
+    public func byteRange(forNamePrefix prefix: String) -> (offset: Int, length: Int)? {
+        var minOff = Int.max
+        var maxEnd = 0
+        for (name, info) in infoByName where name.hasPrefix(prefix) {
+            minOff = min(minOff, info.absoluteOffset)
+            maxEnd = max(maxEnd, info.absoluteOffset + info.byteCount)
+        }
+        guard maxEnd > 0 else { return nil }
+        return (minOff, maxEnd - minOff)
     }
 }

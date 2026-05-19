@@ -28,6 +28,9 @@ import DeepSeekKit
 //                    [--max-seq-len N]               (cap KV cache)
 //                    [--no-chat-template]            (skip the GGUF chat template)
 //                    [--weight-dtype f32|bf16]       (dequant target; default f32)
+//                    [--load-strategy mmap|preload|streaming]  (default mmap)
+//                    [--use-map-shared]              (MAP_SHARED instead of MAP_PRIVATE)
+//                    [--warmup]                      (POSIX_MADV_WILLNEED on the mmap)
 
 let args = CommandLine.arguments
 
@@ -72,6 +75,14 @@ var noChatTemplate = false
 // the resident memory of the weights at no measurable accuracy
 // loss on Q8_0/Q4_0/Q4_K. Q5_K/Q6_K silently fall back to f32.
 var weightDtype: DType = .f32
+// Mirror of the safetensors load-strategy machinery (TODO §10.2
+// follow-up). `.streaming` swaps in `LlamaStreamingModel`, which
+// dequantizes weights lazily per forward and emits per-layer
+// `POSIX_MADV_DONTNEED` hints so the OS can evict the source mmap
+// under pressure.
+var loadStrategy: LoadStrategy = .mmap
+var useMapShared = false
+var warmup = false
 
 while i < args.count {
     switch args[i] {
@@ -144,6 +155,19 @@ while i < args.count {
         default: usage()
         }
         i += 2
+    case "--load-strategy":
+        guard i + 1 < args.count else { usage() }
+        switch args[i + 1] {
+        case "mmap":      loadStrategy = .mmap
+        case "preload":   loadStrategy = .preload
+        case "streaming": loadStrategy = .streaming
+        default: usage()
+        }
+        i += 2
+    case "--use-map-shared":
+        useMapShared = true; i += 1
+    case "--warmup":
+        warmup = true; i += 1
     default:
         usage()
     }
@@ -155,19 +179,32 @@ let stderr = FileHandle.standardError
 let ggufURL = URL(fileURLWithPath: ggufPath)
 let gguf: GGUFFile
 do {
-    gguf = try GGUFFile(url: ggufURL)
+    gguf = try GGUFFile(url: ggufURL,
+                          strategy: loadStrategy,
+                          useMapShared: useMapShared,
+                          warmup: warmup)
 } catch {
     stderr.write(Data("Failed to open GGUF: \(error)\n".utf8))
     exit(1)
 }
 
 // ---------- Build model ----------
-stderr.write(Data("Loading model weights…\n".utf8))
-let model: LlamaModel
+stderr.write(Data(
+    "Loading model weights (strategy=\(loadStrategy.rawValue))…\n".utf8))
+let model: any LlamaForwardModel
 do {
-    model = try LlamaModel.fromGGUF(gguf,
-                                      maxSeqLenOverride: maxSeqLenOverride,
-                                      weightDtype: weightDtype)
+    switch loadStrategy {
+    case .streaming:
+        model = try LlamaStreamingModel(
+            gguf: gguf,
+            maxSeqLenOverride: maxSeqLenOverride,
+            weightDtype: weightDtype)
+    case .mmap, .preload:
+        model = try LlamaModel.fromGGUF(
+            gguf,
+            maxSeqLenOverride: maxSeqLenOverride,
+            weightDtype: weightDtype)
+    }
 } catch {
     stderr.write(Data("Failed to build LlamaModel: \(error)\n".utf8))
     exit(1)

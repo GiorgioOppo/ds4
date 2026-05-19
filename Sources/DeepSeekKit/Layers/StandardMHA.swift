@@ -42,14 +42,21 @@ public final class StandardMHA {
     public let wO: Linear
     public let rope: RoPE
 
-    private var kCache: Tensor?
-    private var vCache: Tensor?
+    /// Public-read so `LlamaStreamingModel` can stash the cache
+    /// across layer rebuilds (in streaming mode the StandardMHA
+    /// instance is reconstructed per forward; we restore the
+    /// previous cache here before running and read it back after).
+    /// External callers in the materialized path should leave
+    /// these alone — `ensureCache(B:)` owns the allocation.
+    public var kCache: Tensor?
+    public var vCache: Tensor?
 
     /// Per-batch cache shape. `B` is not part of `init` — we
     /// allocate on the first forward pass once we know the batch
     /// size. Cached for reuse + lazy realloc after
-    /// `releaseCache()`.
-    private var cachedB: Int = 0
+    /// `releaseCache()`. Public so the streaming model can keep
+    /// it in sync when it rebuilds the layer.
+    public var cachedB: Int = 0
 
     public init(nHeads: Int, nKVHeads: Int, headDim: Int,
                 maxSeq: Int,
