@@ -126,6 +126,11 @@ enum KeychainError: LocalizedError {
 /// typos in the account string don't silently shadow each other.
 enum KeychainAccount {
     static let openRouterAPIKey = "openrouter.apiKey"
+    /// Anthropic native API key, used by `AnthropicClient` for
+    /// `api.anthropic.com/v1/messages` (TODO §10.4 / T4). Distinct
+    /// from `openRouterAPIKey` so users can keep both backends
+    /// configured side-by-side.
+    static let anthropicAPIKey = "anthropic.apiKey"
     /// Optional bearer token required on requests to the local
     /// OpenAI-compatible server (TODO §10.1 / `LocalServer.swift`).
     /// Nil/empty = auth disabled (the default for localhost).

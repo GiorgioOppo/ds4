@@ -203,6 +203,7 @@ private struct ModelPicker: View {
     @ObservedObject var catalog: OpenRouterCatalog
 
     @State private var showAddOpenRouter: Bool = false
+    @State private var showAddAnthropic: Bool = false
 
     var body: some View {
         Menu {
@@ -254,6 +255,11 @@ private struct ModelPicker: View {
                 } label: {
                     Label("Add OpenRouter model…", systemImage: "cloud")
                 }
+                Button {
+                    showAddAnthropic = true
+                } label: {
+                    Label("Add Anthropic model…", systemImage: "cloud.fill")
+                }
                 if modelState.isReady {
                     Button(role: .destructive) {
                         Task { await modelState.unload() }
@@ -278,6 +284,9 @@ private struct ModelPicker: View {
         .sheet(isPresented: $showAddOpenRouter) {
             AddOpenRouterModelSheet(catalog: catalog,
                                      modelState: modelState)
+        }
+        .sheet(isPresented: $showAddAnthropic) {
+            AddAnthropicModelSheet(modelState: modelState)
         }
     }
 

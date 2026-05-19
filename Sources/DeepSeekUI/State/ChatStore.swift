@@ -232,6 +232,17 @@ final class ChatStore: ObservableObject {
         if case .openRouter(let modelID) = modelState.loadedEndpoint {
             sendRemote(text: trimmed,
                         conversationIndex: idx,
+                        provider: .openRouter,
+                        modelID: modelID,
+                        mode: mode,
+                        options: options,
+                        maxTokens: maxTokens)
+            return
+        }
+        if case .anthropic(let modelID) = modelState.loadedEndpoint {
+            sendRemote(text: trimmed,
+                        conversationIndex: idx,
+                        provider: .anthropic,
                         modelID: modelID,
                         mode: mode,
                         options: options,
@@ -1200,8 +1211,33 @@ final class ChatStore: ObservableObject {
     /// placeholder message lifecycle, `pendingTurn`) is mimicked
     /// here so the chat UI doesn't have to special-case remote
     /// chats at the view layer.
+    /// Which remote backend `sendRemote` / `runRemoteLoop` dispatch
+    /// to. Threaded through so both the Keychain account and the
+    /// streaming client pick the right provider — same shape on the
+    /// consumer side (`OpenAIStreamChunk`) so the iteration loop
+    /// stays unified.
+    enum RemoteProvider {
+        case openRouter
+        case anthropic
+
+        fileprivate var keychainAccount: String {
+            switch self {
+            case .openRouter: return KeychainAccount.openRouterAPIKey
+            case .anthropic:  return KeychainAccount.anthropicAPIKey
+            }
+        }
+
+        fileprivate var displayName: String {
+            switch self {
+            case .openRouter: return "OpenRouter"
+            case .anthropic:  return "Anthropic"
+            }
+        }
+    }
+
     private func sendRemote(text: String,
                               conversationIndex idx: Int,
+                              provider: RemoteProvider,
                               modelID: String,
                               mode: ThinkingMode,
                               options: SamplingOptions,
@@ -1211,10 +1247,11 @@ final class ChatStore: ObservableObject {
         // API key is read at send time so a key rotation in
         // Settings takes effect on the next turn without
         // restarting the app.
-        let apiKey = KeychainStore.get(account: KeychainAccount.openRouterAPIKey) ?? ""
+        let apiKey = KeychainStore.get(account: provider.keychainAccount) ?? ""
         guard !apiKey.isEmpty else {
             phases[id] = .error(
-                "OpenRouter API key not configured. Add it from Settings → API Keys.")
+                "\(provider.displayName) API key not configured. "
+                + "Add it from Settings → API Keys.")
             return
         }
 
@@ -1238,6 +1275,7 @@ final class ChatStore: ObservableObject {
             await self.runRemoteLoop(conversationID: id,
                                        initialPlaceholderID: firstPlaceholderID,
                                        userMessageID: userMessageID,
+                                       provider: provider,
                                        modelID: modelID,
                                        mode: mode,
                                        options: options,
@@ -1256,12 +1294,14 @@ final class ChatStore: ObservableObject {
     private func runRemoteLoop(conversationID id: UUID,
                                  initialPlaceholderID: UUID,
                                  userMessageID: UUID,
+                                 provider: RemoteProvider,
                                  modelID: String,
                                  mode: ThinkingMode,
                                  options: SamplingOptions,
                                  maxTokens: Int,
                                  apiKey: String) async {
-        let client = OpenRouterClient()
+        let openRouterClient = OpenRouterClient()
+        let anthropicClient = AnthropicClient()
         var currentPlaceholderID = initialPlaceholderID
         var iteration = 0
 
@@ -1327,9 +1367,27 @@ final class ChatStore: ObservableObject {
             case .chat: break
             }
 
-            // Stream + accumulate.
-            let stream = client.streamChatCompletion(
-                apiKey: apiKey, body: body)
+            // Stream + accumulate. Both providers return the same
+            // `OpenAIStreamChunk` shape — for Anthropic, that's a
+            // local translation inside `AnthropicClient` — so the
+            // accumulator below is provider-agnostic.
+            let stream: AsyncThrowingStream<OpenAIStreamChunk, Error>
+            switch provider {
+            case .openRouter:
+                stream = openRouterClient.streamChatCompletion(
+                    apiKey: apiKey, body: body)
+            case .anthropic:
+                let anthropicBody = AnthropicMessageBuilder.buildBody(
+                    model: modelID,
+                    maxTokens: maxTokens,
+                    history: snapshot.history,
+                    agentSystem: snapshot.agent?.systemPrompt,
+                    tools: AnthropicMessageBuilder.translateTools(toolsArray),
+                    temperature: options.temperature,
+                    topP: options.topP)
+                stream = anthropicClient.streamMessages(
+                    apiKey: apiKey, body: anthropicBody)
+            }
             var contentBuf = ""
             var reasoningBuf = ""
             var toolCallsAccum: [Int: (id: String?, name: String, args: String)] = [:]
