@@ -44,6 +44,15 @@ final class ModelState: ObservableObject {
 
     @Published private(set) var status: LoadStatus = .idle
 
+    /// Mirror sul main actor di "il service ha un local model
+    /// caricato in RAM?". Non passa per `service.q.sync` (che
+    /// bloccherebbe il main thread durante una generation), quindi
+    /// può essere letto dal `body` di SwiftUI in modo sicuro. Post-
+    /// refactor multi-endpoint NON è derivabile da `status`, perché
+    /// status può puntare a un remote anche se il local è ancora
+    /// caricato (loadRemoteOpenRouter non scarica più il local).
+    @Published private(set) var loadedLocalModelDir: URL?
+
     let service: InferenceService
     let library: ModelLibrary
 
@@ -128,9 +137,10 @@ final class ModelState: ObservableObject {
             library.forget(endpoint)
             return
         }
-        // If another model is loaded, drop it first so RAM
+        // If another local model is loaded, drop it first so RAM
         // doesn't blow up holding two copies during the swap.
         await service.unloadModel()
+        loadedLocalModelDir = nil
         status = .loading(endpoint: endpoint, plan: nil)
         do {
             let rawStrategy = AppSettings.loadStrategy
@@ -150,6 +160,7 @@ final class ModelState: ObservableObject {
                 })
             library.touch(endpoint)
             AppSettings.setLastModelDir(path)
+            loadedLocalModelDir = url
             status = .loaded(endpoint: endpoint, config: cfg)
         } catch {
             let msg = (error as? LocalizedError)?.errorDescription
@@ -163,6 +174,7 @@ final class ModelState: ObservableObject {
     /// open but can't send until the user picks again.
     func unload() async {
         await service.unloadModel()
+        loadedLocalModelDir = nil
         status = .idle
     }
 

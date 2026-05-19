@@ -327,14 +327,16 @@ struct ChatView: View {
                 account: KeychainAccount.openRouterAPIKey)
         case .localDirectory:
             // Local: serve il transformer caricato nel service.
-            // Verifichiamo direttamente sulla service (fonte di
-            // verità RAM-level): `currentModelDir() != nil` significa
-            // che `transformer` e `tokenizer` sono entrambi popolati.
-            // Lo `status` di ModelState NON è affidabile qui: post-
-            // refactor multi-endpoint, status può dire "loaded remote"
-            // mentre il local model è ancora in RAM dal precedente
-            // load (loadRemoteOpenRouter non scarica più il local).
-            return store.service.currentModelDir() != nil
+            // Leggiamo da `modelState.loadedLocalModelDir` (mirror
+            // @Published sul main actor) invece che da
+            // `service.currentModelDir()` — quest'ultimo passa per
+            // `q.sync` sulla coda di inferenza e blocca il main
+            // thread per minuti durante una generation, rendendo la
+            // UI non-responsiva. Lo `status` di ModelState NON è
+            // affidabile qui: post-refactor multi-endpoint, status
+            // può dire "loaded remote" mentre il local model è
+            // ancora in RAM dal load precedente.
+            return modelState.loadedLocalModelDir != nil
         case .none:
             // Chat senza endpoint proprio: cade sul global state.
             return modelState.isReady

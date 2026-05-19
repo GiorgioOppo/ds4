@@ -363,13 +363,14 @@ private struct ModelPicker: View {
         switch endpoint {
         case .localDirectory(let path):
             // Skip load se il service ha già *questo* local model in
-            // RAM (la verifica corretta è sul `currentModelDir`, non
-            // sullo `loadedEndpoint` di ModelState che post-refactor
-            // riflette l'ultimo endpoint *scelto*, non quello fisico).
-            // Evita un unload+reload spurio se l'utente seleziona di
-            // nuovo lo stesso local — operazione che ucciderebbe
-            // ogni altra chat local in volo.
-            if store.service.currentModelDir()?.path != path {
+            // RAM. Leggiamo dal mirror `loadedLocalModelDir` di
+            // ModelState (main-actor, no blocking) invece che da
+            // `service.currentModelDir()` che fa `q.sync` e
+            // appenderebbe il bind alla coda di inferenza,
+            // bloccando il main thread per la durata di una
+            // generation in volo. Evita anche un unload+reload
+            // spurio sullo stesso modello.
+            if modelState.loadedLocalModelDir?.path != path {
                 Task { await modelState.load(endpoint) }
             }
         case .openRouter:
