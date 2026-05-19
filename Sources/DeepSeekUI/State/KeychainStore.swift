@@ -126,4 +126,8 @@ enum KeychainError: LocalizedError {
 /// typos in the account string don't silently shadow each other.
 enum KeychainAccount {
     static let openRouterAPIKey = "openrouter.apiKey"
+    /// Optional bearer token required on requests to the local
+    /// OpenAI-compatible server (TODO §10.1 / `LocalServer.swift`).
+    /// Nil/empty = auth disabled (the default for localhost).
+    static let serverBearerToken = "server.bearerToken"
 }
