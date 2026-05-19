@@ -126,6 +126,20 @@ final class ChatStore: ObservableObject {
     /// when no delegation is in flight; cleared on the way back
     /// up as each frame's `runSubAgentToCompletionInner` returns.
     @Published private(set) var activeDelegations: [UUID: [DelegationFrame]] = [:]
+
+    /// Per-frame cancellation handles (TODO §4 follow-up: stop a
+    /// single sub-agent from the chain UI). When the delegation
+    /// chain pushes a frame, the runner stashes its `Task`-cancel
+    /// closure here; the UI's per-frame stop button calls
+    /// `cancelDelegation(frameID:)` which invokes the closure +
+    /// records a marker so the inner loop can report graceful
+    /// cancellation.
+    private var delegationCancellations: [UUID: () -> Void] = [:]
+    /// Frames the user explicitly cancelled (vs. natural completion
+    /// or error). Read by the inner loop right after the stream
+    /// drains so the persisted assistant turn reflects the reason
+    /// instead of looking like an empty reply.
+    @Published private(set) var cancelledDelegations: Set<UUID> = []
     /// Sampler parameters captured at the start of `send`; reused
     /// by `runToolCallsAndContinue` so a tool-output continuation
     /// inherits the same temperature / topK / topP / maxTokens
@@ -1009,6 +1023,29 @@ final class ChatStore: ObservableObject {
         activeDelegations[hostConvID, default: []].append(frame)
     }
 
+    /// Register a cancellation closure for a freshly-pushed frame.
+    /// Called by the inner runner once it's wrapped its decode loop
+    /// in a `Task`. The closure typically just calls
+    /// `task.cancel()`; the loop checks `Task.isCancelled` between
+    /// yielded tokens (or via the AsyncThrowingStream
+    /// `onTermination` hook).
+    private func registerDelegationCancellation(
+        frameID: UUID, cancel: @escaping () -> Void)
+    {
+        delegationCancellations[frameID] = cancel
+    }
+
+    /// User-facing entry point for the chain UI's per-frame Stop
+    /// button (TODO §4 follow-up). Cancels the matching sub-agent
+    /// run and records the frame id in `cancelledDelegations` so
+    /// the persisted reply gets a `[cancelled]` marker.
+    public func cancelDelegation(frameID: UUID) {
+        cancelledDelegations.insert(frameID)
+        if let cancel = delegationCancellations[frameID] {
+            cancel()
+        }
+    }
+
     private func appendDelegationBuffer(hostConvID: UUID,
                                          frameID: UUID,
                                          text: String) {
@@ -1017,6 +1054,14 @@ final class ChatStore: ObservableObject {
         else { return }
         stack[idx].buffer.append(text)
         activeDelegations[hostConvID] = stack
+    }
+
+    /// Clean up the cancellation registry when a frame pops. The
+    /// closure isn't retained past the frame's lifetime so the
+    /// Task it points at can deinit cleanly.
+    private func popDelegationCancellation(frameID: UUID) {
+        delegationCancellations.removeValue(forKey: frameID)
+        cancelledDelegations.remove(frameID)
     }
 
     private func popDelegationFrame(hostConvID: UUID, frameID: UUID) {
@@ -1406,8 +1451,18 @@ final class ChatStore: ObservableObject {
                 history: snapshot.history,
                 agent: snapshot.agent,
                 projectInventory: projectInventory)
+            // TODO §4: also expose other agents as delegate targets
+            // so the remote model can hand off via the synthetic
+            // `__delegate_to_agent` schema. The attached agent
+            // itself is filtered out to prevent the trivial
+            // self-loop; deeper cycle prevention runs in
+            // `dispatchDelegation`.
+            let delegableForRemote = await MainActor.run {
+                self.agents.agents.filter { $0.id != snapshot.agent?.id }
+            }
             let toolsArray = self.composeOpenAITools(
-                mcpAllowed: snapshot.agent?.allowedToolNames)
+                mcpAllowed: snapshot.agent?.allowedToolNames,
+                delegableAgents: delegableForRemote)
 
             var body: [String: Any] = [
                 "model": modelID,
@@ -1562,10 +1617,25 @@ final class ChatStore: ObservableObject {
             // check.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
+            // Cross-agent delegation: resolve the host agent id
+            // for cycle prevention. Same chain seed as the local
+            // path so a delegate sub-agent can't loop back to the
+            // host.
+            let hostAgentForRemote = await MainActor.run {
+                self.conversations
+                    .first(where: { $0.id == id })?.agentID
+            }
             for call in final.toolCalls {
                 let result: String
                 if call.name == EncodingDSV4.delegateToolName {
-                    result = "[error: cross-agent delegation is not yet supported on remote models]"
+                    // TODO §4: cross-agent delegation now works on
+                    // the remote path too. The sub-agent runs on
+                    // whatever backend its own AgentConfig points
+                    // at (local / OpenRouter / Anthropic).
+                    result = await self.executeSubAgentDelegation(
+                        argsJSON: call.args,
+                        hostAgentID: hostAgentForRemote,
+                        hostConvID: id)
                 } else if call.name.hasPrefix("native__") {
                     result = await self.dispatchNativeTool(
                         qualifiedName: call.name,
@@ -1770,22 +1840,29 @@ final class ChatStore: ObservableObject {
     }
 
     private func composeOpenAITools(
-        mcpAllowed: Set<String>?
+        mcpAllowed: Set<String>?,
+        delegableAgents: [AgentConfig] = []
     ) -> [[String: Any]]? {
-        if let allowed = mcpAllowed, allowed.isEmpty { return nil }
+        if let allowed = mcpAllowed, allowed.isEmpty
+           && delegableAgents.isEmpty { return nil }
         var schemas: [[String: Any]] = []
-        for tool in mcpPool.allTools() {
-            if let allowed = mcpAllowed, !allowed.contains(tool.qualifiedName) {
-                continue
+        if let allowed = mcpAllowed, allowed.isEmpty {
+            // explicit "no MCP tools" set — skip MCP entirely
+        } else {
+            for tool in mcpPool.allTools() {
+                if let allowed = mcpAllowed,
+                   !allowed.contains(tool.qualifiedName) {
+                    continue
+                }
+                schemas.append([
+                    "type": "function",
+                    "function": [
+                        "name": tool.qualifiedName,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema
+                    ]
+                ])
             }
-            schemas.append([
-                "type": "function",
-                "function": [
-                    "name": tool.qualifiedName,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
-                ]
-            ])
         }
         // TODO §8 follow-up: native tools alongside MCP, with the
         // `native__` prefix so the dispatch side can route them.
@@ -1802,6 +1879,43 @@ final class ChatStore: ObservableObject {
                     ]
                 ])
             }
+        }
+        // TODO §4 follow-up: cross-agent delegation on remote
+        // chats. Emit the synthetic `__delegate_to_agent` schema
+        // when there's at least one other agent the model could
+        // hand off to. The dispatch side in `runRemoteLoop` now
+        // routes calls with `call.name == EncodingDSV4.delegateToolName`
+        // through `executeSubAgentDelegation` instead of the
+        // stub error.
+        if !delegableAgents.isEmpty {
+            let roster = delegableAgents
+                .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
+                .joined(separator: "\n")
+            schemas.append([
+                "type": "function",
+                "function": [
+                    "name": EncodingDSV4.delegateToolName,
+                    "description":
+                        """
+                        Delegate a focused sub-task to another agent. The named agent will run independently with its own system prompt and produce a single textual reply that becomes this tool's output. Use it when a sub-task is better handled by a specialist agent. Available agents:
+                        \(roster)
+                        """,
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "agent_name": [
+                                "type": "string",
+                                "description": "Exact name of the agent to invoke."
+                            ],
+                            "task": [
+                                "type": "string",
+                                "description": "Self-contained instructions for the sub-agent."
+                            ]
+                        ],
+                        "required": ["agent_name", "task"]
+                    ]
+                ]
+            ])
         }
         return schemas.isEmpty ? nil : schemas
     }
