@@ -83,7 +83,8 @@ public enum VocabRewriter {
             } else {
                 try rewriteShard(inURL: inURL,
                                   outURL: outURL,
-                                  decision: decision)
+                                  decision: decision,
+                                  cancellation: cancellation)
                 let outAttrs = try fm.attributesOfItem(atPath: outURL.path)
                 if let sz = outAttrs[.size] as? UInt64 { bytesOut += sz }
                 onShardDone?(shardName)
@@ -113,7 +114,8 @@ public enum VocabRewriter {
         //    added_tokens preservati, resto verbatim).
         try rewriteTokenizerJSON(inputDir: inputDir,
                                   outputDir: outputDir,
-                                  decision: decision)
+                                  decision: decision,
+                                  cancellation: cancellation)
 
         return (bytesIn, bytesOut)
     }
@@ -124,7 +126,8 @@ public enum VocabRewriter {
     /// embedding tensors e stream-copiando il resto.
     private static func rewriteShard(inURL: URL,
                                        outURL: URL,
-                                       decision: KeepDecision) throws {
+                                       decision: KeepDecision,
+                                       cancellation: CancellationToken? = nil) throws {
         let dataStart = try readDataStart(inURL)
         let file = try SafeTensorsFile(url: inURL)
         let writer = SafeTensorsWriter()
@@ -145,7 +148,8 @@ public enum VocabRewriter {
                     byteCount: byteCount,
                     originalShape: entry.shape,
                     dtype: entry.dtype,
-                    decision: decision)
+                    decision: decision,
+                    cancellation: cancellation)
                 let newShape = [decision.newVocabSize] + Array(entry.shape.dropFirst())
                 writer.add(name: name,
                            dtype: entry.dtype,
@@ -175,7 +179,8 @@ public enum VocabRewriter {
         byteCount: Int,
         originalShape: [Int],
         dtype: String,
-        decision: KeepDecision
+        decision: KeepDecision,
+        cancellation: CancellationToken? = nil
     ) throws -> Data {
         precondition(originalShape.count >= 2,
                      "vocab tensor expected rank >= 2, got \(originalShape)")
@@ -202,6 +207,11 @@ public enum VocabRewriter {
         // Ottimizzazione futura: read in blocchi multipli di rows
         // contigue dove (oldId+1, newId+1) sono entrambi presenti
         // in sequenza.
+        // Cancellation cooperativa: il loop sotto può richiedere
+        // 10-60s per tensori giganti (50k mapping × seek+read+memcpy).
+        // Settiamo un flag dentro la closure (non-throwing) e
+        // throw dopo l'uscita. Check ogni 1000 mapping (~100-500ms).
+        var cancelledDuringSlice = false
         out.withUnsafeMutableBytes { dst in
             let dstBase = dst.baseAddress!
             // Ordina per oldId per leggere sequenzialmente dal file.
@@ -209,6 +219,7 @@ public enum VocabRewriter {
                 .filter { $0.value < decision.newVocabSize }
                 .sorted { $0.key < $1.key }
             var lastReadEnd = 0
+            var sinceCheck = 0
             for (oldId, newId) in mappings {
                 let rowOffsetInTensor = oldId * bytesPerRow
                 if rowOffsetInTensor != lastReadEnd {
@@ -227,7 +238,18 @@ public enum VocabRewriter {
                            bytesPerRow)
                 }
                 lastReadEnd = rowOffsetInTensor + bytesPerRow
+                sinceCheck &+= 1
+                if sinceCheck >= 1000 {
+                    if cancellation?.isCancelled == true {
+                        cancelledDuringSlice = true
+                        return
+                    }
+                    sinceCheck = 0
+                }
             }
+        }
+        if cancelledDuringSlice {
+            try cancellation?.throwIfCancelled()
         }
         return out
     }
@@ -335,7 +357,8 @@ public enum VocabRewriter {
     /// `post_processor` copiati verbatim.
     static func rewriteTokenizerJSON(inputDir: URL,
                                        outputDir: URL,
-                                       decision: KeepDecision) throws {
+                                       decision: KeepDecision,
+                                       cancellation: CancellationToken? = nil) throws {
         let inURL = inputDir.appendingPathComponent("tokenizer.json")
         let outURL = outputDir.appendingPathComponent("tokenizer.json")
         let data = try Data(contentsOf: inURL)
@@ -358,9 +381,15 @@ public enum VocabRewriter {
         }
         let keepSet = Set(decision.keepIds)
         var newVocab: [String: Int] = [:]
+        var sinceCheck = 0
         for (tok, oldId) in oldVocab where keepSet.contains(oldId) {
             guard let newId = decision.oldToNew[oldId] else { continue }
             newVocab[tok] = newId
+            sinceCheck &+= 1
+            if sinceCheck >= 10_000 {
+                try cancellation?.throwIfCancelled()
+                sinceCheck = 0
+            }
         }
         model["vocab"] = newVocab
 
@@ -375,7 +404,13 @@ public enum VocabRewriter {
         if let oldMerges = model["merges"] as? [Any] {
             var newMerges: [String] = []
             newMerges.reserveCapacity(oldMerges.count / 2)
+            var sinceMergeCheck = 0
             for m in oldMerges {
+                sinceMergeCheck &+= 1
+                if sinceMergeCheck >= 5_000 {
+                    try cancellation?.throwIfCancelled()
+                    sinceMergeCheck = 0
+                }
                 let pair: (String, String)?
                 if let s = m as? String {
                     let parts = s.split(separator: " ", maxSplits: 1)
