@@ -224,8 +224,14 @@ public final class ActQuant {
     }
 
     private static func roundToE4M3(_ x: Float) -> Float {
-        let h = Float16(x)
-        let bits = h.bitPattern
+        // `floatToF16Local` (in `QuantHelpers.swift`) is the pure-Swift
+        // IEEE-754 F32→F16 converter the INT4/INT8 quantizers already
+        // use. Avoiding `Float16(x)` here keeps this code compilable on
+        // x86_64 macOS (Float16 conversion initializers are stripped
+        // from the stdlib there — see Swift's
+        // `#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))`
+        // gate around the BinaryFloatingPoint extension).
+        let bits = floatToF16Local(x)
         let sign = (bits >> 15) & 1
         let exp16 = Int((bits >> 10) & 0x1F)
         let mant10 = UInt32(bits & 0x3FF)
