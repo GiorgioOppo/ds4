@@ -47,6 +47,21 @@ struct ChatView: View {
                             if shouldShowInlineProgress(for: msg, in: c, phase: phase) {
                                 inlineProgress(phase)
                             }
+                            // Prefill trace: blocco grigio collassabile
+                            // fra l'user message precedente e la
+                            // risposta dell'assistente al primo turn
+                            // cold. Appare solo se `prefillTrace` non è
+                            // nil (= ChatStore ha raccolto chunk da
+                            // `.prefillToken`). Espanso live durante il
+                            // prefill, collassato dopo.
+                            if let trace = msg.prefillTrace, !trace.isEmpty,
+                               msg.role == .assistant {
+                                PrefillTraceDisclosure(
+                                    trace: trace,
+                                    isStreaming: isPrefillingPlaceholder(
+                                        msg, in: c, phase: phase))
+                                    .padding(.leading, 40)
+                            }
                             MessageView(
                                 message: msg,
                                 isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase),
@@ -90,8 +105,10 @@ struct ChatView: View {
             // Model-state banner: tells the user that the chat is
             // alive but inference isn't (no model loaded / load
             // in progress / load failed). Collapses to EmptyView
-            // when a model is ready.
-            modelStateBanner
+            // when QUESTA chat può inviare (post-refactor
+            // multi-endpoint: una chat remota non si lamenta se il
+            // local model non è caricato, e viceversa).
+            modelStateBanner(for: c)
             // Cumulative-cost banner for remote chats. Hidden for
             // local chats (cost is nil) and for fresh remote chats
             // that haven't billed anything yet.
@@ -122,8 +139,9 @@ struct ChatView: View {
             thinkingPicker
             ComposerView(draft: $draft,
                           phase: phase,
-                          canSend: modelState.isReady,
-                          onSend: sendCurrent, onStop: { store.cancel() })
+                          canSend: canSend(for: c),
+                          onSend: sendCurrent,
+                          onStop: { store.cancel(of: c.id) })
         }
         .navigationTitle(c.title)
     }
@@ -183,31 +201,38 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private var modelStateBanner: some View {
-        switch modelState.status {
-        case .idle:
-            modelBannerRow(
-                icon: "tray",
-                tint: .secondary,
-                title: "No model loaded",
-                subtitle: "Pick one from the model menu in the toolbar to start chatting.",
-                progress: false)
-        case .loading(let ep, let plan):
-            modelBannerRow(
-                icon: "arrow.down.circle",
-                tint: .accentColor,
-                title: "Loading \(ep.displayName)…",
-                subtitle: plan.map(planSummary) ?? "Probing shards on disk…",
-                progress: true)
-        case .error(let ep, let msg):
-            modelBannerRow(
-                icon: "exclamationmark.octagon.fill",
-                tint: .orange,
-                title: "Could not load \(ep.displayName)",
-                subtitle: msg,
-                progress: false)
-        case .loaded:
+    private func modelStateBanner(for c: Conversation) -> some View {
+        // Se questa chat può già inviare con il suo endpoint
+        // proprio (es. remote con API key configurata), il banner
+        // del global ModelState è solo rumore — la sopprimiamo.
+        if canSend(for: c) {
             EmptyView()
+        } else {
+            switch modelState.status {
+            case .idle:
+                modelBannerRow(
+                    icon: "tray",
+                    tint: .secondary,
+                    title: "No model loaded",
+                    subtitle: "Pick one from the model menu in the toolbar to start chatting.",
+                    progress: false)
+            case .loading(let ep, let plan):
+                modelBannerRow(
+                    icon: "arrow.down.circle",
+                    tint: .accentColor,
+                    title: "Loading \(ep.displayName)…",
+                    subtitle: plan.map(planSummary) ?? "Probing shards on disk…",
+                    progress: true)
+            case .error(let ep, let msg):
+                modelBannerRow(
+                    icon: "exclamationmark.octagon.fill",
+                    tint: .orange,
+                    title: "Could not load \(ep.displayName)",
+                    subtitle: msg,
+                    progress: false)
+            case .loaded:
+                EmptyView()
+            }
         }
     }
 
@@ -289,10 +314,56 @@ struct ChatView: View {
         }
     }
 
+    /// Send abilitato per QUESTA chat: dipende dal suo endpoint
+    /// effettivo, non più dal global `modelState.isReady`. Una
+    /// chat remota può inviare anche se il local model non è
+    /// caricato in RAM (e viceversa) — è proprio il punto del
+    /// refactor multi-endpoint.
+    private func canSend(for c: Conversation) -> Bool {
+        let ep = store.endpoint(of: c.id)
+        switch ep {
+        case .openRouter:
+            // Per OpenRouter basta che esista una chiave; il
+            // validate vero passa per il send (errore mostrato
+            // in-chat) — qui filtriamo solo il caso "nessuna chiave
+            // configurata" così il pulsante Send è disabilitato.
+            return KeychainStore.exists(
+                account: KeychainAccount.openRouterAPIKey)
+        case .localDirectory:
+            // Local: serve il transformer caricato nel service.
+            // Leggiamo da `modelState.loadedLocalModelDir` (mirror
+            // @Published sul main actor) invece che da
+            // `service.currentModelDir()` — quest'ultimo passa per
+            // `q.sync` sulla coda di inferenza e blocca il main
+            // thread per minuti durante una generation, rendendo la
+            // UI non-responsiva. Lo `status` di ModelState NON è
+            // affidabile qui: post-refactor multi-endpoint, status
+            // può dire "loaded remote" mentre il local model è
+            // ancora in RAM dal load precedente.
+            return modelState.loadedLocalModelDir != nil
+        case .none:
+            // Chat senza endpoint proprio: cade sul global state.
+            return modelState.isReady
+        }
+    }
+
     private func isStreamingPlaceholder(_ msg: StoredMessage,
                                          in c: Conversation,
                                          phase: GenerationPhase) -> Bool {
         guard case .streaming = phase,
+              msg.role == .assistant,
+              msg.id == c.messages.last?.id else { return false }
+        return true
+    }
+
+    /// True mentre il prefill sta accumulando token su questo
+    /// placeholder (l'ultimo assistente con contenuto vuoto). Usato
+    /// dal `PrefillTraceDisclosure` per forzare l'apertura del
+    /// blocco mentre il prompt scorre.
+    private func isPrefillingPlaceholder(_ msg: StoredMessage,
+                                          in c: Conversation,
+                                          phase: GenerationPhase) -> Bool {
+        guard case .prefilling = phase,
               msg.role == .assistant,
               msg.id == c.messages.last?.id else { return false }
         return true
@@ -323,7 +394,7 @@ struct ChatView: View {
               msg.content.isEmpty else { return false }
         switch phase {
         case .prefilling: return true
-        case .streaming(_, let status, _): return !status.isEmpty
+        case .streaming(_, _, let status, _): return !status.isEmpty
         default: return false
         }
     }
@@ -335,7 +406,7 @@ struct ChatView: View {
             PrefillIndicator(promptTokens: promptTokens,
                               startTime: startTime)
                 .padding(.leading, 40)
-        case .streaming(_, let status, _) where !status.isEmpty:
+        case .streaming(_, _, let status, _) where !status.isEmpty:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
                 Text(status)

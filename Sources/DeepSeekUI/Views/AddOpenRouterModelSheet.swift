@@ -12,6 +12,12 @@ import SwiftUI
 struct AddOpenRouterModelSheet: View {
     @ObservedObject var catalog: OpenRouterCatalog
     @ObservedObject var modelState: ModelState
+    /// Opzionale: quando presente, il sheet lega l'endpoint scelto
+    /// alla chat selezionata invece di limitarsi a chiamare
+    /// `modelState.load`. Permette `chat A locale + chat B remota`
+    /// — la chat A continua sul local model, la B passa alla remota.
+    /// Nil → fallback al vecchio comportamento globale.
+    var store: ChatStore? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var search: String = ""
@@ -175,8 +181,15 @@ struct AddOpenRouterModelSheet: View {
     }
 
     private func select(_ model: OpenRouterModel) {
+        let endpoint = ModelEndpoint.openRouter(modelID: model.id)
+        // Bind alla chat selezionata se abbiamo lo store; questo
+        // permette di tenere il local model caricato e usare la
+        // remote SOLO per questa chat.
+        if let store = store, let id = store.selectedID {
+            store.setEndpoint(endpoint, for: id)
+        }
         Task {
-            await modelState.load(.openRouter(modelID: model.id))
+            await modelState.load(endpoint)
             await MainActor.run { dismiss() }
         }
     }

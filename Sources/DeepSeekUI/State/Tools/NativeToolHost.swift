@@ -44,9 +44,24 @@ final class NativeToolHost: ObservableObject {
         let useSandbox = UserDefaults.standard.bool(
             forKey: AppSettingsKey.useShellSandbox)
         Task { @MainActor [registry] in
+            // Shell escluso esplicitamente: troppo invasivo per
+            // l'esposizione di default al chat — il modello tende a
+            // raggiungerlo anche quando le tool dedicate (read /
+            // edit / grep / glob) fanno il lavoro più sicuro e
+            // strutturato. Resterà registrabile manualmente in
+            // futuro tramite un toggle.
+            // Shell stays disabled by default (UPKmT decision) even
+            // though the sandbox flag is wired — flipping the
+            // `useShellSandbox` toggle is meaningful only once the
+            // shell tool itself gets re-enabled (manual register or
+            // future Settings toggle). `shellUsesSandbox` is passed
+            // through so DefaultTools threads it to a future
+            // ShellTool construction without us having to edit this
+            // call site again.
             await registry.registerAll(
                 DefaultTools.standard(
                     planStore: store,
+                    includeShell: false,
                     shellUsesSandbox: useSandbox,
                     webSearchProvider: searchProvider))
             self.schemas = await registry.availableSchemas(mode: .build)

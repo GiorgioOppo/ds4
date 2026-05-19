@@ -28,10 +28,26 @@ if [ "${#metal_files[@]}" -eq 0 ]; then
 fi
 
 air_files=()
+# Source embedding + line tables make the Metal Shader Debugger work
+# (Xcode → Debug → Metal → step through kernels), but the App Store
+# validator rejects any .metallib that ships debug info or source
+# ("Found Metal shader source code", error 90659 / Transporter
+# 90258). Xcode sets CONFIGURATION=Release for Archive builds —
+# the only path that ends up at App Store Connect — so we drop both
+# flags then and keep them for every other build (plain
+# `swift build`, Xcode Debug, etc.) where the shader debugger is
+# useful. Override with `DEEPSEEK_METALLIB_DEBUG=0` to strip even
+# outside Xcode Release (e.g. when building a notarized direct-
+# download .app via `swift build -c release`).
+metal_debug_flags=( -gline-tables-only -frecord-sources )
+if [ "${CONFIGURATION:-}" = "Release" ] || [ "${DEEPSEEK_METALLIB_DEBUG:-1}" = "0" ]; then
+    metal_debug_flags=()
+fi
+
 for metal in "${metal_files[@]}"; do
     name=$(basename "$metal" .metal)
     air="$air_dir/$name.air"
-    xcrun -sdk macosx metal -gline-tables-only -frecord-sources -c "$metal" -o "$air"
+    xcrun -sdk macosx metal "${metal_debug_flags[@]}" -c "$metal" -o "$air"
     air_files+=( "$air" )
 done
 

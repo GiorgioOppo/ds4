@@ -128,7 +128,23 @@ let package = Package(
                 "DeepSeekVocabPruner",
             ],
             path: "Sources/DeepSeekUI",
-            exclude: ["Resources/Info.plist"],
+            // Info.plist is embedded into __TEXT/__info_plist via the
+            // linker flags below — SwiftPM must not also try to copy
+            // it as a bundle resource.
+            //
+            // Assets.xcassets is consumed only by the Xcode build
+            // (`xcodegen` → DeepSeekV4Pro.xcodeproj → asset-catalog
+            // compiler → Assets.car). SwiftPM has no asset-catalog
+            // compiler, so excluding it keeps `swift build` clean and
+            // avoids copying raw PNGs into the SPM bundle, where the
+            // SwiftUI runtime can't find them anyway.
+            // DeepSeekUI.entitlements is referenced by CODE_SIGN_ENTITLEMENTS
+            // in project.yml and is meaningless to SPM.
+            exclude: [
+                "Resources/Info.plist",
+                "Resources/Assets.xcassets",
+                "Resources/DeepSeekUI.entitlements",
+            ],
             // Embed Info.plist directly into the executable's __TEXT
             // section. This is the Apple-standard "non-bundle" trick:
             // macOS reads CFBundleIdentifier / CFBundleName etc. from

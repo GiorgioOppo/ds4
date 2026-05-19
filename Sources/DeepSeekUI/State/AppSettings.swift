@@ -69,6 +69,18 @@ enum AppSettingsKey {
     /// attivo.
     static let kvCacheCompression = "deepseek.kvCacheCompression"
 
+    /// Quando attivo, sul primo turn di una conversazione (cold
+    /// prefill, KV cache vuota) la UI mostra fra il messaggio
+    /// dell'utente e la risposta dell'assistente un blocco
+    /// collassabile in grigio con il testo del prompt completo
+    /// (system + tools + history + user) che il modello sta per
+    /// vedere — emesso in chunk dal tokenizer mentre il prefill è
+    /// in corso. Solo i turn cold (no cache hit) lo mostrano; sui
+    /// turn incrementali, dove la prefill è solo il delta del
+    /// nuovo user message, il trace è omesso per non rumoreggiare.
+    /// Default true.
+    static let showPrefillTrace = "deepseek.showPrefillTrace"
+
     /// Local OpenAI-compatible HTTP server (TODO §10.1 / T1). Flag is
     /// off by default — the server only runs when the user explicitly
     /// flips the Settings → Server toggle. Port defaults to 8080,

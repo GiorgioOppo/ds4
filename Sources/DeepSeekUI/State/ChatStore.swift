@@ -64,10 +64,19 @@ final class ChatStore: ObservableObject {
     /// `modelDirPath` and the first send will fail on tokenizer
     /// lookup until the user picks a model from the toolbar.
     /// Used to live as a stored `let` populated at init time, back
+    /// Path del local model attualmente caricato nel service.
+    /// Letto dal mirror `@Published` di ModelState (main-actor,
+    /// non-blocking) invece che da `service.currentModelDir()` —
+    /// quest'ultimo passa per `q.sync` sulla coda di inferenza e
+    /// bloccherebbe il main thread per minuti se una generation è
+    /// in volo. Usato dai costruttori di `Conversation` (newChat
+    /// inclusa) per popolare il campo `modelDirPath`; per le chat
+    /// remote viene "" e va bene così.
+    /// Used to live as a stored `let` populated at init time, back
     /// when the load step gated the chat UI; in-chat picking
     /// turns it into a derived value.
     var modelDirPath: String {
-        service.currentModelDir()?.path ?? ""
+        modelState.loadedLocalModelDir?.path ?? ""
     }
     /// Library references handed down from the App scene. Used at
     /// "first turn of a chat with a project attached" time to pull
@@ -106,6 +115,15 @@ final class ChatStore: ObservableObject {
     /// failure mode of a model that keeps calling tools forever.
     private var toolRoundtrips: [UUID: Int] = [:]
     private let maxToolRoundtripsPerTurn: Int = 8
+
+    /// Task in volo per ogni conversation, keyed by conv id. Permette
+    /// (a) di cancellare un singolo run senza toccare gli altri,
+    /// (b) di sapere quali conversation hanno una generation pending
+    /// — informazione che la UI usa per mostrare "Queued behind chat
+    /// X…" quando una local-vs-local serializza dietro alla q dell'
+    /// InferenceService. Cleanup nel `defer` del Task body così
+    /// completion/error/cancel rimuovono sempre l'entry.
+    private var generationTasks: [UUID: Task<Void, Never>] = [:]
     /// How many *levels* of sub-agent invocation are allowed past
     /// the host. Cap = N means the host can delegate (level 1),
     /// that sub can delegate (level 2), … up to level N. A
@@ -147,13 +165,18 @@ final class ChatStore: ObservableObject {
     private var lastSamplingOptions: [UUID: (opts: SamplingOptions,
                                               maxTokens: Int)] = [:]
 
-    /// Optional native-tool host. When set, native tools are
-    /// included in the schema block emitted to the model under a
-    /// `native__` prefix (mirrors the MCP `server__tool` prefix
-    /// convention). Tool-call routing in `runRemoteLoop` and the
-    /// local execute path checks the prefix to decide whether to
-    /// hit `NativeToolHost.dispatch` or `MCPClientPool.invokeQualified`.
-    let nativeTools: NativeToolHost?
+    /// Host della suite di tool nativi (read/write/edit/grep/shell/…
+    /// 16 tool definiti in `Sources/DeepSeekTools/Tools/`). Era già
+    /// inizializzato in `DeepSeekUIApp` e cablato al Settings, ma il
+    /// chat path non lo agganciava — i suoi schemi non finivano nel
+    /// system block e le tool call con nome nativo non venivano
+    /// routate. Adesso `composeToolSchemasJSON` / `composeOpenAITools`
+    /// emettono gli schemi con prefisso `native__<name>` e i dispatch
+    /// site indirizzano le invocazioni `native__*` a
+    /// `nativeTools.dispatch(...)`. Tool-call routing in `runRemoteLoop`
+    /// e local execute path controlla il prefisso per decidere fra
+    /// `NativeToolHost.dispatch` e `MCPClientPool.invokeQualified`.
+    let nativeTools: NativeToolHost
 
     init(service: InferenceService,
          documents: DocumentLibrary,
@@ -161,7 +184,7 @@ final class ChatStore: ObservableObject {
          mcpPool: MCPClientPool,
          agents: AgentLibrary,
          modelState: ModelState,
-         nativeTools: NativeToolHost? = nil) {
+         nativeTools: NativeToolHost) {
         self.service = service
         self.documents = documents
         self.projects = projects
@@ -189,10 +212,11 @@ final class ChatStore: ObservableObject {
     }
 
     func newChat() {
-        // TODO §4: capture the typed endpoint in the new
-        // conversation. `modelDirPath` stays populated for local
-        // endpoints so older code paths keep working; remote chats
-        // get `endpoint` set and `modelDirPath = ""`.
+        // Cattura l'endpoint corrente di ModelState come default per
+        // questa chat — l'utente può poi cambiarlo via picker senza
+        // toccare gli altri chat in volo. Se è una remote, la chat
+        // non occuperà il local model in RAM; se è local, condivide
+        // il transformer caricato con le altre chat locali.
         let c = Conversation(modelDirPath: modelDirPath,
                               endpoint: modelState.loadedEndpoint)
         conversations.insert(c, at: 0)
@@ -223,8 +247,53 @@ final class ChatStore: ObservableObject {
         scheduleSave(id)
     }
 
+    /// Cambia l'endpoint usato da questa chat per l'inferenza. Non
+    /// tocca il `ModelState` globale né il modello caricato nel
+    /// service — un'altra chat locale può continuare a usare il
+    /// transformer corrente mentre questa passa a una remote. Il
+    /// cambio prende effetto dal prossimo `send` (il turn corrente,
+    /// se in volo, non viene interrotto).
+    /// Invalida `encodedTokens` quando si cambia il *tipo* di
+    /// endpoint (local↔remote) perché la token stream cached non è
+    /// più valida — le rappresentazioni interne dei due backend non
+    /// sono compatibili.
+    func setEndpoint(_ endpoint: ModelEndpoint?, for id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        let old = conversations[idx].endpoint
+        guard old != endpoint else { return }
+        // Cambio tipo backend → la cache di token locale è
+        // inutile per il backend nuovo, droppiamola così il primo
+        // send rifà l'encoding da capo.
+        if old?.isRemote != endpoint?.isRemote {
+            conversations[idx].encodedTokens = nil
+            conversations[idx].lastEncodedMode = nil
+        }
+        conversations[idx].endpoint = endpoint
+        scheduleSave(id)
+    }
+
+    /// Endpoint effettivamente usato da questa chat per l'inferenza
+    /// (vedi `Conversation.endpoint`). Fallback su `modelState.loadedEndpoint`
+    /// per BWC su chat pre-migration. Esposto pubblicamente così la
+    /// toolbar / ComposerView / banner-stato possono renderizzare
+    /// l'endpoint giusto per la chat selezionata invece di leggere
+    /// sempre lo stato globale di ModelState (che ora rappresenta
+    /// "il modello locale caricato in RAM", non più "l'endpoint
+    /// corrente di tutte le chat").
+    func endpoint(of id: UUID) -> ModelEndpoint? {
+        guard let c = conversations.first(where: { $0.id == id }) else {
+            return modelState.loadedEndpoint
+        }
+        return c.endpoint ?? modelState.loadedEndpoint
+    }
+
     func delete(_ id: UUID) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        // Cancella un'eventuale generation in corso per questa
+        // chat — altrimenti il Task continuerebbe a girare sul
+        // service finché non finisce maxTokens, sprecando RAM/GPU
+        // su una conversation che non esiste più.
+        cancel(of: id)
         conversations.remove(at: idx)
         phases.removeValue(forKey: id)
         // Best-effort: remove the on-disk files. Both the JSON
@@ -272,11 +341,23 @@ final class ChatStore: ObservableObject {
         default: break
         }
 
+        // Endpoint effettivo per QUESTA chat. `Conversation.endpoint`
+        // è la fonte primaria: permette `chat A locale + chat B
+        // remota` in parallelo perché ogni chat decide il proprio
+        // backend invece di leggere lo stato globale di ModelState.
+        // Fallback sul `loadedEndpoint` globale per le chat
+        // pre-migration (campo nil) — al primo send con un
+        // ModelState valido il caller può anche fare opportunistic
+        // backfill via `setEndpoint(_:for:)`, ma il fallback è
+        // sufficiente per la BWC.
+        let effectiveEndpoint = conversations[idx].endpoint
+            ?? modelState.loadedEndpoint
+
         // Remote endpoints take a completely different code path —
         // no tokenizer, no KV cache, no fast-delta. Branch early so
         // the local pipeline below operates only on the case it was
         // designed for.
-        if case .openRouter(let modelID) = modelState.loadedEndpoint {
+        if case .openRouter(let modelID) = effectiveEndpoint {
             sendRemote(text: trimmed,
                         conversationIndex: idx,
                         provider: .openRouter,
@@ -301,7 +382,15 @@ final class ChatStore: ObservableObject {
         let userMessage = StoredMessage(role: .user, content: trimmed)
         conversations[idx].messages.append(userMessage)
         conversations[idx].retitleIfNeeded()
-        phases[id] = .streaming(buffer: "", status: "Encoding prompt…",
+        // Status iniziale: se c'è già un'altra conversation locale
+        // attiva, questa generation andrà in coda dietro la q seriale
+        // dell'InferenceService. Dirlo all'utente esplicitamente
+        // invece di mostrargli "Encoding prompt…" per minuti mentre
+        // sta in realtà aspettando.
+        let initialStatus: String = otherLocalGenerationInFlight(excluding: id)
+            ? "Waiting — another local chat is using the model…"
+            : "Encoding prompt…"
+        phases[id] = .streaming(buffer: "", status: initialStatus,
                                  metrics: GenerationMetrics())
         // Tool-call continuations (M3b) re-use these — capture them
         // before the Task that drives the model run is spawned so
@@ -383,9 +472,22 @@ final class ChatStore: ObservableObject {
             }
         }()
 
-        Task {
+        // Cancella un'eventuale entry rimasta (sicurezza per
+        // dev-loop: in produzione la gate `phase(of: id)` sopra
+        // garantisce che non ci sia già un task per questa conv).
+        generationTasks[id]?.cancel()
+        let task = Task { [weak self] in
+            defer {
+                // Cleanup dell'entry per questa conversation alla
+                // fine del run (success/throw/cancel). Defer
+                // garantisce esecuzione anche se il body solleva o
+                // viene cancellato. Siamo su @MainActor (ereditato
+                // da ChatStore), quindi accesso diretto alla mappa.
+                self?.generationTasks.removeValue(forKey: id)
+            }
+            guard let self else { return }
             do {
-                let promptTokens = try await buildPromptTokens(
+                let promptTokens = try await self.buildPromptTokens(
                     canReusePrefix: canReusePrefix,
                     cachedPrefix: cachedPrefix,
                     userText: trimmed,
@@ -394,38 +496,86 @@ final class ChatStore: ObservableObject {
                     projectContext: projectContext,
                     toolSchemasJSON: toolSchemasJSON,
                     agentSystemPrompt: agentSystemPrompt)
+                // Bail-out se l'utente ha cancellato mentre stavamo
+                // aspettando la tokenize (la q seriale può tenerci
+                // bloccati per la durata di un altro generate).
+                // Throw così cade nel catch CancellationError che
+                // resetta il phase a .idle invece di lasciarlo nello
+                // status "Waiting…".
+                if Task.isCancelled { throw CancellationError() }
                 // Snapshot the pending turn on disk immediately. If
                 // the app dies during the prefill (which can take
                 // minutes for a project context), the user's prompt
                 // is preserved and the resume path can still pick
                 // up — without any tokens emitted yet.
-                if let cIdx = conversations.firstIndex(where: { $0.id == id }) {
-                    conversations[cIdx].pendingTurn = PendingTurn(
+                if let cIdx = self.conversations.firstIndex(where: { $0.id == id }) {
+                    self.conversations[cIdx].pendingTurn = PendingTurn(
                         assistantMessageID: placeholderId,
                         promptTokens: promptTokens,
                         generatedTokens: [],
                         mode: modeRaw)
-                    scheduleSave(id)
+                    self.scheduleSave(id)
                 }
-                for try await event in service.generateForConversation(
+                for try await event in self.service.generateForConversation(
                     promptTokens: promptTokens,
                     conversationID: id,
                     mode: mode,
                     options: options,
                     maxTokens: maxTokens)
                 {
-                    apply(event: event,
-                           to: id,
-                           placeholderId: placeholderId,
-                           userMessageId: userMessage.id,
-                           mode: modeRaw)
+                    self.apply(event: event,
+                                to: id,
+                                placeholderId: placeholderId,
+                                userMessageId: userMessage.id,
+                                mode: modeRaw)
                 }
+            } catch is CancellationError {
+                // Cancellazione esplicita: phase passa a .idle, non
+                // .error — l'utente ha chiesto stop, non c'è un
+                // errore da mostrare.
+                self.phases[id] = .idle
+                self.scheduleSave(id)
             } catch {
-                phases[id] = .error((error as? LocalizedError)?.errorDescription
+                self.phases[id] = .error((error as? LocalizedError)?.errorDescription
                                      ?? error.localizedDescription)
-                scheduleSave(id)
+                self.scheduleSave(id)
             }
         }
+        generationTasks[id] = task
+    }
+
+    /// True se almeno una conversation locale (esclusa `excluding`,
+    /// di solito quella che stiamo per avviare) sta correndo nel
+    /// `service` o è in coda davanti. Usato dal `send` per scegliere
+    /// lo status iniziale del phase (chiaro vs "in attesa"). La q
+    /// dell'InferenceService è seriale: due locali sullo stesso
+    /// modello serializzano per forza. Le remote girano via HTTP
+    /// — non contendono nulla, quindi non contano.
+    private func otherLocalGenerationInFlight(excluding id: UUID) -> Bool {
+        for (otherID, task) in generationTasks {
+            guard otherID != id, !task.isCancelled else { continue }
+            // Filtra solo gli active phase: una entry in
+            // `generationTasks` può persistere per qualche istante
+            // dopo che il Task body è uscito (prima che il `defer`
+            // rimuova la chiave), e quei task non bloccano più la
+            // q. Controlla il phase per essere sicuri.
+            switch phases[otherID] ?? .idle {
+            case .idle, .error:
+                continue
+            case .prefilling, .streaming:
+                // Solo i local endpoint passano per la q seriale.
+                // Le remote (OpenRouter) girano via HTTP, non
+                // bloccano nulla. Leggiamo l'endpoint effettivo
+                // (Conversation.endpoint con fallback global)
+                // perché post-refactor multi-endpoint i due tipi
+                // coesistono nella stessa app.
+                let otherEp = self.endpoint(of: otherID)
+                if case .localDirectory = otherEp {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /// Restart a generation that was cut short (crash, app-quit,
@@ -639,8 +789,16 @@ final class ChatStore: ObservableObject {
     }
 
 
-    func cancel() {
-        service.cancelCurrent()
+    /// Cancella la generation in volo per `id` (default: la chat
+    /// attualmente selezionata). Cancella il Task swift — che
+    /// termina il `for try await event in …` loop — e alza il flag
+    /// per-conv nel service così se il run è già dentro al
+    /// prefill/decode esce dopo il token corrente. Le altre chat in
+    /// volo (locale + remote) restano intatte.
+    func cancel(of id: UUID? = nil) {
+        guard let target = id ?? selectedID else { return }
+        generationTasks[target]?.cancel()
+        service.cancelCurrent(conversationID: target)
     }
 
     /// User chose to throw away the interrupted assistant turn. The
@@ -690,6 +848,32 @@ final class ChatStore: ObservableObject {
         case .prefillStart(let promptTokens):
             phases[id] = .prefilling(promptTokens: promptTokens,
                                       startTime: Date())
+            // Resetta il prefillTrace sul placeholder: su un resume
+            // dopo crash il placeholder rientra con il trace del
+            // turn precedente; senza azzeramento i nuovi
+            // `.prefillToken` ci appenderebbero sopra producendo un
+            // trace duplicato. Sul flusso normale (placeholder
+            // appena creato) è un no-op.
+            if let mIdx = conversations[idx].messages.firstIndex(
+                where: { $0.id == placeholderId }) {
+                conversations[idx].messages[mIdx].prefillTrace = nil
+            }
+
+        case .prefillToken(let text):
+            // Append al `prefillTrace` del placeholder. Cresce
+            // live durante il prefill (la UI legge da
+            // `placeholder.prefillTrace` per disegnare il blocco
+            // grigio collassabile fra l'user e l'assistente).
+            // Persistito nel conversation JSON al `.done` via
+            // `scheduleSave`, ma scriviamo subito qui per il
+            // crash-recovery — il debounce di scheduleSave evita
+            // di sgranchire il disco a ogni chunk.
+            if let mIdx = conversations[idx].messages.firstIndex(
+                where: { $0.id == placeholderId }) {
+                let prev = conversations[idx].messages[mIdx].prefillTrace ?? ""
+                conversations[idx].messages[mIdx].prefillTrace = prev + text
+                scheduleSave(id)
+            }
 
         case .prefillDone(let promptTokens, let elapsed, let tokPerMin):
             var m = currentMetrics(of: id)
@@ -710,15 +894,21 @@ final class ChatStore: ObservableObject {
         case .done(let final, let promptTokens, let generatedTokens):
             // Finalize the assistant placeholder with the parsed
             // structure (reasoning + tool calls split out).
+            // Preserva l'eventuale prefillTrace accumulato durante
+            // il cold prefill — l'init non lo prende dal Message
+            // (il kit non lo conosce) quindi va riassegnato dal
+            // valore precedente.
             if let mIdx = conversations[idx].messages.firstIndex(
                 where: { $0.id == placeholderId }) {
+                let prevTrace = conversations[idx].messages[mIdx].prefillTrace
                 conversations[idx].messages[mIdx] = StoredMessage(
                     id: placeholderId,
                     role: .assistant,
                     content: final.content,
                     reasoningContent: final.reasoningContent,
                     toolCalls: final.toolCalls.map(StoredToolCall.init),
-                    tokenCount: generatedTokens.count)
+                    tokenCount: generatedTokens.count,
+                    prefillTrace: prevTrace)
             }
             // Stamp the user message with the share of the prompt it
             // contributed. Approximation: prompt length minus the
@@ -804,23 +994,10 @@ final class ChatStore: ObservableObject {
             var outputs: [String] = []
             outputs.reserveCapacity(calls.count)
             for call in calls {
-                let result: String
-                if call.name == EncodingDSV4.delegateToolName {
-                    // Synthetic "delegate to another agent" tool.
-                    // Handled in-process (no MCP server involved) by
-                    // spawning a sub-agent run.
-                    result = await self.executeSubAgentDelegation(
-                        argsJSON: call.args,
-                        hostAgentID: hostAgentID,
-                        hostConvID: id)
-                } else if call.name.hasPrefix("native__") {
-                    result = await self.dispatchNativeTool(
-                        qualifiedName: call.name,
-                        argsJSON: call.args)
-                } else {
-                    result = await pool.invokeQualified(
-                        call.name, argsJSON: call.args)
-                }
+                let result = await self.executeToolCall(
+                    call,
+                    conversationID: id,
+                    hostAgentID: hostAgentID)
                 outputs.append(result)
             }
 
@@ -921,11 +1098,154 @@ final class ChatStore: ObservableObject {
     /// Returns nil when the resulting set is empty (no MCP tools
     /// allowed AND no other agents) so the chat template can skip
     /// the tools block entirely.
+    /// Esegue una tool call invocata dal modello. Tre branch:
+    ///   - `__delegate_to_agent` → spawn sub-agent;
+    ///   - `native__<name>` → `nativeTools.dispatch` (lo strip del
+    ///     prefisso è l'unica cosa che separa il nome wire dal nome
+    ///     registro);
+    ///   - tutto il resto → `mcpPool.invokeQualified` (deve avere
+    ///     forma `server__tool` o l'MCP pool rifiuta).
+    /// Centralizza il routing così i tre call site
+    /// (runToolCallsAndContinue, runRemoteLoop, runSubAgentToCompletionInner)
+    /// non duplicano la logica.
+    private func executeToolCall(_ call: ToolCall,
+                                  conversationID: UUID,
+                                  hostAgentID: UUID?) async -> String {
+        if call.name == EncodingDSV4.delegateToolName {
+            return await executeSubAgentDelegation(
+                argsJSON: call.args,
+                hostAgentID: hostAgentID,
+                hostConvID: conversationID)
+        }
+        if call.name.hasPrefix("native__") {
+            let nativeName = String(call.name.dropFirst("native__".count))
+            return await invokeNativeTool(
+                name: nativeName,
+                argsJSON: call.args,
+                conversationID: conversationID)
+        }
+        // Tool name che non match nessuno dei branch supportati e
+        // non ha il `__` separator MCP. Senza questa guardia,
+        // `mcpPool.invokeQualified` ritorna un errore generico
+        // "[error: tool name not qualified as <server>__<tool>: X]"
+        // che è criptico per il modello. Qui invece elenchiamo
+        // esplicitamente quali nomi avrebbe potuto usare così
+        // l'output del tool message è auto-esplicativo e il modello
+        // recupera invece di ripetere lo stesso errore.
+        if call.name.range(of: "__") == nil {
+            return unknownToolError(call.name)
+        }
+        return await mcpPool.invokeQualified(call.name, argsJSON: call.args)
+    }
+
+    /// Costruisce un messaggio "tool not found" auto-descrittivo che
+    /// elenca i nomi qualificati che il modello dovrebbe usare al
+    /// posto dello sbagliato. Tornare un errore ricco invece del
+    /// silenzio (o di un errore generico) è ciò che rompe il loop
+    /// agentico quando il modello rinomina i tool a casaccio.
+    private func unknownToolError(_ name: String) -> String {
+        let nativeNames = nativeTools.schemas
+            .map { "native__\($0.name)" }
+            .sorted()
+        let mcpNames = mcpPool.allTools()
+            .map { $0.qualifiedName }
+            .sorted()
+        var hint = "Available tool names:"
+        if !nativeNames.isEmpty {
+            hint += " " + nativeNames.joined(separator: ", ")
+        }
+        if !mcpNames.isEmpty {
+            hint += (nativeNames.isEmpty ? " " : ", ")
+                + mcpNames.joined(separator: ", ")
+        }
+        hint += ", __delegate_to_agent."
+        return "[error: tool '\(name)' is not registered. \(hint)]"
+    }
+
+    /// Decodifica gli args JSON, risolve mode + rootDirectory dalla
+    /// chat (Project attaccato → primo sourcePath; fallback → home),
+    /// invoca `NativeToolHost.dispatch` e ritorna l'output testuale
+    /// per la tool_outputs block. Errori (JSON malformed, esecuzione
+    /// fallita) tornano come stringa con marker `[error: ...]` così
+    /// il modello può recuperare invece di crashare.
+    private func invokeNativeTool(name: String,
+                                    argsJSON: String,
+                                    conversationID: UUID) async -> String {
+        let input: [String: Any]
+        if argsJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            input = [:]
+        } else if let data = argsJSON.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] {
+            input = obj
+        } else {
+            return "[error: native tool '\(name)' got malformed JSON args]"
+        }
+
+        let conv = conversations.first(where: { $0.id == conversationID })
+        let agent = conv?.agentID.flatMap { agents.agent(id: $0) }
+        let mode = agent?.agentMode ?? .build
+        let rootDir: URL = {
+            if let pid = conv?.projectID,
+               let project = projects.project(id: pid),
+               let path = project.sourcePaths.first {
+                return URL(fileURLWithPath: path)
+            }
+            return FileManager.default.homeDirectoryForCurrentUser
+        }()
+
+        let out = await nativeTools.dispatch(
+            name: name, input: input, mode: mode, rootDirectory: rootDir)
+        if out.isError {
+            return "[error: \(out.output)]"
+        }
+        // Output vuoto = la tool è andata a buon fine ma non ha
+        // trovato niente (glob con pattern malformato, grep senza
+        // match, read di un file vuoto, ecc.). Senza un marker il
+        // modello vede una stringa vuota e non capisce se la tool
+        // ha funzionato — di solito ritenta con varianti e blocca
+        // il loop agentico. Un marker esplicito gli dice "operazione
+        // OK, zero risultati" così può cambiare strategia.
+        let trimmed = out.output.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "(empty output / 0 results — tool '\(name)' " +
+                "ran successfully but produced no content; " +
+                "consider whether the arguments are correct)"
+        }
+        return out.output
+    }
+
     private func composeToolSchemasJSON(
         mcpAllowed: Set<String>?,
         delegableAgents: [AgentConfig]
     ) -> String? {
         var schemas: [[String: Any]] = []
+
+        // Native tools (DeepSeekTools): read/write/edit/grep/shell/glob/
+        // apply_patch/task/todo/plan/web_fetch/web_search/lsp/repo_*.
+        // Prefisso `native__<name>` per non collidere con tool MCP che
+        // potrebbero avere nomi corti uguali; il dispatch site
+        // (runToolCallsAndContinue, runSubAgentToCompletionInner,
+        // runRemoteLoop) controlla il prefisso e instrada al
+        // `nativeTools.dispatch` invece che a `mcpPool.invokeQualified`.
+        // Filtro per `mcpAllowed`: se l'allowlist è non-nil ma vuota
+        // la chat è "tools off" → niente nativi né MCP. Altrimenti i
+        // nomi sono inclusi se l'allowlist li contiene esplicitamente
+        // come `native__<name>`, oppure se non c'è allowlist.
+        if !(mcpAllowed?.isEmpty == true) {
+            let nativeSchemas = nativeTools.schemas
+            for native in nativeSchemas {
+                let qualified = "native__\(native.name)"
+                if let allowed = mcpAllowed,
+                   !allowed.contains(qualified) { continue }
+                schemas.append([
+                    "name": qualified,
+                    "description": native.description,
+                    "inputSchema": native.inputSchema.foundationValue
+                ])
+            }
+        }
 
         // MCP tools (already filtered by agent allowlist semantics
         // when `mcpAllowed` is non-nil).
@@ -1303,11 +1623,28 @@ final class ChatStore: ObservableObject {
             for call in final.toolCalls {
                 let out: String
                 if call.name == EncodingDSV4.delegateToolName {
+                    // Recursive sub-agent: tracking depth + chain
+                    // qui non è riutilizzabile da `executeToolCall`
+                    // (che è chiamato solo dal turn host), quindi
+                    // teniamo il branch dedicato.
                     out = await dispatchDelegation(
                         argsJSON: call.args,
                         depth: depth + 1,
                         chain: chain,
                         hostConvID: hostConvID)
+                } else if call.name.hasPrefix("native__") {
+                    let nativeName = String(
+                        call.name.dropFirst("native__".count))
+                    out = await invokeNativeTool(
+                        name: nativeName,
+                        argsJSON: call.args,
+                        conversationID: hostConvID)
+                } else if call.name.range(of: "__") == nil {
+                    // Stesso fallback dell'host path: nome senza
+                    // qualificatore = tool non registrato → errore
+                    // ricco con elenco dei nomi disponibili così il
+                    // modello recupera invece di girare in tondo.
+                    out = unknownToolError(call.name)
                 } else {
                     out = await mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -1411,7 +1748,16 @@ final class ChatStore: ObservableObject {
         let userMessageID = userMessage.id
         let firstPlaceholderID = placeholder.id
 
-        Task { [weak self] in
+        // Stesso pattern del local-send: registriamo il Task nella
+        // mappa per permettere cancellazione granulare e cleanup
+        // automatico. Cancella un eventuale residuo per questa
+        // conv prima di sostituire (dovrebbe essere già nil per la
+        // gate sopra, ma è una rete di sicurezza per dev-loop).
+        generationTasks[id]?.cancel()
+        let task = Task { [weak self] in
+            defer {
+                self?.generationTasks.removeValue(forKey: id)
+            }
             guard let self else { return }
             await self.runRemoteLoop(conversationID: id,
                                        initialPlaceholderID: firstPlaceholderID,
@@ -1423,6 +1769,7 @@ final class ChatStore: ObservableObject {
                                        maxTokens: maxTokens,
                                        apiKey: apiKey)
         }
+        generationTasks[id] = task
     }
 
     /// Drive a remote chat to completion through (up to)
@@ -1484,18 +1831,17 @@ final class ChatStore: ObservableObject {
                 history: snapshot.history,
                 agent: snapshot.agent,
                 projectInventory: projectInventory)
-            // TODO §4: also expose other agents as delegate targets
-            // so the remote model can hand off via the synthetic
-            // `__delegate_to_agent` schema. The attached agent
-            // itself is filtered out to prevent the trivial
-            // self-loop; deeper cycle prevention runs in
-            // `dispatchDelegation`.
-            let delegableForRemote = await MainActor.run {
-                self.agents.agents.filter { $0.id != snapshot.agent?.id }
-            }
+            // Stessa logica del local path (vedi `send` →
+            // `composeToolSchemasJSON`): l'agent attivo viene filtrato
+            // fuori dalla roster delegabile per evitare di mandarsi
+            // a se stesso. Senza un agent attaccato, tutti gli agent
+            // registrati sono potenzialmente delegabili. ChatStore è
+            // @MainActor → accesso sincrono diretto.
+            let delegableAgents = self.agents.agents
+                .filter { $0.id != snapshot.agent?.id }
             let toolsArray = self.composeOpenAITools(
                 mcpAllowed: snapshot.agent?.allowedToolNames,
-                delegableAgents: delegableForRemote)
+                delegableAgents: delegableAgents)
 
             var body: [String: Any] = [
                 "model": modelID,
@@ -1516,6 +1862,29 @@ final class ChatStore: ObservableObject {
             case .max:  body["reasoning"] = ["effort": "high"]
             case .high: body["reasoning"] = ["effort": "medium"]
             case .chat: break
+            }
+
+            // Prompt trace remoto: dump del body JSON inviato al
+            // provider — system message, tools array (formato OpenAI
+            // o Anthropic), tool_choice/tools, messages (history +
+            // tool outputs delle iterazioni precedenti), sampler.
+            // Ogni iterazione del loop ha il suo placeholder fresco
+            // e quindi il suo dump dedicato, così l'utente può
+            // verificare lungo la timeline cosa il modello ha
+            // effettivamente visto a ogni passo (in particolare: il
+            // marker "(empty output)" appare nei tool messages delle
+            // iterazioni che seguono una tool call senza risultati).
+            // In background per non ritardare la HTTP request. Per
+            // Anthropic dumpiamo la forma OpenAI-shape `body` perché
+            // mantiene 1:1 le info (system + messages + tools +
+            // sampler) senza dover esporre l'API Anthropic dettagliata
+            // — il trace è per debugging, non per wire-match.
+            let bodyForTrace = body
+            Task { [weak self] in
+                await self?.emitRemotePromptTrace(
+                    conversationID: id,
+                    placeholderID: currentPlaceholderID,
+                    body: bodyForTrace)
             }
 
             // Stream + accumulate. Both providers return the same
@@ -1650,33 +2019,19 @@ final class ChatStore: ObservableObject {
             // check.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
-            // Cross-agent delegation: resolve the host agent id
-            // for cycle prevention. Same chain seed as the local
-            // path so a delegate sub-agent can't loop back to the
-            // host.
-            let hostAgentForRemote = await MainActor.run {
-                self.conversations
-                    .first(where: { $0.id == id })?.agentID
-            }
+            // Snapshot dell'host agent ID per la cycle prevention
+            // della delegation (lo stesso check del local path).
+            // `executeToolCall` instrada internamente delegation /
+            // native__* / MCP via il loro prefisso, quindi anche il
+            // remote loop usa lo stesso router. ChatStore è
+            // @MainActor → accesso sincrono diretto.
+            let hostAgentID = self.conversations
+                .first(where: { $0.id == id })?.agentID
             for call in final.toolCalls {
-                let result: String
-                if call.name == EncodingDSV4.delegateToolName {
-                    // TODO §4: cross-agent delegation now works on
-                    // the remote path too. The sub-agent runs on
-                    // whatever backend its own AgentConfig points
-                    // at (local / OpenRouter / Anthropic).
-                    result = await self.executeSubAgentDelegation(
-                        argsJSON: call.args,
-                        hostAgentID: hostAgentForRemote,
-                        hostConvID: id)
-                } else if call.name.hasPrefix("native__") {
-                    result = await self.dispatchNativeTool(
-                        qualifiedName: call.name,
-                        argsJSON: call.args)
-                } else {
-                    result = await self.mcpPool.invokeQualified(
-                        call.name, argsJSON: call.args)
-                }
+                let result = await self.executeToolCall(
+                    call,
+                    conversationID: id,
+                    hostAgentID: hostAgentID)
                 outputs.append(result)
             }
 
@@ -1763,6 +2118,14 @@ final class ChatStore: ObservableObject {
         if let mIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == placeholderID })
         {
+            // Preserva il prefillTrace accumulato durante lo
+            // streaming remote (dump del body OpenRouter). L'init
+            // dello StoredMessage non lo prende dal `Message` del
+            // kit — il backend remoto non lo conosce — quindi va
+            // letto dal valore precedente e ripassato esplicitamente
+            // così non viene azzerato dalla riscrittura del
+            // placeholder.
+            let prevTrace = conversations[idx].messages[mIdx].prefillTrace
             conversations[idx].messages[mIdx] = StoredMessage(
                 id: placeholderID,
                 role: .assistant,
@@ -1770,7 +2133,8 @@ final class ChatStore: ObservableObject {
                 reasoningContent: final.reasoningContent,
                 toolCalls: final.toolCalls.map(StoredToolCall.init),
                 tokenCount: usage?.completionTokens,
-                toolOutputs: nil)
+                toolOutputs: nil,
+                prefillTrace: prevTrace)
         }
         if let uIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == userMessageID })
@@ -1821,67 +2185,111 @@ final class ChatStore: ObservableObject {
     /// invocation would need a remote sub-agent loop that doesn't
     /// exist yet. A `__delegate_to_agent` schema would just lure
     /// the model into calls we have to refuse with an error.
-    /// Route a `native__<tool>` call to `NativeToolHost.dispatch`
-    /// (TODO §8 follow-up). Strips the prefix, parses the JSON
-    /// args, resolves the active agent's mode + a sensible root
-    /// directory (project path when attached, $HOME otherwise),
-    /// and formats the resulting `ToolOutput` to a string the
-    /// model can re-ingest. Errors are returned inline (matches
-    /// `MCPClientPool.invokeQualified`'s never-throws contract).
-    private func dispatchNativeTool(qualifiedName: String,
-                                      argsJSON: String) async -> String
-    {
-        guard qualifiedName.hasPrefix("native__") else {
-            return "[error: not a native tool: \(qualifiedName)]"
-        }
-        let toolName = String(qualifiedName.dropFirst("native__".count))
-        let input: [String: Any] = {
-            guard let data = argsJSON.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data)
-                            as? [String: Any]
-            else { return [:] }
-            return obj
+    /// Emette il body JSON di una OpenRouter / Anthropic request
+    /// nel campo `prefillTrace` del placeholder, a chunk per dare
+    /// l'effetto streaming come per il prefill trace locale. Gated
+    /// dallo stesso flag `showPrefillTrace`. Reset del trace al
+    /// start così un retry/iterazione sovrascrive invece di
+    /// appendere. Si esegue su un Task in background (non blocca
+    /// l'HTTP) — il dump è solo informativo e la response arriva
+    /// comunque.
+    private func emitRemotePromptTrace(conversationID: UUID,
+                                         placeholderID: UUID,
+                                         body: [String: Any]) async {
+        let traceFlag = UserDefaults.standard.object(
+            forKey: AppSettingsKey.showPrefillTrace) as? Bool ?? true
+        guard traceFlag else { return }
+
+        let pretty: String? = {
+            // .sortedKeys per output deterministico (utile per
+            // confrontare due trace). .withoutEscapingSlashes evita
+            // che gli URL dentro al body diventino illeggibili.
+            let opts: JSONSerialization.WritingOptions =
+                [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: body, options: opts) else { return nil }
+            return String(data: data, encoding: .utf8)
         }()
-        guard let host = self.nativeTools else {
-            return "[error: native tools host not attached]"
+        guard let text = pretty else { return }
+
+        // Reset on this placeholder prima di scrivere (no doppione
+        // se per qualche motivo entriamo qua due volte).
+        await MainActor.run {
+            if let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
+               let mIdx = self.conversations[cIdx].messages.firstIndex(
+                where: { $0.id == placeholderID }) {
+                self.conversations[cIdx].messages[mIdx].prefillTrace = nil
+            }
         }
-        // Resolve agent mode + project root on the main actor.
-        let (mode, rootDir): (AgentMode, URL) = await MainActor.run {
-            let conv = self.selectedConversation
-            let agent = conv?.agentID
-                .flatMap { self.agents.agent(id: $0) }
-            let agentMode = agent?.agentMode ?? .build
-            // Project root: pick the first source path of the
-            // attached project; fall back to $HOME otherwise. Not
-            // ideal (multi-root projects aren't represented) but
-            // unblocks the common single-root case. See TODO §11
-            // for per-project `.deepseek/` overrides.
-            let projectRoot: URL? = conv?.projectID
-                .flatMap { self.projects.project(id: $0) }
-                .flatMap { $0.sourcePaths.first }
-                .map { URL(fileURLWithPath: $0) }
-            return (agentMode, projectRoot
-                    ?? URL(fileURLWithPath: NSHomeDirectory()))
+
+        let chars = Array(text)
+        let chunkSize = 40
+        var i = 0
+        while i < chars.count {
+            if Task.isCancelled { break }
+            let end = min(i + chunkSize, chars.count)
+            let chunk = String(chars[i..<end])
+            await MainActor.run {
+                guard let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
+                      let mIdx = self.conversations[cIdx].messages.firstIndex(
+                        where: { $0.id == placeholderID })
+                else { return }
+                let prev = self.conversations[cIdx].messages[mIdx].prefillTrace ?? ""
+                self.conversations[cIdx].messages[mIdx].prefillTrace = prev + chunk
+                self.scheduleSave(conversationID)
+            }
+            i = end
+            // ~4 ms fra chunk — totalizza ~1 s per body da 10 KB.
+            // Trascurabile vs latenza HTTP (centinaia di ms al
+            // first-byte del provider).
+            try? await Task.sleep(nanoseconds: 4_000_000)
         }
-        let result = await host.dispatch(name: toolName, input: input,
-                                           mode: mode,
-                                           rootDirectory: rootDir)
-        if result.isError {
-            return "[error: \(result.output)]"
-        }
-        return result.output
     }
 
+    /// Costruisce l'array `tools` nel formato OpenAI canonico
+    /// (`{type: "function", function: {name, description, parameters}}`)
+    /// che OpenRouter / Anthropic inietta nel system prompt
+    /// server-side. Specchio remoto di `composeToolSchemasJSON` per
+    /// il local DSV4 — stessi input, output diverso. Include native
+    /// tools (prefisso `native__`), MCP tools (prefisso
+    /// `server__`), e il sintetico `__delegate_to_agent` quando ci
+    /// sono altri agent invocabili; senza quest'ultimo, un chat
+    /// remota con agent configurati non saprebbe come delegare e
+    /// l'asimmetria local↔remote sarebbe visibile.
     private func composeOpenAITools(
         mcpAllowed: Set<String>?,
-        delegableAgents: [AgentConfig] = []
+        delegableAgents: [AgentConfig]
     ) -> [[String: Any]]? {
-        if let allowed = mcpAllowed, allowed.isEmpty
-           && delegableAgents.isEmpty { return nil }
         var schemas: [[String: Any]] = []
-        if let allowed = mcpAllowed, allowed.isEmpty {
-            // explicit "no MCP tools" set — skip MCP entirely
-        } else {
+
+        // Native tools (DeepSeekTools) — wrappate in OpenAI function
+        // format. Stesso prefisso `native__<name>` del path locale così
+        // i dispatch site sanno instradarle a `nativeTools.dispatch`
+        // invece che a `mcpPool.invokeQualified`. JSONValue ha bisogno
+        // di `foundationValue` per restituire `[String: Any]` ad
+        // JSONSerialization.
+        let allEmpty = (mcpAllowed?.isEmpty == true)
+        if !allEmpty {
+            for native in nativeTools.schemas {
+                let qualified = "native__\(native.name)"
+                if let allowed = mcpAllowed,
+                   !allowed.contains(qualified) { continue }
+                schemas.append([
+                    "type": "function",
+                    "function": [
+                        "name": qualified,
+                        "description": native.description,
+                        "parameters": native.inputSchema.foundationValue
+                    ]
+                ])
+            }
+        }
+
+        // MCP tools (filtered by the attached agent's allowlist
+        // when one is in effect — same precedence the local path
+        // uses in composeToolSchemasJSON).
+        let mcpAllEmpty = (mcpAllowed?.isEmpty == true)
+        if !mcpAllEmpty {
             for tool in mcpPool.allTools() {
                 if let allowed = mcpAllowed,
                    !allowed.contains(tool.qualifiedName) {
@@ -1897,29 +2305,13 @@ final class ChatStore: ObservableObject {
                 ])
             }
         }
-        // TODO §8 follow-up: native tools alongside MCP, with the
-        // `native__` prefix so the dispatch side can route them.
-        // Same agent-allowlist caveat as the local-side block —
-        // native tools are not yet filterable from AgentConfig.
-        if let host = nativeTools {
-            for s in host.schemas {
-                schemas.append([
-                    "type": "function",
-                    "function": [
-                        "name": "native__\(s.name)",
-                        "description": s.description,
-                        "parameters": s.inputSchema.foundationValue,
-                    ]
-                ])
-            }
-        }
-        // TODO §4 follow-up: cross-agent delegation on remote
-        // chats. Emit the synthetic `__delegate_to_agent` schema
-        // when there's at least one other agent the model could
-        // hand off to. The dispatch side in `runRemoteLoop` now
-        // routes calls with `call.name == EncodingDSV4.delegateToolName`
-        // through `executeSubAgentDelegation` instead of the
-        // stub error.
+
+        // Sub-agent delegation. Mirrors composeToolSchemasJSON:1075
+        // — same name, same description shape, same parameters; only
+        // the wrapping differs (OpenAI `function` block vs DSV4
+        // `inputSchema` field). Il dispatch site in `runRemoteLoop`
+        // routes `call.name == EncodingDSV4.delegateToolName`
+        // attraverso `executeSubAgentDelegation`.
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
                 .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
@@ -1942,7 +2334,7 @@ final class ChatStore: ObservableObject {
                             ],
                             "task": [
                                 "type": "string",
-                                "description": "Self-contained instructions for the sub-agent."
+                                "description": "Clear, self-contained description of what the sub-agent should do."
                             ]
                         ],
                         "required": ["agent_name", "task"]
@@ -1950,6 +2342,7 @@ final class ChatStore: ObservableObject {
                 ]
             ])
         }
+
         return schemas.isEmpty ? nil : schemas
     }
 
