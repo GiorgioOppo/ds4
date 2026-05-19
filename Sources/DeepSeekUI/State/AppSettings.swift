@@ -80,6 +80,29 @@ enum AppSettingsKey {
     /// nuovo user message, il trace è omesso per non rumoreggiare.
     /// Default true.
     static let showPrefillTrace = "deepseek.showPrefillTrace"
+
+    /// Local OpenAI-compatible HTTP server (TODO §10.1 / T1). Flag is
+    /// off by default — the server only runs when the user explicitly
+    /// flips the Settings → Server toggle. Port defaults to 8080,
+    /// bind address to `127.0.0.1`.
+    static let serverEnabled = "deepseek.server.enabled"
+    static let serverPort = "deepseek.server.port"
+    static let serverBindAddress = "deepseek.server.bindAddress"
+
+    /// Web-search backend choice (TODO §8 follow-up). Values:
+    /// "duckduckgo" (default, no key needed, fragile scraper),
+    /// "tavily", "brave", "serper" (each requires the matching
+    /// Keychain entry under `KeychainAccount.*APIKey`). When the
+    /// selected backend's key is missing, `NativeToolHost` falls
+    /// back to the DuckDuckGo provider with a stderr note.
+    static let webSearchProvider = "deepseek.webSearch.provider"
+
+    /// TODO §9 sandbox toggle. Opt-in `sandbox-exec` wrapper for
+    /// `ShellTool` (DeepSeekIntegrations/Sandbox/Sandbox.swift).
+    /// Default false because the bundled profile is strict; turn
+    /// it on once you've tuned `<root>/sandbox/default.sb` for
+    /// your workflow.
+    static let useShellSandbox = "deepseek.shell.useSandbox"
 }
 
 /// Helper for code paths that need to read defaults without going

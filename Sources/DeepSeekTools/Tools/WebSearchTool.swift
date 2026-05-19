@@ -64,6 +64,155 @@ public protocol WebSearchProvider: Sendable {
     func search(query: String, limit: Int) async throws -> [WebSearchResult]
 }
 
+// MARK: - Configurable providers (TODO §8)
+
+/// Tavily search (https://tavily.com). Their `/search` endpoint
+/// is purpose-built for LLM agent loops — returns short answer
+/// snippets keyed by relevance. Requires an API key from
+/// https://tavily.com/.
+public struct TavilyProvider: WebSearchProvider {
+    public let apiKey: String
+    public let endpoint: URL
+
+    public init(apiKey: String,
+                endpoint: URL = URL(string: "https://api.tavily.com/search")!)
+    {
+        self.apiKey = apiKey
+        self.endpoint = endpoint
+    }
+
+    public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 20
+        let body: [String: Any] = [
+            "api_key": apiKey,
+            "query": query,
+            "max_results": min(max(limit, 1), 20),
+            "search_depth": "basic",
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse,
+              200..<300 ~= http.statusCode
+        else {
+            throw ToolError.external("Tavily HTTP non-2xx")
+        }
+        struct TavilyResponse: Decodable {
+            struct Result: Decodable {
+                let title: String
+                let url: String
+                let content: String
+            }
+            let results: [Result]
+        }
+        let parsed = try JSONDecoder().decode(TavilyResponse.self, from: data)
+        return parsed.results.prefix(limit).map {
+            WebSearchResult(title: $0.title, url: $0.url, snippet: $0.content)
+        }
+    }
+}
+
+/// Brave Search (https://brave.com/search/api). Uses the JSON
+/// `/res/v1/web/search` endpoint with a subscription token in the
+/// `X-Subscription-Token` header.
+public struct BraveProvider: WebSearchProvider {
+    public let apiKey: String
+    public let endpoint: URL
+
+    public init(apiKey: String,
+                endpoint: URL = URL(string: "https://api.search.brave.com/res/v1/web/search")!)
+    {
+        self.apiKey = apiKey
+        self.endpoint = endpoint
+    }
+
+    public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+        guard let escaped = query.addingPercentEncoding(
+                withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string:
+                "\(endpoint.absoluteString)?q=\(escaped)&count=\(min(max(limit, 1), 20))")
+        else {
+            throw ToolError.invalidInput("Brave query URL build failed")
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(apiKey, forHTTPHeaderField: "X-Subscription-Token")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse,
+              200..<300 ~= http.statusCode
+        else {
+            throw ToolError.external("Brave HTTP non-2xx")
+        }
+        struct BraveResponse: Decodable {
+            struct WebResults: Decodable {
+                struct Result: Decodable {
+                    let title: String
+                    let url: String
+                    let description: String?
+                }
+                let results: [Result]
+            }
+            let web: WebResults?
+        }
+        let parsed = try JSONDecoder().decode(BraveResponse.self, from: data)
+        let raw = parsed.web?.results ?? []
+        return raw.prefix(limit).map {
+            WebSearchResult(title: $0.title, url: $0.url,
+                             snippet: $0.description ?? "")
+        }
+    }
+}
+
+/// Serper (https://serper.dev). Google SERP wrapper. Endpoint
+/// `/search` with a JSON body keyed by `X-API-KEY`.
+public struct SerperProvider: WebSearchProvider {
+    public let apiKey: String
+    public let endpoint: URL
+
+    public init(apiKey: String,
+                endpoint: URL = URL(string: "https://google.serper.dev/search")!)
+    {
+        self.apiKey = apiKey
+        self.endpoint = endpoint
+    }
+
+    public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "X-API-KEY")
+        req.timeoutInterval = 20
+        let body: [String: Any] = [
+            "q": query,
+            "num": min(max(limit, 1), 20),
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse,
+              200..<300 ~= http.statusCode
+        else {
+            throw ToolError.external("Serper HTTP non-2xx")
+        }
+        struct SerperResponse: Decodable {
+            struct Result: Decodable {
+                let title: String
+                let link: String
+                let snippet: String?
+            }
+            let organic: [Result]?
+        }
+        let parsed = try JSONDecoder().decode(SerperResponse.self, from: data)
+        let raw = parsed.organic ?? []
+        return raw.prefix(limit).map {
+            WebSearchResult(title: $0.title, url: $0.link,
+                             snippet: $0.snippet ?? "")
+        }
+    }
+}
+
 /// Default scraping-based provider. Fragile by design — included so
 /// `websearch` works out-of-the-box for casual use; replace with a
 /// real API for anything that matters.

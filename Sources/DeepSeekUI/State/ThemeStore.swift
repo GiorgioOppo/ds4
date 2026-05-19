@@ -22,6 +22,36 @@ final class ThemeStore: ObservableObject {
         save()
     }
 
+    /// Add (or replace) a user-defined theme and persist (TODO §12).
+    /// Themes whose name collides with a built-in are rejected —
+    /// otherwise the catalog merge in `load()` would silently
+    /// shadow them on next launch.
+    func addCustomTheme(_ theme: Theme) {
+        guard !BuiltInThemes.all.contains(where: { $0.id == theme.id })
+        else { return }
+        var c = catalog
+        if let idx = c.firstIndex(where: { $0.id == theme.id }) {
+            c[idx] = theme
+        } else {
+            c.append(theme)
+        }
+        catalog = c.sorted { $0.name < $1.name }
+        save()
+    }
+
+    /// Drop a user-defined theme. Built-in themes are protected.
+    /// If the deleted theme was active, the active selection
+    /// falls back to `BuiltInThemes.system`.
+    func removeCustomTheme(_ themeID: String) {
+        guard !BuiltInThemes.all.contains(where: { $0.id == themeID })
+        else { return }
+        catalog.removeAll { $0.id == themeID }
+        if activeThemeID == themeID {
+            activeThemeID = BuiltInThemes.system.id
+        }
+        save()
+    }
+
     /// Effective ColorScheme override for the SwiftUI root.
     /// `nil` → follow the system.
     var preferredColorScheme: ColorScheme? {

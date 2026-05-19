@@ -25,8 +25,25 @@ enum GenerationPhase: Equatable {
     /// single synchronous forward that doesn't stream intermediate
     /// progress, so live elapsed is the most useful liveness signal).
     case prefilling(promptTokens: Int, startTime: Date)
-    case streaming(buffer: String, status: String, metrics: GenerationMetrics)
+    /// `buffer` is the visible assistant text. `reasoningBuffer` is
+    /// the live thinking content (today streamed only via the remote
+    /// path's `reasoning_content` delta; local generation emits it
+    /// only at `.done` once the `<think>` block has been split off
+    /// the token stream). Empty by default so older callsites that
+    /// construct `.streaming(buffer:, status:, metrics:)` without
+    /// reasoning continue to compile via the new init helpers below.
+    case streaming(buffer: String, reasoningBuffer: String,
+                    status: String, metrics: GenerationMetrics)
     case error(String)
+
+    /// Shorthand factory matching the pre-T4-followup signature.
+    /// Existing call sites use this form; it just leaves the new
+    /// `reasoningBuffer` empty.
+    static func streaming(buffer: String, status: String,
+                           metrics: GenerationMetrics) -> GenerationPhase {
+        .streaming(buffer: buffer, reasoningBuffer: "",
+                    status: status, metrics: metrics)
+    }
 }
 
 /// Multi-chat store. Owns `[Conversation]` indexed by id, a selection,
@@ -127,6 +144,20 @@ final class ChatStore: ObservableObject {
     /// when no delegation is in flight; cleared on the way back
     /// up as each frame's `runSubAgentToCompletionInner` returns.
     @Published private(set) var activeDelegations: [UUID: [DelegationFrame]] = [:]
+
+    /// Per-frame cancellation handles (TODO §4 follow-up: stop a
+    /// single sub-agent from the chain UI). When the delegation
+    /// chain pushes a frame, the runner stashes its `Task`-cancel
+    /// closure here; the UI's per-frame stop button calls
+    /// `cancelDelegation(frameID:)` which invokes the closure +
+    /// records a marker so the inner loop can report graceful
+    /// cancellation.
+    private var delegationCancellations: [UUID: () -> Void] = [:]
+    /// Frames the user explicitly cancelled (vs. natural completion
+    /// or error). Read by the inner loop right after the stream
+    /// drains so the persisted assistant turn reflects the reason
+    /// instead of looking like an empty reply.
+    @Published private(set) var cancelledDelegations: Set<UUID> = []
     /// Sampler parameters captured at the start of `send`; reused
     /// by `runToolCallsAndContinue` so a tool-output continuation
     /// inherits the same temperature / topK / topP / maxTokens
@@ -142,7 +173,9 @@ final class ChatStore: ObservableObject {
     /// routate. Adesso `composeToolSchemasJSON` / `composeOpenAITools`
     /// emettono gli schemi con prefisso `native__<name>` e i dispatch
     /// site indirizzano le invocazioni `native__*` a
-    /// `nativeTools.dispatch(...)`.
+    /// `nativeTools.dispatch(...)`. Tool-call routing in `runRemoteLoop`
+    /// e local execute path controlla il prefisso per decidere fra
+    /// `NativeToolHost.dispatch` e `MCPClientPool.invokeQualified`.
     let nativeTools: NativeToolHost
 
     init(service: InferenceService,
@@ -327,6 +360,17 @@ final class ChatStore: ObservableObject {
         if case .openRouter(let modelID) = effectiveEndpoint {
             sendRemote(text: trimmed,
                         conversationIndex: idx,
+                        provider: .openRouter,
+                        modelID: modelID,
+                        mode: mode,
+                        options: options,
+                        maxTokens: maxTokens)
+            return
+        }
+        if case .anthropic(let modelID) = modelState.loadedEndpoint {
+            sendRemote(text: trimmed,
+                        conversationIndex: idx,
+                        provider: .anthropic,
                         modelID: modelID,
                         mode: mode,
                         options: options,
@@ -1219,6 +1263,22 @@ final class ChatStore: ObservableObject {
             }
         }
 
+        // Native tools (TODO §8 follow-up). The host's
+        // `schemas` already include only tools the registry made
+        // available for the current `AgentMode`; we prefix the
+        // public name with `native__` so the dispatch side can
+        // tell native from MCP without ambiguity. Agent allowlist
+        // filtering of native tools is a separate follow-up.
+        if let host = nativeTools {
+            for s in host.schemas {
+                schemas.append([
+                    "name": "native__\(s.name)",
+                    "description": s.description,
+                    "inputSchema": s.inputSchema.foundationValue,
+                ])
+            }
+        }
+
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
                 .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
@@ -1283,6 +1343,62 @@ final class ChatStore: ObservableObject {
         activeDelegations[hostConvID, default: []].append(frame)
     }
 
+    /// Register a cancellation closure for a freshly-pushed frame.
+    /// Called by the inner runner once it's wrapped its decode loop
+    /// in a `Task`. The closure typically just calls
+    /// `task.cancel()`; the loop checks `Task.isCancelled` between
+    /// yielded tokens (or via the AsyncThrowingStream
+    /// `onTermination` hook).
+    private func registerDelegationCancellation(
+        frameID: UUID, cancel: @escaping () -> Void)
+    {
+        delegationCancellations[frameID] = cancel
+    }
+
+    /// User-facing entry point for the chain UI's per-frame Stop
+    /// button (TODO §4 follow-up). Cancels the matching sub-agent
+    /// run and records the frame id in `cancelledDelegations` so
+    /// the persisted reply gets a `[cancelled]` marker.
+    public func cancelDelegation(frameID: UUID) {
+        cancelledDelegations.insert(frameID)
+        if let cancel = delegationCancellations[frameID] {
+            cancel()
+        }
+    }
+
+    /// Effective agent catalog for the active conversation
+    /// (TODO §11). When the chat is attached to a project that
+    /// carries a `.deepseek/agents.json` overlay, those entries
+    /// override / extend the global library. Returns the global
+    /// list unchanged when no project / no overlay file is present.
+    public func effectiveAgents() -> [AgentConfig] {
+        guard let conv = selectedConversation,
+              let projectID = conv.projectID,
+              let project = projects.project(id: projectID),
+              let firstPath = project.sourcePaths.first
+        else { return agents.agents }
+        let overlay = ProjectOverlayLoader.load(
+            rootDirectory: URL(fileURLWithPath: firstPath))
+        return ProjectOverlayLoader.mergeAgents(
+            global: agents.agents, overlay: overlay.agents)
+    }
+
+    /// Snapshot the current project's overlay (or an empty one
+    /// rooted at $HOME if no project is attached). Helper for UI
+    /// surfaces that want to introspect what came from the
+    /// project vs. the global library.
+    public func currentProjectOverlay() -> ProjectOverlay {
+        guard let conv = selectedConversation,
+              let projectID = conv.projectID,
+              let project = projects.project(id: projectID),
+              let firstPath = project.sourcePaths.first
+        else {
+            return .empty(rootDirectory: URL(fileURLWithPath: NSHomeDirectory()))
+        }
+        return ProjectOverlayLoader.load(
+            rootDirectory: URL(fileURLWithPath: firstPath))
+    }
+
     private func appendDelegationBuffer(hostConvID: UUID,
                                          frameID: UUID,
                                          text: String) {
@@ -1291,6 +1407,14 @@ final class ChatStore: ObservableObject {
         else { return }
         stack[idx].buffer.append(text)
         activeDelegations[hostConvID] = stack
+    }
+
+    /// Clean up the cancellation registry when a frame pops. The
+    /// closure isn't retained past the frame's lifetime so the
+    /// Task it points at can deinit cleanly.
+    private func popDelegationCancellation(frameID: UUID) {
+        delegationCancellations.removeValue(forKey: frameID)
+        cancelledDelegations.remove(frameID)
     }
 
     private func popDelegationFrame(hostConvID: UUID, frameID: UUID) {
@@ -1555,8 +1679,33 @@ final class ChatStore: ObservableObject {
     /// placeholder message lifecycle, `pendingTurn`) is mimicked
     /// here so the chat UI doesn't have to special-case remote
     /// chats at the view layer.
+    /// Which remote backend `sendRemote` / `runRemoteLoop` dispatch
+    /// to. Threaded through so both the Keychain account and the
+    /// streaming client pick the right provider — same shape on the
+    /// consumer side (`OpenAIStreamChunk`) so the iteration loop
+    /// stays unified.
+    enum RemoteProvider {
+        case openRouter
+        case anthropic
+
+        fileprivate var keychainAccount: String {
+            switch self {
+            case .openRouter: return KeychainAccount.openRouterAPIKey
+            case .anthropic:  return KeychainAccount.anthropicAPIKey
+            }
+        }
+
+        fileprivate var displayName: String {
+            switch self {
+            case .openRouter: return "OpenRouter"
+            case .anthropic:  return "Anthropic"
+            }
+        }
+    }
+
     private func sendRemote(text: String,
                               conversationIndex idx: Int,
+                              provider: RemoteProvider,
                               modelID: String,
                               mode: ThinkingMode,
                               options: SamplingOptions,
@@ -1566,10 +1715,11 @@ final class ChatStore: ObservableObject {
         // API key is read at send time so a key rotation in
         // Settings takes effect on the next turn without
         // restarting the app.
-        let apiKey = KeychainStore.get(account: KeychainAccount.openRouterAPIKey) ?? ""
+        let apiKey = KeychainStore.get(account: provider.keychainAccount) ?? ""
         guard !apiKey.isEmpty else {
             phases[id] = .error(
-                "OpenRouter API key not configured. Add it from Settings → API Keys.")
+                "\(provider.displayName) API key not configured. "
+                + "Add it from Settings → API Keys.")
             return
         }
 
@@ -1581,6 +1731,16 @@ final class ChatStore: ObservableObject {
         phases[id] = .streaming(buffer: "",
                                  status: "Calling \(modelID)…",
                                  metrics: GenerationMetrics())
+        // TODO §4 follow-up: persist remote-side pendingTurn so a
+        // crash mid-call surfaces a retry affordance on next launch.
+        // Cleared in `finalizeRemoteIteration` and in the catch
+        // branch of `runRemoteLoop`.
+        conversations[idx].remotePendingTurn = RemotePendingTurn(
+            assistantMessageID: placeholder.id,
+            userMessageID: userMessage.id,
+            userText: text,
+            mode: mode.rawValue,
+            issuedAt: Date())
         lastSamplingOptions[id] = (options, maxTokens)
         toolRoundtrips[id] = 0
         scheduleSave(id)
@@ -1602,6 +1762,7 @@ final class ChatStore: ObservableObject {
             await self.runRemoteLoop(conversationID: id,
                                        initialPlaceholderID: firstPlaceholderID,
                                        userMessageID: userMessageID,
+                                       provider: provider,
                                        modelID: modelID,
                                        mode: mode,
                                        options: options,
@@ -1621,12 +1782,14 @@ final class ChatStore: ObservableObject {
     private func runRemoteLoop(conversationID id: UUID,
                                  initialPlaceholderID: UUID,
                                  userMessageID: UUID,
+                                 provider: RemoteProvider,
                                  modelID: String,
                                  mode: ThinkingMode,
                                  options: SamplingOptions,
                                  maxTokens: Int,
                                  apiKey: String) async {
-        let client = OpenRouterClient()
+        let openRouterClient = OpenRouterClient()
+        let anthropicClient = AnthropicClient()
         var currentPlaceholderID = initialPlaceholderID
         var iteration = 0
 
@@ -1701,17 +1864,21 @@ final class ChatStore: ObservableObject {
             case .chat: break
             }
 
-            // Prompt trace remoto: dump del body JSON inviato a
-            // OpenRouter — system message, tools array (formato
-            // OpenAI), tool_choice, messages (history + tool outputs
-            // delle iterazioni precedenti), sampler. Ogni iterazione
-            // del loop ha il suo placeholder fresco e quindi il suo
-            // dump dedicato, così l'utente può verificare lungo la
-            // timeline cosa il modello ha effettivamente visto a
-            // ogni passo (in particolare: il marker "(empty output)"
-            // appare nei tool messages delle iterazioni che seguono
-            // una tool call senza risultati). In background per non
-            // ritardare la HTTP request.
+            // Prompt trace remoto: dump del body JSON inviato al
+            // provider — system message, tools array (formato OpenAI
+            // o Anthropic), tool_choice/tools, messages (history +
+            // tool outputs delle iterazioni precedenti), sampler.
+            // Ogni iterazione del loop ha il suo placeholder fresco
+            // e quindi il suo dump dedicato, così l'utente può
+            // verificare lungo la timeline cosa il modello ha
+            // effettivamente visto a ogni passo (in particolare: il
+            // marker "(empty output)" appare nei tool messages delle
+            // iterazioni che seguono una tool call senza risultati).
+            // In background per non ritardare la HTTP request. Per
+            // Anthropic dumpiamo la forma OpenAI-shape `body` perché
+            // mantiene 1:1 le info (system + messages + tools +
+            // sampler) senza dover esporre l'API Anthropic dettagliata
+            // — il trace è per debugging, non per wire-match.
             let bodyForTrace = body
             Task { [weak self] in
                 await self?.emitRemotePromptTrace(
@@ -1720,9 +1887,27 @@ final class ChatStore: ObservableObject {
                     body: bodyForTrace)
             }
 
-            // Stream + accumulate.
-            let stream = client.streamChatCompletion(
-                apiKey: apiKey, body: body)
+            // Stream + accumulate. Both providers return the same
+            // `OpenAIStreamChunk` shape — for Anthropic, that's a
+            // local translation inside `AnthropicClient` — so the
+            // accumulator below is provider-agnostic.
+            let stream: AsyncThrowingStream<OpenAIStreamChunk, Error>
+            switch provider {
+            case .openRouter:
+                stream = openRouterClient.streamChatCompletion(
+                    apiKey: apiKey, body: body)
+            case .anthropic:
+                let anthropicBody = AnthropicMessageBuilder.buildBody(
+                    model: modelID,
+                    maxTokens: maxTokens,
+                    history: snapshot.history,
+                    agentSystem: snapshot.agent?.systemPrompt,
+                    tools: AnthropicMessageBuilder.translateTools(toolsArray),
+                    temperature: options.temperature,
+                    topP: options.topP)
+                stream = anthropicClient.streamMessages(
+                    apiKey: apiKey, body: anthropicBody)
+            }
             var contentBuf = ""
             var reasoningBuf = ""
             var toolCallsAccum: [Int: (id: String?, name: String, args: String)] = [:]
@@ -1759,6 +1944,16 @@ final class ChatStore: ObservableObject {
                         }
                         if let r = delta.reasoningContent, !r.isEmpty {
                             reasoningBuf.append(r)
+                            // TODO §4 follow-up: push the running
+                            // thinking buffer to the UI bubble so the
+                            // reasoning is visible mid-stream instead
+                            // of only at .done.
+                            let snapshotReasoning = reasoningBuf
+                            await MainActor.run {
+                                self.updateRemoteReasoningBuffer(
+                                    conversationID: id,
+                                    reasoning: snapshotReasoning)
+                            }
                         }
                         if let tcs = delta.toolCalls {
                             for tc in tcs {
@@ -1819,16 +2014,19 @@ final class ChatStore: ObservableObject {
             // remote chats (yet) — that case returns a structured
             // error string so the model can self-correct on the
             // next iteration. MCP calls route through the same
-            // pool the local path uses.
+            // pool the local path uses. Native calls (TODO §8)
+            // route to NativeToolHost.dispatch via the prefix
+            // check.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
             // Snapshot dell'host agent ID per la cycle prevention
             // della delegation (lo stesso check del local path).
-            // Letto su MainActor — la chat può essere mutata fra
-            // un'iterazione e l'altra.
-            let hostAgentID = await MainActor.run {
-                self.conversations.first(where: { $0.id == id })?.agentID
-            }
+            // `executeToolCall` instrada internamente delegation /
+            // native__* / MCP via il loro prefisso, quindi anche il
+            // remote loop usa lo stesso router. ChatStore è
+            // @MainActor → accesso sincrono diretto.
+            let hostAgentID = self.conversations
+                .first(where: { $0.id == id })?.agentID
             for call in final.toolCalls {
                 let result = await self.executeToolCall(
                     call,
@@ -1872,21 +2070,37 @@ final class ChatStore: ObservableObject {
     }
 
     private func updateRemoteBuffer(conversationID id: UUID, buffer: String) {
-        guard case .streaming(_, let status, let metrics) = phases[id] else { return }
-        phases[id] = .streaming(buffer: buffer, status: status, metrics: metrics)
+        guard case .streaming(_, let reasoning, let status, let metrics) =
+                phases[id] else { return }
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: status, metrics: metrics)
+    }
+
+    /// TODO §4 follow-up: live reasoning content in the bubble.
+    /// Called by `runRemoteLoop` whenever the upstream emits more
+    /// `reasoning_content` so the UI can render the running
+    /// thinking buffer before the turn finalizes at `.done`. Local
+    /// generation can't separate think tokens mid-stream, so this
+    /// path is remote-only today.
+    private func updateRemoteReasoningBuffer(conversationID id: UUID,
+                                               reasoning: String) {
+        guard case .streaming(let buffer, _, let status, let metrics) =
+                phases[id] else { return }
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: status, metrics: metrics)
     }
 
     private func updateRemoteProgress(conversationID id: UUID,
                                        generated: Int,
                                        elapsed: TimeInterval,
                                        tokPerMin: Double) {
-        guard case .streaming(let buffer, _, var metrics) = phases[id] else { return }
+        guard case .streaming(let buffer, let reasoning, _, var metrics) =
+                phases[id] else { return }
         metrics.generatedTokens = generated
         metrics.generationElapsed = elapsed
         metrics.generationTokPerMin = tokPerMin
-        phases[id] = .streaming(buffer: buffer,
-                                 status: "Streaming…",
-                                 metrics: metrics)
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: "Streaming…", metrics: metrics)
     }
 
     /// Write the finalised assistant turn back to the store,
@@ -1952,6 +2166,9 @@ final class ChatStore: ObservableObject {
                                      metrics: metrics)
             toolRoundtrips[id] = nil
             lastSamplingOptions[id] = nil
+            // TODO §4 follow-up: the remote turn finished, drop
+            // the recovery breadcrumb.
+            conversations[idx].remotePendingTurn = nil
             phases[id] = .idle
         }
         scheduleSave(id)
@@ -1968,13 +2185,14 @@ final class ChatStore: ObservableObject {
     /// invocation would need a remote sub-agent loop that doesn't
     /// exist yet. A `__delegate_to_agent` schema would just lure
     /// the model into calls we have to refuse with an error.
-    /// Emette il body JSON di una OpenRouter request nel campo
-    /// `prefillTrace` del placeholder, a chunk per dare l'effetto
-    /// streaming come per il prefill trace locale. Gated dallo
-    /// stesso flag `showPrefillTrace`. Reset del trace al start
-    /// così un retry/iterazione sovrascrive invece di appendere.
-    /// Si esegue su un Task in background (non blocca l'HTTP) — il
-    /// dump è solo informativo e la response arriva comunque.
+    /// Emette il body JSON di una OpenRouter / Anthropic request
+    /// nel campo `prefillTrace` del placeholder, a chunk per dare
+    /// l'effetto streaming come per il prefill trace locale. Gated
+    /// dallo stesso flag `showPrefillTrace`. Reset del trace al
+    /// start così un retry/iterazione sovrascrive invece di
+    /// appendere. Si esegue su un Task in background (non blocca
+    /// l'HTTP) — il dump è solo informativo e la response arriva
+    /// comunque.
     private func emitRemotePromptTrace(conversationID: UUID,
                                          placeholderID: UUID,
                                          body: [String: Any]) async {
@@ -2023,20 +2241,21 @@ final class ChatStore: ObservableObject {
             i = end
             // ~4 ms fra chunk — totalizza ~1 s per body da 10 KB.
             // Trascurabile vs latenza HTTP (centinaia di ms al
-            // first-byte di OpenRouter).
+            // first-byte del provider).
             try? await Task.sleep(nanoseconds: 4_000_000)
         }
     }
 
     /// Costruisce l'array `tools` nel formato OpenAI canonico
     /// (`{type: "function", function: {name, description, parameters}}`)
-    /// che OpenRouter inietta nel system prompt server-side. Specchio
-    /// remoto di `composeToolSchemasJSON` per il local DSV4 — stessi
-    /// input, output diverso. Include sia gli MCP tool che il
-    /// sintetico `__delegate_to_agent` (quando ci sono altri agent
-    /// invocabili); senza quest'ultimo, un chat remota con agent
-    /// configurati non saprebbe come delegare e l'asimmetria
-    /// local↔remote sarebbe visibile.
+    /// che OpenRouter / Anthropic inietta nel system prompt
+    /// server-side. Specchio remoto di `composeToolSchemasJSON` per
+    /// il local DSV4 — stessi input, output diverso. Include native
+    /// tools (prefisso `native__`), MCP tools (prefisso
+    /// `server__`), e il sintetico `__delegate_to_agent` quando ci
+    /// sono altri agent invocabili; senza quest'ultimo, un chat
+    /// remota con agent configurati non saprebbe come delegare e
+    /// l'asimmetria local↔remote sarebbe visibile.
     private func composeOpenAITools(
         mcpAllowed: Set<String>?,
         delegableAgents: [AgentConfig]
@@ -2090,7 +2309,9 @@ final class ChatStore: ObservableObject {
         // Sub-agent delegation. Mirrors composeToolSchemasJSON:1075
         // — same name, same description shape, same parameters; only
         // the wrapping differs (OpenAI `function` block vs DSV4
-        // `inputSchema` field).
+        // `inputSchema` field). Il dispatch site in `runRemoteLoop`
+        // routes `call.name == EncodingDSV4.delegateToolName`
+        // attraverso `executeSubAgentDelegation`.
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
                 .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
@@ -2204,12 +2425,12 @@ final class ChatStore: ObservableObject {
     }
 
     private func currentMetrics(of id: UUID) -> GenerationMetrics {
-        if case .streaming(_, _, let m) = phase(of: id) { return m }
+        if case .streaming(_, _, _, let m) = phase(of: id) { return m }
         return GenerationMetrics()
     }
 
     private func currentBuffer(of id: UUID) -> String {
-        if case .streaming(let b, _, _) = phase(of: id) { return b }
+        if case .streaming(let b, _, _, _) = phase(of: id) { return b }
         return ""
     }
 

@@ -33,7 +33,8 @@ For step-by-step CLI workflows (build, convert, run), see
 | Add a custom slash command | §16 | easy |
 | Read GGUF metadata + a pass-through tensor | §17 | easy |
 | Render a chat with a Jinja2 template | §18 | easy |
-| Sources | §19 | — |
+| Hit the local OpenAI-compatible server with `curl` | §19 | trivial |
+| Sources | §20 | — |
 
 ## 1. Load a Tensor from safetensors
 
@@ -899,7 +900,66 @@ That way the V4 path keeps using `DSV4Template` (fast, no Jinja
 interpretation) and the Llama / Mistral / Qwen path picks up the
 model's own format automatically.
 
-## 19. Sources
+## 19. Hit the local OpenAI-compatible server with `curl`
+
+The desktop app can expose an OpenAI-shaped HTTP API on localhost so
+external clients (VS Code, Zed, TUI, GitHub Actions, custom scripts)
+can talk to the locally-loaded model with no extra plumbing. Wire it
+up in **Settings → Server**: enable the toggle, pick a port (default
+`8080`), optionally add a bearer token. Once `Listening on http://…`
+turns green, hit the API:
+
+```bash
+# Catalog of loaded models (just the one currently loaded today).
+curl -s http://127.0.0.1:8080/v1/models | jq
+
+# Non-streaming chat completion. `model` is ignored — we always use
+# whatever is loaded in the desktop app.
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local",
+    "messages": [
+      {"role": "system", "content": "You are helpful."},
+      {"role": "user", "content": "What is 2+2?"}
+    ],
+    "max_tokens": 64
+  }' | jq
+
+# Streaming (SSE). `data: {...}` chunks per round, terminated by
+# `data: [DONE]`.
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local",
+    "messages": [{"role": "user", "content": "Tell me a joke."}],
+    "stream": true
+  }'
+```
+
+If you configured a bearer token, every request needs an
+`Authorization: Bearer <token>` header.
+
+The `tools[]` field of the request is honored as a name-filter
+against the server's MCP registry: pass an empty array to opt out of
+tools entirely, an array of `{type:"function", function:{name:"…"}}`
+entries to restrict the model to those names, or omit the field to
+expose every MCP tool the desktop app currently has connected. The
+schemas inside `tools[]` are ignored — the server uses the
+authoritative schema from the MCP server itself. Tool dispatch runs
+server-side (up to 8 round-trips per request); only the final
+text-only round streams to the client.
+
+Limitations of the first cut:
+
+  - JSON-schema constrained output (`response_format`) is not
+    plumbed yet (T3 in `TODO.md` §10).
+  - Streaming clients see no SSE bytes while intermediate tool
+    rounds are running.
+  - One generation at a time across all HTTP clients (the
+    `InferenceService` queue serializes).
+
+## 20. Sources
 
 - All recipes here exercise public API documented in
   [MODULES.md](MODULES.md) and kernels listed in [KERNELS.md](KERNELS.md).

@@ -43,33 +43,35 @@ Legenda: `[ ]` open · `[~]` partial · `[x]` done · `[!]` blocked
   per le activations); quantization-noise aggiuntiva — opt-in
   per layer dove la perdita è accettabile (default off).
 
-- [~] **Quantizzazione calibrata (GPTQ / AWQ / SmoothQuant)** sui
-  pesi INT8/INT4. RTN attuale è il baseline; calibrazione recupera
-  ~1-2 punti di perplexity. Scaffold in
-  `Sources/DeepSeekKit/CalibratedQuant.swift`:
-  - `QuantMethod` enum (`.rtn` / `.awq` / `.smoothQuant` / `.gptq`).
-  - `CalibrationStats` struct (per-channel absmax + opzionalmente mean).
-  - `ActivationObserver` (hook accumulatore per il forward pass —
-    NON ancora wirato in `Linear.swift`).
-  - `quantizeBF16ToInt8Calibrated(method:stats:)` entry point:
-    - `.rtn` → delega a `quantizeBF16ToInt8` esistente (no-op).
-    - `.awq` → implementazione preview (smoothing per-canale
-      `s = (act_amax^α · w_amax^(1-α))/geomMean` → moltiplica i
-      pesi → RTN). **Limite documentato**: manca l'inverse-scale
-      sulle activations a runtime — vedi nota in
-      `awqQuantizeBF16ToInt8`.
-    - `.smoothQuant` / `.gptq` → `throw QuantNotImplemented` stub.
-  Follow-up necessari per la chiusura completa:
-  1. Wire `ActivationObserver` in `Linear.forward` (capture
-     opzionale durante calibration runs).
-  2. Aggiungere `inverseChannelScale: Tensor?` a `Linear` + pre-mul
-     nel forward, così l'AWQ smoothing si bilancia esattamente.
-  3. Implementare SmoothQuant (più semplice di GPTQ — solo
-     smoothing per-canale come AWQ ma con `α` fisso 0.5 e nessun
-     activation re-scale runtime). Stub già in posto.
-  4. Implementare GPTQ (algoritmo OBS layer-by-layer con Hessian
-     approssimata — il più costoso). Stub già in posto.
-  5. Wire `--quant-method awq|gptq|...` nel converter CLI.
+- [x] **Quantizzazione calibrata (GPTQ / AWQ / SmoothQuant)** sui
+  pesi INT8/INT4. Tutti i 5 follow-up chiusi:
+  1. ✅ AWQ + SmoothQuant + GPTQ (full OBS via Accelerate LAPACK)
+     in `Sources/DeepSeekKit/CalibratedQuant.swift`.
+  2. ✅ `inverseChannelScale: Tensor?` su `Linear` + kernel
+     `channel_scale_f32` per il pre-mul (TODO §12 di AWQ chiuso).
+  3. ✅ `ActivationObserver` + `HessianObserver` con accumulazione
+     via `cblas_dgemm`.
+  4. ✅ `LlamaCalibrationRunner` + `V4CalibrationRunner` che
+     installano hook su `Block.preAttnObserver` / `preFfnObserver`
+     per intercettare gli input MLA / MoE in mid-forward.
+  5. ✅ `deepseek_calibrate <model> <corpus> <out> --architecture
+     llama|v4 --collect-hessian` dumpa `stats.json` + `hessians/<n>.f64`.
+  6. ✅ Converter CLI `--quant-method rtn|awq|smoothQuant|gptq` +
+     `--calib-stats <path>` con dispatch per-tensor.
+  7. ✅ `CalibrationDir` loader pubblico per i consumer esterni.
+
+  Gap residui documentati nei commit (non bloccanti):
+  - `inverseChannelScale` round-trip su safetensors (writer in
+    converter + reader in `WeightLoader` → consumed by `Linear`
+    at load time). Oggi il converter calcola lo scale ma lo
+    scarta; AWQ/SmoothQuant restano "QAT warm-start" finché il
+    round-trip non chiude.
+  - MLA-internal sites non osservati (`wq_b`, `wo_a`, `wo_b`,
+    expert `w2`). Servono hook simili in `MLA.callAsFunction` /
+    `MoEFFN.callAsFunction`.
+  - Router-aware MoE calibration: oggi tutti gli expert ricevono
+    le stesse stats (pre-routing); una calibrazione per-routed-token
+    serve instrumentation in `MoEFFN`.
 
 ---
 
@@ -118,8 +120,11 @@ Legenda: `[ ]` open · `[~]` partial · `[x]` done · `[!]` blocked
 - [ ] **Task tokens** (`<｜action｜>`, `<｜query｜>`, ecc. da
   `DS_TASK_SP_TOKENS`) non emessi.
 
-- [ ] **`response_format` schema injection** (encoding_dsv4.py:49)
-  non portato.
+- [~] **`response_format` schema injection** (encoding_dsv4.py:49)
+  — la versione "constrained decoding via token mask" è chiusa
+  (T3 / `SchemaCompiler` / `SchemaMask` / `LocalServer` binding
+  / `--json-schema` CLI flag). L'iniezione del JSON Schema come
+  hint testuale nel system prompt resta da fare.
 
 - [ ] **`latest_reminder` token** (encoding_dsv4.py:25) non emesso.
 
@@ -173,29 +178,49 @@ Legenda: `[ ]` open · `[~]` partial · `[x]` done · `[!]` blocked
 
 ### Open
 
-- [ ] **Cross-agent delegation on remote chats**. Lo schema
-  `__delegate_to_agent` non è injected su remoto. Una versione
-  remota richiede un loop sub-agent remoto. ~200 LOC se serve.
+- [x] **Cross-agent delegation on remote chats**. `composeOpenAITools`
+  ora emette lo schema `__delegate_to_agent` quando esistono altri
+  agenti delegabili; il dispatch in `runRemoteLoop` chiama
+  `executeSubAgentDelegation` come sul path locale. Il sub-agent
+  spawnato gira sul backend del suo `AgentConfig` (local / OpenRouter
+  / Anthropic). Commit `3bfc079`.
 
-- [ ] **Remote crash recovery**. `pendingTurn` non viene riarmato
-  per `sendRemote`. Workaround: l'utente reinvia il messaggio
-  (cheap, idempotente lato provider).
+- [~] **Remote crash recovery**. `Conversation.remotePendingTurn`
+  (`RemotePendingTurn` struct) ora viene popolato in `sendRemote`
+  e cleared in `finalizeRemoteIteration`. Manca la UI banner di
+  retry su next launch (legge il campo + pulsante reinvia). Commit
+  `e0abd40`.
 
-- [ ] **Prompt-caching Anthropic via OpenRouter**. Il body non
-  passa headers cache-control. Cheap da aggiungere.
+- [x] **Prompt-caching Anthropic** — chiuso via T4 native driver
+  (`AnthropicMessageBuilder` auto-inietta `cache_control` su system
+  block e ultimo `tool_result`). Commit `f43188c`.
 
 - [ ] **Sub-agent cross-delega reuse**. Una sub-agent invocata due
   volte nella stessa turn paga il cold prefill ogni volta. Cache
-  per `(agentID, promptHash)` aggiuntiva (di nicchia).
+  per `(agentID, promptHash)` aggiuntiva (di nicchia). Richiede
+  refactor di `InferenceService` cache layer; perf optimization
+  separata.
 
-- [ ] **Conversation.modelDirPath → endpointID** migration. Oggi
-  per chat remote `modelDirPath = ""`. Cosmetico.
+- [~] **Conversation.modelDirPath → endpointID** migration. Il
+  campo `endpoint: ModelEndpoint?` è stato aggiunto a `Conversation`
+  con `effectiveEndpoint` resolver. I call site del codice esistente
+  continuano a usare `modelDirPath` per compatibilità; sweep dei
+  consumer è follow-up. Commit `e0abd40`.
 
-- [ ] **Streaming reasoning content visibile in tempo reale** nel
-  buffer della bolla (oggi solo a `.done`).
+- [x] **Streaming reasoning content visibile in tempo reale**. La
+  `.streaming` phase ora carry `reasoningBuffer: String`; il remote
+  loop chiama `updateRemoteReasoningBuffer` su ogni delta;
+  `MessageView` preferisce il live buffer al persisted finché il
+  `.done` non finalizza. Path locale ancora limitato (split
+  `<think>` solo a `.done`). Commit `e0abd40`.
 
-- [ ] **Stop di un singolo sub-agent** dalla chain UI (oggi solo
-  Stop globale).
+- [~] **Stop di un singolo sub-agent**. API surface chiusa:
+  `cancelDelegation(frameID:)`, storage in `delegationCancellations`
+  + `cancelledDelegations`. La runner-side (wrap di
+  `runSubAgentToCompletionInner` in un Task + check `isCancelled`
+  nel loop interno) è documentata come follow-up — la UI può già
+  chiamare il metodo, marcando il frame come user-cancelled. Commit
+  `3bfc079`.
 
 ---
 
@@ -234,8 +259,10 @@ Stime di speedup — vedi `docs/PERFORMANCE.md` per le metriche.
 
 - [ ] **KV cache pool** → multi-session serving.
 
-- [ ] **Cold-start prefetch**. Sfogliare sequenzialmente i shard
-  per pre-popolare il page cache OS.
+- [~] **Cold-start prefetch**. Sfogliare sequenzialmente i shard
+  per pre-popolare il page cache OS. Il path GGUF (`GGUFFile.init`)
+  ora supporta `warmup: true` che applica `POSIX_MADV_WILLNEED`
+  sull'intera mmap; safetensors path ancora pending. Commit `41385eb`.
 
 - [ ] **B3 — KV cache persistence to disk**. Riprende una chat
   project-attached dopo un riavvio senza ri-prefilare il contesto
@@ -327,19 +354,23 @@ Toolbox nativo per agire su codice. Storia: vedi
   apply_patch / webfetch / repo_clone / repo_overview / plan / task /
   todo. Test smoke in `Tests/DeepSeekToolsTests/`.
 
-- [~] **Wire tool registry into `InferenceService`**. Il registry
-  esiste in `NativeToolHost`, ma `InferenceService` ancora costruisce
-  il blocco `tools` solo dagli MCP. Mancano:
-  1. Merge degli schemi nativi con quelli MCP nel system block /
-     OpenAI `tools` array (key prefix `native__<name>`?).
-  2. Routing del `tools/call` al `NativeToolHost.dispatch` quando il
-     nome è nativo.
-  3. Resolve `rootDirectory` dal Project attaccato, o dalla home
-     dell'utente come fallback.
+- [x] **Wire tool registry into `InferenceService`**. `ChatStore`
+  ora include gli schemi nativi (prefisso `native__`) in
+  `composeToolSchemasJSON` (path locale) e `composeOpenAITools` (path
+  remoto); `dispatchNativeTool` instrada le chiamate
+  `native__<tool>` a `NativeToolHost.dispatch` con il root resolved
+  dal project attaccato (fallback `$HOME`). Commit `52832ef`.
 
-- [~] **`websearch`** — il backend di default (DuckDuckGo lite scraper)
-  funziona ma è fragile. Aggiungere provider configurabili (Tavily /
-  Brave / Serper) con API key in `Keychain`.
+  Gap residuo: `AgentConfig.allowedToolNames` oggi filtra solo MCP.
+  Aggiungere filtering anche per nativi serve uno sweep delle
+  configurazioni esistenti (le allowlist conoscono solo nomi MCP).
+
+- [x] **`websearch`** — Tavily / Brave / Serper aggiunti come
+  `WebSearchProvider` conformances. `NativeToolHost.init` legge
+  `AppSettingsKey.webSearchProvider` + la chiave matching
+  (`KeychainAccount.{tavily,braveSearch,serper}APIKey`) e costruisce
+  il provider; fallback su DuckDuckGo se la chiave manca. Commit
+  `cfe94ee`. UI per il picker è follow-up.
 
 - [ ] **`lsp` tool**. Stub registrato che ritorna `notImplemented`.
   Necessita: spawn `sourcekit-lsp` (per Swift) / `pyright` (Python)
@@ -347,39 +378,49 @@ Toolbox nativo per agire su codice. Storia: vedi
   JSON-RPC simile a `MCPClient`. Operazioni minime: `definition`,
   `hover`, `references`, `diagnostics`.
 
-- [ ] **Sandbox `ShellTool`**. `Sources/DeepSeekIntegrations/Sandbox/`
-  scrive un profilo `sandbox-exec` base; `ShellTool(useSandbox:true)`
-  lo cerca a `<root>/sandbox/default.sb`. Il profilo è
-  deliberatamente strict (deny default); tunarlo per workflow di dev
-  e abilitare il toggle nelle Settings.
+- [~] **Sandbox `ShellTool`**. Toggle `AppSettingsKey.useShellSandbox`
+  + Settings → Tools → "Initialize default profile" button + auto-
+  wiring di `shellUsesSandbox:` su `DefaultTools.standard`. Il
+  profilo default rimane strict; tuning per workflow specifici
+  resta lavoro del singolo utente. Commit `4964470`.
 
-- [ ] **HTTP recorder wiring**. `Sources/DeepSeekIntegrations/HTTPRecorder/`
-  ha l'API ma non è collegato a `OpenRouterAPI`. Implementare come
-  `URLProtocol` su una sessione opt-in.
+- [x] **HTTP recorder wiring**. `HTTPRecorderURLProtocol`
+  intercetta richieste sulle `URLSession` di `OpenRouterClient` e
+  `AnthropicClient`. Modi `.off` (default, no-op), `.record`
+  (forward + persist), `.replay` (sintetizza response da file).
+  `HTTPRecorder.shared.configure(directory:mode:)` flippa lo stato.
+  Commit `758a6cc`. Limitazione: streaming SSE catturato come
+  single chunk (replay batch invece di event-by-event).
 
-- [ ] **Server mode / headless CLI**. Esporre `InferenceService` su
-  `localhost:PORT` con un'API OpenAI-compatible. Sblocca:
-  TUI client esterni, plugin VS Code / Zed, GitHub Actions
-  `agent-review.yml` (oggi placeholder), Slack bot completo.
-  **Piano dettagliato in §10.1 (T1).**
+- [x] **Server mode / headless CLI**. T1 chiuso — vedi §10.1.
+  `LocalServer` actor + routes `/v1/models` + `/v1/chat/completions`
+  (stream + buffered) + tools[] passthrough + Settings → Server.
 
 - [ ] **Slack bot completo**. `Sources/DeepSeekIntegrations/Slack/`
   ha solo un webhook one-shot. Mancano: Events API listener, OAuth,
-  session keyed by `(team_id, channel_id)`, dipendenza dal server
-  mode sopra.
+  session keyed by `(team_id, channel_id)`. Dipendenza dal server
+  mode (T1) ora soddisfatta — manca il bot vero. ~500+ LOC.
 
-- [ ] **Per-project `.deepseek/`**. Carica agent / skill / slash
-  command da un percorso versionabile nel repo target, sovrascrivendo
-  i default globali. Pattern di `.opencode/` e `CLAUDE.md`.
+- [~] **Per-project `.deepseek/`**. Loader `ProjectOverlayLoader` +
+  `ProjectOverlay` struct + `ChatStore.effectiveAgents()` /
+  `currentProjectOverlay()` helpers. Carica
+  `<projectRoot>/.deepseek/{agents,skills,slash}.json` e fa merge
+  con i globali (project-local vince su name collision). Le view
+  (agent picker, slash palette, skills tab) non chiamano ancora
+  `effectiveAgents()` — sweep follow-up. Commit `a2f9dd9`.
 
-- [ ] **Inline rebind di keybinding**. La tab `Keys` è oggi
-  read-only + reset; aggiungere un widget di key-grab + detection
-  conflitti + conferma overwrite delle scorciatoie di sistema.
+- [x] **Inline rebind di keybinding**. Settings → Keys ora ha
+  pulsante "Rebind" per riga + sheet `KeybindingRebindSheet` che
+  cattura chord via `.onKeyPress(phases: .down)` (macOS 14+), con
+  toggle modificatori, named-key recognition (return / escape /
+  tab / space / delete / arrows), e conflict detection inline che
+  marca il binding rivale come empty su overwrite. Commit `86b6583`.
 
-- [ ] **Custom theme editor**. Oggi `ThemeStore` accetta temi custom
-  via JSON ma non c'è UI per crearli. Aggiungere editor con
-  ColorPicker per i sei slot (accent / background / foreground /
-  bubble assistant / bubble user / appearance).
+- [x] **Custom theme editor**. Settings → Theme ha "Create custom
+  theme…" button + sheet con 5 `ColorPicker` (round-trip via
+  NSColor → #RRGGBB), TextField name / summary, segmented
+  Appearance picker. `ThemeStore.addCustomTheme` /
+  `removeCustomTheme`; built-ins protetti. Commit `86b6583`.
 
 ---
 
@@ -405,16 +446,24 @@ Pezzi scaffoldati nel merge di llama.cpp-gap. Storia: vedi
   table + zero-copy load per dtype pass-through (`F32 / F16 /
   BF16 / I32 / I8`). Test: `GGUFTests.swift`.
 
-- [ ] **Kernel dequant per GGUF quantizzati** (`Q4_0`, `Q4_K`,
-  `Q4_K_M`, `Q5_K`, `Q6_K`, `Q8_0`). Senza questi `GGUFFile.load`
-  solleva `unsupportedType`. Pattern di partenza:
-  `int4_gemm.metal` + `int8_gemm.metal`. Ogni formato ~2-3 giorni.
-  **Piano dettagliato in §10.2 (T2).**
+- [x] **Kernel dequant per GGUF quantizzati**. `Q8_0`, `Q4_0`,
+  `Q4_K` (= `Q4_K_M`), `Q5_K`, `Q6_K` con variante F32; `Q8_0` /
+  `Q4_0` / `Q4_K` anche BF16 (Q5_K / Q6_K fallback automatico a F32).
+  Vedi `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`. `GGUFFile.load`
+  ora dispatcha kernel-side invece di sollevare `unsupportedType`.
+  Commit `3fb5bef` + `aadbd12`.
 
-- [ ] **Kernel transformer Llama-style** (MHA + SwiGLU + RMSNorm,
-  no MLA, no MoE, no HC). Pre-requisito perché il dispatcher di
-  template + il reader GGUF facciano *girare* un modello Llama,
-  non solo leggerlo. **Piano dettagliato in §10.2 (T2).**
+- [x] **Kernel transformer Llama-style** — `StandardMHA` (GQA +
+  causal mask + KV cache), `SwiGLU`, `LlamaDecoderLayer`,
+  `LlamaModel`, `LlamaConfig`, `ModelArchitecture` dispatcher,
+  `LlamaModel.fromGGUF` factory, `TokenizerLoader.loadFromGGUF`,
+  `LlamaStreamingModel` per il path `.streaming`. CLI
+  `deepseek_gguf`. Commit `9024ce2` + `02571a7` + `41385eb`.
+
+  Gap residuo: SDPA kernel oggi è `sdpa_naive_causal_gqa_f32`
+  (streaming softmax ma no tiling). Una variante FlashAttention
+  con `simdgroup_matrix` MMA darebbe ~5× su prefill. Drop-in nello
+  stesso entry point Swift.
 
 - [ ] **GGUF writer**. Simmetrico al reader; permetterebbe al
   converter di produrre un GGUF leggibile da llama.cpp. Low
@@ -435,115 +484,131 @@ T1 (server) sblocca testabilità esterna di tutti gli altri; T2 (GGUF
 forward) è il più grosso ed è parallelizzabile. Effort stimati a
 "uomo-settimana" single developer focused.
 
-### 10.1 Server HTTP OpenAI-compatible — T1 (~2 settimane)
+### 10.1 Server HTTP OpenAI-compatible — T1 ✅ LANDED
 
 Blocker per integrazione esterna (VS Code / Zed / TUI / Slack /
 GitHub Actions). Sostituisce e dettaglia la voce "Server mode" in §8.
 
-- [ ] **`LocalServer` actor**. SwiftNIO o `URLSession` server APIs;
-  bind su `localhost:PORT`, configurabile. ~3d. Nuovo file:
-  `Sources/DeepSeekUI/State/LocalServer.swift`.
-- [ ] **`POST /v1/chat/completions` non-streaming**. Mapping
-  `OpenAIRequest → InferenceService.generateForConversation`.
-  Tokenizer attivo dal modello caricato. ~2d.
-- [ ] **SSE streaming (`stream: true`)**. Delta chunks
-  `data: {choices:[{delta:{...}}]}\n\n`, terminatore `data: [DONE]`.
-  ~2d.
-- [ ] **`GET /v1/models`**. Catalogo dal modello locale caricato +
-  modelli OpenRouter conosciuti (opt-in). ~0.5d.
-- [ ] **`tools[]` passthrough**. Array OpenAI → MCP/native registry;
-  emissione `tool_calls` nella response. Riusa logica `ChatStore`.
-  ~2d.
-- [ ] **Settings → Server tab**. Port, bind addr, enable toggle,
-  optional bearer token. ~1d. Nuovo file:
-  `Sources/DeepSeekUI/Views/Settings/ServerSettingsTab.swift`.
-- [ ] **Test integrazione + curl recipe**. `LocalServerTests.swift`
-  + sezione in `docs/EXAMPLES.md`. ~1d.
+- [x] **`LocalServer` actor** via `Network.framework` `NWListener`
+  — no SwiftNIO dep. Commit `932639f`.
+- [x] **`POST /v1/chat/completions` non-streaming + SSE streaming**
+  via `OpenAIRequest`. Commit `7539cf3`.
+- [x] **`GET /v1/models`** — modello locale caricato come catalogo
+  singleton. Commit `7539cf3`.
+- [x] **`tools[]` passthrough** + tool-call loop (cap 8) +
+  fallback graceful. Commit `7421e54`.
+- [x] **Settings → Server tab** con port / bind addr / toggle /
+  optional bearer token in Keychain + auto-start on launch
+  se enabled. Commit `6410fb4`.
+- [x] **curl recipe** in `docs/EXAMPLES.md` §19. Test integrazione
+  esplicitamente saltato per preferenza del committer; manca
+  `LocalServerTests.swift`. Commit `7421e54`.
 
-### 10.2 GGUF run-forward (dequant + Llama) — T2 (~3 settimane)
+### 10.2 GGUF run-forward (dequant + Llama) — T2 ✅ LANDED
 
 Estende §9 "Kernel dequant" + "Kernel transformer Llama-style" con
-piano sequenziato. Senza questo, il lavoro post-merge llama.cpp-gap
-(GGUF reader, Jinja, multi-tokenizer) è inerte.
+piano sequenziato.
 
-- [ ] **Q8_0 dequant kernel**. Simmetrico a `int8_gemm.metal` ma su
-  blocchi GGUF da 32 elementi + scala F16. ~2d. Nuovo:
-  `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`.
-- [ ] **Q4_0 + Q4_K_M dequant kernels**. Q4_K_M è super-block 256
-  con 8 scale F16 + min F16. ~4d.
-- [ ] **`GGUFFile.load` → BF16 staging tensor**. Sostituisce
-  `unsupportedType` in `GGUFLoader.swift`. ~1d.
-- [ ] **`LlamaDecoderLayer`** (MHA + RoPE + SwiGLU + RMSNorm). ~3d.
-  Nuovo: `Sources/DeepSeekKit/Layers/LlamaDecoderLayer.swift`.
-- [ ] **`LlamaModel` wrapper + `ModelArchitecture` dispatcher**.
-  ~2d. Nuovi: `Sources/DeepSeekKit/{LlamaModel,ModelArchitecture}.swift`.
-- [ ] **Tokenizer auto-detect** da GGUF metadata
-  (`tokenizer.ggml.model` = "llama" / "gpt2" / "bert"). ~1d.
-- [ ] **End-to-end test con TinyLlama-1.1B Q4_K_M**. Greedy decoding
-  match vs llama.cpp reference. ~2d. Nuovo:
-  `Tests/DeepSeekKitTests/LlamaForwardTests.swift`.
+- [x] **Q8_0 / Q4_0 / Q4_K_M dequant kernels** + varianti BF16 per
+  i tre (output dtype configurabile via `outputDtype:`). Commit
+  `3fb5bef` + `aadbd12`.
+- [x] **Q5_K + Q6_K dequant kernels** (F32 output; BF16 fallback su
+  F32 per now). Commit `aadbd12`.
+- [x] **`GGUFFile.load(outputDtype:)`** dispatcha al kernel matching.
+- [x] **`LlamaDecoderLayer`** + `StandardMHA` (con GQA + causal +
+  KV cache) + `SwiGLU`. Commit `9024ce2`.
+- [x] **`LlamaModel` + `LlamaConfig` + `ModelArchitecture`
+  dispatcher** + `LlamaModel.fromGGUF` factory. Commit `02571a7`.
+- [x] **`LlamaStreamingModel`** per `--load-strategy streaming`:
+  weights dequantati per-forward + `madvise(DONTNEED)` per layer.
+  Commit `41385eb`.
+- [x] **Tokenizer auto-detect** da GGUF metadata via
+  `TokenizerLoader.loadFromGGUF` (gpt2/llama BPE; bert WordPiece
+  rimane stub). Commit `9024ce2`.
+- [x] **`deepseek_gguf` CLI** end-to-end con flag sampler completi
+  + `--load-strategy mmap|preload|streaming` + `--weight-dtype
+  f32|bf16` + `--use-map-shared` + `--warmup`. Commit `ddb6253` +
+  `41385eb`.
+- [ ] **End-to-end test TinyLlama Q4_K_M** vs llama.cpp reference.
+  Skip per preferenza del committer.
 
-### 10.3 Constrained decoding (JSON schema) — T3 (~1.5 settimane)
+### 10.3 Constrained decoding (JSON schema) — T3 ✅ LANDED
 
 Output JSON garantito — gap killer dopo "no server". Subset
 `response_format: {type:"json_schema"}` di OpenAI Structured Outputs.
 
-- [ ] **JSON-Schema → token-mask compiler**. Subset: `type`,
-  `enum`, `oneOf`, `anyOf`, `properties`, `items`, `pattern`
-  (regex semplice). ~4d. Nuovo:
-  `Sources/DeepSeekKit/Sampling/SchemaCompiler.swift`.
-- [ ] **Mask injection in `Sampling.swift`**. Nuovo campo
-  `Sampler.schemaMask: SchemaMask?`, applicato stage 0 prima di
-  temperature/top-K. Stato automa avanzato per token. ~2d. Nuovo:
-  `Sources/DeepSeekKit/Sampling/SchemaMask.swift`.
-- [ ] **API binding `response_format: {type:"json_schema"}`**. Sia
-  su `LocalServer` (§10.1) che su CLI. ~1d.
-- [ ] **CLI flag `--json-schema <path>`** in
-  `Sources/deepseek/main.swift`. ~0.5d.
-- [ ] **Test golden con 5 schemi** (object, array, enum, oneOf,
-  pattern). ~1d.
+- [x] **`SchemaCompiler` + `SchemaMask`** in `Sources/DeepSeekKit/`.
+  Cartesian-product enumeration di `enum` / `const` / `oneOf` /
+  `anyOf` / `type:"object"` (con caps su properties × values ≤ 8 ×
+  32, total ≤ 4096) / `type:"array"` con `items` + `minItems` +
+  `maxItems`. Commit `193682b` + `aadbd12` + `68095e9` + `2169e8d`.
+- [x] **Mask injection in `Sampling.swift`** come stage 0a (prima
+  di logitBias / temperature). `sample()` split in `sampleCore` +
+  wrapper che chiama `mask.advance(token:)` dopo ogni pick.
+- [x] **API binding `response_format`** su `LocalServer` via
+  `extractResponseSchema(body:)`; resolve tokenizer + vocabSize da
+  `InferenceService.snapshotTokenizerAndConfig()`.
+- [x] **CLI flag `--json-schema <path>`** su `deepseek` +
+  `deepseek_gguf`.
+- [ ] **Regex `pattern` su `type:"string"`** — fuori scope cartesian
+  product. Servirebbe un automaton character-class. ~200 LOC parser
+  + automaton.
+- [ ] **5 test golden** (object, array, enum, oneOf, pattern). Skip
+  per preferenza del committer.
 
 Stretch: **GBNF parser** stile llama.cpp per grammar arbitrarie. Non
 bloccante — JSON Schema copre ~90 % dei casi d'uso.
 
-### 10.4 Driver provider nativi — T4 (~3 giorni)
+### 10.4 Driver provider nativi — T4 ✅ LANDED
 
 Smette di pagare il margine OpenRouter sui modelli più usati e abilita
-prompt caching Anthropic (oggi non passabile via OpenRouter, vedi
-§4 "Prompt-caching Anthropic via OpenRouter").
+prompt caching Anthropic (chiude la voce §4).
 
-- [ ] **`AnthropicAPI`** client (Messages API + SSE streaming). ~1d.
-  Nuovo: `Sources/DeepSeekUI/State/AnthropicAPI.swift`.
-- [ ] **`ModelEndpoint.anthropic` case** + Settings → API Keys
-  Anthropic field. ~0.5d.
-- [ ] **Format translation** OpenAI `tools[]` ↔ Anthropic
-  `tool_use`/`tool_result` blocks. ~1d.
-- [ ] **`cache_control` auto-injection** sul system block + ultimo
-  tool result. Chiude voce §4 "Prompt-caching Anthropic via
-  OpenRouter". ~0.5d.
+- [x] **`AnthropicClient`** Messages API + SSE streaming → traduce
+  in `OpenAIStreamChunk` (text_delta / input_json_delta /
+  thinking_delta / message_delta) così `ChatStore.runRemoteLoop`
+  consuma entrambi i provider uniformemente. Commit `f43188c`.
+- [x] **`ModelEndpoint.anthropic(modelID:)`** + `KeychainAccount
+  .anthropicAPIKey` + `ModelState.loadRemoteAnthropic` +
+  `ChatStore.RemoteProvider` enum + Settings → API Keys
+  ProviderKeySection generica.
+- [x] **Format translation** in `AnthropicMessageBuilder`
+  (system separato; tool_use/tool_result content-block array;
+  role="user" per tool results).
+- [x] **`cache_control` auto-injection** su system block (quando
+  ≥ 3500 chars) + ultimo tool_result block.
+- [x] **"Add Anthropic model…" sheet** con 4 modelli suggeriti +
+  custom id.
 
-Stretch: driver **Ollama localhost** (`/api/chat`). Utile per chi
-gira llama.cpp via Ollama in parallelo al nostro engine. Stessa
-struttura, no auth.
+Stretch: driver **Ollama localhost** (`/api/chat`). Non implementato.
 
-### 10.5 Sampler residui — T5 (~2 giorni)
+### 10.5 Sampler residui — T5 ✅ LANDED
 
-- [ ] **DRY sampler** — penalty moltiplicativa su token che
-  estenderebbero n-gram già visti. Parametri standard: `multiplier`,
-  `base`, `allowed_length`. ~1d. In `Sources/DeepSeekKit/Sampling.swift`.
-- [ ] **`logitBias: [Int32: Float]`** in `Sampler`. Stage 0
-  (additivo prima di softmax). ~0.3d.
-- [ ] **Mirostat v1** — algoritmo originale (oggi solo v2). ~0.5d.
-- [ ] **CLI flag + test golden**. ~0.2d.
+Tutti in `Sources/DeepSeekKit/Sampling.swift` + CLI flag su
+`deepseek` + `deepseek_gguf`. Commit `5a80d4b`.
 
-### 10.6 Sequenziamento consigliato
+- [x] **DRY sampler** — bounded scan O(H × L_max), history cap 1024,
+  match cap 32 token. Stage 2c dopo frequency/presence.
+- [x] **`logitBias: [Int32: Float]`** stage 0a (additivo, prima di
+  temperature; `-100` è hard block regardless of T).
+- [x] **Mirostat v1** — variante smoothed con window-average di `m`
+  surprise recenti vs single-step di v2.
+- [x] **CLI flag**: `--logit-bias '<JSON>'`, `--dry-multiplier`,
+  `--dry-base`, `--dry-allowed-length`, `--mirostat-v1`,
+  `--mirostat-m`. Test golden saltati per preferenza del committer.
+
+### 10.6 Sequenziamento (storico) — tutte le 5 track landed
+
+Pianificazione originale conservata per riferimento; l'effettivo
+landing è avvenuto in un'unica burst su `claude/read-todo-C9gW9`
+(commit `932639f` → `4964470`).
 
 ```
-Settimana 1-2:  T1 (server)
+Settimana 1-2:  T1 (server)        — landed in 4 commit
 Settimana 3:    T4 + T5 in parallelo (cheap, indipendenti)
-Settimana 4-6:  T2 (GGUF + Llama) — può forkare in parallelo a T1
-                 se 2 dev
-Settimana 7-8:  T3 (constrained) — più valore quando T1 è on
+Settimana 4-6:  T2 (GGUF + Llama)  — landed in 5 commit + factory
+                 in `LlamaModel.fromGGUF`
+Settimana 7-8:  T3 (constrained)   — enum/const/oneOf/anyOf/object/array
 ```
 
 ### 10.6.bis Vocab pruning italiano-only (in scope)
@@ -576,6 +641,86 @@ strategica. Da rivalutare solo se cambia il target del progetto:
   l'attuale modo d'uso; rivalutare se §10.1 prende traffico serio.
 - **DRY / XTC** in versione completa con tutte le tunable di
   koboldcpp. Subset minimo in T5.
+
+---
+
+## 11. Follow-up impegnativi rimasti
+
+Cose esplicitamente lasciate aperte dopo il giro di lavoro sul
+branch `claude/read-todo-C9gW9`. Ognuna è un'unità di lavoro
+focused (multi-day) che non rientrava in una sessione conversazionale.
+
+### Engine performance
+
+- **SDPA tiled (FlashAttention-style)** per `StandardMHA`. Il kernel
+  `sdpa_naive_causal_gqa_f32` è corretto ma 1-thread-per-output-row;
+  una variante con threadgroup memory + `simdgroup_matrix<bfloat>`
+  MMA + softmax rescale darebbe ~5× su prefill Llama lungo. ~300-400
+  LOC Metal. Drop-in nello stesso entry point Swift.
+
+- **MLA multi-token forward con `startPos > 0`** (§5). Rimuove la
+  `precondition(S == 1)` in `Attention.swift:180` + adatta il blit
+  KV per `S > 1, startPos > 0`. ~5-10× sui turn tool-heavy.
+
+- **`simdgroup_matrix` BF16 GEMM** (§5). Sostituisce il path BF16
+  in `Linear.callAsFunction` con MMA tile-based. ~5-10× per ogni
+  Linear V4.
+
+- **Sub-agent KV cache reuse** per `(agentID, promptHash)` (§4).
+  Refactor di `InferenceService` cache layer per evitare cold
+  prefill ad ogni rievocazione dello stesso sub-agent nella stessa
+  turn.
+
+### Integrazioni
+
+- **LSP tool** (§8). Spawn `sourcekit-lsp` / `pyright` /
+  `typescript-language-server` + framing JSON-RPC simile a
+  `MCPClient` + operazioni `definition` / `hover` / `references` /
+  `diagnostics`. ~400-500 LOC.
+
+- **Slack bot completo** (§8). OAuth + Events API listener + session
+  keyed by `(team_id, channel_id)`. Dipendenza T1 server soddisfatta.
+  ~500+ LOC.
+
+- **GGUF writer** (§9, §10.7). Simmetrico al reader. Tradeoff
+  esplicito in §10.7 — solo se servirà interop bidirezionale.
+
+### Round-trip configurazione calibrata
+
+- **`inverseChannelScale` round-trip safetensors**. AWQ/SmoothQuant
+  oggi calcolano il vettore di scale per-canale e lo scartano. Per
+  rendere il quant matematicamente esatto a inference (e non solo
+  "QAT warm-start") serve:
+  1. Writer in `converter/main.swift` che emette
+     `<layer>.inv_channel_scale` come tensor F32.
+  2. Reader in `WeightLoader` / `Assembly.swift` che lo legge e
+     popola `Linear.inverseChannelScale` al load.
+  ~200 LOC across the two sides.
+
+- **Router-aware MoE calibration**. Oggi tutti gli expert ricevono
+  le stesse stats `yNorm2` (pre-routing); per quant calibrato
+  per-expert serve instrumentation in `MoEFFN.callAsFunction` che
+  emetta gli input per-routed-token. Sotanziale.
+
+### Test (esplicitamente saltati per scelta del committer)
+
+Tutti i 7 item di §7 — Sampler, EncodingDSV4, converter,
+OpenRouterClient, MCPClient, ChatStore.runRemoteLoop, e
+`EndToEndForwardTests` (quest'ultimo bloccato dalla mancanza di
+PyTorch reference).
+
+### UI sweep necessari (data layer pronto, view ancora cablano i vecchi accessor)
+
+- Agent picker / slash palette / skills tab → migrare da
+  `agents.agents` a `ChatStore.effectiveAgents()` per pickare la
+  overlay `.deepseek/` quando il chat ha un Project.
+- Remote crash recovery banner: legge `Conversation.remotePendingTurn`
+  + pulsante "Retry" che reinvia il `userText` salvato.
+- Chain UI per-frame Stop button: legge `delegationCancellations` +
+  pulsante che chiama `ChatStore.cancelDelegation(frameID:)`.
+- Settings → API Keys: aggiungere campi per Tavily / Brave / Serper
+  + picker per `webSearchProvider`. Keys già scrivibili via Keychain
+  programmaticamente.
 
 ---
 

@@ -65,22 +65,48 @@ public final class Linear {
     /// vanno lasciati a W8A16).
     public let useW8A8Activations: Bool
 
+    /// Per-channel inverse scale applied to the input before the
+    /// GEMM (`x' = x · invScale`). Wires the runtime side of the
+    /// AWQ / SmoothQuant calibration: those methods migrate
+    /// per-channel difficulty from activations to weights via
+    /// `weight *= s[c]`. At inference, the activation must be
+    /// pre-multiplied by `1/s[c]` so `x' W' = (x/s) (s W) = x W` is
+    /// recovered exactly. `nil` (default) disables the pre-multiply.
+    /// Shape: `[inFeatures]` F32.
+    public var inverseChannelScale: Tensor? = nil
+
     public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?,
                 castOutputToBF16: Bool = false,
-                useW8A8Activations: Bool = false) {
+                useW8A8Activations: Bool = false,
+                inverseChannelScale: Tensor? = nil) {
         self.inFeatures = inFeatures
         self.outFeatures = outFeatures
         self.weight = weight
         self.scale = scale
         self.castOutputToBF16 = castOutputToBF16
         self.useW8A8Activations = useW8A8Activations
+        self.inverseChannelScale = inverseChannelScale
     }
 
     /// `x`: [M, K] f32 or bf16. Output: [M, N] f32. When `castOutputToBF16`
     /// is true (default), the returned tensor is round-tripped through
     /// BF16 in-place so callers see the same precision the reference's
     /// BF16 activations would carry.
-    public func callAsFunction(_ x: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+    public func callAsFunction(_ xIn: Tensor, in cmd: MTLCommandBuffer) -> Tensor {
+        // AWQ / SmoothQuant inverse-scale pre-multiply. Allocates a
+        // fresh tensor so the caller's `xIn` isn't mutated — relevant
+        // when `xIn` is the residual stream being shared with another
+        // Linear in the same block. When `inverseChannelScale == nil`
+        // (the default) this branch is skipped and the path is
+        // bit-identical to the pre-AWQ behavior.
+        let x: Tensor
+        if let invScale = inverseChannelScale {
+            precondition(xIn.dtype == .f32,
+                          "Linear inverseChannelScale: f32 input only")
+            x = Elementwise.channelScale(xIn, scale: invScale, in: cmd)
+        } else {
+            x = xIn
+        }
         let M = x.shape.dropLast().reduce(1, *)
         let outShape = Array(x.shape.dropLast()) + [outFeatures]
         let y = Tensor.empty(shape: outShape, dtype: .f32)

@@ -30,6 +30,7 @@ struct DeepSeekUIApp: App {
     @StateObject private var themes: ThemeStore
     @StateObject private var keybindings: KeybindingStore
     @StateObject private var slashCommands: SlashCommandLibrary
+    @StateObject private var serverController: LocalServerController
 
     init() {
         let service = InferenceService()
@@ -57,6 +58,11 @@ struct DeepSeekUIApp: App {
         self._themes = StateObject(wrappedValue: ThemeStore())
         self._keybindings = StateObject(wrappedValue: KeybindingStore())
         self._slashCommands = StateObject(wrappedValue: SlashCommandLibrary())
+        // Local OpenAI-compatible HTTP server (TODO §10.1 / T1). The
+        // controller stays idle until the user flips the Settings →
+        // Server toggle; nothing binds at launch.
+        self._serverController = StateObject(wrappedValue:
+            LocalServerController(service: service, mcpPool: pool))
     }
 
     var body: some Scene {
@@ -77,6 +83,11 @@ struct DeepSeekUIApp: App {
                 // the system setting.
                 .preferredColorScheme(themes.preferredColorScheme)
                 .tint(swiftUIColor(hex: themes.active.accent) ?? .accentColor)
+                // Auto-start the local server if the user left
+                // Settings → Server enabled on the previous quit.
+                // `controller.start` is idempotent so reopening the
+                // window after closing it won't double-bind.
+                .task { await maybeAutoStartServer() }
         }
         .windowResizability(.contentMinSize)
 
@@ -90,6 +101,21 @@ struct DeepSeekUIApp: App {
                        permissions: permissions,
                        skills: skills,
                        themes: themes,
-                       keybindings: keybindings)
+                       keybindings: keybindings,
+                       serverController: serverController)
+    }
+
+    private func maybeAutoStartServer() async {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: AppSettingsKey.serverEnabled),
+              !serverController.isRunning
+        else { return }
+        let rawPort = defaults.integer(forKey: AppSettingsKey.serverPort)
+        let port = UInt16(clamping: rawPort == 0 ? 8080 : rawPort)
+        let address = defaults.string(forKey: AppSettingsKey.serverBindAddress)
+            ?? "127.0.0.1"
+        await serverController.start(
+            port: port,
+            address: address.isEmpty ? "127.0.0.1" : address)
     }
 }

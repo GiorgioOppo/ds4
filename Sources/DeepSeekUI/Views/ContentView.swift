@@ -222,6 +222,7 @@ private struct ModelPicker: View {
     @ObservedObject var catalog: OpenRouterCatalog
 
     @State private var showAddOpenRouter: Bool = false
+    @State private var showAddAnthropic: Bool = false
     @State private var showLocalModelSettings: Bool = false
 
     /// Endpoint mostrato in toolbar = quello della chat selezionata
@@ -296,6 +297,11 @@ private struct ModelPicker: View {
                     Label("Add OpenRouter model…", systemImage: "cloud")
                 }
                 Button {
+                    showAddAnthropic = true
+                } label: {
+                    Label("Add Anthropic model…", systemImage: "cloud.fill")
+                }
+                Button {
                     showLocalModelSettings = true
                 } label: {
                     Label("Customize local model settings…",
@@ -330,6 +336,9 @@ private struct ModelPicker: View {
         }
         .sheet(isPresented: $showLocalModelSettings) {
             LocalModelSettingsSheet(modelState: modelState)
+        }
+        .sheet(isPresented: $showAddAnthropic) {
+            AddAnthropicModelSheet(modelState: modelState)
         }
     }
 

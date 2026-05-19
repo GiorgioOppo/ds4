@@ -16,6 +16,12 @@ struct MessageView: View {
     /// True while this message is the in-progress streaming target so
     /// we can show a blinking caret.
     var isStreaming: Bool = false
+    /// Live reasoning buffer fed by the streaming runner (TODO §4
+    /// follow-up). When non-nil it overrides
+    /// `message.reasoningContent` in the disclosure widget so the
+    /// running thinking text is visible mid-turn instead of only at
+    /// `.done`. Nil for non-streaming / no-reasoning messages.
+    var streamingReasoning: String? = nil
     /// Resolve a `__delegate_to_agent` call's `agent_name` to the
     /// AgentConfig it targets so the tool row can render the
     /// delegate's icon + tint instead of a generic wrench. nil
@@ -79,7 +85,13 @@ struct MessageView: View {
                         .help(copied ? "Copied" : "Copy reply")
                     }
                 }
-                if let r = message.reasoningContent, !r.isEmpty {
+                // Prefer the live streaming buffer when present so
+                // the reasoning shows up as it streams; fall back to
+                // the persisted value (which finalizeRemoteIteration
+                // writes at .done).
+                if let r = streamingReasoning ?? message.reasoningContent,
+                   !r.isEmpty
+                {
                     ReasoningDisclosure(reasoning: r)
                 }
                 assistantContent

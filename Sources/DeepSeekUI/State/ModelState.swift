@@ -92,6 +92,34 @@ final class ModelState: ObservableObject {
             await loadLocal(path: path, endpoint: endpoint, force: force)
         case .openRouter(let modelID):
             await loadRemoteOpenRouter(modelID: modelID, endpoint: endpoint)
+        case .anthropic(let modelID):
+            await loadRemoteAnthropic(modelID: modelID, endpoint: endpoint)
+        }
+    }
+
+    /// Anthropic-native variant of `loadRemoteOpenRouter`. Same
+    /// shape: ping `/v1/models` to confirm the key works, then mark
+    /// the endpoint loaded. The actual chat path runs through
+    /// `AnthropicClient.streamMessages` (TODO §10.4 / T4).
+    private func loadRemoteAnthropic(modelID: String,
+                                       endpoint: ModelEndpoint) async {
+        await service.unloadModel()
+        status = .loading(endpoint: endpoint, plan: nil)
+        guard let key = KeychainStore.get(
+            account: KeychainAccount.anthropicAPIKey), !key.isEmpty
+        else {
+            status = .error(endpoint: endpoint,
+                             message: "Add an Anthropic API key under Settings → API Keys first.")
+            return
+        }
+        do {
+            try await AnthropicClient().validateKey(key)
+            library.touch(endpoint)
+            status = .loaded(endpoint: endpoint, config: ModelConfig())
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            status = .error(endpoint: endpoint, message: msg)
         }
     }
 

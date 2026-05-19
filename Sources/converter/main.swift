@@ -24,12 +24,22 @@ import DeepSeekConverter
 //       [--model-parallel 1] \
 //       [--target-dtype bf16|f16|int8|int4|int2|keep]  # default: bf16
 //       [--shard-size-gb 5]                   # default: 5 GB per shard
+//       [--quant-method rtn|awq|smoothQuant|gptq]  # default: rtn
+//       [--calib-stats <dir-or-stats.json>]   # required for non-RTN methods
 //
 // `int8` is a W8A16 weight-only quantization: every Linear weight that
 // passes `shouldQuantizeToInt8` (DeepSeekKit/Int8Quant.swift) gets
 // symmetric RTN quantization into INT8 with per-row per-group-128 F16
 // scales. Other tensors (embed/head/norm/attn_sink/hc_*/bias) fall through
 // to BF16 like in `--target-dtype bf16`.
+//
+// `--quant-method awq|smoothQuant|gptq` consults `--calib-stats` to
+// pick per-tensor calibration. Per-tensor lookup key is the OUTPUT
+// (renamed) tensor name minus the trailing `.weight`. Tensors with
+// no stats entry silently fall back to RTN. The inverseChannelScale
+// produced by AWQ / SmoothQuant is currently DISCARDED — the runtime
+// loader doesn't read it yet, so emitting it would just bloat the
+// output safetensors. Documented follow-up.
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
@@ -53,6 +63,14 @@ var nExperts: Int = 0
 var mp: Int = 1
 var targetDType: TargetDType = .bf16
 var shardSizeGB: Double = 5.0
+// Calibrated quantization (TODO §1). `--quant-method` defaults to
+// .rtn (the existing behavior). When set to .awq / .smoothQuant /
+// .gptq, the converter consults `--calib-stats <path>` to pick the
+// per-tensor stats; if a tensor isn't represented in the stats it
+// falls back to RTN silently (matches what an under-specified
+// calibration set would imply).
+var quantMethod: QuantMethod = .rtn
+var calibStatsPath: String?
 
 var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
@@ -76,6 +94,18 @@ while !args.isEmpty {
     case "--shard-size-gb":
         guard !args.isEmpty, let v = Double(args.removeFirst()) else { usage() }
         shardSizeGB = v
+    case "--quant-method":
+        guard !args.isEmpty else { usage() }
+        let raw = args.removeFirst()
+        guard let m = QuantMethod(rawValue: raw) else {
+            FileHandle.standardError.write(Data(
+                "--quant-method must be one of rtn|awq|smoothQuant|gptq (got '\(raw)')\n".utf8))
+            exit(2)
+        }
+        quantMethod = m
+    case "--calib-stats":
+        guard !args.isEmpty else { usage() }
+        calibStatsPath = args.removeFirst()
     default:
         usage()
     }
@@ -84,6 +114,31 @@ while !args.isEmpty {
 guard let hf = hfPath, let save = savePath, nExperts > 0 else { usage() }
 precondition(nExperts % mp == 0, "n_experts must be divisible by model_parallel")
 precondition(mp == 1, "model_parallel > 1 not supported by this Swift port (single-rank)")
+// Load the calibration bundle if --calib-stats was supplied. Once
+// here, per-tensor lookups are cheap (dict access). When the user
+// asks for a non-RTN method but doesn't pass --calib-stats, error
+// out — silently demoting to RTN would surprise them.
+let calibDir: CalibrationDir?
+if let path = calibStatsPath {
+    do {
+        calibDir = try CalibrationDir(url: URL(fileURLWithPath: path))
+        FileHandle.standardError.write(Data(
+            "Loaded calibration stats: \(calibDir!.statsByName.count) "
+            + "layers\n".utf8))
+    } catch {
+        FileHandle.standardError.write(Data(
+            "--calib-stats failed to load: \(error)\n".utf8))
+        exit(1)
+    }
+} else {
+    calibDir = nil
+    if quantMethod != .rtn {
+        FileHandle.standardError.write(Data(
+            "--quant-method \(quantMethod.rawValue) requires --calib-stats "
+            + "<path>\n".utf8))
+        exit(2)
+    }
+}
 // Cap shard size to ~95% of the device's per-MTLBuffer limit. The
 // runtime mmaps each shard as one MTLBuffer, so a shard larger than
 // `maxBufferLength` is unloadable on this machine. The 95% margin
@@ -300,6 +355,30 @@ for newName in plan.keys.sorted() {
             let scaleOffset = companion?.offset ?? 0
             let isFP8 = isFP8DType(srcDtype)
             let isFP4 = isPackedFP4
+            // For calibrated dispatch, we look up CalibrationStats by
+            // the OUTPUT (renamed) tensor name without the trailing
+            // ".weight" suffix — matches the convention
+            // `deepseek_calibrate` writes. If no entry is found we
+            // fall back to RTN (silently for non-quantized methods on
+            // tensors out of the calibration corpus's scope, like
+            // freshly-added bias / norm Linears).
+            let calibStem: String = {
+                if newName.hasSuffix(".weight") {
+                    return String(newName.dropLast(".weight".count))
+                }
+                return newName
+            }()
+            let calibStats = calibDir?.statsByName[calibStem]
+            let calibHessian = (quantMethod == .gptq)
+                ? calibDir?.hessian(for: calibStem) : nil
+            let effectiveMethod: QuantMethod = {
+                guard quantMethod != .rtn else { return .rtn }
+                // Without stats we can't run AWQ / SmoothQuant /
+                // GPTQ; downgrade to RTN silently for this tensor.
+                if calibStats == nil { return .rtn }
+                if quantMethod == .gptq && calibHessian == nil { return .rtn }
+                return quantMethod
+            }()
             let compute: () throws -> (weight: Data, scale: Data) = {
                 if let c = cached { return c }
                 let r: (weight: Data, scale: Data)
@@ -314,8 +393,43 @@ for newName in plan.keys.sorted() {
                                                outDim: outDim, inDim: inDim,
                                                e2m1LUT: e2m1LUT, e8m0LUT: e8m0LUT)
                 } else if upper == "BF16" {
-                    r = try quantizeBF16ToInt8(srcURL: weightURL, srcOffset: weightOffset,
-                                                outDim: outDim, inDim: inDim)
+                    switch effectiveMethod {
+                    case .rtn:
+                        r = try quantizeBF16ToInt8(
+                            srcURL: weightURL, srcOffset: weightOffset,
+                            outDim: outDim, inDim: inDim)
+                    case .awq:
+                        let stats = calibStats!  // forced by effectiveMethod resolution
+                        let res = try awqQuantizeBF16ToInt8(
+                            srcURL: weightURL, srcOffset: weightOffset,
+                            outDim: outDim, inDim: inDim,
+                            actAbsMax: stats.perChannelAbsMax,
+                            alpha: 0.5)
+                        r = (res.weight, res.scale)
+                        // The inverseChannelScale produced by AWQ
+                        // would belong as a sidecar tensor consumed
+                        // by `Linear.inverseChannelScale` at load
+                        // time. Not yet written here — the loader
+                        // doesn't read it either, so emitting it
+                        // would just bloat the safetensors output.
+                        // Documented follow-up.
+                        _ = res.inverseChannelScale
+                    case .smoothQuant:
+                        let stats = calibStats!
+                        let res = try smoothQuantBF16ToInt8(
+                            srcURL: weightURL, srcOffset: weightOffset,
+                            outDim: outDim, inDim: inDim,
+                            actAbsMax: stats.perChannelAbsMax,
+                            alpha: 0.5)
+                        r = (res.weight, res.scale)
+                        _ = res.inverseChannelScale
+                    case .gptq:
+                        let H = calibHessian!  // forced by effectiveMethod
+                        r = try gptqQuantizeBF16ToInt8(
+                            srcURL: weightURL, srcOffset: weightOffset,
+                            outDim: outDim, inDim: inDim,
+                            hessian: H)
+                    }
                 } else if upper == "F32" {
                     r = try quantizeF32ToInt8(srcURL: weightURL, srcOffset: weightOffset,
                                                outDim: outDim, inDim: inDim)

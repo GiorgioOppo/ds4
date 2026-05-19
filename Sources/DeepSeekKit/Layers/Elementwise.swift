@@ -96,6 +96,33 @@ public enum Elementwise {
         enc.endEncoding()
     }
 
+    /// `y[r, c] = x[r, c] * scale[c]` — per-channel multiply over
+    /// the last axis. Used by `Linear`'s AWQ / SmoothQuant
+    /// inverse-scale path (the smoothing migrated difficulty to
+    /// the weight; the runtime applies the inverse on the
+    /// activation here so the math cancels exactly).
+    public static func channelScale(_ x: Tensor,
+                                       scale: Tensor,
+                                       in cmd: MTLCommandBuffer) -> Tensor
+    {
+        precondition(x.dtype == .f32 && scale.dtype == .f32)
+        let cols = x.shape.last!
+        precondition(scale.count == cols,
+                      "channelScale: scale length \(scale.count) != cols \(cols)")
+        let y = Tensor.empty(shape: x.shape, dtype: .f32)
+        let pipeline = Device.shared.makePipeline("channel_scale_f32")
+        let enc = cmd.makeComputeCommandEncoder()!
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+        enc.setBuffer(scale.buffer, offset: scale.offset, index: 1)
+        enc.setBuffer(y.buffer, offset: 0, index: 2)
+        var dims = SIMD2<UInt32>(UInt32(x.count), UInt32(cols))
+        enc.setBytes(&dims, length: MemoryLayout<SIMD2<UInt32>>.size, index: 3)
+        dispatch1D(enc, pipeline: pipeline, count: x.count)
+        enc.endEncoding()
+        return y
+    }
+
     /// TG calcolato dinamicamente in funzione della pipeline
     /// (`threadExecutionWidth`, `maxTotalThreadsPerThreadgroup`). Vedi
     /// `Sources/DeepSeekKit/PipelineTuning.swift`.

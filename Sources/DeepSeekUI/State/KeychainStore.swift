@@ -126,4 +126,22 @@ enum KeychainError: LocalizedError {
 /// typos in the account string don't silently shadow each other.
 enum KeychainAccount {
     static let openRouterAPIKey = "openrouter.apiKey"
+    /// Anthropic native API key, used by `AnthropicClient` for
+    /// `api.anthropic.com/v1/messages` (TODO §10.4 / T4). Distinct
+    /// from `openRouterAPIKey` so users can keep both backends
+    /// configured side-by-side.
+    static let anthropicAPIKey = "anthropic.apiKey"
+    /// Optional bearer token required on requests to the local
+    /// OpenAI-compatible server (TODO §10.1 / `LocalServer.swift`).
+    /// Nil/empty = auth disabled (the default for localhost).
+    static let serverBearerToken = "server.bearerToken"
+    /// Web-search backend API keys (TODO §8 follow-up). When the
+    /// `webSearchProvider` AppStorage flag picks one of these
+    /// backends, `NativeToolHost` reads the matching key out of
+    /// the Keychain to construct the corresponding
+    /// `WebSearchProvider`. Missing key → fall back to the
+    /// DuckDuckGo lite scraper with a stderr note.
+    static let tavilyAPIKey = "webSearch.tavily.apiKey"
+    static let braveSearchAPIKey = "webSearch.brave.apiKey"
+    static let serperAPIKey = "webSearch.serper.apiKey"
 }

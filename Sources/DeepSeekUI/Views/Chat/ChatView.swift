@@ -65,12 +65,16 @@ struct ChatView: View {
                             MessageView(
                                 message: msg,
                                 isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase),
+                                streamingReasoning:
+                                    streamingReasoning(for: msg,
+                                                        in: c,
+                                                        phase: phase),
                                 agentResolver: { name in
                                     store.agents.agents.first(where: { $0.name == name })
                                 })
                             .id(msg.id)
                         }
-                        if case .streaming(_, _, let metrics) = phase {
+                        if case .streaming(_, _, _, let metrics) = phase {
                             // Throughput bar stays in the trailing slot
                             // so the live tok/min readout sits under the
                             // reply as it grows.
@@ -365,6 +369,19 @@ struct ChatView: View {
         return true
     }
 
+    /// Live reasoning buffer for the streaming placeholder bubble
+    /// (TODO §4 follow-up). Returns nil for any message that isn't
+    /// the in-flight streaming target, OR when the buffer is empty
+    /// (no `reasoning_content` deltas seen yet) — the bubble then
+    /// falls back to the persisted `message.reasoningContent`.
+    private func streamingReasoning(for msg: StoredMessage,
+                                     in c: Conversation,
+                                     phase: GenerationPhase) -> String? {
+        guard isStreamingPlaceholder(msg, in: c, phase: phase) else { return nil }
+        guard case .streaming(_, let reasoning, _, _) = phase else { return nil }
+        return reasoning.isEmpty ? nil : reasoning
+    }
+
     /// True for the empty assistant placeholder at the tail of the
     /// conversation while the model is encoding the prompt or running
     /// the prefill forward — the slot where the inline indicator
@@ -377,7 +394,7 @@ struct ChatView: View {
               msg.content.isEmpty else { return false }
         switch phase {
         case .prefilling: return true
-        case .streaming(_, let status, _): return !status.isEmpty
+        case .streaming(_, _, let status, _): return !status.isEmpty
         default: return false
         }
     }
@@ -389,7 +406,7 @@ struct ChatView: View {
             PrefillIndicator(promptTokens: promptTokens,
                               startTime: startTime)
                 .padding(.leading, 40)
-        case .streaming(_, let status, _) where !status.isEmpty:
+        case .streaming(_, _, let status, _) where !status.isEmpty:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
                 Text(status)
@@ -403,7 +420,7 @@ struct ChatView: View {
     }
 
     private func scrollBufferLength(_ phase: GenerationPhase) -> Int {
-        if case .streaming(let buffer, _, _) = phase { return buffer.count }
+        if case .streaming(let buffer, _, _, _) = phase { return buffer.count }
         return 0
     }
 
