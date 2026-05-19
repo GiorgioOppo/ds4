@@ -112,6 +112,24 @@ struct PendingTurn: Codable, Hashable {
     let mode: String
 }
 
+/// Remote-chat analog of `PendingTurn` (TODO §4 follow-up). For
+/// remote calls we can't resume from a token cursor — the model
+/// state lives upstream. We instead persist the user message and
+/// the placeholder assistant id; on app restart the UI can offer
+/// to re-issue the call (idempotent on the provider side).
+struct RemotePendingTurn: Codable, Hashable {
+    let assistantMessageID: UUID
+    let userMessageID: UUID
+    /// Raw user message text. Re-issuing the call uses this verbatim.
+    let userText: String
+    /// `ThinkingMode.rawValue` for the in-flight call.
+    let mode: String
+    /// Wall-clock timestamp when the request was issued. UI shows
+    /// "Started X minutes ago" so the user can decide whether to
+    /// retry or abandon.
+    let issuedAt: Date
+}
+
 /// One chat thread. Title is auto-generated from the first user
 /// message; falls back to "New Chat" until the user types something.
 struct Conversation: Codable, Identifiable, Hashable {
@@ -164,6 +182,37 @@ struct Conversation: Codable, Identifiable, Hashable {
     /// stopped — see `PendingTurn`. Cleared at `.done`.
     var pendingTurn: PendingTurn?
 
+    /// Remote analog of `pendingTurn` (TODO §4 follow-up). For
+    /// remote chats the engine doesn't own a tokenized prompt /
+    /// generation cursor to resume from, so we instead persist the
+    /// user message that was in flight when the app died. On
+    /// launch, `ChatStore.detectOrphanedRemoteTurn` surfaces these
+    /// to the UI so the user can re-issue the call. Cleared at
+    /// `.done` or on user dismissal.
+    var remotePendingTurn: RemotePendingTurn?
+
+    /// Typed endpoint identifier (TODO §4 cosmetic). New chats
+    /// populate this; the legacy `modelDirPath` is retained for
+    /// older on-disk JSON. `effectiveEndpoint` resolves the
+    /// canonical reference whichever way the chat was persisted.
+    /// Codable as Optional so older `.json` files (without this
+    /// field) decode cleanly.
+    var endpoint: ModelEndpoint?
+
+    /// Best-effort resolution of which endpoint this chat speaks
+    /// to. Prefers the typed `endpoint` field; falls back to the
+    /// legacy `modelDirPath` (non-empty = local directory path).
+    /// Returns `nil` for remote chats persisted before the typed
+    /// field landed — callers must accept that and look elsewhere
+    /// (Settings, ModelState.loadedEndpoint).
+    var effectiveEndpoint: ModelEndpoint? {
+        if let endpoint = endpoint { return endpoint }
+        if !modelDirPath.isEmpty {
+            return .localDirectory(path: modelDirPath)
+        }
+        return nil
+    }
+
     init(id: UUID = UUID(),
          title: String = "New Chat",
          createdAt: Date = .now,
@@ -174,7 +223,9 @@ struct Conversation: Codable, Identifiable, Hashable {
          cumulativeCostUSD: Double? = nil,
          encodedTokens: [Int32]? = nil,
          lastEncodedMode: String? = nil,
-         pendingTurn: PendingTurn? = nil) {
+         pendingTurn: PendingTurn? = nil,
+         remotePendingTurn: RemotePendingTurn? = nil,
+         endpoint: ModelEndpoint? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
         self.projectID = projectID
@@ -183,6 +234,8 @@ struct Conversation: Codable, Identifiable, Hashable {
         self.encodedTokens = encodedTokens
         self.lastEncodedMode = lastEncodedMode
         self.pendingTurn = pendingTurn
+        self.remotePendingTurn = remotePendingTurn
+        self.endpoint = endpoint
     }
 
     mutating func retitleIfNeeded() {

@@ -25,8 +25,25 @@ enum GenerationPhase: Equatable {
     /// single synchronous forward that doesn't stream intermediate
     /// progress, so live elapsed is the most useful liveness signal).
     case prefilling(promptTokens: Int, startTime: Date)
-    case streaming(buffer: String, status: String, metrics: GenerationMetrics)
+    /// `buffer` is the visible assistant text. `reasoningBuffer` is
+    /// the live thinking content (today streamed only via the remote
+    /// path's `reasoning_content` delta; local generation emits it
+    /// only at `.done` once the `<think>` block has been split off
+    /// the token stream). Empty by default so older callsites that
+    /// construct `.streaming(buffer:, status:, metrics:)` without
+    /// reasoning continue to compile via the new init helpers below.
+    case streaming(buffer: String, reasoningBuffer: String,
+                    status: String, metrics: GenerationMetrics)
     case error(String)
+
+    /// Shorthand factory matching the pre-T4-followup signature.
+    /// Existing call sites use this form; it just leaves the new
+    /// `reasoningBuffer` empty.
+    static func streaming(buffer: String, status: String,
+                           metrics: GenerationMetrics) -> GenerationPhase {
+        .streaming(buffer: buffer, reasoningBuffer: "",
+                    status: status, metrics: metrics)
+    }
 }
 
 /// Multi-chat store. Owns `[Conversation]` indexed by id, a selection,
@@ -130,7 +147,8 @@ final class ChatStore: ObservableObject {
         self.modelState = modelState
         loadFromDisk()
         if conversations.isEmpty {
-            let first = Conversation(modelDirPath: modelDirPath)
+            let first = Conversation(modelDirPath: modelDirPath,
+                                       endpoint: modelState.loadedEndpoint)
             conversations.append(first)
             selectedID = first.id
             scheduleSave(first.id)
@@ -147,7 +165,12 @@ final class ChatStore: ObservableObject {
     }
 
     func newChat() {
-        let c = Conversation(modelDirPath: modelDirPath)
+        // TODO §4: capture the typed endpoint in the new
+        // conversation. `modelDirPath` stays populated for local
+        // endpoints so older code paths keep working; remote chats
+        // get `endpoint` set and `modelDirPath = ""`.
+        let c = Conversation(modelDirPath: modelDirPath,
+                              endpoint: modelState.loadedEndpoint)
         conversations.insert(c, at: 0)
         selectedID = c.id
         scheduleSave(c.id)
@@ -1263,6 +1286,16 @@ final class ChatStore: ObservableObject {
         phases[id] = .streaming(buffer: "",
                                  status: "Calling \(modelID)…",
                                  metrics: GenerationMetrics())
+        // TODO §4 follow-up: persist remote-side pendingTurn so a
+        // crash mid-call surfaces a retry affordance on next launch.
+        // Cleared in `finalizeRemoteIteration` and in the catch
+        // branch of `runRemoteLoop`.
+        conversations[idx].remotePendingTurn = RemotePendingTurn(
+            assistantMessageID: placeholder.id,
+            userMessageID: userMessage.id,
+            userText: text,
+            mode: mode.rawValue,
+            issuedAt: Date())
         lastSamplingOptions[id] = (options, maxTokens)
         toolRoundtrips[id] = 0
         scheduleSave(id)
@@ -1424,6 +1457,16 @@ final class ChatStore: ObservableObject {
                         }
                         if let r = delta.reasoningContent, !r.isEmpty {
                             reasoningBuf.append(r)
+                            // TODO §4 follow-up: push the running
+                            // thinking buffer to the UI bubble so the
+                            // reasoning is visible mid-stream instead
+                            // of only at .done.
+                            let snapshotReasoning = reasoningBuf
+                            await MainActor.run {
+                                self.updateRemoteReasoningBuffer(
+                                    conversationID: id,
+                                    reasoning: snapshotReasoning)
+                            }
                         }
                         if let tcs = delta.toolCalls {
                             for tc in tcs {
@@ -1533,21 +1576,37 @@ final class ChatStore: ObservableObject {
     }
 
     private func updateRemoteBuffer(conversationID id: UUID, buffer: String) {
-        guard case .streaming(_, let status, let metrics) = phases[id] else { return }
-        phases[id] = .streaming(buffer: buffer, status: status, metrics: metrics)
+        guard case .streaming(_, let reasoning, let status, let metrics) =
+                phases[id] else { return }
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: status, metrics: metrics)
+    }
+
+    /// TODO §4 follow-up: live reasoning content in the bubble.
+    /// Called by `runRemoteLoop` whenever the upstream emits more
+    /// `reasoning_content` so the UI can render the running
+    /// thinking buffer before the turn finalizes at `.done`. Local
+    /// generation can't separate think tokens mid-stream, so this
+    /// path is remote-only today.
+    private func updateRemoteReasoningBuffer(conversationID id: UUID,
+                                               reasoning: String) {
+        guard case .streaming(let buffer, _, let status, let metrics) =
+                phases[id] else { return }
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: status, metrics: metrics)
     }
 
     private func updateRemoteProgress(conversationID id: UUID,
                                        generated: Int,
                                        elapsed: TimeInterval,
                                        tokPerMin: Double) {
-        guard case .streaming(let buffer, _, var metrics) = phases[id] else { return }
+        guard case .streaming(let buffer, let reasoning, _, var metrics) =
+                phases[id] else { return }
         metrics.generatedTokens = generated
         metrics.generationElapsed = elapsed
         metrics.generationTokPerMin = tokPerMin
-        phases[id] = .streaming(buffer: buffer,
-                                 status: "Streaming…",
-                                 metrics: metrics)
+        phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
+                                 status: "Streaming…", metrics: metrics)
     }
 
     /// Write the finalised assistant turn back to the store,
@@ -1604,6 +1663,9 @@ final class ChatStore: ObservableObject {
                                      metrics: metrics)
             toolRoundtrips[id] = nil
             lastSamplingOptions[id] = nil
+            // TODO §4 follow-up: the remote turn finished, drop
+            // the recovery breadcrumb.
+            conversations[idx].remotePendingTurn = nil
             phases[id] = .idle
         }
         scheduleSave(id)
@@ -1720,12 +1782,12 @@ final class ChatStore: ObservableObject {
     }
 
     private func currentMetrics(of id: UUID) -> GenerationMetrics {
-        if case .streaming(_, _, let m) = phase(of: id) { return m }
+        if case .streaming(_, _, _, let m) = phase(of: id) { return m }
         return GenerationMetrics()
     }
 
     private func currentBuffer(of id: UUID) -> String {
-        if case .streaming(let b, _, _) = phase(of: id) { return b }
+        if case .streaming(let b, _, _, _) = phase(of: id) { return b }
         return ""
     }
 
