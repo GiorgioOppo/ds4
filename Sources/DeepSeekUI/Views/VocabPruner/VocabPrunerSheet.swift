@@ -287,6 +287,23 @@ struct VocabPrunerSheet: View {
                     .opacity(vm.isCancelling ? 0.4 : (vm.isRunning ? 1 : 0.25))
             }
 
+            // Banner post-cancel: l'ultima run è stata cancellata,
+            // il checkpoint è salvato su disco, l'utente può
+            // premere Start per riprenderla o cambiare i parametri
+            // (al cambio di spec hash il checkpoint viene scartato
+            // e si riparte da zero).
+            if vm.status.cancelled && !vm.isRunning {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Run cancelled — checkpoint saved. " +
+                          "Press Start to resume from where you left off.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+
             // Status one-liner.
             HStack(spacing: 12) {
                 statusSummary

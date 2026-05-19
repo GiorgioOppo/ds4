@@ -105,6 +105,7 @@ final class VocabPrunerViewModel: ObservableObject {
         isCancelling = false
         lastError = nil
         status = VocabPruneStatus()
+        lastDecision = nil
         let token = CancellationToken()
         self.cancellation = token
 
@@ -137,6 +138,16 @@ final class VocabPrunerViewModel: ObservableObject {
                     // messaggio.
                     if wasCancelling {
                         self?.lastError = nil
+                        // Reset UI dello stato run per permettere
+                        // un nuovo Start pulito. Lo `status.cancelled`
+                        // resta true così la sheet può mostrare un
+                        // banner "Run cancelled — checkpoint salvato".
+                        self?.status = VocabPruneStatus(cancelled: true)
+                        self?.lastDecision = nil
+                        // Refresh delle info checkpoint così l'utente
+                        // vede quanti file/shard sono stati salvati
+                        // dal cancel (info pre-flight per il next Start).
+                        self?.refreshCheckpointInfo()
                     } else {
                         self?.lastError = (error as? LocalizedError)?.errorDescription
                             ?? cancelMsg
