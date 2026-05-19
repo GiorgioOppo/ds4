@@ -1,36 +1,42 @@
 import Foundation
 import DeepSeekKit
 
-// Calibration runner for the Llama-family path (TODO §1 follow-up).
-// Loads a GGUF model, walks a calibration corpus, accumulates
-// per-layer activation stats (ActivationObserver) and optionally
-// the per-layer Hessian (HessianObserver), and writes the results
-// to disk so a follow-up quantizer (gptqQuantizeBF16ToInt8,
-// quantizeBF16ToInt8Calibrated with .awq / .smoothQuant) can ingest
-// them.
+// Calibration runner shared by the Llama-family (GGUF) and the
+// DeepSeek-V4 (safetensors) paths (TODO §1 follow-up). Loads a
+// model, walks a calibration corpus, accumulates per-layer
+// activation stats (`ActivationObserver`) and optionally the
+// per-layer Hessian (`HessianObserver`), and writes the results
+// to disk in the format the converter ingests via
+// `--calib-stats`.
 //
-// CLI: deepseek_calibrate <path-to.gguf> <corpus.txt> <out-dir>
-//                          [--collect-hessian]            (heavy; required for GPTQ)
-//                          [--max-tokens-per-batch N]     (default 1024)
-//                          [--load-strategy mmap|preload|streaming]
-//                          [--weight-dtype f32|bf16]
-//                          [--max-seq-len N]
+// CLI:
+//   deepseek_calibrate <model-path> <corpus.txt> <out-dir> [options]
+//
+// `--architecture llama` (default): `<model-path>` is a .gguf file.
+//                                   Uses `LlamaCalibrationRunner`.
+// `--architecture v4`:              `<model-path>` is a directory
+//                                   from the V4 converter (BF16).
+//                                   Uses `V4CalibrationRunner`.
+//
+// Options:
+//   --collect-hessian            heavy, required for GPTQ
+//   --max-tokens-per-batch N     default 1024
+//   --max-seq-len N              optional KV cache cap (llama only)
+//   --weight-dtype f32|bf16      llama only; default f32
+//   --load-strategy mmap|preload llama only; default mmap
 //
 // Output:
-//   <out-dir>/stats.json
-//     { "layers": [
-//         { "name": "blk.0.attn_q", "inDim": 4096,
-//           "observedTokens": 12345,
-//           "perChannelAbsMax": [...], "perChannelMean": [...] }, ... ] }
-//   <out-dir>/hessians/<layer>.f64    (when --collect-hessian is set)
-//     raw little-endian Double[inDim * inDim], symmetric.
+//   <out-dir>/stats.json           per-layer perChannelAbsMax/Mean
+//   <out-dir>/hessians/<name>.f64  raw [inDim*inDim] Doubles (with --collect-hessian)
+
+enum Architecture: String { case llama, v4 }
 
 let args = CommandLine.arguments
 let stderr = FileHandle.standardError
 
 func usage() -> Never {
     stderr.write(Data("""
-    usage: deepseek_calibrate <path-to.gguf> <corpus.txt> <out-dir> [options]
+    usage: deepseek_calibrate <model-path> <corpus.txt> <out-dir> [options]
     See header in Sources/deepseek_calibrate/main.swift for the full flag list.
 
     """.utf8))
@@ -38,10 +44,11 @@ func usage() -> Never {
 }
 
 guard args.count >= 4 else { usage() }
-let ggufPath = args[1]
+let modelPath = args[1]
 let corpusPath = args[2]
 let outDir = args[3]
 
+var architecture: Architecture = .llama
 var collectHessian = false
 var maxTokensPerBatch = 1024
 var loadStrategy: LoadStrategy = .mmap
@@ -51,6 +58,11 @@ var maxSeqLenOverride: Int? = nil
 var i = 4
 while i < args.count {
     switch args[i] {
+    case "--architecture":
+        guard i + 1 < args.count,
+              let a = Architecture(rawValue: args[i + 1])
+        else { usage() }
+        architecture = a; i += 2
     case "--collect-hessian":
         collectHessian = true; i += 1
     case "--max-tokens-per-batch":
@@ -81,20 +93,6 @@ while i < args.count {
     }
 }
 
-// ---------- Load GGUF ----------
-stderr.write(Data("Opening GGUF (\(loadStrategy.rawValue))…\n".utf8))
-let gguf: GGUFFile
-do {
-    gguf = try GGUFFile(url: URL(fileURLWithPath: ggufPath),
-                          strategy: loadStrategy)
-} catch {
-    stderr.write(Data("GGUF open failed: \(error)\n".utf8))
-    exit(1)
-}
-
-// Streaming model would mean re-dequantizing weights every forward;
-// fine for normal inference but a calibration sweep is many forwards
-// so we materialize once instead.
 guard loadStrategy != .streaming else {
     stderr.write(Data(
         "Refusing to calibrate with --load-strategy streaming: per-forward "
@@ -102,32 +100,7 @@ guard loadStrategy != .streaming else {
     exit(1)
 }
 
-stderr.write(Data("Building LlamaModel…\n".utf8))
-let model: LlamaModel
-do {
-    model = try LlamaModel.fromGGUF(
-        gguf,
-        maxSeqLenOverride: maxSeqLenOverride,
-        weightDtype: weightDtype)
-} catch {
-    stderr.write(Data("LlamaModel build failed: \(error)\n".utf8))
-    exit(1)
-}
-stderr.write(Data(
-    "Model: \(model.config.nLayers) layers × \(model.config.nHeads) heads, "
-    + "vocab=\(model.config.vocabSize)\n".utf8))
-
-stderr.write(Data("Building tokenizer…\n".utf8))
-let loaded: LoadedTokenizer
-do {
-    loaded = try TokenizerLoader.loadFromGGUF(gguf)
-} catch {
-    stderr.write(Data("Tokenizer build failed: \(error)\n".utf8))
-    exit(1)
-}
-let tokenizer = loaded.tokenizer
-
-// ---------- Read corpus ----------
+// ---------- Read corpus (shared) ----------
 let corpusContents: String
 do {
     corpusContents = try String(
@@ -143,29 +116,132 @@ let samples = corpusContents
     .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
 stderr.write(Data("Corpus: \(samples.count) samples\n".utf8))
 
-// ---------- Run calibration ----------
 let actObs = ActivationObserver()
 let hessObs: HessianObserver? = collectHessian ? HessianObserver() : nil
-let runner = LlamaCalibrationRunner(
-    model: model, tokenizer: tokenizer,
-    activation: actObs, hessian: hessObs)
-runner.maxTokensPerBatch = maxTokensPerBatch
 
+// nLayers and orderedNames depend on the architecture; we fill
+// them in inside each branch and use them after for the write-out.
+var nLayers = 0
+var orderedNames: [String] = []
+var modelLabel = modelPath
 let started = Date()
-for (idx, sample) in samples.enumerated() {
-    runner.observe(sample)
-    if (idx + 1) % 10 == 0 || idx == samples.count - 1 {
-        let dt = Date().timeIntervalSince(started)
-        stderr.write(Data(
-            "[\(idx + 1)/\(samples.count)] " + String(format: "%.1f", dt)
-            + "s elapsed\n".utf8))
+
+switch architecture {
+
+case .llama:
+    // ---------- Load GGUF + Llama ----------
+    stderr.write(Data("Opening GGUF (\(loadStrategy.rawValue))…\n".utf8))
+    let gguf: GGUFFile
+    do {
+        gguf = try GGUFFile(url: URL(fileURLWithPath: modelPath),
+                              strategy: loadStrategy)
+    } catch {
+        stderr.write(Data("GGUF open failed: \(error)\n".utf8))
+        exit(1)
     }
+    stderr.write(Data("Building LlamaModel…\n".utf8))
+    let model: LlamaModel
+    do {
+        model = try LlamaModel.fromGGUF(
+            gguf,
+            maxSeqLenOverride: maxSeqLenOverride,
+            weightDtype: weightDtype)
+    } catch {
+        stderr.write(Data("LlamaModel build failed: \(error)\n".utf8))
+        exit(1)
+    }
+    stderr.write(Data(
+        "Model: \(model.config.nLayers) layers × \(model.config.nHeads) heads, "
+        + "vocab=\(model.config.vocabSize)\n".utf8))
+
+    let loaded = try TokenizerLoader.loadFromGGUF(gguf)
+    let tokenizer = loaded.tokenizer
+
+    let runner = LlamaCalibrationRunner(
+        model: model, tokenizer: tokenizer,
+        activation: actObs, hessian: hessObs)
+    runner.maxTokensPerBatch = maxTokensPerBatch
+
+    for (idx, sample) in samples.enumerated() {
+        runner.observe(sample)
+        if (idx + 1) % 10 == 0 || idx == samples.count - 1 {
+            stderr.write(Data(
+                "[\(idx + 1)/\(samples.count)] "
+                + String(format: "%.1f", Date().timeIntervalSince(started))
+                + "s elapsed\n".utf8))
+        }
+    }
+    nLayers = model.config.nLayers
+    var names = Set<String>()
+    for L in 0..<nLayers {
+        for s in ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"] {
+            names.insert("blk.\(L).\(s)")
+        }
+    }
+    orderedNames = names.sorted()
+
+case .v4:
+    // ---------- Load V4 converted model ----------
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let configURL = modelDir.appendingPathComponent("config.json")
+    stderr.write(Data("Reading config.json…\n".utf8))
+    let config: ModelConfig
+    do {
+        config = try ModelConfig.load(from: configURL)
+    } catch {
+        stderr.write(Data("ModelConfig.load failed: \(error)\n".utf8))
+        exit(1)
+    }
+    stderr.write(Data(
+        "Model: \(config.nLayers) layers, dim=\(config.dim), "
+        + "nRoutedExperts=\(config.nRoutedExperts)\n".utf8))
+
+    stderr.write(Data("Loading tokenizer…\n".utf8))
+    let loaded: LoadedTokenizer
+    do {
+        loaded = try TokenizerLoader.load(tokenizerDir: modelDir)
+    } catch {
+        stderr.write(Data("Tokenizer load failed: \(error)\n".utf8))
+        exit(1)
+    }
+    let tokenizer = loaded.tokenizer
+
+    stderr.write(Data("Loading Transformer weights "
+        + "(\(loadStrategy.rawValue))…\n".utf8))
+    let model: Transformer
+    do {
+        model = try Transformer.load(
+            config: config, from: modelDir,
+            strategyOverride: loadStrategy.rawValue)
+    } catch {
+        stderr.write(Data("Transformer.load failed: \(error)\n".utf8))
+        exit(1)
+    }
+
+    let runner = V4CalibrationRunner(
+        model: model, tokenizer: tokenizer,
+        activation: actObs, hessian: hessObs)
+    runner.maxTokensPerBatch = maxTokensPerBatch
+
+    for (idx, sample) in samples.enumerated() {
+        runner.observe(sample)
+        if (idx + 1) % 5 == 0 || idx == samples.count - 1 {
+            stderr.write(Data(
+                "[\(idx + 1)/\(samples.count)] "
+                + String(format: "%.1f", Date().timeIntervalSince(started))
+                + "s elapsed\n".utf8))
+        }
+    }
+    nLayers = config.nLayers
+    orderedNames = runner.tagNames()
+    modelLabel = modelDir.path
 }
+
 stderr.write(Data("Calibration done in "
     + String(format: "%.1f", Date().timeIntervalSince(started))
     + "s\n".utf8))
 
-// ---------- Write outputs ----------
+// ---------- Write outputs (shared) ----------
 let outURL = URL(fileURLWithPath: outDir)
 do {
     try FileManager.default.createDirectory(
@@ -175,19 +251,6 @@ do {
     exit(1)
 }
 
-// Layer name set: union of what's been observed. We sort so the
-// JSON output has a deterministic order.
-var layerNames = Set<String>()
-for L in 0..<model.config.nLayers {
-    for suffix in ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"] {
-        layerNames.insert("blk.\(L).\(suffix)")
-    }
-}
-let orderedNames = layerNames.sorted()
-
-// stats.json — uses the public `CalibrationStatsFile` from
-// DeepSeekKit so the converter can decode the same struct on the
-// consume side.
 var layerStats: [CalibrationStatsFile.LayerStats] = []
 for name in orderedNames {
     guard let s = actObs.finalize(for: name) else { continue }
@@ -199,8 +262,8 @@ for name in orderedNames {
         perChannelMean: s.perChannelMean ?? []))
 }
 let statsFile = CalibrationStatsFile(
-    model: ggufPath,
-    nLayers: model.config.nLayers,
+    model: modelLabel,
+    nLayers: nLayers,
     hessianCollected: collectHessian,
     layers: layerStats)
 let statsJSONURL = outURL.appendingPathComponent("stats.json")
@@ -216,7 +279,6 @@ do {
     exit(1)
 }
 
-// hessians/<layer>.f64
 if let hessObs = hessObs {
     let hessDir = outURL.appendingPathComponent("hessians")
     try? FileManager.default.createDirectory(
@@ -234,8 +296,6 @@ if let hessObs = hessObs {
         } catch {
             stderr.write(Data("hessian write failed for \(name): \(error)\n".utf8))
         }
-        // Release immediately so we don't hold every layer's Hessian
-        // in memory at once — for inDim=11k that's ~970 MB per layer.
         hessObs.releaseLayer(name)
     }
 }

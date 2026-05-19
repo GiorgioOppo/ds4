@@ -20,6 +20,20 @@ public final class Block {
     public let hcFfnBase: Tensor
     public let hcFfnScale: Tensor
 
+    /// Optional observation hooks used by `V4CalibrationRunner`
+    /// (TODO §1). `preAttnObserver` fires with `yNorm` (the input
+    /// to MLA's wq_a / wkv) just before the attention sub-layer;
+    /// `preFfnObserver` fires with `yNorm2` (the input to the MoE
+    /// expert gates / up projections) just before the FFN
+    /// sub-layer. The closure is responsible for any
+    /// `commit + waitUntilCompleted` it needs to read the
+    /// activation bytes — it can rotate `cmd` to a fresh buffer
+    /// after sync. Default nil → zero overhead on the inference
+    /// path.
+    public typealias ObservationHook = (Tensor, inout MTLCommandBuffer) -> Void
+    public var preAttnObserver: ObservationHook?
+    public var preFfnObserver: ObservationHook?
+
     public init(layerId: Int, config: ModelConfig,
                 attn: MLA, ffn: MoEFFN,
                 attnNorm: RMSNorm, ffnNorm: RMSNorm,
@@ -65,6 +79,10 @@ public final class Block {
         // attnPre.y: [N, dim]
         let yNorm = attnNorm(attnPre.y, in: cmd).reshape([B, S, dim])
         traceHere("after attnNorm", yNorm)
+        // Calibration hook (TODO §1) — yNorm is the input to MLA's
+        // wq_a / wkv. The observer commits + reads + records, then
+        // rotates `cmd` to a fresh buffer via the inout.
+        preAttnObserver?(yNorm, &cmd)
         let attnOut = attn(yNorm, startPos: startPos, in: &cmd)       // [B, S, dim]
         traceHere("after attn (MLA returned)", attnOut)
 
@@ -81,6 +99,11 @@ public final class Block {
         traceHere("after hc.pre(ffn).y", ffnPre.y)
         let yNorm2 = ffnNorm(ffnPre.y, in: cmd).reshape([B, S, dim])
         traceHere("after ffnNorm", yNorm2)
+        // Calibration hook (TODO §1) — yNorm2 is the input to the
+        // MoE expert gate/up projections (pre-routing; every expert
+        // sees the routed subset of this, the same per-channel
+        // statistics serve all of them as an approximation).
+        preFfnObserver?(yNorm2, &cmd)
         let ffnOut = ffn(yNorm2, inputIds: inputIds, in: &cmd)        // [B, S, dim]
         traceHere("after ffn", ffnOut)
         let xOut = hc.post(x: ffnOut.reshape([N, dim]),
