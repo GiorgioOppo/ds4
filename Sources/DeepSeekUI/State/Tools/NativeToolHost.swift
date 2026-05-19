@@ -83,9 +83,9 @@ final class NativeToolHost: ObservableObject {
                 account: KeychainAccount.tavilyAPIKey),
                   !key.isEmpty
             else {
-                FileHandle.standardError.write(Data(
+                FileHandle.standardError.write(Data((
                     "[websearch] webSearchProvider=tavily but no Keychain "
-                    + "entry under tavilyAPIKey — falling back to DuckDuckGo\n".utf8))
+                    + "entry under tavilyAPIKey — falling back to DuckDuckGo\n").utf8))
                 return nil
             }
             return TavilyProvider(apiKey: key)
@@ -94,9 +94,9 @@ final class NativeToolHost: ObservableObject {
                 account: KeychainAccount.braveSearchAPIKey),
                   !key.isEmpty
             else {
-                FileHandle.standardError.write(Data(
+                FileHandle.standardError.write(Data((
                     "[websearch] webSearchProvider=brave but no Keychain "
-                    + "entry under braveSearchAPIKey — falling back to DuckDuckGo\n".utf8))
+                    + "entry under braveSearchAPIKey — falling back to DuckDuckGo\n").utf8))
                 return nil
             }
             return BraveProvider(apiKey: key)
@@ -105,9 +105,9 @@ final class NativeToolHost: ObservableObject {
                 account: KeychainAccount.serperAPIKey),
                   !key.isEmpty
             else {
-                FileHandle.standardError.write(Data(
+                FileHandle.standardError.write(Data((
                     "[websearch] webSearchProvider=serper but no Keychain "
-                    + "entry under serperAPIKey — falling back to DuckDuckGo\n".utf8))
+                    + "entry under serperAPIKey — falling back to DuckDuckGo\n").utf8))
                 return nil
             }
             return SerperProvider(apiKey: key)
