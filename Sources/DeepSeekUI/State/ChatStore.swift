@@ -1504,8 +1504,17 @@ final class ChatStore: ObservableObject {
                 history: snapshot.history,
                 agent: snapshot.agent,
                 projectInventory: projectInventory)
+            // Stessa logica del local path (vedi `send` →
+            // `composeToolSchemasJSON`): l'agent attivo viene filtrato
+            // fuori dalla roster delegabile per evitare di mandarsi
+            // a se stesso. Senza un agent attaccato, tutti gli agent
+            // registrati sono potenzialmente delegabili. ChatStore è
+            // @MainActor → accesso sincrono diretto.
+            let delegableAgents = self.agents.agents
+                .filter { $0.id != snapshot.agent?.id }
             let toolsArray = self.composeOpenAITools(
-                mcpAllowed: snapshot.agent?.allowedToolNames)
+                mcpAllowed: snapshot.agent?.allowedToolNames,
+                delegableAgents: delegableAgents)
 
             var body: [String: Any] = [
                 "model": modelID,
@@ -1851,24 +1860,77 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Costruisce l'array `tools` nel formato OpenAI canonico
+    /// (`{type: "function", function: {name, description, parameters}}`)
+    /// che OpenRouter inietta nel system prompt server-side. Specchio
+    /// remoto di `composeToolSchemasJSON` per il local DSV4 — stessi
+    /// input, output diverso. Include sia gli MCP tool che il
+    /// sintetico `__delegate_to_agent` (quando ci sono altri agent
+    /// invocabili); senza quest'ultimo, un chat remota con agent
+    /// configurati non saprebbe come delegare e l'asimmetria
+    /// local↔remote sarebbe visibile.
     private func composeOpenAITools(
-        mcpAllowed: Set<String>?
+        mcpAllowed: Set<String>?,
+        delegableAgents: [AgentConfig]
     ) -> [[String: Any]]? {
-        if let allowed = mcpAllowed, allowed.isEmpty { return nil }
         var schemas: [[String: Any]] = []
-        for tool in mcpPool.allTools() {
-            if let allowed = mcpAllowed, !allowed.contains(tool.qualifiedName) {
-                continue
+
+        // MCP tools (filtered by the attached agent's allowlist
+        // when one is in effect — same precedence the local path
+        // uses in composeToolSchemasJSON).
+        let mcpAllEmpty = (mcpAllowed?.isEmpty == true)
+        if !mcpAllEmpty {
+            for tool in mcpPool.allTools() {
+                if let allowed = mcpAllowed,
+                   !allowed.contains(tool.qualifiedName) {
+                    continue
+                }
+                schemas.append([
+                    "type": "function",
+                    "function": [
+                        "name": tool.qualifiedName,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema
+                    ]
+                ])
             }
+        }
+
+        // Sub-agent delegation. Mirrors composeToolSchemasJSON:1075
+        // — same name, same description shape, same parameters; only
+        // the wrapping differs (OpenAI `function` block vs DSV4
+        // `inputSchema` field).
+        if !delegableAgents.isEmpty {
+            let roster = delegableAgents
+                .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
+                .joined(separator: "\n")
             schemas.append([
                 "type": "function",
                 "function": [
-                    "name": tool.qualifiedName,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
+                    "name": EncodingDSV4.delegateToolName,
+                    "description":
+                        """
+                        Delegate a focused sub-task to another agent. The named agent will run independently with its own system prompt and produce a single textual reply that becomes this tool's output. Use it when a sub-task is better handled by a specialist agent. Available agents:
+                        \(roster)
+                        """,
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "agent_name": [
+                                "type": "string",
+                                "description": "Exact name of the agent to invoke."
+                            ],
+                            "task": [
+                                "type": "string",
+                                "description": "Clear, self-contained description of what the sub-agent should do."
+                            ]
+                        ],
+                        "required": ["agent_name", "task"]
+                    ]
                 ]
             ])
         }
+
         return schemas.isEmpty ? nil : schemas
     }
 
