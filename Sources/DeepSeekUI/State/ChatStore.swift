@@ -1727,6 +1727,14 @@ final class ChatStore: ObservableObject {
         if let mIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == placeholderID })
         {
+            // Preserva il prefillTrace accumulato durante lo
+            // streaming remote (dump del body OpenRouter). L'init
+            // dello StoredMessage non lo prende dal `Message` del
+            // kit — il backend remoto non lo conosce — quindi va
+            // letto dal valore precedente e ripassato esplicitamente
+            // così non viene azzerato dalla riscrittura del
+            // placeholder.
+            let prevTrace = conversations[idx].messages[mIdx].prefillTrace
             conversations[idx].messages[mIdx] = StoredMessage(
                 id: placeholderID,
                 role: .assistant,
@@ -1734,7 +1742,8 @@ final class ChatStore: ObservableObject {
                 reasoningContent: final.reasoningContent,
                 toolCalls: final.toolCalls.map(StoredToolCall.init),
                 tokenCount: usage?.completionTokens,
-                toolOutputs: nil)
+                toolOutputs: nil,
+                prefillTrace: prevTrace)
         }
         if let uIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == userMessageID })
