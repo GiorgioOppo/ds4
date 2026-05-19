@@ -1,4 +1,5 @@
 import Foundation
+import DeepSeekIntegrations
 
 /// Anthropic Messages API client (TODO §10.4 / T4). Mirrors
 /// `OpenRouterClient`'s shape — same `AsyncThrowingStream<OpenAIStreamChunk,
@@ -34,6 +35,11 @@ final class AnthropicClient: @unchecked Sendable {
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 600
         cfg.waitsForConnectivity = true
+        // TODO §9: opt-in HTTPRecorder — same pattern as
+        // OpenRouterClient. Off by default; flip via
+        // `HTTPRecorder.shared.configure(directory:mode:)`.
+        cfg.protocolClasses = [HTTPRecorderURLProtocol.self]
+            + (cfg.protocolClasses ?? [])
         self.session = URLSession(configuration: cfg)
     }
 

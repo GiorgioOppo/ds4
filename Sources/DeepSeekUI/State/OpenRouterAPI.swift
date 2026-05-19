@@ -1,4 +1,5 @@
 import Foundation
+import DeepSeekIntegrations
 
 // MARK: - Types
 
@@ -211,6 +212,13 @@ final class OpenRouterClient: @unchecked Sendable {
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 600
         cfg.waitsForConnectivity = true
+        // TODO §9: opt-in HTTPRecorder. The protocol decides per-
+        // request whether to intercept based on
+        // `HTTPRecorder.shared.mode`. When off (the default) the
+        // protocol's canInit returns false and we hit the standard
+        // URL loader — zero overhead.
+        cfg.protocolClasses = [HTTPRecorderURLProtocol.self]
+            + (cfg.protocolClasses ?? [])
         self.session = URLSession(configuration: cfg)
     }
 
