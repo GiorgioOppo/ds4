@@ -17,7 +17,8 @@ public enum DefaultTools {
                                 includeNetwork: Bool = true,
                                 includeRepoClone: Bool = true,
                                 includeStubs: Bool = false,
-                                shellUsesSandbox: Bool = false) -> [Tool] {
+                                shellUsesSandbox: Bool = false,
+                                webSearchProvider: WebSearchProvider? = nil) -> [Tool] {
         var tools: [Tool] = [
             ReadTool(),
             WriteTool(),
@@ -35,7 +36,15 @@ public enum DefaultTools {
         }
         if includeNetwork {
             tools.append(WebFetchTool())
-            tools.append(WebSearchTool())
+            // The caller can swap the search backend in via
+            // `webSearchProvider`; nil keeps the DuckDuckGo lite
+            // scraper default. See TavilyProvider / BraveProvider /
+            // SerperProvider in `WebSearchTool.swift`.
+            if let provider = webSearchProvider {
+                tools.append(WebSearchTool(provider: provider))
+            } else {
+                tools.append(WebSearchTool())
+            }
         }
         if includeRepoClone {
             tools.append(RepoCloneTool())

@@ -76,6 +76,14 @@ enum AppSettingsKey {
     static let serverEnabled = "deepseek.server.enabled"
     static let serverPort = "deepseek.server.port"
     static let serverBindAddress = "deepseek.server.bindAddress"
+
+    /// Web-search backend choice (TODO §8 follow-up). Values:
+    /// "duckduckgo" (default, no key needed, fragile scraper),
+    /// "tavily", "brave", "serper" (each requires the matching
+    /// Keychain entry under `KeychainAccount.*APIKey`). When the
+    /// selected backend's key is missing, `NativeToolHost` falls
+    /// back to the DuckDuckGo provider with a stderr note.
+    static let webSearchProvider = "deepseek.webSearch.provider"
 }
 
 /// Helper for code paths that need to read defaults without going

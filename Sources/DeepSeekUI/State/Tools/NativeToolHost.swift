@@ -35,10 +35,64 @@ final class NativeToolHost: ObservableObject {
         self.registry = registry
         self.permissionDelegate = delegate
         delegate.host = self
+        // TODO §8: pick the web-search backend from AppStorage +
+        // Keychain. Missing key on the selected provider falls
+        // back to DuckDuckGo with a stderr note so the tool stays
+        // useful even when configuration's incomplete.
+        let searchProvider = Self.resolveWebSearchProvider()
         Task { @MainActor [registry] in
             await registry.registerAll(
-                DefaultTools.standard(planStore: store))
+                DefaultTools.standard(planStore: store,
+                                       webSearchProvider: searchProvider))
             self.schemas = await registry.availableSchemas(mode: .build)
+        }
+    }
+
+    /// Resolve the user-configured search backend (or nil to keep
+    /// the DefaultTools default of `DuckDuckGoLiteProvider`).
+    /// Reads `AppSettingsKey.webSearchProvider` from UserDefaults
+    /// + the matching `KeychainAccount.*APIKey` from the Keychain.
+    /// Emits a one-time stderr note when the user asked for a
+    /// key'd provider but didn't store the key.
+    private static func resolveWebSearchProvider() -> WebSearchProvider? {
+        let raw = UserDefaults.standard.string(
+            forKey: AppSettingsKey.webSearchProvider) ?? "duckduckgo"
+        switch raw {
+        case "tavily":
+            guard let key = KeychainStore.get(
+                account: KeychainAccount.tavilyAPIKey),
+                  !key.isEmpty
+            else {
+                FileHandle.standardError.write(Data(
+                    "[websearch] webSearchProvider=tavily but no Keychain "
+                    + "entry under tavilyAPIKey — falling back to DuckDuckGo\n".utf8))
+                return nil
+            }
+            return TavilyProvider(apiKey: key)
+        case "brave":
+            guard let key = KeychainStore.get(
+                account: KeychainAccount.braveSearchAPIKey),
+                  !key.isEmpty
+            else {
+                FileHandle.standardError.write(Data(
+                    "[websearch] webSearchProvider=brave but no Keychain "
+                    + "entry under braveSearchAPIKey — falling back to DuckDuckGo\n".utf8))
+                return nil
+            }
+            return BraveProvider(apiKey: key)
+        case "serper":
+            guard let key = KeychainStore.get(
+                account: KeychainAccount.serperAPIKey),
+                  !key.isEmpty
+            else {
+                FileHandle.standardError.write(Data(
+                    "[websearch] webSearchProvider=serper but no Keychain "
+                    + "entry under serperAPIKey — falling back to DuckDuckGo\n".utf8))
+                return nil
+            }
+            return SerperProvider(apiKey: key)
+        default:
+            return nil  // duckduckgo (DefaultTools.standard's default)
         }
     }
 
