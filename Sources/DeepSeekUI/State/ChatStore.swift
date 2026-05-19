@@ -1528,6 +1528,25 @@ final class ChatStore: ObservableObject {
             case .chat: break
             }
 
+            // Prompt trace remoto: dump del body JSON che stiamo
+            // per inviare a OpenRouter — system message, tools array
+            // (formato OpenAI), tool_choice, messages, sampler.
+            // Equivalente del prefill trace locale per ispezione di
+            // "cosa vede il modello?". Solo alla prima iterazione
+            // del runRemoteLoop (= primo turn dopo lo user send;
+            // iterazioni successive sono continuazioni dopo tool
+            // calls e hanno body simile + outputs). In background
+            // così non rallenta la HTTP request.
+            if iteration == 1 {
+                let bodyForTrace = body
+                Task { [weak self] in
+                    await self?.emitRemotePromptTrace(
+                        conversationID: id,
+                        placeholderID: currentPlaceholderID,
+                        body: bodyForTrace)
+                }
+            }
+
             // Stream + accumulate.
             let stream = client.streamChatCompletion(
                 apiKey: apiKey, body: body)
@@ -1763,6 +1782,66 @@ final class ChatStore: ObservableObject {
     /// invocation would need a remote sub-agent loop that doesn't
     /// exist yet. A `__delegate_to_agent` schema would just lure
     /// the model into calls we have to refuse with an error.
+    /// Emette il body JSON di una OpenRouter request nel campo
+    /// `prefillTrace` del placeholder, a chunk per dare l'effetto
+    /// streaming come per il prefill trace locale. Gated dallo
+    /// stesso flag `showPrefillTrace`. Reset del trace al start
+    /// così un retry/iterazione sovrascrive invece di appendere.
+    /// Si esegue su un Task in background (non blocca l'HTTP) — il
+    /// dump è solo informativo e la response arriva comunque.
+    private func emitRemotePromptTrace(conversationID: UUID,
+                                         placeholderID: UUID,
+                                         body: [String: Any]) async {
+        let traceFlag = UserDefaults.standard.object(
+            forKey: AppSettingsKey.showPrefillTrace) as? Bool ?? true
+        guard traceFlag else { return }
+
+        let pretty: String? = {
+            // .sortedKeys per output deterministico (utile per
+            // confrontare due trace). .withoutEscapingSlashes evita
+            // che gli URL dentro al body diventino illeggibili.
+            let opts: JSONSerialization.WritingOptions =
+                [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: body, options: opts) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }()
+        guard let text = pretty else { return }
+
+        // Reset on this placeholder prima di scrivere (no doppione
+        // se per qualche motivo entriamo qua due volte).
+        await MainActor.run {
+            if let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
+               let mIdx = self.conversations[cIdx].messages.firstIndex(
+                where: { $0.id == placeholderID }) {
+                self.conversations[cIdx].messages[mIdx].prefillTrace = nil
+            }
+        }
+
+        let chars = Array(text)
+        let chunkSize = 40
+        var i = 0
+        while i < chars.count {
+            if Task.isCancelled { break }
+            let end = min(i + chunkSize, chars.count)
+            let chunk = String(chars[i..<end])
+            await MainActor.run {
+                guard let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
+                      let mIdx = self.conversations[cIdx].messages.firstIndex(
+                        where: { $0.id == placeholderID })
+                else { return }
+                let prev = self.conversations[cIdx].messages[mIdx].prefillTrace ?? ""
+                self.conversations[cIdx].messages[mIdx].prefillTrace = prev + chunk
+                self.scheduleSave(conversationID)
+            }
+            i = end
+            // ~4 ms fra chunk — totalizza ~1 s per body da 10 KB.
+            // Trascurabile vs latenza HTTP (centinaia di ms al
+            // first-byte di OpenRouter).
+            try? await Task.sleep(nanoseconds: 4_000_000)
+        }
+    }
+
     private func composeOpenAITools(
         mcpAllowed: Set<String>?
     ) -> [[String: Any]]? {

@@ -92,18 +92,19 @@ struct LocalModelSettingsSheet: View {
                 }
 
                 Section("Diagnostics") {
-                    Toggle("Mostra il prompt al modello (primo turn)",
+                    Toggle("Mostra il prompt al modello",
                             isOn: $showPrefillTrace)
-                    Text("Sul primo messaggio di ogni conversazione " +
-                         "(cold prefill, KV cache vuota) inserisce " +
-                         "fra il tuo messaggio e la risposta un " +
-                         "blocco grigio collassabile che mostra in " +
-                         "streaming il testo completo del prompt che " +
-                         "il modello sta per leggere: system message, " +
-                         "blocco tools, project context, history. " +
-                         "Sui turn successivi il delta è solo il " +
-                         "nuovo user message — il trace viene omesso " +
-                         "per non rumoreggiare.")
+                    Text("Fra il tuo messaggio e la risposta " +
+                         "inserisce un blocco grigio collassabile " +
+                         "con il payload effettivo che il modello " +
+                         "vede. Locale: testo del prompt decodificato " +
+                         "dai token (system + tools + project + " +
+                         "history), mostrato solo sui cold prefill " +
+                         "(primo turn della conversation). Remoto: " +
+                         "JSON del body della HTTP request a " +
+                         "OpenRouter (messages array, tools array, " +
+                         "sampler, tool_choice), mostrato al primo " +
+                         "step di ogni user send.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
