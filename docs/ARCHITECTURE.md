@@ -281,7 +281,7 @@ ChatStore.send(text, mode, options, maxTokens)
                       executeSubAgentDelegation
           • tokenizeToolOutputsDelta → fast-path delta append
           • re-issue generateForConversation
-          • loop (≤ 8 roundtrips per turn)
+          • loop (≤ 21 roundtrips per turn)
 ```
 
 Both branches surface the same `GenerationPhase` enum
