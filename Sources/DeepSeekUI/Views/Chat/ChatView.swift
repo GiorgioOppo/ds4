@@ -329,6 +329,11 @@ struct ChatView: View {
             // configurata" così il pulsante Send è disabilitato.
             return KeychainStore.exists(
                 account: KeychainAccount.openRouterAPIKey)
+        case .anthropic:
+            // Stesso schema di OpenRouter: serve solo che la chiave
+            // sia presente; il validate vero parte al send.
+            return KeychainStore.exists(
+                account: KeychainAccount.anthropicAPIKey)
         case .localDirectory:
             // Local: serve il transformer caricato nel service.
             // Leggiamo da `modelState.loadedLocalModelDir` (mirror

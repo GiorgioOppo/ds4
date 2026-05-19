@@ -1269,14 +1269,12 @@ final class ChatStore: ObservableObject {
         // public name with `native__` so the dispatch side can
         // tell native from MCP without ambiguity. Agent allowlist
         // filtering of native tools is a separate follow-up.
-        if let host = nativeTools {
-            for s in host.schemas {
-                schemas.append([
-                    "name": "native__\(s.name)",
-                    "description": s.description,
-                    "inputSchema": s.inputSchema.foundationValue,
-                ])
-            }
+        for s in nativeTools.schemas {
+            schemas.append([
+                "name": "native__\(s.name)",
+                "description": s.description,
+                "inputSchema": s.inputSchema.foundationValue,
+            ])
         }
 
         if !delegableAgents.isEmpty {

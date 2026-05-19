@@ -399,7 +399,7 @@ private struct ModelPicker: View {
             if modelState.loadedLocalModelDir?.path != path {
                 Task { await modelState.load(endpoint) }
             }
-        case .openRouter:
+        case .openRouter, .anthropic:
             // Remote: il load valida la chiave, non scarica il local.
             // Sicuro chiamarlo a ogni bind (idempotente lato server).
             Task { await modelState.load(endpoint) }
