@@ -7,28 +7,46 @@ import DeepSeekKit
 ///   - `GET  /v1/models`              — returns the currently loaded
 ///                                       model as a singleton catalog
 ///   - `POST /v1/chat/completions`    — both `stream: true` (SSE) and
-///                                       `stream: false` (single JSON)
+///                                       `stream: false` (single JSON);
+///                                       supports server-side `tools[]`
+///                                       dispatch through `MCPClientPool`
 ///
-/// Tools (`tools[]` passthrough → MCP / native registry) follow in a
-/// later sub-task; for now any `tools` field in the request is
-/// ignored and the loop stays in pure text mode.
+/// Tool flow (mirrors the local-backend loop in `ChatStore`):
+///   1. Build `toolSchemasJSON` from the controller's MCP registry,
+///      optionally filtered by the `tools[*].function.name` array in
+///      the request body.
+///   2. Tokenize the user-supplied messages with that schema injected
+///      into the DSV4 prompt.
+///   3. Generate until `.done`. If the parsed assistant Message has
+///      no `toolCalls`, emit the text to the client and we're done.
+///   4. Otherwise: append the assistant turn to the in-memory
+///      history, invoke each tool via the controller, slot the
+///      results into `toolOutputs`, and loop. Cap at 8 round-trips
+///      to bound runaway models — the cap matches `ChatStore`'s
+///      `maxToolRoundtripsPerTurn`.
 ///
-/// Concurrency: each handler captures `service` by reference. The
-/// underlying `InferenceService` dispatches every generation onto a
-/// single serial queue, so concurrent HTTP requests naturally
-/// serialize — first-come-first-served, no multiplexing. That's the
-/// right semantics for single-user dev workflows; multi-tenant
-/// serving would require `KV cache pool` (TODO §5) plus per-request
-/// transformer instances.
+/// Limitation (documented): streaming clients see no SSE bytes while
+/// intermediate tool rounds run. Only the final text-only round
+/// streams. This is the same trade-off `ChatStore` makes on the local
+/// path; OpenAI's `delta.tool_calls` streaming would require
+/// formatting DSML tool calls back to OpenAI tool_calls JSON
+/// per-token, which is a separate workstream.
 enum LocalServerRoutes {
-    /// Wire every supported route onto `server`. Call once at startup
-    /// after `LocalServer.start(...)` succeeds.
+    /// Hard cap on tool-call iterations per request. Same constant
+    /// as ChatStore's local loop.
+    private static let maxToolRoundtripsPerTurn = 8
+
+    /// Wire every supported route onto `server`. Call once after
+    /// `LocalServer.start(...)` succeeds. `controller` brokers all
+    /// `@MainActor`-isolated access (MCP pool, Keychain reads).
     static func register(on server: LocalServer,
-                          service: InferenceService) async {
+                          service: InferenceService,
+                          controller: LocalServerController) async {
         await server.register(method: "GET", path: "/v1/models",
                                handler: makeModelsHandler(service: service))
         await server.register(method: "POST", path: "/v1/chat/completions",
-                               handler: makeChatCompletionsHandler(service: service))
+                               handler: makeChatCompletionsHandler(
+                                service: service, controller: controller))
     }
 
     // MARK: - /v1/models
@@ -60,7 +78,8 @@ enum LocalServerRoutes {
     // MARK: - /v1/chat/completions
 
     private static func makeChatCompletionsHandler(
-        service: InferenceService) -> LocalServerHandler
+        service: InferenceService,
+        controller: LocalServerController) -> LocalServerHandler
     {
         return { request, writer in
             // Decode the OpenAI request body.
@@ -73,8 +92,6 @@ enum LocalServerRoutes {
                 return
             }
 
-            // Bail early if the model isn't loaded — without a
-            // tokenizer we can't even turn the prompt into ids.
             guard service.loadedModelDir != nil else {
                 await writeError(writer, status: 503,
                                   message: "No local model loaded on the server. "
@@ -82,67 +99,149 @@ enum LocalServerRoutes {
                 return
             }
 
-            // Map OpenAI messages → DeepSeekKit Message. Tool messages
-            // (role="tool") are folded into the preceding assistant
-            // turn's toolOutputs — first-cut handling until tools[]
-            // passthrough lands.
-            let history = mapMessages(req.messages)
+            // Resolve which MCP tools to expose this turn:
+            //   - request.tools nil → expose every registered tool
+            //   - request.tools [] → opt out, no tools
+            //   - request.tools non-empty → filter by name
+            let allowedNames: Set<String>? = {
+                guard let tools = req.tools else { return nil }
+                let names = tools.compactMap { $0.function?.name }
+                return Set(names)
+            }()
+            let toolSchemasJSON = await controller.composeToolSchemasJSON(
+                allowedNames: allowedNames)
+
+            // Map OpenAI messages → DeepSeekKit Message.
+            var history = mapMessages(req.messages)
             let mode = thinkingMode(from: req)
             let options = samplingOptions(from: req)
             let maxTokens = req.max_tokens ?? 1024
 
-            guard let promptTokens = await service.tokenizeFullHistory(
-                history, mode: mode, toolSchemasJSON: nil)
-            else {
-                await writeError(writer, status: 500,
-                                  message: "Tokenizer unavailable.")
-                return
-            }
-
-            // Synthesize a fresh UUID per request. This forces a
-            // full reset of the InferenceService KV cache on each
-            // call — correct but slow for repeated turns from the
-            // same client. Session reuse is a future optimization
-            // (see TODO §5 "KV cache pool").
             let conversationID = UUID()
-            let stream = service.generateForConversation(
-                promptTokens: promptTokens,
-                conversationID: conversationID,
-                mode: mode,
-                options: options,
-                maxTokens: maxTokens)
-
             let modelName = service.loadedModelDir?.lastPathComponent
                 ?? "local-model"
             let chatID = "chatcmpl-\(UUID().uuidString)"
             let created = Int(Date().timeIntervalSince1970)
 
-            if req.stream == true {
-                await streamChatResponse(
-                    writer: writer, chatID: chatID, model: modelName,
-                    created: created, stream: stream)
-            } else {
-                await bufferChatResponse(
-                    writer: writer, chatID: chatID, model: modelName,
-                    created: created, stream: stream)
+            // Tool-call loop. Each non-final iteration appends an
+            // assistant turn with toolCalls + toolOutputs and re-runs
+            // the model. The final iteration (zero toolCalls in the
+            // parsed Message) is the one that streams / buffers to
+            // the client.
+            var totalPromptTokens = 0
+            var totalGeneratedTokens = 0
+
+            for _ in 0..<maxToolRoundtripsPerTurn {
+                guard let promptTokens = await service.tokenizeFullHistory(
+                    history, mode: mode,
+                    toolSchemasJSON: toolSchemasJSON)
+                else {
+                    await writeError(writer, status: 500,
+                                      message: "Tokenizer unavailable.")
+                    return
+                }
+                totalPromptTokens = promptTokens.count
+                let stream = service.generateForConversation(
+                    promptTokens: promptTokens,
+                    conversationID: conversationID,
+                    mode: mode,
+                    options: options,
+                    maxTokens: maxTokens)
+
+                // Drain the stream. We need the final parsed Message
+                // (with `toolCalls` populated by EncodingDSV4) before
+                // we can decide whether to stream or loop again — so
+                // intermediate iterations always buffer. Only the
+                // last iteration (no tool calls) gets to stream live.
+                var finalMessage: Message?
+
+                do {
+                    for try await event in stream {
+                        switch event {
+                        case .token:
+                            totalGeneratedTokens += 1
+                        case .done(let msg, _, _):
+                            finalMessage = msg
+                        case .status, .prefillStart,
+                             .prefillDone, .generationProgress:
+                            continue
+                        }
+                    }
+                } catch {
+                    await writeError(writer, status: 500,
+                                      message: "Generation failed: \(error.localizedDescription)")
+                    return
+                }
+
+                guard let msg = finalMessage else {
+                    await writeError(writer, status: 500,
+                                      message: "Inference stream ended without a final message.")
+                    return
+                }
+
+                if msg.toolCalls.isEmpty {
+                    // Final round — emit to the client.
+                    if req.stream == true {
+                        await streamFinalResponse(
+                            writer: writer, chatID: chatID,
+                            model: modelName, created: created,
+                            text: msg.content,
+                            promptTokens: totalPromptTokens,
+                            generatedTokens: totalGeneratedTokens)
+                    } else {
+                        await bufferedFinalResponse(
+                            writer: writer, chatID: chatID,
+                            model: modelName, created: created,
+                            text: msg.content,
+                            finishReason: "stop",
+                            promptTokens: totalPromptTokens,
+                            generatedTokens: totalGeneratedTokens)
+                    }
+                    return
+                }
+
+                // Tool-call round: extend history with the assistant
+                // turn carrying the calls + outputs, then loop.
+                var assistant = msg
+                var outputs: [String] = []
+                outputs.reserveCapacity(msg.toolCalls.count)
+                for call in msg.toolCalls {
+                    let result = await controller.invokeQualified(
+                        call.name, argsJSON: call.args)
+                    outputs.append(result)
+                }
+                assistant.toolOutputs = outputs
+                history.append(assistant)
             }
+
+            // Hit the round-trip cap with tools still outstanding.
+            // Emit whatever the last assistant message produced with
+            // finish_reason: "tool_calls" so OpenAI clients can take
+            // over the tool dispatch themselves.
+            let lastText = history.last?.content ?? ""
+            await bufferedFinalResponse(
+                writer: writer, chatID: chatID,
+                model: modelName, created: created,
+                text: lastText,
+                finishReason: "tool_calls",
+                promptTokens: totalPromptTokens,
+                generatedTokens: totalGeneratedTokens)
         }
     }
 
-    // MARK: - Streaming response
+    // MARK: - Response writers (final-round only)
 
-    /// Drain `stream` and emit one SSE `chat.completion.chunk` per
-    /// sampled token. Terminates with `data: [DONE]` per the OpenAI
-    /// convention. On stream error, emits a final chunk carrying
-    /// `finish_reason: "stop"` rather than failing the connection
-    /// mid-frame — most OpenAI clients react badly to torn streams.
-    private static func streamChatResponse(
+    private static func streamFinalResponse(
         writer: HTTPResponseWriter,
-        chatID: String,
-        model: String,
-        created: Int,
-        stream: AsyncThrowingStream<GenerationEvent, Error>) async
+        chatID: String, model: String, created: Int,
+        text: String,
+        promptTokens: Int, generatedTokens: Int) async
     {
+        // promptTokens / generatedTokens are accepted for symmetry
+        // with the buffered path; the OpenAI SSE protocol has no
+        // standard slot for usage in stream chunks.
+        _ = promptTokens
+        _ = generatedTokens
         do {
             try await writer.writeHead(
                 status: 200, statusText: "OK",
@@ -151,86 +250,32 @@ enum LocalServerRoutes {
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 ])
-
-            // Emit a first chunk with role: "assistant" so OpenAI
-            // clients that key off the role transition open a new
-            // message bubble.
-            let openChunk = chunkPayload(
+            let opener = chunkPayload(
                 id: chatID, model: model, created: created,
-                delta: ["role": "assistant"],
-                finishReason: nil)
-            try await writer.writeSSE(jsonString(openChunk))
-
-            var finishReason = "stop"
-            do {
-                for try await event in stream {
-                    switch event {
-                    case .token(let text, _):
-                        let chunk = chunkPayload(
-                            id: chatID, model: model, created: created,
-                            delta: ["content": text],
-                            finishReason: nil)
-                        try await writer.writeSSE(jsonString(chunk))
-                    case .done:
-                        finishReason = "stop"
-                    case .status, .prefillStart, .prefillDone,
-                         .generationProgress:
-                        // Status events aren't part of the OpenAI
-                        // streaming protocol; swallow them.
-                        continue
-                    }
-                }
-            } catch {
-                finishReason = "stop"
+                delta: ["role": "assistant"], finishReason: nil)
+            try await writer.writeSSE(jsonString(opener))
+            if !text.isEmpty {
+                let content = chunkPayload(
+                    id: chatID, model: model, created: created,
+                    delta: ["content": text], finishReason: nil)
+                try await writer.writeSSE(jsonString(content))
             }
-
             let finalChunk = chunkPayload(
                 id: chatID, model: model, created: created,
-                delta: [:],
-                finishReason: finishReason)
+                delta: [:], finishReason: "stop")
             try await writer.writeSSE(jsonString(finalChunk))
             try await writer.writeSSEDone()
         } catch {
-            // If writing fails mid-stream the client disconnected.
-            // Nothing useful to do — connection.cancel() runs in
-            // LocalServer.handle().
+            // Client disconnected mid-flush — nothing useful to do.
         }
     }
 
-    // MARK: - Buffered response
-
-    private static func bufferChatResponse(
+    private static func bufferedFinalResponse(
         writer: HTTPResponseWriter,
-        chatID: String,
-        model: String,
-        created: Int,
-        stream: AsyncThrowingStream<GenerationEvent, Error>) async
+        chatID: String, model: String, created: Int,
+        text: String, finishReason: String,
+        promptTokens: Int, generatedTokens: Int) async
     {
-        var collected = ""
-        var generatedTokens = 0
-        var promptTokens = 0
-        var finishReason = "stop"
-
-        do {
-            for try await event in stream {
-                switch event {
-                case .token(let text, _):
-                    collected += text
-                    generatedTokens += 1
-                case .done(_, let prompt, _):
-                    promptTokens = prompt.count
-                    finishReason = "stop"
-                case .status, .prefillStart, .prefillDone,
-                     .generationProgress:
-                    continue
-                }
-            }
-        } catch {
-            await writeError(writer, status: 500,
-                              message: "Generation failed: \(error.localizedDescription)")
-            return
-        }
-
         let payload: [String: Any] = [
             "id": chatID,
             "object": "chat.completion",
@@ -240,7 +285,7 @@ enum LocalServerRoutes {
                 "index": 0,
                 "message": [
                     "role": "assistant",
-                    "content": collected,
+                    "content": text,
                 ],
                 "finish_reason": finishReason,
             ]],
@@ -277,8 +322,6 @@ enum LocalServerRoutes {
                     out[lastIdx].toolOutputs.append(content)
                 }
             default:
-                // Unknown role — pass through as user content so the
-                // model at least sees the bytes rather than 400ing.
                 out.append(Message(role: .user, content: content))
             }
         }
@@ -287,8 +330,7 @@ enum LocalServerRoutes {
 
     /// OpenAI doesn't model "thinking mode" natively. Treat
     /// `reasoning_effort: "medium"` / `"high"` as a hint to flip on
-    /// `.high`; everything else stays `.chat`. (The desktop app's
-    /// remote picker mirrors this convention.)
+    /// `.high`; everything else stays `.chat`.
     private static func thinkingMode(
         from req: OpenAIChatRequest) -> ThinkingMode
     {
@@ -325,9 +367,8 @@ enum LocalServerRoutes {
     {
         // JSONSerialization treats Swift `nil` in `[String: Any]` as
         // "key absent", but the OpenAI streaming protocol requires
-        // the `finish_reason` slot to be present (with explicit JSON
-        // `null` until the final chunk). Use NSNull() to force the
-        // null literal.
+        // the `finish_reason` slot present (with explicit JSON `null`
+        // until the final chunk). Use NSNull() to force the null literal.
         let fr: Any = finishReason ?? NSNull()
         return [
             "id": id,
@@ -391,8 +432,7 @@ enum LocalServerRoutes {
 
 /// Codable shape for `POST /v1/chat/completions`. Only models the
 /// subset of fields we honor today; unknown fields are silently
-/// ignored (the rest of the OpenAI surface — `tools`, `tool_choice`,
-/// `logprobs`, `response_format`, etc. — lands in follow-up commits).
+/// ignored.
 private struct OpenAIChatRequest: Decodable {
     let model: String?
     let messages: [Message]
@@ -404,11 +444,24 @@ private struct OpenAIChatRequest: Decodable {
     let presence_penalty: Float?
     /// OpenAI's reasoning-effort field for thinking-mode hint.
     let reasoning_effort: String?
+    /// Optional tool advertisement from the client. We honor it only
+    /// as a name-filter against our own MCP registry — the schemas
+    /// here are ignored; the authoritative schemas come from the MCP
+    /// servers.
+    let tools: [Tool]?
 
     struct Message: Decodable {
         let role: String
         let content: String?
         let name: String?
         let tool_call_id: String?
+    }
+
+    struct Tool: Decodable {
+        let type: String?
+        let function: Function?
+        struct Function: Decodable {
+            let name: String
+        }
     }
 }

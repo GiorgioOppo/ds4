@@ -62,7 +62,7 @@ struct DeepSeekUIApp: App {
         // controller stays idle until the user flips the Settings →
         // Server toggle; nothing binds at launch.
         self._serverController = StateObject(wrappedValue:
-            LocalServerController(service: service))
+            LocalServerController(service: service, mcpPool: pool))
     }
 
     var body: some Scene {
