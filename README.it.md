@@ -51,7 +51,8 @@ L'app desktop supporta:
 > tramite OpenRouter è la risposta quando vuoi Claude, GPT, o altri
 > modelli non eseguibili in locale.
 
-🇬🇧 [English version](README.md) · 🏗 [Architettura (dettagli)](docs/ARCHITECTURE.md)
+🇬🇧 [English version](README.md) · 🧠 [Il modello](docs/MODEL.it.md)
+· 🏗 [Architettura (dettagli)](docs/ARCHITECTURE.md)
 · 🧪 [Test](docs/TESTING.md) · 🛠 [Sviluppo](docs/DEVELOPING.md)
 · 🧰 [Tool nativi](docs/TOOLS.md) · 🚦 [Modalità agente](docs/AGENT-MODES.md)
 · 📦 [Lettore GGUF](docs/GGUF.md)
