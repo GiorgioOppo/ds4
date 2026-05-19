@@ -190,6 +190,12 @@ final class VocabPrunerViewModel: ObservableObject {
         guard isRunning, !isCancelling else { return }
         isCancelling = true
         cancellation?.cancel()
+        // Propaga il cancel a Swift Concurrency: il task root e
+        // tutti i child task del TaskGroup interno ricevono
+        // `Task.isCancelled == true` istantaneamente. Combina col
+        // CancellationToken (cooperativo lato API pubblica)
+        // per garantire il bail-out più veloce.
+        task?.cancel()
     }
 
     // MARK: - Checkpoint info

@@ -133,7 +133,7 @@ public enum VocabAnalyzer {
         onChunkedFileStart: ((String, UInt64, [Int]) -> Void)? = nil,
         onChunkDone: ((String, Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onEvent: @escaping (VocabPruneEvent) -> Void
-    ) throws -> KeepDecision {
+    ) async throws -> KeepDecision {
         precondition(coverage > 0 && coverage <= 1.0,
                      "coverage must be in (0, 1]")
         precondition(concurrency >= 1, "concurrency must be >= 1")
@@ -183,6 +183,7 @@ public enum VocabAnalyzer {
             // Path sequenziale: supporta save intra-file ogni
             // `tokenBatchThreshold` token via `onTokenBatch`.
             for file in files {
+                try Task.checkCancellation()
                 try cancellation?.throwIfCancelled()
                 let path = file.url.path
                 let matchesInFlight = (inFlightFile?.path == path)
@@ -303,7 +304,7 @@ public enum VocabAnalyzer {
                           "'\(file.url.path)' distribuito su " +
                           "\(concurrency) thread — thread k processa " +
                           "le righe i con i % \(concurrency) == k."))
-            let result = try Self.processFileParallel(
+            let result = try await Self.processFileParallel(
                 file.url,
                 isJsonl: file.isJsonl,
                 tokenizer: tokenizer,
@@ -350,9 +351,6 @@ public enum VocabAnalyzer {
                               "Quel file verrà processato da capo."))
             }
             let lock = NSLock()
-            // Snapshot mutable via class wrapper per condividerlo fra
-            // thread (il `inout` non funziona attraverso closure
-            // concurrentPerform).
             final class Aggregate: @unchecked Sendable {
                 var counts: [Int: Int]
                 var lines: Int = 0
@@ -360,35 +358,33 @@ public enum VocabAnalyzer {
                 init(counts: [Int: Int]) { self.counts = counts }
             }
             let agg = Aggregate(counts: counts)
-            var caught: Error? = nil
 
-            DispatchQueue.concurrentPerform(iterations: files.count) { idx in
-                // Cancellation check all'inizio di ogni file. I file
-                // già in volo non possono essere interrotti a metà
-                // (read-then-tokenize è già su un singolo thread del
-                // pool), ma evitiamo di iniziarne di nuovi.
-                if cancellation?.isCancelled == true { return }
-                let file = files[idx]
-                do {
-                    let (lc, tc, localCounts) = try Self.countTokensInFile(
-                        file.url, isJsonl: file.isJsonl, tokenizer: tokenizer,
-                        cancellation: cancellation)
-                    lock.lock()
-                    Self.mergeCounts(localCounts, into: &agg.counts)
-                    agg.lines += lc
-                    agg.tokens += tc
-                    let snapshotLines = agg.lines
-                    let snapshotTokens = agg.tokens
-                    lock.unlock()
-                    onFileDone?(file.url.path, lc, tc, localCounts)
-                    onEvent(.scanned(lines: snapshotLines, tokens: snapshotTokens))
-                } catch {
-                    lock.lock()
-                    if caught == nil { caught = error }
-                    lock.unlock()
+            // TaskGroup invece di concurrentPerform: `task?.cancel()`
+            // del VM propaga ai child task istantaneamente
+            // (`Task.isCancelled == true` dentro `countTokensInFile`
+            // tramite il check ogni 1000 righe).
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for idx in 0..<files.count {
+                    let file = files[idx]
+                    group.addTask {
+                        let (lc, tc, localCounts) = try Self.countTokensInFile(
+                            file.url, isJsonl: file.isJsonl,
+                            tokenizer: tokenizer,
+                            cancellation: cancellation)
+                        lock.lock()
+                        Self.mergeCounts(localCounts, into: &agg.counts)
+                        agg.lines += lc
+                        agg.tokens += tc
+                        let snapshotLines = agg.lines
+                        let snapshotTokens = agg.tokens
+                        lock.unlock()
+                        onFileDone?(file.url.path, lc, tc, localCounts)
+                        onEvent(.scanned(lines: snapshotLines,
+                                          tokens: snapshotTokens))
+                    }
                 }
+                try await group.waitForAll()
             }
-            if let caught { throw caught }
             counts = agg.counts
             lines = agg.lines
             tokens = agg.tokens
@@ -662,7 +658,7 @@ public enum VocabAnalyzer {
                 // del cancel premuto.
                 sinceLastCancelCheck &+= 1
                 if sinceLastCancelCheck >= 1000 {
-                    if cancellation?.isCancelled == true {
+                    if Task.isCancelled || cancellation?.isCancelled == true {
                         cancelledDuringScan = true
                         return  // esce dalla closure
                     }
@@ -740,7 +736,7 @@ public enum VocabAnalyzer {
         onBoundariesReady: ((UInt64, [Int]) -> Void)? = nil,
         onChunkDone: ((Int, Int, Int, [Int: Int]) -> Void)? = nil,
         onProgress: ((Int, Int) -> Void)? = nil
-    ) throws -> ParallelFileResult {
+    ) async throws -> ParallelFileResult {
         precondition(concurrency >= 1, "concurrency must be >= 1")
         let data = try Data(contentsOf: url, options: .alwaysMapped)
         let fileSize = data.count
@@ -781,74 +777,77 @@ public enum VocabAnalyzer {
         onBoundariesReady?(UInt64(fileSize), boundaries)
 
         // 2) Strutture per chunk-local results. Una `AnalyzerChunkSlot`
-        // per chunk; ogni thread scrive solo nel proprio slot
-        // (nessun lock contention sull'hot path).
+        // per chunk; ogni task scrive solo nel proprio slot.
         let results: [AnalyzerChunkSlot] = (0..<actualChunks)
             .map { _ in AnalyzerChunkSlot() }
-        let lock = NSLock()
-        var caught: Error? = nil
 
         // 3) Progress reporting (debounced).
         let progressLock = NSLock()
-        var lastProgressEmit = Date.distantPast
-
-        DispatchQueue.concurrentPerform(iterations: actualChunks) { idx in
-            // Cancellation cooperativa: niente nuovi chunk dopo
-            // cancel(). Quelli già in volo finiscono (un chunk dura
-            // 1-10s a seconda del tokenizer + bytes), poi il controllo
-            // ritorna al caller che fa rethrow.
-            if cancellation?.isCancelled == true { return }
-            // Resume: skippa i chunk già completati in una run
-            // precedente (i loro counts sono già nel checkpoint, e
-            // il caller li ha pre-popolati nei counts globali).
-            if resumeFromCompletedChunks.contains(idx) {
-                return
-            }
-            // Round-robin: ogni thread scanna l'intero file ma
-            // tokenizza solo le righe `lineIdx % actualChunks == idx`.
-            let r = results[idx]
-            do {
-                try Self.processByteRange(
-                    data: data,
-                    start: 0,
-                    end: fileSize,
-                    isJsonl: isJsonl,
-                    tokenizer: tokenizer,
-                    chunkResult: r,
-                    cancellation: cancellation,
-                    lineFilter: { lineIdx in
-                        lineIdx % actualChunks == idx
-                    },
-                    onTokenProgress: {
-                        // Debounce: chiama onProgress al massimo ogni
-                        // 200ms (evita storm di callback durante
-                        // tokenization veloce).
-                        guard let cb = onProgress else { return }
-                        progressLock.lock()
-                        let now = Date()
-                        let shouldEmit = now.timeIntervalSince(lastProgressEmit) > 0.2
-                        if shouldEmit { lastProgressEmit = now }
-                        progressLock.unlock()
-                        if shouldEmit {
-                            lock.lock()
-                            let totalLines = results.reduce(0) { $0 + $1.lines }
-                            let totalTokens = results.reduce(0) { $0 + $1.tokens }
-                            lock.unlock()
-                            cb(totalLines, totalTokens)
-                        }
-                    })
-                // Chunk completato: notifica al caller per save
-                // intermedio del checkpoint. Eseguito sul thread del
-                // chunk — il caller (CheckpointStore) ha il proprio
-                // lock interno.
-                onChunkDone?(idx, r.lines, r.tokens, r.counts)
-            } catch {
-                lock.lock()
-                if caught == nil { caught = error }
-                lock.unlock()
-            }
+        // Wrapper Sendable per data sharing tra task. Date.distantPast
+        // serializzato come timestamp double.
+        final class ProgressState: @unchecked Sendable {
+            var lastEmit: Date = .distantPast
         }
-        if let caught { throw caught }
+        let progressState = ProgressState()
+
+        // Swift Concurrency TaskGroup: sostituisce concurrentPerform
+        // perché supporta `Task.cancel()` propagato. Quando il
+        // VM chiama `task?.cancel()` (in `VocabPrunerViewModel.cancel`)
+        // tutti i child task qui ricevono `Task.isCancelled = true`
+        // istantaneamente; `processByteRange` lo verifica ogni 500
+        // iter del while loop e bail-out via `throwIfCancelled`.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for idx in 0..<actualChunks {
+                // Resume: skippa i chunk già completati in una run
+                // precedente (i loro counts sono già nel checkpoint,
+                // pre-popolati nei counts globali dal caller).
+                if resumeFromCompletedChunks.contains(idx) { continue }
+
+                let r = results[idx]
+                group.addTask {
+                    // Round-robin: ogni task scanna l'intero file ma
+                    // tokenizza solo le righe con lineIdx % N == idx.
+                    try Self.processByteRange(
+                        data: data,
+                        start: 0,
+                        end: fileSize,
+                        isJsonl: isJsonl,
+                        tokenizer: tokenizer,
+                        chunkResult: r,
+                        cancellation: cancellation,
+                        lineFilter: { lineIdx in
+                            lineIdx % actualChunks == idx
+                        },
+                        onTokenProgress: {
+                            // Debounce: emit progress al max ogni 200ms.
+                            guard let cb = onProgress else { return }
+                            progressLock.lock()
+                            let now = Date()
+                            let shouldEmit = now.timeIntervalSince(
+                                progressState.lastEmit) > 0.2
+                            if shouldEmit { progressState.lastEmit = now }
+                            progressLock.unlock()
+                            if shouldEmit {
+                                let totalLines = results.reduce(0) {
+                                    $0 + $1.lines
+                                }
+                                let totalTokens = results.reduce(0) {
+                                    $0 + $1.tokens
+                                }
+                                cb(totalLines, totalTokens)
+                            }
+                        })
+                    // Chunk completato: notifica al caller per save
+                    // intermedio del checkpoint.
+                    onChunkDone?(idx, r.lines, r.tokens, r.counts)
+                }
+            }
+
+            // Wait for all child tasks. Se uno throws (incluso il
+            // CancellationError di Task.cancel propagato dal VM),
+            // il group cancella gli altri e rethrow.
+            try await group.waitForAll()
+        }
         try cancellation?.throwIfCancelled()
 
         // 4) Merge finale dei chunk results (solo i chunk processati
@@ -981,13 +980,15 @@ public enum VocabAnalyzer {
                 lineIdx &+= 1
 
                 // Check cancellation OGNI 500 iter (sia processed
-                // che skipped). Non bloccare su un singolo
-                // `tokenizer.encode(...)` lungo: questo check
-                // scatta DOPO ogni encode, quindi il worst case è
-                // 1 encode duration prima del bail-out.
+                // che skipped). Verifica entrambi:
+                //   - `Task.isCancelled` (Swift Concurrency, settato
+                //     da `task?.cancel()` nel VM)
+                //   - `CancellationToken.isCancelled` (API pubblica
+                //     cooperativa, settato da `vm.cancellation.cancel()`)
+                // Whichever è on, bail-out.
                 sinceCancelCheck &+= 1
                 if sinceCancelCheck >= 500 {
-                    if cancellation?.isCancelled == true {
+                    if Task.isCancelled || cancellation?.isCancelled == true {
                         cancelled = true
                         return
                     }

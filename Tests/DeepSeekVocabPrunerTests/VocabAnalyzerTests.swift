@@ -114,7 +114,7 @@ final class VocabAnalyzerTests: XCTestCase {
         XCTAssertTrue(VocabAnalyzer.containsForeignScript("अ"))
     }
 
-    func testAnalyzeBasicCoverage() throws {
+    func testAnalyzeBasicCoverage() async throws {
         // Vocab: 256 byte-base + "ciao" id 300 + "mondo" id 301 +
         //        token CJK fittizio "noise" id 302 + special id 999.
         let tokURL = try makeMiniTokenizerJSON(
@@ -127,7 +127,7 @@ final class VocabAnalyzerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: corpusURL) }
 
         var events: [VocabPruneEvent] = []
-        let decision = try VocabAnalyzer.analyze(
+        let decision = try await VocabAnalyzer.analyze(
             tokenizerJSON: tokURL,
             corpus: corpusURL,
             coverage: 0.99,

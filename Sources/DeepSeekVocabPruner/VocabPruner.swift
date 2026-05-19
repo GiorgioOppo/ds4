@@ -20,21 +20,6 @@ public enum VocabPruner {
         cancellation: CancellationToken = CancellationToken(),
         onEvent: @escaping @Sendable (VocabPruneEvent) -> Void
     ) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            try Self.runSync(spec: spec,
-                              cancellation: cancellation,
-                              onEvent: onEvent)
-        }.value
-    }
-
-    /// Versione sincrona (usata dal CLI che gira già su un
-    /// thread dedicato). Non è esposta come `async` perché lo
-    /// scheduling è già fatto dal caller.
-    public static func runSync(
-        spec: VocabPruneSpec,
-        cancellation: CancellationToken = CancellationToken(),
-        onEvent: @escaping @Sendable (VocabPruneEvent) -> Void
-    ) throws {
         let tokenizerURL = spec.inputDir.appendingPathComponent("tokenizer.json")
         guard FileManager.default.fileExists(atPath: tokenizerURL.path) else {
             throw NSError(domain: "VocabPruner", code: 1,
@@ -114,7 +99,7 @@ public enum VocabPruner {
                               "(\(infl.tokensInFile) token già contati)."))
             }
 
-            decision = try VocabAnalyzer.analyze(
+            decision = try await VocabAnalyzer.analyze(
                 tokenizerJSON: tokenizerURL,
                 corpus: corpus,
                 coverage: spec.coverage,

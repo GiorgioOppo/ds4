@@ -127,8 +127,11 @@ let spec = VocabPruneSpec(
 let token = CancellationToken()
 let status = StatusPrinter()
 
+// Top-level await richiede Swift 5.5+ con `parseAsLibrary`
+// disabilitato; il package SPM compila questo file come main script
+// quindi `await` top-level è supportato direttamente.
 do {
-    try VocabPruner.runSync(spec: spec, cancellation: token) { event in
+    try await VocabPruner.run(spec: spec, cancellation: token) { event in
         status.handle(event)
     }
     status.flush()
