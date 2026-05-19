@@ -48,7 +48,16 @@ settings:
     # never falls back to "no eligible run destination".
     SDKROOT: macosx
     SUPPORTED_PLATFORMS: macosx
-    ARCHS: "$(ARCHS_STANDARD)"
+    # Apple Silicon only. Intel Macs are explicitly unsupported
+    # (`Device.swift` fatal-errors with "requires Apple Silicon",
+    # README §0 documents the requirement). Beyond runtime, the
+    # source itself can't compile on x86_64: `Float16(_:Float)` and
+    # `Float(_:Float16)` initializers are gated out of the stdlib
+    # on macOS x86_64 (see `Layers/ActQuant.swift` roundToE4M3 and
+    # `Model+KVSnapshot.swift` F16 disk compression). Building with
+    # `ARCHS_STANDARD` would force the x86_64 slice and fail with
+    # "Argument passed to call that takes no arguments".
+    ARCHS: arm64
     # Local dev: ad-hoc signing only. Gatekeeper on macOS 14+
     # silently refuses to launch *unsigned* binaries; ad-hoc ("-")
     # is the lightest signing identity that satisfies it. Hardened
