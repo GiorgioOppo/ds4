@@ -1387,7 +1387,7 @@ final class ChatStore: ObservableObject {
     /// rooted at $HOME if no project is attached). Helper for UI
     /// surfaces that want to introspect what came from the
     /// project vs. the global library.
-    public func currentProjectOverlay() -> ProjectOverlay {
+    func currentProjectOverlay() -> ProjectOverlay {
         guard let conv = selectedConversation,
               let projectID = conv.projectID,
               let project = projects.project(id: projectID),
