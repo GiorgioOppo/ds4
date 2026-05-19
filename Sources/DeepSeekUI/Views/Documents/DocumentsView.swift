@@ -37,8 +37,8 @@ struct DocumentsView: View {
             } label: {
                 Label("Import…", systemImage: "plus")
             }
-            .disabled(service.currentTokenizer() == nil)
-            .help(service.currentTokenizer() == nil
+            .disabled(!service.isModelLoaded())
+            .help(!service.isModelLoaded()
                    ? "Load a model first"
                    : "Import a new text document")
         }
@@ -54,7 +54,7 @@ struct DocumentsView: View {
                     .foregroundStyle(.tertiary)
                 Text("No documents yet.")
                     .foregroundStyle(.secondary)
-                if service.currentTokenizer() == nil {
+                if !service.isModelLoaded() {
                     Text("Load a model from the picker, then come back to import a document.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)

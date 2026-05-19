@@ -47,10 +47,19 @@ final class ChatStore: ObservableObject {
     /// `modelDirPath` and the first send will fail on tokenizer
     /// lookup until the user picks a model from the toolbar.
     /// Used to live as a stored `let` populated at init time, back
+    /// Path del local model attualmente caricato nel service.
+    /// Letto dal mirror `@Published` di ModelState (main-actor,
+    /// non-blocking) invece che da `service.currentModelDir()` —
+    /// quest'ultimo passa per `q.sync` sulla coda di inferenza e
+    /// bloccherebbe il main thread per minuti se una generation è
+    /// in volo. Usato dai costruttori di `Conversation` (newChat
+    /// inclusa) per popolare il campo `modelDirPath`; per le chat
+    /// remote viene "" e va bene così.
+    /// Used to live as a stored `let` populated at init time, back
     /// when the load step gated the chat UI; in-chat picking
     /// turns it into a derived value.
     var modelDirPath: String {
-        service.currentModelDir()?.path ?? ""
+        modelState.loadedLocalModelDir?.path ?? ""
     }
     /// Library references handed down from the App scene. Used at
     /// "first turn of a chat with a project attached" time to pull

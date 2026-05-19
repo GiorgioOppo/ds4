@@ -399,6 +399,24 @@ final class InferenceService: @unchecked Sendable {
         q.sync { _tokenizer }
     }
 
+    /// Non-blocking "is a model loaded?" check. Protetto da
+    /// `stateLock` invece che dalla coda di inferenza `q`, così le
+    /// view body possono chiamarlo senza bloccarsi per la durata di
+    /// una generation in volo. Aggiornato dentro `loadModel` /
+    /// `unloadModel` al momento di settare/svuotare il transformer.
+    /// Le view che hanno solo bisogno di "è il modello pronto?"
+    /// dovrebbero usare questo invece di `currentTokenizer() == nil`.
+    private let stateLock = NSLock()
+    private var _isModelLoaded: Bool = false
+    func isModelLoaded() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _isModelLoaded
+    }
+    private func setModelLoaded(_ loaded: Bool) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _isModelLoaded = loaded
+    }
+
     /// Snapshot of the active model directory. The document library
     /// uses it as a fingerprint to detect "different model selected
     /// since import time".
@@ -497,6 +515,7 @@ final class InferenceService: @unchecked Sendable {
                 }
                 self.transformer = nil
                 self._tokenizer = nil
+                self.setModelLoaded(false)
                 self.loadedConfig = nil
                 self.loadedModelDir = nil
                 self.cacheImage = nil
@@ -599,6 +618,7 @@ final class InferenceService: @unchecked Sendable {
                     self._tokenizer = tok
                     self.loadedConfig = cfg
                     self.loadedModelDir = url
+                    self.setModelLoaded(true)
                     // A model swap renders every cached KV state
                     // invalid (different weight tensors → different
                     // attention outputs).
