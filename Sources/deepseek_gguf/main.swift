@@ -27,6 +27,7 @@ import DeepSeekKit
 //                    [--json-schema PATH]
 //                    [--max-seq-len N]               (cap KV cache)
 //                    [--no-chat-template]            (skip the GGUF chat template)
+//                    [--weight-dtype f32|bf16]       (dequant target; default f32)
 
 let args = CommandLine.arguments
 
@@ -66,6 +67,11 @@ var dryAllowedLength = 2
 var jsonSchemaPath: String? = nil
 var maxSeqLenOverride: Int? = nil
 var noChatTemplate = false
+// `--weight-dtype f32|bf16` — controls the dequant target for
+// quantized GGUF weights. f32 is safer numerically; bf16 halves
+// the resident memory of the weights at no measurable accuracy
+// loss on Q8_0/Q4_0/Q4_K. Q5_K/Q6_K silently fall back to f32.
+var weightDtype: DType = .f32
 
 while i < args.count {
     switch args[i] {
@@ -130,6 +136,14 @@ while i < args.count {
         maxSeqLenOverride = n; i += 2
     case "--no-chat-template":
         noChatTemplate = true; i += 1
+    case "--weight-dtype":
+        guard i + 1 < args.count else { usage() }
+        switch args[i + 1] {
+        case "f32":  weightDtype = .f32
+        case "bf16": weightDtype = .bf16
+        default: usage()
+        }
+        i += 2
     default:
         usage()
     }
@@ -151,7 +165,9 @@ do {
 stderr.write(Data("Loading model weights…\n".utf8))
 let model: LlamaModel
 do {
-    model = try LlamaModel.fromGGUF(gguf, maxSeqLenOverride: maxSeqLenOverride)
+    model = try LlamaModel.fromGGUF(gguf,
+                                      maxSeqLenOverride: maxSeqLenOverride,
+                                      weightDtype: weightDtype)
 } catch {
     stderr.write(Data("Failed to build LlamaModel: \(error)\n".utf8))
     exit(1)
