@@ -8,8 +8,11 @@ public struct HeadTool: Tool {
         ToolSchema(
             name: "head",
             description:
-                "Print the first N lines (default 10) of a file. " +
-                "Use 'bytes' to count bytes instead. Sandboxed to agent root.",
+                "Print the first N lines of a file (default 10). " +
+                "Use this when you need a small prefix — e.g. the first few lines of a log, " +
+                "the shebang of a script, the header of a CSV. " +
+                "For the whole file use 'read'; for the tail use 'tail'. " +
+                "'bytes' counts bytes instead of lines.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [

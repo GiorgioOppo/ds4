@@ -15,8 +15,11 @@ public struct FindTool: Tool {
         ToolSchema(
             name: "find",
             description:
-                "Walk a directory tree under the agent root filtering by exact name, type, size, and mtime. " +
-                "For glob/wildcard matching use 'glob' instead. " +
+                "Recursively walk a directory tree under the agent root and filter entries by exact " +
+                "filename, type (file/dir/symlink), size range, or modification time. " +
+                "Use this when you have an attribute-based query ('all .swift files modified in the last week'). " +
+                "For one directory's immediate contents use 'ls'; for wildcard pattern matching by name " +
+                "('Sources/**/*.swift') use 'glob' — it's faster and the regex translation handles globs natively. " +
                 "Output is one matching path per line, capped at 'limit' (default 500).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(

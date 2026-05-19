@@ -10,10 +10,14 @@ public struct XcodebuildBuildTool: Tool {
         ToolSchema(
             name: "xcodebuild_build",
             description:
-                "Build an Xcode scheme. Provide 'scheme' (required), 'workspace' OR 'project', " +
-                "and optionally 'destination' (e.g. 'platform=iOS Simulator,name=iPhone 15'), " +
-                "'configuration' (Debug/Release), 'sdk', 'derivedDataPath'. " +
-                "Set 'noCodesign=true' to disable code signing (useful for simulator/CI builds).",
+                "Build a scheme from an Xcode project (.xcodeproj) or workspace (.xcworkspace). " +
+                "Use this for macOS / iOS / iPadOS / visionOS / watchOS / tvOS app targets and any " +
+                "build that needs a specific simulator/device destination. " +
+                "For a pure Swift Package Manager package (Package.swift, no .xcodeproj) use 'swift_build' instead. " +
+                "Before calling, use 'xcodebuild_list' to discover schemes and 'xcodebuild_showdestinations' " +
+                "to pick a valid destination string. " +
+                "'destination' = 'platform=iOS Simulator,name=iPhone 15' etc.; " +
+                "'noCodesign=true' disables signing (typical for simulator/CI builds).",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [

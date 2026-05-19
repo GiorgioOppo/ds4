@@ -9,10 +9,13 @@ public struct XcodebuildTestTool: Tool {
         ToolSchema(
             name: "xcodebuild_test",
             description:
-                "Run XCTest / Swift Testing through xcodebuild. " +
-                "Provide 'scheme' and 'destination'. Optional: 'testPlan', 'onlyTesting' (array of test ids), " +
-                "'skipTesting' (array), 'resultBundlePath' for a .xcresult. " +
-                "Without 'destination' xcodebuild picks a default which often fails on iOS schemes.",
+                "Run XCTest / Swift Testing of a scheme inside an Xcode project on a simulator or device. " +
+                "Use this for app targets where the tests need a destination (UI tests on iOS sim, " +
+                "visionOS tests on the Vision Pro simulator, macOS app unit tests, etc.). " +
+                "For a Swift Package Manager package (no scheme/destination) use 'swift_test' — simpler and faster. " +
+                "Always pass 'destination' explicitly; the xcodebuild default frequently picks a generic iOS " +
+                "destination that fails to build. Pair with 'xcresulttool_get' on the produced 'resultBundlePath' " +
+                "to parse failures.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [

@@ -9,9 +9,12 @@ public struct SwiftBuildTool: Tool {
         ToolSchema(
             name: "swift_build",
             description:
-                "Build a Swift package (Package.swift). " +
-                "'packagePath' defaults to the agent root; 'configuration' is debug or release. " +
-                "Use 'target' / 'product' to scope the build.",
+                "Build a Swift Package Manager package (the directory MUST contain a Package.swift). " +
+                "Use this for SPM libraries, CLI tools, server-side Swift, and any package that doesn't " +
+                "have a .xcodeproj/.xcworkspace. " +
+                "For an Xcode project (iOS / macOS / visionOS app targets) use 'xcodebuild_build' instead. " +
+                "'packagePath' defaults to the agent root; 'configuration' is debug or release; " +
+                "'target' / 'product' scopes the build.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
