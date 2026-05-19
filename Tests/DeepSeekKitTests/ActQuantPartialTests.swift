@@ -121,12 +121,12 @@ final class ActQuantPartialTests: XCTestCase {
 
     /// Round f32 → e4m3 byte, matching Metal's `f32_to_e4m3` (RTNE through
     /// half-precision then re-bias to 4-bit exp / 3-bit mantissa).
-    /// Reuses the existing `Float16` round-trip so we don't have to
-    /// duplicate the rounding logic in the test — accuracy is good to a
+    /// Routes through `floatToF16Local` (pure-Swift IEEE-754 F32→F16,
+    /// shared with the INT4/INT8 quantizers) instead of `Float16(x)`,
+    /// which is unavailable on x86_64 macOS. Accuracy is good to a
     /// fraction of an ULP at the FP8 magnitudes we care about.
     private func f32ToE4M3(_ x: Float) -> UInt8 {
-        let h = Float16(x)
-        let bits = h.bitPattern
+        let bits = floatToF16Local(x)
         let sign = UInt8((bits >> 15) & 1)
         var exp16 = Int((bits >> 10) & 0x1F)
         var mant10 = Int(bits & 0x3FF)

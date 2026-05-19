@@ -66,8 +66,9 @@ public struct KVCacheSnapshot {
     /// Compressione opt-in per il salvataggio su disco. La memoria
     /// in-process resta nei dtype originali (es. F32 per kvState);
     /// la quantizzazione avviene solo al `save` e la dequantize al
-    /// `load`. Niente kernel Metal richiesto — tutto CPU-side
-    /// (Float16 nativo Swift su Apple Silicon).
+    /// `load`. Niente kernel Metal richiesto — tutto CPU-side via
+    /// `floatToF16Local` / `f16ToFloatLocal` (pure-Swift IEEE-754
+    /// bit-manip, condivise con i quantizzatori INT4/INT8).
     ///
     /// Trade-off:
     ///   - `.f32`: lossless, file size = original.
@@ -255,11 +256,20 @@ public struct KVCacheSnapshot {
             case .f32:
                 return src   // no-op
             case .f16:
+                // UInt16-typed storage + `floatToF16Local` (in
+                // `QuantHelpers.swift`) instead of binding to `Float16`
+                // and calling `Float16(_:Float)`. The latter compiles
+                // only on arm64: on x86_64 macOS the stdlib's
+                // BinaryFloatingPoint conformance for Float16 — and
+                // therefore its numeric-conversion initializers — are
+                // gated out. The 16-bit byte layout is identical
+                // either way (IEEE-754 binary16), so disk format is
+                // unchanged.
                 var out = Data(count: count * 2)
                 out.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-                    let dst = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
+                    let dst = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
                     for i in 0..<count {
-                        dst[i] = Float16(srcPtr[i])
+                        dst[i] = floatToF16Local(srcPtr[i])
                     }
                 }
                 return out
@@ -296,8 +306,13 @@ public struct KVCacheSnapshot {
                     let srcF = raw.baseAddress!.assumingMemoryBound(to: Float.self)
                     for i in 0..<count { dst[i] = srcF[i] }
                 case .f16:
-                    let srcH = raw.baseAddress!.assumingMemoryBound(to: Float16.self)
-                    for i in 0..<count { dst[i] = Float(srcH[i]) }
+                    // `f16ToFloatLocal` (defined in `Int4Quant.swift`,
+                    // module-internal) is the inverse of
+                    // `floatToF16Local` used by `quantizeF32Bytes`
+                    // above. Same rationale: `Float(_:Float16)` is
+                    // unavailable on macOS x86_64.
+                    let srcH = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<count { dst[i] = f16ToFloatLocal(srcH[i]) }
                 case .bf16:
                     let srcU = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
                     for i in 0..<count {
