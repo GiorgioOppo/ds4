@@ -937,11 +937,13 @@ public enum VocabAnalyzer {
             // round-robin: il caller passa `{ $0 % N == k }` per
             // selezionare solo le righe del proprio thread.
             var lineIdx = 0
-            // Cancel check counter per le righe SKIPPATE dal filter
-            // (per il round-robin, ogni thread itera tutte le righe
-            // del file ma tokenizza solo le sue: anche le righe
-            // skipped contano nel responsiveness del cancel).
-            var sinceCheckSkippedLines = 0
+            // Cancellation check counter unificato — incrementato
+            // OGNI iterazione del while (sia righe processate che
+            // skipped). Check ogni 500 righe (~50-200ms su file
+            // realistici, garantisce cancel responsiveness anche
+            // su file con poche righe ma giganti dove i flush
+            // boundary tardano a essere raggiunti).
+            var sinceCancelCheck = 0
             while pos < end {
                 // Trova la fine della linea corrente (newline o
                 // confine del range).
@@ -974,35 +976,31 @@ public enum VocabAnalyzer {
                         }
                         localLines &+= 1
                     }
-                } else if !shouldProcess {
-                    // Riga skipped: contiamo nel contatore separato
-                    // così il cancel può scattare anche se il thread
-                    // sta in fase di "scan-and-skip" (es. round-robin
-                    // dove il 7/8 delle righe non sono sue).
-                    sinceCheckSkippedLines &+= 1
-                    if sinceCheckSkippedLines >= 10_000 {
-                        if cancellation?.isCancelled == true {
-                            cancelled = true
-                            return
-                        }
-                        sinceCheckSkippedLines = 0
-                    }
                 }
                 pos = lineEnd &+ 1   // skip il \n
                 lineIdx &+= 1
 
-                // Flush periodico nel chunkResult + progress callback +
-                // cancellation check (~ogni 50k token: bilanciamento tra
-                // overhead del check e responsiveness del cancel).
+                // Check cancellation OGNI 500 iter (sia processed
+                // che skipped). Non bloccare su un singolo
+                // `tokenizer.encode(...)` lungo: questo check
+                // scatta DOPO ogni encode, quindi il worst case è
+                // 1 encode duration prima del bail-out.
+                sinceCancelCheck &+= 1
+                if sinceCancelCheck >= 500 {
+                    if cancellation?.isCancelled == true {
+                        cancelled = true
+                        return
+                    }
+                    sinceCancelCheck = 0
+                }
+
+                // Flush periodico nel chunkResult + progress callback
+                // (ogni 50k token: granularità del save al checkpoint).
                 if localTokens - lastFlush > 50_000 {
                     chunkResult.lines = localLines
                     chunkResult.tokens = localTokens
                     lastFlush = localTokens
                     onTokenProgress?()
-                    if cancellation?.isCancelled == true {
-                        cancelled = true
-                        return  // esce dal `withUnsafeBytes` closure
-                    }
                 }
             }
         }
