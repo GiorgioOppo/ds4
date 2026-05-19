@@ -18,6 +18,7 @@ struct ContentView: View {
     @ObservedObject var modelLibrary: ModelLibrary
     @ObservedObject var modelState: ModelState
     @ObservedObject var openRouterCatalog: OpenRouterCatalog
+    @ObservedObject var nativeTools: NativeToolHost
 
     var body: some View {
         ChatContainer(
@@ -26,7 +27,8 @@ struct ContentView: View {
                               projects: projects,
                               mcpPool: mcpPool,
                               agents: agents,
-                              modelState: modelState),
+                              modelState: modelState,
+                              nativeTools: nativeTools),
             projects: projects,
             agents: agents,
             modelLibrary: modelLibrary,

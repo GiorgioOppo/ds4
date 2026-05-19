@@ -133,18 +133,28 @@ final class ChatStore: ObservableObject {
     private var lastSamplingOptions: [UUID: (opts: SamplingOptions,
                                               maxTokens: Int)] = [:]
 
+    /// Optional native-tool host. When set, native tools are
+    /// included in the schema block emitted to the model under a
+    /// `native__` prefix (mirrors the MCP `server__tool` prefix
+    /// convention). Tool-call routing in `runRemoteLoop` and the
+    /// local execute path checks the prefix to decide whether to
+    /// hit `NativeToolHost.dispatch` or `MCPClientPool.invokeQualified`.
+    let nativeTools: NativeToolHost?
+
     init(service: InferenceService,
          documents: DocumentLibrary,
          projects: ProjectLibrary,
          mcpPool: MCPClientPool,
          agents: AgentLibrary,
-         modelState: ModelState) {
+         modelState: ModelState,
+         nativeTools: NativeToolHost? = nil) {
         self.service = service
         self.documents = documents
         self.projects = projects
         self.mcpPool = mcpPool
         self.agents = agents
         self.modelState = modelState
+        self.nativeTools = nativeTools
         loadFromDisk()
         if conversations.isEmpty {
             let first = Conversation(modelDirPath: modelDirPath,
@@ -789,6 +799,10 @@ final class ChatStore: ObservableObject {
                         argsJSON: call.args,
                         hostAgentID: hostAgentID,
                         hostConvID: id)
+                } else if call.name.hasPrefix("native__") {
+                    result = await self.dispatchNativeTool(
+                        qualifiedName: call.name,
+                        argsJSON: call.args)
                 } else {
                     result = await pool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -911,6 +925,22 @@ final class ChatStore: ObservableObject {
                     "name": tool.qualifiedName,
                     "description": tool.description,
                     "inputSchema": tool.inputSchema
+                ])
+            }
+        }
+
+        // Native tools (TODO §8 follow-up). The host's
+        // `schemas` already include only tools the registry made
+        // available for the current `AgentMode`; we prefix the
+        // public name with `native__` so the dispatch side can
+        // tell native from MCP without ambiguity. Agent allowlist
+        // filtering of native tools is a separate follow-up.
+        if let host = nativeTools {
+            for s in host.schemas {
+                schemas.append([
+                    "name": "native__\(s.name)",
+                    "description": s.description,
+                    "inputSchema": s.inputSchema.foundationValue,
                 ])
             }
         }
@@ -1527,13 +1557,19 @@ final class ChatStore: ObservableObject {
             // remote chats (yet) — that case returns a structured
             // error string so the model can self-correct on the
             // next iteration. MCP calls route through the same
-            // pool the local path uses.
+            // pool the local path uses. Native calls (TODO §8)
+            // route to NativeToolHost.dispatch via the prefix
+            // check.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
             for call in final.toolCalls {
                 let result: String
                 if call.name == EncodingDSV4.delegateToolName {
                     result = "[error: cross-agent delegation is not yet supported on remote models]"
+                } else if call.name.hasPrefix("native__") {
+                    result = await self.dispatchNativeTool(
+                        qualifiedName: call.name,
+                        argsJSON: call.args)
                 } else {
                     result = await self.mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -1682,6 +1718,57 @@ final class ChatStore: ObservableObject {
     /// invocation would need a remote sub-agent loop that doesn't
     /// exist yet. A `__delegate_to_agent` schema would just lure
     /// the model into calls we have to refuse with an error.
+    /// Route a `native__<tool>` call to `NativeToolHost.dispatch`
+    /// (TODO §8 follow-up). Strips the prefix, parses the JSON
+    /// args, resolves the active agent's mode + a sensible root
+    /// directory (project path when attached, $HOME otherwise),
+    /// and formats the resulting `ToolOutput` to a string the
+    /// model can re-ingest. Errors are returned inline (matches
+    /// `MCPClientPool.invokeQualified`'s never-throws contract).
+    private func dispatchNativeTool(qualifiedName: String,
+                                      argsJSON: String) async -> String
+    {
+        guard qualifiedName.hasPrefix("native__") else {
+            return "[error: not a native tool: \(qualifiedName)]"
+        }
+        let toolName = String(qualifiedName.dropFirst("native__".count))
+        let input: [String: Any] = {
+            guard let data = argsJSON.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                            as? [String: Any]
+            else { return [:] }
+            return obj
+        }()
+        guard let host = self.nativeTools else {
+            return "[error: native tools host not attached]"
+        }
+        // Resolve agent mode + project root on the main actor.
+        let (mode, rootDir): (AgentMode, URL) = await MainActor.run {
+            let conv = self.selectedConversation
+            let agent = conv?.agentID
+                .flatMap { self.agents.agent(id: $0) }
+            let agentMode = agent?.agentMode ?? .build
+            // Project root: pick the first source path of the
+            // attached project; fall back to $HOME otherwise. Not
+            // ideal (multi-root projects aren't represented) but
+            // unblocks the common single-root case. See TODO §11
+            // for per-project `.deepseek/` overrides.
+            let projectRoot: URL? = conv?.projectID
+                .flatMap { self.projects.project(id: $0) }
+                .flatMap { $0.sourcePaths.first }
+                .map { URL(fileURLWithPath: $0) }
+            return (agentMode, projectRoot
+                    ?? URL(fileURLWithPath: NSHomeDirectory()))
+        }
+        let result = await host.dispatch(name: toolName, input: input,
+                                           mode: mode,
+                                           rootDirectory: rootDir)
+        if result.isError {
+            return "[error: \(result.output)]"
+        }
+        return result.output
+    }
+
     private func composeOpenAITools(
         mcpAllowed: Set<String>?
     ) -> [[String: Any]]? {
@@ -1699,6 +1786,22 @@ final class ChatStore: ObservableObject {
                     "parameters": tool.inputSchema
                 ]
             ])
+        }
+        // TODO §8 follow-up: native tools alongside MCP, with the
+        // `native__` prefix so the dispatch side can route them.
+        // Same agent-allowlist caveat as the local-side block —
+        // native tools are not yet filterable from AgentConfig.
+        if let host = nativeTools {
+            for s in host.schemas {
+                schemas.append([
+                    "type": "function",
+                    "function": [
+                        "name": "native__\(s.name)",
+                        "description": s.description,
+                        "parameters": s.inputSchema.foundationValue,
+                    ]
+                ])
+            }
         }
         return schemas.isEmpty ? nil : schemas
     }
