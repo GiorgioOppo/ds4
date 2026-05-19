@@ -68,7 +68,8 @@ struct DeepSeekUIApp: App {
                          agents: agents,
                          modelLibrary: modelLibrary,
                          modelState: modelState,
-                         openRouterCatalog: openRouterCatalog)
+                         openRouterCatalog: openRouterCatalog,
+                         nativeTools: nativeTools)
                 .frame(minWidth: 720, minHeight: 480)
                 // Theme overrides applied at the WindowGroup root so
                 // every descendant — including modal sheets — sees

@@ -75,7 +75,7 @@ struct ImportDocumentSheet: View {
                     Label("Choose file…", systemImage: "doc.text.magnifyingglass")
                 }
                 .controlSize(.large)
-                if service.currentTokenizer() == nil {
+                if !service.isModelLoaded() {
                     Label("Load a model first — the tokenizer must match the model that will use the document.",
                            systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
@@ -163,7 +163,7 @@ struct ImportDocumentSheet: View {
         if case .ready = phase,
            pickedURL != nil,
            !displayName.trimmingCharacters(in: .whitespaces).isEmpty,
-           service.currentTokenizer() != nil {
+           service.isModelLoaded() {
             return true
         }
         return false
@@ -207,7 +207,7 @@ struct ImportDocumentSheet: View {
 
     private func vectorize() {
         guard let url = pickedURL,
-              service.currentTokenizer() != nil else {
+              service.isModelLoaded() else {
             errorMessage = "Missing file or tokenizer."
             return
         }

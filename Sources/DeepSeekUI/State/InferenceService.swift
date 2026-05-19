@@ -21,6 +21,18 @@ enum GenerationEvent: Sendable {
                promptTokens: [Int32],
                generatedTokens: [Int32])
     case status(String)
+    /// A decoded chunk of the prompt the model is about to see. Only
+    /// emitted on cold prefill (cachedCount == 0) and only when the
+    /// `showPrefillTrace` AppStorage flag is on. The chunks together
+    /// reconstruct the full prompt text — system message (with tools
+    /// block), conversation history, and the just-typed user turn —
+    /// streamed to the UI so it can render a collapsible gray
+    /// "what the model saw" block between the user message and the
+    /// assistant reply. Decoded with the same tokenizer that produced
+    /// the IDs, so the reconstruction is faithful to what the
+    /// transformer ingests (token boundaries collapsed back into
+    /// readable text).
+    case prefillToken(text: String)
     /// Emitted right before the prefill forward pass starts. The UI uses
     /// it to swap the bubble into a "prefilling" indicator (no text
     /// streamed yet because no tokens have been sampled).
@@ -387,6 +399,24 @@ final class InferenceService: @unchecked Sendable {
         q.sync { _tokenizer }
     }
 
+    /// Non-blocking "is a model loaded?" check. Protetto da
+    /// `stateLock` invece che dalla coda di inferenza `q`, così le
+    /// view body possono chiamarlo senza bloccarsi per la durata di
+    /// una generation in volo. Aggiornato dentro `loadModel` /
+    /// `unloadModel` al momento di settare/svuotare il transformer.
+    /// Le view che hanno solo bisogno di "è il modello pronto?"
+    /// dovrebbero usare questo invece di `currentTokenizer() == nil`.
+    private let stateLock = NSLock()
+    private var _isModelLoaded: Bool = false
+    func isModelLoaded() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _isModelLoaded
+    }
+    private func setModelLoaded(_ loaded: Bool) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        _isModelLoaded = loaded
+    }
+
     /// Snapshot of the active model directory. The document library
     /// uses it as a fingerprint to detect "different model selected
     /// since import time".
@@ -416,28 +446,54 @@ final class InferenceService: @unchecked Sendable {
 
     private let q = DispatchQueue(label: "deepseek.inference", qos: .userInitiated)
 
-    /// Set by `cancelCurrent()`; the generate loop checks this between
-    /// tokens and exits early. We can't preempt a mid-token forward
-    /// (Metal commands are already in flight), so cancellation always
-    /// finishes the current token before stopping.
-    private var cancelFlag = false
+    /// Cancellazione per-conversazione. Il prefill/decode loop legge
+    /// `isCancelled(for: convID)` fra un token e l'altro; se è in set
+    /// (o se `globalCancel` è on) esce dopo aver finito il token
+    /// corrente. Multi-track safe: cancellare la chat A non ferma
+    /// la chat B che sta aspettando dietro di lei sulla q seriale.
+    /// `globalCancel` resta come backstop per chiamate legacy
+    /// (`cancelCurrent()` senza id) — useremmo unloadModel per uno
+    /// stop più drastico ma manteniamo la semantica esistente.
+    private var cancelledConvIDs = Set<UUID>()
+    private var globalCancel = false
     private let cancelLock = NSLock()
 
     init() {}
 
-    func cancelCurrent() {
+    /// Marca questa conversazione come cancellata; se id è nil,
+    /// alza il flag globale (vecchio comportamento `cancelCurrent()`
+    /// senza argomenti — equivalente a "stop whatever is current").
+    /// La conversation viene tolta dal set automaticamente al prossimo
+    /// `resetCancelFlag(for:)` (= prima dell'inizio del prossimo
+    /// generate per quella conv).
+    func cancelCurrent(conversationID: UUID? = nil) {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        cancelFlag = true
+        if let id = conversationID {
+            cancelledConvIDs.insert(id)
+        } else {
+            globalCancel = true
+        }
     }
 
-    private func resetCancelFlag() {
+    private func resetCancelFlag(for conversationID: UUID? = nil) {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        cancelFlag = false
+        if let id = conversationID {
+            cancelledConvIDs.remove(id)
+        }
+        // `globalCancel` lo droppiamo sempre quando un generate parte:
+        // se era stato alzato per fermare il run precedente e quello
+        // ha già finito (o se l'utente l'ha alzato per errore), il
+        // nuovo run riparte pulito.
+        globalCancel = false
     }
 
-    private func isCancelled() -> Bool {
+    private func isCancelled(for conversationID: UUID? = nil) -> Bool {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        return cancelFlag
+        if globalCancel { return true }
+        if let id = conversationID, cancelledConvIDs.contains(id) {
+            return true
+        }
+        return false
     }
 
     /// Tear down whatever model is currently in memory. Releases
@@ -459,6 +515,7 @@ final class InferenceService: @unchecked Sendable {
                 }
                 self.transformer = nil
                 self._tokenizer = nil
+                self.setModelLoaded(false)
                 self.loadedConfig = nil
                 self.loadedModelDir = nil
                 self.cacheImage = nil
@@ -561,6 +618,7 @@ final class InferenceService: @unchecked Sendable {
                     self._tokenizer = tok
                     self.loadedConfig = cfg
                     self.loadedModelDir = url
+                    self.setModelLoaded(true)
                     // A model swap renders every cached KV state
                     // invalid (different weight tensors → different
                     // attention outputs).
@@ -1072,7 +1130,7 @@ final class InferenceService: @unchecked Sendable {
                         ]))
                     return
                 }
-                self.resetCancelFlag()
+                self.resetCancelFlag(for: conversationID)
                 // Sync user preference for common-prefix rewind. Letta
                 // ogni turn così l'utente può abilitarla/disabilitarla
                 // dal Settings senza riavviare.
@@ -1205,6 +1263,46 @@ final class InferenceService: @unchecked Sendable {
                 let deltaTokens = Array(promptTokens.suffix(
                     promptTokens.count - cachedCount))
                 continuation.yield(.prefillStart(promptTokens: deltaTokens.count))
+
+                // Prefill trace: solo turn cold (KV cache vuota),
+                // perché il delta dei turn incrementali è giusto il
+                // nuovo user message + marker — niente di
+                // ispezionabile in più. Decodifichiamo tutto il
+                // delta in un colpo (round-trip safe sul byte-BPE
+                // del V4: i token vengono da text tokenizzato pochi
+                // ms fa), poi splittiamo in chunk fissi e yieldiamo
+                // un evento per chunk con un micro-sleep in mezzo
+                // così la UI vede il prompt scorrere invece di
+                // apparire tutto insieme. Il flag è opt-out via
+                // settings; default ON (`object(forKey:) == nil`
+                // significa "non scritto ancora" → trattalo come
+                // attivo).
+                let traceFlag = UserDefaults.standard.object(
+                    forKey: AppSettingsKey.showPrefillTrace) as? Bool ?? true
+                if traceFlag, cachedCount == 0 {
+                    let fullText = tok.decode(deltaTokens.map(Int.init))
+                    if !fullText.isEmpty {
+                        let chars = Array(fullText)
+                        let chunkSize = 24
+                        let totalChunks = max(1, (chars.count + chunkSize - 1) / chunkSize)
+                        // Cap il delay sintetico a 1.5 s totali su
+                        // prompt enormi così la prefill non si
+                        // ferma dietro al render.
+                        let perChunkDelay = min(0.004, 1.5 / Double(totalChunks))
+                        var i = 0
+                        while i < chars.count {
+                            if self.isCancelled(for: conversationID) { break }
+                            let end = min(i + chunkSize, chars.count)
+                            continuation.yield(.prefillToken(
+                                text: String(chars[i..<end])))
+                            i = end
+                            if perChunkDelay > 0 {
+                                Thread.sleep(forTimeInterval: perChunkDelay)
+                            }
+                        }
+                    }
+                }
+
                 let prefillStart = Date()
 
                 var logits: Tensor
@@ -1217,7 +1315,7 @@ final class InferenceService: @unchecked Sendable {
                     // produce the assistant's first new token.
                     var lastLogits: Tensor? = nil
                     for (i, t) in deltaTokens.enumerated() {
-                        if self.isCancelled() { break }
+                        if self.isCancelled(for: conversationID) { break }
                         lastLogits = model.forward(
                             inputIds: [[Int(t)]],
                             startPos: cachedCount + i)
@@ -1273,7 +1371,7 @@ final class InferenceService: @unchecked Sendable {
                 // after the prefill step above, regardless of which path
                 // we took).
                 for step in 0..<maxTokens {
-                    if self.isCancelled() { break }
+                    if self.isCancelled(for: conversationID) { break }
 
                     let nextId = Sampler.sample(logits,
                                                   history: generated,

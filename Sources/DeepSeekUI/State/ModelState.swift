@@ -44,6 +44,15 @@ final class ModelState: ObservableObject {
 
     @Published private(set) var status: LoadStatus = .idle
 
+    /// Mirror sul main actor di "il service ha un local model
+    /// caricato in RAM?". Non passa per `service.q.sync` (che
+    /// bloccherebbe il main thread durante una generation), quindi
+    /// può essere letto dal `body` di SwiftUI in modo sicuro. Post-
+    /// refactor multi-endpoint NON è derivabile da `status`, perché
+    /// status può puntare a un remote anche se il local è ancora
+    /// caricato (loadRemoteOpenRouter non scarica più il local).
+    @Published private(set) var loadedLocalModelDir: URL?
+
     let service: InferenceService
     let library: ModelLibrary
 
@@ -86,15 +95,19 @@ final class ModelState: ObservableObject {
         }
     }
 
-    /// Activate a remote OpenRouter endpoint. No weights to map
-    /// and nothing to probe, but we still drop any locally-loaded
-    /// model (so the chat unambiguously talks to one backend),
-    /// validate that the Keychain holds a key, and ping
-    /// `/auth/key` so an invalid token fails here instead of on
-    /// the first send. `library.touch` bumps the recents.
+    /// Activate a remote OpenRouter endpoint. Stateless: nessun
+    /// weight da mappare. Crucialmente NON scarica un eventuale
+    /// modello locale già caricato — è proprio questo che permette
+    /// `chat A locale + chat B remota in parallelo`. Lo `status` di
+    /// ModelState diventa "questo è l'endpoint corrente per le
+    /// nuove chat e per il banner toolbar", non più "questa è la
+    /// cosa unica caricata in memoria". Le chat che hanno
+    /// `Conversation.endpoint` settato continuano a parlare al loro
+    /// backend dedicato indipendentemente.
+    /// Validiamo comunque la chiave verso `/auth/key` così un
+    /// token invalido fallisce qui invece che al primo send.
     private func loadRemoteOpenRouter(modelID: String,
                                         endpoint: ModelEndpoint) async {
-        await service.unloadModel()
         status = .loading(endpoint: endpoint, plan: nil)
         guard let key = KeychainStore.get(
             account: KeychainAccount.openRouterAPIKey), !key.isEmpty
@@ -124,9 +137,10 @@ final class ModelState: ObservableObject {
             library.forget(endpoint)
             return
         }
-        // If another model is loaded, drop it first so RAM
+        // If another local model is loaded, drop it first so RAM
         // doesn't blow up holding two copies during the swap.
         await service.unloadModel()
+        loadedLocalModelDir = nil
         status = .loading(endpoint: endpoint, plan: nil)
         do {
             let rawStrategy = AppSettings.loadStrategy
@@ -146,6 +160,7 @@ final class ModelState: ObservableObject {
                 })
             library.touch(endpoint)
             AppSettings.setLastModelDir(path)
+            loadedLocalModelDir = url
             status = .loaded(endpoint: endpoint, config: cfg)
         } catch {
             let msg = (error as? LocalizedError)?.errorDescription
@@ -159,6 +174,7 @@ final class ModelState: ObservableObject {
     /// open but can't send until the user picks again.
     func unload() async {
         await service.unloadModel()
+        loadedLocalModelDir = nil
         status = .idle
     }
 

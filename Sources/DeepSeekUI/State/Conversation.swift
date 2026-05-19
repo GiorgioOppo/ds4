@@ -25,12 +25,25 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     /// re-tokenisation so the model sees the tool answers on its
     /// next turn.
     var toolOutputs: [String]?
+    /// Sul primo turn cold di una conversazione, raccoglie il
+    /// testo del prompt completo (decoded dai token che il modello
+    /// ingerisce) man mano che `.prefillToken` arriva. La UI lo
+    /// mostra come blocco grigio collassabile fra il messaggio
+    /// dell'utente e questa risposta dell'assistente. Nil sui turn
+    /// incrementali (il delta è giusto il nuovo user message,
+    /// poco ispezionabile) e su tutti i messaggi salvati prima che
+    /// il campo esistesse. Persistito in conversation JSON quando
+    /// presente — può inflare il file su prompt lunghissimi, ma
+    /// la persistenza è quel che permette al disclosure di restare
+    /// utilizzabile dopo restart.
+    var prefillTrace: String?
 
     init(id: UUID = UUID(), role: StoredRole, content: String,
          reasoningContent: String? = nil,
          toolCalls: [StoredToolCall] = [],
          tokenCount: Int? = nil,
-         toolOutputs: [String]? = nil) {
+         toolOutputs: [String]? = nil,
+         prefillTrace: String? = nil) {
         self.id = id
         self.role = role
         self.content = content
@@ -38,6 +51,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         self.toolCalls = toolCalls
         self.tokenCount = tokenCount
         self.toolOutputs = toolOutputs
+        self.prefillTrace = prefillTrace
     }
 
     static func from(_ m: Message, id: UUID = UUID()) -> StoredMessage {
@@ -119,6 +133,16 @@ struct Conversation: Codable, Identifiable, Hashable {
     var title: String
     var createdAt: Date
     var modelDirPath: String      // captured at chat creation
+    /// Endpoint che questa conversation usa per l'inferenza. Quando
+    /// nil (chat salvate prima che il campo esistesse, oppure chat
+    /// "default" che ereditano dall'endpoint corrente di ModelState),
+    /// `ChatStore` cade su `modelState.loadedEndpoint` al send.
+    /// Quando non nil, è la fonte di verità: una chat con
+    /// `.openRouter(modelID:)` parla HTTP a quel provider anche se
+    /// `ModelState` ha un local model caricato in RAM, e viceversa.
+    /// Questo è il meccanismo che permette `chat A locale + chat B
+    /// remota in parallelo` (vedi commento in `ChatStore.send`).
+    var endpoint: ModelEndpoint?
     var messages: [StoredMessage]
     /// Optional reference to a `Project` in `ProjectLibrary`. When
     /// set, the chat surface shows the project's name in the toolbar.
@@ -168,6 +192,7 @@ struct Conversation: Codable, Identifiable, Hashable {
          title: String = "New Chat",
          createdAt: Date = .now,
          modelDirPath: String,
+         endpoint: ModelEndpoint? = nil,
          messages: [StoredMessage] = [],
          projectID: UUID? = nil,
          agentID: UUID? = nil,
@@ -177,6 +202,7 @@ struct Conversation: Codable, Identifiable, Hashable {
          pendingTurn: PendingTurn? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
+        self.endpoint = endpoint
         self.projectID = projectID
         self.agentID = agentID
         self.cumulativeCostUSD = cumulativeCostUSD

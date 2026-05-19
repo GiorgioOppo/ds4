@@ -36,8 +36,15 @@ final class NativeToolHost: ObservableObject {
         self.permissionDelegate = delegate
         delegate.host = self
         Task { @MainActor [registry] in
+            // Shell escluso esplicitamente: troppo invasivo per
+            // l'esposizione di default al chat — il modello tende a
+            // raggiungerlo anche quando le tool dedicate (read /
+            // edit / grep / glob) fanno il lavoro più sicuro e
+            // strutturato. Resterà registrabile manualmente in
+            // futuro tramite un toggle.
             await registry.registerAll(
-                DefaultTools.standard(planStore: store))
+                DefaultTools.standard(planStore: store,
+                                       includeShell: false))
             self.schemas = await registry.availableSchemas(mode: .build)
         }
     }

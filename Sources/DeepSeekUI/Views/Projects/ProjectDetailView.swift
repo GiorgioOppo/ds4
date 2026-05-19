@@ -61,7 +61,7 @@ struct ProjectDetailView: View {
                 }
                 .disabled(indexing
                           || project.sourcePaths.isEmpty
-                          || service.currentTokenizer() == nil)
+                          || !service.isModelLoaded())
                 .help(indexButtonHelp)
             }
             if indexing {
@@ -94,7 +94,7 @@ struct ProjectDetailView: View {
     }
 
     private var indexButtonHelp: String {
-        if service.currentTokenizer() == nil { return "Load a model first" }
+        if !service.isModelLoaded() { return "Load a model first" }
         if project.sourcePaths.isEmpty { return "Add at least one source path" }
         return "Re-scan every source and tokenize the discovered files"
     }
