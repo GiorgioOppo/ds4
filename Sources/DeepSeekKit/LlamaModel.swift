@@ -130,3 +130,228 @@ public final class LlamaModel {
         for l in layers { l.releaseCache() }
     }
 }
+
+// MARK: - GGUF factory
+
+extension LlamaModel {
+    /// Construct a `LlamaModel` from a GGUF file (TODO §10.2 / T2
+    /// final piece). Pulls every dimension off the file's metadata,
+    /// dequants the weight tensors through `GGUFFile.load` (which
+    /// dispatches the Q8_0 / Q4_0 / Q4_K kernels added earlier in
+    /// T2), and wires up Linears / RMSNorms / RoPE / KV caches so
+    /// `forward(...)` is immediately callable.
+    ///
+    /// `maxSeqLen` defaults to the GGUF's `context_length` metadata
+    /// but can be capped by `maxSeqLenOverride` so a 128k-context
+    /// checkpoint doesn't try to allocate KV caches sized for that
+    /// full window on a small Mac. Cap is per-layer:
+    /// `[B, maxSeqLen, Hkv, D] × n_layers × 2 (K + V)` so it adds
+    /// up fast.
+    ///
+    /// Architectures recognized: every value
+    /// `ModelArchitecture.fromGGUFArchString(_:)` resolves to
+    /// `.llama` (llama, mistral, qwen / qwen2 / qwen3, codellama).
+    /// Tensor naming convention is the post-`llama.cpp`-`convert.py`
+    /// canonical form: `token_embd.weight` for the embedding,
+    /// `blk.N.{attn_norm, attn_q, attn_k, attn_v, attn_output,
+    /// ffn_norm, ffn_gate, ffn_up, ffn_down}.weight`,
+    /// `output_norm.weight`, optional `output.weight` (tied to
+    /// `token_embd` when absent — the common Llama 3 setup).
+    public static func fromGGUF(_ gguf: GGUFFile,
+                                  maxSeqLenOverride: Int? = nil) throws
+        -> LlamaModel
+    {
+        let meta = gguf.header.metadata
+
+        guard case .string(let arch)? = meta["general.architecture"] else {
+            throw GGUFError.malformed(
+                "missing general.architecture metadata")
+        }
+        guard ModelArchitecture.fromGGUFArchString(arch) == .llama else {
+            throw GGUFError.malformed(
+                "general.architecture '\(arch)' is not Llama-family; "
+                + "use the DeepSeek-V4 path instead")
+        }
+        let p = arch.lowercased()  // metadata key prefix
+
+        // Required scalar dimensions.
+        let hiddenSize       = try metaInt(meta, "\(p).embedding_length")
+        let nLayers          = try metaInt(meta, "\(p).block_count")
+        let nHeads           = try metaInt(meta, "\(p).attention.head_count")
+        let intermediateSize = try metaInt(meta, "\(p).feed_forward_length")
+        let ctxLen           = try metaInt(meta, "\(p).context_length")
+
+        // Optional with sensible Llama defaults.
+        let nKVHeads = (try? metaInt(meta, "\(p).attention.head_count_kv"))
+            ?? nHeads
+        let normEps = (try? metaFloat(meta, "\(p).attention.layer_norm_rms_epsilon"))
+            ?? 1e-5
+        let ropeTheta = (try? metaFloat(meta, "\(p).rope.freq_base"))
+            ?? 10_000.0
+        let headDim = hiddenSize / nHeads
+        let ropeHeadDim = (try? metaInt(meta, "\(p).rope.dimension_count"))
+            ?? headDim
+        let maxSeqLen = maxSeqLenOverride ?? ctxLen
+
+        // Vocab size: prefer explicit metadata, fall back to the
+        // tokens array length (every Llama GGUF has one or the other).
+        let vocabSize: Int
+        if let v = try? metaInt(meta, "\(p).vocab_size") {
+            vocabSize = v
+        } else if case .array(let toks)? = meta["tokenizer.ggml.tokens"] {
+            vocabSize = toks.count
+        } else {
+            throw GGUFError.malformed(
+                "GGUF: cannot determine vocab size (no \(p).vocab_size "
+                + "and no tokenizer.ggml.tokens)")
+        }
+
+        let config = LlamaConfig(
+            vocabSize: vocabSize,
+            hiddenSize: hiddenSize,
+            nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+            intermediateSize: intermediateSize,
+            nLayers: nLayers,
+            maxSeqLen: maxSeqLen,
+            normEps: normEps,
+            ropeTheta: ropeTheta,
+            ropeHeadDim: ropeHeadDim)
+
+        // Shared RoPE freqs. Llama doesn't use YaRN (factor=1,
+        // originalSeqLen=0 bypasses the YaRN correction logic in
+        // `precomputeFreqsCis`).
+        let freqsArr = YaRN.precomputeFreqsCis(
+            dim: ropeHeadDim,
+            seqlen: maxSeqLen,
+            originalSeqLen: 0,
+            base: ropeTheta,
+            factor: 1.0,
+            betaFast: 32, betaSlow: 1)
+        let freqs = freqsArr.withUnsafeBytes { raw in
+            Tensor.from(bytes: raw,
+                         shape: [maxSeqLen, ropeHeadDim / 2, 2],
+                         dtype: .f32)
+        }
+        let rope = RoPE(ropeHeadDim: ropeHeadDim, freqs: freqs)
+
+        // Embedding (also reused as the LM-head weight when the
+        // checkpoint ties them — common in Llama 3).
+        let embedW = try gguf.load("token_embd.weight")
+        let embed = ParallelEmbedding(
+            vocabSize: vocabSize, dim: hiddenSize, weight: embedW)
+
+        // Decoder layers.
+        var layers: [LlamaDecoderLayer] = []
+        layers.reserveCapacity(nLayers)
+        for layerId in 0..<nLayers {
+            let prefix = "blk.\(layerId)."
+
+            let attnNormW = try gguf.load("\(prefix)attn_norm.weight")
+            let attnNorm  = RMSNorm(weight: attnNormW, eps: normEps)
+
+            let wqW = try gguf.load("\(prefix)attn_q.weight")
+            let wkW = try gguf.load("\(prefix)attn_k.weight")
+            let wvW = try gguf.load("\(prefix)attn_v.weight")
+            let woW = try gguf.load("\(prefix)attn_output.weight")
+            let wQ = Linear(inFeatures: hiddenSize,
+                             outFeatures: nHeads * headDim,
+                             weight: wqW, scale: nil)
+            let wK = Linear(inFeatures: hiddenSize,
+                             outFeatures: nKVHeads * headDim,
+                             weight: wkW, scale: nil)
+            let wV = Linear(inFeatures: hiddenSize,
+                             outFeatures: nKVHeads * headDim,
+                             weight: wvW, scale: nil)
+            let wO = Linear(inFeatures: nHeads * headDim,
+                             outFeatures: hiddenSize,
+                             weight: woW, scale: nil)
+            let attn = StandardMHA(
+                nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                maxSeq: maxSeqLen,
+                wQ: wQ, wK: wK, wV: wV, wO: wO, rope: rope)
+
+            let ffnNormW = try gguf.load("\(prefix)ffn_norm.weight")
+            let ffnNorm  = RMSNorm(weight: ffnNormW, eps: normEps)
+
+            let gateW = try gguf.load("\(prefix)ffn_gate.weight")
+            let upW   = try gguf.load("\(prefix)ffn_up.weight")
+            let downW = try gguf.load("\(prefix)ffn_down.weight")
+            let wGate = Linear(inFeatures: hiddenSize,
+                                outFeatures: intermediateSize,
+                                weight: gateW, scale: nil)
+            let wUp   = Linear(inFeatures: hiddenSize,
+                                outFeatures: intermediateSize,
+                                weight: upW, scale: nil)
+            let wDown = Linear(inFeatures: intermediateSize,
+                                outFeatures: hiddenSize,
+                                weight: downW, scale: nil)
+            let ffn = SwiGLU(wGate: wGate, wUp: wUp, wDown: wDown)
+
+            layers.append(LlamaDecoderLayer(
+                layerId: layerId,
+                attnNorm: attnNorm, attn: attn,
+                ffnNorm: ffnNorm, ffn: ffn))
+        }
+
+        // Final norm + LM head.
+        let outputNormW = try gguf.load("output_norm.weight")
+        let norm = RMSNorm(weight: outputNormW, eps: normEps)
+
+        // Tied embeddings: when `output.weight` is absent the LM
+        // head reuses `token_embd.weight`. Detection is a name
+        // lookup against the tensor table — `info(name:)` doesn't
+        // touch the data, just the in-memory index.
+        let headW: Tensor
+        if gguf.info(name: "output.weight") != nil {
+            headW = try gguf.load("output.weight")
+        } else {
+            headW = embedW
+        }
+        let lmHead = Linear(inFeatures: hiddenSize,
+                             outFeatures: vocabSize,
+                             weight: headW, scale: nil)
+
+        return LlamaModel(config: config,
+                           embed: embed,
+                           layers: layers,
+                           norm: norm,
+                           lmHead: lmHead)
+    }
+}
+
+// MARK: - GGUF metadata helpers
+
+/// Read a numeric metadata value as Int. Accepts int64 / uint64 /
+/// float64 (GGUF stores `block_count` etc. as uint64 typically) and
+/// throws if the key is missing or non-numeric.
+private func metaInt(_ meta: [String: GGUFValue],
+                      _ key: String) throws -> Int
+{
+    guard let v = meta[key] else {
+        throw GGUFError.malformed("missing GGUF metadata key '\(key)'")
+    }
+    switch v {
+    case .int64(let n):   return Int(n)
+    case .uint64(let n):  return Int(n)
+    case .float64(let n): return Int(n)
+    default:
+        throw GGUFError.malformed("'\(key)' is not numeric")
+    }
+}
+
+/// Like `metaInt` but returns Float. Accepts the same three numeric
+/// cases; common for epsilons / RoPE base.
+private func metaFloat(_ meta: [String: GGUFValue],
+                        _ key: String) throws -> Float
+{
+    guard let v = meta[key] else {
+        throw GGUFError.malformed("missing GGUF metadata key '\(key)'")
+    }
+    switch v {
+    case .float64(let n): return Float(n)
+    case .int64(let n):   return Float(n)
+    case .uint64(let n):  return Float(n)
+    default:
+        throw GGUFError.malformed("'\(key)' is not numeric")
+    }
+}
