@@ -203,6 +203,7 @@ private struct ModelPicker: View {
     @ObservedObject var catalog: OpenRouterCatalog
 
     @State private var showAddOpenRouter: Bool = false
+    @State private var showLocalModelSettings: Bool = false
 
     var body: some View {
         Menu {
@@ -254,6 +255,12 @@ private struct ModelPicker: View {
                 } label: {
                     Label("Add OpenRouter model…", systemImage: "cloud")
                 }
+                Button {
+                    showLocalModelSettings = true
+                } label: {
+                    Label("Customize local model settings…",
+                           systemImage: "slider.horizontal.3")
+                }
                 if modelState.isReady {
                     Button(role: .destructive) {
                         Task { await modelState.unload() }
@@ -278,6 +285,9 @@ private struct ModelPicker: View {
         .sheet(isPresented: $showAddOpenRouter) {
             AddOpenRouterModelSheet(catalog: catalog,
                                      modelState: modelState)
+        }
+        .sheet(isPresented: $showLocalModelSettings) {
+            LocalModelSettingsSheet(modelState: modelState)
         }
     }
 
