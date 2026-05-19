@@ -104,21 +104,22 @@ struct MessageView: View {
         .padding(.vertical, 4)
     }
 
-    /// Wrench-icon disclosure with one row per (call, output)
-    /// pair. Rendered below the assistant prose because the calls
-    /// chronologically fire *after* the model writes its text /
-    /// reasoning. Output is shown plain because most MCP servers
-    /// return raw text or JSON — running it through MarkdownText
-    /// would mangle a JSON blob with stray code-block heuristics.
+    /// Wrench-icon disclosure containing one ToolCallDisclosure per
+    /// (call, output) pair. Rendered below the assistant prose because
+    /// the calls chronologically fire *after* the model writes its text
+    /// / reasoning. Each inner disclosure is collapsed by default —
+    /// expanding it reveals the full args JSON plus the tool's output.
     private var toolCallSection: some View {
         DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(message.toolCalls.enumerated()), id: \.offset) { idx, call in
-                    toolCallRow(call: call,
-                                 output: message.toolOutputs?
-                                    .indices.contains(idx) == true
-                                    ? message.toolOutputs![idx]
-                                    : nil)
+                    ToolCallDisclosure(
+                        call: call,
+                        output: message.toolOutputs?
+                            .indices.contains(idx) == true
+                            ? message.toolOutputs![idx]
+                            : nil,
+                        agentResolver: agentResolver)
                 }
             }
             .padding(.top, 4)
@@ -132,136 +133,6 @@ struct MessageView: View {
             .foregroundStyle(.secondary)
         }
         .padding(.top, 6)
-    }
-
-    private func toolCallRow(call: StoredToolCall, output: String?) -> some View {
-        // Recognise the synthetic delegation tool so the row can
-        // render the *target* agent's identity (icon + tint +
-        // name) instead of the generic wrench, and surface the
-        // sub-task text plainly instead of the `{agent_name, task}`
-        // JSON pair the model emitted.
-        let delegation = parseDelegation(call: call)
-
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                if let agent = delegation?.agent {
-                    Image(systemName: agent.iconName)
-                        .font(.caption)
-                        .foregroundStyle(AgentTint.color(for: agent.tint))
-                    Text("Delegated to ")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    + Text(agent.name)
-                        .font(.callout.bold())
-                    if !agent.summary.isEmpty {
-                        Text("· \(agent.summary)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                } else if delegation != nil {
-                    Image(systemName: "person.crop.circle.badge.questionmark")
-                        .font(.caption)
-                        .foregroundStyle(Color.orange)
-                    Text("Delegation to unknown agent")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                } else {
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    Text(call.name)
-                        .font(.callout.monospaced())
-                }
-                if output == nil {
-                    Spacer()
-                    HStack(spacing: 4) {
-                        ProgressView().controlSize(.mini)
-                        Text("running…")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-            // Args: for a delegation, drop the JSON envelope and
-            // show the sub-task as plain text — it's the bit the
-            // user actually cares about. For everything else,
-            // pretty-print the JSON args so the structure is legible
-            // (falls back to raw text on parse failure).
-            if let task = delegation?.task, !task.isEmpty {
-                Text(task)
-                    .font(.callout)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(NSColor.textBackgroundColor),
-                                 in: RoundedRectangle(cornerRadius: 4))
-            } else {
-                let prettyArgs = MessageView.prettyJSON(call.args)
-                if !prettyArgs.isEmpty {
-                    Text(prettyArgs)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.textBackgroundColor),
-                                     in: RoundedRectangle(cornerRadius: 4))
-                }
-            }
-            if let out = output, !out.isEmpty {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.left.square")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    Text("output")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                Text(out)
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(NSColor.textBackgroundColor),
-                                 in: RoundedRectangle(cornerRadius: 4))
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    /// Decode a delegation call's payload into the bits the row
-    /// needs: the resolved target agent (or nil if the name isn't
-    /// registered) and the sub-task text. Returns nil for calls
-    /// that aren't `__delegate_to_agent` so the caller can fall
-    /// through to the generic rendering.
-    private func parseDelegation(call: StoredToolCall)
-        -> (agent: AgentConfig?, task: String)?
-    {
-        guard call.name == EncodingDSV4.delegateToolName else { return nil }
-        let data = call.args.data(using: .utf8) ?? Data()
-        let obj = (try? JSONSerialization.jsonObject(with: data))
-            as? [String: Any] ?? [:]
-        let agentName = (obj["agent_name"] as? String) ?? ""
-        let task = (obj["task"] as? String) ?? ""
-        let agent = agentName.isEmpty ? nil : agentResolver?(agentName)
-        return (agent, task)
-    }
-
-    private static func prettyJSON(_ raw: String) -> String {
-        guard !raw.isEmpty,
-              let data = raw.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data),
-              let out = try? JSONSerialization.data(
-                withJSONObject: obj,
-                options: [.prettyPrinted, .sortedKeys]),
-              let str = String(data: out, encoding: .utf8)
-        else { return raw }
-        return str
     }
 
     @ViewBuilder
@@ -341,5 +212,192 @@ private struct StreamingCaretText: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// One collapsible row inside the wrench-icon disclosure. Collapsed
+/// shows the tool name + a single-line preview of the call args so the
+/// user can scan a batch of calls (`ls {path: "src"}` → `grep
+/// {pattern: "foo"}` → …) without opening every one. Expanding reveals
+/// the pretty-printed args JSON plus the tool's output. Owns its own
+/// `@State` for `isExpanded`, so each row keeps independent open/close
+/// state across re-renders even when its sibling rows toggle.
+private struct ToolCallDisclosure: View {
+    let call: StoredToolCall
+    let output: String?
+    let agentResolver: ((String) -> AgentConfig?)?
+
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            expandedContent.padding(.top, 4)
+        } label: {
+            headerLabel
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: header
+
+    @ViewBuilder
+    private var headerLabel: some View {
+        HStack(spacing: 6) {
+            if let agent = delegation?.agent {
+                Image(systemName: agent.iconName)
+                    .font(.caption)
+                    .foregroundStyle(AgentTint.color(for: agent.tint))
+                (Text("Delegated to ")
+                    .foregroundStyle(.secondary)
+                 + Text(agent.name).bold())
+                    .font(.callout)
+                    .lineLimit(1)
+            } else if delegation != nil {
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+                Text("Delegation to unknown agent")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+            } else {
+                Image(systemName: "arrow.up.right.square")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Text(call.name)
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
+            }
+            // Args preview: shown next to the tool name so the user can
+            // tell `ls /Sources` apart from `ls /Tests` without opening
+            // every row. For delegations we surface the sub-task text
+            // (what the user cares about) instead of the JSON envelope.
+            let preview = argsPreview
+            if !preview.isEmpty {
+                Text(preview)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
+            }
+            Spacer(minLength: 4)
+            if output == nil {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.mini)
+                    Text("running…")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    // MARK: expanded body
+
+    @ViewBuilder
+    private var expandedContent: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Agent summary line, only when present, mirrors the
+            // previous flat layout — useful context that's too long
+            // to fit in the collapsed header.
+            if let agent = delegation?.agent, !agent.summary.isEmpty {
+                Text(agent.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Args section: for delegations show the sub-task body
+            // plainly; for everything else pretty-print the JSON.
+            if let task = delegation?.task, !task.isEmpty {
+                Text(task)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.textBackgroundColor),
+                                 in: RoundedRectangle(cornerRadius: 4))
+            } else {
+                let pretty = Self.prettyJSON(call.args)
+                if !pretty.isEmpty {
+                    Text(pretty)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.textBackgroundColor),
+                                     in: RoundedRectangle(cornerRadius: 4))
+                }
+            }
+            if let out = output, !out.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.left.square")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Text("output")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(out)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.textBackgroundColor),
+                                 in: RoundedRectangle(cornerRadius: 4))
+            }
+        }
+    }
+
+    // MARK: helpers
+
+    /// Parse a `__delegate_to_agent` call into the resolved target
+    /// AgentConfig (nil if the name isn't registered) and the sub-task
+    /// text. Returns nil for non-delegation calls.
+    private var delegation: (agent: AgentConfig?, task: String)? {
+        guard call.name == EncodingDSV4.delegateToolName else { return nil }
+        let data = call.args.data(using: .utf8) ?? Data()
+        let obj = (try? JSONSerialization.jsonObject(with: data))
+            as? [String: Any] ?? [:]
+        let agentName = (obj["agent_name"] as? String) ?? ""
+        let task = (obj["task"] as? String) ?? ""
+        let agent = agentName.isEmpty ? nil : agentResolver?(agentName)
+        return (agent, task)
+    }
+
+    /// Compact one-line summary of the call's args, used in the
+    /// collapsed header. JSON is re-serialized without whitespace so
+    /// nested objects fit on one line; truncation is left to SwiftUI.
+    private var argsPreview: String {
+        if let task = delegation?.task, !task.isEmpty {
+            return task.replacingOccurrences(of: "\n", with: " ")
+        }
+        let raw = call.args.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { return "" }
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let out = try? JSONSerialization.data(
+                withJSONObject: obj,
+                options: [.sortedKeys]),
+              let str = String(data: out, encoding: .utf8) else {
+            return raw.replacingOccurrences(of: "\n", with: " ")
+        }
+        return str
+    }
+
+    static func prettyJSON(_ raw: String) -> String {
+        guard !raw.isEmpty,
+              let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let out = try? JSONSerialization.data(
+                withJSONObject: obj,
+                options: [.prettyPrinted, .sortedKeys]),
+              let str = String(data: out, encoding: .utf8)
+        else { return raw }
+        return str
     }
 }
