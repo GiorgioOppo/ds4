@@ -1046,6 +1046,39 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Effective agent catalog for the active conversation
+    /// (TODO §11). When the chat is attached to a project that
+    /// carries a `.deepseek/agents.json` overlay, those entries
+    /// override / extend the global library. Returns the global
+    /// list unchanged when no project / no overlay file is present.
+    public func effectiveAgents() -> [AgentConfig] {
+        guard let conv = selectedConversation,
+              let projectID = conv.projectID,
+              let project = projects.project(id: projectID),
+              let firstPath = project.sourcePaths.first
+        else { return agents.agents }
+        let overlay = ProjectOverlayLoader.load(
+            rootDirectory: URL(fileURLWithPath: firstPath))
+        return ProjectOverlayLoader.mergeAgents(
+            global: agents.agents, overlay: overlay.agents)
+    }
+
+    /// Snapshot the current project's overlay (or an empty one
+    /// rooted at $HOME if no project is attached). Helper for UI
+    /// surfaces that want to introspect what came from the
+    /// project vs. the global library.
+    public func currentProjectOverlay() -> ProjectOverlay {
+        guard let conv = selectedConversation,
+              let projectID = conv.projectID,
+              let project = projects.project(id: projectID),
+              let firstPath = project.sourcePaths.first
+        else {
+            return .empty(rootDirectory: URL(fileURLWithPath: NSHomeDirectory()))
+        }
+        return ProjectOverlayLoader.load(
+            rootDirectory: URL(fileURLWithPath: firstPath))
+    }
+
     private func appendDelegationBuffer(hostConvID: UUID,
                                          frameID: UUID,
                                          text: String) {
