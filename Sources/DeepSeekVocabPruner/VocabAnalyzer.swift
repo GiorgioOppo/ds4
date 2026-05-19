@@ -553,9 +553,6 @@ public enum VocabAnalyzer {
         // RAM contiguamente, le pagine sono fetched on demand dal
         // kernel. Critico per corpora grandi.
         let data = try Data(contentsOf: url, options: .alwaysMapped)
-        guard let s = String(data: data, encoding: .utf8) else {
-            return (0, 0, [:])
-        }
         var counts: [Int: Int] = [:]
         var lines = startLineOffset
         var tokens = 0
@@ -565,68 +562,99 @@ public enum VocabAnalyzer {
         var batchLines = 0
         var batchTokens = 0
 
-        // Iterazione: split poi drop dei primi `startLineOffset`
-        // record. Costo O(N) sul prefix da skippare, accettabile per
-        // file di qualche GB (il bottleneck è la tokenization).
-        let allLines = s.split(separator: "\n", omittingEmptySubsequences: true)
-        let toProcess = startLineOffset > 0
-            ? allLines.dropFirst(startLineOffset)
-            : allLines[allLines.startIndex...]
-
+        // Byte-level scan: niente `String(data: 5GB)` + `split` (sync,
+        // pre-loop, ignoravano il cancellation per minuti). Iteriamo
+        // i bytes direttamente cercando '\n' come delimiter di riga;
+        // per ogni riga decodifichiamo solo lo slice piccolo (kB).
+        // Identico pattern di `processByteRange`.
+        let totalBytes = data.count
         var sinceLastCancelCheck = 0
-        for raw in toProcess {
-            // Cancellation check ogni 1k linee — indipendente dal
-            // batch threshold (che è opzionale e non usato nel path
-            // parallel multi-file). 1k linee = ~50-500ms su un
-            // tokenizer BPE realistico, sufficiente per cancel
-            // responsive.
-            sinceLastCancelCheck &+= 1
-            if sinceLastCancelCheck >= 1000 {
-                try cancellation?.throwIfCancelled()
-                sinceLastCancelCheck = 0
-            }
-            let line = String(raw)
-            let text: String
-            if isJsonl {
-                guard let bytes = line.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-                      let t = obj["text"] as? String else {
-                    lines += 1
-                    batchLines += 1
+        var linesSkippedForOffset = 0
+        var cancelledDuringScan = false
+
+        // La closure è non-throwing → cancel propagato via flag
+        // `cancelledDuringScan`, throw dopo l'uscita. Il batch
+        // callback è non-throwing (signature impone Void return)
+        // quindi può essere chiamato in-line.
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress?
+                    .assumingMemoryBound(to: UInt8.self) else { return }
+
+            var pos = 0
+            while pos < totalBytes {
+                var lineEnd = pos
+                while lineEnd < totalBytes && base[lineEnd] != 0x0A {
+                    lineEnd &+= 1
+                }
+
+                // Skip startLineOffset linee senza tokenizzare.
+                if linesSkippedForOffset < startLineOffset {
+                    linesSkippedForOffset &+= 1
+                    pos = lineEnd &+ 1
                     continue
                 }
-                text = t
-            } else {
-                text = line
-            }
-            let ids = tokenizer.encode(text)
-            for id in ids {
-                counts[id, default: 0] += 1
-                batchCounts[id, default: 0] += 1
-                tokens += 1
-                batchTokens += 1
-            }
-            lines += 1
-            batchLines += 1
 
-            // Flush periodico ogni ~threshold token. Verifica DOPO
-            // aver completato una linea — non spezziamo la
-            // tokenizzazione di una linea a metà (semantica più
-            // pulita per il resume).
-            if let threshold = tokenBatchThreshold,
-               let cb = onTokenBatch,
-               batchTokens >= threshold
-            {
-                cb(batchLines, batchTokens, batchCounts, lines, tokens)
-                batchCounts.removeAll(keepingCapacity: true)
-                batchLines = 0
-                batchTokens = 0
-                // Cancellation check ai flush boundary: gli unici punti
-                // dove il batch è coerente e possiamo bail-out senza
-                // perdere dati parzialmente accumulati.
-                try cancellation?.throwIfCancelled()
+                if lineEnd > pos {
+                    let lineSlice = data[pos..<lineEnd]
+                    let text: String?
+                    if isJsonl {
+                        if let obj = try? JSONSerialization.jsonObject(with: lineSlice)
+                            as? [String: Any],
+                           let t = obj["text"] as? String {
+                            text = t
+                        } else {
+                            text = nil
+                        }
+                    } else {
+                        text = String(data: lineSlice, encoding: .utf8)
+                    }
+                    if let text = text, !text.isEmpty {
+                        let ids = tokenizer.encode(text)
+                        for id in ids {
+                            counts[id, default: 0] += 1
+                            batchCounts[id, default: 0] += 1
+                            tokens &+= 1
+                            batchTokens &+= 1
+                        }
+                    }
+                    lines &+= 1
+                    batchLines &+= 1
+                }
+                pos = lineEnd &+ 1
+
+                // Flush periodico ogni ~threshold token. Path
+                // sequenziale only (parallel multi-file non passa
+                // threshold). Chiamata in-line — onTokenBatch è
+                // non-throwing.
+                if let threshold = tokenBatchThreshold,
+                   let cb = onTokenBatch,
+                   batchTokens >= threshold
+                {
+                    cb(batchLines, batchTokens, batchCounts, lines, tokens)
+                    batchCounts.removeAll(keepingCapacity: true)
+                    batchLines = 0
+                    batchTokens = 0
+                }
+
+                // Cancellation check ogni 1k linee. Niente più
+                // pre-processing pesante PRIMA del loop, quindi
+                // il check è raggiungibile in pochi ms dal momento
+                // del cancel premuto.
+                sinceLastCancelCheck &+= 1
+                if sinceLastCancelCheck >= 1000 {
+                    if cancellation?.isCancelled == true {
+                        cancelledDuringScan = true
+                        return  // esce dalla closure
+                    }
+                    sinceLastCancelCheck = 0
+                }
             }
         }
+
+        if cancelledDuringScan {
+            try cancellation?.throwIfCancelled()
+        }
+
         // Flush finale residuo (può essere < threshold).
         if batchTokens > 0, let cb = onTokenBatch {
             cb(batchLines, batchTokens, batchCounts, lines, tokens)
