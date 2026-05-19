@@ -264,25 +264,45 @@ public enum VocabAnalyzer {
                 } else {
                     fileSize = 0
                 }
-                if ck.fileSize == fileSize, !ck.completedChunks.isEmpty {
-                    // Match: pre-popola i counts globali con il
-                    // partial già fatto + segna i chunk da skippare.
+                // Validità del checkpoint round-robin:
+                //   - fileSize identico (file non modificato)
+                //   - boundaries == [0, fileSize] (formato round-robin
+                //     attuale; vecchi checkpoint byte-chunked hanno
+                //     più boundary e sono incompatibili)
+                //   - max(completedChunks) < concurrency attuale
+                //     (l'utente non ha ridotto i thread; un thread idx=7
+                //     in 8-thread non ha senso se ora abbiamo 4 thread)
+                let isRoundRobin = ck.boundaries.count == 2
+                let maxCompleted = ck.completedChunks.max() ?? -1
+                if ck.fileSize == fileSize, isRoundRobin,
+                   !ck.completedChunks.isEmpty,
+                   maxCompleted < concurrency
+                {
                     Self.mergeCounts(ck.partialCountsForFile, into: &counts)
                     tokens += ck.tokensInFile
                     lines += ck.linesInFile
                     resumeChunks = Set(ck.completedChunks)
                     onEvent(.log("Resume chunked: \(ck.completedChunks.count) " +
-                                  "chunk già completati su '\(ck.path)' " +
+                                  "thread già completati su '\(ck.path)' " +
                                   "(\(ck.tokensInFile) token), processo i restanti."))
+                } else if ck.fileSize == fileSize, !isRoundRobin {
+                    onEvent(.log("Warning: checkpoint chunked legacy " +
+                                  "(byte-based) incompatibile col round-robin " +
+                                  "attuale. Riparto da zero per '\(ck.path)'."))
+                } else if ck.fileSize == fileSize, maxCompleted >= concurrency {
+                    onEvent(.log("Warning: concurrency ridotta " +
+                                  "(\(maxCompleted + 1) → \(concurrency)). " +
+                                  "Resume non possibile. Riparto da capo."))
                 } else if ck.fileSize != fileSize {
                     onEvent(.log("Warning: chunked checkpoint trovato ma " +
                                   "fileSize cambiata (\(ck.fileSize) → " +
                                   "\(fileSize)). Riparto da capo."))
                 }
             }
-            onEvent(.log("Single-file parallel mode: chunking " +
-                          "'\(file.url.path)' in \(concurrency) range " +
-                          "allineati al newline."))
+            onEvent(.log("Single-file parallel mode (round-robin): " +
+                          "'\(file.url.path)' distribuito su " +
+                          "\(concurrency) thread — thread k processa " +
+                          "le righe i con i % \(concurrency) == k."))
             let result = try Self.processFileParallel(
                 file.url,
                 isJsonl: file.isJsonl,
@@ -729,24 +749,28 @@ public enum VocabAnalyzer {
                                        boundaries: [0], fileSize: 0)
         }
 
-        // 1) Calcola i boundary di chunk. Target = fileSize / N;
-        // ogni boundary viene "snappato" al successivo \n perché
-        // non possiamo iniziare a metà di una linea.
+        // 1) Round-robin line distribution invece di chunk byte
+        // contigui. Ogni thread `k` (0..<nChunks) scanna l'intero
+        // file mmap'd ma tokenizza solo le righe `i` tali che
+        // `i % nChunks == k`. Bilanciamento perfetto del lavoro
+        // anche con righe di dimensione molto eterogenea
+        // (es. un dataset misto JSON oggetti grandi + righe brevi).
+        //
+        // Costo: ogni thread esegue il byte-scan dell'intero file
+        // (cercando i '\n' per contare l'indice di riga). Su
+        // mmap'd Data zero-copy, lo scan è CPU-bound a ~1 GB/s
+        // per thread → ~5s per file da 5GB. La tokenizzazione,
+        // 10× più costosa, domina il wall-clock — quindi il
+        // byte-scan ripetuto è ammortizzato.
+        //
+        // Vantaggio rispetto al byte-chunking: niente pre-pass
+        // per contare le linee + niente boundary array.
+        // `boundaries = [0, fileSize]` resta per backward compat
+        // con il checkpoint (il caller setta `chunkedFile.boundaries`
+        // ma la logica di resume usa solo `completedChunks`).
         let nChunks = max(1, min(concurrency, fileSize / 1024 + 1))
-        var boundaries: [Int] = [0]
-        let chunkSize = fileSize / nChunks
-        for i in 1..<nChunks {
-            let target = chunkSize * i
-            let nl = Self.findNewline(after: target, in: data)
-            // +1 per iniziare DOPO il \n (la riga corrente "appartiene"
-            // al chunk precedente). Se non trova un \n, il chunk
-            // precedente si estende fino a fileSize.
-            if nl < fileSize, nl + 1 > (boundaries.last ?? 0) {
-                boundaries.append(nl + 1)
-            }
-        }
-        boundaries.append(fileSize)
-        let actualChunks = boundaries.count - 1
+        let boundaries: [Int] = [0, fileSize]
+        let actualChunks = nChunks
 
         // Notifica al caller i boundary calcolati PRIMA del dispatch
         // dei thread, così il caller può fare setup del checkpoint
@@ -780,18 +804,21 @@ public enum VocabAnalyzer {
             if resumeFromCompletedChunks.contains(idx) {
                 return
             }
-            let startByte = boundaries[idx]
-            let endByte = boundaries[idx + 1]
+            // Round-robin: ogni thread scanna l'intero file ma
+            // tokenizza solo le righe `lineIdx % actualChunks == idx`.
             let r = results[idx]
             do {
                 try Self.processByteRange(
                     data: data,
-                    start: startByte,
-                    end: endByte,
+                    start: 0,
+                    end: fileSize,
                     isJsonl: isJsonl,
                     tokenizer: tokenizer,
                     chunkResult: r,
                     cancellation: cancellation,
+                    lineFilter: { lineIdx in
+                        lineIdx % actualChunks == idx
+                    },
                     onTokenProgress: {
                         // Debounce: chiama onProgress al massimo ogni
                         // 200ms (evita storm di callback durante
@@ -863,6 +890,7 @@ public enum VocabAnalyzer {
         }
     }
 
+
     /// Processa un range di byte `[start, end)` dentro `data`,
     /// iterando linea per linea e tokenizzando ciascuna. Riempie
     /// `chunkResult.{lines, tokens, counts}` direttamente — nessun
@@ -879,6 +907,7 @@ public enum VocabAnalyzer {
         tokenizer: BPETokenizer,
         chunkResult: AnalyzerChunkSlot,
         cancellation: CancellationToken? = nil,
+        lineFilter: ((Int) -> Bool)? = nil,
         onTokenProgress: (() -> Void)? = nil
     ) throws {
         var localCounts: [Int: Int] = [:]
@@ -903,6 +932,16 @@ public enum VocabAnalyzer {
 
             var pos = start
             var lastFlush = 0
+            // Indice globale della riga corrente (zero-based dal
+            // primo `pos = start`). Usato dal `lineFilter` per il
+            // round-robin: il caller passa `{ $0 % N == k }` per
+            // selezionare solo le righe del proprio thread.
+            var lineIdx = 0
+            // Cancel check counter per le righe SKIPPATE dal filter
+            // (per il round-robin, ogni thread itera tutte le righe
+            // del file ma tokenizza solo le sue: anche le righe
+            // skipped contano nel responsiveness del cancel).
+            var sinceCheckSkippedLines = 0
             while pos < end {
                 // Trova la fine della linea corrente (newline o
                 // confine del range).
@@ -910,7 +949,10 @@ public enum VocabAnalyzer {
                 while lineEnd < end && base[lineEnd] != 0x0A {
                     lineEnd &+= 1
                 }
-                if lineEnd > pos {
+
+                let shouldProcess = lineFilter?(lineIdx) ?? true
+
+                if shouldProcess && lineEnd > pos {
                     // Estrai la linea come Data slice (zero-copy view).
                     let lineSlice = data[pos..<lineEnd]
                     let text: String?
@@ -932,8 +974,22 @@ public enum VocabAnalyzer {
                         }
                         localLines &+= 1
                     }
+                } else if !shouldProcess {
+                    // Riga skipped: contiamo nel contatore separato
+                    // così il cancel può scattare anche se il thread
+                    // sta in fase di "scan-and-skip" (es. round-robin
+                    // dove il 7/8 delle righe non sono sue).
+                    sinceCheckSkippedLines &+= 1
+                    if sinceCheckSkippedLines >= 10_000 {
+                        if cancellation?.isCancelled == true {
+                            cancelled = true
+                            return
+                        }
+                        sinceCheckSkippedLines = 0
+                    }
                 }
                 pos = lineEnd &+ 1   // skip il \n
+                lineIdx &+= 1
 
                 // Flush periodico nel chunkResult + progress callback +
                 // cancellation check (~ogni 50k token: bilanciamento tra
