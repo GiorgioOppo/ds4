@@ -182,14 +182,69 @@ public enum SchemaCompiler {
             return
         }
 
-        // Future: array / pattern / number ranges. Each needs its
-        // own automaton; punt with a clear error so the caller
-        // knows we haven't silently dropped the constraint on the
-        // floor.
+        // type:"array" with `items` reducible to a string union and
+        // a bounded length range. Enumerate every (length,
+        // combination) compactly: `[v1,v2,…,vL]` for each L in
+        // `[minItems, maxItems]`. Unbounded `maxItems` is rejected
+        // — we won't silently emit a single-element constraint when
+        // the schema allows N.
+        if (schema["type"] as? String) == "array" {
+            guard let itemsSchema = schema["items"] as? [String: Any] else {
+                throw SchemaError.unsupported(
+                    "array schema missing `items`")
+            }
+            let minItems = (schema["minItems"] as? Int) ?? 0
+            guard let maxItems = schema["maxItems"] as? Int else {
+                throw SchemaError.unsupported(
+                    "array schema needs an explicit `maxItems` "
+                    + "(unbounded length is not enumerable)")
+            }
+            guard minItems >= 0, minItems <= maxItems else {
+                throw SchemaError.unsupported(
+                    "array minItems / maxItems out of range")
+            }
+            let itemsAllowed = try collectAllowedStrings(from: itemsSchema)
+            guard !itemsAllowed.isEmpty else {
+                throw SchemaError.unsupported(
+                    "array items admits no values")
+            }
+            let totalLimit = 4096
+            for length in minItems...maxItems {
+                if length == 0 {
+                    if seen.insert("[]").inserted { out.append("[]") }
+                    continue
+                }
+                var rows: [String] = [""]
+                for i in 0..<length {
+                    let sep = i == 0 ? "[" : ","
+                    var expanded: [String] = []
+                    expanded.reserveCapacity(rows.count * itemsAllowed.count)
+                    for cur in rows {
+                        for val in itemsAllowed {
+                            expanded.append(cur + sep + jsonEncodeString(val))
+                        }
+                    }
+                    rows = expanded
+                    if rows.count > totalLimit {
+                        throw SchemaError.unsupported(
+                            "array enumeration exceeds \(totalLimit) at length \(length)")
+                    }
+                }
+                for s in rows {
+                    let closed = s + "]"
+                    if seen.insert(closed).inserted { out.append(closed) }
+                }
+            }
+            return
+        }
+
+        // Future: pattern / number ranges. Each needs its own
+        // automaton; punt with a clear error so the caller knows
+        // we haven't silently dropped the constraint on the floor.
         throw SchemaError.unsupported(
             "JSON Schema feature not yet supported by SchemaCompiler "
             + "(this version handles enum / const / oneOf / anyOf / "
-            + "type:object — see TODO §10.3 for array / pattern "
+            + "type:object / type:array — see TODO §10.3 for pattern "
             + "follow-ups)")
     }
 
