@@ -6,7 +6,7 @@ import DeepSeekVocabPruner
 /// Modal sheet per il vocab pruning italiano-only. Tre pannelli:
 ///   - top: form (input/output dir + corpus + coverage + dry-run)
 ///   - middle: live progress (status, progress bar, log scrollabile)
-///   - bottom: footer con Start / Cancel / Close
+///   - bottom: footer con Start / Stop / Close
 ///
 /// Mirror strutturale di `ConvertSheet` — locale `@StateObject vm`,
 /// nessun environment object necessario.
@@ -71,7 +71,7 @@ struct VocabPrunerSheet: View {
             }
             Spacer()
             Button {
-                if vm.isRunning { vm.cancel() }
+                if vm.isRunning { vm.stop() }
                 dismiss()
             } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -264,8 +264,8 @@ struct VocabPrunerSheet: View {
             HStack {
                 Text("Progress").font(.headline)
                 Spacer()
-                if vm.isCancelling {
-                    Label("Cancelling…", systemImage: "xmark.circle")
+                if vm.isStopping {
+                    Label("Stopping…", systemImage: "stop.circle")
                         .foregroundStyle(.orange)
                 } else if vm.isRunning {
                     ProgressView().controlSize(.small)
@@ -276,29 +276,29 @@ struct VocabPrunerSheet: View {
             }
 
             // Progress bar: significativa solo in Fase 2 (shard).
-            // Durante il cancel la mostriamo dimmed per segnalare
-            // visivamente che è "frozen" — gli eventi continuano ad
-            // arrivare ma `handle()` li scarta finché il task non
-            // rilascia.
+            // Durante lo stop la mostriamo dimmed per segnalare
+            // visivamente che è "frozen" — eventuali eventi residui
+            // (rari, <100ms tipicamente) vengono scartati da
+            // `handle()` finché il task non rilascia.
             if vm.status.shardsTotal > 0 {
                 ProgressView(value: vm.progressFraction)
-                    .opacity(vm.isCancelling ? 0.4 : 1)
+                    .opacity(vm.isStopping ? 0.4 : 1)
             } else {
                 ProgressView()
                     .progressViewStyle(.linear)
-                    .opacity(vm.isCancelling ? 0.4 : (vm.isRunning ? 1 : 0.25))
+                    .opacity(vm.isStopping ? 0.4 : (vm.isRunning ? 1 : 0.25))
             }
 
-            // Banner post-cancel: l'ultima run è stata cancellata,
+            // Banner post-stop: l'ultima run è stata interrotta,
             // il checkpoint è salvato su disco, l'utente può
             // premere Start per riprenderla o cambiare i parametri
             // (al cambio di spec hash il checkpoint viene scartato
             // e si riparte da zero).
-            if vm.status.cancelled && !vm.isRunning {
+            if vm.status.stopped && !vm.isRunning {
                 HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
+                    Image(systemName: "stop.circle.fill")
                         .foregroundStyle(.orange)
-                    Text("Run cancelled — checkpoint saved. " +
+                    Text("Scan stopped — progress saved. " +
                           "Press Start to resume from where you left off.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -498,8 +498,8 @@ struct VocabPrunerSheet: View {
                  "\(vm.status.tokensScanned) tokens")
                 .font(.callout.monospacedDigit())
         } else {
-            Text(vm.isCancelling
-                  ? "cancelling…"
+            Text(vm.isStopping
+                  ? "stopping…"
                   : (vm.isRunning ? "starting…" : "idle"))
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -538,12 +538,13 @@ struct VocabPrunerSheet: View {
         HStack {
             Spacer()
             if vm.isRunning {
-                Button(vm.isCancelling ? "Cancelling…" : "Cancel",
-                        role: .destructive) {
-                    vm.cancel()
+                Button(vm.isStopping ? "Stopping…" : "Stop") {
+                    vm.stop()
                 }
                 .keyboardShortcut(.cancelAction)
-                .disabled(vm.isCancelling)
+                .disabled(vm.isStopping)
+                .help("Interrompe la scansione e salva il checkpoint. " +
+                      "Premi Start per riprendere dal punto raggiunto.")
             } else {
                 Button("Close") { dismiss() }
                     .keyboardShortcut(.cancelAction)

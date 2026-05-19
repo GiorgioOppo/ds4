@@ -30,16 +30,19 @@ final class VocabPrunerViewModel: ObservableObject {
     // ---- Runtime state ----
     @Published var status: VocabPruneStatus = VocabPruneStatus()
     @Published var isRunning: Bool = false
-    /// True dal momento in cui l'utente preme Cancel finché il task
-    /// background non rilascia (può durare 1-30s perché il cancel
-    /// è cooperativo: i thread/chunk già in volo finiscono prima
-    /// di rilasciare il controllo). Quando true:
-    ///   - il bottone Cancel diventa disabled + label "Cancelling…"
-    ///   - la ProgressView mostra il testo di cancel in corso
-    ///   - i nuovi `VocabPruneEvent` non aggiornano più `progressFraction`
-    ///     così la barra resta visivamente "ferma" al punto di
-    ///     cancel invece di continuare ad avanzare
-    @Published var isCancelling: Bool = false
+    /// True dal momento in cui l'utente preme Stop finché il task
+    /// background non rilascia. Con la nuova strategia di bail-out
+    /// cooperativo (Task.isCancelled ogni riga + yield ogni 50k
+    /// righe) la transizione tipica è <100ms, ma resta cooperativa:
+    /// se l'encode BPE è in volo su una riga gigante, finisce
+    /// quella riga prima di rilasciare. Quando true:
+    ///   - il bottone Stop diventa disabled + label "Stopping…"
+    ///   - la ProgressView mostra il testo di stop in corso
+    ///   - i nuovi `VocabPruneEvent` non aggiornano più
+    ///     `progressFraction` così la barra resta visivamente
+    ///     "ferma" al punto di stop invece di continuare ad
+    ///     avanzare
+    @Published var isStopping: Bool = false
     @Published var lastError: String? = nil
 
     /// Popolato dalla Fase 1 (analyze) appena prima della Fase 2.
@@ -102,7 +105,7 @@ final class VocabPrunerViewModel: ObservableObject {
             resume: resumeEnabled)
 
         isRunning = true
-        isCancelling = false
+        isStopping = false
         lastError = nil
         status = VocabPruneStatus()
         lastDecision = nil
@@ -112,6 +115,12 @@ final class VocabPrunerViewModel: ObservableObject {
         // Capture references for the closure (sendable hop).
         let specCopy = spec
         self.task = Task { [weak self] in
+            // Sia il path success che il path catch finiscono in
+            // `finishRun`. Garantisce che `isRunning`/`isStopping`
+            // siano sempre resettati anche se in futuro aggiungiamo
+            // branch di errore non strutturati. Mantiene la
+            // distinzione user-stop vs failure tramite lo snapshot
+            // di `isStopping` letto sul MainActor.
             do {
                 try await VocabPruner.run(
                     spec: specCopy,
@@ -122,49 +131,62 @@ final class VocabPrunerViewModel: ObservableObject {
                         }
                     })
                 await MainActor.run { [weak self] in
-                    self?.isRunning = false
-                    self?.isCancelling = false
+                    self?.finishRun(error: nil)
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    let wasCancelling = self?.isCancelling ?? false
-                    self?.isRunning = false
-                    self?.isCancelling = false
-                    let cancelMsg = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String
-                    // Se il task è stato terminato da un cancel
-                    // esplicito dell'utente, non mostriamo l'errore
-                    // come fallimento — è UX previsto. Per gli altri
-                    // errori (file I/O, parse, etc.) mostriamo il
-                    // messaggio.
-                    if wasCancelling {
-                        self?.lastError = nil
-                        // Reset UI dello stato run per permettere
-                        // un nuovo Start pulito. Lo `status.cancelled`
-                        // resta true così la sheet può mostrare un
-                        // banner "Run cancelled — checkpoint salvato".
-                        self?.status = VocabPruneStatus(cancelled: true)
-                        self?.lastDecision = nil
-                        // Refresh delle info checkpoint così l'utente
-                        // vede quanti file/shard sono stati salvati
-                        // dal cancel (info pre-flight per il next Start).
-                        self?.refreshCheckpointInfo()
-                    } else {
-                        self?.lastError = (error as? LocalizedError)?.errorDescription
-                            ?? cancelMsg
-                            ?? error.localizedDescription
-                    }
+                    self?.finishRun(error: error)
                 }
             }
         }
     }
 
+    /// Chiusura della run: chiamata sul MainActor sia dal success
+    /// che dal catch del Task in `start()`. Resetta lo stato di
+    /// runtime e, se l'errore corrisponde a uno stop user-initiated
+    /// (rilevato via `isStopping == true` al momento della chiusura),
+    /// promuove lo stato a `stopped` invece che a `error`.
+    private func finishRun(error: Error?) {
+        let wasStopping = isStopping
+        isRunning = false
+        isStopping = false
+        guard let error = error else {
+            // Path success: niente da fare oltre il reset dei flag.
+            return
+        }
+        // Se il task è stato terminato da uno Stop esplicito
+        // dell'utente, non mostriamo l'errore come fallimento — è
+        // UX previsto. Per gli altri errori (file I/O, parse, etc.)
+        // mostriamo il messaggio.
+        if wasStopping {
+            lastError = nil
+            // Reset UI dello stato run per permettere un nuovo
+            // Start pulito. Lo `status.stopped` resta true così
+            // la sheet può mostrare un banner "Scan stopped —
+            // progress saved".
+            status = VocabPruneStatus(stopped: true)
+            lastDecision = nil
+            // Refresh delle info checkpoint così l'utente vede
+            // quanti file/shard sono stati salvati dallo stop
+            // (info pre-flight per il next Start).
+            refreshCheckpointInfo()
+        } else {
+            let cancelMsg = (error as NSError).userInfo[NSLocalizedDescriptionKey] as? String
+            lastError = (error as? LocalizedError)?.errorDescription
+                ?? cancelMsg
+                ?? error.localizedDescription
+        }
+    }
+
     private func handle(event: VocabPruneEvent, spec: VocabPruneSpec) {
-        // Quando l'utente ha cancellato, congeliamo la UI sul punto
-        // raggiunto. Gli eventi continuano ad arrivare per qualche
-        // secondo (i thread in volo non si interrompono mid-chunk),
-        // ma li scartiamo così la progress bar non avanza più e
-        // l'utente capisce che il cancel è stato accettato.
-        if isCancelling { return }
+        // Quando l'utente ha premuto Stop, congeliamo la UI sul
+        // punto raggiunto. Con il bail-out responsivo gli eventi
+        // residui sono pochi (<100ms tipicamente), ma se l'encode
+        // BPE era in volo su una riga gigante possono arrivare
+        // ancora dopo lo stop: li scartiamo così la progress bar
+        // non avanza più e l'utente capisce che lo stop è stato
+        // accettato.
+        if isStopping { return }
         status.apply(event)
         switch event {
         case .decisionReady(let decision):
@@ -185,16 +207,22 @@ final class VocabPrunerViewModel: ObservableObject {
         }
     }
 
-    func cancel() {
-        // Idempotente: doppi click sul bottone non fanno danni.
-        guard isRunning, !isCancelling else { return }
-        isCancelling = true
+    /// Interrompe la run corrente senza perdere progressi: il
+    /// checkpoint su disco resta intatto, e un successivo `start()`
+    /// riparte dal punto raggiunto. Idempotente — doppi click non
+    /// fanno danni.
+    func stop() {
+        guard isRunning, !isStopping else { return }
+        isStopping = true
         cancellation?.cancel()
-        // Propaga il cancel a Swift Concurrency: il task root e
+        // Propaga lo stop a Swift Concurrency: il task root e
         // tutti i child task del TaskGroup interno ricevono
         // `Task.isCancelled == true` istantaneamente. Combina col
-        // CancellationToken (cooperativo lato API pubblica)
-        // per garantire il bail-out più veloce.
+        // CancellationToken (cooperativo lato API pubblica) per
+        // garantire il bail-out più veloce — i loop di scan
+        // controllano Task.isCancelled OGNI riga e fanno
+        // `await Task.yield()` ogni 50k righe, quindi la
+        // transizione a `stopped` avviene tipicamente in <100ms.
         task?.cancel()
     }
 

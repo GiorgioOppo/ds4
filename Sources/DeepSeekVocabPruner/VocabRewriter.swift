@@ -60,6 +60,7 @@ public enum VocabRewriter {
         var newWeightMap: [String: String] = [:]
 
         for (i, shardName) in shards.enumerated() {
+            try Task.checkCancellation()
             try cancellation?.throwIfCancelled()
             let inURL = inputDir.appendingPathComponent(shardName)
             let outURL = outputDir.appendingPathComponent(shardName)
@@ -207,10 +208,13 @@ public enum VocabRewriter {
         // Ottimizzazione futura: read in blocchi multipli di rows
         // contigue dove (oldId+1, newId+1) sono entrambi presenti
         // in sequenza.
-        // Cancellation cooperativa: il loop sotto può richiedere
-        // 10-60s per tensori giganti (50k mapping × seek+read+memcpy).
-        // Settiamo un flag dentro la closure (non-throwing) e
-        // throw dopo l'uscita. Check ogni 1000 mapping (~100-500ms).
+        // Stop cooperativo: il loop sotto può richiedere 10-60s per
+        // tensori giganti (50k mapping × seek+read+memcpy). Settiamo
+        // un flag dentro la closure (non-throwing) e throw dopo
+        // l'uscita.
+        //   - `Task.isCancelled` (~5ns thread-local) ogni mapping
+        //   - `CancellationToken` (NSLock) ogni 200 mapping
+        // Bail-out tipico: <50ms per la responsiveness UI.
         var cancelledDuringSlice = false
         out.withUnsafeMutableBytes { dst in
             let dstBase = dst.baseAddress!
@@ -219,8 +223,14 @@ public enum VocabRewriter {
                 .filter { $0.value < decision.newVocabSize }
                 .sorted { $0.key < $1.key }
             var lastReadEnd = 0
-            var sinceCheck = 0
+            var sinceTokenCheck = 0
             for (oldId, newId) in mappings {
+                // Hot-path stop check (Task.isCancelled è gratuito).
+                if Task.isCancelled {
+                    cancelledDuringSlice = true
+                    return
+                }
+
                 let rowOffsetInTensor = oldId * bytesPerRow
                 if rowOffsetInTensor != lastReadEnd {
                     // Skip avanti nel file.
@@ -238,17 +248,18 @@ public enum VocabRewriter {
                            bytesPerRow)
                 }
                 lastReadEnd = rowOffsetInTensor + bytesPerRow
-                sinceCheck &+= 1
-                if sinceCheck >= 1000 {
+                sinceTokenCheck &+= 1
+                if sinceTokenCheck >= 200 {
                     if cancellation?.isCancelled == true {
                         cancelledDuringSlice = true
                         return
                     }
-                    sinceCheck = 0
+                    sinceTokenCheck = 0
                 }
             }
         }
         if cancelledDuringSlice {
+            try Task.checkCancellation()
             try cancellation?.throwIfCancelled()
         }
         return out

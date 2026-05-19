@@ -196,7 +196,7 @@ public enum VocabAnalyzer {
                 var fileTokens = resumeTokens
                 var fileLineOffset = resumeOffset
 
-                let (_, _, scannedCounts) = try Self.countTokensInFile(
+                let (_, _, scannedCounts) = try await Self.countTokensInFile(
                     file.url,
                     isJsonl: file.isJsonl,
                     tokenizer: tokenizer,
@@ -362,12 +362,13 @@ public enum VocabAnalyzer {
             // TaskGroup invece di concurrentPerform: `task?.cancel()`
             // del VM propaga ai child task istantaneamente
             // (`Task.isCancelled == true` dentro `countTokensInFile`
-            // tramite il check ogni 1000 righe).
+            // viene letto OGNI riga, e il yield ogni 50k righe
+            // permette al runtime di cancellare i sibling).
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for idx in 0..<files.count {
                     let file = files[idx]
                     group.addTask {
-                        let (lc, tc, localCounts) = try Self.countTokensInFile(
+                        let (lc, tc, localCounts) = try await Self.countTokensInFile(
                             file.url, isJsonl: file.isJsonl,
                             tokenizer: tokenizer,
                             cancellation: cancellation)
@@ -556,6 +557,14 @@ public enum VocabAnalyzer {
     ///   tokensInBatch, deltaCounts, totalLinesSoFar,
     ///   totalTokensSoFar)`. `totalLinesSoFar` include
     ///   `startLineOffset`.
+    ///
+    /// **Stop responsiveness**: il loop interno controlla
+    /// `Task.isCancelled` (~5ns, thread-local) PRIMA di ogni riga,
+    /// e il `CancellationToken` (NSLock) ogni 200 righe. Inoltre
+    /// ogni 50_000 righe esce dal `withUnsafeBytes` e fa un
+    /// `await Task.yield()` per dare al runtime Swift Concurrency
+    /// l'opportunità di propagare la cancellation ai sibling task
+    /// del `TaskGroup` parent. Bail-out tipico: <100ms.
     static func countTokensInFile(
         _ url: URL,
         isJsonl: Bool,
@@ -564,7 +573,7 @@ public enum VocabAnalyzer {
         tokenBatchThreshold: Int? = nil,
         cancellation: CancellationToken? = nil,
         onTokenBatch: ((Int, Int, [Int: Int], Int, Int) -> Void)? = nil
-    ) throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
+    ) async throws -> (lines: Int, tokens: Int, counts: [Int: Int]) {
         // mmap esplicito: file > qualche GB non vengono caricati in
         // RAM contiguamente, le pagine sono fetched on demand dal
         // kernel. Critico per corpora grandi.
@@ -584,91 +593,131 @@ public enum VocabAnalyzer {
         // per ogni riga decodifichiamo solo lo slice piccolo (kB).
         // Identico pattern di `processByteRange`.
         let totalBytes = data.count
-        var sinceLastCancelCheck = 0
+        var pos = 0
+        var sinceTokenCheck = 0
         var linesSkippedForOffset = 0
-        var cancelledDuringScan = false
+        let yieldEveryLines = 50_000
 
-        // La closure è non-throwing → cancel propagato via flag
-        // `cancelledDuringScan`, throw dopo l'uscita. Il batch
-        // callback è non-throwing (signature impone Void return)
-        // quindi può essere chiamato in-line.
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            guard let base = raw.baseAddress?
-                    .assumingMemoryBound(to: UInt8.self) else { return }
+        // Outer loop: ad ogni iterazione entriamo in `withUnsafeBytes`
+        // e processiamo fino a `yieldEveryLines` righe; poi usciamo
+        // dalla closure (mmap pointer rilasciato) per fare `Task.yield()`
+        // + richeck cancellation. Senza questo breakout, il runtime
+        // Swift non potrebbe rischedulare il task e — più importante
+        // nel multi-file parallel — il TaskGroup non riuscirebbe a
+        // propagare il cancel ai sibling fintanto che un thread è
+        // dentro un singolo `withUnsafeBytes` esteso.
+        while pos < totalBytes {
+            var batchProcessed = 0
+            var batchCancelled = false
 
-            var pos = 0
-            while pos < totalBytes {
-                var lineEnd = pos
-                while lineEnd < totalBytes && base[lineEnd] != 0x0A {
-                    lineEnd &+= 1
-                }
+            // La closure è non-throwing → cancel propagato via flag
+            // `batchCancelled`, throw dopo l'uscita. Il batch
+            // callback è non-throwing (signature impone Void return)
+            // quindi può essere chiamato in-line.
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress?
+                        .assumingMemoryBound(to: UInt8.self) else { return }
 
-                // Skip startLineOffset linee senza tokenizzare.
-                if linesSkippedForOffset < startLineOffset {
-                    linesSkippedForOffset &+= 1
-                    pos = lineEnd &+ 1
-                    continue
-                }
+                while pos < totalBytes && batchProcessed < yieldEveryLines {
+                    // Hot-path stop check: `Task.isCancelled` è una
+                    // proprietà thread-local (~5ns, no lock), quindi
+                    // possiamo leggerla ogni riga senza impatto sul
+                    // throughput. Appena il VM chiama `task?.cancel()`,
+                    // il bail-out scatta entro UNA riga di lavoro
+                    // (tipicamente <50ms).
+                    if Task.isCancelled {
+                        batchCancelled = true
+                        return
+                    }
 
-                if lineEnd > pos {
-                    let lineSlice = data[pos..<lineEnd]
-                    let text: String?
-                    if isJsonl {
-                        if let obj = try? JSONSerialization.jsonObject(with: lineSlice)
-                            as? [String: Any],
-                           let t = obj["text"] as? String {
-                            text = t
+                    var lineEnd = pos
+                    while lineEnd < totalBytes && base[lineEnd] != 0x0A {
+                        lineEnd &+= 1
+                    }
+
+                    // Skip startLineOffset linee senza tokenizzare.
+                    if linesSkippedForOffset < startLineOffset {
+                        linesSkippedForOffset &+= 1
+                        pos = lineEnd &+ 1
+                        batchProcessed &+= 1
+                        continue
+                    }
+
+                    if lineEnd > pos {
+                        let lineSlice = data[pos..<lineEnd]
+                        let text: String?
+                        if isJsonl {
+                            if let obj = try? JSONSerialization.jsonObject(with: lineSlice)
+                                as? [String: Any],
+                               let t = obj["text"] as? String {
+                                text = t
+                            } else {
+                                text = nil
+                            }
                         } else {
-                            text = nil
+                            text = String(data: lineSlice, encoding: .utf8)
                         }
-                    } else {
-                        text = String(data: lineSlice, encoding: .utf8)
-                    }
-                    if let text = text, !text.isEmpty {
-                        let ids = tokenizer.encode(text)
-                        for id in ids {
-                            counts[id, default: 0] += 1
-                            batchCounts[id, default: 0] += 1
-                            tokens &+= 1
-                            batchTokens &+= 1
+                        if let text = text, !text.isEmpty {
+                            let ids = tokenizer.encode(text)
+                            for id in ids {
+                                counts[id, default: 0] += 1
+                                batchCounts[id, default: 0] += 1
+                                tokens &+= 1
+                                batchTokens &+= 1
+                            }
                         }
+                        lines &+= 1
+                        batchLines &+= 1
                     }
-                    lines &+= 1
-                    batchLines &+= 1
-                }
-                pos = lineEnd &+ 1
+                    pos = lineEnd &+ 1
+                    batchProcessed &+= 1
 
-                // Flush periodico ogni ~threshold token. Path
-                // sequenziale only (parallel multi-file non passa
-                // threshold). Chiamata in-line — onTokenBatch è
-                // non-throwing.
-                if let threshold = tokenBatchThreshold,
-                   let cb = onTokenBatch,
-                   batchTokens >= threshold
-                {
-                    cb(batchLines, batchTokens, batchCounts, lines, tokens)
-                    batchCounts.removeAll(keepingCapacity: true)
-                    batchLines = 0
-                    batchTokens = 0
-                }
-
-                // Cancellation check ogni 1k linee. Niente più
-                // pre-processing pesante PRIMA del loop, quindi
-                // il check è raggiungibile in pochi ms dal momento
-                // del cancel premuto.
-                sinceLastCancelCheck &+= 1
-                if sinceLastCancelCheck >= 1000 {
-                    if Task.isCancelled || cancellation?.isCancelled == true {
-                        cancelledDuringScan = true
-                        return  // esce dalla closure
+                    // Flush periodico ogni ~threshold token. Path
+                    // sequenziale only (parallel multi-file non passa
+                    // threshold). Chiamata in-line — onTokenBatch è
+                    // non-throwing.
+                    if let threshold = tokenBatchThreshold,
+                       let cb = onTokenBatch,
+                       batchTokens >= threshold
+                    {
+                        cb(batchLines, batchTokens, batchCounts, lines, tokens)
+                        batchCounts.removeAll(keepingCapacity: true)
+                        batchLines = 0
+                        batchTokens = 0
                     }
-                    sinceLastCancelCheck = 0
+
+                    // Cold-path stop check: il `CancellationToken`
+                    // usa NSLock (~20-50ns), quindi lo leggiamo ogni
+                    // 200 righe — sufficiente per la public API
+                    // cooperativa, sub-percentage sul throughput.
+                    sinceTokenCheck &+= 1
+                    if sinceTokenCheck >= 200 {
+                        if cancellation?.isCancelled == true {
+                            batchCancelled = true
+                            return
+                        }
+                        sinceTokenCheck = 0
+                    }
                 }
             }
-        }
 
-        if cancelledDuringScan {
-            try cancellation?.throwIfCancelled()
+            // Throw cooperativo dopo il bail-out. Priorità a
+            // `Task.checkCancellation()` per uniformare l'errore con
+            // CancellationError (gestito di default dai TaskGroup);
+            // fallback al `ConversionCancelled` se solo il token
+            // pubblico è stato settato (caso CLI senza Task wrapping).
+            if batchCancelled {
+                try Task.checkCancellation()
+                try cancellation?.throwIfCancelled()
+            }
+
+            // Yield tra batch: in single-task scenarios è un no-op,
+            // ma nel multi-file/multi-chunk TaskGroup permette al
+            // runtime di:
+            //   1. propagare il `Task.cancel()` ai sibling task,
+            //   2. rischedulare altri lavori cooperativi pendenti,
+            //   3. far avanzare il MainActor (eventi UI in coda).
+            await Task.yield()
         }
 
         // Flush finale residuo (può essere < threshold).
@@ -792,10 +841,13 @@ public enum VocabAnalyzer {
 
         // Swift Concurrency TaskGroup: sostituisce concurrentPerform
         // perché supporta `Task.cancel()` propagato. Quando il
-        // VM chiama `task?.cancel()` (in `VocabPrunerViewModel.cancel`)
+        // VM chiama `task?.cancel()` (in `VocabPrunerViewModel.stop`)
         // tutti i child task qui ricevono `Task.isCancelled = true`
-        // istantaneamente; `processByteRange` lo verifica ogni 500
-        // iter del while loop e bail-out via `throwIfCancelled`.
+        // istantaneamente; `processByteRange` lo verifica OGNI riga
+        // (Task.isCancelled è ~5ns thread-local) e bail-out via
+        // `Task.checkCancellation` o `throwIfCancelled`. Il yield
+        // periodico (ogni 50k righe) garantisce che il runtime
+        // possa propagare il cancel ai sibling task del group.
         try await withThrowingTaskGroup(of: Void.self) { group in
             for idx in 0..<actualChunks {
                 // Resume: skippa i chunk già completati in una run
@@ -807,7 +859,7 @@ public enum VocabAnalyzer {
                 group.addTask {
                     // Round-robin: ogni task scanna l'intero file ma
                     // tokenizza solo le righe con lineIdx % N == idx.
-                    try Self.processByteRange(
+                    try await Self.processByteRange(
                         data: data,
                         start: 0,
                         end: fileSize,
@@ -898,6 +950,12 @@ public enum VocabAnalyzer {
     ///
     /// L'iterazione è byte-level via `withUnsafeBytes`: niente
     /// `String.split`, niente `Substring` alloc.
+    ///
+    /// **Stop responsiveness**: identica strategia di `countTokensInFile` —
+    /// `Task.isCancelled` ogni riga + `CancellationToken` ogni 200 righe
+    /// + breakout `await Task.yield()` ogni 50_000 righe. Bail-out
+    /// tipico: <100ms anche con tutti i thread del round-robin
+    /// attivi simultaneamente.
     fileprivate static func processByteRange(
         data: Data,
         start: Int,
@@ -908,7 +966,7 @@ public enum VocabAnalyzer {
         cancellation: CancellationToken? = nil,
         lineFilter: ((Int) -> Bool)? = nil,
         onTokenProgress: (() -> Void)? = nil
-    ) throws {
+    ) async throws {
         var localCounts: [Int: Int] = [:]
         localCounts.reserveCapacity(1024)
         var localLines = 0
@@ -918,96 +976,97 @@ public enum VocabAnalyzer {
         chunkResult.lines = 0
         chunkResult.tokens = 0
 
-        // La closure di `withUnsafeBytes` è non-throwing, quindi non
-        // possiamo throw direttamente. Settiamo un flag e lo
-        // controlliamo all'uscita.
-        var cancelled = false
+        var pos = start
+        var lastFlush = 0
+        // Indice globale della riga corrente (zero-based dal
+        // primo `pos = start`). Usato dal `lineFilter` per il
+        // round-robin: il caller passa `{ $0 % N == k }` per
+        // selezionare solo le righe del proprio thread.
+        var lineIdx = 0
+        var sinceTokenCheck = 0
+        let yieldEveryLines = 50_000
 
-        // Body non throws (try? JSONSerialization e' interno), quindi
-        // niente `try` esterno; il `throws` della funzione resta per
-        // futura espansione e per la simmetria con `processFileParallel`.
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        // Outer loop: ogni iterazione entra in `withUnsafeBytes` per
+        // un batch e poi esce per `await Task.yield()`. Vedi il
+        // commento esteso in `countTokensInFile`.
+        while pos < end {
+            var batchProcessed = 0
+            var batchCancelled = false
 
-            var pos = start
-            var lastFlush = 0
-            // Indice globale della riga corrente (zero-based dal
-            // primo `pos = start`). Usato dal `lineFilter` per il
-            // round-robin: il caller passa `{ $0 % N == k }` per
-            // selezionare solo le righe del proprio thread.
-            var lineIdx = 0
-            // Cancellation check counter unificato — incrementato
-            // OGNI iterazione del while (sia righe processate che
-            // skipped). Check ogni 500 righe (~50-200ms su file
-            // realistici, garantisce cancel responsiveness anche
-            // su file con poche righe ma giganti dove i flush
-            // boundary tardano a essere raggiunti).
-            var sinceCancelCheck = 0
-            while pos < end {
-                // Trova la fine della linea corrente (newline o
-                // confine del range).
-                var lineEnd = pos
-                while lineEnd < end && base[lineEnd] != 0x0A {
-                    lineEnd &+= 1
-                }
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
 
-                let shouldProcess = lineFilter?(lineIdx) ?? true
-
-                if shouldProcess && lineEnd > pos {
-                    // Estrai la linea come Data slice (zero-copy view).
-                    let lineSlice = data[pos..<lineEnd]
-                    let text: String?
-                    if isJsonl {
-                        if let obj = try? JSONSerialization.jsonObject(with: lineSlice) as? [String: Any],
-                           let t = obj["text"] as? String {
-                            text = t
-                        } else {
-                            text = nil
-                        }
-                    } else {
-                        text = String(data: lineSlice, encoding: .utf8)
-                    }
-                    if let text = text, !text.isEmpty {
-                        let ids = tokenizer.encode(text)
-                        for id in ids {
-                            localCounts[id, default: 0] += 1
-                            localTokens &+= 1
-                        }
-                        localLines &+= 1
-                    }
-                }
-                pos = lineEnd &+ 1   // skip il \n
-                lineIdx &+= 1
-
-                // Check cancellation OGNI 500 iter (sia processed
-                // che skipped). Verifica entrambi:
-                //   - `Task.isCancelled` (Swift Concurrency, settato
-                //     da `task?.cancel()` nel VM)
-                //   - `CancellationToken.isCancelled` (API pubblica
-                //     cooperativa, settato da `vm.cancellation.cancel()`)
-                // Whichever è on, bail-out.
-                sinceCancelCheck &+= 1
-                if sinceCancelCheck >= 500 {
-                    if Task.isCancelled || cancellation?.isCancelled == true {
-                        cancelled = true
+                while pos < end && batchProcessed < yieldEveryLines {
+                    // Hot-path stop check (~5ns, no lock).
+                    if Task.isCancelled {
+                        batchCancelled = true
                         return
                     }
-                    sinceCancelCheck = 0
-                }
 
-                // Flush periodico nel chunkResult + progress callback
-                // (ogni 50k token: granularità del save al checkpoint).
-                if localTokens - lastFlush > 50_000 {
-                    chunkResult.lines = localLines
-                    chunkResult.tokens = localTokens
-                    lastFlush = localTokens
-                    onTokenProgress?()
+                    // Trova la fine della linea corrente (newline o
+                    // confine del range).
+                    var lineEnd = pos
+                    while lineEnd < end && base[lineEnd] != 0x0A {
+                        lineEnd &+= 1
+                    }
+
+                    let shouldProcess = lineFilter?(lineIdx) ?? true
+
+                    if shouldProcess && lineEnd > pos {
+                        // Estrai la linea come Data slice (zero-copy view).
+                        let lineSlice = data[pos..<lineEnd]
+                        let text: String?
+                        if isJsonl {
+                            if let obj = try? JSONSerialization.jsonObject(with: lineSlice) as? [String: Any],
+                               let t = obj["text"] as? String {
+                                text = t
+                            } else {
+                                text = nil
+                            }
+                        } else {
+                            text = String(data: lineSlice, encoding: .utf8)
+                        }
+                        if let text = text, !text.isEmpty {
+                            let ids = tokenizer.encode(text)
+                            for id in ids {
+                                localCounts[id, default: 0] += 1
+                                localTokens &+= 1
+                            }
+                            localLines &+= 1
+                        }
+                    }
+                    pos = lineEnd &+ 1   // skip il \n
+                    lineIdx &+= 1
+                    batchProcessed &+= 1
+
+                    // Cold-path stop check (NSLock, ~20-50ns).
+                    sinceTokenCheck &+= 1
+                    if sinceTokenCheck >= 200 {
+                        if cancellation?.isCancelled == true {
+                            batchCancelled = true
+                            return
+                        }
+                        sinceTokenCheck = 0
+                    }
+
+                    // Flush periodico nel chunkResult + progress callback
+                    // (ogni 50k token: granularità del save al checkpoint).
+                    if localTokens - lastFlush > 50_000 {
+                        chunkResult.lines = localLines
+                        chunkResult.tokens = localTokens
+                        lastFlush = localTokens
+                        onTokenProgress?()
+                    }
                 }
             }
-        }
 
-        if cancelled {
-            try cancellation?.throwIfCancelled()
+            if batchCancelled {
+                try Task.checkCancellation()
+                try cancellation?.throwIfCancelled()
+            }
+
+            // Yield tra batch — vedi `countTokensInFile`.
+            await Task.yield()
         }
 
         // Final flush dei counts del chunk.

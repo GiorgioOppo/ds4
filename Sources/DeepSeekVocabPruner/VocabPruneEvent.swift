@@ -51,16 +51,18 @@ public struct VocabPruneStatus: Sendable, Equatable {
     public var finishedAt: Date? = nil
     public var bytesIn: UInt64 = 0
     public var bytesOut: UInt64 = 0
-    /// True quando l'ultima run è stata interrotta da un cancel
+    /// True quando l'ultima run è stata interrotta da uno Stop
     /// dell'utente. La UI lo legge per mostrare un banner
-    /// "Cancelled — checkpoint salvato, premi Start per riprendere"
-    /// invece dello stato idle vuoto.
-    public var cancelled: Bool = false
+    /// "Scan stopped — progress saved, premi Start per riprendere"
+    /// invece dello stato idle vuoto. Semanticamente "stop" anziché
+    /// "cancel": il checkpoint resta intatto e Start ripartirà dal
+    /// punto raggiunto.
+    public var stopped: Bool = false
 
     public init() {}
 
-    public init(cancelled: Bool) {
-        self.cancelled = cancelled
+    public init(stopped: Bool) {
+        self.stopped = stopped
     }
 
     public mutating func apply(_ event: VocabPruneEvent) {
