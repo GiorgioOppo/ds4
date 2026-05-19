@@ -50,6 +50,11 @@ public struct KillTool: Tool {
         if pid <= 1 {
             throw ToolError.permissionDenied("refusing to signal PID \(pid)")
         }
+        // pid_t is Int32 on macOS; reject anything that wouldn't fit
+        // so the pid_t(pid) cast below can't trap.
+        guard pid <= Int(Int32.max) else {
+            throw ToolError.invalidInput("PID out of range")
+        }
         let selfPid = Int(getpid())
         if pid == selfPid {
             throw ToolError.permissionDenied("refusing to signal the agent process (\(selfPid))")
