@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "DeepSeekVocabPruner", targets: ["DeepSeekVocabPruner"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
         .executable(name: "deepseek_gguf", targets: ["deepseek_gguf"]),
+        .executable(name: "deepseek_calibrate", targets: ["deepseek_calibrate"]),
         .executable(name: "converter", targets: ["converter"]),
         .executable(name: "vocab_pruner", targets: ["vocab_pruner"]),
         .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
@@ -45,6 +46,16 @@ let package = Package(
             name: "deepseek_gguf",
             dependencies: ["DeepSeekKit"],
             path: "Sources/deepseek_gguf"
+        ),
+        // Calibration runner for GPTQ / AWQ / SmoothQuant (TODO §1).
+        // Loads a GGUF Llama, walks a calibration corpus, dumps
+        // per-layer activation absmax/mean (always) and the
+        // per-layer Hessian (with --collect-hessian) to disk. The
+        // converter then consumes those when --quant-method is set.
+        .executableTarget(
+            name: "deepseek_calibrate",
+            dependencies: ["DeepSeekKit"],
+            path: "Sources/deepseek_calibrate"
         ),
         .target(
             name: "DeepSeekConverter",

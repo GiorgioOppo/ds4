@@ -29,6 +29,28 @@ kernel void silu_mul_f32(
     y[gid] = silu * uv;
 }
 
+// out[i] = in[i] * scale[i % cols]
+//
+// Per-channel multiply on a row-major 2-D tensor flattened to 1-D
+// at dispatch time. `cols` is the channel dimension stride (= the
+// last axis of the logical tensor). Used by `Linear`'s AWQ /
+// SmoothQuant inverseChannelScale path: when the calibrated quant
+// migrated per-channel difficulty to the weight via
+// `weight *= s[c]`, the activation must be pre-multiplied by
+// `1/s[c]` for the GEMM to recover the original output.
+kernel void channel_scale_f32(
+    device const float* in    [[buffer(0)]],
+    device const float* scale [[buffer(1)]],   // [cols]
+    device float*       out   [[buffer(2)]],
+    constant uint2&     dims  [[buffer(3)]],   // (N_total_elements, cols)
+    uint gid [[thread_position_in_grid]]
+) {
+    uint N    = dims.x;
+    uint cols = dims.y;
+    if (gid >= N) return;
+    out[gid] = in[gid] * scale[gid % cols];
+}
+
 // y += alpha * x
 kernel void axpy_f32(
     device float*       y [[buffer(0)]],

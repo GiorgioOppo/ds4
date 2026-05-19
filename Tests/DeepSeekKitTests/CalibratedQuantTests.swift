@@ -80,7 +80,37 @@ final class CalibratedQuantTests: XCTestCase {
         )
     }
 
-    func testSmoothQuantAndGPTQAreNotImplemented() throws {
+    func testSmoothQuantWorksWithStats() throws {
+        // SmoothQuant is now implemented; the simple API succeeds
+        // with non-nil CalibrationStats. Output differs from RTN
+        // on the same per-channel-imbalance input AWQ also catches.
+        let outDim = 8, inDim = 256
+        let url = try makeTempBF16File(outDim: outDim, inDim: inDim, seed: 88)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var actStats = [Float](repeating: 0.1, count: inDim)
+        for c in stride(from: 0, to: inDim, by: 2) { actStats[c] = 10.0 }
+        let stats = CalibrationStats(perChannelAbsMax: actStats,
+                                      observedTokens: 1000)
+
+        let rtn = try quantizeBF16ToInt8Calibrated(
+            srcURL: url, srcOffset: 0,
+            outDim: outDim, inDim: inDim,
+            method: .rtn, stats: nil)
+        let sq = try quantizeBF16ToInt8Calibrated(
+            srcURL: url, srcOffset: 0,
+            outDim: outDim, inDim: inDim,
+            method: .smoothQuant, stats: stats)
+        XCTAssertEqual(rtn.weight.count, sq.weight.count)
+        XCTAssertNotEqual(rtn.weight, sq.weight,
+                           "SmoothQuant with channel imbalance must differ from RTN")
+    }
+
+    func testGPTQNeedsHessianFromSimpleAPI() throws {
+        // GPTQ requires the per-layer Hessian, which the simple
+        // entry point doesn't carry. Calling .gptq via the simple
+        // overload throws an error pointing at the dedicated
+        // gptqQuantizeBF16ToInt8 entry.
         let outDim = 4, inDim = 128
         let url = try makeTempBF16File(outDim: outDim, inDim: inDim, seed: 88)
         defer { try? FileManager.default.removeItem(at: url) }
@@ -90,18 +120,8 @@ final class CalibratedQuantTests: XCTestCase {
         XCTAssertThrowsError(
             try quantizeBF16ToInt8Calibrated(srcURL: url, srcOffset: 0,
                                               outDim: outDim, inDim: inDim,
-                                              method: .smoothQuant, stats: stats)
-        ) { error in
-            XCTAssertTrue(error is QuantNotImplemented)
-        }
-
-        XCTAssertThrowsError(
-            try quantizeBF16ToInt8Calibrated(srcURL: url, srcOffset: 0,
-                                              outDim: outDim, inDim: inDim,
                                               method: .gptq, stats: stats)
-        ) { error in
-            XCTAssertTrue(error is QuantNotImplemented)
-        }
+        )
     }
 
     // MARK: - ActivationObserver
