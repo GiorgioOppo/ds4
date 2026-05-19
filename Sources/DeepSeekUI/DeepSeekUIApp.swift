@@ -76,18 +76,6 @@ struct DeepSeekUIApp: App {
                 // the system setting.
                 .preferredColorScheme(themes.preferredColorScheme)
                 .tint(swiftUIColor(hex: themes.active.accent) ?? .accentColor)
-                .task {
-                    // Auto-resume the most recently used model on
-                    // launch. Done from a top-level .task instead
-                    // of `init` so the load runs after the SwiftUI
-                    // window is on screen — that way the loading
-                    // banner is visible from the first frame.
-                    if case .idle = modelState.status,
-                       let last = AppSettings.lastModelDir,
-                       FileManager.default.fileExists(atPath: last) {
-                        await modelState.load(.localDirectory(path: last))
-                    }
-                }
         }
         .windowResizability(.contentMinSize)
 
