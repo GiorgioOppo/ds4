@@ -1,32 +1,32 @@
 import SwiftUI
 
-/// Blocco grigio collassabile inserito fra il messaggio dell'utente
-/// e la risposta dell'assistente al primo turn (cold prefill) di una
-/// conversazione. Mostra esattamente il testo del prompt che il
-/// modello sta per vedere — system message, blocco tools, project
-/// context, history e nuovo turn dell'utente — decodificato dal
-/// tokenizer dai token che il transformer ingerisce.
+/// Blocco grigio inserito fra il messaggio dell'utente e la
+/// risposta dell'assistente: mostra esattamente cosa il modello
+/// vede al turn corrente. Per i local chat = il prompt completo
+/// decodificato dai token (system + tools + project + history +
+/// turn). Per i remote chat = il body JSON inviato a OpenRouter
+/// (messages array, tools, sampler, tool_choice).
 ///
-/// Specchio strutturale di `ReasoningDisclosure`: stesso layout
-/// (`DisclosureGroup` con scroll interno + monospaced + max height),
-/// ma label diversa e tint più tenue per non rubare attenzione alla
-/// risposta vera e propria. Stato di default:
-/// - durante il prefill (`isStreaming == true`): espanso, così
-///   l'utente vede il prompt scorrere mentre arriva;
-/// - dopo il prefill: collassato, perché di solito non interessa più
-///   — un tap riapre il blocco se serve ispezionare il prompt.
+/// Default ESPANSO e persistente come membro normale della
+/// conversation — non auto-collassa quando la risposta arriva: il
+/// trace è parte della chronology al pari del messaggio user e
+/// della reply dell'assistente. Il pulsante di disclosure rimane
+/// per nasconderlo manualmente se occupa troppo spazio, ma quella
+/// scelta è dell'utente, non del flusso.
 struct PrefillTraceDisclosure: View {
     let trace: String
-    /// True mentre il prefill è in corso. Forza l'apertura del
-    /// disclosure così il flusso del prompt è visibile senza un tap.
+    /// True mentre il trace si sta riempiendo (prefill in corso o
+    /// dump remote in streaming). Solo cosmetico: cambia la label
+    /// in "streaming…". Non più usato per decidere espanso/chiuso
+    /// — quello è sempre espanso tranne se l'utente collassa.
     var isStreaming: Bool = false
 
-    @State private var manualExpanded: Bool = false
+    @State private var collapsed: Bool = false
 
     var body: some View {
         DisclosureGroup(isExpanded: Binding(
-            get: { isStreaming || manualExpanded },
-            set: { manualExpanded = $0 })
+            get: { !collapsed },
+            set: { collapsed = !$0 })
         ) {
             ScrollView(.vertical, showsIndicators: true) {
                 Text(trace)
@@ -36,7 +36,7 @@ struct PrefillTraceDisclosure: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
             }
-            .frame(maxHeight: 220)
+            .frame(maxHeight: 320)
             .background(Color(NSColor.controlBackgroundColor),
                          in: RoundedRectangle(cornerRadius: 8))
         } label: {
