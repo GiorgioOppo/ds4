@@ -50,6 +50,8 @@ The desktop app supports:
 > can't run locally.
 
 🇮🇹 [Versione italiana](README.it.md) · 🧠 [The model](docs/MODEL.md)
+· 🎲 [Sampling](docs/SAMPLING.md) · 🔤 [Tokenizers](docs/TOKENIZERS.md)
+· 📥 [Loading](docs/LOADING.md) · 🔁 [Converter](docs/CONVERTER.md)
 · 🏗 [Architecture deep-dive](docs/ARCHITECTURE.md)
 · 🧪 [Testing](docs/TESTING.md) · 🛠 [Developing](docs/DEVELOPING.md)
 · 🧰 [Native tools](docs/TOOLS.md) · 🚦 [Agent modes](docs/AGENT-MODES.md)

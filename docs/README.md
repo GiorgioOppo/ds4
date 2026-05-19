@@ -19,6 +19,12 @@ Where to start depends on what you came here for.
   is the canonical reference for the DeepSeek-V4 architecture: MLA,
   MoE, Hyper-Connections, Compressor, Indexer, MTP, RoPE/YaRN, the
   forward pass, the dtypes and the KV cache.
+- **Want to understand a specific subsystem around the model.**
+  [`SAMPLING.md`](SAMPLING.md) (logits → next id),
+  [`TOKENIZERS.md`](TOKENIZERS.md) (text ↔ ids and chat templates),
+  [`LOADING.md`](LOADING.md) (disk → resident `Transformer`),
+  [`CONVERTER.md`](CONVERTER.md) (HF release → on-disk dtype). Each
+  has an `.it.md` counterpart.
 - **Want to understand how the runtime and the app are built around it.**
   [`ARCHITECTURE.md`](ARCHITECTURE.md) for the big picture (engine
   data flow + desktop app + remote backend) →
@@ -36,6 +42,10 @@ Where to start depends on what you came here for.
 | Doc | When to read |
 |---|---|
 | [`MODEL.md`](MODEL.md) · [`MODEL.it.md`](MODEL.it.md) | **Canonical model reference**. Every component of the DeepSeek-V4 transformer: ModelConfig, MLA, MoE, HyperConnections, Compressor, Indexer, MTP, RoPE/YaRN, the forward pass, dtypes per-component, weight naming, KV cache lifecycle, snapshot/restore. Italian counterpart available. |
+| [`SAMPLING.md`](SAMPLING.md) · [`SAMPLING.it.md`](SAMPLING.it.md) | The sampler. Ten-stage host-side pipeline (temperature, repetition/frequency/presence penalties, top-K, min-P, tail-free, locally-typical, top-P, Mirostat v2, Gumbel-max), the GPU argmax shortcut, vectorised Accelerate kernels, per-instance RNG state, recommended values. |
+| [`TOKENIZERS.md`](TOKENIZERS.md) · [`TOKENIZERS.it.md`](TOKENIZERS.it.md) | Tokenizers + chat templates. BPE / SentencePiece / WordPiece, the `TokenizerLoader` dispatcher, the DSV4 native template (`EncodingDSV4`), the Jinja2 subset for Llama/Mistral/Qwen, DSML tool-call format, project / document tokenisation. |
+| [`LOADING.md`](LOADING.md) · [`LOADING.it.md`](LOADING.it.md) | Loading the model. `LoadPlan.decide`, the three strategies (preload / mmap / streaming), the StreamingPool with its modular sub-slot assignment, KV cache budget projection, cross-restart KV persistence via `KVCacheFile` / `KVCacheLayout`, warm-up. |
+| [`CONVERTER.md`](CONVERTER.md) · [`CONVERTER.it.md`](CONVERTER.it.md) | Converter CLI. Tensor renaming, FP8/FP4 + E8M0 → BF16/F16 fusion, INT8/INT4/INT2 symmetric RTN quantisation with per-row group scales, layer-aligned re-sharding, resume-safe write loop, the GUI driver. |
 | [`ISTRUZIONI.md`](ISTRUZIONI.md) | **Tutorial passo-passo (italiano)** dal Mac vuoto al primo token. Inizia da qui se è la prima volta. |
 | [`USAGE.md`](USAGE.md) | Operational reference: CLI flags, GUI walkthrough, OpenRouter onboarding, troubleshooting checklist. |
 | [`TOOLS.md`](TOOLS.md) | The native code-agent toolbox (`read / write / edit / shell / apply_patch / webfetch / …`). Categories, statuses, how to add a new one. |

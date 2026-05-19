@@ -52,6 +52,8 @@ L'app desktop supporta:
 > modelli non eseguibili in locale.
 
 🇬🇧 [English version](README.md) · 🧠 [Il modello](docs/MODEL.it.md)
+· 🎲 [Sampling](docs/SAMPLING.it.md) · 🔤 [Tokenizer](docs/TOKENIZERS.it.md)
+· 📥 [Loading](docs/LOADING.it.md) · 🔁 [Converter](docs/CONVERTER.it.md)
 · 🏗 [Architettura (dettagli)](docs/ARCHITECTURE.md)
 · 🧪 [Test](docs/TESTING.md) · 🛠 [Sviluppo](docs/DEVELOPING.md)
 · 🧰 [Tool nativi](docs/TOOLS.md) · 🚦 [Modalità agente](docs/AGENT-MODES.md)
