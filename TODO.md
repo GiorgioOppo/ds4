@@ -282,6 +282,13 @@ Stime di speedup — vedi `docs/PERFORMANCE.md` per le metriche.
   fare con `Task.detached(priority: .background)` per non
   ostacolare l'UI.
 
+- [x] **ANE / NPU come backend: valutazione**. Analisi statica in
+  `docs/NPU-ANE-ANALYSIS.md`: scheduling MPSGraph imprevedibile,
+  sync ANE↔GPU dominante, routing MoE / FP4 / FP8 non esprimibili
+  in CoreML. Conclusione: filone deferito in attesa di numeri
+  empirici. I 3 POC di verifica sono tracciati in §11 "Esperimenti
+  ANE / NPU"; piano operativo dettagliato in `docs/ANE-POC-PLAN.md`.
+
 ---
 
 ## 6. Documentazione
@@ -685,6 +692,61 @@ focused (multi-day) che non rientrava in una sessione conversazionale.
   Refactor di `InferenceService` cache layer per evitare cold
   prefill ad ogni rievocazione dello stesso sub-agent nella stessa
   turn.
+
+### Esperimenti ANE / NPU
+
+Tre POC misurabili prima di archiviare definitivamente il filone NPU
+(vedi §5 "ANE / NPU como backend"). Piano operativo completo in
+`docs/ANE-POC-PLAN.md`; analisi statica di partenza in
+`docs/NPU-ANE-ANALYSIS.md`. Sequenza: POC 3 → POC 1 → POC 2 con
+exit gate ad ogni step (se il risultato conferma le aspettative
+negative dell'analisi, si chiude lì). Tutta la fase run-and-measure
+richiede una macchina Apple Silicon fisica — non eseguibile nel
+container di sviluppo Linux remoto. Effort totale: ~6-9 giorni uomo
+se completati tutti e 3.
+
+- [ ] **POC 3 — MPSGraph attention smoke test**. Verifica se MPSGraph
+  schedula `scaledDotProductAttention` sull'ANE o ricade su GPU
+  tramite `powermetrics --samplers ane_power`. Sola misura
+  osservativa, no integrazione in `MLA.swift`. Loop 1000× su
+  attention decode-style `[B=1, H=64, S=1, T=2048, D=64]`, varianti
+  con e senza sliding-window mask. Output:
+  `Tools/ane-poc-3-mpsgraph/` (~120 LOC) + `docs/ANE-POC-3-RESULTS.md`.
+  Stima: 1 giorno uomo. Exit gate atteso: SCRAP.
+
+- [ ] **POC 1 — Microbench ANE vs Metal su `wq_b`**. Single GEMM
+  `[1, 2048] × [2048, 32768]` (shape `q_lora_rank × n_heads × head_dim`
+  da `Reference/inference/model.py`) in 4 scenari: ANE pure (con sync
+  GPU↔CPU↔ANE per iter), ANE batched, baseline Metal `gemm_bf16`,
+  baseline `MPSMatrixMultiplication`. Conversione `.mlpackage` via
+  `coremltools` lato Mac (Python venv). Verifica esplicita che il
+  modello giri davvero su ANE via `MLModel.computeDeviceUsage`.
+  Output: `Tools/ane-poc-1-microbench/` (~280 LOC totali) +
+  `docs/ANE-POC-1-RESULTS.md` + CSV grezzo. Include break-even
+  analysis: a quale shape (M, N, K) ANE pareggia? È una shape che
+  compare nel forward V4-Pro? Stima: 2-3 giorni uomo. Exit gate
+  atteso: SCRAP (sync cost domina).
+
+- [ ] **POC 2 — Draft model standalone su ANE**. Llama-3.2-1B-Instruct
+  come `.mlpackage` su ANE, tok/s standalone + acceptance rate
+  *teorico* vs V4-Pro su corpus fisso ~100 prompt. Tokenizer V4/Llama
+  diversi → strategia (a) re-tokenize per prefix-match (acceptance =
+  *lower bound* — un draft custom con vocab V4 farebbe meglio).
+  Modello speedup classico
+  `speedup = (1 - α^(N+1)) / ((1-α) · (1 + c))`. Aggiunge SPM
+  dependency `huggingface/swift-transformers` confinata al solo
+  target POC (DeepSeekKit resta pulito). NO integrazione live in
+  `Generation.swift` (fase 2 separata, da aprire solo se acceptance
+  rate giustifica). Output: `Tools/ane-poc-2-draft/` (~450 LOC) +
+  `docs/ANE-POC-2-RESULTS.md` + corpus. Stima: 3-5 giorni uomo.
+  Exit gate: PROCEED se speedup predetto > 1.3×, altrimenti SCRAP.
+
+Prerequisiti trasversali: Mac Apple Silicon (idealmente M3+/M4),
+macOS ≥ 14, Xcode 15+, Python 3.11 + `coremltools` ≥ 8.0 + `torch`
+≥ 2.4 in venv dedicato `Tools/ane-bench/.venv/`, sudo per
+`powermetrics`. Out-of-scope deliberato: full speculative integration,
+conversione V4-Pro a CoreML (MoE/FP4/FP8 non esprimibili), MPSGraph
+GEMM backend (eventuale POC 4 separato), riproduzione numeri ANEMLL.
 
 ### Integrazioni
 
