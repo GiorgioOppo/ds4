@@ -43,6 +43,14 @@ final class NativeToolHost: ObservableObject {
         // TODO §9: opt-in sandbox-exec wrapper on ShellTool.
         let useSandbox = UserDefaults.standard.bool(
             forKey: AppSettingsKey.useShellSandbox)
+        // Unix + Xcode toolboxes default ON: bool(forKey:) returns
+        // false for an unset key, so we route through `object` to
+        // distinguish "unset" (= default true) from "explicitly off"
+        // (= user turned the toggle off in Settings).
+        let enableUnix = Self.boolDefaultingTrue(
+            key: AppSettingsKey.enableUnixTools)
+        let enableXcode = Self.boolDefaultingTrue(
+            key: AppSettingsKey.enableXcodeTools)
         Task { @MainActor [registry] in
             // Shell escluso esplicitamente: troppo invasivo per
             // l'esposizione di default al chat — il modello tende a
@@ -62,10 +70,23 @@ final class NativeToolHost: ObservableObject {
                 DefaultTools.standard(
                     planStore: store,
                     includeShell: false,
+                    includeUnixTools: enableUnix,
+                    includeXcodeTools: enableXcode,
                     shellUsesSandbox: useSandbox,
                     webSearchProvider: searchProvider))
             self.schemas = await registry.availableSchemas(mode: .build)
         }
+    }
+
+    /// `UserDefaults.bool(forKey:)` returns false for an unset key,
+    /// which would silently keep the Unix/Xcode toolboxes off on a
+    /// fresh install. This helper distinguishes unset (= return
+    /// default) from explicitly set false (= respect the user's
+    /// choice).
+    private static func boolDefaultingTrue(key: String) -> Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: key) == nil { return true }
+        return defaults.bool(forKey: key)
     }
 
     /// Resolve the user-configured search backend (or nil to keep

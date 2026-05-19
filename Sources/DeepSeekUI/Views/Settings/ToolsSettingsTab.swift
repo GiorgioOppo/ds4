@@ -12,6 +12,13 @@ struct ToolsSettingsTab: View {
     @ObservedObject var host: NativeToolHost
     @AppStorage(AppSettingsKey.useShellSandbox)
     private var useShellSandbox: Bool = false
+    // AppStorage's initial-value parameter is the seed when the key
+    // is absent in defaults — matches NativeToolHost.boolDefaultingTrue
+    // so the UI and the registry agree on "ON unless explicitly off".
+    @AppStorage(AppSettingsKey.enableUnixTools)
+    private var enableUnixTools: Bool = true
+    @AppStorage(AppSettingsKey.enableXcodeTools)
+    private var enableXcodeTools: Bool = true
     @State private var profileStatus: String? = nil
 
     private var grouped: [(ToolCategory, [ToolSchema])] {
@@ -25,6 +32,7 @@ struct ToolsSettingsTab: View {
 
     var body: some View {
         Form {
+            toolboxSection
             sandboxSection
             ForEach(grouped, id: \.0) { (category, tools) in
                 Section(header: Text(label(for: category))) {
@@ -70,6 +78,31 @@ struct ToolsSettingsTab: View {
         case .dangerous: return "exclamationmark.triangle"
         case .network:   return "network"
         case .planning:  return "list.bullet.rectangle"
+        }
+    }
+
+    /// Toolbox toggles for the two opt-in bundles registered by
+    /// `DefaultTools.unixTools()` / `xcodeTools()`. Both default ON;
+    /// turning either off removes ~50 (Unix) or ~30 (Xcode) schemas
+    /// from the registry on next launch, which is the right move on
+    /// machines where the full toolbox makes the model "get lost"
+    /// across too many similar tools.
+    private var toolboxSection: some View {
+        Section {
+            Toggle("Unix toolbox (ls, head, sort, sed, awk, find, …)",
+                    isOn: $enableUnixTools)
+            Toggle("Xcode / macOS-iOS-visionOS dev toolbox " +
+                    "(xcodebuild_*, swift_*, simctl_*, codesign_*, …)",
+                    isOn: $enableXcodeTools)
+        } header: {
+            Text("Toolbox")
+        } footer: {
+            Text("Both toolboxes are ON by default. Toggle off if the "
+                 + "model is making spurious calls across too many "
+                 + "similar tools. Changes require restart — the "
+                 + "NativeToolHost registers tools at app launch.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
