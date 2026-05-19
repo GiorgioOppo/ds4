@@ -630,10 +630,11 @@ public func gptqQuantizeBF16ToInt8(
     //    distinction collapses; the triangular outputs we use
     //    `U[i, j]` for i ≤ j, address as `U[i * n + j]` (row-major).
     var lapackN = __CLPK_integer(n)
+    var lapackLDA = __CLPK_integer(n)
     var info: __CLPK_integer = 0
     var uplo: Int8 = 76 // 'L'
     H.withUnsafeMutableBufferPointer { ptr in
-        dpotrf_(&uplo, &lapackN, ptr.baseAddress!, &lapackN, &info)
+        dpotrf_(&uplo, &lapackN, ptr.baseAddress!, &lapackLDA, &info)
     }
     guard info == 0 else {
         throw NSError(domain: "gptqQuantizeBF16ToInt8", code: 10,
@@ -642,7 +643,7 @@ public func gptqQuantizeBF16ToInt8(
                                    + "increase --gptq-damp"])
     }
     H.withUnsafeMutableBufferPointer { ptr in
-        dpotri_(&uplo, &lapackN, ptr.baseAddress!, &lapackN, &info)
+        dpotri_(&uplo, &lapackN, ptr.baseAddress!, &lapackLDA, &info)
     }
     guard info == 0 else {
         throw NSError(domain: "gptqQuantizeBF16ToInt8", code: 11)
@@ -663,7 +664,7 @@ public func gptqQuantizeBF16ToInt8(
     }
     uplo = 85 // 'U'
     H.withUnsafeMutableBufferPointer { ptr in
-        dpotrf_(&uplo, &lapackN, ptr.baseAddress!, &lapackN, &info)
+        dpotrf_(&uplo, &lapackN, ptr.baseAddress!, &lapackLDA, &info)
     }
     guard info == 0 else {
         throw NSError(domain: "gptqQuantizeBF16ToInt8", code: 12)
