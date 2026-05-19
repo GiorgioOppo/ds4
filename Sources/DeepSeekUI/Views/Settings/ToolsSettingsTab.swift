@@ -1,13 +1,18 @@
 import SwiftUI
 import DeepSeekTools
+import DeepSeekIntegrations
 
-/// Read-only inventory of native tools currently registered with the
-/// `NativeToolHost`, grouped by category. Lets the user verify
-/// what's available without parsing the chat's system block. Wiring
-/// (enable/disable per agent) lives in the Agent editor; this tab
-/// is purely informational.
+/// Inventory of native tools registered with the `NativeToolHost`,
+/// grouped by category. Adds a Sandbox section (TODO §9) that
+/// surfaces the `useShellSandbox` toggle + an "Initialize default
+/// profile" button — `ShellTool(useSandbox:)` reads the toggle at
+/// NativeToolHost init time, so flipping the switch requires
+/// restarting the app for the change to take effect.
 struct ToolsSettingsTab: View {
     @ObservedObject var host: NativeToolHost
+    @AppStorage(AppSettingsKey.useShellSandbox)
+    private var useShellSandbox: Bool = false
+    @State private var profileStatus: String? = nil
 
     private var grouped: [(ToolCategory, [ToolSchema])] {
         let byCategory = Dictionary(grouping: host.schemas, by: { $0.category })
@@ -20,6 +25,7 @@ struct ToolsSettingsTab: View {
 
     var body: some View {
         Form {
+            sandboxSection
             ForEach(grouped, id: \.0) { (category, tools) in
                 Section(header: Text(label(for: category))) {
                     ForEach(tools, id: \.name) { schema in
@@ -64,6 +70,39 @@ struct ToolsSettingsTab: View {
         case .dangerous: return "exclamationmark.triangle"
         case .network:   return "network"
         case .planning:  return "list.bullet.rectangle"
+        }
+    }
+
+    private var sandboxSection: some View {
+        Section {
+            Toggle("Wrap ShellTool calls in `sandbox-exec`",
+                    isOn: $useShellSandbox)
+            HStack {
+                Button("Initialize default profile") {
+                    let root = URL(fileURLWithPath: NSHomeDirectory())
+                        .appendingPathComponent(".deepseek")
+                    do {
+                        try Sandbox.ensureDefaultProfile(at: root)
+                        profileStatus = "Wrote profile to \(root.path)/sandbox/default.sb"
+                    } catch {
+                        profileStatus = "Failed: \(error.localizedDescription)"
+                    }
+                }
+                .disabled(!useShellSandbox)
+                Spacer()
+            }
+            if let status = profileStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Sandbox")
+        } footer: {
+            Text("Sandbox uses macOS `sandbox-exec` with the profile at "
+                 + "`~/.deepseek/sandbox/default.sb`. The default profile is "
+                 + "strict (read-only outside the root, no network); tune it "
+                 + "before relying on the toggle. Changes require restart.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }

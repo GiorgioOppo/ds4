@@ -84,6 +84,13 @@ enum AppSettingsKey {
     /// selected backend's key is missing, `NativeToolHost` falls
     /// back to the DuckDuckGo provider with a stderr note.
     static let webSearchProvider = "deepseek.webSearch.provider"
+
+    /// TODO §9 sandbox toggle. Opt-in `sandbox-exec` wrapper for
+    /// `ShellTool` (DeepSeekIntegrations/Sandbox/Sandbox.swift).
+    /// Default false because the bundled profile is strict; turn
+    /// it on once you've tuned `<root>/sandbox/default.sb` for
+    /// your workflow.
+    static let useShellSandbox = "deepseek.shell.useSandbox"
 }
 
 /// Helper for code paths that need to read defaults without going

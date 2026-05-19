@@ -40,10 +40,15 @@ final class NativeToolHost: ObservableObject {
         // back to DuckDuckGo with a stderr note so the tool stays
         // useful even when configuration's incomplete.
         let searchProvider = Self.resolveWebSearchProvider()
+        // TODO §9: opt-in sandbox-exec wrapper on ShellTool.
+        let useSandbox = UserDefaults.standard.bool(
+            forKey: AppSettingsKey.useShellSandbox)
         Task { @MainActor [registry] in
             await registry.registerAll(
-                DefaultTools.standard(planStore: store,
-                                       webSearchProvider: searchProvider))
+                DefaultTools.standard(
+                    planStore: store,
+                    shellUsesSandbox: useSandbox,
+                    webSearchProvider: searchProvider))
             self.schemas = await registry.availableSchemas(mode: .build)
         }
     }
