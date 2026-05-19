@@ -89,8 +89,13 @@ targets:
         # The Info.plist is referenced via INFOPLIST_FILE below;
         # exclude it from the Compile Sources phase so Xcode doesn't
         # try to treat it as a Swift file or duplicate-copy it.
+        # DeepSeekUI.entitlements is consumed only by codesign at
+        # build time (via CODE_SIGN_ENTITLEMENTS below); excluding it
+        # keeps XcodeGen from also copying it as a runtime resource
+        # under .app/Contents/Resources/.
         excludes:
           - "Resources/Info.plist"
+          - "Resources/DeepSeekUI.entitlements"
     dependencies:
       - package: DeepSeekKit
         product: DeepSeekKit
