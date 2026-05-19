@@ -394,6 +394,22 @@ final class InferenceService: @unchecked Sendable {
         q.sync { loadedModelDir }
     }
 
+    /// Snapshot the currently-loaded tokenizer + config so external
+    /// callers (T3: `LocalServerRoutes.makeChatCompletionsHandler`)
+    /// can compile a `SchemaMask` without juggling actor isolation.
+    /// Runs through the inference queue to respect the
+    /// "private state guarded by q" invariant on `_tokenizer` /
+    /// `loadedConfig`. Returns nil if no model is loaded yet.
+    func snapshotTokenizerAndConfig() -> (Tokenizer, ModelConfig)? {
+        return q.sync { [weak self] in
+            guard let self,
+                  let tok = self._tokenizer,
+                  let cfg = self.loadedConfig
+            else { return nil }
+            return (tok, cfg)
+        }
+    }
+
     /// Encode `text` into Int32 token ids on the inference serial
     /// queue. Returns nil when no model has been loaded yet (and
     /// therefore no tokenizer is available). Used by the document

@@ -114,8 +114,35 @@ enum LocalServerRoutes {
             // Map OpenAI messages → DeepSeekKit Message.
             var history = mapMessages(req.messages)
             let mode = thinkingMode(from: req)
-            let options = samplingOptions(from: req)
+            var options = samplingOptions(from: req)
             let maxTokens = req.max_tokens ?? 1024
+
+            // T3: `response_format: {type:"json_schema", json_schema:
+            // {schema: …}}` — compile the inner schema into a
+            // SchemaMask and attach it to the sampler. Failures
+            // surface as a 400 so the client knows the constraint
+            // wasn't honored, rather than silently getting an
+            // unconstrained response.
+            if let schemaDict = extractResponseSchema(body: request.body) {
+                guard let (tok, cfg) = service.snapshotTokenizerAndConfig()
+                else {
+                    await writeError(writer, status: 503,
+                                      message: "response_format requested but "
+                                               + "no model is loaded.")
+                    return
+                }
+                do {
+                    let mask = try SchemaCompiler.compile(
+                        schema: schemaDict,
+                        tokenizer: tok,
+                        vocabSize: cfg.vocabSize)
+                    options.schemaMask = mask
+                } catch {
+                    await writeError(writer, status: 400,
+                                      message: "response_format: \(error.localizedDescription)")
+                    return
+                }
+            }
 
             let conversationID = UUID()
             let modelName = service.loadedModelDir?.lastPathComponent
@@ -326,6 +353,27 @@ enum LocalServerRoutes {
             }
         }
         return out
+    }
+
+    /// Extract `response_format.json_schema.schema` from the raw
+    /// request body. We re-parse the body with `JSONSerialization`
+    /// because `OpenAIChatRequest` is `Codable` over a fixed shape
+    /// and the schema dict is intentionally unstructured.
+    /// Returns nil when the request doesn't carry a JSON-schema
+    /// response_format (including the "text" / "json_object"
+    /// variants we don't constrain).
+    private static func extractResponseSchema(
+        body: Data) -> [String: Any]?
+    {
+        guard let obj = try? JSONSerialization.jsonObject(with: body)
+                as? [String: Any]
+        else { return nil }
+        guard let rf = obj["response_format"] as? [String: Any] else {
+            return nil
+        }
+        if (rf["type"] as? String) != "json_schema" { return nil }
+        let js = rf["json_schema"] as? [String: Any]
+        return (js?["schema"] as? [String: Any]) ?? js
     }
 
     /// OpenAI doesn't model "thinking mode" natively. Treat

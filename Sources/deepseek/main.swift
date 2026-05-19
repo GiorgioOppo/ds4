@@ -12,6 +12,7 @@ import DeepSeekKit
 //                   [--mirostat-v1] [--mirostat-m N]
 //                   [--logit-bias '{"<id>": <bias>, …}']
 //                   [--dry-multiplier M] [--dry-base B] [--dry-allowed-length N]
+//                   [--json-schema PATH]
 //                   [--mode raw|chat]
 //                   [--load-strategy auto|preload|mmap]
 //                   [--force-load]
@@ -142,6 +143,10 @@ var logitBiasArg: String? = nil
 var dryMultiplier: Float = 0.0
 var dryBase: Float = 1.75
 var dryAllowedLength: Int = 2
+// T3 (TODO §10.3): JSON-Schema constrained decoding. Path to a
+// JSON file matching OpenAI's `response_format.json_schema.schema`
+// shape (subset: only `{enum:[...]}` supported in this version).
+var jsonSchemaPath: String? = nil
 var mode = "chat"
 var thinking = "off"   // off | high | max — picks the trailing think marker in chat mode
 var loadStrategy: String? = nil
@@ -215,6 +220,9 @@ while i < args.count {
     case "--dry-allowed-length":
         guard i + 1 < args.count, let v = Int(args[i + 1]), v > 0 else { usage() }
         dryAllowedLength = v; i += 2
+    case "--json-schema":
+        guard i + 1 < args.count else { usage() }
+        jsonSchemaPath = args[i + 1]; i += 2
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
@@ -526,6 +534,27 @@ inferenceQueue.async {
         dryMultiplier: dryMultiplier, dryBase: dryBase,
         dryAllowedLength: dryAllowedLength,
         mirostatV1: mirostatV1, mirostatM: mirostatM)
+
+    // T3: compile the optional JSON-Schema constraint into a
+    // SchemaMask and attach it to the sampler. Built once here, the
+    // mask's `consumed` state is advanced inside `Sampler.sample`
+    // across the decode loop.
+    if let path = jsonSchemaPath {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let mask = try SchemaCompiler.compile(
+                jsonData: data,
+                tokenizer: tokenizer,
+                vocabSize: config.vocabSize)
+            samplingOpts.schemaMask = mask
+        } catch {
+            FileHandle.standardError.write(Data(
+                "JSON schema compile failed: \(error.localizedDescription)\n"
+                    .utf8))
+            inferenceError = error
+            return
+        }
+    }
 
     // Prefill.
     var logits = model.forward(inputIds: [promptIds], startPos: 0)

@@ -105,6 +105,18 @@ public struct SamplingOptions {
     /// running mean reflects history within the same generation.
     public var mirostatV1History: [Float] = []
 
+    /// Optional schema-constrained-decoding mask (TODO §10.3 / T3).
+    /// When non-nil, the sampler applies the mask at stage 0
+    /// (`-INF`s every token whose decoded bytes would steer the
+    /// output off the schema), and after sampling calls
+    /// `mask.advance(token:)` so the next step's allowed-set
+    /// reflects the new consumed prefix.
+    ///
+    /// Reference type by design — the consumed-prefix state lives
+    /// on the mask object and persists across calls without the
+    /// caller having to thread it back through `options`.
+    public var schemaMask: SchemaMask? = nil
+
     public init(temperature: Float = 1.0, topK: Int = 0, topP: Float = 1.0,
                 minP: Float = 0.0, tailFree: Float = 1.0, typical: Float = 1.0,
                 repetitionPenalty: Float = 1.0,
@@ -147,6 +159,7 @@ public struct SamplingOptions {
             && frequencyPenalty == 0.0 && presencePenalty == 0.0
             && mirostatTau == 0.0
             && logitBias.isEmpty && dryMultiplier == 0.0
+            && schemaMask == nil
     }
 }
 
@@ -273,6 +286,22 @@ public enum Sampler {
     /// when active, `options.mirostatMu` across calls.
     public static func sample(_ logits: Tensor, history: [Int],
                               options: inout SamplingOptions) -> Int {
+        let id = sampleCore(logits, history: history, options: &options)
+        // T3: advance the schema mask's consumed-prefix state so the
+        // next call's allowed-set reflects what we just emitted.
+        // Stop tokens are a no-op inside the mask itself.
+        options.schemaMask?.advance(token: Int32(id))
+        return id
+    }
+
+    /// Internal: the actual sampling body. Split out so the public
+    /// `sample(...)` can wrap it with the `SchemaMask.advance(...)`
+    /// post-step without smearing that concern across the four
+    /// existing return paths (early greedy / mirostat v1 / mirostat
+    /// v2 / Gumbel-max). All other behavior is identical to the
+    /// pre-T3 sampler.
+    private static func sampleCore(_ logits: Tensor, history: [Int],
+                                    options: inout SamplingOptions) -> Int {
         precondition(logits.dtype == .f32 && logits.shape.count == 2 && logits.shape[0] == 1)
         let V = logits.shape[1]
 
@@ -282,9 +311,28 @@ public enum Sampler {
 
         var arr = logits.toFloatArray()
 
-        // 0. Logit bias — additive in raw-logit space (OpenAI's
-        //    `logit_bias` semantics). Applied before temperature so
-        //    `-100` is a hard block regardless of T. Trivial cost.
+        // 0a. Schema mask — `-INF`s every token whose decoded
+        //     string would steer the running output off the
+        //     compiled schema. Applied first so downstream
+        //     temperature / penalties operate on the already
+        //     constrained support. Trivial cost (precomputed
+        //     allowed set in the mask).
+        if let mask = options.schemaMask {
+            let allowed = mask.allowedTokens()
+            if allowed.isEmpty {
+                // Pathological: caller compiled a mask with no
+                // accepting tokens. Bail to the unconstrained
+                // argmax so generation doesn't hang.
+                return argmax(logits)
+            }
+            for i in 0..<V where !allowed.contains(Int32(i)) {
+                arr[i] = -.infinity
+            }
+        }
+
+        // 0b. Logit bias — additive in raw-logit space (OpenAI's
+        //     `logit_bias` semantics). Applied before temperature so
+        //     `-100` is a hard block regardless of T. Trivial cost.
         if !options.logitBias.isEmpty {
             for (id, bias) in options.logitBias where id >= 0 && Int(id) < V {
                 arr[Int(id)] += bias
