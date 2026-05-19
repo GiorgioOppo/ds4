@@ -103,6 +103,21 @@ enum AppSettingsKey {
     /// it on once you've tuned `<root>/sandbox/default.sb` for
     /// your workflow.
     static let useShellSandbox = "deepseek.shell.useSandbox"
+
+    /// Register the 50 Unix-style tools (ls, head, tail, sort, sed,
+    /// awk, find, …) under `DeepSeekTools/Tools/Unix/` so the model
+    /// can call them directly instead of falling through to the
+    /// .dangerous `shell` tool. Default true. Unset (missing key)
+    /// is read as true so a fresh install gets the full toolbox.
+    static let enableUnixTools = "deepseek.tools.unix.enabled"
+
+    /// Register the 30 Xcode / Apple-platform tools (xcodebuild_*,
+    /// swift_*, simctl_*, devicectl_*, codesign_*, …) under
+    /// `DeepSeekTools/Tools/Xcode/` for macOS / iOS / visionOS app
+    /// development. Default true on macOS. Tools that need a binary
+    /// missing on the host (jq, devicectl on pre-Xcode-15 setups)
+    /// return `not_found` at call time.
+    static let enableXcodeTools = "deepseek.tools.xcode.enabled"
 }
 
 /// Helper for code paths that need to read defaults without going
