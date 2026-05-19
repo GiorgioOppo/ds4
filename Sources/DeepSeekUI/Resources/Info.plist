@@ -29,6 +29,14 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
 
+    <!-- Mac App Store validator 90242 requires this; the value must be
+         a UTI from Apple's "App Categories" list. Productivity is the
+         closest match for an AI chat client (Claude, ChatGPT, etc. all
+         use the same category on the store). Edit this if you'd prefer
+         e.g. public.app-category.developer-tools. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
 
@@ -42,8 +50,16 @@
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 
-    <!-- Allow opening files via NSOpenPanel without sandboxed entitlements
-         (SPM build is not sandboxed; this is descriptive only). -->
+    <!-- Modern asset-catalog icon registration. The Xcode build
+         compiles Resources/Assets.xcassets/AppIcon.appiconset into
+         Assets.car (+ a .icns fallback) and the runtime resolves the
+         Dock / about-window icon through this key. -->
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
     <key>NSSupportsAutomaticTermination</key>
     <true/>
 

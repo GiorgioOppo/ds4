@@ -89,8 +89,13 @@ targets:
         # The Info.plist is referenced via INFOPLIST_FILE below;
         # exclude it from the Compile Sources phase so Xcode doesn't
         # try to treat it as a Swift file or duplicate-copy it.
+        # DeepSeekUI.entitlements is consumed only by codesign at
+        # build time (via CODE_SIGN_ENTITLEMENTS below); excluding it
+        # keeps XcodeGen from also copying it as a runtime resource
+        # under .app/Contents/Resources/.
         excludes:
           - "Resources/Info.plist"
+          - "Resources/DeepSeekUI.entitlements"
     dependencies:
       - package: DeepSeekKit
         product: DeepSeekKit
@@ -132,10 +137,24 @@ targets:
         # Info.plist's CFBundleDisplayName = "DeepSeek-V4" which is
         # independent of the binary name.
         PRODUCT_NAME: DeepSeekUI
-        # The UI is a SwiftUI macOS app, not a sandboxed App Store
-        # build. NSOpenPanel needs filesystem access to /Volumes/...
-        # for the model directory.
-        ENABLE_APP_SANDBOX: NO
-        # Asset catalog hook — empty for now; future: add an
-        # Assets.xcassets with an AppIcon set under Sources/DeepSeekUI/Resources.
+        # App Sandbox is required for Mac App Store distribution
+        # (App Store Connect validator error 90296 rejects unsandboxed
+        # bundles at upload). The entitlements file below grants
+        # NSOpenPanel-selected filesystem access (read+write, with
+        # security-scoped bookmarks for persistence) plus outbound
+        # network for OpenRouter / web tools / HTTP MCP. Caveats:
+        # ShellTool, RepoCloneTool, and stdio-MCP transports rely on
+        # `Process()` to spawn /bin/zsh / git / node etc. — those
+        # APIs are denied under the sandbox and will fail at runtime
+        # in App Store builds. Direct-download (Developer ID outside
+        # the store) builds can keep using them by signing with a
+        # variant of this entitlements file that omits the app-sandbox
+        # key.
+        ENABLE_APP_SANDBOX: YES
+        CODE_SIGN_ENTITLEMENTS: Sources/DeepSeekUI/Resources/DeepSeekUI.entitlements
+        # Asset catalog. Resources/Assets.xcassets/AppIcon.appiconset
+        # ships PNGs at every macOS slot (16…1024 px); the catalog
+        # compiler turns them into Assets.car + a .icns fallback so
+        # the bundle satisfies App Store validator 90236 (which
+        # requires a 512pt @2x — i.e. 1024 px — icon).
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
