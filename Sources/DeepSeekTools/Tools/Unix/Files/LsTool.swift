@@ -11,9 +11,12 @@ public struct LsTool: Tool {
         ToolSchema(
             name: "ls",
             description:
-                "List entries of a directory under the agent root. " +
-                "Default sort: alphabetical. Set 'long=true' for permissions/size/mtime; " +
-                "'all=true' to include dotfiles; 'limit' caps the number of entries (default 1000).",
+                "List the immediate children of one directory (non-recursive). " +
+                "Use this when you know the directory and want to see what's directly inside it. " +
+                "For a recursive walk filtered by attribute use 'find'; for pattern matching by name " +
+                "across the tree use 'glob'. " +
+                "'long=true' adds permissions/size/mtime; 'all=true' includes dotfiles; " +
+                "'limit' caps the number of entries (default 1000).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [

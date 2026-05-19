@@ -8,8 +8,10 @@ public struct TailTool: Tool {
         ToolSchema(
             name: "tail",
             description:
-                "Print the last N lines (default 10) of a file. " +
-                "Use 'bytes' to count bytes instead. Sandboxed to agent root.",
+                "Print the last N lines of a file (default 10). " +
+                "Use this for the latest entries in a log, the last error trace, or the bottom of a long output. " +
+                "For the whole file use 'read'; for the start use 'head'. " +
+                "'bytes' counts bytes instead of lines.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [

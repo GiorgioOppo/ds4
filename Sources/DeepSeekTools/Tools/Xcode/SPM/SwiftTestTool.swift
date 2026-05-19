@@ -9,8 +9,10 @@ public struct SwiftTestTool: Tool {
         ToolSchema(
             name: "swift_test",
             description:
-                "Run a Swift package's tests. 'filter' is forwarded to --filter (regex). " +
-                "'parallel' enables --parallel.",
+                "Run the tests of a Swift Package Manager package (XCTest and Swift Testing both work). " +
+                "Use this for a package with Package.swift — no scheme or destination needed. " +
+                "For tests inside an Xcode project use 'xcodebuild_test' (which requires scheme + destination). " +
+                "'filter' is forwarded to --filter (regex). 'parallel' enables --parallel.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
