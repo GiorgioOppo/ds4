@@ -89,6 +89,15 @@ final class ChatStore: ObservableObject {
     /// failure mode of a model that keeps calling tools forever.
     private var toolRoundtrips: [UUID: Int] = [:]
     private let maxToolRoundtripsPerTurn: Int = 8
+
+    /// Task in volo per ogni conversation, keyed by conv id. Permette
+    /// (a) di cancellare un singolo run senza toccare gli altri,
+    /// (b) di sapere quali conversation hanno una generation pending
+    /// — informazione che la UI usa per mostrare "Queued behind chat
+    /// X…" quando una local-vs-local serializza dietro alla q dell'
+    /// InferenceService. Cleanup nel `defer` del Task body così
+    /// completion/error/cancel rimuovono sempre l'entry.
+    private var generationTasks: [UUID: Task<Void, Never>] = [:]
     /// How many *levels* of sub-agent invocation are allowed past
     /// the host. Cap = N means the host can delegate (level 1),
     /// that sub can delegate (level 2), … up to level N. A
@@ -178,6 +187,11 @@ final class ChatStore: ObservableObject {
 
     func delete(_ id: UUID) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        // Cancella un'eventuale generation in corso per questa
+        // chat — altrimenti il Task continuerebbe a girare sul
+        // service finché non finisce maxTokens, sprecando RAM/GPU
+        // su una conversation che non esiste più.
+        cancel(of: id)
         conversations.remove(at: idx)
         phases.removeValue(forKey: id)
         // Best-effort: remove the on-disk files. Both the JSON
@@ -243,7 +257,15 @@ final class ChatStore: ObservableObject {
         let userMessage = StoredMessage(role: .user, content: trimmed)
         conversations[idx].messages.append(userMessage)
         conversations[idx].retitleIfNeeded()
-        phases[id] = .streaming(buffer: "", status: "Encoding prompt…",
+        // Status iniziale: se c'è già un'altra conversation locale
+        // attiva, questa generation andrà in coda dietro la q seriale
+        // dell'InferenceService. Dirlo all'utente esplicitamente
+        // invece di mostrargli "Encoding prompt…" per minuti mentre
+        // sta in realtà aspettando.
+        let initialStatus: String = otherLocalGenerationInFlight(excluding: id)
+            ? "Waiting — another local chat is using the model…"
+            : "Encoding prompt…"
+        phases[id] = .streaming(buffer: "", status: initialStatus,
                                  metrics: GenerationMetrics())
         // Tool-call continuations (M3b) re-use these — capture them
         // before the Task that drives the model run is spawned so
@@ -325,9 +347,22 @@ final class ChatStore: ObservableObject {
             }
         }()
 
-        Task {
+        // Cancella un'eventuale entry rimasta (sicurezza per
+        // dev-loop: in produzione la gate `phase(of: id)` sopra
+        // garantisce che non ci sia già un task per questa conv).
+        generationTasks[id]?.cancel()
+        let task = Task { [weak self] in
+            defer {
+                // Cleanup dell'entry per questa conversation alla
+                // fine del run (success/throw/cancel). Defer
+                // garantisce esecuzione anche se il body solleva o
+                // viene cancellato. Siamo su @MainActor (ereditato
+                // da ChatStore), quindi accesso diretto alla mappa.
+                self?.generationTasks.removeValue(forKey: id)
+            }
+            guard let self else { return }
             do {
-                let promptTokens = try await buildPromptTokens(
+                let promptTokens = try await self.buildPromptTokens(
                     canReusePrefix: canReusePrefix,
                     cachedPrefix: cachedPrefix,
                     userText: trimmed,
@@ -336,38 +371,83 @@ final class ChatStore: ObservableObject {
                     projectContext: projectContext,
                     toolSchemasJSON: toolSchemasJSON,
                     agentSystemPrompt: agentSystemPrompt)
+                // Bail-out se l'utente ha cancellato mentre stavamo
+                // aspettando la tokenize (la q seriale può tenerci
+                // bloccati per la durata di un altro generate).
+                // Throw così cade nel catch CancellationError che
+                // resetta il phase a .idle invece di lasciarlo nello
+                // status "Waiting…".
+                if Task.isCancelled { throw CancellationError() }
                 // Snapshot the pending turn on disk immediately. If
                 // the app dies during the prefill (which can take
                 // minutes for a project context), the user's prompt
                 // is preserved and the resume path can still pick
                 // up — without any tokens emitted yet.
-                if let cIdx = conversations.firstIndex(where: { $0.id == id }) {
-                    conversations[cIdx].pendingTurn = PendingTurn(
+                if let cIdx = self.conversations.firstIndex(where: { $0.id == id }) {
+                    self.conversations[cIdx].pendingTurn = PendingTurn(
                         assistantMessageID: placeholderId,
                         promptTokens: promptTokens,
                         generatedTokens: [],
                         mode: modeRaw)
-                    scheduleSave(id)
+                    self.scheduleSave(id)
                 }
-                for try await event in service.generateForConversation(
+                for try await event in self.service.generateForConversation(
                     promptTokens: promptTokens,
                     conversationID: id,
                     mode: mode,
                     options: options,
                     maxTokens: maxTokens)
                 {
-                    apply(event: event,
-                           to: id,
-                           placeholderId: placeholderId,
-                           userMessageId: userMessage.id,
-                           mode: modeRaw)
+                    self.apply(event: event,
+                                to: id,
+                                placeholderId: placeholderId,
+                                userMessageId: userMessage.id,
+                                mode: modeRaw)
                 }
+            } catch is CancellationError {
+                // Cancellazione esplicita: phase passa a .idle, non
+                // .error — l'utente ha chiesto stop, non c'è un
+                // errore da mostrare.
+                self.phases[id] = .idle
+                self.scheduleSave(id)
             } catch {
-                phases[id] = .error((error as? LocalizedError)?.errorDescription
+                self.phases[id] = .error((error as? LocalizedError)?.errorDescription
                                      ?? error.localizedDescription)
-                scheduleSave(id)
+                self.scheduleSave(id)
             }
         }
+        generationTasks[id] = task
+    }
+
+    /// True se almeno una conversation locale (esclusa `excluding`,
+    /// di solito quella che stiamo per avviare) sta correndo nel
+    /// `service` o è in coda davanti. Usato dal `send` per scegliere
+    /// lo status iniziale del phase (chiaro vs "in attesa"). La q
+    /// dell'InferenceService è seriale: due locali sullo stesso
+    /// modello serializzano per forza. Le remote girano via HTTP
+    /// — non contendono nulla, quindi non contano.
+    private func otherLocalGenerationInFlight(excluding id: UUID) -> Bool {
+        for (otherID, task) in generationTasks {
+            guard otherID != id, !task.isCancelled else { continue }
+            // Filtra solo gli active phase: una entry in
+            // `generationTasks` può persistere per qualche istante
+            // dopo che il Task body è uscito (prima che il `defer`
+            // rimuova la chiave), e quei task non bloccano più la
+            // q. Controlla il phase per essere sicuri.
+            switch phases[otherID] ?? .idle {
+            case .idle, .error:
+                continue
+            case .prefilling, .streaming:
+                // Solo i local model usano la q dell'InferenceService.
+                // Le chat remote (modelDirPath vuoto) girano via HTTP
+                // — non bloccano nulla.
+                if let c = conversations.first(where: { $0.id == otherID }),
+                   !c.modelDirPath.isEmpty {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     /// Restart a generation that was cut short (crash, app-quit,
@@ -581,8 +661,16 @@ final class ChatStore: ObservableObject {
     }
 
 
-    func cancel() {
-        service.cancelCurrent()
+    /// Cancella la generation in volo per `id` (default: la chat
+    /// attualmente selezionata). Cancella il Task swift — che
+    /// termina il `for try await event in …` loop — e alza il flag
+    /// per-conv nel service così se il run è già dentro al
+    /// prefill/decode esce dopo il token corrente. Le altre chat in
+    /// volo (locale + remote) restano intatte.
+    func cancel(of id: UUID? = nil) {
+        guard let target = id ?? selectedID else { return }
+        generationTasks[target]?.cancel()
+        service.cancelCurrent(conversationID: target)
     }
 
     /// User chose to throw away the interrupted assistant turn. The
@@ -1265,7 +1353,16 @@ final class ChatStore: ObservableObject {
         let userMessageID = userMessage.id
         let firstPlaceholderID = placeholder.id
 
-        Task { [weak self] in
+        // Stesso pattern del local-send: registriamo il Task nella
+        // mappa per permettere cancellazione granulare e cleanup
+        // automatico. Cancella un eventuale residuo per questa
+        // conv prima di sostituire (dovrebbe essere già nil per la
+        // gate sopra, ma è una rete di sicurezza per dev-loop).
+        generationTasks[id]?.cancel()
+        let task = Task { [weak self] in
+            defer {
+                self?.generationTasks.removeValue(forKey: id)
+            }
             guard let self else { return }
             await self.runRemoteLoop(conversationID: id,
                                        initialPlaceholderID: firstPlaceholderID,
@@ -1276,6 +1373,7 @@ final class ChatStore: ObservableObject {
                                        maxTokens: maxTokens,
                                        apiKey: apiKey)
         }
+        generationTasks[id] = task
     }
 
     /// Drive a remote chat to completion through (up to)

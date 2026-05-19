@@ -428,28 +428,54 @@ final class InferenceService: @unchecked Sendable {
 
     private let q = DispatchQueue(label: "deepseek.inference", qos: .userInitiated)
 
-    /// Set by `cancelCurrent()`; the generate loop checks this between
-    /// tokens and exits early. We can't preempt a mid-token forward
-    /// (Metal commands are already in flight), so cancellation always
-    /// finishes the current token before stopping.
-    private var cancelFlag = false
+    /// Cancellazione per-conversazione. Il prefill/decode loop legge
+    /// `isCancelled(for: convID)` fra un token e l'altro; se è in set
+    /// (o se `globalCancel` è on) esce dopo aver finito il token
+    /// corrente. Multi-track safe: cancellare la chat A non ferma
+    /// la chat B che sta aspettando dietro di lei sulla q seriale.
+    /// `globalCancel` resta come backstop per chiamate legacy
+    /// (`cancelCurrent()` senza id) — useremmo unloadModel per uno
+    /// stop più drastico ma manteniamo la semantica esistente.
+    private var cancelledConvIDs = Set<UUID>()
+    private var globalCancel = false
     private let cancelLock = NSLock()
 
     init() {}
 
-    func cancelCurrent() {
+    /// Marca questa conversazione come cancellata; se id è nil,
+    /// alza il flag globale (vecchio comportamento `cancelCurrent()`
+    /// senza argomenti — equivalente a "stop whatever is current").
+    /// La conversation viene tolta dal set automaticamente al prossimo
+    /// `resetCancelFlag(for:)` (= prima dell'inizio del prossimo
+    /// generate per quella conv).
+    func cancelCurrent(conversationID: UUID? = nil) {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        cancelFlag = true
+        if let id = conversationID {
+            cancelledConvIDs.insert(id)
+        } else {
+            globalCancel = true
+        }
     }
 
-    private func resetCancelFlag() {
+    private func resetCancelFlag(for conversationID: UUID? = nil) {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        cancelFlag = false
+        if let id = conversationID {
+            cancelledConvIDs.remove(id)
+        }
+        // `globalCancel` lo droppiamo sempre quando un generate parte:
+        // se era stato alzato per fermare il run precedente e quello
+        // ha già finito (o se l'utente l'ha alzato per errore), il
+        // nuovo run riparte pulito.
+        globalCancel = false
     }
 
-    private func isCancelled() -> Bool {
+    private func isCancelled(for conversationID: UUID? = nil) -> Bool {
         cancelLock.lock(); defer { cancelLock.unlock() }
-        return cancelFlag
+        if globalCancel { return true }
+        if let id = conversationID, cancelledConvIDs.contains(id) {
+            return true
+        }
+        return false
     }
 
     /// Tear down whatever model is currently in memory. Releases
@@ -1084,7 +1110,7 @@ final class InferenceService: @unchecked Sendable {
                         ]))
                     return
                 }
-                self.resetCancelFlag()
+                self.resetCancelFlag(for: conversationID)
                 // Sync user preference for common-prefix rewind. Letta
                 // ogni turn così l'utente può abilitarla/disabilitarla
                 // dal Settings senza riavviare.
@@ -1245,7 +1271,7 @@ final class InferenceService: @unchecked Sendable {
                         let perChunkDelay = min(0.004, 1.5 / Double(totalChunks))
                         var i = 0
                         while i < chars.count {
-                            if self.isCancelled() { break }
+                            if self.isCancelled(for: conversationID) { break }
                             let end = min(i + chunkSize, chars.count)
                             continuation.yield(.prefillToken(
                                 text: String(chars[i..<end])))
@@ -1269,7 +1295,7 @@ final class InferenceService: @unchecked Sendable {
                     // produce the assistant's first new token.
                     var lastLogits: Tensor? = nil
                     for (i, t) in deltaTokens.enumerated() {
-                        if self.isCancelled() { break }
+                        if self.isCancelled(for: conversationID) { break }
                         lastLogits = model.forward(
                             inputIds: [[Int(t)]],
                             startPos: cachedCount + i)
@@ -1325,7 +1351,7 @@ final class InferenceService: @unchecked Sendable {
                 // after the prefill step above, regardless of which path
                 // we took).
                 for step in 0..<maxTokens {
-                    if self.isCancelled() { break }
+                    if self.isCancelled(for: conversationID) { break }
 
                     let nextId = Sampler.sample(logits,
                                                   history: generated,

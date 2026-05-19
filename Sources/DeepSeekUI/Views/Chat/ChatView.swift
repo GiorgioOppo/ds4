@@ -134,7 +134,8 @@ struct ChatView: View {
             ComposerView(draft: $draft,
                           phase: phase,
                           canSend: modelState.isReady,
-                          onSend: sendCurrent, onStop: { store.cancel() })
+                          onSend: sendCurrent,
+                          onStop: { store.cancel(of: c.id) })
         }
         .navigationTitle(c.title)
     }
