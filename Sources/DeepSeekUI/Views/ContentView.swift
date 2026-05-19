@@ -114,6 +114,21 @@ struct ChatContainer: View {
         .sheet(isPresented: $showPlayground) {
             PlaygroundSheet()
         }
+        // Sheet di consenso per le tool native gated (shell, write,
+        // edit, apply_patch, repo_clone). Senza questo presenter il
+        // dispatch resta in `await context.permission.decide(...)`
+        // per sempre e il loop agentico si blocca. Lo attacchiamo a
+        // ChatContainer (root del chat surface) così è disponibile
+        // ovunque l'utente possa innescare una tool call.
+        .sheet(item: Binding(
+            get: { store.nativeTools.pendingRequest },
+            set: { store.nativeTools.pendingRequest = $0 })
+        ) { pending in
+            PermissionSheet(request: pending.request) { decision in
+                pending.resolve(decision)
+                store.nativeTools.pendingRequest = nil
+            }
+        }
     }
 
     @ViewBuilder

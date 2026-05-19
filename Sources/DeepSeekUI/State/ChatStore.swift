@@ -1701,23 +1701,23 @@ final class ChatStore: ObservableObject {
             case .chat: break
             }
 
-            // Prompt trace remoto: dump del body JSON che stiamo
-            // per inviare a OpenRouter — system message, tools array
-            // (formato OpenAI), tool_choice, messages, sampler.
-            // Equivalente del prefill trace locale per ispezione di
-            // "cosa vede il modello?". Solo alla prima iterazione
-            // del runRemoteLoop (= primo turn dopo lo user send;
-            // iterazioni successive sono continuazioni dopo tool
-            // calls e hanno body simile + outputs). In background
-            // così non rallenta la HTTP request.
-            if iteration == 1 {
-                let bodyForTrace = body
-                Task { [weak self] in
-                    await self?.emitRemotePromptTrace(
-                        conversationID: id,
-                        placeholderID: currentPlaceholderID,
-                        body: bodyForTrace)
-                }
+            // Prompt trace remoto: dump del body JSON inviato a
+            // OpenRouter — system message, tools array (formato
+            // OpenAI), tool_choice, messages (history + tool outputs
+            // delle iterazioni precedenti), sampler. Ogni iterazione
+            // del loop ha il suo placeholder fresco e quindi il suo
+            // dump dedicato, così l'utente può verificare lungo la
+            // timeline cosa il modello ha effettivamente visto a
+            // ogni passo (in particolare: il marker "(empty output)"
+            // appare nei tool messages delle iterazioni che seguono
+            // una tool call senza risultati). In background per non
+            // ritardare la HTTP request.
+            let bodyForTrace = body
+            Task { [weak self] in
+                await self?.emitRemotePromptTrace(
+                    conversationID: id,
+                    placeholderID: currentPlaceholderID,
+                    body: bodyForTrace)
             }
 
             // Stream + accumulate.
