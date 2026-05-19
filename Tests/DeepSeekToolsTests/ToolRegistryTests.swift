@@ -143,6 +143,87 @@ final class ToolRegistryTests: XCTestCase {
         XCTAssertTrue(result.output.contains("b.swift"))
     }
 
+    // MARK: - unix toolbox
+
+    func testUnixToolboxRegistersAll50Tools() async throws {
+        let registry = ToolRegistry()
+        let store = PlanStore()
+        await registry.registerAll(
+            DefaultTools.standard(planStore: store,
+                                  includeShell: false,
+                                  includeNetwork: false,
+                                  includeRepoClone: false,
+                                  includeUnixTools: true))
+        let names = await registry.names()
+        let unixNames: [String] = [
+            // Files (10)
+            "ls", "head", "tail", "wc", "stat",
+            "du", "basename", "dirname", "find", "which",
+            // Text (10)
+            "sort", "uniq", "cut", "tr", "paste",
+            "comm", "xxd", "md5", "sha1", "sha256",
+            // Hash + TextBin
+            "base64", "sed", "awk", "file",
+            // Mutate (7)
+            "touch", "mkdir", "cp", "mv", "rm", "ln", "chmod",
+            // Archive (5)
+            "tar", "gzip", "gunzip", "zip", "unzip",
+            // System (6)
+            "uname", "date", "env", "hostname", "whoami", "id",
+            // Process (3)
+            "ps", "lsof", "kill",
+            // JSON
+            "jq",
+            // Git (4)
+            "git_status", "git_log", "git_diff", "git_blame",
+        ]
+        XCTAssertEqual(unixNames.count, 50, "expected exactly 50 unix tools")
+        for name in unixNames {
+            XCTAssertTrue(names.contains(name), "missing unix tool: \(name)")
+        }
+    }
+
+    func testUnixToolboxOffByDefault() async throws {
+        let registry = ToolRegistry()
+        let store = PlanStore()
+        await registry.registerAll(
+            DefaultTools.standard(planStore: store,
+                                  includeShell: false,
+                                  includeNetwork: false,
+                                  includeRepoClone: false))
+        let names = await registry.names()
+        XCTAssertFalse(names.contains("ls"), "unix tools should be off by default")
+        XCTAssertFalse(names.contains("jq"))
+        XCTAssertFalse(names.contains("git_status"))
+    }
+
+    func testUnixToolboxPlanModeFiltersMutatingAndDangerous() async throws {
+        let registry = ToolRegistry()
+        let store = PlanStore()
+        await registry.registerAll(
+            DefaultTools.standard(planStore: store,
+                                  includeShell: false,
+                                  includeNetwork: false,
+                                  includeRepoClone: false,
+                                  includeUnixTools: true))
+        let plan = await registry.availableSchemas(mode: .plan)
+        let planNames = Set(plan.map(\.name))
+        // .mutating: must be filtered out
+        for name in ["touch", "mkdir", "cp", "mv", "rm", "ln", "chmod",
+                     "tar", "gzip", "gunzip", "zip", "unzip"] {
+            XCTAssertFalse(planNames.contains(name),
+                           "\(name) leaked into plan mode")
+        }
+        // .dangerous: must be filtered out
+        XCTAssertFalse(planNames.contains("kill"))
+        // .readOnly: must still be there
+        for name in ["ls", "head", "tail", "wc", "stat", "find",
+                     "git_status", "git_log", "git_diff", "git_blame", "jq"] {
+            XCTAssertTrue(planNames.contains(name),
+                          "\(name) wrongly filtered out of plan mode")
+        }
+    }
+
     // MARK: - planning
 
     func testPlanToolReadAndWrite() async throws {

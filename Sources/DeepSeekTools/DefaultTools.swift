@@ -17,6 +17,7 @@ public enum DefaultTools {
                                 includeNetwork: Bool = true,
                                 includeRepoClone: Bool = true,
                                 includeStubs: Bool = false,
+                                includeUnixTools: Bool = false,
                                 shellUsesSandbox: Bool = false,
                                 webSearchProvider: WebSearchProvider? = nil) -> [Tool] {
         var tools: [Tool] = [
@@ -52,6 +53,54 @@ public enum DefaultTools {
         if includeStubs {
             tools.append(LSPTool())
         }
+        if includeUnixTools {
+            tools.append(contentsOf: unixTools())
+        }
         return tools
+    }
+
+    /// The 50-tool Unix toolbox under `Sources/DeepSeekTools/Tools/Unix/`.
+    /// Opt-in via `includeUnixTools: true` on `standard(...)` — default
+    /// off so the existing 16-tool surface keeps the same defaults for
+    /// agents that don't need the extra primitives.
+    ///
+    /// Surface, by family:
+    ///   - Files (10): ls, head, tail, wc, stat, du, basename, dirname,
+    ///                 find, which
+    ///   - Text (10):  sort, uniq, cut, tr, paste, comm, xxd, md5,
+    ///                 sha1, sha256
+    ///   - Hash (1):   base64
+    ///   - TextBin (3): sed, awk, file
+    ///   - Mutate (7): touch, mkdir, cp, mv, rm, ln, chmod
+    ///   - Archive (5): tar, gzip, gunzip, zip, unzip
+    ///   - System (6): uname, date, env, hostname, whoami, id
+    ///   - Process (3): ps, lsof, kill
+    ///   - JSON (1):   jq
+    ///   - Git (4):    git_status, git_log, git_diff, git_blame
+    public static func unixTools() -> [Tool] {
+        return [
+            // Files
+            LsTool(), HeadTool(), TailTool(), WcTool(), StatTool(),
+            DuTool(), BasenameTool(), DirnameTool(), FindTool(), WhichTool(),
+            // Text
+            SortTool(), UniqTool(), CutTool(), TrTool(), PasteTool(),
+            CommTool(), XxdTool(), Md5Tool(), Sha1Tool(), Sha256Tool(),
+            // Hash / Text via binary
+            Base64Tool(), SedTool(), AwkTool(), FileTool(),
+            // Mutating
+            TouchTool(), MkdirTool(), CpTool(), MvTool(),
+            RmTool(), LnTool(), ChmodTool(),
+            // Archive
+            TarTool(), GzipTool(), GunzipTool(), ZipTool(), UnzipTool(),
+            // System
+            UnameTool(), DateTool(), EnvTool(),
+            HostnameTool(), WhoamiTool(), IdTool(),
+            // Process
+            PsTool(), LsofTool(), KillTool(),
+            // JSON
+            JqTool(),
+            // Git
+            GitStatusTool(), GitLogTool(), GitDiffTool(), GitBlameTool(),
+        ]
     }
 }
