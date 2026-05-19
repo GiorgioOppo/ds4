@@ -18,6 +18,7 @@ public enum DefaultTools {
                                 includeRepoClone: Bool = true,
                                 includeStubs: Bool = false,
                                 includeUnixTools: Bool = false,
+                                includeXcodeTools: Bool = false,
                                 shellUsesSandbox: Bool = false,
                                 webSearchProvider: WebSearchProvider? = nil) -> [Tool] {
         var tools: [Tool] = [
@@ -55,6 +56,9 @@ public enum DefaultTools {
         }
         if includeUnixTools {
             tools.append(contentsOf: unixTools())
+        }
+        if includeXcodeTools {
+            tools.append(contentsOf: xcodeTools())
         }
         return tools
     }
@@ -101,6 +105,73 @@ public enum DefaultTools {
             JqTool(),
             // Git
             GitStatusTool(), GitLogTool(), GitDiffTool(), GitBlameTool(),
+        ]
+    }
+
+    /// The 30-tool Xcode / Apple-platform development toolbox under
+    /// `Sources/DeepSeekTools/Tools/Xcode/`. Opt-in via
+    /// `includeXcodeTools: true` on `standard(...)` — default off so
+    /// non-Apple-platform agents and CI without Xcode CLT don't pull
+    /// in tools that would fail-by-config.
+    ///
+    /// Surface, by family:
+    ///   - Build (8):     xcodebuild_list / build / test / clean /
+    ///                    archive / showsdks / showdestinations /
+    ///                    exportarchive
+    ///   - SPM (3):       swift_build / test / package
+    ///   - Simulator (8): simctl_list / boot / shutdown / install /
+    ///                    launch / uninstall / screenshot / erase
+    ///   - Device (2):    devicectl_list / install (dangerous)
+    ///   - Signing (3):   codesign_verify / display,
+    ///                    security_find_identity
+    ///   - Mach-O (2):    otool_info, lipo_info
+    ///   - Plist (4):     plutil_print / lint, agvtool_version,
+    ///                    xcresulttool_get
+    ///
+    /// Every Xcode-toolchain command goes through `/usr/bin/xcrun`
+    /// (see `_Xcrun.swift`) so the active Xcode picked by
+    /// `xcode-select -p` is the one that runs. Stable `/usr/bin/X`
+    /// binaries (codesign, security, otool, lipo, plutil) call
+    /// `UnixBinary.runBinary` directly.
+    public static func xcodeTools() -> [Tool] {
+        return [
+            // Build (8)
+            XcodebuildListTool(),
+            XcodebuildBuildTool(),
+            XcodebuildTestTool(),
+            XcodebuildCleanTool(),
+            XcodebuildArchiveTool(),
+            XcodebuildShowSdksTool(),
+            XcodebuildShowDestinationsTool(),
+            XcodebuildExportArchiveTool(),
+            // SPM (3)
+            SwiftBuildTool(),
+            SwiftTestTool(),
+            SwiftPackageTool(),
+            // Simulator (8)
+            SimctlListTool(),
+            SimctlBootTool(),
+            SimctlShutdownTool(),
+            SimctlInstallTool(),
+            SimctlLaunchTool(),
+            SimctlUninstallTool(),
+            SimctlScreenshotTool(),
+            SimctlEraseTool(),
+            // Device (2)
+            DevicectlListTool(),
+            DevicectlInstallTool(),
+            // Signing (3)
+            CodesignVerifyTool(),
+            CodesignDisplayTool(),
+            SecurityFindIdentityTool(),
+            // Mach-O inspect (2)
+            OtoolInfoTool(),
+            LipoInfoTool(),
+            // Plist / version / results (4)
+            PlutilPrintTool(),
+            PlutilLintTool(),
+            AgvtoolVersionTool(),
+            XcresulttoolGetTool(),
         ]
     }
 }

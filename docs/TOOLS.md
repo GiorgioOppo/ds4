@@ -85,6 +85,46 @@ Caveats worth knowing:
 - `git_log` defaults to `--oneline -n 20` to stay within the 32 KB
   output cap; the model can override `n` for more.
 
+## Xcode / Apple-platform toolbox (opt-in)
+
+A 30-tool toolbox for macOS / iOS / iPadOS / visionOS / watchOS / tvOS
+development lives under `Sources/DeepSeekTools/Tools/Xcode/`. Off by
+default — enable by passing `includeXcodeTools: true` to
+`DefaultTools.standard(...)`. Every Xcode-toolchain command goes
+through `/usr/bin/xcrun` (`_Xcrun.swift`) so it picks up the active
+Xcode chosen by `xcode-select -p`.
+
+| Family | Tools |
+|---|---|
+| Build (8) | `xcodebuild_list`, `xcodebuild_build`, `xcodebuild_test`, `xcodebuild_clean`, `xcodebuild_archive`, `xcodebuild_showsdks`, `xcodebuild_showdestinations`, `xcodebuild_exportarchive` |
+| Swift PM (3) | `swift_build`, `swift_test`, `swift_package` (resolve / update / init / describe / clean) |
+| Simulator (8, mutating) | `simctl_list` (readOnly), `simctl_boot`, `simctl_shutdown`, `simctl_install`, `simctl_launch`, `simctl_uninstall`, `simctl_screenshot`, `simctl_erase` |
+| Real device (2) | `devicectl_list` (readOnly), `devicectl_install` (**dangerous** — physical hardware) |
+| Signing (3, readOnly) | `codesign_verify`, `codesign_display`, `security_find_identity` |
+| Mach-O inspect (2, readOnly) | `otool_info` (header / loadcommands / libraries / symbols / archs), `lipo_info` |
+| Plist / version / results (4) | `plutil_print`, `plutil_lint`, `agvtool_version` (mutating), `xcresulttool_get` (parses `.xcresult`) |
+
+Notes:
+
+- `xcodebuild_test` and `xcodebuild_archive` default to a 600-900 s
+  timeout (build operations on real projects take minutes). The model
+  can override via `timeoutSeconds`.
+- All input paths (workspace, project, archive, app bundles,
+  exportOptions.plist, …) must resolve inside the agent root. The
+  default `derivedDataPath` for `xcodebuild_build`/`test` is `build/`
+  so derived data lives inside the repo by default.
+- `xcodebuild_build` exposes `noCodesign=true` which sets
+  `CODE_SIGNING_ALLOWED=NO` etc. — needed for simulator-only or CI
+  builds without provisioning profiles.
+- `devicectl_install` is `.dangerous`, not `.mutating`: physical-device
+  installs are harder to recover from than simulator state changes.
+- `xcresulttool_get` uses the Xcode 16+ `test-results summary/tests`
+  invocations for `kind=summary|tests` and falls back to the legacy
+  `--legacy object` form when `kind=object` is requested.
+- `agvtool_version` operations like `next-build` and `set-marketing`
+  write Info.plist files; `read-*` operations are pure reads but the
+  category is `.mutating` because the same tool can be used to write.
+
 ## Categories and modes
 
 The registry filters tools by `ToolCategory` according to the active
