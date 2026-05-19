@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "DeepSeekIntegrations", targets: ["DeepSeekIntegrations"]),
         .library(name: "DeepSeekVocabPruner", targets: ["DeepSeekVocabPruner"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
+        .executable(name: "deepseek_gguf", targets: ["deepseek_gguf"]),
         .executable(name: "converter", targets: ["converter"]),
         .executable(name: "vocab_pruner", targets: ["vocab_pruner"]),
         .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
@@ -35,6 +36,15 @@ let package = Package(
             name: "deepseek",
             dependencies: ["DeepSeekKit"],
             path: "Sources/deepseek"
+        ),
+        // Minimal CLI for running a GGUF Llama-family checkpoint
+        // (TODO §10.2 / T2). Kept separate from the V4-specific
+        // `deepseek` CLI so the conversion-heavy / MLA-specific
+        // machinery in main.swift doesn't bleed into the GGUF path.
+        .executableTarget(
+            name: "deepseek_gguf",
+            dependencies: ["DeepSeekKit"],
+            path: "Sources/deepseek_gguf"
         ),
         .target(
             name: "DeepSeekConverter",
