@@ -18,16 +18,16 @@ import DeepSeekTools
 /// Pattern matches `.opencode/` and `CLAUDE.md` overlays — anything
 /// in the repo travels with the repo without requiring the user to
 /// sync `~/Library/Application Support` between machines.
-public struct ProjectOverlay: Sendable {
-    public let agents: [AgentConfig]
-    public let skills: [Skill]
-    public let slashCommands: [SlashCommand]
-    public let rootDirectory: URL
+struct ProjectOverlay: Sendable {
+    let agents: [AgentConfig]
+    let skills: [Skill]
+    let slashCommands: [SlashCommand]
+    let rootDirectory: URL
 
-    public init(agents: [AgentConfig] = [],
-                skills: [Skill] = [],
-                slashCommands: [SlashCommand] = [],
-                rootDirectory: URL)
+    init(agents: [AgentConfig] = [],
+         skills: [Skill] = [],
+         slashCommands: [SlashCommand] = [],
+         rootDirectory: URL)
     {
         self.agents = agents
         self.skills = skills
@@ -39,17 +39,17 @@ public struct ProjectOverlay: Sendable {
     /// project doesn't carry a `.deepseek/` directory — callers
     /// still get a stable handle they can ask for overrides
     /// from (yielding the global library each time).
-    public static func empty(rootDirectory: URL) -> ProjectOverlay {
+    static func empty(rootDirectory: URL) -> ProjectOverlay {
         ProjectOverlay(rootDirectory: rootDirectory)
     }
 }
 
-public enum ProjectOverlayLoader {
+enum ProjectOverlayLoader {
     /// Read a project's overlay (if present). Missing files are
     /// silently ignored — projects opt in by creating the
     /// matching JSON. Malformed files emit a stderr note and
     /// fall back to empty.
-    public static func load(rootDirectory: URL) -> ProjectOverlay {
+    static func load(rootDirectory: URL) -> ProjectOverlay {
         let dotDir = rootDirectory.appendingPathComponent(".deepseek")
         let fm = FileManager.default
         guard fm.fileExists(atPath: dotDir.path) else {
@@ -81,9 +81,9 @@ public enum ProjectOverlayLoader {
             let data = try Data(contentsOf: url)
             return try JSONDecoder().decode([T].self, from: data)
         } catch {
-            FileHandle.standardError.write(Data(
-                "[ProjectOverlay] failed to decode \(url.lastPathComponent): "
-                + "\(error)\n".utf8))
+            let message = "[ProjectOverlay] failed to decode "
+                + "\(url.lastPathComponent): \(error)\n"
+            FileHandle.standardError.write(Data(message.utf8))
             return []
         }
     }
@@ -94,7 +94,7 @@ public enum ProjectOverlayLoader {
     /// with unique names are appended. Returns the merged array
     /// in stable order: global first, then any new project-local
     /// additions.
-    public static func mergeAgents(
+    static func mergeAgents(
         global: [AgentConfig],
         overlay: [AgentConfig]) -> [AgentConfig]
     {
@@ -115,7 +115,7 @@ public enum ProjectOverlayLoader {
 
     /// Merge for skills. Same precedence as agents — overlay
     /// wins on name collision.
-    public static func mergeSkills(
+    static func mergeSkills(
         global: [Skill],
         overlay: [Skill]) -> [Skill]
     {
@@ -134,7 +134,7 @@ public enum ProjectOverlayLoader {
 
     /// Merge for slash commands. Match key is `name` — that's the
     /// palette label and also (today) the `/foo` trigger.
-    public static func mergeSlashCommands(
+    static func mergeSlashCommands(
         global: [SlashCommand],
         overlay: [SlashCommand]) -> [SlashCommand]
     {
