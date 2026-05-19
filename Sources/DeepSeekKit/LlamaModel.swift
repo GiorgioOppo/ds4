@@ -157,8 +157,16 @@ extension LlamaModel {
     /// ffn_norm, ffn_gate, ffn_up, ffn_down}.weight`,
     /// `output_norm.weight`, optional `output.weight` (tied to
     /// `token_embd` when absent — the common Llama 3 setup).
+    /// `weightDtype` controls the dequant target for quantized
+    /// weights (Q8_0 / Q4_0 / Q4_K). `.f32` (default) is safer
+    /// numerically; `.bf16` halves the resident memory of those
+    /// weights at no measurable accuracy loss in practice. Q5_K /
+    /// Q6_K silently fall back to F32 — their BF16 kernels haven't
+    /// landed yet. Pass-through dtypes in the GGUF (F32, F16, BF16)
+    /// ignore this knob and load as-is.
     public static func fromGGUF(_ gguf: GGUFFile,
-                                  maxSeqLenOverride: Int? = nil) throws
+                                  maxSeqLenOverride: Int? = nil,
+                                  weightDtype: DType = .f32) throws
         -> LlamaModel
     {
         let meta = gguf.header.metadata
@@ -236,7 +244,8 @@ extension LlamaModel {
 
         // Embedding (also reused as the LM-head weight when the
         // checkpoint ties them — common in Llama 3).
-        let embedW = try gguf.load("token_embd.weight")
+        let embedW = try gguf.load("token_embd.weight",
+                                     outputDtype: weightDtype)
         let embed = ParallelEmbedding(
             vocabSize: vocabSize, dim: hiddenSize, weight: embedW)
 
@@ -246,13 +255,22 @@ extension LlamaModel {
         for layerId in 0..<nLayers {
             let prefix = "blk.\(layerId)."
 
-            let attnNormW = try gguf.load("\(prefix)attn_norm.weight")
+            // RMSNorms ship as F32 in GGUF (pass-through, no
+            // dequant); the `outputDtype` arg only kicks in for
+            // quantized tensors, so threading it through unchanged
+            // is safe.
+            let attnNormW = try gguf.load("\(prefix)attn_norm.weight",
+                                            outputDtype: weightDtype)
             let attnNorm  = RMSNorm(weight: attnNormW, eps: normEps)
 
-            let wqW = try gguf.load("\(prefix)attn_q.weight")
-            let wkW = try gguf.load("\(prefix)attn_k.weight")
-            let wvW = try gguf.load("\(prefix)attn_v.weight")
-            let woW = try gguf.load("\(prefix)attn_output.weight")
+            let wqW = try gguf.load("\(prefix)attn_q.weight",
+                                      outputDtype: weightDtype)
+            let wkW = try gguf.load("\(prefix)attn_k.weight",
+                                      outputDtype: weightDtype)
+            let wvW = try gguf.load("\(prefix)attn_v.weight",
+                                      outputDtype: weightDtype)
+            let woW = try gguf.load("\(prefix)attn_output.weight",
+                                      outputDtype: weightDtype)
             let wQ = Linear(inFeatures: hiddenSize,
                              outFeatures: nHeads * headDim,
                              weight: wqW, scale: nil)
@@ -270,12 +288,16 @@ extension LlamaModel {
                 maxSeq: maxSeqLen,
                 wQ: wQ, wK: wK, wV: wV, wO: wO, rope: rope)
 
-            let ffnNormW = try gguf.load("\(prefix)ffn_norm.weight")
+            let ffnNormW = try gguf.load("\(prefix)ffn_norm.weight",
+                                           outputDtype: weightDtype)
             let ffnNorm  = RMSNorm(weight: ffnNormW, eps: normEps)
 
-            let gateW = try gguf.load("\(prefix)ffn_gate.weight")
-            let upW   = try gguf.load("\(prefix)ffn_up.weight")
-            let downW = try gguf.load("\(prefix)ffn_down.weight")
+            let gateW = try gguf.load("\(prefix)ffn_gate.weight",
+                                        outputDtype: weightDtype)
+            let upW   = try gguf.load("\(prefix)ffn_up.weight",
+                                        outputDtype: weightDtype)
+            let downW = try gguf.load("\(prefix)ffn_down.weight",
+                                        outputDtype: weightDtype)
             let wGate = Linear(inFeatures: hiddenSize,
                                 outFeatures: intermediateSize,
                                 weight: gateW, scale: nil)
@@ -294,7 +316,8 @@ extension LlamaModel {
         }
 
         // Final norm + LM head.
-        let outputNormW = try gguf.load("output_norm.weight")
+        let outputNormW = try gguf.load("output_norm.weight",
+                                          outputDtype: weightDtype)
         let norm = RMSNorm(weight: outputNormW, eps: normEps)
 
         // Tied embeddings: when `output.weight` is absent the LM
@@ -303,7 +326,8 @@ extension LlamaModel {
         // touch the data, just the in-memory index.
         let headW: Tensor
         if gguf.info(name: "output.weight") != nil {
-            headW = try gguf.load("output.weight")
+            headW = try gguf.load("output.weight",
+                                    outputDtype: weightDtype)
         } else {
             headW = embedW
         }

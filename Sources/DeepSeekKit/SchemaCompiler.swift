@@ -6,26 +6,26 @@ import Foundation
 /// json_schema:{schema: …}}` carries) and returns a `SchemaMask`
 /// that constrains the sampler to outputs valid under that schema.
 ///
-/// Coverage today:
-///   - `{"enum": ["A", "B", …]}` — literal string union. Closes
-///     the user-facing "give me exactly one of these tokens" case
-///     that most non-trivial structured-output workflows actually
-///     need.
+/// Coverage today (all reduce to a finite union of literal strings,
+/// which is the only model `SchemaMask` enforces — see that file
+/// for the constraint semantics):
+///   - `{"enum": [...]}` — literal string union.
+///   - `{"const": "X"}` — single literal.
+///   - `{"oneOf": [...]}` / `{"anyOf": [...]}` — union over the
+///     compiled inner schemas. Recursive: `oneOf` of `enum`s
+///     flattens, `oneOf` of `const`s flattens, mixed works too.
 ///
 /// Out of scope (deferred to T3 follow-up commits):
-///   - `type: "object"` with `properties` / `required` /
-///     `additionalProperties`. Needs a recursive
-///     value-state pushdown automaton.
-///   - `type: "array"` with `items`. Same.
-///   - `oneOf` / `anyOf`. Union of N alternatives — extendable
-///     from the enum scaffold by tracking which alternatives are
-///     still viable as bytes get consumed.
-///   - `type: "string"` with `pattern` (regex). Requires a
-///     character-class subset of the regex engine.
+///   - `type: "object"` with `properties` — needs a JSON
+///     pushdown automaton (open-brace, key, colon, value, comma,
+///     close-brace) where each value can recursively be another
+///     schema.
+///   - `type: "array"` with `items` — same machinery.
+///   - `type: "string"` with `pattern` — regex subset.
 ///
-/// When the input schema isn't yet supported we throw
-/// `SchemaError.unsupported` so callers see the gap rather than
-/// silently getting an unconstrained sample.
+/// When the input schema isn't reducible to a literal union we
+/// throw `SchemaError.unsupported` so callers see the gap rather
+/// than silently getting an unconstrained sample.
 public enum SchemaCompiler {
     /// Build a mask from a JSON-Schema dictionary. `tokenizer` and
     /// `vocabSize` are passed through to the resulting `SchemaMask`
@@ -35,29 +35,85 @@ public enum SchemaCompiler {
         tokenizer: any Tokenizer,
         vocabSize: Int) throws -> SchemaMask
     {
-        // Enum of literal strings.
+        let allowed = try collectAllowedStrings(from: schema)
+        guard !allowed.isEmpty else {
+            throw SchemaError.unsupported("schema admits no string values")
+        }
+        return SchemaMask(tokenizer: tokenizer,
+                           allowed: allowed,
+                           vocabSize: vocabSize)
+    }
+
+    /// Walk the schema collecting the literal-string union it
+    /// describes. Throws if the schema contains a construct
+    /// (`type:"object"`, `pattern`, …) we can't reduce to a finite
+    /// set today. De-duplicates so `oneOf: [{enum:["A"]},
+    /// {const:"A"}]` doesn't double-count.
+    static func collectAllowedStrings(
+        from schema: [String: Any]) throws -> [String]
+    {
+        var out: [String] = []
+        var seen: Set<String> = []
+        try appendAllowedStrings(from: schema, out: &out, seen: &seen)
+        return out
+    }
+
+    private static func appendAllowedStrings(
+        from schema: [String: Any],
+        out: inout [String],
+        seen: inout Set<String>) throws
+    {
+        // enum: list of literal strings.
         if let enumValues = schema["enum"] as? [Any] {
             let strings = enumValues.compactMap { $0 as? String }
             guard strings.count == enumValues.count else {
                 throw SchemaError.unsupported(
-                    "enum with non-string members (T3 covers strings only)")
+                    "enum with non-string members "
+                    + "(this version handles string unions only)")
             }
-            guard !strings.isEmpty else {
-                throw SchemaError.unsupported("empty enum")
+            for s in strings where seen.insert(s).inserted {
+                out.append(s)
             }
-            return SchemaMask(tokenizer: tokenizer,
-                               allowed: strings,
-                               vocabSize: vocabSize)
+            return
+        }
+        // const: single literal.
+        if let constValue = schema["const"] {
+            guard let s = constValue as? String else {
+                throw SchemaError.unsupported(
+                    "const with non-string value")
+            }
+            if seen.insert(s).inserted { out.append(s) }
+            return
+        }
+        // oneOf / anyOf: recurse and union. anyOf is treated like
+        // oneOf here because the constraint cares only about the
+        // accepted *language*; OpenAI Structured Outputs additionally
+        // require exclusivity at decode time, which we don't model.
+        if let alternatives = (schema["oneOf"] as? [Any])
+            ?? (schema["anyOf"] as? [Any])
+        {
+            guard !alternatives.isEmpty else {
+                throw SchemaError.unsupported("empty oneOf/anyOf")
+            }
+            for alt in alternatives {
+                guard let altDict = alt as? [String: Any] else {
+                    throw SchemaError.unsupported(
+                        "oneOf/anyOf member is not a JSON object")
+                }
+                try appendAllowedStrings(
+                    from: altDict, out: &out, seen: &seen)
+            }
+            return
         }
 
-        // Future: type / properties / items / oneOf / anyOf /
-        // pattern. Each maps to a different automaton; punt with a
-        // clear error so callers know we haven't silently dropped
-        // their constraint on the floor.
+        // Future: object / array / pattern / number ranges. Each
+        // needs its own automaton; punt with a clear error so the
+        // caller knows we haven't silently dropped the constraint
+        // on the floor.
         throw SchemaError.unsupported(
             "JSON Schema feature not yet supported by SchemaCompiler "
-            + "(this version handles `enum` only — see TODO §10.3 for "
-            + "object / array / pattern follow-ups)")
+            + "(this version handles enum / const / oneOf / anyOf — "
+            + "see TODO §10.3 for object / array / pattern follow-ups)")
     }
 
     /// Convenience: parse a JSON Schema from a raw `Data` (the

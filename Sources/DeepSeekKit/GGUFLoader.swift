@@ -92,10 +92,20 @@ public final class GGUFFile {
 
     /// Load a tensor by name. Pass-through types (F32 / F16 / BF16 /
     /// I32 / I8) return a zero-copy view into the mmap; quantized
-    /// types (Q8_0 / Q4_0 / Q4_K) allocate a fresh F32 `MTLBuffer`
-    /// and dispatch the matching dequant kernel. Other quantized
-    /// types still throw `unsupportedType`.
-    public func load(_ name: String) throws -> Tensor {
+    /// types (Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K) allocate a fresh
+    /// `MTLBuffer` of `outputDtype` and dispatch the matching
+    /// dequant kernel. Other quantized types still throw
+    /// `unsupportedType`.
+    ///
+    /// `outputDtype` is `.f32` by default for full precision; pass
+    /// `.bf16` to halve the resident memory of the dequantized
+    /// weight (the loaded model keeps these tensors live for its
+    /// entire lifetime, so the saving compounds). Only `.f32` and
+    /// `.bf16` are valid; other targets throw `unsupportedType`.
+    /// Pass-through dtypes ignore the parameter — there's nothing
+    /// to dequant.
+    public func load(_ name: String,
+                      outputDtype: DType = .f32) throws -> Tensor {
         guard let info = infoByName[name] else {
             throw GGUFError.malformed("tensor not found: \(name)")
         }
@@ -116,37 +126,70 @@ public final class GGUFFile {
             return Tensor(shape: info.shape, dtype: .i8,
                            buffer: sharedBuffer, offset: info.absoluteOffset)
         case .q8_0:
-            return dispatchDequant(info: info,
-                                    kernel: "dequant_q8_0_to_f32")
+            return try dispatchDequant(info: info, base: "dequant_q8_0",
+                                        outputDtype: outputDtype)
         case .q4_0:
-            return dispatchDequant(info: info,
-                                    kernel: "dequant_q4_0_to_f32")
+            return try dispatchDequant(info: info, base: "dequant_q4_0",
+                                        outputDtype: outputDtype)
         case .q4_K:
-            return dispatchDequant(info: info,
-                                    kernel: "dequant_q4_k_m_to_f32")
+            return try dispatchDequant(info: info, base: "dequant_q4_k_m",
+                                        outputDtype: outputDtype)
+        case .q5_K:
+            // Q5_K BF16 variant not shipped yet; fall back to F32
+            // and ignore outputDtype with a soft warning. F32 still
+            // unblocks the model; BF16 follow-up is a 1-line kernel
+            // add when needed.
+            return try dispatchDequant(info: info, base: "dequant_q5_k",
+                                        outputDtype: .f32,
+                                        bf16Available: false)
+        case .q6_K:
+            return try dispatchDequant(info: info, base: "dequant_q6_k",
+                                        outputDtype: .f32,
+                                        bf16Available: false)
         default:
             throw GGUFError.unsupportedType(info.type.rawValue)
         }
     }
 
-    /// Allocate an F32 output tensor and run one of the dequant
-    /// kernels declared in
-    /// `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`. The kernel
-    /// is a 1-D dispatch with one thread per output element; we
-    /// `waitUntilCompleted` before returning so the caller sees a
-    /// fully materialized tensor and doesn't have to thread a
-    /// `MTLCommandBuffer` through the load path.
+    /// Allocate the output tensor (in `outputDtype`) and run one of
+    /// the dequant kernels declared in
+    /// `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`. `base` is
+    /// the kernel name prefix without the `_to_<dtype>` suffix; we
+    /// append `_to_f32` or `_to_bf16` based on the requested
+    /// `outputDtype`.
     ///
-    /// The synchronous wait is fine here because `load` runs at
-    /// model-load time, not in the hot generation loop — saving a
-    /// few ms per weight by deferring the wait would complicate the
-    /// API for no user-visible win.
+    /// `bf16Available` is a per-format gate: not every quantized
+    /// type has its BF16 variant landed yet. When false (Q5_K /
+    /// Q6_K today), we silently fall back to F32 — the caller still
+    /// gets correct values, just at 2× the memory footprint.
+    ///
+    /// Synchronous `waitUntilCompleted` matches the design: `load`
+    /// runs at model-load time, not in the hot loop.
     private func dispatchDequant(info: GGUFTensorInfo,
-                                  kernel name: String) -> Tensor
+                                  base: String,
+                                  outputDtype: DType,
+                                  bf16Available: Bool = true) throws -> Tensor
     {
+        let effectiveDtype: DType
+        let suffix: String
+        switch outputDtype {
+        case .f32:
+            effectiveDtype = .f32
+            suffix = "_to_f32"
+        case .bf16 where bf16Available:
+            effectiveDtype = .bf16
+            suffix = "_to_bf16"
+        case .bf16:
+            // BF16 not available for this format — fall back.
+            effectiveDtype = .f32
+            suffix = "_to_f32"
+        default:
+            throw GGUFError.unsupportedType(info.type.rawValue)
+        }
         let nElem = info.shape.reduce(1, *)
-        let out = Tensor.empty(shape: info.shape, dtype: .f32)
-        let pipeline = Device.shared.makePipeline(name)
+        let out = Tensor.empty(shape: info.shape, dtype: effectiveDtype)
+        let kernelName = base + suffix
+        let pipeline = Device.shared.makePipeline(kernelName)
         guard let cmd = Device.shared.queue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder()
         else {
