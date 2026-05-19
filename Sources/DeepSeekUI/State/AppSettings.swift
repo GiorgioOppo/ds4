@@ -68,6 +68,14 @@ enum AppSettingsKey {
     /// range completo F32). Letta solo se `crossRestartKVCache`
     /// attivo.
     static let kvCacheCompression = "deepseek.kvCacheCompression"
+
+    /// Local OpenAI-compatible HTTP server (TODO §10.1 / T1). Flag is
+    /// off by default — the server only runs when the user explicitly
+    /// flips the Settings → Server toggle. Port defaults to 8080,
+    /// bind address to `127.0.0.1`.
+    static let serverEnabled = "deepseek.server.enabled"
+    static let serverPort = "deepseek.server.port"
+    static let serverBindAddress = "deepseek.server.bindAddress"
 }
 
 /// Helper for code paths that need to read defaults without going

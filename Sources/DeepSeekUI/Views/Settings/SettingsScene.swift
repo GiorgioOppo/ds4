@@ -22,6 +22,7 @@ struct SettingsScene: Scene {
     @ObservedObject var skills: SkillLibrary
     @ObservedObject var themes: ThemeStore
     @ObservedObject var keybindings: KeybindingStore
+    @ObservedObject var serverController: LocalServerController
 
     var body: some Scene {
         Settings {
@@ -35,7 +36,8 @@ struct SettingsScene: Scene {
                          permissions: permissions,
                          skills: skills,
                          themes: themes,
-                         keybindings: keybindings)
+                         keybindings: keybindings,
+                         serverController: serverController)
         }
     }
 }
@@ -44,7 +46,7 @@ private enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case generation, loading, modelConfig, quantization
     case agents, tools, permissions, skills
     case theme, keybindings
-    case documents, projects, mcp, apiKeys, storage
+    case documents, projects, mcp, apiKeys, server, storage
 
     var id: String { rawValue }
 
@@ -64,6 +66,7 @@ private enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .projects:    return "Projects"
         case .mcp:         return "MCP"
         case .apiKeys:     return "API Keys"
+        case .server:      return "Server"
         case .storage:     return "Storage"
         }
     }
@@ -84,6 +87,7 @@ private enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .projects:    return "folder"
         case .mcp:         return "server.rack"
         case .apiKeys:     return "key"
+        case .server:      return "network"
         case .storage:     return "externaldrive"
         }
     }
@@ -101,6 +105,7 @@ private struct SettingsRoot: View {
     @ObservedObject var skills: SkillLibrary
     @ObservedObject var themes: ThemeStore
     @ObservedObject var keybindings: KeybindingStore
+    @ObservedObject var serverController: LocalServerController
 
     @State private var selection: SettingsCategory = .generation
 
@@ -138,6 +143,7 @@ private struct SettingsRoot: View {
                                          service: service)
         case .mcp:          MCPServersView(library: mcp, pool: mcpPool)
         case .apiKeys:      APIKeysSettingsTab()
+        case .server:       ServerSettingsTab(controller: serverController)
         case .storage:      StorageSettingsTab()
         }
     }
