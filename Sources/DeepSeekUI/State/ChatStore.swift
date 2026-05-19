@@ -114,7 +114,7 @@ final class ChatStore: ObservableObject {
     /// reply) or the cap is hit. The cap prevents the obvious
     /// failure mode of a model that keeps calling tools forever.
     private var toolRoundtrips: [UUID: Int] = [:]
-    private let maxToolRoundtripsPerTurn: Int = 8
+    private let maxToolRoundtripsPerTurn: Int = 21
 
     /// Task in volo per ogni conversation, keyed by conv id. Permette
     /// (a) di cancellare un singolo run senza toccare gli altri,
@@ -1563,7 +1563,7 @@ final class ChatStore: ObservableObject {
         }
 
         let subID = UUID() // isolated cacheImage namespace
-        let maxIterations = 8
+        let maxIterations = 21
         var iteration = 0
         var lastContent = ""
 
