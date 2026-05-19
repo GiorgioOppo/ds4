@@ -8,24 +8,23 @@ import Darwin
 /// once, expose it as one shared `MTLBuffer`, then return `Tensor`
 /// views into that buffer.
 ///
-/// Scope of this MVP: pass-through dtypes only (F32 / F16 / BF16 / I32
-/// / I8). Quantised tensors (Q4_0, Q4_K, Q8_0, …) are surfaced by
-/// `info(name:)` so a caller can read the raw bytes + `GGUFType`, but
-/// `load(name:)` will throw on them until the matching dequant
-/// kernels land. Architecturally this leaves a clean seam for the
-/// follow-up:
+/// Supported dtypes:
+///   - Pass-through (zero-copy view into the mmap): F32 / F16 / BF16
+///     / I32 / I8.
+///   - Dequant-on-load (TODO §10.2 / T2): Q8_0 / Q4_0 / Q4_K (Q4_K_M
+///     uses the same `Q4_K` block format). Each call to `load(name:)`
+///     for one of these types allocates a new F32 `MTLBuffer` and
+///     dispatches the matching kernel from
+///     `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`. The result
+///     is a dense F32 tensor with `info.shape`.
 ///
-///   - add `q*_dequant.metal` kernels
-///   - call them from `loadDequantized(name:targetDtype:)`
-///   - the file mmap, name index, and tensor table parsing are
-///     already in place
+/// Other quantized types (Q5_K, Q6_K, the IQ family) still throw
+/// `unsupportedType` until their kernels land.
 ///
 /// V4 / DeepSeek does NOT have a GGUF release yet (as of May 2026) —
-/// the value of this loader is to enable testing the GGUF surface
-/// with the many Llama / Mistral / Qwen quants available, with the
-/// understanding that *running* those models also requires their
-/// architecture to be implemented in the Transformer forward pass
-/// (out of scope).
+/// the value of this loader is to enable running the many Llama /
+/// Mistral / Qwen quants available, paired with `LlamaModel` (TODO
+/// §10.2 / T2).
 public final class GGUFFile {
     public let url: URL
     public let header: GGUFHeader
@@ -91,24 +90,81 @@ public final class GGUFFile {
         return infoByName[name]
     }
 
-    /// Pass-through load: returns a `Tensor` view into the mmap for
-    /// F32/F16/BF16/I32/I8 tensors. Throws for quantised types until
-    /// per-type dequant kernels land.
+    /// Load a tensor by name. Pass-through types (F32 / F16 / BF16 /
+    /// I32 / I8) return a zero-copy view into the mmap; quantized
+    /// types (Q8_0 / Q4_0 / Q4_K) allocate a fresh F32 `MTLBuffer`
+    /// and dispatch the matching dequant kernel. Other quantized
+    /// types still throw `unsupportedType`.
     public func load(_ name: String) throws -> Tensor {
         guard let info = infoByName[name] else {
             throw GGUFError.malformed("tensor not found: \(name)")
         }
-        let dtype: DType
         switch info.type {
-        case .f32:  dtype = .f32
-        case .f16:  dtype = .f16
-        case .bf16: dtype = .bf16
-        case .i32:  dtype = .i32
-        case .i8:   dtype = .i8
+        case .f32:
+            return Tensor(shape: info.shape, dtype: .f32,
+                           buffer: sharedBuffer, offset: info.absoluteOffset)
+        case .f16:
+            return Tensor(shape: info.shape, dtype: .f16,
+                           buffer: sharedBuffer, offset: info.absoluteOffset)
+        case .bf16:
+            return Tensor(shape: info.shape, dtype: .bf16,
+                           buffer: sharedBuffer, offset: info.absoluteOffset)
+        case .i32:
+            return Tensor(shape: info.shape, dtype: .i32,
+                           buffer: sharedBuffer, offset: info.absoluteOffset)
+        case .i8:
+            return Tensor(shape: info.shape, dtype: .i8,
+                           buffer: sharedBuffer, offset: info.absoluteOffset)
+        case .q8_0:
+            return dispatchDequant(info: info,
+                                    kernel: "dequant_q8_0_to_f32")
+        case .q4_0:
+            return dispatchDequant(info: info,
+                                    kernel: "dequant_q4_0_to_f32")
+        case .q4_K:
+            return dispatchDequant(info: info,
+                                    kernel: "dequant_q4_k_m_to_f32")
         default:
             throw GGUFError.unsupportedType(info.type.rawValue)
         }
-        return Tensor(shape: info.shape, dtype: dtype,
-                      buffer: sharedBuffer, offset: info.absoluteOffset)
+    }
+
+    /// Allocate an F32 output tensor and run one of the dequant
+    /// kernels declared in
+    /// `Sources/DeepSeekKit/Kernels/dequant_gguf.metal`. The kernel
+    /// is a 1-D dispatch with one thread per output element; we
+    /// `waitUntilCompleted` before returning so the caller sees a
+    /// fully materialized tensor and doesn't have to thread a
+    /// `MTLCommandBuffer` through the load path.
+    ///
+    /// The synchronous wait is fine here because `load` runs at
+    /// model-load time, not in the hot generation loop — saving a
+    /// few ms per weight by deferring the wait would complicate the
+    /// API for no user-visible win.
+    private func dispatchDequant(info: GGUFTensorInfo,
+                                  kernel name: String) -> Tensor
+    {
+        let nElem = info.shape.reduce(1, *)
+        let out = Tensor.empty(shape: info.shape, dtype: .f32)
+        let pipeline = Device.shared.makePipeline(name)
+        guard let cmd = Device.shared.queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder()
+        else {
+            fatalError("GGUF dequant: failed to allocate Metal command buffer")
+        }
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(sharedBuffer, offset: info.absoluteOffset, index: 0)
+        enc.setBuffer(out.buffer, offset: 0, index: 1)
+        var nElemU32 = UInt32(nElem)
+        enc.setBytes(&nElemU32, length: MemoryLayout<UInt32>.size, index: 2)
+
+        let tgWidth = min(256, pipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(
+            MTLSize(width: nElem, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return out
     }
 }
