@@ -25,12 +25,25 @@ struct StoredMessage: Codable, Identifiable, Hashable {
     /// re-tokenisation so the model sees the tool answers on its
     /// next turn.
     var toolOutputs: [String]?
+    /// Sul primo turn cold di una conversazione, raccoglie il
+    /// testo del prompt completo (decoded dai token che il modello
+    /// ingerisce) man mano che `.prefillToken` arriva. La UI lo
+    /// mostra come blocco grigio collassabile fra il messaggio
+    /// dell'utente e questa risposta dell'assistente. Nil sui turn
+    /// incrementali (il delta è giusto il nuovo user message,
+    /// poco ispezionabile) e su tutti i messaggi salvati prima che
+    /// il campo esistesse. Persistito in conversation JSON quando
+    /// presente — può inflare il file su prompt lunghissimi, ma
+    /// la persistenza è quel che permette al disclosure di restare
+    /// utilizzabile dopo restart.
+    var prefillTrace: String?
 
     init(id: UUID = UUID(), role: StoredRole, content: String,
          reasoningContent: String? = nil,
          toolCalls: [StoredToolCall] = [],
          tokenCount: Int? = nil,
-         toolOutputs: [String]? = nil) {
+         toolOutputs: [String]? = nil,
+         prefillTrace: String? = nil) {
         self.id = id
         self.role = role
         self.content = content
@@ -38,6 +51,7 @@ struct StoredMessage: Codable, Identifiable, Hashable {
         self.toolCalls = toolCalls
         self.tokenCount = tokenCount
         self.toolOutputs = toolOutputs
+        self.prefillTrace = prefillTrace
     }
 
     static func from(_ m: Message, id: UUID = UUID()) -> StoredMessage {

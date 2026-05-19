@@ -632,6 +632,32 @@ final class ChatStore: ObservableObject {
         case .prefillStart(let promptTokens):
             phases[id] = .prefilling(promptTokens: promptTokens,
                                       startTime: Date())
+            // Resetta il prefillTrace sul placeholder: su un resume
+            // dopo crash il placeholder rientra con il trace del
+            // turn precedente; senza azzeramento i nuovi
+            // `.prefillToken` ci appenderebbero sopra producendo un
+            // trace duplicato. Sul flusso normale (placeholder
+            // appena creato) è un no-op.
+            if let mIdx = conversations[idx].messages.firstIndex(
+                where: { $0.id == placeholderId }) {
+                conversations[idx].messages[mIdx].prefillTrace = nil
+            }
+
+        case .prefillToken(let text):
+            // Append al `prefillTrace` del placeholder. Cresce
+            // live durante il prefill (la UI legge da
+            // `placeholder.prefillTrace` per disegnare il blocco
+            // grigio collassabile fra l'user e l'assistente).
+            // Persistito nel conversation JSON al `.done` via
+            // `scheduleSave`, ma scriviamo subito qui per il
+            // crash-recovery — il debounce di scheduleSave evita
+            // di sgranchire il disco a ogni chunk.
+            if let mIdx = conversations[idx].messages.firstIndex(
+                where: { $0.id == placeholderId }) {
+                let prev = conversations[idx].messages[mIdx].prefillTrace ?? ""
+                conversations[idx].messages[mIdx].prefillTrace = prev + text
+                scheduleSave(id)
+            }
 
         case .prefillDone(let promptTokens, let elapsed, let tokPerMin):
             var m = currentMetrics(of: id)
@@ -652,15 +678,21 @@ final class ChatStore: ObservableObject {
         case .done(let final, let promptTokens, let generatedTokens):
             // Finalize the assistant placeholder with the parsed
             // structure (reasoning + tool calls split out).
+            // Preserva l'eventuale prefillTrace accumulato durante
+            // il cold prefill — l'init non lo prende dal Message
+            // (il kit non lo conosce) quindi va riassegnato dal
+            // valore precedente.
             if let mIdx = conversations[idx].messages.firstIndex(
                 where: { $0.id == placeholderId }) {
+                let prevTrace = conversations[idx].messages[mIdx].prefillTrace
                 conversations[idx].messages[mIdx] = StoredMessage(
                     id: placeholderId,
                     role: .assistant,
                     content: final.content,
                     reasoningContent: final.reasoningContent,
                     toolCalls: final.toolCalls.map(StoredToolCall.init),
-                    tokenCount: generatedTokens.count)
+                    tokenCount: generatedTokens.count,
+                    prefillTrace: prevTrace)
             }
             // Stamp the user message with the share of the prompt it
             // contributed. Approximation: prompt length minus the

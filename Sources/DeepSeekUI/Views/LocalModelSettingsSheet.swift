@@ -26,6 +26,8 @@ struct LocalModelSettingsSheet: View {
     private var crossRestartKVCache: Bool = false
     @AppStorage(AppSettingsKey.kvCacheCompression)
     private var kvCacheCompression: String = "f32"
+    @AppStorage(AppSettingsKey.showPrefillTrace)
+    private var showPrefillTrace: Bool = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -88,13 +90,30 @@ struct LocalModelSettingsSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Section("Diagnostics") {
+                    Toggle("Mostra il prompt al modello (primo turn)",
+                            isOn: $showPrefillTrace)
+                    Text("Sul primo messaggio di ogni conversazione " +
+                         "(cold prefill, KV cache vuota) inserisce " +
+                         "fra il tuo messaggio e la risposta un " +
+                         "blocco grigio collassabile che mostra in " +
+                         "streaming il testo completo del prompt che " +
+                         "il modello sta per leggere: system message, " +
+                         "blocco tools, project context, history. " +
+                         "Sui turn successivi il delta è solo il " +
+                         "nuovo user message — il trace viene omesso " +
+                         "per non rumoreggiare.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
 
             footer
         }
         .padding(20)
-        .frame(width: 540, height: 520)
+        .frame(width: 540, height: 600)
     }
 
     private var header: some View {

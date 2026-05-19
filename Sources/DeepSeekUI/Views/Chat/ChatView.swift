@@ -47,6 +47,21 @@ struct ChatView: View {
                             if shouldShowInlineProgress(for: msg, in: c, phase: phase) {
                                 inlineProgress(phase)
                             }
+                            // Prefill trace: blocco grigio collassabile
+                            // fra l'user message precedente e la
+                            // risposta dell'assistente al primo turn
+                            // cold. Appare solo se `prefillTrace` non è
+                            // nil (= ChatStore ha raccolto chunk da
+                            // `.prefillToken`). Espanso live durante il
+                            // prefill, collassato dopo.
+                            if let trace = msg.prefillTrace, !trace.isEmpty,
+                               msg.role == .assistant {
+                                PrefillTraceDisclosure(
+                                    trace: trace,
+                                    isStreaming: isPrefillingPlaceholder(
+                                        msg, in: c, phase: phase))
+                                    .padding(.leading, 40)
+                            }
                             MessageView(
                                 message: msg,
                                 isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase),
@@ -289,6 +304,19 @@ struct ChatView: View {
                                          in c: Conversation,
                                          phase: GenerationPhase) -> Bool {
         guard case .streaming = phase,
+              msg.role == .assistant,
+              msg.id == c.messages.last?.id else { return false }
+        return true
+    }
+
+    /// True mentre il prefill sta accumulando token su questo
+    /// placeholder (l'ultimo assistente con contenuto vuoto). Usato
+    /// dal `PrefillTraceDisclosure` per forzare l'apertura del
+    /// blocco mentre il prompt scorre.
+    private func isPrefillingPlaceholder(_ msg: StoredMessage,
+                                          in c: Conversation,
+                                          phase: GenerationPhase) -> Bool {
+        guard case .prefilling = phase,
               msg.role == .assistant,
               msg.id == c.messages.last?.id else { return false }
         return true

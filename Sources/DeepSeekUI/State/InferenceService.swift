@@ -21,6 +21,18 @@ enum GenerationEvent: Sendable {
                promptTokens: [Int32],
                generatedTokens: [Int32])
     case status(String)
+    /// A decoded chunk of the prompt the model is about to see. Only
+    /// emitted on cold prefill (cachedCount == 0) and only when the
+    /// `showPrefillTrace` AppStorage flag is on. The chunks together
+    /// reconstruct the full prompt text — system message (with tools
+    /// block), conversation history, and the just-typed user turn —
+    /// streamed to the UI so it can render a collapsible gray
+    /// "what the model saw" block between the user message and the
+    /// assistant reply. Decoded with the same tokenizer that produced
+    /// the IDs, so the reconstruction is faithful to what the
+    /// transformer ingests (token boundaries collapsed back into
+    /// readable text).
+    case prefillToken(text: String)
     /// Emitted right before the prefill forward pass starts. The UI uses
     /// it to swap the bubble into a "prefilling" indicator (no text
     /// streamed yet because no tokens have been sampled).
@@ -1205,6 +1217,46 @@ final class InferenceService: @unchecked Sendable {
                 let deltaTokens = Array(promptTokens.suffix(
                     promptTokens.count - cachedCount))
                 continuation.yield(.prefillStart(promptTokens: deltaTokens.count))
+
+                // Prefill trace: solo turn cold (KV cache vuota),
+                // perché il delta dei turn incrementali è giusto il
+                // nuovo user message + marker — niente di
+                // ispezionabile in più. Decodifichiamo tutto il
+                // delta in un colpo (round-trip safe sul byte-BPE
+                // del V4: i token vengono da text tokenizzato pochi
+                // ms fa), poi splittiamo in chunk fissi e yieldiamo
+                // un evento per chunk con un micro-sleep in mezzo
+                // così la UI vede il prompt scorrere invece di
+                // apparire tutto insieme. Il flag è opt-out via
+                // settings; default ON (`object(forKey:) == nil`
+                // significa "non scritto ancora" → trattalo come
+                // attivo).
+                let traceFlag = UserDefaults.standard.object(
+                    forKey: AppSettingsKey.showPrefillTrace) as? Bool ?? true
+                if traceFlag, cachedCount == 0 {
+                    let fullText = tok.decode(deltaTokens.map(Int.init))
+                    if !fullText.isEmpty {
+                        let chars = Array(fullText)
+                        let chunkSize = 24
+                        let totalChunks = max(1, (chars.count + chunkSize - 1) / chunkSize)
+                        // Cap il delay sintetico a 1.5 s totali su
+                        // prompt enormi così la prefill non si
+                        // ferma dietro al render.
+                        let perChunkDelay = min(0.004, 1.5 / Double(totalChunks))
+                        var i = 0
+                        while i < chars.count {
+                            if self.isCancelled() { break }
+                            let end = min(i + chunkSize, chars.count)
+                            continuation.yield(.prefillToken(
+                                text: String(chars[i..<end])))
+                            i = end
+                            if perChunkDelay > 0 {
+                                Thread.sleep(forTimeInterval: perChunkDelay)
+                            }
+                        }
+                    }
+                }
+
                 let prefillStart = Date()
 
                 var logits: Tensor
