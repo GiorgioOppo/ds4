@@ -1080,7 +1080,42 @@ final class ChatStore: ObservableObject {
                 argsJSON: call.args,
                 conversationID: conversationID)
         }
+        // Tool name che non match nessuno dei branch supportati e
+        // non ha il `__` separator MCP. Senza questa guardia,
+        // `mcpPool.invokeQualified` ritorna un errore generico
+        // "[error: tool name not qualified as <server>__<tool>: X]"
+        // che è criptico per il modello. Qui invece elenchiamo
+        // esplicitamente quali nomi avrebbe potuto usare così
+        // l'output del tool message è auto-esplicativo e il modello
+        // recupera invece di ripetere lo stesso errore.
+        if call.name.range(of: "__") == nil {
+            return unknownToolError(call.name)
+        }
         return await mcpPool.invokeQualified(call.name, argsJSON: call.args)
+    }
+
+    /// Costruisce un messaggio "tool not found" auto-descrittivo che
+    /// elenca i nomi qualificati che il modello dovrebbe usare al
+    /// posto dello sbagliato. Tornare un errore ricco invece del
+    /// silenzio (o di un errore generico) è ciò che rompe il loop
+    /// agentico quando il modello rinomina i tool a casaccio.
+    private func unknownToolError(_ name: String) -> String {
+        let nativeNames = nativeTools.schemas
+            .map { "native__\($0.name)" }
+            .sorted()
+        let mcpNames = mcpPool.allTools()
+            .map { $0.qualifiedName }
+            .sorted()
+        var hint = "Available tool names:"
+        if !nativeNames.isEmpty {
+            hint += " " + nativeNames.joined(separator: ", ")
+        }
+        if !mcpNames.isEmpty {
+            hint += (nativeNames.isEmpty ? " " : ", ")
+                + mcpNames.joined(separator: ", ")
+        }
+        hint += ", __delegate_to_agent."
+        return "[error: tool '\(name)' is not registered. \(hint)]"
     }
 
     /// Decodifica gli args JSON, risolve mode + rootDirectory dalla
@@ -1119,6 +1154,20 @@ final class ChatStore: ObservableObject {
             name: name, input: input, mode: mode, rootDirectory: rootDir)
         if out.isError {
             return "[error: \(out.output)]"
+        }
+        // Output vuoto = la tool è andata a buon fine ma non ha
+        // trovato niente (glob con pattern malformato, grep senza
+        // match, read di un file vuoto, ecc.). Senza un marker il
+        // modello vede una stringa vuota e non capisce se la tool
+        // ha funzionato — di solito ritenta con varianti e blocca
+        // il loop agentico. Un marker esplicito gli dice "operazione
+        // OK, zero risultati" così può cambiare strategia.
+        let trimmed = out.output.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return "(empty output / 0 results — tool '\(name)' " +
+                "ran successfully but produced no content; " +
+                "consider whether the arguments are correct)"
         }
         return out.output
     }
@@ -1466,6 +1515,12 @@ final class ChatStore: ObservableObject {
                         name: nativeName,
                         argsJSON: call.args,
                         conversationID: hostConvID)
+                } else if call.name.range(of: "__") == nil {
+                    // Stesso fallback dell'host path: nome senza
+                    // qualificatore = tool non registrato → errore
+                    // ricco con elenco dei nomi disponibili così il
+                    // modello recupera invece di girare in tondo.
+                    out = unknownToolError(call.name)
                 } else {
                     out = await mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -1767,21 +1822,18 @@ final class ChatStore: ObservableObject {
             // pool the local path uses.
             var outputs: [String] = []
             outputs.reserveCapacity(final.toolCalls.count)
+            // Snapshot dell'host agent ID per la cycle prevention
+            // della delegation (lo stesso check del local path).
+            // Letto su MainActor — la chat può essere mutata fra
+            // un'iterazione e l'altra.
+            let hostAgentID = await MainActor.run {
+                self.conversations.first(where: { $0.id == id })?.agentID
+            }
             for call in final.toolCalls {
-                let result: String
-                if call.name == EncodingDSV4.delegateToolName {
-                    result = "[error: cross-agent delegation is not yet supported on remote models]"
-                } else if call.name.hasPrefix("native__") {
-                    let nativeName = String(
-                        call.name.dropFirst("native__".count))
-                    result = await self.invokeNativeTool(
-                        name: nativeName,
-                        argsJSON: call.args,
-                        conversationID: id)
-                } else {
-                    result = await self.mcpPool.invokeQualified(
-                        call.name, argsJSON: call.args)
-                }
+                let result = await self.executeToolCall(
+                    call,
+                    conversationID: id,
+                    hostAgentID: hostAgentID)
                 outputs.append(result)
             }
 
