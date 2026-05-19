@@ -210,9 +210,11 @@ struct VocabPrunerSheet: View {
                 Toggle("Resume from checkpoint when compatible",
                        isOn: $vm.resumeEnabled)
                     .disabled(vm.isRunning)
-                Text("Quando attivo, legge `<output>/.vocab_pruner_checkpoint.json` " +
+                Text("Quando attivo, legge `<output>/checkpoint/vocab_pruner.json` " +
                      "e riprende invece di ricominciare. Lo spec hash protegge " +
-                     "da resume con corpus / coverage diversi.")
+                     "da resume con corpus / coverage diversi. Checkpoint legacy " +
+                     "in `<output>/.vocab_pruner_checkpoint.json` vengono migrati " +
+                     "automaticamente al primo avvio.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }

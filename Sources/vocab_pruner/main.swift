@@ -39,8 +39,10 @@ func usage() -> Never {
                                   (= 80% dei core attivi su questo host).
                                   1 = sequenziale (con save intra-file ogni 10k token).
             --no-resume           Disabilita il resume dal checkpoint.
-                                  Default: legge `<output>/.vocab_pruner_checkpoint.json`
-                                  e riprende se lo spec corrisponde.
+                                  Default: legge `<output>/checkpoint/vocab_pruner.json`
+                                  e riprende se lo spec corrisponde. Eventuali
+                                  checkpoint legacy in `<output>/.vocab_pruner_checkpoint.json`
+                                  vengono migrati automaticamente al nuovo path.
 
         Esempio:
             \(exe) --input-dir ~/models/V4-Flash-converted \\
