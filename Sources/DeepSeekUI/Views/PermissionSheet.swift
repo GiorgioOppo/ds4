@@ -96,7 +96,12 @@ struct PermissionSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 480, minHeight: 240)
+        // SwiftUI non ha un overload `.frame(width:minHeight:)` —
+        // chain di due frame: il primo fissa la width, il secondo
+        // dà il minimo verticale così il sheet cresce se `detail`
+        // è lungo invece di clippare.
+        .frame(width: 480)
+        .frame(minHeight: 240)
     }
 
     private var iconName: String {
