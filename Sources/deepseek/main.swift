@@ -9,6 +9,9 @@ import DeepSeekKit
 //                   [--repetition-penalty R]
 //                   [--frequency-penalty F] [--presence-penalty P]
 //                   [--mirostat TAU] [--mirostat-eta ETA]
+//                   [--mirostat-v1] [--mirostat-m N]
+//                   [--logit-bias '{"<id>": <bias>, …}']
+//                   [--dry-multiplier M] [--dry-base B] [--dry-allowed-length N]
 //                   [--mode raw|chat]
 //                   [--load-strategy auto|preload|mmap]
 //                   [--force-load]
@@ -132,6 +135,13 @@ var frequencyPenalty: Float = 0.0
 var presencePenalty: Float = 0.0
 var mirostatTau: Float = 0.0
 var mirostatEta: Float = 0.1
+var mirostatV1 = false
+var mirostatM: Int = 100
+// T5: sampler residui (TODO §10.5). All disabled at defaults.
+var logitBiasArg: String? = nil
+var dryMultiplier: Float = 0.0
+var dryBase: Float = 1.75
+var dryAllowedLength: Int = 2
 var mode = "chat"
 var thinking = "off"   // off | high | max — picks the trailing think marker in chat mode
 var loadStrategy: String? = nil
@@ -187,6 +197,24 @@ while i < args.count {
     case "--mirostat-eta":
         guard i + 1 < args.count, let v = Float(args[i + 1]) else { usage() }
         mirostatEta = v; i += 2
+    case "--mirostat-v1":
+        mirostatV1 = true; i += 1
+    case "--mirostat-m":
+        guard i + 1 < args.count, let v = Int(args[i + 1]), v > 0 else { usage() }
+        mirostatM = v; i += 2
+    case "--logit-bias":
+        // JSON dict like '{"50256": -100, "100": 5.0}'.
+        guard i + 1 < args.count else { usage() }
+        logitBiasArg = args[i + 1]; i += 2
+    case "--dry-multiplier":
+        guard i + 1 < args.count, let v = Float(args[i + 1]), v >= 0 else { usage() }
+        dryMultiplier = v; i += 2
+    case "--dry-base":
+        guard i + 1 < args.count, let v = Float(args[i + 1]), v > 0 else { usage() }
+        dryBase = v; i += 2
+    case "--dry-allowed-length":
+        guard i + 1 < args.count, let v = Int(args[i + 1]), v > 0 else { usage() }
+        dryAllowedLength = v; i += 2
     case "--mode":
         guard i + 1 < args.count, ["raw", "chat"].contains(args[i + 1]) else { usage() }
         mode = args[i + 1]; i += 2
@@ -467,6 +495,25 @@ var inferenceError: Error? = nil
 
 inferenceQueue.async {
     defer { done.signal() }
+    // Parse `--logit-bias` JSON if supplied. Keys may be either
+    // numeric strings ("50256") or — eventually — token literals; for
+    // now we accept only the int-key form.
+    var parsedLogitBias: [Int32: Float] = [:]
+    if let raw = logitBiasArg {
+        if let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any]
+        {
+            for (k, v) in obj {
+                guard let id = Int32(k) else { continue }
+                let f: Float?
+                if let n = v as? NSNumber { f = n.floatValue }
+                else if let s = v as? String { f = Float(s) }
+                else { f = nil }
+                if let f { parsedLogitBias[id] = f }
+            }
+        }
+    }
     var samplingOpts = SamplingOptions(
         temperature: temperature,
         topK: topK, topP: topP,
@@ -474,7 +521,11 @@ inferenceQueue.async {
         repetitionPenalty: repetitionPenalty,
         frequencyPenalty: frequencyPenalty, presencePenalty: presencePenalty,
         mirostatTau: mirostatTau, mirostatEta: mirostatEta,
-        mirostatMu: 2.0 * mirostatTau)
+        mirostatMu: 2.0 * mirostatTau,
+        logitBias: parsedLogitBias,
+        dryMultiplier: dryMultiplier, dryBase: dryBase,
+        dryAllowedLength: dryAllowedLength,
+        mirostatV1: mirostatV1, mirostatM: mirostatM)
 
     // Prefill.
     var logits = model.forward(inputIds: [promptIds], startPos: 0)

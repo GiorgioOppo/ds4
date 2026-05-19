@@ -66,12 +66,55 @@ public struct SamplingOptions {
     /// produce distinct streams.
     public var rngState: UInt64 = defaultSamplerSeed()
 
+    // MARK: - T5 sampler residui (TODO §10.5)
+
+    /// Per-token additive bias applied at stage 0 (before temperature
+    /// scaling). Mirrors the OpenAI API `logit_bias` field — the caller
+    /// can hard-block a token by passing `[id: -100]` or boost one with
+    /// `[id: 5]`. Empty (the default) is the no-op identity.
+    public var logitBias: [Int32: Float] = [:]
+
+    /// DRY sampler ("Don't Repeat Yourself"). Multiplicative penalty on
+    /// candidates that would extend an n-gram already present in the
+    /// history. `dryMultiplier == 0` disables. Standard tunables:
+    ///   - `dryMultiplier`: 0.5–1.0 typical; 0 disables.
+    ///   - `dryBase`: 1.5–2.0 typical (penalty grows exponentially in
+    ///     the matched n-gram length beyond `dryAllowedLength`).
+    ///   - `dryAllowedLength`: short n-grams below this are not
+    ///     penalized — keeps natural repetition (function words,
+    ///     punctuation) intact.
+    public var dryMultiplier: Float = 0.0
+    public var dryBase: Float = 1.75
+    public var dryAllowedLength: Int = 2
+
+    /// Mirostat v1 toggle. When true *and* `mirostatTau > 0`, the
+    /// sampler uses the smoothed `μ`-update path (averaging the recent
+    /// `mirostatM` surprises) instead of the single-step v2. Slight
+    /// stability win in long generations at the cost of a per-step
+    /// `[Float]` allocation. Default false (v2).
+    public var mirostatV1: Bool = false
+
+    /// Window size for the v1 smoothed update. Ignored when
+    /// `mirostatV1 == false`. The reference paper uses ~100; smaller
+    /// values track surprise faster but oscillate more.
+    public var mirostatM: Int = 100
+
+    /// Internal: rolling buffer of recent surprise values for the
+    /// v1 update. The sampler appends to this on every call and
+    /// trims to `mirostatM` entries. Persisted across calls so the
+    /// running mean reflects history within the same generation.
+    public var mirostatV1History: [Float] = []
+
     public init(temperature: Float = 1.0, topK: Int = 0, topP: Float = 1.0,
                 minP: Float = 0.0, tailFree: Float = 1.0, typical: Float = 1.0,
                 repetitionPenalty: Float = 1.0,
                 frequencyPenalty: Float = 0.0, presencePenalty: Float = 0.0,
                 mirostatTau: Float = 0.0, mirostatEta: Float = 0.1,
                 mirostatMu: Float = 10.0,
+                logitBias: [Int32: Float] = [:],
+                dryMultiplier: Float = 0.0, dryBase: Float = 1.75,
+                dryAllowedLength: Int = 2,
+                mirostatV1: Bool = false, mirostatM: Int = 100,
                 rngState: UInt64 = defaultSamplerSeed()) {
         self.temperature = temperature
         self.topK = topK
@@ -85,6 +128,12 @@ public struct SamplingOptions {
         self.mirostatTau = mirostatTau
         self.mirostatEta = mirostatEta
         self.mirostatMu = mirostatMu
+        self.logitBias = logitBias
+        self.dryMultiplier = dryMultiplier
+        self.dryBase = dryBase
+        self.dryAllowedLength = dryAllowedLength
+        self.mirostatV1 = mirostatV1
+        self.mirostatM = mirostatM
         self.rngState = rngState
     }
 
@@ -97,6 +146,7 @@ public struct SamplingOptions {
             && repetitionPenalty == 1.0
             && frequencyPenalty == 0.0 && presencePenalty == 0.0
             && mirostatTau == 0.0
+            && logitBias.isEmpty && dryMultiplier == 0.0
     }
 }
 
@@ -232,6 +282,15 @@ public enum Sampler {
 
         var arr = logits.toFloatArray()
 
+        // 0. Logit bias — additive in raw-logit space (OpenAI's
+        //    `logit_bias` semantics). Applied before temperature so
+        //    `-100` is a hard block regardless of T. Trivial cost.
+        if !options.logitBias.isEmpty {
+            for (id, bias) in options.logitBias where id >= 0 && Int(id) < V {
+                arr[Int(id)] += bias
+            }
+        }
+
         // 1. Temperature — vectorized via vDSP_vsmul (~3-5× faster
         //    than the per-element Swift loop for V=130k).
         if options.temperature > 0 && options.temperature != 1.0 {
@@ -267,9 +326,21 @@ public enum Sampler {
             }
         }
 
+        // 2c. DRY penalty — discourage candidates that would extend an
+        //     n-gram already present in history. Cost is O(H × L_max)
+        //     where H is the (bounded) history window and L_max is the
+        //     longest match we bother extending; both are small in
+        //     practice. Disabled at `dryMultiplier == 0`.
+        if options.dryMultiplier > 0.0 && history.count >= 2 {
+            applyDRY(&arr, vocabSize: V, history: history, options: options)
+        }
+
         // Mirostat path: it sets its own filter + sample strategy and
         // does not use top-K/top-P/min-P/tail-free/typical/Gumbel-max.
         if options.mirostatTau > 0.0 {
+            if options.mirostatV1 {
+                return mirostatV1Sample(&arr, vocabSize: V, options: &options)
+            }
             return mirostatV2Sample(&arr, vocabSize: V, options: &options)
         }
 
@@ -488,6 +559,106 @@ public enum Sampler {
         let err = Float(St) - options.mirostatTau
         options.mirostatMu = max(0.01, options.mirostatMu - options.mirostatEta * err)
         return bestI
+    }
+
+    /// Mirostat v1 (TODO §10.5): same surprise-controlled truncation
+    /// as v2 — the math literature distinguishes them by the μ
+    /// estimation rule, not the sampling rule — but the update step
+    /// averages the recent `mirostatM` surprises instead of using only
+    /// the current step. Smoother in long generations at the cost of a
+    /// per-call append/trim of a small `[Float]` buffer.
+    @inline(__always)
+    private static func mirostatV1Sample(_ arr: inout [Float], vocabSize V: Int,
+                                          options: inout SamplingOptions) -> Int {
+        let probs = softmaxDouble(arr, vocabSize: V)
+        let order = (0..<V).sorted { probs[$0] > probs[$1] }
+        let mu = Double(options.mirostatMu)
+        var keep = 1
+        for (k, idx) in order.enumerated() {
+            let surprise = probs[idx] > 0 ? -log(probs[idx]) : .infinity
+            if surprise > mu { keep = max(1, k); break }
+            keep = k + 1
+        }
+        for i in keep..<order.count { arr[order[i]] = -.infinity }
+        var rng = options.rngState
+        var bestI = order[0]
+        var bestV = -Float.infinity
+        let mLog = arr.max() ?? 0
+        for k in 0..<keep {
+            let i = order[k]
+            let u = nextUnit(&rng)
+            let g = -log(max(-log(max(u, 1e-12)), 1e-30))
+            let key = (arr[i] - mLog) + g
+            if key > bestV { bestV = key; bestI = i }
+        }
+        options.rngState = rng
+
+        // v1 update: append this step's surprise to the rolling
+        // window, trim to `mirostatM`, drive μ toward the window mean.
+        let pSel = probs[bestI]
+        let St = pSel > 0 ? -log(pSel) : Double(options.mirostatTau)
+        options.mirostatV1History.append(Float(St))
+        let m = max(1, options.mirostatM)
+        if options.mirostatV1History.count > m {
+            options.mirostatV1History.removeFirst(
+                options.mirostatV1History.count - m)
+        }
+        let sum = options.mirostatV1History.reduce(0, +)
+        let avg = sum / Float(options.mirostatV1History.count)
+        let err = avg - options.mirostatTau
+        options.mirostatMu = max(0.01, options.mirostatMu - options.mirostatEta * err)
+        return bestI
+    }
+
+    /// DRY penalty (TODO §10.5). Walks the (bounded) history window
+    /// looking for previous occurrences of the most recent token; for
+    /// each occurrence it computes the matching n-gram length L and
+    /// — if L ≥ `dryAllowedLength` — subtracts
+    /// `multiplier * base^(L - allowedLength)` from the logit of the
+    /// token that previously followed that n-gram. That candidate is
+    /// the one that would extend the repetition.
+    ///
+    /// Bounded scan: only the last 1024 history tokens participate, and
+    /// individual matches stop extending at 32 tokens. Both caps are
+    /// generous — typical hits are L ≤ 8 on conversational text.
+    @inline(__always)
+    private static func applyDRY(_ arr: inout [Float], vocabSize V: Int,
+                                  history: [Int], options: SamplingOptions)
+    {
+        let historyCap = 1024
+        let maxMatchLen = 32
+        let end = history.count - 1
+        guard end >= 1 else { return }
+        let lastTok = history[end]
+        let scanStart = max(0, end - historyCap)
+        // Iterate previous positions p in the recent window where
+        // history[p] == lastTok. p == end - 1 is fine (a directly
+        // preceding occurrence still counts); the next position
+        // history[p + 1] is the candidate that would extend the
+        // n-gram and gets penalized.
+        for p in scanStart..<end where history[p] == lastTok {
+            // Extend backward as long as tokens match and we're
+            // within both the scan window and the per-match cap.
+            var L = 1
+            while L < maxMatchLen
+                && p - L >= scanStart
+                && end - L >= 0
+                && history[p - L] == history[end - L]
+            {
+                L += 1
+            }
+            // Identify the candidate that would extend this n-gram.
+            let candIdx = p + 1
+            guard candIdx <= end else { continue }
+            let candidate = history[candIdx]
+            guard candidate >= 0 && candidate < V else { continue }
+            if L >= options.dryAllowedLength {
+                let exponent = Float(L - options.dryAllowedLength)
+                let penalty = options.dryMultiplier
+                    * pow(options.dryBase, exponent)
+                arr[candidate] -= penalty
+            }
+        }
     }
 
     /// Stable softmax → Double[] without mutating the input. Skips
