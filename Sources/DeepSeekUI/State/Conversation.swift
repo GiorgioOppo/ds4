@@ -133,6 +133,16 @@ struct Conversation: Codable, Identifiable, Hashable {
     var title: String
     var createdAt: Date
     var modelDirPath: String      // captured at chat creation
+    /// Endpoint che questa conversation usa per l'inferenza. Quando
+    /// nil (chat salvate prima che il campo esistesse, oppure chat
+    /// "default" che ereditano dall'endpoint corrente di ModelState),
+    /// `ChatStore` cade su `modelState.loadedEndpoint` al send.
+    /// Quando non nil, è la fonte di verità: una chat con
+    /// `.openRouter(modelID:)` parla HTTP a quel provider anche se
+    /// `ModelState` ha un local model caricato in RAM, e viceversa.
+    /// Questo è il meccanismo che permette `chat A locale + chat B
+    /// remota in parallelo` (vedi commento in `ChatStore.send`).
+    var endpoint: ModelEndpoint?
     var messages: [StoredMessage]
     /// Optional reference to a `Project` in `ProjectLibrary`. When
     /// set, the chat surface shows the project's name in the toolbar.
@@ -182,6 +192,7 @@ struct Conversation: Codable, Identifiable, Hashable {
          title: String = "New Chat",
          createdAt: Date = .now,
          modelDirPath: String,
+         endpoint: ModelEndpoint? = nil,
          messages: [StoredMessage] = [],
          projectID: UUID? = nil,
          agentID: UUID? = nil,
@@ -191,6 +202,7 @@ struct Conversation: Codable, Identifiable, Hashable {
          pendingTurn: PendingTurn? = nil) {
         self.id = id; self.title = title; self.createdAt = createdAt
         self.modelDirPath = modelDirPath; self.messages = messages
+        self.endpoint = endpoint
         self.projectID = projectID
         self.agentID = agentID
         self.cumulativeCostUSD = cumulativeCostUSD

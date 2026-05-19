@@ -86,15 +86,19 @@ final class ModelState: ObservableObject {
         }
     }
 
-    /// Activate a remote OpenRouter endpoint. No weights to map
-    /// and nothing to probe, but we still drop any locally-loaded
-    /// model (so the chat unambiguously talks to one backend),
-    /// validate that the Keychain holds a key, and ping
-    /// `/auth/key` so an invalid token fails here instead of on
-    /// the first send. `library.touch` bumps the recents.
+    /// Activate a remote OpenRouter endpoint. Stateless: nessun
+    /// weight da mappare. Crucialmente NON scarica un eventuale
+    /// modello locale già caricato — è proprio questo che permette
+    /// `chat A locale + chat B remota in parallelo`. Lo `status` di
+    /// ModelState diventa "questo è l'endpoint corrente per le
+    /// nuove chat e per il banner toolbar", non più "questa è la
+    /// cosa unica caricata in memoria". Le chat che hanno
+    /// `Conversation.endpoint` settato continuano a parlare al loro
+    /// backend dedicato indipendentemente.
+    /// Validiamo comunque la chiave verso `/auth/key` così un
+    /// token invalido fallisce qui invece che al primo send.
     private func loadRemoteOpenRouter(modelID: String,
                                         endpoint: ModelEndpoint) async {
-        await service.unloadModel()
         status = .loading(endpoint: endpoint, plan: nil)
         guard let key = KeychainStore.get(
             account: KeychainAccount.openRouterAPIKey), !key.isEmpty

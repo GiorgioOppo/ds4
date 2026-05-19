@@ -60,6 +60,7 @@ struct ChatContainer: View {
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
                         ModelPicker(modelState: modelState,
+                                     store: store,
                                      library: modelLibrary,
                                      catalog: openRouterCatalog)
                     }
@@ -199,22 +200,44 @@ struct ChatContainer: View {
 /// an Unload affordance when a model is loaded.
 private struct ModelPicker: View {
     @ObservedObject var modelState: ModelState
+    @ObservedObject var store: ChatStore
     @ObservedObject var library: ModelLibrary
     @ObservedObject var catalog: OpenRouterCatalog
 
     @State private var showAddOpenRouter: Bool = false
     @State private var showLocalModelSettings: Bool = false
 
+    /// Endpoint mostrato in toolbar = quello della chat selezionata
+    /// (post-refactor multi-endpoint). Permette di vedere a colpo
+    /// d'occhio "questa chat parla a X" anche se in background
+    /// un'altra chat sta usando un endpoint diverso. Fallback su
+    /// `modelState.loadedEndpoint` per chat senza endpoint
+    /// proprio (pre-migration) o quando nessuna chat è selezionata.
+    private var currentEndpoint: ModelEndpoint? {
+        if let id = store.selectedID {
+            return store.endpoint(of: id)
+        }
+        return modelState.loadedEndpoint
+    }
+
     var body: some View {
         Menu {
-            Section("Current") {
+            Section("This chat") {
+                if let ep = currentEndpoint {
+                    Label(ep.displayName, systemImage: ep.iconName)
+                } else {
+                    Label("No model bound", systemImage: "circle")
+                }
+                // Stato del local model loader (rilevante solo se la
+                // chat usa un local endpoint o se l'utente sta per
+                // selezionarne uno).
                 switch modelState.status {
                 case .idle:
-                    Label("No model loaded", systemImage: "circle")
+                    EmptyView()
                 case .loading(let ep, _):
                     Label("Loading \(ep.displayName)…", systemImage: "arrow.down.circle")
-                case .loaded(let ep, _):
-                    Label(ep.displayName, systemImage: "checkmark.circle")
+                case .loaded:
+                    EmptyView()
                 case .error(let ep, _):
                     Label("Failed: \(ep.displayName)",
                            systemImage: "exclamationmark.octagon")
@@ -225,7 +248,7 @@ private struct ModelPicker: View {
                 Section("Recent") {
                     ForEach(recents) { entry in
                         Button {
-                            Task { await modelState.load(entry.endpoint) }
+                            bind(entry.endpoint)
                         } label: {
                             HStack {
                                 Image(systemName: entry.endpoint.iconName)
@@ -261,11 +284,12 @@ private struct ModelPicker: View {
                     Label("Customize local model settings…",
                            systemImage: "slider.horizontal.3")
                 }
-                if modelState.isReady {
+                if modelState.isReady,
+                   case .localDirectory = modelState.loadedEndpoint {
                     Button(role: .destructive) {
                         Task { await modelState.unload() }
                     } label: {
-                        Label("Unload current model",
+                        Label("Unload local model from RAM",
                                systemImage: "eject")
                     }
                 }
@@ -284,7 +308,8 @@ private struct ModelPicker: View {
         .help(helpText)
         .sheet(isPresented: $showAddOpenRouter) {
             AddOpenRouterModelSheet(catalog: catalog,
-                                     modelState: modelState)
+                                     modelState: modelState,
+                                     store: store)
         }
         .sheet(isPresented: $showLocalModelSettings) {
             LocalModelSettingsSheet(modelState: modelState)
@@ -293,30 +318,64 @@ private struct ModelPicker: View {
 
     @ViewBuilder
     private var label: some View {
-        switch modelState.status {
-        case .idle:
-            Label("No model", systemImage: "cpu")
-        case .loading(let ep, _):
+        // La label di toolbar segue la chat selezionata, non il
+        // global state — così se chat A è locale e chat B è remota,
+        // la toolbar cambia quando l'utente sposta la selezione.
+        if case .loading(let ep, _) = modelState.status {
             Label("Loading \(ep.displayName)",
                    systemImage: "arrow.down.circle")
-        case .loaded(let ep, _):
-            Label(ep.displayName, systemImage: ep.iconName)
-        case .error(let ep, _):
+        } else if case .error(let ep, _) = modelState.status,
+                  currentEndpoint == ep {
             Label("Failed: \(ep.displayName)",
                    systemImage: "exclamationmark.octagon.fill")
+        } else if let ep = currentEndpoint {
+            Label(ep.displayName, systemImage: ep.iconName)
+        } else {
+            Label("No model", systemImage: "cpu")
         }
     }
 
     private var helpText: String {
-        switch modelState.status {
-        case .idle:
-            return "No model loaded — choose one to start chatting"
-        case .loading(let ep, _):
+        if case .loading(let ep, _) = modelState.status {
             return "Loading \(ep.subtitle)…"
-        case .loaded(let ep, _):
-            return ep.subtitle
-        case .error(_, let msg):
+        }
+        if case .error(_, let msg) = modelState.status {
             return "Load failed: \(msg)"
+        }
+        if let ep = currentEndpoint {
+            return ep.subtitle
+        }
+        return "No model bound to this chat — pick one to start"
+    }
+
+    /// Cuore del refactor multi-endpoint: l'utente sceglie un
+    /// endpoint dal picker e questa funzione lo lega alla CHAT
+    /// CORRENTE (non globalmente). Per local: carichiamo il modello
+    /// nel service se non è già quello — il modello locale è
+    /// singleton in RAM, condiviso fra tutte le chat con endpoint
+    /// local. Per remote: validiamo la chiave OpenRouter via
+    /// `modelState.load` ma NON tocchiamo il local loaded. Le chat
+    /// in volo restano sul loro endpoint.
+    private func bind(_ endpoint: ModelEndpoint) {
+        if let id = store.selectedID {
+            store.setEndpoint(endpoint, for: id)
+        }
+        switch endpoint {
+        case .localDirectory(let path):
+            // Skip load se il service ha già *questo* local model in
+            // RAM (la verifica corretta è sul `currentModelDir`, non
+            // sullo `loadedEndpoint` di ModelState che post-refactor
+            // riflette l'ultimo endpoint *scelto*, non quello fisico).
+            // Evita un unload+reload spurio se l'utente seleziona di
+            // nuovo lo stesso local — operazione che ucciderebbe
+            // ogni altra chat local in volo.
+            if store.service.currentModelDir()?.path != path {
+                Task { await modelState.load(endpoint) }
+            }
+        case .openRouter:
+            // Remote: il load valida la chiave, non scarica il local.
+            // Sicuro chiamarlo a ogni bind (idempotente lato server).
+            Task { await modelState.load(endpoint) }
         }
     }
 
@@ -329,7 +388,7 @@ private struct ModelPicker: View {
         panel.prompt = "Choose"
         panel.message = "Select the converted DeepSeek model directory."
         if panel.runModal() == .OK, let url = panel.url {
-            Task { await modelState.load(.localDirectory(path: url.path)) }
+            bind(.localDirectory(path: url.path))
         }
         #endif
     }

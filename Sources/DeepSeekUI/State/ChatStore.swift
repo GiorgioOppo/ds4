@@ -139,7 +139,8 @@ final class ChatStore: ObservableObject {
         self.modelState = modelState
         loadFromDisk()
         if conversations.isEmpty {
-            let first = Conversation(modelDirPath: modelDirPath)
+            let first = Conversation(modelDirPath: modelDirPath,
+                                       endpoint: modelState.loadedEndpoint)
             conversations.append(first)
             selectedID = first.id
             scheduleSave(first.id)
@@ -156,7 +157,13 @@ final class ChatStore: ObservableObject {
     }
 
     func newChat() {
-        let c = Conversation(modelDirPath: modelDirPath)
+        // Cattura l'endpoint corrente di ModelState come default per
+        // questa chat — l'utente può poi cambiarlo via picker senza
+        // toccare gli altri chat in volo. Se è una remote, la chat
+        // non occuperà il local model in RAM; se è local, condivide
+        // il transformer caricato con le altre chat locali.
+        let c = Conversation(modelDirPath: modelDirPath,
+                              endpoint: modelState.loadedEndpoint)
         conversations.insert(c, at: 0)
         selectedID = c.id
         scheduleSave(c.id)
@@ -183,6 +190,46 @@ final class ChatStore: ObservableObject {
         guard conversations[idx].agentID != aid else { return }
         conversations[idx].agentID = aid
         scheduleSave(id)
+    }
+
+    /// Cambia l'endpoint usato da questa chat per l'inferenza. Non
+    /// tocca il `ModelState` globale né il modello caricato nel
+    /// service — un'altra chat locale può continuare a usare il
+    /// transformer corrente mentre questa passa a una remote. Il
+    /// cambio prende effetto dal prossimo `send` (il turn corrente,
+    /// se in volo, non viene interrotto).
+    /// Invalida `encodedTokens` quando si cambia il *tipo* di
+    /// endpoint (local↔remote) perché la token stream cached non è
+    /// più valida — le rappresentazioni interne dei due backend non
+    /// sono compatibili.
+    func setEndpoint(_ endpoint: ModelEndpoint?, for id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        let old = conversations[idx].endpoint
+        guard old != endpoint else { return }
+        // Cambio tipo backend → la cache di token locale è
+        // inutile per il backend nuovo, droppiamola così il primo
+        // send rifà l'encoding da capo.
+        if old?.isRemote != endpoint?.isRemote {
+            conversations[idx].encodedTokens = nil
+            conversations[idx].lastEncodedMode = nil
+        }
+        conversations[idx].endpoint = endpoint
+        scheduleSave(id)
+    }
+
+    /// Endpoint effettivamente usato da questa chat per l'inferenza
+    /// (vedi `Conversation.endpoint`). Fallback su `modelState.loadedEndpoint`
+    /// per BWC su chat pre-migration. Esposto pubblicamente così la
+    /// toolbar / ComposerView / banner-stato possono renderizzare
+    /// l'endpoint giusto per la chat selezionata invece di leggere
+    /// sempre lo stato globale di ModelState (che ora rappresenta
+    /// "il modello locale caricato in RAM", non più "l'endpoint
+    /// corrente di tutte le chat").
+    func endpoint(of id: UUID) -> ModelEndpoint? {
+        guard let c = conversations.first(where: { $0.id == id }) else {
+            return modelState.loadedEndpoint
+        }
+        return c.endpoint ?? modelState.loadedEndpoint
     }
 
     func delete(_ id: UUID) {
@@ -239,11 +286,23 @@ final class ChatStore: ObservableObject {
         default: break
         }
 
+        // Endpoint effettivo per QUESTA chat. `Conversation.endpoint`
+        // è la fonte primaria: permette `chat A locale + chat B
+        // remota` in parallelo perché ogni chat decide il proprio
+        // backend invece di leggere lo stato globale di ModelState.
+        // Fallback sul `loadedEndpoint` globale per le chat
+        // pre-migration (campo nil) — al primo send con un
+        // ModelState valido il caller può anche fare opportunistic
+        // backfill via `setEndpoint(_:for:)`, ma il fallback è
+        // sufficiente per la BWC.
+        let effectiveEndpoint = conversations[idx].endpoint
+            ?? modelState.loadedEndpoint
+
         // Remote endpoints take a completely different code path —
         // no tokenizer, no KV cache, no fast-delta. Branch early so
         // the local pipeline below operates only on the case it was
         // designed for.
-        if case .openRouter(let modelID) = modelState.loadedEndpoint {
+        if case .openRouter(let modelID) = effectiveEndpoint {
             sendRemote(text: trimmed,
                         conversationIndex: idx,
                         modelID: modelID,
@@ -438,11 +497,14 @@ final class ChatStore: ObservableObject {
             case .idle, .error:
                 continue
             case .prefilling, .streaming:
-                // Solo i local model usano la q dell'InferenceService.
-                // Le chat remote (modelDirPath vuoto) girano via HTTP
-                // — non bloccano nulla.
-                if let c = conversations.first(where: { $0.id == otherID }),
-                   !c.modelDirPath.isEmpty {
+                // Solo i local endpoint passano per la q seriale.
+                // Le remote (OpenRouter) girano via HTTP, non
+                // bloccano nulla. Leggiamo l'endpoint effettivo
+                // (Conversation.endpoint con fallback global)
+                // perché post-refactor multi-endpoint i due tipi
+                // coesistono nella stessa app.
+                let otherEp = self.endpoint(of: otherID)
+                if case .localDirectory = otherEp {
                     return true
                 }
             }
