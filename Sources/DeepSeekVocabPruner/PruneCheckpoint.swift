@@ -2,8 +2,10 @@ import Foundation
 import CryptoKit
 
 /// Stato persistente del job di vocab pruning, salvato in
-/// `<outputDir>/.vocab_pruner_checkpoint.json` per permettere il
+/// `<outputDir>/checkpoint/vocab_pruner.json` per permettere il
 /// ripristino dopo un'interruzione (kill, crash, cancel utente).
+/// Una eventuale versione legacy in `<outputDir>/.vocab_pruner_checkpoint.json`
+/// viene migrata automaticamente al primo load (vedi `load(from:)`).
 ///
 /// Validità: lo `specHash` viene confrontato all'inizio del run
 /// successivo. Se non corrisponde (es. l'utente ha cambiato corpus
@@ -254,18 +256,69 @@ public struct PruneCheckpoint: Codable, Sendable {
 
     // MARK: - File I/O
 
-    public static let filename = ".vocab_pruner_checkpoint.json"
+    /// Nome del file di checkpoint. Vive dentro la sottocartella
+    /// `checkpoint/` della destinazione (vedi `fileURL(in:)`).
+    public static let filename = "vocab_pruner.json"
 
+    /// Nome della sottocartella che contiene il checkpoint (e in
+    /// futuro eventuali file ausiliari del resume).
+    public static let subdir = "checkpoint"
+
+    /// Path legacy (pre-introduzione della sottocartella
+    /// `checkpoint/`): file hidden direttamente in `outputDir`.
+    /// Mantenuto solo per la migration al load — niente di nuovo
+    /// viene scritto qui.
+    public static let legacyFilename = ".vocab_pruner_checkpoint.json"
+
+    /// URL del checkpoint corrente: `<outputDir>/checkpoint/vocab_pruner.json`.
     public static func fileURL(in outputDir: URL) -> URL {
-        outputDir.appendingPathComponent(filename)
+        outputDir
+            .appendingPathComponent(subdir, isDirectory: true)
+            .appendingPathComponent(filename)
+    }
+
+    /// URL del checkpoint legacy (pre-migration).
+    public static func legacyFileURL(in outputDir: URL) -> URL {
+        outputDir.appendingPathComponent(legacyFilename)
     }
 
     /// Carica un checkpoint dal disco. Restituisce nil se il file
     /// non esiste o se il parse fallisce (corruzione → ripartiamo
     /// da zero, è più sicuro che provare a ripristinare).
+    ///
+    /// Migration: se il checkpoint non esiste al nuovo path
+    /// (`checkpoint/vocab_pruner.json`) ma esiste al legacy path
+    /// (`.vocab_pruner_checkpoint.json`), lo MIGRA atomicamente al
+    /// nuovo path prima di ritornare. Questo significa che la
+    /// prima volta che apri lo sheet su una destinazione con un
+    /// checkpoint precedente, vedi il resume info come prima.
     public static func load(from outputDir: URL) -> PruneCheckpoint? {
         let url = fileURL(in: outputDir)
-        guard FileManager.default.fileExists(atPath: url.path),
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            // Tenta migration dal legacy path.
+            let legacy = legacyFileURL(in: outputDir)
+            if fm.fileExists(atPath: legacy.path) {
+                do {
+                    try fm.createDirectory(
+                        at: url.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
+                    try fm.moveItem(at: legacy, to: url)
+                } catch {
+                    // Migration fallita → leggi dal legacy senza
+                    // spostare. Il prossimo save scriverà nel nuovo
+                    // path e lascerà orfano il legacy (lo lasciamo
+                    // all'utente per evitare data loss).
+                    guard let data = try? Data(contentsOf: legacy) else {
+                        return nil
+                    }
+                    let decoder = JSONDecoder()
+                    decoder.dateDecodingStrategy = .iso8601
+                    return try? decoder.decode(PruneCheckpoint.self, from: data)
+                }
+            }
+        }
+        guard fm.fileExists(atPath: url.path),
               let data = try? Data(contentsOf: url) else {
             return nil
         }
@@ -274,19 +327,35 @@ public struct PruneCheckpoint: Codable, Sendable {
         return try? decoder.decode(PruneCheckpoint.self, from: data)
     }
 
-    /// Persiste atomicamente. Crea `outputDir` se non esiste.
+    /// Persiste atomicamente. Crea `outputDir/checkpoint/` se non
+    /// esiste.
     public func save(to outputDir: URL) throws {
+        let url = Self.fileURL(in: outputDir)
         try FileManager.default.createDirectory(
-            at: outputDir, withIntermediateDirectories: true)
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(self)
-        try data.write(to: Self.fileURL(in: outputDir), options: .atomic)
+        try data.write(to: url, options: .atomic)
     }
 
+    /// Cancella il checkpoint. Rimuove sia il file nuovo che il
+    /// legacy se presente, e prova a rimuovere la sottocartella
+    /// `checkpoint/` se diventa vuota (per non lasciare directory
+    /// orfana nella destinazione).
     public static func delete(from outputDir: URL) {
-        try? FileManager.default.removeItem(at: fileURL(in: outputDir))
+        let fm = FileManager.default
+        try? fm.removeItem(at: fileURL(in: outputDir))
+        try? fm.removeItem(at: legacyFileURL(in: outputDir))
+        let subdirURL = outputDir.appendingPathComponent(subdir,
+                                                          isDirectory: true)
+        if let contents = try? fm.contentsOfDirectory(atPath: subdirURL.path),
+           contents.isEmpty
+        {
+            try? fm.removeItem(at: subdirURL)
+        }
     }
 
     // MARK: - Hash dello spec

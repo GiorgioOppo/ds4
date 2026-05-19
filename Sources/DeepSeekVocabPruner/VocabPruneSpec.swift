@@ -48,7 +48,7 @@ public struct VocabPruneSpec: Sendable {
     public var concurrency: Int = 1
 
     /// Quando true (default), legge il checkpoint da
-    /// `<outputDir>/.vocab_pruner_checkpoint.json` se esiste e
+    /// `<outputDir>/checkpoint/vocab_pruner.json` se esiste e
     /// coincide col current spec, e riprende da dove si era
     /// interrotto il job precedente. Quando false, cancella il
     /// checkpoint e ricomincia da zero.
