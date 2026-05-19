@@ -134,18 +134,31 @@ final class ChatStore: ObservableObject {
     private var lastSamplingOptions: [UUID: (opts: SamplingOptions,
                                               maxTokens: Int)] = [:]
 
+    /// Host della suite di tool nativi (read/write/edit/grep/shell/…
+    /// 16 tool definiti in `Sources/DeepSeekTools/Tools/`). Era già
+    /// inizializzato in `DeepSeekUIApp` e cablato al Settings, ma il
+    /// chat path non lo agganciava — i suoi schemi non finivano nel
+    /// system block e le tool call con nome nativo non venivano
+    /// routate. Adesso `composeToolSchemasJSON` / `composeOpenAITools`
+    /// emettono gli schemi con prefisso `native__<name>` e i dispatch
+    /// site indirizzano le invocazioni `native__*` a
+    /// `nativeTools.dispatch(...)`.
+    let nativeTools: NativeToolHost
+
     init(service: InferenceService,
          documents: DocumentLibrary,
          projects: ProjectLibrary,
          mcpPool: MCPClientPool,
          agents: AgentLibrary,
-         modelState: ModelState) {
+         modelState: ModelState,
+         nativeTools: NativeToolHost) {
         self.service = service
         self.documents = documents
         self.projects = projects
         self.mcpPool = mcpPool
         self.agents = agents
         self.modelState = modelState
+        self.nativeTools = nativeTools
         loadFromDisk()
         if conversations.isEmpty {
             let first = Conversation(modelDirPath: modelDirPath,
@@ -937,19 +950,10 @@ final class ChatStore: ObservableObject {
             var outputs: [String] = []
             outputs.reserveCapacity(calls.count)
             for call in calls {
-                let result: String
-                if call.name == EncodingDSV4.delegateToolName {
-                    // Synthetic "delegate to another agent" tool.
-                    // Handled in-process (no MCP server involved) by
-                    // spawning a sub-agent run.
-                    result = await self.executeSubAgentDelegation(
-                        argsJSON: call.args,
-                        hostAgentID: hostAgentID,
-                        hostConvID: id)
-                } else {
-                    result = await pool.invokeQualified(
-                        call.name, argsJSON: call.args)
-                }
+                let result = await self.executeToolCall(
+                    call,
+                    conversationID: id,
+                    hostAgentID: hostAgentID)
                 outputs.append(result)
             }
 
@@ -1050,11 +1054,105 @@ final class ChatStore: ObservableObject {
     /// Returns nil when the resulting set is empty (no MCP tools
     /// allowed AND no other agents) so the chat template can skip
     /// the tools block entirely.
+    /// Esegue una tool call invocata dal modello. Tre branch:
+    ///   - `__delegate_to_agent` → spawn sub-agent;
+    ///   - `native__<name>` → `nativeTools.dispatch` (lo strip del
+    ///     prefisso è l'unica cosa che separa il nome wire dal nome
+    ///     registro);
+    ///   - tutto il resto → `mcpPool.invokeQualified` (deve avere
+    ///     forma `server__tool` o l'MCP pool rifiuta).
+    /// Centralizza il routing così i tre call site
+    /// (runToolCallsAndContinue, runRemoteLoop, runSubAgentToCompletionInner)
+    /// non duplicano la logica.
+    private func executeToolCall(_ call: ToolCall,
+                                  conversationID: UUID,
+                                  hostAgentID: UUID?) async -> String {
+        if call.name == EncodingDSV4.delegateToolName {
+            return await executeSubAgentDelegation(
+                argsJSON: call.args,
+                hostAgentID: hostAgentID,
+                hostConvID: conversationID)
+        }
+        if call.name.hasPrefix("native__") {
+            let nativeName = String(call.name.dropFirst("native__".count))
+            return await invokeNativeTool(
+                name: nativeName,
+                argsJSON: call.args,
+                conversationID: conversationID)
+        }
+        return await mcpPool.invokeQualified(call.name, argsJSON: call.args)
+    }
+
+    /// Decodifica gli args JSON, risolve mode + rootDirectory dalla
+    /// chat (Project attaccato → primo sourcePath; fallback → home),
+    /// invoca `NativeToolHost.dispatch` e ritorna l'output testuale
+    /// per la tool_outputs block. Errori (JSON malformed, esecuzione
+    /// fallita) tornano come stringa con marker `[error: ...]` così
+    /// il modello può recuperare invece di crashare.
+    private func invokeNativeTool(name: String,
+                                    argsJSON: String,
+                                    conversationID: UUID) async -> String {
+        let input: [String: Any]
+        if argsJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            input = [:]
+        } else if let data = argsJSON.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] {
+            input = obj
+        } else {
+            return "[error: native tool '\(name)' got malformed JSON args]"
+        }
+
+        let conv = conversations.first(where: { $0.id == conversationID })
+        let agent = conv?.agentID.flatMap { agents.agent(id: $0) }
+        let mode = agent?.agentMode ?? .build
+        let rootDir: URL = {
+            if let pid = conv?.projectID,
+               let project = projects.project(id: pid),
+               let path = project.sourcePaths.first {
+                return URL(fileURLWithPath: path)
+            }
+            return FileManager.default.homeDirectoryForCurrentUser
+        }()
+
+        let out = await nativeTools.dispatch(
+            name: name, input: input, mode: mode, rootDirectory: rootDir)
+        if out.isError {
+            return "[error: \(out.output)]"
+        }
+        return out.output
+    }
+
     private func composeToolSchemasJSON(
         mcpAllowed: Set<String>?,
         delegableAgents: [AgentConfig]
     ) -> String? {
         var schemas: [[String: Any]] = []
+
+        // Native tools (DeepSeekTools): read/write/edit/grep/shell/glob/
+        // apply_patch/task/todo/plan/web_fetch/web_search/lsp/repo_*.
+        // Prefisso `native__<name>` per non collidere con tool MCP che
+        // potrebbero avere nomi corti uguali; il dispatch site
+        // (runToolCallsAndContinue, runSubAgentToCompletionInner,
+        // runRemoteLoop) controlla il prefisso e instrada al
+        // `nativeTools.dispatch` invece che a `mcpPool.invokeQualified`.
+        // Filtro per `mcpAllowed`: se l'allowlist è non-nil ma vuota
+        // la chat è "tools off" → niente nativi né MCP. Altrimenti i
+        // nomi sono inclusi se l'allowlist li contiene esplicitamente
+        // come `native__<name>`, oppure se non c'è allowlist.
+        if !(mcpAllowed?.isEmpty == true) {
+            let nativeSchemas = nativeTools.schemas
+            for native in nativeSchemas {
+                let qualified = "native__\(native.name)"
+                if let allowed = mcpAllowed,
+                   !allowed.contains(qualified) { continue }
+                schemas.append([
+                    "name": qualified,
+                    "description": native.description,
+                    "inputSchema": native.inputSchema.foundationValue
+                ])
+            }
+        }
 
         // MCP tools (already filtered by agent allowlist semantics
         // when `mcpAllowed` is non-nil).
@@ -1352,11 +1450,22 @@ final class ChatStore: ObservableObject {
             for call in final.toolCalls {
                 let out: String
                 if call.name == EncodingDSV4.delegateToolName {
+                    // Recursive sub-agent: tracking depth + chain
+                    // qui non è riutilizzabile da `executeToolCall`
+                    // (che è chiamato solo dal turn host), quindi
+                    // teniamo il branch dedicato.
                     out = await dispatchDelegation(
                         argsJSON: call.args,
                         depth: depth + 1,
                         chain: chain,
                         hostConvID: hostConvID)
+                } else if call.name.hasPrefix("native__") {
+                    let nativeName = String(
+                        call.name.dropFirst("native__".count))
+                    out = await invokeNativeTool(
+                        name: nativeName,
+                        argsJSON: call.args,
+                        conversationID: hostConvID)
                 } else {
                     out = await mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -1662,6 +1771,13 @@ final class ChatStore: ObservableObject {
                 let result: String
                 if call.name == EncodingDSV4.delegateToolName {
                     result = "[error: cross-agent delegation is not yet supported on remote models]"
+                } else if call.name.hasPrefix("native__") {
+                    let nativeName = String(
+                        call.name.dropFirst("native__".count))
+                    result = await self.invokeNativeTool(
+                        name: nativeName,
+                        argsJSON: call.args,
+                        conversationID: id)
                 } else {
                     result = await self.mcpPool.invokeQualified(
                         call.name, argsJSON: call.args)
@@ -1874,6 +1990,29 @@ final class ChatStore: ObservableObject {
         delegableAgents: [AgentConfig]
     ) -> [[String: Any]]? {
         var schemas: [[String: Any]] = []
+
+        // Native tools (DeepSeekTools) — wrappate in OpenAI function
+        // format. Stesso prefisso `native__<name>` del path locale così
+        // i dispatch site sanno instradarle a `nativeTools.dispatch`
+        // invece che a `mcpPool.invokeQualified`. JSONValue ha bisogno
+        // di `foundationValue` per restituire `[String: Any]` ad
+        // JSONSerialization.
+        let allEmpty = (mcpAllowed?.isEmpty == true)
+        if !allEmpty {
+            for native in nativeTools.schemas {
+                let qualified = "native__\(native.name)"
+                if let allowed = mcpAllowed,
+                   !allowed.contains(qualified) { continue }
+                schemas.append([
+                    "type": "function",
+                    "function": [
+                        "name": qualified,
+                        "description": native.description,
+                        "parameters": native.inputSchema.foundationValue
+                    ]
+                ])
+            }
+        }
 
         // MCP tools (filtered by the attached agent's allowlist
         // when one is in effect — same precedence the local path
