@@ -165,22 +165,28 @@ public func quantizeBF16ToInt8Calibrated(
                           userInfo: [NSLocalizedDescriptionKey:
                                       "AWQ requires CalibrationStats"])
         }
-        return try awqQuantizeBF16ToInt8(srcURL: srcURL,
-                                          srcOffset: srcOffset,
-                                          outDim: outDim, inDim: inDim,
-                                          actAbsMax: stats.perChannelAbsMax,
-                                          alpha: awqAlpha)
+        // Drop the inverseChannelScale tuple element — the simple
+        // public API stays a (weight, scale) tuple. Callers that
+        // want the inverse scale call `awqQuantizeBF16ToInt8`
+        // directly.
+        let r = try awqQuantizeBF16ToInt8(srcURL: srcURL,
+                                            srcOffset: srcOffset,
+                                            outDim: outDim, inDim: inDim,
+                                            actAbsMax: stats.perChannelAbsMax,
+                                            alpha: awqAlpha)
+        return (r.weight, r.scale)
     case .smoothQuant:
         guard let stats else {
             throw NSError(domain: "quantizeBF16ToInt8Calibrated", code: 101,
                           userInfo: [NSLocalizedDescriptionKey:
                                       "SmoothQuant requires CalibrationStats"])
         }
-        return try smoothQuantBF16ToInt8(srcURL: srcURL,
-                                           srcOffset: srcOffset,
-                                           outDim: outDim, inDim: inDim,
-                                           actAbsMax: stats.perChannelAbsMax,
-                                           alpha: 0.5)
+        let r = try smoothQuantBF16ToInt8(srcURL: srcURL,
+                                            srcOffset: srcOffset,
+                                            outDim: outDim, inDim: inDim,
+                                            actAbsMax: stats.perChannelAbsMax,
+                                            alpha: 0.5)
+        return (r.weight, r.scale)
     case .gptq:
         throw NSError(domain: "quantizeBF16ToInt8Calibrated", code: 102,
                       userInfo: [NSLocalizedDescriptionKey:
@@ -245,12 +251,19 @@ public func quantizeBF16ToInt8Calibrated(
 ///
 /// Follow-up: aggiungere un campo `inverseChannelScale: Tensor?`
 /// a `Linear` + un pre-mul nel forward quando presente.
-func awqQuantizeBF16ToInt8(
+/// AWQ output tuple. `inverseChannelScale` is `1 / s[c]` ready to
+/// plug into `Linear.inverseChannelScale`: the runtime applies it
+/// as `x' = x · inverseChannelScale` before the GEMM, recovering
+/// the un-smoothed output exactly. Length is `inDim`.
+public typealias CalibratedQuantResult = (
+    weight: Data, scale: Data, inverseChannelScale: [Float])
+
+public func awqQuantizeBF16ToInt8(
     srcURL: URL, srcOffset: Int,
     outDim: Int, inDim: Int,
     actAbsMax: [Float],
     alpha: Float
-) throws -> (weight: Data, scale: Data) {
+) throws -> CalibratedQuantResult {
     precondition(inDim % kInt8GroupK == 0,
                  "AWQ INT8 requires inDim % \(kInt8GroupK) == 0")
     precondition(actAbsMax.count == inDim,
@@ -354,7 +367,15 @@ func awqQuantizeBF16ToInt8(
         }
     }
 
-    return (weight, scale)
+    // Invert channelScale so the runtime side (`Linear.inverseChannelScale`)
+    // can multiply directly. `s == 0` shouldn't happen after the eps
+    // clamp above, but guard anyway.
+    var inverseChannelScale = [Float](repeating: 1, count: inDim)
+    for c in 0..<inDim {
+        inverseChannelScale[c] = channelScale[c] == 0
+            ? 1 : 1.0 / channelScale[c]
+    }
+    return (weight, scale, inverseChannelScale)
 }
 
 // MARK: - SmoothQuant implementation
@@ -386,13 +407,13 @@ func awqQuantizeBF16ToInt8(
 /// layer. Today the engine doesn't apply that inverse scale — same
 /// follow-up as the AWQ note: add `inverseChannelScale: Tensor?`
 /// to `Linear` and pre-multiply in the forward.
-func smoothQuantBF16ToInt8(
+public func smoothQuantBF16ToInt8(
     srcURL: URL, srcOffset: Int,
     outDim: Int, inDim: Int,
     actAbsMax: [Float],
     alpha: Float,
     clampRange: Float = 5.0
-) throws -> (weight: Data, scale: Data) {
+) throws -> CalibratedQuantResult {
     precondition(inDim % kInt8GroupK == 0,
                   "SmoothQuant INT8 requires inDim % \(kInt8GroupK) == 0")
     precondition(actAbsMax.count == inDim)
@@ -484,7 +505,12 @@ func smoothQuantBF16ToInt8(
             }
         }
     }
-    return (weight, scale)
+    var inverseChannelScale = [Float](repeating: 1, count: inDim)
+    for c in 0..<inDim {
+        inverseChannelScale[c] = channelScale[c] == 0
+            ? 1 : 1.0 / channelScale[c]
+    }
+    return (weight, scale, inverseChannelScale)
 }
 
 // MARK: - GPTQ implementation
@@ -757,6 +783,114 @@ public func gptqQuantizeBF16ToInt8(
         }
     }
     return (weight, scale)
+}
+
+// MARK: - On-disk calibration format
+
+/// Decodable mirror of the `stats.json` shape written by
+/// `deepseek_calibrate`. Per-layer activation observations only;
+/// Hessians live in a sibling `hessians/<name>.f64` directory.
+public struct CalibrationStatsFile: Codable {
+    public let model: String
+    public let nLayers: Int
+    public let hessianCollected: Bool
+    public let layers: [LayerStats]
+
+    public init(model: String, nLayers: Int,
+                hessianCollected: Bool, layers: [LayerStats])
+    {
+        self.model = model
+        self.nLayers = nLayers
+        self.hessianCollected = hessianCollected
+        self.layers = layers
+    }
+
+    public struct LayerStats: Codable {
+        public let name: String
+        public let inDim: Int
+        public let observedTokens: Int
+        public let perChannelAbsMax: [Float]
+        public let perChannelMean: [Float]
+
+        public init(name: String, inDim: Int, observedTokens: Int,
+                    perChannelAbsMax: [Float],
+                    perChannelMean: [Float])
+        {
+            self.name = name
+            self.inDim = inDim
+            self.observedTokens = observedTokens
+            self.perChannelAbsMax = perChannelAbsMax
+            self.perChannelMean = perChannelMean
+        }
+    }
+}
+
+/// In-memory handle on a `deepseek_calibrate` output directory.
+/// Wraps the `stats.json` plus an optional path to the
+/// `hessians/` subdirectory so the converter can look up
+/// per-tensor calibration without re-parsing per call.
+public struct CalibrationDir {
+    public let statsByName: [String: CalibrationStats]
+    public let inDimByName: [String: Int]
+    public let hessianDirURL: URL?
+
+    /// Read `stats.json` from `url` (or `<url>/stats.json` if a
+    /// directory). If `stats.hessianCollected` is true, populate
+    /// `hessianDirURL` with the sibling `hessians/` folder so
+    /// `hessian(for:)` lookups can stream the binaries.
+    public init(url: URL) throws {
+        let fm = FileManager.default
+        var statsURL = url
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: url.path, isDirectory: &isDir),
+           isDir.boolValue
+        {
+            statsURL = url.appendingPathComponent("stats.json")
+        }
+        let data = try Data(contentsOf: statsURL)
+        let parsed = try JSONDecoder().decode(
+            CalibrationStatsFile.self, from: data)
+
+        var byName: [String: CalibrationStats] = [:]
+        var dimByName: [String: Int] = [:]
+        for layer in parsed.layers {
+            byName[layer.name] = CalibrationStats(
+                perChannelAbsMax: layer.perChannelAbsMax,
+                perChannelMean: layer.perChannelMean.isEmpty
+                    ? nil : layer.perChannelMean,
+                observedTokens: layer.observedTokens)
+            dimByName[layer.name] = layer.inDim
+        }
+        self.statsByName = byName
+        self.inDimByName = dimByName
+        if parsed.hessianCollected {
+            let dir = statsURL.deletingLastPathComponent()
+                .appendingPathComponent("hessians")
+            self.hessianDirURL = fm.fileExists(atPath: dir.path) ? dir : nil
+        } else {
+            self.hessianDirURL = nil
+        }
+    }
+
+    /// Look up the Hessian for `layerName`. Returns nil when no
+    /// hessian directory was paired with this calibration or when
+    /// the per-layer file is missing. The file is `[inDim*inDim]`
+    /// little-endian Doubles (no header) — we trust the caller to
+    /// have the right `inDim` from the stats lookup.
+    public func hessian(for layerName: String) -> [Double]? {
+        guard let dir = hessianDirURL else { return nil }
+        guard let inDim = inDimByName[layerName] else { return nil }
+        let path = dir.appendingPathComponent("\(layerName).f64")
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        let count = inDim * inDim
+        let expectedBytes = count * MemoryLayout<Double>.size
+        guard data.count == expectedBytes else { return nil }
+        var out = [Double](repeating: 0, count: count)
+        _ = out.withUnsafeMutableBytes { dst in
+            data.copyBytes(to: dst)
+        }
+        return out
+    }
 }
 
 // MARK: - Hessian collection

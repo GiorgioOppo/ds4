@@ -185,25 +185,13 @@ for L in 0..<model.config.nLayers {
 }
 let orderedNames = layerNames.sorted()
 
-// stats.json
-struct LayerStats: Encodable {
-    let name: String
-    let inDim: Int
-    let observedTokens: Int
-    let perChannelAbsMax: [Float]
-    let perChannelMean: [Float]
-}
-struct CalibrationStatsFile: Encodable {
-    let model: String
-    let nLayers: Int
-    let hessianCollected: Bool
-    let layers: [LayerStats]
-}
-
-var layerStats: [LayerStats] = []
+// stats.json — uses the public `CalibrationStatsFile` from
+// DeepSeekKit so the converter can decode the same struct on the
+// consume side.
+var layerStats: [CalibrationStatsFile.LayerStats] = []
 for name in orderedNames {
     guard let s = actObs.finalize(for: name) else { continue }
-    layerStats.append(LayerStats(
+    layerStats.append(CalibrationStatsFile.LayerStats(
         name: name,
         inDim: s.perChannelAbsMax.count,
         observedTokens: s.observedTokens,
