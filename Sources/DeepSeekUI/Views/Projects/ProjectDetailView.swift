@@ -334,19 +334,42 @@ struct ProjectDetailView: View {
         panel.title = directory ? "Add source folders" : "Add source files"
         guard panel.runModal() == .OK else { return }
         var updated = project
+        // Bookmarks are kept positional with `sourcePaths`: grow the
+        // bookmark array to match the existing path list before
+        // appending so old entries stay aligned. Re-picking an existing
+        // path overwrites its bookmark in place — that's how the user
+        // recovers sandbox access after a stale grant.
+        var bookmarks = updated.sourceBookmarks ?? []
+        while bookmarks.count < updated.sourcePaths.count {
+            bookmarks.append(Data())
+        }
         for url in panel.urls {
             let p = url.path
-            if !updated.sourcePaths.contains(p) {
+            let fresh = ProjectSourceAccess.makeBookmark(for: url) ?? Data()
+            if let existing = updated.sourcePaths.firstIndex(of: p) {
+                bookmarks[existing] = fresh
+            } else {
                 updated.sourcePaths.append(p)
+                bookmarks.append(fresh)
             }
         }
+        updated.sourceBookmarks = bookmarks
         library.update(updated)
         #endif
     }
 
     private func removePath(_ path: String) {
         var updated = project
-        updated.sourcePaths.removeAll { $0 == path }
+        // Drop the bookmark at the matching index so the parallel
+        // array stays aligned with `sourcePaths`.
+        if let idx = updated.sourcePaths.firstIndex(of: path) {
+            updated.sourcePaths.remove(at: idx)
+            if var bookmarks = updated.sourceBookmarks,
+               idx < bookmarks.count {
+                bookmarks.remove(at: idx)
+                updated.sourceBookmarks = bookmarks
+            }
+        }
         library.update(updated)
     }
 

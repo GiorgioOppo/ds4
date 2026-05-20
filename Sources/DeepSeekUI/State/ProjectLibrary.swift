@@ -17,6 +17,20 @@ struct Project: Codable, Identifiable, Hashable {
     /// Absolute filesystem paths. May point at single files or whole
     /// directories — `ProjectIndexer` walks directories recursively.
     var sourcePaths: [String]
+    /// App-scoped security bookmarks, one per entry in `sourcePaths`
+    /// (positional match). Required so the macOS sandbox keeps granting
+    /// reads after the original `NSOpenPanel` session expires —
+    /// otherwise tools fail with "couldn't be opened because you don't
+    /// have permission to view it" when they follow a symlink in the
+    /// per-project farm down to the user's real disk.
+    ///
+    /// Optional + nil-default for backward compatibility: projects
+    /// persisted before the bookmark wiring landed decode without this
+    /// field, and `addPath` re-grants them lazily as the user re-picks
+    /// folders. When non-nil, the array length matches `sourcePaths`;
+    /// individual entries may still be empty `Data()` if bookmark
+    /// generation failed for that specific URL.
+    var sourceBookmarks: [Data]?
     var createdAt: Date
     var lastIndexedAt: Date?
     var modelFingerprint: String?
@@ -36,6 +50,7 @@ struct Project: Codable, Identifiable, Hashable {
     init(id: UUID = UUID(),
          name: String,
          sourcePaths: [String] = [],
+         sourceBookmarks: [Data]? = nil,
          createdAt: Date = .now,
          lastIndexedAt: Date? = nil,
          modelFingerprint: String? = nil,
@@ -44,6 +59,7 @@ struct Project: Codable, Identifiable, Hashable {
         self.id = id
         self.name = name
         self.sourcePaths = sourcePaths
+        self.sourceBookmarks = sourceBookmarks
         self.createdAt = createdAt
         self.lastIndexedAt = lastIndexedAt
         self.modelFingerprint = modelFingerprint
@@ -72,6 +88,15 @@ struct Project: Codable, Identifiable, Hashable {
 final class ProjectLibrary: ObservableObject {
     @Published private(set) var projects: [Project] = []
 
+    /// Active security-scoped resource accessors, one vault per project
+    /// id. Vault `acquire(bookmarks:)` is called whenever a project's
+    /// bookmark blob changes (initial load, edit, re-add) so the macOS
+    /// sandbox keeps granting reads to the user's source folders across
+    /// app launches. Removing a project (or replacing its sources) drops
+    /// the vault, which `stopAccessingSecurityScopedResource()`s every
+    /// URL it was holding.
+    private var sourceAccess: [UUID: ProjectSourceAccess] = [:]
+
     init() {
         load()
     }
@@ -92,6 +117,12 @@ final class ProjectLibrary: ObservableObject {
         if prev.sourcePaths != project.sourcePaths {
             try? ProjectRootBuilder.rebuild(project)
         }
+        // Always refresh the vault when bookmarks change — even if the
+        // path list is identical, the user may have re-picked a folder
+        // to recover sandbox access after a stale grant.
+        if prev.sourceBookmarks != project.sourceBookmarks {
+            refreshAccess(for: project)
+        }
     }
 
     func delete(_ id: UUID, documents: DocumentLibrary) {
@@ -99,6 +130,7 @@ final class ProjectLibrary: ObservableObject {
         projects.removeAll { $0.id == id }
         saveIndex()
         ProjectRootBuilder.remove(id: id)
+        sourceAccess.removeValue(forKey: id) // releases via deinit
     }
 
     func project(id: UUID) -> Project? {
@@ -114,6 +146,49 @@ final class ProjectLibrary: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         if let entries = try? decoder.decode([Project].self, from: data) {
             projects = entries.sorted { $0.createdAt > $1.createdAt }
+            // Re-establish sandbox access to every project's source
+            // folders before any tool dispatch can touch them. Without
+            // this, reads through the per-project symlink farm fail
+            // with permission errors after a restart.
+            for project in projects {
+                refreshAccess(for: project)
+            }
+        }
+    }
+
+    /// (Re)create the per-project access vault from the project's
+    /// current `sourceBookmarks`. If any bookmark resolves stale, the
+    /// vault re-mints it and we persist the refreshed blob so the next
+    /// launch starts from a clean state. Bookmark-less projects (old
+    /// JSON, or freshly created without paths) get an empty vault —
+    /// safe, but reads to those paths will fail until the user adds
+    /// them through the picker.
+    private func refreshAccess(for project: Project) {
+        let bookmarks = project.sourceBookmarks ?? []
+        let vault = ProjectSourceAccess()
+        let resolved = vault.acquire(bookmarks: bookmarks)
+        sourceAccess[project.id] = vault
+
+        // Re-mint stale bookmarks so we don't keep paying the resolve
+        // cost (and keep working if the original bookmark eventually
+        // expires for real). Only persist if something actually changed
+        // to avoid touching the JSON on every launch.
+        let hasStale = resolved.contains(where: { $0?.isStale == true })
+        guard hasStale else { return }
+        var newBookmarks = bookmarks
+        for (i, entry) in resolved.enumerated()
+        where i < newBookmarks.count {
+            guard let r = entry, r.isStale else { continue }
+            if let fresh = ProjectSourceAccess.makeBookmark(for: r.url) {
+                newBookmarks[i] = fresh
+            }
+        }
+        if newBookmarks != bookmarks,
+           let idx = projects.firstIndex(where: { $0.id == project.id }) {
+            var updated = projects[idx]
+            updated.sourceBookmarks = newBookmarks
+            projects[idx] = updated
+            saveIndex()
         }
     }
 
