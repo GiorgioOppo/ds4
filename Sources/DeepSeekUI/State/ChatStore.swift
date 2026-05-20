@@ -2527,7 +2527,13 @@ final class ChatStore: ObservableObject {
         // per-chat folder. The legacy `{UUID}.json` above remains
         // the source of truth for reads; PR 3 will flip that.
         if PersistencePaths.isV2Chat(id: id) {
-            scheduleManifestForV2(c)
+            // PR 3b: also synthesise the turn summaries + round
+            // payloads from `c.messages` and stage diff-only writes
+            // for any file whose content changed since the last
+            // sync. This is what `groupedItems(c.messages)` used to
+            // do at render time, hoisted here so the on-disk v2
+            // layout matches what PR 3c will read from.
+            syncV2State(id, conversation: c)
         }
     }
 
@@ -2554,6 +2560,68 @@ final class ChatStore: ObservableObject {
     /// Stage a debounced manifest dual-write for a v2 chat.
     private func scheduleManifestForV2(_ c: Conversation) {
         chatPersistence.scheduleManifestSave(manifest(from: c))
+    }
+
+    /// PR 3b: recompute turn summaries + round payloads from
+    /// `c.messages`, diff against the last sync (turn summaries
+    /// memoised in `synthCache`, round payloads in `roundLRU`),
+    /// and stage debounced writes only for the files whose contents
+    /// actually changed. Called from `flushSave` AFTER the legacy
+    /// `{UUID}.json` write — so a crash between the two saves
+    /// leaves the legacy file as the recoverable copy and the v2
+    /// layout catches up on the next flush.
+    ///
+    /// The cost is bounded by the chat's message count (single
+    /// pass via `synthesizeTurnsAndRounds`); the diff filter keeps
+    /// the write rate down to a handful of files per turn instead
+    /// of a quadratic re-write of the whole transcript.
+    private func syncV2State(_ id: UUID, conversation c: Conversation) {
+        let oldTurns = synthCache[id]?.turns ?? []
+        let oldByID = Dictionary(uniqueKeysWithValues:
+            oldTurns.map { ($0.id, $0) })
+
+        let pairs = Self.synthesizeTurnsAndRounds(from: c.messages)
+        let newTurns = pairs.map { $0.summary }
+
+        // Refresh the synth memo so the next `turns(of:)` returns
+        // an array consistent with what we just persisted.
+        synthCache[id] = SynthCacheEntry(
+            fingerprint: SynthFingerprint(messages: c.messages),
+            turns: newTurns)
+
+        // Per-turn diff. The Equatable on `TurnSummary` compares
+        // every field, so a content-preview tweak or flag change
+        // re-schedules the small turn-summary file write only.
+        for (summary, rounds) in pairs {
+            if oldByID[summary.id] != summary {
+                chatPersistence.scheduleTurnSummarySave(
+                    chatID: id, summary)
+            }
+            // Per-round diff via the LRU peek: if the cached payload
+            // matches the freshly synthesised one, skip the write
+            // entirely. Otherwise update the LRU + stage the write.
+            // Pin nothing here — PR 4 takes ownership of the
+            // streaming round's pin slot.
+            for round in rounds {
+                let key = RoundKey(chatID: id,
+                                    turnID: summary.id,
+                                    roundID: round.id)
+                if let cached = roundLRU.peek(key), cached == round {
+                    continue
+                }
+                roundLRU.put(key, round)
+                chatPersistence.scheduleRoundSave(
+                    chatID: id, turnID: summary.id, round)
+            }
+        }
+
+        // Manifest carries the chronologically-ordered turn id
+        // list. `manifest(from:)` builds the rest of the metadata
+        // (title, endpoint, agent…) from `c`; we just overlay the
+        // freshly computed `turnIDs`.
+        var newManifest = manifest(from: c)
+        newManifest.turnIDs = newTurns.map(\.id)
+        chatPersistence.scheduleManifestSave(newManifest)
     }
 
     // MARK: - v2 lazy-loading API (PR 3a — dead code)
@@ -2620,24 +2688,39 @@ final class ChatStore: ObservableObject {
     nonisolated static func synthesizeTurns(
         from messages: [StoredMessage]
     ) -> [TurnSummary] {
-        var out: [TurnSummary] = []
+        synthesizeTurnsAndRounds(from: messages).map { $0.summary }
+    }
+
+    /// Bulk synth path used by `syncV2State` (PR 3b). Walks the
+    /// `[StoredMessage]` array ONCE and produces both the per-turn
+    /// summaries and the full per-round payloads in a single pass.
+    /// Avoids the quadratic cost of calling `synthesizeRound`
+    /// independently for every round on every save.
+    nonisolated static func synthesizeTurnsAndRounds(
+        from messages: [StoredMessage]
+    ) -> [(summary: TurnSummary, rounds: [StoredRound])] {
+        var out: [(summary: TurnSummary, rounds: [StoredRound])] = []
         var buffer: [StoredMessage] = []
         var lead: StoredMessage?
 
+        func emit(_ leadMsg: StoredMessage, _ assistants: [StoredMessage]) {
+            let rounds = assistants.enumerated().map { idx, m in
+                makeRound(from: m, roundIndex: idx)
+            }
+            out.append((makeTurn(lead: leadMsg, rounds: assistants), rounds))
+        }
+
         func flush() {
             guard let leadMsg = lead else {
-                // Orphan assistant messages with no preceding user —
-                // shouldn't happen in practice but we render them as
-                // a synthetic empty-user turn so they don't vanish.
                 if !buffer.isEmpty {
-                    out.append(makeTurn(
-                        lead: StoredMessage(role: .user, content: ""),
-                        rounds: buffer))
+                    // Orphan assistants — synthetic empty-user lead
+                    // so the screen doesn't lose the content.
+                    emit(StoredMessage(role: .user, content: ""), buffer)
                     buffer.removeAll(keepingCapacity: true)
                 }
                 return
             }
-            out.append(makeTurn(lead: leadMsg, rounds: buffer))
+            emit(leadMsg, buffer)
             buffer.removeAll(keepingCapacity: true)
             lead = nil
         }
@@ -2653,7 +2736,7 @@ final class ChatStore: ObservableObject {
                 // System messages always stand alone — flush whatever
                 // came before, emit the system turn, and reset.
                 flush()
-                out.append(TurnSummary(
+                let summary = TurnSummary(
                     id: m.id,
                     createdAt: .now,
                     userMessageID: m.id,
@@ -2665,7 +2748,8 @@ final class ChatStore: ObservableObject {
                     flags: [.isSystem],
                     toolCallCount: 0,
                     totalGeneratedTokens: 0,
-                    turnCostUSD: nil))
+                    turnCostUSD: nil)
+                out.append((summary, []))
             }
         }
         flush()

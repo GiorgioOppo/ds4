@@ -117,6 +117,45 @@ final class SynthesizeTurnsTests: XCTestCase {
         XCTAssertTrue(turns[0].finalContentIsTruncated)
     }
 
+    // MARK: synthesizeTurnsAndRounds (bulk path used by syncV2State)
+
+    func testBulkSynth_singlePassMatchesPerTurnAndPerRoundPaths() {
+        let u1 = StoredMessage(role: .user, content: "a")
+        let a1 = StoredMessage(role: .assistant, content: "ans1",
+                                reasoningContent: "r1")
+        let a2 = StoredMessage(role: .assistant, content: "ans2",
+                                toolCalls: [
+                                    StoredToolCall(name: "t",
+                                                    args: "{}")
+                                ])
+        let u2 = StoredMessage(role: .user, content: "b")
+        let a3 = StoredMessage(role: .assistant, content: "ans3")
+        let messages = [u1, a1, a2, u2, a3]
+
+        let pairs = ChatStore.synthesizeTurnsAndRounds(from: messages)
+        XCTAssertEqual(pairs.count, 2)
+
+        // Turn 1: lead u1, two rounds (a1, a2)
+        XCTAssertEqual(pairs[0].summary.userText, "a")
+        XCTAssertEqual(pairs[0].summary.roundIDs, [a1.id, a2.id])
+        XCTAssertEqual(pairs[0].rounds.count, 2)
+        XCTAssertEqual(pairs[0].rounds[0].content, "ans1")
+        XCTAssertEqual(pairs[0].rounds[0].reasoningContent, "r1")
+        XCTAssertEqual(pairs[0].rounds[0].roundIndex, 0)
+        XCTAssertEqual(pairs[0].rounds[1].content, "ans2")
+        XCTAssertEqual(pairs[0].rounds[1].toolCalls.first?.name, "t")
+        XCTAssertEqual(pairs[0].rounds[1].roundIndex, 1)
+
+        // Turn 2: lead u2, one round (a3)
+        XCTAssertEqual(pairs[1].summary.userText, "b")
+        XCTAssertEqual(pairs[1].rounds.count, 1)
+        XCTAssertEqual(pairs[1].rounds[0].content, "ans3")
+
+        // Equivalence: synthesizeTurns is just .map { $0.summary }
+        let turns = ChatStore.synthesizeTurns(from: messages)
+        XCTAssertEqual(turns, pairs.map { $0.summary })
+    }
+
     // MARK: synthesizeRound
 
     func testSynthesizeRound_returnsAssistantPayloadByID() {

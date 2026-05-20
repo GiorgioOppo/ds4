@@ -384,6 +384,15 @@ struct RoundLRUCache {
         return v
     }
 
+    /// Non-mutating read. Useful when the caller only wants to
+    /// compare the cached payload against a freshly-synthesised one
+    /// without perturbing the LRU eviction order. PR 3b's
+    /// `syncV2State` uses this on every render to decide which
+    /// round files actually need a write.
+    func peek(_ key: RoundKey) -> StoredRound? {
+        values[key]
+    }
+
     mutating func put(_ key: RoundKey, _ value: StoredRound) {
         values[key] = value
         clock &+= 1
