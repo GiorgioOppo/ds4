@@ -947,7 +947,7 @@ entries to restrict the model to those names, or omit the field to
 expose every MCP tool the desktop app currently has connected. The
 schemas inside `tools[]` are ignored — the server uses the
 authoritative schema from the MCP server itself. Tool dispatch runs
-server-side (up to 8 round-trips per request); only the final
+server-side (up to 21 round-trips per request); only the final
 text-only round streams to the client.
 
 Limitations of the first cut:

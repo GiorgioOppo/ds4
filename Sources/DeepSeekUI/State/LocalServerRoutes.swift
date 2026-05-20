@@ -21,7 +21,7 @@ import DeepSeekKit
 ///      no `toolCalls`, emit the text to the client and we're done.
 ///   4. Otherwise: append the assistant turn to the in-memory
 ///      history, invoke each tool via the controller, slot the
-///      results into `toolOutputs`, and loop. Cap at 8 round-trips
+///      results into `toolOutputs`, and loop. Cap at 21 round-trips
 ///      to bound runaway models — the cap matches `ChatStore`'s
 ///      `maxToolRoundtripsPerTurn`.
 ///
@@ -34,7 +34,7 @@ import DeepSeekKit
 enum LocalServerRoutes {
     /// Hard cap on tool-call iterations per request. Same constant
     /// as ChatStore's local loop.
-    private static let maxToolRoundtripsPerTurn = 8
+    private static let maxToolRoundtripsPerTurn = 21
 
     /// Wire every supported route onto `server`. Call once after
     /// `LocalServer.start(...)` succeeds. `controller` brokers all

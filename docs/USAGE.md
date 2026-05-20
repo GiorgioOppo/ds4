@@ -290,7 +290,7 @@ the bubble fill in. Differences specific to remote:
 Same MCP plumbing as local. When the chat is on an OpenRouter
 endpoint, the MCP catalogue (filtered through the agent's
 allowlist if one is attached) is translated to the OpenAI `tools`
-array. Tool calls fire HTTP round-trips up to 8 iterations per
+array. Tool calls fire HTTP round-trips up to 21 iterations per
 turn; outputs splice back as `{role:"tool", tool_call_id, content}`
 messages.
 

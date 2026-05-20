@@ -37,42 +37,9 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(c.messages) { msg in
-                            // Drop progress indicators where they belong
-                            // in the flow: right between the user prompt
-                            // and the about-to-be-filled assistant turn.
-                            // The placeholder is always the last message
-                            // with empty content while we're prefilling
-                            // or just starting to stream.
-                            if shouldShowInlineProgress(for: msg, in: c, phase: phase) {
-                                inlineProgress(phase)
-                            }
-                            // Prefill trace: blocco grigio collassabile
-                            // fra l'user message precedente e la
-                            // risposta dell'assistente al primo turn
-                            // cold. Appare solo se `prefillTrace` non è
-                            // nil (= ChatStore ha raccolto chunk da
-                            // `.prefillToken`). Espanso live durante il
-                            // prefill, collassato dopo.
-                            if let trace = msg.prefillTrace, !trace.isEmpty,
-                               msg.role == .assistant {
-                                PrefillTraceDisclosure(
-                                    trace: trace,
-                                    isStreaming: isPrefillingPlaceholder(
-                                        msg, in: c, phase: phase))
-                                    .padding(.leading, 40)
-                            }
-                            MessageView(
-                                message: msg,
-                                isStreaming: isStreamingPlaceholder(msg, in: c, phase: phase),
-                                streamingReasoning:
-                                    streamingReasoning(for: msg,
-                                                        in: c,
-                                                        phase: phase),
-                                agentResolver: { name in
-                                    store.agents.agents.first(where: { $0.name == name })
-                                })
-                            .id(msg.id)
+                        ForEach(groupedItems(c.messages)) { item in
+                            renderItem(item, in: c, phase: phase)
+                                .id(item.id)
                         }
                         if case .streaming(_, _, _, let metrics) = phase {
                             // Throughput bar stays in the trailing slot
@@ -429,10 +396,115 @@ struct ChatView: View {
         return 0
     }
 
+    // MARK: - turn grouping
+
+    /// Render-only grouping of the conversation's flat `[StoredMessage]`
+    /// into per-turn buckets. The chat backend keeps every model pass
+    /// (each generate → tool calls → tool outputs roundtrip) as its own
+    /// assistant message; we collapse consecutive assistant messages
+    /// into a single `.assistantTurn` so the UI shows one bubble per
+    /// logical reply, no matter how many tool roundtrips it took.
+    private enum ChatItem: Identifiable {
+        case user(StoredMessage)
+        case system(StoredMessage)
+        case assistantTurn(messages: [StoredMessage])
+
+        /// Stable identifier — the FIRST message id of an assistant
+        /// turn is used so new mid-turn rounds appended during
+        /// streaming don't churn the ForEach diff (which would tear
+        /// down DisclosureGroup @State for every open tool row).
+        var id: String {
+            switch self {
+            case .user(let m):           return "u-\(m.id.uuidString)"
+            case .system(let m):         return "s-\(m.id.uuidString)"
+            case .assistantTurn(let ms): return "a-\(ms.first!.id.uuidString)"
+            }
+        }
+    }
+
+    private func groupedItems(_ messages: [StoredMessage]) -> [ChatItem] {
+        var out: [ChatItem] = []
+        var batch: [StoredMessage] = []
+        for m in messages {
+            switch m.role {
+            case .assistant:
+                batch.append(m)
+            case .user:
+                if !batch.isEmpty {
+                    out.append(.assistantTurn(messages: batch))
+                    batch.removeAll()
+                }
+                out.append(.user(m))
+            case .system:
+                if !batch.isEmpty {
+                    out.append(.assistantTurn(messages: batch))
+                    batch.removeAll()
+                }
+                out.append(.system(m))
+            }
+        }
+        if !batch.isEmpty {
+            out.append(.assistantTurn(messages: batch))
+        }
+        return out
+    }
+
+    @ViewBuilder
+    private func renderItem(_ item: ChatItem,
+                            in c: Conversation,
+                            phase: GenerationPhase) -> some View {
+        switch item {
+        case .user(let msg):
+            MessageView(message: msg)
+        case .system(let msg):
+            MessageView(message: msg)
+        case .assistantTurn(let messages):
+            VStack(alignment: .leading, spacing: 16) {
+                // Inline progress: the placeholder sits at the tail of
+                // the LAST assistant turn during prefilling / pre-token
+                // streaming. Anchored above the bubble so the spinner
+                // visually leads the soon-to-be reply.
+                if let last = messages.last,
+                   shouldShowInlineProgress(for: last, in: c, phase: phase)
+                {
+                    inlineProgress(phase)
+                }
+                // Prefill trace: stamped on the FIRST round of the
+                // first cold turn (later roundtrips reuse the warm
+                // KV cache and don't produce a trace).
+                if let first = messages.first,
+                   let trace = first.prefillTrace, !trace.isEmpty
+                {
+                    PrefillTraceDisclosure(
+                        trace: trace,
+                        isStreaming: isPrefillingPlaceholder(
+                            first, in: c, phase: phase))
+                        .padding(.leading, 40)
+                }
+                AssistantTurnView(
+                    messages: messages,
+                    isStreamingFinal: messages.last.map {
+                        isStreamingPlaceholder($0, in: c, phase: phase)
+                    } ?? false,
+                    streamingReasoning: messages.last.flatMap {
+                        streamingReasoning(for: $0, in: c, phase: phase)
+                    },
+                    agentResolver: { name in
+                        store.agents.agents.first(where: { $0.name == name })
+                    })
+            }
+        }
+    }
+
     private func scrollToBottom(_ proxy: ScrollViewProxy, _ c: Conversation) {
-        guard let last = c.messages.last else { return }
+        // Scroll to the LAST ChatItem (a user/system message or an
+        // assistant turn group) rather than to the last raw message.
+        // Mid-turn the turn's id stays stable while new round messages
+        // are appended, so the scroll target keeps resolving and the
+        // per-tool DisclosureGroup @State doesn't churn.
+        guard let lastID = groupedItems(c.messages).last?.id else { return }
         withAnimation(.easeOut(duration: 0.15)) {
-            proxy.scrollTo(last.id, anchor: .bottom)
+            proxy.scrollTo(lastID, anchor: .bottom)
         }
     }
 
