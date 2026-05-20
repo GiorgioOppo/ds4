@@ -39,10 +39,21 @@ struct DeepSeekUIApp: App {
         // to load a model. The pool reads the flag at every
         // `ensureLayer` call so a later UI change also takes effect
         // mid-session, but doing it here keeps the very first token
-        // of the first run on the right path. The kit-side default
-        // is already `true`, so this only matters for users who
-        // explicitly turned the toggle off in a prior session.
-        StreamingPool.lazyExpertEnabled = AppSettings.lazyExpertLoad
+        // of the first run on the right path.
+        //
+        // IMPORTANT: if `DEEPSEEK_LAZY_EXPERT` is set in the
+        // environment, it WINS — both `StreamingPool.swift`'s class
+        // doc and the kit-side static initializer treat the env var
+        // as the override of last resort, so we must not clobber it
+        // here. Without this guard, launching with the env var set
+        // gets silently overridden by whatever happens to be in
+        // `UserDefaults` (false for users who never touched the
+        // toggle), and the "DEEPSEEK_LAZY_EXPERT=1 forces it on"
+        // contract advertised in the kit comment is broken.
+        if ProcessInfo.processInfo
+            .environment["DEEPSEEK_LAZY_EXPERT"] == nil {
+            StreamingPool.lazyExpertEnabled = AppSettings.lazyExpertLoad
+        }
 
         let service = InferenceService()
         self.service = service
