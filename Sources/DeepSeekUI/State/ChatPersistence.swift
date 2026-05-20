@@ -426,9 +426,15 @@ struct RoundLRUCache {
 
     private mutating func evictIfNeeded() {
         while values.count > capacity {
+            // Snapshot `pins` into a local so the filter closure
+            // doesn't try to capture `self` — escaping closures
+            // can't capture the mutating `self` of a struct method.
+            // `Set` is a value type so the snapshot is independent
+            // of subsequent pin mutations during this loop.
+            let pinsSnapshot = pins
             let candidate = ages
                 .lazy
-                .filter { !self.pins.contains($0.key) }
+                .filter { !pinsSnapshot.contains($0.key) }
                 .min(by: { $0.value < $1.value })?.key
             guard let victim = candidate else {
                 // Every entry pinned — cannot evict. The cache will
