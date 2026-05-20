@@ -309,10 +309,10 @@ public final class WeightLoader {
             try pool.ensureTensors(layer: K, names: names)
         } catch {
             if MemoryLogger.enabled {
-                FileHandle.standardError.write(Data(
-                    "[pool] ensureExperts(layer=\(K), n=\(indices.count)) failed: " +
-                    "\(error.localizedDescription)\n"
-                        .utf8))
+                let msg = "[pool] ensureExperts(layer=\(K), " +
+                          "n=\(indices.count)) failed: " +
+                          "\(error.localizedDescription)\n"
+                FileHandle.standardError.write(Data(msg.utf8))
             }
         }
     }
