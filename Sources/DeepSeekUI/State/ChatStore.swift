@@ -115,6 +115,29 @@ final class ChatStore: ObservableObject {
     /// the legacy `{UUID}.json`. PR 3 will move reads onto this path
     /// and stop writing the legacy file for new chats.
     private let chatPersistence = ChatPersistence()
+
+    /// Round payload cache shared by every chat (capacity is across
+    /// the app, not per chat). Pinned entries — the in-flight
+    /// streaming round and any round whose disclosure is open —
+    /// stay warm; everything else can be evicted under memory
+    /// pressure. The legacy synth path doesn't populate the cache:
+    /// it re-derives rounds from `c.messages` every call because
+    /// the in-memory transcript is already the source of truth.
+    private var roundLRU = RoundLRUCache(capacity: 64)
+
+    /// Memoisation of the legacy synth pipeline: keep the last
+    /// `[StoredMessage]` we computed `[TurnSummary]` for, keyed by
+    /// chat id. A simple ObjectIdentifier-style identity comparison
+    /// won't work on a Swift value-type array; we use a content
+    /// fingerprint (count + last id + last content length) which is
+    /// O(1) and stable enough to cut 99% of re-synthesis cost
+    /// during streaming, where only the last message's content
+    /// grows token-by-token.
+    private struct SynthCacheEntry {
+        var fingerprint: SynthFingerprint
+        var turns: [TurnSummary]
+    }
+    private var synthCache: [UUID: SynthCacheEntry] = [:]
     /// Per-conversation count of how many tool-call -> generate
     /// continuations have fired since the latest user turn. Cleared
     /// the moment a `.done` arrives without tool calls (= final
@@ -324,6 +347,12 @@ final class ChatStore: ObservableObject {
         // Single FS call covers manifest, KV cache, pending
         // snapshot, and any turn/round files PR 3 will write here.
         try? chatPersistence.deleteChat(id: id)
+        // PR 3a: drop synth/LRU entries for this chat so a recycled
+        // UUID can't ever read stale summaries.
+        synthCache.removeValue(forKey: id)
+        for key in Array(roundLRU.allKeys) where key.chatID == id {
+            roundLRU.remove(key)
+        }
         if selectedID == id {
             selectedID = conversations.first?.id
         }
@@ -2525,5 +2554,247 @@ final class ChatStore: ObservableObject {
     /// Stage a debounced manifest dual-write for a v2 chat.
     private func scheduleManifestForV2(_ c: Conversation) {
         chatPersistence.scheduleManifestSave(manifest(from: c))
+    }
+
+    // MARK: - v2 lazy-loading API (PR 3a — dead code)
+    //
+    // These two methods are the read surface the UI will consume in
+    // PR 3b: `turns(of:)` returns the per-turn summary list and
+    // `loadRound(_:)` fetches one round's full payload. They work
+    // for BOTH legacy and v2 chats: legacy chats synthesise summaries
+    // from the in-memory `[StoredMessage]` array on every call
+    // (memoised by a content fingerprint), v2 chats will read
+    // pre-written summary / round files once PR 3b adds the write
+    // path. For now the v2 read paths fall back on the same synth
+    // so the UI doesn't observe a regression when PR 3b lands.
+
+    /// Per-turn summaries for `chatID`, in chronological order.
+    /// Synth-derived from `conversations[idx].messages` for both
+    /// legacy and v2 chats in PR 3a; PR 3b will read summary files
+    /// for v2 chats directly. Returns an empty array when the chat
+    /// id isn't known to the store.
+    func turns(of chatID: UUID) -> [TurnSummary] {
+        guard let c = conversations.first(where: { $0.id == chatID }) else {
+            return []
+        }
+        let fingerprint = SynthFingerprint(messages: c.messages)
+        if let cached = synthCache[chatID],
+           cached.fingerprint == fingerprint
+        {
+            return cached.turns
+        }
+        let turns = Self.synthesizeTurns(from: c.messages)
+        synthCache[chatID] = SynthCacheEntry(
+            fingerprint: fingerprint, turns: turns)
+        return turns
+    }
+
+    /// Full payload for one round. Synth-derived in PR 3a; PR 3b
+    /// adds a disk read path keyed on `RoundKey`, with the
+    /// `roundLRU` cache in front of it. Returns nil when the
+    /// `(chatID, turnID, roundID)` triple isn't present in the
+    /// in-memory transcript.
+    func loadRound(_ key: RoundKey) -> StoredRound? {
+        if let cached = roundLRU.get(key) { return cached }
+        guard let c = conversations.first(where: { $0.id == key.chatID })
+        else { return nil }
+        guard let round = Self.synthesizeRound(
+            from: c.messages, turnID: key.turnID, roundID: key.roundID)
+        else { return nil }
+        return round
+    }
+
+    // MARK: - synthesizer (legacy ↔ v2 bridge)
+
+    /// Walk `messages` once and bucket consecutive assistants into
+    /// the turn opened by the preceding user (or system) message.
+    /// One `TurnSummary` per bucket; each summary's `roundIDs`
+    /// captures the assistant `StoredMessage.id`s in order so a
+    /// later `loadRound(_:)` can locate the right entry back.
+    ///
+    /// Mirrors the previous `ChatView.groupedItems` grouping so
+    /// existing chats render identically under the new pipeline:
+    /// system messages get their own `.isSystem` turn with no
+    /// rounds; user messages start a turn whose rounds are filled
+    /// by every assistant message until the next user / system.
+    nonisolated static func synthesizeTurns(
+        from messages: [StoredMessage]
+    ) -> [TurnSummary] {
+        var out: [TurnSummary] = []
+        var buffer: [StoredMessage] = []
+        var lead: StoredMessage?
+
+        func flush() {
+            guard let leadMsg = lead else {
+                // Orphan assistant messages with no preceding user —
+                // shouldn't happen in practice but we render them as
+                // a synthetic empty-user turn so they don't vanish.
+                if !buffer.isEmpty {
+                    out.append(makeTurn(
+                        lead: StoredMessage(role: .user, content: ""),
+                        rounds: buffer))
+                    buffer.removeAll(keepingCapacity: true)
+                }
+                return
+            }
+            out.append(makeTurn(lead: leadMsg, rounds: buffer))
+            buffer.removeAll(keepingCapacity: true)
+            lead = nil
+        }
+
+        for m in messages {
+            switch m.role {
+            case .assistant:
+                buffer.append(m)
+            case .user:
+                flush()
+                lead = m
+            case .system:
+                // System messages always stand alone — flush whatever
+                // came before, emit the system turn, and reset.
+                flush()
+                out.append(TurnSummary(
+                    id: m.id,
+                    createdAt: .now,
+                    userMessageID: m.id,
+                    userText: m.content,
+                    userTokenCount: m.tokenCount,
+                    finalContentPreview: "",
+                    finalContentIsTruncated: false,
+                    roundIDs: [],
+                    flags: [.isSystem],
+                    toolCallCount: 0,
+                    totalGeneratedTokens: 0,
+                    turnCostUSD: nil))
+            }
+        }
+        flush()
+        return out
+    }
+
+    /// Construct one `TurnSummary` from a `(user, assistantRounds)`
+    /// pair. Aggregates flags, tool-call count, and a preview of
+    /// the final round's content. Used by both `synthesizeTurns`
+    /// and (in PR 3b) the live-update path that builds summaries
+    /// incrementally during streaming.
+    nonisolated static func makeTurn(
+        lead: StoredMessage, rounds: [StoredMessage]
+    ) -> TurnSummary {
+        var flags: TurnFlags = []
+        var toolCallCount = 0
+        var totalGeneratedTokens = 0
+        for r in rounds {
+            if let rc = r.reasoningContent, !rc.isEmpty {
+                flags.insert(.hasReasoning)
+            }
+            if !r.toolCalls.isEmpty {
+                flags.insert(.hasToolCalls)
+                toolCallCount += r.toolCalls.count
+                if r.toolCalls.contains(where: {
+                    $0.name == EncodingDSV4.delegateToolName
+                }) {
+                    flags.insert(.hasDelegation)
+                }
+            }
+            if let pt = r.prefillTrace, !pt.isEmpty {
+                flags.insert(.hasPrefillTrace)
+            }
+            if let tc = r.tokenCount { totalGeneratedTokens += tc }
+        }
+        let finalContent = rounds.last?.content ?? ""
+        let (preview, truncated) = Self.previewSlice(finalContent)
+        return TurnSummary(
+            id: lead.id,
+            createdAt: .now,
+            userMessageID: lead.id,
+            userText: lead.content,
+            userTokenCount: lead.tokenCount,
+            finalContentPreview: preview,
+            finalContentIsTruncated: truncated,
+            roundIDs: rounds.map(\.id),
+            flags: flags,
+            toolCallCount: toolCallCount,
+            totalGeneratedTokens: totalGeneratedTokens,
+            turnCostUSD: nil)
+    }
+
+    /// Look up one round inside a synthesised transcript. The
+    /// `turnID` matches the lead user/system message id (the turn's
+    /// stable identifier); `roundID` matches the assistant message
+    /// id in `roundIDs`. Returns the assistant message rebuilt as a
+    /// `StoredRound`, or nil when either id doesn't resolve.
+    nonisolated static func synthesizeRound(
+        from messages: [StoredMessage],
+        turnID: UUID,
+        roundID: UUID
+    ) -> StoredRound? {
+        // Find the lead message + the index in `messages` that opens
+        // this turn. Walk forward across consecutive assistants and
+        // pick the one whose id matches `roundID`.
+        guard let leadIdx = messages.firstIndex(where: { $0.id == turnID })
+        else { return nil }
+        var i = leadIdx + 1
+        var roundIndex = 0
+        while i < messages.count, messages[i].role == .assistant {
+            if messages[i].id == roundID {
+                return Self.makeRound(from: messages[i],
+                                       roundIndex: roundIndex)
+            }
+            roundIndex += 1
+            i += 1
+        }
+        return nil
+    }
+
+    nonisolated static func makeRound(
+        from m: StoredMessage, roundIndex: Int
+    ) -> StoredRound {
+        StoredRound(
+            id: m.id,
+            roundIndex: roundIndex,
+            content: m.content,
+            reasoningContent: m.reasoningContent,
+            toolCalls: m.toolCalls,
+            toolOutputs: m.toolOutputs,
+            prefillTrace: m.prefillTrace,
+            tokenCount: m.tokenCount)
+    }
+
+    /// Truncate `content` to roughly 2 KB so the summary stays
+    /// light. The cutoff is character-based (not byte-based) to
+    /// keep the UI predictable; the small overshoot in UTF-8 byte
+    /// count is fine — the file is still kilobyte-scale.
+    nonisolated private static func previewSlice(
+        _ content: String
+    ) -> (String, Bool) {
+        let limit = 2048
+        if content.count <= limit { return (content, false) }
+        let cutoff = content.index(content.startIndex, offsetBy: limit)
+        return (String(content[..<cutoff]), true)
+    }
+}
+
+/// Lightweight content fingerprint of a `[StoredMessage]` array.
+/// `Equatable` so the synth memoisation cache can decide whether a
+/// re-synth is needed; intentionally NOT a full hash of every
+/// message (that would walk the whole transcript on every render).
+/// What's captured is enough to detect:
+///   * append (count changed),
+///   * mutation of the streaming target (last message's id + its
+///     content length changed),
+///   * tool-output landing on the last assistant (last message's
+///     toolOutputs count changed).
+struct SynthFingerprint: Equatable {
+    let count: Int
+    let lastID: UUID?
+    let lastContentCount: Int
+    let lastToolOutputsCount: Int
+
+    init(messages: [StoredMessage]) {
+        self.count = messages.count
+        self.lastID = messages.last?.id
+        self.lastContentCount = messages.last?.content.count ?? 0
+        self.lastToolOutputsCount =
+            messages.last?.toolOutputs?.count ?? 0
     }
 }

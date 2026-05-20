@@ -408,6 +408,12 @@ struct RoundLRUCache {
     var count: Int { values.count }
     func contains(_ key: RoundKey) -> Bool { values[key] != nil }
     func isPinned(_ key: RoundKey) -> Bool { pins.contains(key) }
+    /// Snapshot of every key currently cached, in unspecified
+    /// order. Useful for batch eviction on chat delete: walk the
+    /// snapshot, filter by `chatID`, call `remove(_:)` per match.
+    /// The returned array doesn't keep the cache live — safe to
+    /// iterate while mutating.
+    var allKeys: [RoundKey] { Array(values.keys) }
 
     private mutating func evictIfNeeded() {
         while values.count > capacity {
