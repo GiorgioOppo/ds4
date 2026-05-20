@@ -32,16 +32,17 @@ air_files=()
 # (Xcode → Debug → Metal → step through kernels), but the App Store
 # validator rejects any .metallib that ships debug info or source
 # ("Found Metal shader source code", error 90659 / Transporter
-# 90258). Xcode sets CONFIGURATION=Release for Archive builds —
-# the only path that ends up at App Store Connect — so we drop both
-# flags then and keep them for every other build (plain
-# `swift build`, Xcode Debug, etc.) where the shader debugger is
-# useful. Override with `DEEPSEEK_METALLIB_DEBUG=0` to strip even
-# outside Xcode Release (e.g. when building a notarized direct-
-# download .app via `swift build -c release`).
-metal_debug_flags=( -gline-tables-only -frecord-sources )
-if [ "${CONFIGURATION:-}" = "Release" ] || [ "${DEEPSEEK_METALLIB_DEBUG:-1}" = "0" ]; then
-    metal_debug_flags=()
+# 90258). SwiftPM `prebuildCommand` plugins do NOT reliably inherit
+# Xcode's `CONFIGURATION` env var across xcodebuild/archive flows —
+# we used to strip on `CONFIGURATION=Release` and it slipped through
+# anyway on at least one archive that reached the App Store. Default
+# is now "strip" so every release path is safe by construction;
+# developers who want the shader debugger opt in explicitly with
+# `DEEPSEEK_METALLIB_DEBUG=1` (e.g. via a scheme env var, or
+# `DEEPSEEK_METALLIB_DEBUG=1 swift build`).
+metal_debug_flags=()
+if [ "${DEEPSEEK_METALLIB_DEBUG:-0}" = "1" ]; then
+    metal_debug_flags=( -gline-tables-only -frecord-sources )
 fi
 
 for metal in "${metal_files[@]}"; do
