@@ -270,23 +270,6 @@ public final class MoEFFN {
                 }
             }
             if !active.isEmpty {
-                // First few layers only: log the routing so we can
-                // spot whether lazy keeps loading the same experts
-                // (a bug) or correctly tracks per-token routing
-                // changes across decode steps. We're already inside
-                // the lazy path (the hook is only installed when
-                // lazy is enabled), so no extra env-var gate needed
-                // — keeping the line behind another flag would
-                // require the user to set two env vars to debug a
-                // bug they're already debugging with one.
-                if layerId < 4 {
-                    let head = active.prefix(8)
-                        .map(String.init).joined(separator: ",")
-                    let line = "[moe] layer=\(layerId) hook fired " +
-                               "active=\(active.count)/\(nExperts) " +
-                               "first8=[\(head)] N=\(N)\n"
-                    FileHandle.standardError.write(Data(line.utf8))
-                }
                 hook(layerId, active)
             }
         }
