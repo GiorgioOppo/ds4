@@ -366,11 +366,12 @@ public final class StreamingPool {
             .environment["DEEPSEEK_LAZY_EXPERT"]?.lowercased() {
             return !(v == "0" || v == "false" || v == "off" || v == "no")
         }
-        // Default ON. The UI bridges `AppSettings.lazyExpertLoad`
-        // into this var on app startup and on every change; until
-        // that bridge runs (e.g. CLI binaries that don't link
-        // DeepSeekUI), keep the optimisation enabled by default.
-        return true
+        // Default OFF until the V4-Pro correctness regression
+        // ("<|begin_of_sentence|>" loop) is understood. The UI
+        // toggle in Loading Settings still flips this var, and the
+        // DEEPSEEK_LAZY_EXPERT env var still forces it ON from a
+        // shell. When the bug is fixed, flip this back to `true`.
+        return false
     }()
 
     /// Ensure layer K's shard is loaded into its sub-slot. Blocks

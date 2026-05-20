@@ -40,7 +40,7 @@ struct LoadingSettingsTab: View {
             }
 
             Section("Performance tweaks (ds4-inspired)") {
-                Toggle("Lazy-expert load (streaming MoE only)",
+                Toggle("Lazy-expert load (EXPERIMENTAL, streaming MoE only)",
                         isOn: $lazyExpertLoad)
                     .onChange(of: lazyExpertLoad) { _, newValue in
                         // Push the new value to DeepSeekKit so the
@@ -48,16 +48,19 @@ struct LoadingSettingsTab: View {
                         // pread without needing a model reload.
                         StreamingPool.lazyExpertEnabled = newValue
                     }
-                Text("Solo strategy `streaming`. Carica per token i " +
-                     "tensor non-expert del layer (attention, norms, " +
-                     "gate, shared expert) e poi pread on-demand " +
-                     "solo gli expert attivi indicati dal gate " +
-                     "(~8/256 in V4-Pro). Su checkpoint con " +
-                     "oversubscription elevata (es. 148 GB su 16 GB " +
-                     "RAM) taglia l'I/O per token di ~7-15× ed evita " +
-                     "l'errore `Impacting Interactivity` del watchdog " +
-                     "GPU. Default ON. Override env: " +
-                     "`DEEPSEEK_LAZY_EXPERT=0` forza OFF da shell.")
+                Text("⚠️ Sperimentale, default OFF. Su strategy " +
+                     "`streaming` carica per token solo i tensor " +
+                     "non-expert del layer (attention, norms, gate, " +
+                     "shared expert) e poi pread on-demand degli " +
+                     "expert attivi indicati dal gate (~8/256 in " +
+                     "V4-Pro). Sulla carta taglia l'I/O per token " +
+                     "di ~7-15× su checkpoint con oversubscription " +
+                     "elevata (148 GB su 16 GB RAM) ed evita il " +
+                     "watchdog `Impacting Interactivity`. " +
+                     "**Regressione nota su V4-Pro**: produce logits " +
+                     "degeneri (loop di `<|begin_of_sentence|>`). " +
+                     "Attiva solo se vuoi aiutare a fare bisect. " +
+                     "Override env: `DEEPSEEK_LAZY_EXPERT=1` forza ON.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 

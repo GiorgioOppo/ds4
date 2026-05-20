@@ -142,16 +142,15 @@ enum AppSettings {
     static var forceLoad: Bool {
         UserDefaults.standard.bool(forKey: AppSettingsKey.forceLoad)
     }
-    /// `bool(forKey:)` always defaults to `false`; this getter returns
-    /// `true` when the key was never written, so brand-new installs
-    /// pick up the lazy-expert path automatically (the right default
-    /// for streaming-mode MoE checkpoints).
+    /// `bool(forKey:)` always defaults to `false`; this getter keeps
+    /// that semantics for the lazy-expert toggle (default OFF) until
+    /// the correctness regression on V4-Pro checkpoints is tracked
+    /// down — the lazy path emits degenerate logits ("<|begin_of_
+    /// sentence|>" loop) on the user's 148 GB checkpoint while the
+    /// legacy full-shard pread produces correct text. Re-enable via
+    /// the Loading settings tab once we have a fix.
     static var lazyExpertLoad: Bool {
-        let ud = UserDefaults.standard
-        if ud.object(forKey: AppSettingsKey.lazyExpertLoad) == nil {
-            return true
-        }
-        return ud.bool(forKey: AppSettingsKey.lazyExpertLoad)
+        UserDefaults.standard.bool(forKey: AppSettingsKey.lazyExpertLoad)
     }
     static var lastModelDir: String? {
         UserDefaults.standard.string(forKey: AppSettingsKey.lastModelDir)
