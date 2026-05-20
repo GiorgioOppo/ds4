@@ -289,6 +289,31 @@ public struct ModelConfig: Codable, Sendable {
         } else {
             self.prunedExperts = []
         }
+
+        // Runtime override: `DEEPSEEK_TOPK_EXPERTS=N` bumps the
+        // per-token active-expert count without rebuilding the
+        // checkpoint. Useful for quick A/B on whether more experts
+        // helps a specific workload (cost is roughly linear in
+        // topK on the FFN dispatch path). Applies only to learned-
+        // routing layers — hash-routed layers (the first
+        // `nHashLayers`) read from a fixed-shape `tid2eid` lookup
+        // table whose K column was set at training time, and
+        // `Gate.init` snaps them back to that K regardless of this
+        // override. The MoE layer pulls its dispatch K from
+        // `Gate.topK` so the two stay in sync.
+        if let raw = ProcessInfo.processInfo
+            .environment["DEEPSEEK_TOPK_EXPERTS"],
+           let newK = Int(raw), newK > 0,
+           newK != self.nActivatedExperts {
+            let oldK = self.nActivatedExperts
+            self.nActivatedExperts = newK
+            let line = "[config] DEEPSEEK_TOPK_EXPERTS override: " +
+                       "nActivatedExperts \(oldK) → \(newK) " +
+                       "(applies to learned-routing layers; first " +
+                       "\(self.nHashLayers) hash-routed layer(s) " +
+                       "stay at trained K)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
     }
 
     /// Per-layer effective head dimensions.

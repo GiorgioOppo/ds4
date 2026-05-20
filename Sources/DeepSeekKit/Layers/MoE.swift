@@ -32,7 +32,6 @@ public final class Gate {
 
     public init(config: ModelConfig, layerId: Int,
                 weight: Linear, bias: Tensor?, tid2eid: Tensor?) {
-        self.topK = config.nActivatedExperts
         self.nExperts = config.nRoutedExperts
         self.scoreFunc = ScoreFunc(config.scoreFunc)
         self.routeScale = config.routeScale
@@ -40,6 +39,20 @@ public final class Gate {
         self.weight = weight
         self.bias = bias
         self.tid2eid = tid2eid
+        // Effective topK is per-layer. Learned-routing layers
+        // (layerId >= nHashLayers) take whatever the config says,
+        // which may have been bumped at runtime via the
+        // `DEEPSEEK_TOPK_EXPERTS` env var (Config.init applies the
+        // override). Hash-routed layers index into `tid2eid` whose
+        // column count was fixed at training time — overriding past
+        // that would read garbage from the next vocabulary row, so
+        // we pin topK to the table's actual K here regardless of
+        // what the user set globally.
+        if self.hashRouting, let tid = tid2eid {
+            self.topK = tid.shape[1]
+        } else {
+            self.topK = config.nActivatedExperts
+        }
 
         // Specialise the moe_gate kernel with this gate's score func +
         // scale. Veicolati attraverso `PipelineConstants` per condividere
@@ -222,7 +235,14 @@ public final class MoEFFN {
         self.sharedExpert = shared
         self.dim = config.dim
         self.nExperts = config.nRoutedExperts
-        self.topK = config.nActivatedExperts
+        // Take topK from the gate — for learned-routing layers this
+        // is config.nActivatedExperts (possibly overridden by the
+        // DEEPSEEK_TOPK_EXPERTS env var); for hash-routing layers
+        // Gate.init pins it to the tid2eid table's column count.
+        // Reading from config here directly would diverge from the
+        // gate on hash layers and read past the gate's [N, topK]
+        // output buffer during dispatch planning.
+        self.topK = gate.topK
     }
 
     /// `x`: [B, S, D] f32. `inputIds`: [B*S] (used for hash routing only).
