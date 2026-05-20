@@ -20,6 +20,7 @@ public final class Linear {
     private static let pF32BF16SG     = Device.shared.makePipeline("gemm_f32_bf16_to_f32_sg")
     private static let pF32           = Device.shared.makePipeline("gemm_f32_to_f32")
     private static let pFP8           = Device.shared.makePipeline("gemm_fp8_to_f32")
+    private static let pFP8SG         = Device.shared.makePipeline("gemm_fp8_to_f32_sg")
     private static let pFP4           = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
     private static let pInt8F32       = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
     private static let pInt8BF16      = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
@@ -198,19 +199,40 @@ public final class Linear {
         let act = aq.quant(x.reshape([M, inFeatures]), inplace: false, in: cmd)
         guard let qbytes = act.qbytes else { fatalError("ActQuant did not produce qbytes") }
 
+        // simdgroup_matrix path needs M%32, N%32 AND K%128 (the FP8
+        // weight-scale block size). `canUseSG` enforces the first two;
+        // K%128 is FP8-specific because the simdgroup variant walks
+        // K in 128-element blocks (one b_scale per block) and we
+        // haven't implemented the partial-trailing-block branch.
+        // Falls back to the scalar `gemm_fp8_to_f32` kernel when the
+        // shape doesn't fit — common during decode where M=1.
+        let N = outFeatures
+        let K = inFeatures
+        let useSG = Self.canUseSG(M: M, N: N, K: K) && K % 128 == 0
+        let pipeline = useSG ? Self.pFP8SG : Self.pFP8
+
         let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(Self.pFP8)
+        enc.setComputePipelineState(pipeline)
         enc.setBuffer(qbytes.buffer, offset: 0, index: 0)
         enc.setBuffer(act.scales.buffer, offset: 0, index: 1)
         enc.setBuffer(weight.buffer, offset: weight.offset, index: 2)
         enc.setBuffer(wScale.buffer, offset: wScale.offset, index: 3)
         enc.setBuffer(y.buffer, offset: 0, index: 4)
-        var dims = SIMD3<UInt32>(UInt32(M), UInt32(outFeatures), UInt32(inFeatures))
+        var dims = SIMD3<UInt32>(UInt32(M), UInt32(N), UInt32(K))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
 
-        let grid = MTLSize(width: outFeatures, height: M, depth: 1)
-        enc.dispatchThreads(grid,
-                            threadsPerThreadgroup: Self.pFP8.tunedThreadgroup(forGrid: grid))
+        if useSG {
+            // SG kernel: one threadgroup = one 32×32 output tile = one
+            // SIMD group (32 threads). Grid is in threadgroups, not
+            // threads, so we use `dispatchThreadgroups`.
+            let groups = MTLSize(width: N / 32, height: M / 32, depth: 1)
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+        } else {
+            let grid = MTLSize(width: N, height: M, depth: 1)
+            enc.dispatchThreads(grid,
+                                threadsPerThreadgroup: pipeline.tunedThreadgroup(forGrid: grid))
+        }
         enc.endEncoding()
     }
 
