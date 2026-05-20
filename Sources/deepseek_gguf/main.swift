@@ -331,7 +331,4 @@ let decodeElapsed = Date().timeIntervalSince(decodeStart)
 let tps = generatedIds.isEmpty
     ? 0.0
     : Double(generatedIds.count) / max(decodeElapsed, 1e-9)
-stderr.write(Data(
-    "Generated \(generatedIds.count) tokens in "
-    + "\(String(format: "%.2f", decodeElapsed))s "
-    + "(\(String(format: "%.1f", tps)) tok/s)\n".utf8))
+stderr.write(Data( "Generated \(generatedIds.count) tokens in \(String(format: "%.2f", decodeElapsed))s (\(String(format: "%.1f", tps)) tok/s)\n".utf8))
