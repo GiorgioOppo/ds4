@@ -108,6 +108,13 @@ final class ChatStore: ObservableObject {
 
     private let saveDebounce: TimeInterval = 0.5
     private var pendingSaves: [UUID: Task<Void, Never>] = [:]
+    /// Disk IO for the v2 lazy-loading chat layout (per-chat folder,
+    /// manifest + per-turn + per-round files). In PR 2 this layer is
+    /// dual-write only: `newChat()` creates the folder + writes
+    /// `chat.json`, and `flushSave` mirrors the manifest alongside
+    /// the legacy `{UUID}.json`. PR 3 will move reads onto this path
+    /// and stop writing the legacy file for new chats.
+    private let chatPersistence = ChatPersistence()
     /// Per-conversation count of how many tool-call -> generate
     /// continuations have fired since the latest user turn. Cleared
     /// the moment a `.done` arrives without tool calls (= final
@@ -221,6 +228,13 @@ final class ChatStore: ObservableObject {
                               endpoint: modelState.loadedEndpoint)
         conversations.insert(c, at: 0)
         selectedID = c.id
+        // PR 2: stamp this chat as v2 right away. The synchronous
+        // manifest write below creates the per-chat folder + the
+        // `chat.json` file before `scheduleSave` fires, so the
+        // first `flushSave` already sees `isV2Chat == true` and
+        // dual-writes the manifest. The legacy `{UUID}.json` stays
+        // the source of truth for reads; PR 3 will flip that.
+        try? chatPersistence.writeManifestImmediate(manifest(from: c))
         scheduleSave(c.id)
     }
 
@@ -306,6 +320,10 @@ final class ChatStore: ObservableObject {
         if let url = try? PersistencePaths.kvCacheURL(id: id) {
             try? FileManager.default.removeItem(at: url)
         }
+        // PR 2: also wipe the v2 per-chat folder if it exists.
+        // Single FS call covers manifest, KV cache, pending
+        // snapshot, and any turn/round files PR 3 will write here.
+        try? chatPersistence.deleteChat(id: id)
         if selectedID == id {
             selectedID = conversations.first?.id
         }
@@ -2476,5 +2494,36 @@ final class ChatStore: ObservableObject {
             // reflects everything correctly.
             phases[id] = .error("Save failed: \(error.localizedDescription)")
         }
+        // PR 2: dual-write the v2 manifest for any chat that has a
+        // per-chat folder. The legacy `{UUID}.json` above remains
+        // the source of truth for reads; PR 3 will flip that.
+        if PersistencePaths.isV2Chat(id: id) {
+            scheduleManifestForV2(c)
+        }
+    }
+
+    /// Build a v2 `ChatManifest` snapshot of `c`. `turnIDs` stays
+    /// empty in PR 2 — turn/round persistence lands in PR 3, when
+    /// the synthesizer that derives summaries from `c.messages`
+    /// goes live. Until then, the manifest carries only the chat
+    /// metadata (title, dates, endpoint, agent/project, cost).
+    private func manifest(from c: Conversation) -> ChatManifest {
+        ChatManifest(
+            id: c.id,
+            title: c.title,
+            createdAt: c.createdAt,
+            modelDirPath: c.modelDirPath,
+            endpoint: c.endpoint,
+            projectID: c.projectID,
+            agentID: c.agentID,
+            cumulativeCostUSD: c.cumulativeCostUSD,
+            lastEncodedMode: c.lastEncodedMode,
+            turnIDs: [],
+            schemaVersion: 2)
+    }
+
+    /// Stage a debounced manifest dual-write for a v2 chat.
+    private func scheduleManifestForV2(_ c: Conversation) {
+        chatPersistence.scheduleManifestSave(manifest(from: c))
     }
 }

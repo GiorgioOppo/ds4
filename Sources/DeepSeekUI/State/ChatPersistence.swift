@@ -104,6 +104,20 @@ final class ChatPersistence {
         }
     }
 
+    /// Synchronous, non-debounced manifest write. Used at chat
+    /// creation so the v2 folder + `chat.json` exist immediately —
+    /// without this, the next `flushSave` would see `isV2Chat == false`
+    /// for the 500 ms debounce window and skip the dual-write.
+    func writeManifestImmediate(_ manifest: ChatManifest) throws {
+        // Drop any debounced write for the same id so we don't
+        // race a stale snapshot over the freshly-written one.
+        manifestTasks.removeValue(forKey: manifest.id)?.cancel()
+        manifests.removeValue(forKey: manifest.id)
+        let data = try Self.encoder().encode(manifest)
+        let url = try PersistencePaths.chatManifestURL(id: manifest.id)
+        try Self.atomicWrite(data, to: url)
+    }
+
     /// Drain every staged write synchronously. Called on app quit and
     /// from tests that need to observe the on-disk state immediately
     /// after a schedule call.
@@ -279,7 +293,12 @@ final class ChatPersistence {
         manifests.removeValue(forKey: id)
         pending.removeValue(forKey: id)
 
-        let dir = try PersistencePaths.chatDir(id: id)
+        // Avoid `chatDir(id:)` here — it would create the folder
+        // we're about to delete on chats that never had one (i.e.
+        // legacy chats that `ChatStore.delete` also routes through
+        // this method).
+        let dir = try PersistencePaths.conversationsDir()
+            .appendingPathComponent(id.uuidString, isDirectory: true)
         if FileManager.default.fileExists(atPath: dir.path) {
             try FileManager.default.removeItem(at: dir)
         }
