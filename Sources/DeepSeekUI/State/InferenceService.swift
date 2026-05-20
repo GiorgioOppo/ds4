@@ -704,6 +704,33 @@ final class InferenceService: @unchecked Sendable {
                 let prompt = EncodingDSV4.encodeMessages(
                     effectiveHistory, mode: mode,
                     toolSchemasJSON: toolSchemasJSON)
+
+                // Diagnostic: DEEPSEEK_PROMPT_DEBUG=1 dumps the
+                // assembled prompt String to stderr right before
+                // tokenization. Pairs with a separate dump of the
+                // raw toolSchemasJSON so we can tell whether a
+                // weird-looking prompt body is the JSON itself
+                // misbehaving or the template substitution dropping
+                // text. Gated so production prefills aren't noisy.
+                if ProcessInfo.processInfo
+                    .environment["DEEPSEEK_PROMPT_DEBUG"] == "1" {
+                    let header = "[prompt-debug] tokenizeFullHistory " +
+                                 "history=\(effectiveHistory.count) " +
+                                 "schemas=\(toolSchemasJSON?.count ?? -1) " +
+                                 "prompt=\(prompt.count)\n"
+                    FileHandle.standardError.write(Data(header.utf8))
+                    if let schemas = toolSchemasJSON {
+                        let line = "[prompt-debug] >>> toolSchemasJSON >>>\n" +
+                                   schemas +
+                                   "\n[prompt-debug] <<< toolSchemasJSON <<<\n"
+                        FileHandle.standardError.write(Data(line.utf8))
+                    }
+                    let line = "[prompt-debug] >>> prompt >>>\n" +
+                               prompt +
+                               "\n[prompt-debug] <<< prompt <<<\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+
                 let ids = tok.encode(prompt).map(Int32.init)
                 cont.resume(returning: ids)
             }
