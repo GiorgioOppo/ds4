@@ -259,6 +259,19 @@ public final class MLA {
         rope.apply(q.reshape([B * S, nHeads, headDim]),
                    startPos: startPos, inverse: false, in: cmd)
 
+        // Commit-and-renew at every major stage boundary. Each chunk
+        // (Q path, KV path, topk, KV cache write, sparse-attn, output
+        // projection) stays under macOS's interactive-priority GPU
+        // watchdog threshold (~250 ms per cmd buffer; longer triggers
+        // `kIOGPUCommandBufferCallbackErrorImpactingInteractivity` and
+        // aborts the cmd buffer mid-execution). No `waitUntilCompleted`
+        // — the GPU executes the chunks in order, the host doesn't
+        // block here. Internal commit-and-WAIT for the few stages
+        // that need host-side intermediates stays gated on
+        // `TraceFlags.normTrace`; in production this stage-split is
+        // the only thing that fires.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
         let kvFlat = kvNorm(wkv(xFlat, in: cmd), in: cmd)
@@ -288,6 +301,9 @@ public final class MLA {
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
         let kv = kvFlat.reshape([B, S, headDim])
+
+        // Stage boundary — see comment above the first cmd-split.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Topk indices ----------
         // All built directly on GPU into a single [B, S, kWin+kComp] i32
@@ -342,6 +358,9 @@ public final class MLA {
                                                         in: cmd)
             }
         }
+
+        // Stage boundary — see comment above the first cmd-split.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- KV cache write ----------
         let bytesPerRow = headDim * MemoryLayout<Float>.size
@@ -433,6 +452,13 @@ public final class MLA {
             kvFull = kv
         }
 
+        // Stage boundary — see comment above the first cmd-split.
+        // The sparse-attn dispatch below is typically the heaviest
+        // single kernel in an MLA layer (large QK matmul + softmax +
+        // KV gather), so isolating it from the preceding KV-write
+        // blits gives the watchdog the most headroom.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+
         // ---------- Sparse attention ----------
         let qPerToken = q.reshape([B, S, nHeads, headDim])
         let o = SparseAttention.apply(q: qPerToken, kv: kvFull, sink: attnSink,
@@ -443,9 +469,16 @@ public final class MLA {
             cmd = Device.shared.queue.makeCommandBuffer()!
         }
 
+        // Stage boundary — see comment above the first cmd-split.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+
         // ---------- Inverse RoPE ----------
         rope.apply(o.reshape([B * S, nHeads, headDim]),
                    startPos: startPos, inverse: true, in: cmd)
+
+        // Stage boundary before the final output projection (`wo_b`)
+        // — see comment above the first cmd-split.
+        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Grouped output: einsum("bsgd,grd->bsgr"), then wo_b ----------
         let perGroupD = nHeads * headDim / nGroups
