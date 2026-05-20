@@ -2,78 +2,43 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.deepseek.v4pro.ui</string>
-
-    <key>CFBundleName</key>
-    <string>DeepSeek-V4</string>
-
-    <key>CFBundleDisplayName</key>
-    <string>DeepSeekUI</string>
-
-    <key>CFBundleExecutable</key>
-    <string>DeepSeekUI</string>
-
-    <key>CFBundleVersion</key>
-    <string>4</string>
-
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-
-    <key>CFBundleSignature</key>
-    <string>????</string>
-
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-
-    <!-- Mac App Store validator 90242 requires this; the value must be
-         a UTI from Apple's "App Categories" list. "Utilities" matches
-         how the app surfaces locally — model-loader / converter / tools
-         around a downloaded LLM rather than a hosted chat product. -->
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
-
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-
-    <!-- macOS app, presents a window (not a menubar-only utility). -->
-    <key>LSUIElement</key>
-    <false/>
-
-    <key>NSHighResolutionCapable</key>
-    <true/>
-
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-
-    <!-- Modern asset-catalog icon registration. The Xcode build
-         compiles Resources/Assets.xcassets/AppIcon.appiconset into
-         Assets.car (+ a .icns fallback) and the runtime resolves the
-         Dock / about-window icon through this key. -->
-    <key>CFBundleIconName</key>
-    <string>AppIcon</string>
-
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-
-    <key>NSSupportsAutomaticTermination</key>
-    <true/>
-
-    <key>NSSupportsSuddenTermination</key>
-    <false/>
-
-    <!-- Export-compliance declaration. App Store Connect asks every
-         build whether it uses non-exempt cryptography; setting this
-         to NO up-front lets the build skip the manual encryption
-         questionnaire each upload. The app only uses Apple-provided
-         HTTPS (URLSession) and stdlib hashing — both fall under the
-         standard exemption — and ships no proprietary crypto. Flip
-         to YES (and file a self-classification report) if that ever
-         changes. -->
-    <key>ITSAppUsesNonExemptEncryption</key>
-    <false/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>DeepSeek-V4</string>
+	<key>CFBundleExecutable</key>
+	<string>DeepSeekUI</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.deepseek.v4pro.ui</string>
+	<key>CFBundleName</key>
+	<string>DeepSeek-V4</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<true/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 </dict>
 </plist>
