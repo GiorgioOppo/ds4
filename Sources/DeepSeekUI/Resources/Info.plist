@@ -2,68 +2,43 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.deepseek.v4pro.ui</string>
-
-    <key>CFBundleName</key>
-    <string>DeepSeek-V4</string>
-
-    <key>CFBundleDisplayName</key>
-    <string>DeepSeek-V4</string>
-
-    <key>CFBundleExecutable</key>
-    <string>DeepSeekUI</string>
-
-    <key>CFBundleVersion</key>
-    <string>1</string>
-
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-
-    <key>CFBundleSignature</key>
-    <string>????</string>
-
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-
-    <!-- Mac App Store validator 90242 requires this; the value must be
-         a UTI from Apple's "App Categories" list. Productivity is the
-         closest match for an AI chat client (Claude, ChatGPT, etc. all
-         use the same category on the store). Edit this if you'd prefer
-         e.g. public.app-category.developer-tools. -->
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.productivity</string>
-
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-
-    <!-- macOS app, presents a window (not a menubar-only utility). -->
-    <key>LSUIElement</key>
-    <false/>
-
-    <key>NSHighResolutionCapable</key>
-    <true/>
-
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-
-    <!-- Modern asset-catalog icon registration. The Xcode build
-         compiles Resources/Assets.xcassets/AppIcon.appiconset into
-         Assets.car (+ a .icns fallback) and the runtime resolves the
-         Dock / about-window icon through this key. -->
-    <key>CFBundleIconName</key>
-    <string>AppIcon</string>
-
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-
-    <key>NSSupportsAutomaticTermination</key>
-    <true/>
-
-    <key>NSSupportsSuddenTermination</key>
-    <false/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>DeepSeek-V4</string>
+	<key>CFBundleExecutable</key>
+	<string>DeepSeekUI</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.deepseek.v4pro.ui</string>
+	<key>CFBundleName</key>
+	<string>DeepSeek-V4</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<true/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 </dict>
 </plist>
