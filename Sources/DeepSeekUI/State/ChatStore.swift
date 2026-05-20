@@ -167,6 +167,13 @@ final class ChatStore: ObservableObject {
     /// in-conversation `pendingTurn` exclusively.
     @Published private(set) var pendingSnapshots:
         [UUID: PendingSnapshot] = [:]
+
+    /// Last `chat.tokens` payload we've actually written to disk,
+    /// keyed by chat id. Used by `syncV2State` to skip a redundant
+    /// binary write when `encodedTokens` hasn't grown / the mode
+    /// hasn't changed. Tracking just `(count, mode)` is enough
+    /// because `encodedTokens` is append-only within one mode.
+    private var lastWrittenTokens: [UUID: (count: Int, mode: String?)] = [:]
     /// Per-conversation count of how many tool-call -> generate
     /// continuations have fired since the latest user turn. Cleared
     /// the moment a `.done` arrives without tool calls (= final
@@ -387,6 +394,10 @@ final class ChatStore: ObservableObject {
         // via `chatPersistence.deleteChat(id:)`.
         pendingSnapshots.removeValue(forKey: id)
         streamingControllers.removeValue(forKey: id)
+        // PR 6: forget the chat.tokens write fingerprint so a
+        // recycled UUID can't think it has the previous chat's
+        // tokens on disk.
+        lastWrittenTokens.removeValue(forKey: id)
         if selectedID == id {
             selectedID = conversations.first?.id
         }
@@ -2561,29 +2572,73 @@ final class ChatStore: ObservableObject {
 
     private func loadFromDisk() {
         guard let dir = try? PersistencePaths.conversationsDir() else { return }
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil)) ?? []
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+
+        // Split entries into v2 folders and legacy `{UUID}.json`
+        // files. A folder named `{UUID}` with a `chat.json` inside
+        // is the v2 layout's per-chat root; anything else with a
+        // `.json` extension is a legacy single-file chat.
+        var v2Folders: [URL] = []
+        var legacyFiles: [URL] = []
+        for url in entries {
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey])
+                .isDirectory) ?? false
+            if isDir {
+                v2Folders.append(url)
+            } else if url.pathExtension == "json" {
+                legacyFiles.append(url)
+            }
+        }
+
         var loaded: [Conversation] = []
-        for url in files where url.pathExtension == "json" {
+        var loadedV2IDs: Set<UUID> = []
+
+        // PR 6: prefer v2 reads. For each per-chat folder, decode
+        // the manifest + every turn summary + every round file
+        // referenced by the manifest's `turnIDs`. Falls back to
+        // the sibling legacy `{UUID}.json` ONLY when the manifest
+        // has an empty `turnIDs` (PR 2-era chat that never wrote
+        // a turn under the new path) — those are the chats whose
+        // messages still live in the legacy file.
+        for folder in v2Folders {
+            guard let chatID = UUID(uuidString: folder.lastPathComponent)
+            else { continue }
+            if let c = loadV2Chat(
+                from: folder, chatID: chatID, decoder: decoder)
+            {
+                loaded.append(c)
+                loadedV2IDs.insert(chatID)
+            }
+        }
+
+        // Legacy files: only for chat ids that don't have a v2
+        // folder. Anything that was migrated will be skipped here
+        // so we don't load it twice.
+        for url in legacyFiles {
+            let base = url.deletingPathExtension().lastPathComponent
+            if let cid = UUID(uuidString: base),
+               loadedV2IDs.contains(cid)
+            {
+                continue
+            }
             if let data = try? Data(contentsOf: url),
                let c = try? decoder.decode(Conversation.self, from: data) {
                 loaded.append(c)
             }
         }
+
         loaded.sort { $0.createdAt > $1.createdAt }
         conversations = loaded
 
-        // PR 5: for every v2 chat, replay `pending.json` over the
-        // in-memory pending snapshot. The legacy `{UUID}.json` from
-        // the previous app run captured the pendingTurn at the
-        // moment of its last debounced save (potentially zero
-        // tokens for a v2 chat that did the per-token writes via
-        // `pending.json` only); the freshly-read snapshot has
-        // whatever was last persisted at the 200 ms cadence,
-        // which is closer to "what was on screen" before the
-        // crash. Falls back silently when no pending.json exists.
+        // PR 5: replay each v2 chat's `pending.json` over its
+        // freshly-loaded conversation. The on-disk pending snapshot
+        // wins because it tracks the per-token state at a 200 ms
+        // cadence — closer to "what was on screen" before the
+        // crash than whatever was last flushed by the slower paths.
         for i in conversations.indices {
             let chatID = conversations[i].id
             guard PersistencePaths.isV2Chat(id: chatID),
@@ -2603,6 +2658,102 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Materialise one v2 chat from disk into a `Conversation`
+    /// suitable for the in-memory transcript. Walks the manifest's
+    /// `turnIDs`, decodes each `TurnSummary`, then the matching
+    /// `StoredRound` files, and stitches them back into the
+    /// `[StoredMessage]` shape the rest of the store still uses.
+    ///
+    /// Returns nil when the manifest can't be decoded. Falls back
+    /// to the sibling legacy `{UUID}.json` when `turnIDs` is empty
+    /// (PR 2-era chat) so messages aren't lost during the rollout.
+    private func loadV2Chat(from folder: URL,
+                              chatID: UUID,
+                              decoder: JSONDecoder) -> Conversation? {
+        let manifestURL = folder.appendingPathComponent("chat.json")
+        guard let manifestData = try? Data(contentsOf: manifestURL),
+              let manifest = try? decoder.decode(
+                ChatManifest.self, from: manifestData)
+        else { return nil }
+
+        // Empty manifest = chat that hasn't been finalised under
+        // the v2 write path yet. Fallback to legacy.
+        if manifest.turnIDs.isEmpty {
+            let legacyURL = folder.deletingLastPathComponent()
+                .appendingPathComponent("\(chatID.uuidString).json")
+            if let legacyData = try? Data(contentsOf: legacyURL),
+               let c = try? decoder.decode(
+                Conversation.self, from: legacyData)
+            {
+                return c
+            }
+            // No legacy fallback — proceed with the empty v2 shape.
+        }
+
+        var messages: [StoredMessage] = []
+        for turnID in manifest.turnIDs {
+            let turnURL = folder
+                .appendingPathComponent("turns", isDirectory: true)
+                .appendingPathComponent("\(turnID.uuidString).json")
+            guard let turnData = try? Data(contentsOf: turnURL),
+                  let summary = try? decoder.decode(
+                    TurnSummary.self, from: turnData)
+            else { continue }
+
+            let leadRole: StoredRole =
+                summary.flags.contains(.isSystem) ? .system : .user
+            messages.append(StoredMessage(
+                id: summary.userMessageID,
+                role: leadRole,
+                content: summary.userText,
+                tokenCount: summary.userTokenCount))
+
+            for roundID in summary.roundIDs {
+                let roundURL = folder
+                    .appendingPathComponent("turns", isDirectory: true)
+                    .appendingPathComponent(
+                        turnID.uuidString, isDirectory: true)
+                    .appendingPathComponent("rounds", isDirectory: true)
+                    .appendingPathComponent("\(roundID.uuidString).json")
+                guard let roundData = try? Data(contentsOf: roundURL),
+                      let round = try? decoder.decode(
+                        StoredRound.self, from: roundData)
+                else { continue }
+                messages.append(StoredMessage(
+                    id: round.id,
+                    role: .assistant,
+                    content: round.content,
+                    reasoningContent: round.reasoningContent,
+                    toolCalls: round.toolCalls,
+                    tokenCount: round.tokenCount,
+                    toolOutputs: round.toolOutputs,
+                    prefillTrace: round.prefillTrace))
+            }
+        }
+
+        // chat.tokens (Int32 LE binary) carries the canonical
+        // prompt prefix used by the local fast-delta path. Absent
+        // for remote-only chats and fresh chats with no turns yet
+        // — we leave `encodedTokens` nil in that case so the next
+        // `send` does a cold re-encode.
+        let encodedTokens = chatPersistence.readChatTokens(chatID)
+
+        return Conversation(
+            id: manifest.id,
+            title: manifest.title,
+            createdAt: manifest.createdAt,
+            modelDirPath: manifest.modelDirPath,
+            endpoint: manifest.endpoint,
+            messages: messages,
+            projectID: manifest.projectID,
+            agentID: manifest.agentID,
+            cumulativeCostUSD: manifest.cumulativeCostUSD,
+            encodedTokens: encodedTokens,
+            lastEncodedMode: manifest.lastEncodedMode,
+            pendingTurn: nil,
+            remotePendingTurn: nil)
+    }
+
     private func scheduleSave(_ id: UUID) {
         pendingSaves[id]?.cancel()
         pendingSaves[id] = Task { [weak self] in
@@ -2615,29 +2766,35 @@ final class ChatStore: ObservableObject {
 
     private func flushSave(_ id: UUID) async {
         guard let c = conversations.first(where: { $0.id == id }) else { return }
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(c)
-            let url = try PersistencePaths.conversationURL(id: id)
-            try data.write(to: url, options: .atomic)
-        } catch {
-            // Surface persistence errors as a status note on the
-            // conversation; non-fatal — the in-memory state still
-            // reflects everything correctly.
-            phases[id] = .error("Save failed: \(error.localizedDescription)")
+        let isV2 = PersistencePaths.isV2Chat(id: id)
+        // PR 6: v2 chats persist entirely through the v2 layout
+        // (manifest + per-turn + per-round + pending.json). Skip
+        // the legacy `{UUID}.json` write so we don't keep a stale
+        // copy of the transcript around — `loadFromDisk` reads
+        // from the v2 folder when one exists.
+        if !isV2 {
+            do {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let data = try encoder.encode(c)
+                let url = try PersistencePaths.conversationURL(id: id)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                // Surface persistence errors as a status note on the
+                // conversation; non-fatal — the in-memory state still
+                // reflects everything correctly.
+                phases[id] = .error("Save failed: \(error.localizedDescription)")
+            }
         }
-        // PR 2: dual-write the v2 manifest for any chat that has a
-        // per-chat folder. The legacy `{UUID}.json` above remains
-        // the source of truth for reads; PR 3 will flip that.
-        if PersistencePaths.isV2Chat(id: id) {
-            // PR 3b: also synthesise the turn summaries + round
+        if isV2 {
+            // PR 3b: synthesise the turn summaries + round
             // payloads from `c.messages` and stage diff-only writes
             // for any file whose content changed since the last
-            // sync. This is what `groupedItems(c.messages)` used to
-            // do at render time, hoisted here so the on-disk v2
-            // layout matches what PR 3c will read from.
+            // sync. PR 6 made this the SOLE on-disk persistence
+            // path for v2 chats — the legacy block above is
+            // skipped, so this call must cover the entire
+            // transcript, the manifest, and the chat.tokens blob.
             syncV2State(id, conversation: c)
         }
     }
@@ -2862,6 +3019,25 @@ final class ChatStore: ObservableObject {
         var newManifest = manifest(from: c)
         newManifest.turnIDs = newTurns.map(\.id)
         chatPersistence.scheduleManifestSave(newManifest)
+
+        // PR 6: persist the canonical tokenised prompt prefix as
+        // a tiny binary `chat.tokens` blob, so the next `send`'s
+        // fast-delta path can rehydrate it without re-encoding
+        // the whole transcript. Skip on remote-only chats
+        // (encodedTokens == nil there) — they don't own a local
+        // token cursor. The (count, mode) fingerprint short-
+        // circuits writes when nothing actually changed since the
+        // last sync (token append-only within one mode).
+        if let tokens = c.encodedTokens {
+            let previous = lastWrittenTokens[c.id]
+            if previous?.count != tokens.count
+                || previous?.mode != c.lastEncodedMode
+            {
+                try? chatPersistence.writeChatTokens(c.id, tokens: tokens)
+                lastWrittenTokens[c.id] =
+                    (tokens.count, c.lastEncodedMode)
+            }
+        }
     }
 
     // MARK: - v2 lazy-loading API (PR 3a — dead code)
