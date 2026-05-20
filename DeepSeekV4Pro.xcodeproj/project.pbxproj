@@ -14,6 +14,7 @@
 		06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC2A8ACE3A361FA6EC18B8AB /* QuantizationSettingsTab.swift */; };
 		0A5DDE8166FB32D1596B8E5F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0222470499767FD248FF1AD2 /* ChatView.swift */; };
 		0C243435F5B0CD1136F3F76D /* ProjectRootBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */; };
+		F1E2D3C4B5A6789012345670 /* ProjectSourceAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */; };
 		0C71E6B97980C7FE109B5F24 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70E0AEC478A0A308F7B1FDA9 /* KeychainStore.swift */; };
 		0C7A64D3A626579E1052CD1F /* FineTuneSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1D364357AE00BBF63AF90D1 /* FineTuneSheet.swift */; };
 		1312A4CB4E9EB301D2D26A7C /* PlaygroundViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A228296203BF2B3BB9FCF75D /* PlaygroundViewModel.swift */; };
@@ -110,6 +111,7 @@
 		0327803E71CE18066FBAAE1E /* MessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageView.swift; sourceTree = "<group>"; };
 		09F5D228AC2E872A59FD6E74 /* VocabPrunerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VocabPrunerSheet.swift; sourceTree = "<group>"; };
 		0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectRootBuilder.swift; sourceTree = "<group>"; };
+		F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSourceAccess.swift; sourceTree = "<group>"; };
 		0C96B656B104FD6FD206B3B2 /* PlaygroundSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaygroundSheet.swift; sourceTree = "<group>"; };
 		0DCFEE82C5F93850A799F110 /* MCPServerLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPServerLibrary.swift; sourceTree = "<group>"; };
 		0F59E70898C61471DF21D787 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
@@ -264,6 +266,7 @@
 				92D4D689386B87F267B6BE6E /* PersistencePaths.swift */,
 				F7070411545DE289BB1571C6 /* ProjectIndexer.swift */,
 				0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */,
+				F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */,
 			);
 			path = Utility;
 			sourceTree = "<group>";
@@ -638,6 +641,7 @@
 				686A0171CFCBEC545FC7226D /* ProjectLibrary.swift in Sources */,
 				F1E63116F8615E12F4501407 /* ProjectOverlay.swift in Sources */,
 				0C243435F5B0CD1136F3F76D /* ProjectRootBuilder.swift in Sources */,
+				F1E2D3C4B5A6789012345670 /* ProjectSourceAccess.swift in Sources */,
 				038F8906252DF293DFABB854 /* ProjectsView.swift in Sources */,
 				06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */,
 				D88A4DD03F9320774C711177 /* ReasoningDisclosure.swift in Sources */,
