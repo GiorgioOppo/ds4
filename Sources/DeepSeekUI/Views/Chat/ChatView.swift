@@ -373,11 +373,30 @@ struct ChatView: View {
 
     @ViewBuilder
     private func inlineProgress(_ phase: GenerationPhase) -> some View {
+        // Local + remote chats land here while waiting for the first
+        // streamed token. Originally `.prefilling` rendered a separate
+        // `PrefillIndicator` (live elapsed-time counter) while
+        // `.streaming(status:)` rendered a small caption row — two
+        // visibly different controls for what is, from the user's
+        // perspective, the same "model is working" beat. Matched on
+        // the remote pattern (`.streaming(status: "Calling …")`) so
+        // local first-question UI shows the same compact row instead
+        // of the taller `PrefillIndicator` block that was pushing the
+        // user's echo bubble out of the visible scroll viewport.
+        //
+        // Telemetry isn't lost: `.prefillDone` still populates
+        // `metrics.prefillElapsed/promptTokens/prefillTokPerMin` and
+        // `ThroughputBar` surfaces them once the streaming buffer
+        // starts filling.
         switch phase {
-        case .prefilling(let promptTokens, let startTime):
-            PrefillIndicator(promptTokens: promptTokens,
-                              startTime: startTime)
-                .padding(.leading, 40)
+        case .prefilling(let promptTokens, _):
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Prefilling \(promptTokens) tokens…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 40)
         case .streaming(_, _, let status, _) where !status.isEmpty:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
