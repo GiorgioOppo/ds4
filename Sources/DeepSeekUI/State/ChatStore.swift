@@ -149,6 +149,24 @@ final class ChatStore: ObservableObject {
     /// the rest of the transcript's bubbles can skip re-render.
     @Published private(set) var streamingControllers:
         [UUID: StreamingRoundController] = [:]
+
+    /// Crash-recovery snapshot per chat (v2 layout only). Mutated
+    /// per-token during streaming instead of `conversations[idx]
+    /// .pendingTurn` — that avoids the value-type copy of the
+    /// whole `Conversation` struct (including `messages`) every
+    /// time a single Int32 token id is appended. The on-disk
+    /// counterpart is `turns/.../pending.json`, written through
+    /// `ChatPersistence.schedulePendingSave` with a 200 ms
+    /// debounce.
+    ///
+    /// At launch, `loadFromDisk` reads each chat's `pending.json`
+    /// into this dict and copies the snapshot back onto
+    /// `conversations[idx].pendingTurn` so the resume banner +
+    /// `resumePendingTurn` continue to work without reading
+    /// `pending.json` directly. Legacy chats keep using the
+    /// in-conversation `pendingTurn` exclusively.
+    @Published private(set) var pendingSnapshots:
+        [UUID: PendingSnapshot] = [:]
     /// Per-conversation count of how many tool-call -> generate
     /// continuations have fired since the latest user turn. Cleared
     /// the moment a `.done` arrives without tool calls (= final
@@ -364,6 +382,11 @@ final class ChatStore: ObservableObject {
         for key in Array(roundLRU.allKeys) where key.chatID == id {
             roundLRU.remove(key)
         }
+        // PR 5: drop in-memory pending snapshot. The on-disk
+        // `pending.json` lives inside the v2 folder we just wiped
+        // via `chatPersistence.deleteChat(id:)`.
+        pendingSnapshots.removeValue(forKey: id)
+        streamingControllers.removeValue(forKey: id)
         if selectedID == id {
             selectedID = conversations.first?.id
         }
@@ -570,14 +593,16 @@ final class ChatStore: ObservableObject {
                 // minutes for a project context), the user's prompt
                 // is preserved and the resume path can still pick
                 // up — without any tokens emitted yet.
-                if let cIdx = self.conversations.firstIndex(where: { $0.id == id }) {
-                    self.conversations[cIdx].pendingTurn = PendingTurn(
-                        assistantMessageID: placeholderId,
-                        promptTokens: promptTokens,
-                        generatedTokens: [],
-                        mode: modeRaw)
-                    self.scheduleSave(id)
-                }
+                // PR 5: setLocalPending writes both the legacy
+                // in-conversation snapshot AND the v2 `pending.json`
+                // (debounced). The legacy `scheduleSave` is part
+                // of the helper, so no extra call needed here.
+                self.setLocalPending(PendingTurn(
+                    assistantMessageID: placeholderId,
+                    promptTokens: promptTokens,
+                    generatedTokens: [],
+                    mode: modeRaw), for: id)
+                self.scheduleSave(id)
                 for try await event in self.service.generateForConversation(
                     promptTokens: promptTokens,
                     conversationID: id,
@@ -886,7 +911,8 @@ final class ChatStore: ObservableObject {
     func discardPendingTurn(of id: UUID) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }),
               conversations[idx].pendingTurn != nil else { return }
-        conversations[idx].pendingTurn = nil
+        // PR 5: clears both the legacy + v2 pending state.
+        setLocalPending(nil, for: id)
         scheduleSave(id)
     }
 
@@ -914,12 +940,15 @@ final class ChatStore: ObservableObject {
             // controller. The placeholder's `content` is stamped at
             // `.done` from `final.content`.
             streamingControllers[id]?.appendContent(piece)
-            // Append the raw id to the on-disk pendingTurn so a
-            // crash mid-stream replays this token exactly. The save
-            // is debounced (~500 ms) so we don't pay disk I/O at
-            // the model's sampling rate.
-            conversations[idx].pendingTurn?.generatedTokens.append(tokenId)
-            scheduleSave(id)
+            // PR 5: route per-token crash-recovery bookkeeping
+            // through `pendingSnapshots` + a 200 ms-debounced
+            // `pending.json` write for v2 chats. The legacy
+            // `conversations[idx].pendingTurn` mutation copied the
+            // whole Conversation struct (messages array included)
+            // per token — splitting it off keeps the hot path
+            // free of value-type churn. Legacy chats still walk
+            // the old code path.
+            appendPendingTokenID(tokenId, for: id)
 
         case .status(let s):
             let m = currentMetrics(of: id)
@@ -997,7 +1026,9 @@ final class ChatStore: ObservableObject {
             conversations[idx].lastEncodedMode = mode
             // The generation completed cleanly; drop the crash-
             // recovery snapshot so the UI stops offering Resume.
-            conversations[idx].pendingTurn = nil
+            // PR 5: this also clears the v2 `pending.json` / the
+            // in-memory `pendingSnapshots[id]`.
+            setLocalPending(nil, for: id)
 
             // Model asked to call one or more tools? Run them, splice
             // the outputs back into the prompt, and let the model
@@ -1119,11 +1150,13 @@ final class ChatStore: ObservableObject {
                     StoredMessage(id: newPlaceholderId,
                                    role: .assistant,
                                    content: ""))
-                self.conversations[cIdx].pendingTurn = PendingTurn(
+                // PR 5: re-arm pending through the helper so the v2
+                // `pending.json` lands too.
+                self.setLocalPending(PendingTurn(
                     assistantMessageID: newPlaceholderId,
                     promptTokens: promptTokens,
                     generatedTokens: [],
-                    mode: mode.rawValue)
+                    mode: mode.rawValue), for: id)
                 // PR 4: new placeholder → new streaming controller
                 // (the previous one was retired at `.done`).
                 self.newStreamingController(
@@ -1810,12 +1843,14 @@ final class ChatStore: ObservableObject {
         // crash mid-call surfaces a retry affordance on next launch.
         // Cleared in `finalizeRemoteIteration` and in the catch
         // branch of `runRemoteLoop`.
-        conversations[idx].remotePendingTurn = RemotePendingTurn(
+        // PR 5: route through the helper so v2 chats also get the
+        // remote-pending snapshot in `pending.json`.
+        setRemotePending(RemotePendingTurn(
             assistantMessageID: placeholder.id,
             userMessageID: userMessage.id,
             userText: text,
             mode: mode.rawValue,
-            issuedAt: Date())
+            issuedAt: Date()), for: id)
         lastSamplingOptions[id] = (options, maxTokens)
         toolRoundtrips[id] = 0
         scheduleSave(id)
@@ -2243,7 +2278,11 @@ final class ChatStore: ObservableObject {
         // Reset transient fast-path state — remote never uses it.
         conversations[idx].encodedTokens = nil
         conversations[idx].lastEncodedMode = nil
-        conversations[idx].pendingTurn = nil
+        // PR 5: clear pending through the helper so the v2
+        // `pending.json` slot is wiped too (remote chats never
+        // populate the local pending side, but this keeps the
+        // accounting symmetric).
+        setLocalPending(nil, for: id)
         if isFinal {
             var metrics = currentMetrics(of: id)
             metrics.turnCostUSD = usage?.totalCost
@@ -2254,7 +2293,7 @@ final class ChatStore: ObservableObject {
             lastSamplingOptions[id] = nil
             // TODO §4 follow-up: the remote turn finished, drop
             // the recovery breadcrumb.
-            conversations[idx].remotePendingTurn = nil
+            setRemotePending(nil, for: id)
             phases[id] = .idle
             // PR 4: remote turn finished — retire the controller
             // so the bubble switches back to the value-driven
@@ -2535,6 +2574,33 @@ final class ChatStore: ObservableObject {
         }
         loaded.sort { $0.createdAt > $1.createdAt }
         conversations = loaded
+
+        // PR 5: for every v2 chat, replay `pending.json` over the
+        // in-memory pending snapshot. The legacy `{UUID}.json` from
+        // the previous app run captured the pendingTurn at the
+        // moment of its last debounced save (potentially zero
+        // tokens for a v2 chat that did the per-token writes via
+        // `pending.json` only); the freshly-read snapshot has
+        // whatever was last persisted at the 200 ms cadence,
+        // which is closer to "what was on screen" before the
+        // crash. Falls back silently when no pending.json exists.
+        for i in conversations.indices {
+            let chatID = conversations[i].id
+            guard PersistencePaths.isV2Chat(id: chatID),
+                  let snap = chatPersistence.readPending(chatID: chatID)
+            else { continue }
+            pendingSnapshots[chatID] = snap
+            switch snap.kind {
+            case .local:
+                if let pt = snap.local {
+                    conversations[i].pendingTurn = pt
+                }
+            case .remote:
+                if let rt = snap.remote {
+                    conversations[i].remotePendingTurn = rt
+                }
+            }
+        }
     }
 
     private func scheduleSave(_ id: UUID) {
@@ -2637,6 +2703,75 @@ final class ChatStore: ObservableObject {
         return c.messages
             .reversed()
             .first(where: { $0.role != .assistant })?.id
+    }
+
+    // MARK: - pending snapshot helpers (PR 5)
+
+    /// Set / clear the local pending-turn snapshot for `chatID`.
+    /// For v2 chats this writes both the in-memory
+    /// `pendingSnapshots` slot AND a debounced `pending.json` on
+    /// disk. The legacy `conversations[idx].pendingTurn` is also
+    /// kept in sync so the resume banner + `resumePendingTurn`
+    /// continue to work without reading from disk.
+    private func setLocalPending(_ pt: PendingTurn?, for chatID: UUID) {
+        if let cIdx = conversations.firstIndex(where: { $0.id == chatID }) {
+            conversations[cIdx].pendingTurn = pt
+        }
+        guard PersistencePaths.isV2Chat(id: chatID) else { return }
+        if let pt = pt {
+            let snap = PendingSnapshot.local(pt)
+            pendingSnapshots[chatID] = snap
+            chatPersistence.schedulePendingSave(
+                chatID: chatID, snapshot: snap)
+        } else {
+            pendingSnapshots.removeValue(forKey: chatID)
+            chatPersistence.schedulePendingSave(
+                chatID: chatID, snapshot: nil)
+        }
+    }
+
+    /// Remote analog of `setLocalPending`.
+    private func setRemotePending(_ rt: RemotePendingTurn?,
+                                    for chatID: UUID) {
+        if let cIdx = conversations.firstIndex(where: { $0.id == chatID }) {
+            conversations[cIdx].remotePendingTurn = rt
+        }
+        guard PersistencePaths.isV2Chat(id: chatID) else { return }
+        if let rt = rt {
+            let snap = PendingSnapshot.remote(rt)
+            pendingSnapshots[chatID] = snap
+            chatPersistence.schedulePendingSave(
+                chatID: chatID, snapshot: snap)
+        } else {
+            pendingSnapshots.removeValue(forKey: chatID)
+            chatPersistence.schedulePendingSave(
+                chatID: chatID, snapshot: nil)
+        }
+    }
+
+    /// Per-token append. For v2 chats this mutates the in-memory
+    /// `pendingSnapshots` slot (a small struct copy) and schedules
+    /// a 200 ms-debounced `pending.json` write — NO mutation of
+    /// `conversations[idx].pendingTurn`, so the
+    /// `@Published conversations` array doesn't churn per token.
+    /// Legacy chats still mutate the in-conversation snapshot and
+    /// hit the 500 ms `scheduleSave` legacy JSON path.
+    private func appendPendingTokenID(_ tokenId: Int32,
+                                        for chatID: UUID) {
+        if PersistencePaths.isV2Chat(id: chatID) {
+            guard case .local(var pt) = pendingSnapshots[chatID]
+            else { return }
+            pt.generatedTokens.append(tokenId)
+            let snap = PendingSnapshot.local(pt)
+            pendingSnapshots[chatID] = snap
+            chatPersistence.schedulePendingSave(
+                chatID: chatID, snapshot: snap)
+        } else if let cIdx = conversations.firstIndex(
+            where: { $0.id == chatID })
+        {
+            conversations[cIdx].pendingTurn?.generatedTokens.append(tokenId)
+            scheduleSave(chatID)
+        }
     }
 
     /// 0-based index of the LAST assistant round under `leadID`.

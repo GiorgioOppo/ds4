@@ -68,6 +68,50 @@ final class ChatPersistenceIntegrationTests: XCTestCase {
         XCTAssertEqual(readBack.title, "second")
     }
 
+    // MARK: pending.json round-trip
+
+    func testSchedulePendingSave_thenReadBack() async throws {
+        // Folder needs to exist before `schedulePendingSave` runs
+        // (the debounced task calls `chatPendingURL` which goes
+        // through `chatDir` — but `chatDir` creates on demand).
+        let manifest = ChatManifest(id: chatID, title: "x",
+                                      modelDirPath: "", turnIDs: [])
+        try persistence.writeManifestImmediate(manifest)
+
+        let pt = PendingTurn(
+            assistantMessageID: UUID(),
+            promptTokens: [1, 2, 3],
+            generatedTokens: [4, 5, 6],
+            mode: "chat")
+        persistence.schedulePendingSave(
+            chatID: chatID, snapshot: .local(pt))
+        await persistence.flushAll()
+
+        let read = persistence.readPending(chatID: chatID)
+        XCTAssertNotNil(read)
+        XCTAssertEqual(read?.kind, .local)
+        XCTAssertEqual(read?.local, pt)
+    }
+
+    func testSchedulePendingSave_nilDeletesFile() async throws {
+        let manifest = ChatManifest(id: chatID, title: "x",
+                                      modelDirPath: "", turnIDs: [])
+        try persistence.writeManifestImmediate(manifest)
+        let pt = PendingTurn(
+            assistantMessageID: UUID(),
+            promptTokens: [],
+            generatedTokens: [],
+            mode: "chat")
+        persistence.schedulePendingSave(
+            chatID: chatID, snapshot: .local(pt))
+        await persistence.flushAll()
+        XCTAssertNotNil(persistence.readPending(chatID: chatID))
+        // Clear with nil snapshot — file should be removed.
+        persistence.schedulePendingSave(chatID: chatID, snapshot: nil)
+        await persistence.flushAll()
+        XCTAssertNil(persistence.readPending(chatID: chatID))
+    }
+
     // MARK: deleteChat
 
     func testDeleteChat_wipesFolder() throws {
