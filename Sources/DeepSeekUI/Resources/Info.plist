@@ -9,16 +9,16 @@
     <string>DeepSeek-V4</string>
 
     <key>CFBundleDisplayName</key>
-    <string>DeepSeek-V4</string>
+    <string>DeepSeekUI</string>
 
     <key>CFBundleExecutable</key>
     <string>DeepSeekUI</string>
 
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>4</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>1.0</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -30,12 +30,11 @@
     <string>en</string>
 
     <!-- Mac App Store validator 90242 requires this; the value must be
-         a UTI from Apple's "App Categories" list. Productivity is the
-         closest match for an AI chat client (Claude, ChatGPT, etc. all
-         use the same category on the store). Edit this if you'd prefer
-         e.g. public.app-category.developer-tools. -->
+         a UTI from Apple's "App Categories" list. "Utilities" matches
+         how the app surfaces locally — model-loader / converter / tools
+         around a downloaded LLM rather than a hosted chat product. -->
     <key>LSApplicationCategoryType</key>
-    <string>public.app-category.productivity</string>
+    <string>public.app-category.utilities</string>
 
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
@@ -64,6 +63,17 @@
     <true/>
 
     <key>NSSupportsSuddenTermination</key>
+    <false/>
+
+    <!-- Export-compliance declaration. App Store Connect asks every
+         build whether it uses non-exempt cryptography; setting this
+         to NO up-front lets the build skip the manual encryption
+         questionnaire each upload. The app only uses Apple-provided
+         HTTPS (URLSession) and stdlib hashing — both fall under the
+         standard exemption — and ships no proprietary crypto. Flip
+         to YES (and file a self-classification report) if that ever
+         changes. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
 </dict>
 </plist>
