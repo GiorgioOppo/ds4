@@ -84,13 +84,13 @@ public enum DefaultTools {
     public static func unixTools() -> [Tool] {
         return [
             // Files
-            LsTool(),  WcTool(), StatTool(),
-            DuTool(), BasenameTool(), FindTool(),
+            LsTool(), HeadTool(), TailTool(), WcTool(), StatTool(),
+            DuTool(), BasenameTool(), DirnameTool(), FindTool(), WhichTool(),
             // Text
             SortTool(), UniqTool(), CutTool(), TrTool(), PasteTool(),
             CommTool(), XxdTool(), Md5Tool(), Sha1Tool(), Sha256Tool(),
             // Hash / Text via binary
-            Base64Tool(),
+            Base64Tool(), SedTool(), AwkTool(), FileTool(),
             // Mutating
             TouchTool(), MkdirTool(), CpTool(), MvTool(),
             RmTool(), LnTool(), ChmodTool(),
