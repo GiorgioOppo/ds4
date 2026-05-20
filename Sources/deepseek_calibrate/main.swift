@@ -95,8 +95,8 @@ while i < args.count {
 
 guard loadStrategy != .streaming else {
     stderr.write(Data(
-        "Refusing to calibrate with --load-strategy streaming: per-forward "
-        + "redequant would dominate the sweep cost. Use mmap or preload.\n".utf8))
+        ("Refusing to calibrate with --load-strategy streaming: per-forward "
+         + "redequant would dominate the sweep cost. Use mmap or preload.\n").utf8))
     exit(1)
 }
 
@@ -151,8 +151,8 @@ case .llama:
         exit(1)
     }
     stderr.write(Data(
-        "Model: \(model.config.nLayers) layers × \(model.config.nHeads) heads, "
-        + "vocab=\(model.config.vocabSize)\n".utf8))
+        ("Model: \(model.config.nLayers) layers × \(model.config.nHeads) heads, "
+         + "vocab=\(model.config.vocabSize)\n").utf8))
 
     let loaded = try TokenizerLoader.loadFromGGUF(gguf)
     let tokenizer = loaded.tokenizer
@@ -166,9 +166,9 @@ case .llama:
         runner.observe(sample)
         if (idx + 1) % 10 == 0 || idx == samples.count - 1 {
             stderr.write(Data(
-                "[\(idx + 1)/\(samples.count)] "
-                + String(format: "%.1f", Date().timeIntervalSince(started))
-                + "s elapsed\n".utf8))
+                ("[\(idx + 1)/\(samples.count)] "
+                 + String(format: "%.1f", Date().timeIntervalSince(started))
+                 + "s elapsed\n").utf8))
         }
     }
     nLayers = model.config.nLayers
@@ -193,8 +193,8 @@ case .v4:
         exit(1)
     }
     stderr.write(Data(
-        "Model: \(config.nLayers) layers, dim=\(config.dim), "
-        + "nRoutedExperts=\(config.nRoutedExperts)\n".utf8))
+        ("Model: \(config.nLayers) layers, dim=\(config.dim), "
+         + "nRoutedExperts=\(config.nRoutedExperts)\n").utf8))
 
     stderr.write(Data("Loading tokenizer…\n".utf8))
     let loaded: LoadedTokenizer
@@ -206,8 +206,8 @@ case .v4:
     }
     let tokenizer = loaded.tokenizer
 
-    stderr.write(Data("Loading Transformer weights "
-        + "(\(loadStrategy.rawValue))…\n".utf8))
+    stderr.write(Data(("Loading Transformer weights "
+        + "(\(loadStrategy.rawValue))…\n").utf8))
     let model: Transformer
     do {
         model = try Transformer.load(
@@ -227,9 +227,9 @@ case .v4:
         runner.observe(sample)
         if (idx + 1) % 5 == 0 || idx == samples.count - 1 {
             stderr.write(Data(
-                "[\(idx + 1)/\(samples.count)] "
-                + String(format: "%.1f", Date().timeIntervalSince(started))
-                + "s elapsed\n".utf8))
+                ("[\(idx + 1)/\(samples.count)] "
+                 + String(format: "%.1f", Date().timeIntervalSince(started))
+                 + "s elapsed\n").utf8))
         }
     }
     nLayers = config.nLayers
@@ -237,9 +237,9 @@ case .v4:
     modelLabel = modelDir.path
 }
 
-stderr.write(Data("Calibration done in "
+stderr.write(Data(("Calibration done in "
     + String(format: "%.1f", Date().timeIntervalSince(started))
-    + "s\n".utf8))
+    + "s\n").utf8))
 
 // ---------- Write outputs (shared) ----------
 let outURL = URL(fileURLWithPath: outDir)
@@ -272,8 +272,8 @@ do {
     encoder.outputFormatting = [.sortedKeys]
     let data = try encoder.encode(statsFile)
     try data.write(to: statsJSONURL)
-    stderr.write(Data("Wrote \(statsJSONURL.path) "
-        + "(\(layerStats.count) layers)\n".utf8))
+    stderr.write(Data(("Wrote \(statsJSONURL.path) "
+        + "(\(layerStats.count) layers)\n").utf8))
 } catch {
     stderr.write(Data("stats.json write failed: \(error)\n".utf8))
     exit(1)

@@ -210,9 +210,9 @@ do {
     exit(1)
 }
 stderr.write(Data(
-    "Loaded: \(model.config.nLayers) layers × \(model.config.nHeads) heads "
-    + "× \(model.config.headDim) head_dim, vocab=\(model.config.vocabSize), "
-    + "ctx=\(model.config.maxSeqLen)\n".utf8))
+    ("Loaded: \(model.config.nLayers) layers × \(model.config.nHeads) heads "
+     + "× \(model.config.headDim) head_dim, vocab=\(model.config.vocabSize), "
+     + "ctx=\(model.config.maxSeqLen)\n").utf8))
 
 // ---------- Build tokenizer ----------
 let loaded: LoadedTokenizer
@@ -239,8 +239,8 @@ if noChatTemplate {
                                                       options: .init())
     } catch {
         stderr.write(Data(
-            "Chat template render failed (use --no-chat-template to "
-            + "skip): \(error)\n".utf8))
+            ("Chat template render failed (use --no-chat-template to "
+             + "skip): \(error)\n").utf8))
         exit(1)
     }
 }
@@ -302,8 +302,8 @@ let prefillStart = Date()
 var logits = model.forward(inputIds: [promptIds], startPos: 0)
 let prefillElapsed = Date().timeIntervalSince(prefillStart)
 stderr.write(Data(
-    "Prefill: \(promptIds.count) tokens in \(String(format: "%.2f", prefillElapsed))s "
-    + "(\(Int(Double(promptIds.count) / max(prefillElapsed, 1e-9))) tok/s)\n".utf8))
+    ("Prefill: \(promptIds.count) tokens in \(String(format: "%.2f", prefillElapsed))s "
+     + "(\(Int(Double(promptIds.count) / max(prefillElapsed, 1e-9))) tok/s)\n").utf8))
 
 // ---------- Decode loop ----------
 let stopTokens: Set<Int> = tokenizer.stopTokenIds

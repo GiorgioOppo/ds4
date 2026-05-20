@@ -123,8 +123,8 @@ if let path = calibStatsPath {
     do {
         calibDir = try CalibrationDir(url: URL(fileURLWithPath: path))
         FileHandle.standardError.write(Data(
-            "Loaded calibration stats: \(calibDir!.statsByName.count) "
-            + "layers\n".utf8))
+            ("Loaded calibration stats: \(calibDir!.statsByName.count) "
+             + "layers\n").utf8))
     } catch {
         FileHandle.standardError.write(Data(
             "--calib-stats failed to load: \(error)\n".utf8))
@@ -134,8 +134,8 @@ if let path = calibStatsPath {
     calibDir = nil
     if quantMethod != .rtn {
         FileHandle.standardError.write(Data(
-            "--quant-method \(quantMethod.rawValue) requires --calib-stats "
-            + "<path>\n".utf8))
+            ("--quant-method \(quantMethod.rawValue) requires --calib-stats "
+             + "<path>\n").utf8))
         exit(2)
     }
 }
