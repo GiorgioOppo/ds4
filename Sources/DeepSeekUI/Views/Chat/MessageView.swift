@@ -45,13 +45,25 @@ struct MessageView: View {
                 Text("You")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(message.content)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color.accentColor.opacity(0.15),
-                                 in: RoundedRectangle(cornerRadius: 10))
+                InlineMarkdownText(raw: message.content)
+                    .font(.callout)
+                    .lineSpacing(2)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                Color.accentColor.opacity(0.22),
+                                Color.accentColor.opacity(0.12),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing),
+                        in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(
+                                Color.accentColor.opacity(0.25),
+                                lineWidth: 1))
             }
             avatar(symbol: "person.fill", tint: .blue)
         }

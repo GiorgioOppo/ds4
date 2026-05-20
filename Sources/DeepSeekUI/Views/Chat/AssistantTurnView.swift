@@ -47,23 +47,51 @@ struct AssistantTurnView: View {
             Image(systemName: "cpu")
                 .foregroundStyle(.white)
                 .frame(width: 28, height: 28)
-                .background(Color.purple, in: Circle())
-            VStack(alignment: .leading, spacing: 4) {
+                .background(
+                    LinearGradient(
+                        colors: [Color.purple, Color.indigo],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing),
+                    in: Circle())
+                .shadow(color: Color.purple.opacity(0.25),
+                         radius: 3, x: 0, y: 1)
+            VStack(alignment: .leading, spacing: 8) {
                 header
-                if let reasoning = combinedReasoning, !reasoning.isEmpty {
-                    ReasoningDisclosure(reasoning: reasoning)
-                }
-                ForEach(Array(intermediateContents.enumerated()), id: \.offset) { _, text in
-                    MarkdownText(raw: text)
-                }
-                if !allToolPairs.isEmpty {
-                    toolCallSection
-                }
-                finalReply
+                bubbleContent
             }
             Spacer(minLength: 0)
         }
         .padding(.vertical, 4)
+    }
+
+    /// Card-style container around the model's response. A subtle fill
+    /// + hairline border sets the bubble apart from the surrounding
+    /// transcript without competing with the user bubble's accent
+    /// tint. Reasoning / tool-call disclosures sit inside the card so
+    /// the whole turn reads as a single unit.
+    @ViewBuilder
+    private var bubbleContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let reasoning = combinedReasoning, !reasoning.isEmpty {
+                ReasoningDisclosure(reasoning: reasoning)
+            }
+            ForEach(Array(intermediateContents.enumerated()), id: \.offset) { _, text in
+                MarkdownText(raw: text)
+            }
+            if !allToolPairs.isEmpty {
+                toolCallSection
+            }
+            finalReply
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(NSColor.controlBackgroundColor).opacity(0.55)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1))
     }
 
     // MARK: - header (Assistant label + Copy action)
@@ -361,6 +389,13 @@ struct ToolCallDisclosure: View {
 }
 
 /// Streaming assistant text with a blinking caret pinned to the end.
+/// Content is split at the LAST paragraph break (`\n\n`): the stable
+/// prefix gets the full `MarkdownText` treatment so headings, lists,
+/// code blocks and inline formatting render as they stabilize, while
+/// the trailing in-progress block stays plain text + caret. Keeping
+/// the partial block as plain text avoids the distracting flicker
+/// where an unclosed `**` or a half-typed list marker would otherwise
+/// briefly render as bold / bullet before the next token corrects it.
 /// The caret toggles between full opacity and clear (instead of being
 /// removed/added) so the trailing layout position never jumps mid-line,
 /// and the surrounding paragraph reflows naturally as tokens arrive.
@@ -368,13 +403,35 @@ struct StreamingCaretText: View {
     let content: String
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
-            let on = Int(ctx.date.timeIntervalSince1970 * 2)
-                .isMultiple(of: 2)
-            (Text(content)
-             + Text("▌").foregroundColor(on ? .primary : .clear))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+        let split = Self.splitStable(content)
+        VStack(alignment: .leading, spacing: 10) {
+            if !split.stable.isEmpty {
+                MarkdownText(raw: split.stable)
+            }
+            TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+                let on = Int(ctx.date.timeIntervalSince1970 * 2)
+                    .isMultiple(of: 2)
+                (Text(split.partial)
+                 + Text("▌").foregroundColor(on ? .primary : .clear))
+                    .font(.callout)
+                    .lineSpacing(2)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
+    }
+
+    /// Find the last block boundary (`\n\n`). Everything up to and
+    /// including it is "stable" and can be parsed as markdown without
+    /// flicker; everything after is the in-progress block.
+    private static func splitStable(
+        _ content: String
+    ) -> (stable: String, partial: String) {
+        guard let range = content.range(of: "\n\n", options: .backwards)
+        else { return ("", content) }
+        let stable = String(content[..<range.upperBound])
+        let partial = String(content[range.upperBound...])
+        return (stable, partial)
     }
 }
