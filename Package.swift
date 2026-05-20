@@ -180,5 +180,17 @@ let package = Package(
             dependencies: ["DeepSeekVocabPruner", "DeepSeekKit"],
             path: "Tests/DeepSeekVocabPrunerTests"
         ),
+        // Tests for DeepSeekUI's plain-Swift state types — the v2
+        // chat storage Codable surface (`ChatManifest`,
+        // `TurnSummary`, `StoredRound`) plus `ChatPersistence`'s
+        // atomic-write helper and the round LRU. SwiftPM allows a
+        // test target to `@testable import` an executable target
+        // since 5.5, which is what lets us cover these without
+        // promoting the types into DeepSeekKit.
+        .testTarget(
+            name: "DeepSeekUITests",
+            dependencies: ["DeepSeekUI"],
+            path: "Tests/DeepSeekUITests"
+        ),
     ]
 )

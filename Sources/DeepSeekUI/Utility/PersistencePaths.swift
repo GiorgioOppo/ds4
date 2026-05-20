@@ -36,6 +36,112 @@ enum PersistencePaths {
             .appendingPathComponent("\(id.uuidString).kvcache")
     }
 
+    // MARK: - v2 lazy-loading layout
+    //
+    // New chats live in a per-chat folder so deletion is a single
+    // `removeItem(at:)` and the streaming hot path can write to a
+    // small `pending.json` instead of re-encoding the full
+    // transcript. Legacy chats keep `kvCacheURL(id:)` /
+    // `conversationURL(id:)` above unchanged.
+
+    /// Folder root for one v2 chat. Created on demand; throws only on
+    /// FS errors. The caller is responsible for not racing against
+    /// `delete(id:)` — same contract as `conversationURL`.
+    static func chatDir(id: UUID) throws -> URL {
+        let dir = try conversationsDir()
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// `chat.json` — the `ChatManifest` for a v2 chat. Tiny (~kB)
+    /// regardless of conversation length, read at app launch to
+    /// paint the sidebar.
+    static func chatManifestURL(id: UUID) throws -> URL {
+        try chatDir(id: id).appendingPathComponent("chat.json")
+    }
+
+    /// `chat.kvcache` — moved inside the chat folder so a folder
+    /// wipe takes the KV cache with it.
+    static func chatKVCacheURL(id: UUID) throws -> URL {
+        try chatDir(id: id).appendingPathComponent("chat.kvcache")
+    }
+
+    /// `chat.tokens` — binary `[Int32]` payload of the canonical
+    /// tokenised prompt prefix (v1 `Conversation.encodedTokens`).
+    /// Header: 4-byte magic ('DSTK') + 4-byte little-endian count.
+    /// Loaded only on `send()` fast path; absent for remote-only
+    /// chats.
+    static func chatTokensURL(id: UUID) throws -> URL {
+        try chatDir(id: id).appendingPathComponent("chat.tokens")
+    }
+
+    /// `pending.json` — `PendingSnapshot` written hot during
+    /// streaming so a crash mid-turn loses at most ~200 ms of
+    /// sampling. Cleared at `.done`.
+    static func chatPendingURL(id: UUID) throws -> URL {
+        try chatDir(id: id).appendingPathComponent("pending.json")
+    }
+
+    /// `turns/` — folder holding one `{turnID}.json` per turn
+    /// summary, and one `{turnID}/rounds/` subfolder per turn for
+    /// the heavy per-round payloads.
+    static func chatTurnsDir(chatID: UUID) throws -> URL {
+        let dir = try chatDir(id: chatID)
+            .appendingPathComponent("turns", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// `turns/{turnID}.json` — the medium-weight `TurnSummary` file.
+    static func turnSummaryURL(chatID: UUID, turnID: UUID) throws -> URL {
+        try chatTurnsDir(chatID: chatID)
+            .appendingPathComponent("\(turnID.uuidString).json")
+    }
+
+    /// `turns/{turnID}/rounds/` — folder holding one
+    /// `{roundID}.json` per assistant generate pass within this
+    /// turn.
+    static func roundsDir(chatID: UUID, turnID: UUID) throws -> URL {
+        let dir = try chatDir(id: chatID)
+            .appendingPathComponent("turns", isDirectory: true)
+            .appendingPathComponent(turnID.uuidString, isDirectory: true)
+            .appendingPathComponent("rounds", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// `turns/{turnID}/rounds/{roundID}.json` — the full
+    /// per-round payload. Loaded only on demand (disclosure open,
+    /// truncated-preview fetch, or send-time history materialisation).
+    static func roundURL(chatID: UUID, turnID: UUID, roundID: UUID) throws -> URL {
+        try roundsDir(chatID: chatID, turnID: turnID)
+            .appendingPathComponent("\(roundID.uuidString).json")
+    }
+
+    /// True when a per-chat folder exists at the v2 layout location.
+    /// Used by `ChatStore.loadFromDisk()` to decide whether a chat
+    /// id should be read through the v2 manifest pipeline or the
+    /// legacy single-file pipeline.
+    static func isV2Chat(id: UUID) -> Bool {
+        guard let dir = try? chatDir(id: id) else { return false }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: dir.path, isDirectory: &isDir) else { return false }
+        return isDir.boolValue
+            && FileManager.default.fileExists(
+                atPath: dir.appendingPathComponent("chat.json").path)
+    }
+
     /// Root for the global "vectorized documents" library — the
     /// per-document files (.tokens / .vec) plus an index.json that
     /// `DocumentLibrary` reads at app launch.
