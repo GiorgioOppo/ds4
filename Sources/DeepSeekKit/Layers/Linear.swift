@@ -21,6 +21,7 @@ public final class Linear {
     private static let pF32           = Device.shared.makePipeline("gemm_f32_to_f32")
     private static let pFP8           = Device.shared.makePipeline("gemm_fp8_to_f32")
     private static let pFP8SG         = Device.shared.makePipeline("gemm_fp8_to_f32_sg")
+    private static let pFP8GEMV       = Device.shared.makePipeline("gemv_fp8_to_f32")
     private static let pFP4           = Device.shared.makePipeline("gemm_fp8_fp4_to_f32")
     private static let pInt8F32       = Device.shared.makePipeline("gemm_int8_w8a16_to_f32")
     private static let pInt8BF16      = Device.shared.makePipeline("gemm_int8_w8a16_bf16_to_f32")
@@ -199,17 +200,34 @@ public final class Linear {
         let act = aq.quant(x.reshape([M, inFeatures]), inplace: false, in: cmd)
         guard let qbytes = act.qbytes else { fatalError("ActQuant did not produce qbytes") }
 
-        // simdgroup_matrix path needs M%32, N%32 AND K%128 (the FP8
-        // weight-scale block size). `canUseSG` enforces the first two;
-        // K%128 is FP8-specific because the simdgroup variant walks
-        // K in 128-element blocks (one b_scale per block) and we
-        // haven't implemented the partial-trailing-block branch.
-        // Falls back to the scalar `gemm_fp8_to_f32` kernel when the
-        // shape doesn't fit — common during decode where M=1.
+        // Three FP8 pipelines, ordered by per-call cost from best to
+        // worst-case. The picker drops to the next path whenever the
+        // current path's shape constraints aren't met:
+        //
+        //   * GEMV  (`gemv_fp8_to_f32`): M == 1, K % 128 == 0.
+        //     One simdgroup per output col, coalesced lane reads on
+        //     A and B[col, :], simd_sum reduce. The decode hot path.
+        //   * SG    (`gemm_fp8_to_f32_sg`): M % 32 == 0, N % 32 == 0,
+        //     K % 128 == 0. simdgroup_matrix on 32×32 output tiles.
+        //     The prefill hot path.
+        //   * scalar (`gemm_fp8_to_f32`): everything else.
+        //
+        // K % 128 == 0 is FP8-specific (matches the weight-scale block
+        // size); the partial-tail-block branch isn't implemented yet
+        // in either of the two fast variants.
         let N = outFeatures
         let K = inFeatures
-        let useSG = Self.canUseSG(M: M, N: N, K: K) && K % 128 == 0
-        let pipeline = useSG ? Self.pFP8SG : Self.pFP8
+        let kAligned = K % 128 == 0
+        let useGEMV = M == 1 && kAligned
+        let useSG = !useGEMV && kAligned && Self.canUseSG(M: M, N: N, K: K)
+        let pipeline: MTLComputePipelineState
+        if useGEMV {
+            pipeline = Self.pFP8GEMV
+        } else if useSG {
+            pipeline = Self.pFP8SG
+        } else {
+            pipeline = Self.pFP8
+        }
 
         let enc = cmd.makeComputeCommandEncoder()!
         enc.setComputePipelineState(pipeline)
@@ -221,7 +239,13 @@ public final class Linear {
         var dims = SIMD3<UInt32>(UInt32(M), UInt32(N), UInt32(K))
         enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
 
-        if useSG {
+        if useGEMV {
+            // GEMV: one simdgroup per output col, 32 threads each.
+            // Grid is in threadgroups (gid → col directly).
+            let groups = MTLSize(width: N, height: 1, depth: 1)
+            let tg = MTLSize(width: 32, height: 1, depth: 1)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+        } else if useSG {
             // SG kernel: one threadgroup = one 32×32 output tile = one
             // SIMD group (32 threads). Grid is in threadgroups, not
             // threads, so we use `dispatchThreadgroups`.

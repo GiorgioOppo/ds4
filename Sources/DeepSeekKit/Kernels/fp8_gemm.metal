@@ -223,3 +223,78 @@ kernel void gemm_fp8_to_f32_sg(
                             C + (row0 + i * 8) * N + col0 + j * 8, N,
                             ulong2(0, 0), false);
 }
+
+// ============================================================================
+// gemv_fp8_to_f32 — single-row (decode) variant of the FP8 GEMM.
+// ============================================================================
+//
+// The simdgroup_matrix kernel above needs M >= 32 and N >= 32, which holds
+// during prefill but never during decode (M=1). The legacy scalar kernel
+// burns one CPU-style thread per output cell with a scalar K-loop and no
+// lane cooperation — fine for correctness, but it makes decode tok/sec
+// bottleneck on FP8 GEMV (every expert FFN call, every attention QKV proj,
+// every Linear in the model).
+//
+// This kernel handles the M=1 case with one SIMD group (32 lanes) per
+// output column. The 32 lanes cooperate on the K reduction:
+//   - For each K-block of 128 elements, the lanes split the 128 elements
+//     into 4 chunks of 32 (chunk i, lane `lid` handles k = kb*128 + i*32 + lid).
+//   - Reads are coalesced across the simdgroup: all 32 lanes hit 32
+//     consecutive bytes per chunk, both on the A side and on the B side
+//     (within one col, B[col, k_chunk_base..+31] is contiguous in memory).
+//   - Per-lane partial sums are reduced with `simd_sum` into one dot product
+//     before the per-K-block scale is applied.
+//
+// Requirements:
+//   M == 1 (caller's responsibility), K % 128 == 0.
+//   N is unconstrained — each col gets its own threadgroup.
+//
+// Grid dispatch: (N, 1, 1) threadgroups, 32 threads per threadgroup.
+
+kernel void gemv_fp8_to_f32(
+    device const uchar*  A      [[buffer(0)]],
+    device const float*  A_sc   [[buffer(1)]],
+    device const uchar*  B      [[buffer(2)]],
+    device const uchar*  B_sc   [[buffer(3)]],
+    device float*        C      [[buffer(4)]],
+    constant uint3&      dims   [[buffer(5)]],   // (1, N, K)
+    uint  lid  [[thread_index_in_simdgroup]],
+    uint  gid  [[threadgroup_position_in_grid]]
+) {
+    uint K = dims.z;
+    uint col = gid;
+    uint blocksK = K / BLOCK_K;
+    uint n_block = col / BLOCK_N_FP8;
+
+    float acc = 0.0f;
+
+    // Outer loop over K-blocks of 128. One pair of (a_scale, b_scale)
+    // applies to every element inside the block — read once, fold into
+    // the partial sum at the end.
+    for (uint kb = 0; kb < blocksK; kb++) {
+        float a_s = A_sc[kb];
+        float b_s = deq_e8m0(B_sc[n_block * blocksK + kb]);
+
+        // 4 chunks of 32 = 128 elements per block. Lane `lid` handles
+        // element (i * 32 + lid) within the block. Across lanes 0..31,
+        // each chunk reads 32 consecutive bytes from both A and B[col]
+        // — the coalesced pattern Apple Silicon's L1 path is tuned for.
+        float block_acc = 0.0f;
+        uint k_base = kb * BLOCK_K;
+        for (uint i = 0; i < 4; i++) {
+            uint k = k_base + i * 32 + lid;
+            float a = deq_e4m3(A[k]);
+            float b = deq_e4m3(B[col * K + k]);
+            block_acc += a * b;
+        }
+        acc += block_acc * a_s * b_s;
+    }
+
+    // Tree-reduce the 32 per-lane partial sums into the simdgroup's
+    // total. After this every lane holds the same dot-product value;
+    // lane 0 is the canonical writer.
+    acc = simd_sum(acc);
+    if (lid == 0) {
+        C[col] = acc;
+    }
+}
