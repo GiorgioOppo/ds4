@@ -110,6 +110,19 @@ public final class StreamingPool {
     /// in-flight at a time than fight for disk bandwidth.
     private let ioQueue: DispatchQueue
 
+    /// Long-lived file descriptors keyed by shard URL. Opened lazily
+    /// on the first pread for each shard, kept open for the pool's
+    /// lifetime, and closed in `deinit`. Two reasons to cache:
+    ///   - One `open()` + `close()` per layer transition was a measurable
+    ///     fraction of the per-token I/O latency on cold APFS reads.
+    ///   - Each cached fd is opened with `F_RDAHEAD`, telling the
+    ///     Darwin kernel to issue aggressive sequential readahead.
+    ///     That hint is per-fd, so it survives across preads on the
+    ///     same shard — exactly what the rotating-slot access pattern
+    ///     needs (each layer is read sequentially in 1-GiB chunks).
+    /// Accessed only from `ioQueue` (serial), so no locking needed.
+    private var fdCache: [URL: Int32] = [:]
+
     /// Build the pool.
     ///
     /// - Parameter shards: parsed headers, in directory order
@@ -191,11 +204,14 @@ public final class StreamingPool {
         var sharedOffsetCursor = 0
         for i in sharedIndices {
             let header = shards[i]
-            try Self.preadInto(buffer: sharedSlot,
-                                bufferOffset: sharedOffsetCursor,
-                                url: header.url,
-                                fileOffset: header.dataStart,
-                                byteCount: header.dataByteCount)
+            // Init path: shared shards are read once at startup, not
+            // touched again. Open and close a one-shot fd; the cache
+            // is reserved for the rotating-slot hot path.
+            try Self.preadOneShot(buffer: sharedSlot,
+                                   bufferOffset: sharedOffsetCursor,
+                                   url: header.url,
+                                   fileOffset: header.dataStart,
+                                   byteCount: header.dataByteCount)
             for (name, entry) in header.entries {
                 let inShard = entry.dataOffsets[0]
                 locations[name] = TensorLocation(
@@ -338,11 +354,23 @@ public final class StreamingPool {
         stateLock.unlock()
 
         do {
+            // Tell the VM we're about to touch the slot region: it
+            // reserves physical pages and skips compressing/swapping
+            // it during the pread fill. The pages will be fully
+            // overwritten anyway, so the "preserve current contents"
+            // semantics of WILLNEED don't cost us anything here.
+            let slotBase = rotatingSlot.contents()
+                .advanced(by: slotIdx * slotSize)
+            _ = posix_madvise(slotBase, src.dataByteCount,
+                              POSIX_MADV_WILLNEED)
+
+            let fd = try cachedFD(for: src.url)
             try Self.preadInto(buffer: rotatingSlot,
                                 bufferOffset: slotIdx * slotSize,
-                                url: src.url,
+                                fd: fd,
                                 fileOffset: src.dataStart,
-                                byteCount: src.dataByteCount)
+                                byteCount: src.dataByteCount,
+                                shardName: src.url.lastPathComponent)
         } catch {
             // Pread failed; leave the slot poisoned (loadedLayer
             // = nil) so the next caller retries instead of
@@ -360,19 +388,33 @@ public final class StreamingPool {
 
     // ---- internals ----
 
-    private static func preadInto(buffer: MTLBuffer,
-                                   bufferOffset: Int,
-                                   url: URL,
-                                   fileOffset: Int,
-                                   byteCount: Int) throws {
+    /// Init-path helper: open a fresh fd, pread, close. Used for
+    /// shared shards that aren't part of the rotating hot path.
+    private static func preadOneShot(buffer: MTLBuffer,
+                                      bufferOffset: Int,
+                                      url: URL,
+                                      fileOffset: Int,
+                                      byteCount: Int) throws {
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else {
             throw NSError(domain: "StreamingPool", code: 32, userInfo: [
-                NSLocalizedDescriptionKey: "open failed: \(url.path)"
+                NSLocalizedDescriptionKey:
+                    "open failed: \(url.path) (\(String(cString: strerror(errno))))"
             ])
         }
         defer { close(fd) }
+        try preadInto(buffer: buffer, bufferOffset: bufferOffset,
+                       fd: fd, fileOffset: fileOffset,
+                       byteCount: byteCount,
+                       shardName: url.lastPathComponent)
+    }
 
+    private static func preadInto(buffer: MTLBuffer,
+                                   bufferOffset: Int,
+                                   fd: Int32,
+                                   fileOffset: Int,
+                                   byteCount: Int,
+                                   shardName: String) throws {
         // macOS / Darwin `pread` returns EINVAL when `nbyte` exceeds
         // a per-syscall cap (observed at ~2 GiB on M-series Macs,
         // even though POSIX permits up to SSIZE_MAX). For per-layer
@@ -401,13 +443,13 @@ public final class StreamingPool {
             } else if n == 0 {
                 throw NSError(domain: "StreamingPool", code: 33, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "short pread (got \(off)/\(byteCount)) from \(url.lastPathComponent)"
+                        "short pread (got \(off)/\(byteCount)) from \(shardName)"
                 ])
             } else if errno != EINTR {
                 let errnoStr = String(cString: strerror(errno))
                 throw NSError(domain: "StreamingPool", code: 34, userInfo: [
                     NSLocalizedDescriptionKey:
-                        "pread failed at \(off) (req \(toRead) bytes): \(errnoStr) — \(url.lastPathComponent)"
+                        "pread failed at \(off) (req \(toRead) bytes): \(errnoStr) — \(shardName)"
                 ])
             }
         }
@@ -431,6 +473,39 @@ public final class StreamingPool {
         case "F8_E8M0", "F8E8M0", "FLOAT8_E8M0FNU": return .e8m0
         default:
             fatalError("StreamingPool: unsupported safetensors dtype: \(s)")
+        }
+    }
+
+    /// Open (or fetch from cache) a long-lived fd for `url`. Sets
+    /// `F_RDAHEAD` on first open so the Darwin kernel issues
+    /// aggressive sequential prefetch on subsequent preads — a single
+    /// layer shard is read in one or more 1-GiB chunks in increasing
+    /// file offset order, exactly the access pattern readahead is
+    /// optimised for.
+    ///
+    /// Called only from `ioQueue` (serial), so the cache mutation is
+    /// race-free without an explicit lock.
+    private func cachedFD(for url: URL) throws -> Int32 {
+        if let fd = fdCache[url] { return fd }
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw NSError(domain: "StreamingPool", code: 32, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "open failed: \(url.path) (\(String(cString: strerror(errno))))"
+            ])
+        }
+        // F_RDAHEAD takes 0/1 on Darwin; the return value is unused.
+        // Best-effort hint: if the syscall fails (sandbox / unusual
+        // filesystem) we keep the fd anyway — pread still works, just
+        // without prefetch acceleration.
+        _ = fcntl(fd, F_RDAHEAD, 1)
+        fdCache[url] = fd
+        return fd
+    }
+
+    deinit {
+        for fd in fdCache.values where fd >= 0 {
+            close(fd)
         }
     }
 }
