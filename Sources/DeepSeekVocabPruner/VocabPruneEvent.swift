@@ -34,6 +34,18 @@ public enum VocabPruneEvent: Sendable {
     /// pre/post per stimare il risparmio.
     case finished(bytesIn: UInt64, bytesOut: UInt64,
                   vocabIn: Int, vocabOut: Int)
+
+    // ---- Expert-pruning phase events ----
+
+    /// Expert phase — decisione di pruning completa. Pubblicato
+    /// subito dopo `ExpertAnalyzer.analyze(...)` torna, prima del
+    /// primo `shardWritten` della fase expert. Permette alla UI /
+    /// CLI di mostrare il breakdown kept/dropped per layer.
+    case expertDecisionReady(ExpertKeepDecision)
+
+    /// Expert phase — fine job. Statistiche di pruning per layer.
+    case expertFinished(bytesIn: UInt64, bytesOut: UInt64,
+                         totalDropped: Int, totalKept: Int)
 }
 
 /// Snapshot aggregato dello stato del pruning, utile a una UI che
@@ -84,6 +96,17 @@ public struct VocabPruneStatus: Sendable, Equatable {
         case .log(let line):
             logLines.append(line)
         case .finished(let bIn, let bOut, _, _):
+            bytesIn = bIn
+            bytesOut = bOut
+            finishedAt = Date()
+        case .expertDecisionReady:
+            // Pesante (contiene il full usage grid); la UI dedicata
+            // si sottoscrive direttamente all'evento. Niente da
+            // aggregare qui.
+            break
+        case .expertFinished(let bIn, let bOut, _, _):
+            // Sovrascrive byte e finishedAt — l'expert phase è
+            // sempre l'ultima a runnare in pipeline mode.
             bytesIn = bIn
             bytesOut = bOut
             finishedAt = Date()

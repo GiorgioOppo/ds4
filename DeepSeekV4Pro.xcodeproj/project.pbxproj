@@ -10,6 +10,7 @@
 		00277B610FCA251D5833A058 /* CreateProjectSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23A3281DC5F4329F47E67C6C /* CreateProjectSheet.swift */; };
 		003E6087F90B796ADAED8C30 /* GenerationSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5170D8C9A0C95CC0393423D5 /* GenerationSettingsTab.swift */; };
 		038F8906252DF293DFABB854 /* ProjectsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E7478A26DE16C6CA112CDAA /* ProjectsView.swift */; };
+		0569F78D9361DE4CAC8CF21E /* ServerSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A0A41539BA04BAD911EAC22 /* ServerSettingsTab.swift */; };
 		06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC2A8ACE3A361FA6EC18B8AB /* QuantizationSettingsTab.swift */; };
 		0A5DDE8166FB32D1596B8E5F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0222470499767FD248FF1AD2 /* ChatView.swift */; };
 		0C71E6B97980C7FE109B5F24 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70E0AEC478A0A308F7B1FDA9 /* KeychainStore.swift */; };
@@ -28,7 +29,10 @@
 		2FFFC6D619A0A5AEE4CC8A8E /* ProjectDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB84BE909E6E1596CB6608E5 /* ProjectDetailView.swift */; };
 		33D312C9F312335C54F3B10E /* ProjectIndexer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7070411545DE289BB1571C6 /* ProjectIndexer.swift */; };
 		362ED68916C6AFA7886E47E6 /* DeepSeekConverter in Frameworks */ = {isa = PBXBuildFile; productRef = 90B8BA72F956224253D42EDE /* DeepSeekConverter */; };
+		3F6E48D2F8BFDD5FACA3B0FB /* AssistantTurnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E3735F4B5550F6C01EAAE1C /* AssistantTurnView.swift */; };
 		3F6EA386D68E78DD9D1CA840 /* PermissionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76B04BC9BB05594442AE8346 /* PermissionStore.swift */; };
+		40409D40C778A7B80D49892B /* PermissionSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = C67844A75862EBB88ED91310 /* PermissionSheet.swift */; };
+		43A5E640A1810B34ED5D9916 /* LocalServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC992FA7AB95CC2253F21BA4 /* LocalServer.swift */; };
 		4437B92FECBA4D22B7B7AD36 /* InferenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 013AFFD3629B6CFC29A695B1 /* InferenceService.swift */; };
 		464D9522A0986EAFA03C7E2B /* MessageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0327803E71CE18066FBAAE1E /* MessageView.swift */; };
 		48D04EBF2BC2218D30B41333 /* VocabPrunerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09F5D228AC2E872A59FD6E74 /* VocabPrunerSheet.swift */; };
@@ -42,14 +46,17 @@
 		6370DBA52917A42855768832 /* ToolsSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5288282E84E5DC653AB136D8 /* ToolsSettingsTab.swift */; };
 		645828B1E87CDF1E39A53549 /* ModelEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3BFD382D52977A9FE8E042A /* ModelEndpoint.swift */; };
 		67342FB3E92A5115A69CF862 /* KVCacheLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1B7D8606AFD3141C6F7C1C /* KVCacheLifecycle.swift */; };
+		6784F8DBCEEDF15F8C00A7A2 /* AnthropicMessageBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22FCAEAF5A261361C1B5D516 /* AnthropicMessageBuilder.swift */; };
 		678F688995F1160F9519D2A9 /* ModePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6FD2C6B3C2972A072636DB4 /* ModePickerView.swift */; };
 		686A0171CFCBEC545FC7226D /* ProjectLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AA040733C8FD59ADFE80BA8 /* ProjectLibrary.swift */; };
 		6ABBC4FDDBBCBF35CAC4FD30 /* ConvertSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D976460FAD6CBD28E89C31F1 /* ConvertSheet.swift */; };
 		771F6059B5362D38BD212802 /* MCPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71BDF7645DAE4BCD8DBC3717 /* MCPClient.swift */; };
 		7FDF0D8C2FE390D409A794DC /* KeybindingsSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = F69DA699B1A59D3590114BF6 /* KeybindingsSettingsTab.swift */; };
+		83C9F3BDACD9F3039105B607 /* LocalServerRoutes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50CD19FC70AF54AE9BBD48EA /* LocalServerRoutes.swift */; };
 		850FB98F800BF1508BF1E16F /* LoadingSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F16D75E968B84953F70C13E /* LoadingSettingsTab.swift */; };
 		86D317C29C92FA7AAAD415B0 /* OpenRouterCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0941E1630122D299C425231 /* OpenRouterCatalog.swift */; };
 		87071058A6659BFF9CAA8447 /* OpenRouterAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADB6F7D3ABCA982A0A7BB498 /* OpenRouterAPI.swift */; };
+		8966EAC0A3AD5C47057BD158 /* LocalServerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE22F2F77C4834457F48D47D /* LocalServerController.swift */; };
 		9022613D9C75E9ADA93B95F5 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F59E70898C61471DF21D787 /* ChatStore.swift */; };
 		92BB69F90028150346DC74DE /* PermissionsSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC98588561E952860E2246C6 /* PermissionsSettingsTab.swift */; };
 		92CDFE0D0743417EE7C3908E /* PlaygroundSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C96B656B104FD6FD206B3B2 /* PlaygroundSheet.swift */; };
@@ -59,10 +66,12 @@
 		9A0575ADFD1D2904956FC7BC /* SlashCommandLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8486F9D0DD24E112BE9E57D5 /* SlashCommandLibrary.swift */; };
 		9D5C6C6ABAE4D29D47DB3EF4 /* SkillLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDFF8DB4D4ED6E1026FF4B79 /* SkillLibrary.swift */; };
 		9E3667222E51D95E488145AE /* DeepSeekUIApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 767B5089C2140DC69D9B3D3E /* DeepSeekUIApp.swift */; };
+		A16671BDC6918947A4BC5F70 /* LocalModelSettingsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41BEB2155CBE9978EB03A8B9 /* LocalModelSettingsSheet.swift */; };
 		A4F6AB9A7F2CD76DC84D967C /* DocumentsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1870D57CAB370A27C83210B /* DocumentsView.swift */; };
 		A7FC2A44B0F79359D7E26048 /* PermissionPromptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F924901AAC78B8D3726EF9DE /* PermissionPromptView.swift */; };
 		A87CEEB80465B8D334503465 /* APIKeysSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 195F30DE381275E9D03FEDD7 /* APIKeysSettingsTab.swift */; };
 		AAF8E40DC9341C347C2C0BC8 /* ThemeSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4E92C856251084CD5727C57 /* ThemeSettingsTab.swift */; };
+		B5873AD6EA4294050F549647 /* AnthropicAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = C76CC815805D21C0C6110C53 /* AnthropicAPI.swift */; };
 		B822B67026F521A841431672 /* KeybindingStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78FE5FD28510B5B6D399D5D1 /* KeybindingStore.swift */; };
 		BB143287AE8AA1E0486BF626 /* ComposerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17DC49FABAFA7A8B83F9939 /* ComposerView.swift */; };
 		BC4BFB79EF4B0BB00E3BABFD /* SettingsScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00ED624622FE428BBCF16F8 /* SettingsScene.swift */; };
@@ -78,11 +87,14 @@
 		D96EC88EA808DF6FFB3E2997 /* AgentEditSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3A143C33B1C2FC54DB1062A /* AgentEditSheet.swift */; };
 		DAEBD49E168433BE9B51CCC5 /* Conversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EFB5202D2F1C4A24A8391C8 /* Conversation.swift */; };
 		DBFA83B17FB0DFDCD2A38A52 /* BuiltInAgents.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB8D0DEC5DC0B616C95DB258 /* BuiltInAgents.swift */; };
+		DF664F5A3A17D77E6934EB51 /* PrefillTraceDisclosure.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3877A95F14BECACC6BE563F4 /* PrefillTraceDisclosure.swift */; };
 		E3B5690972144101D7A40102 /* ProjectInventory.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA1CC3884BE367159F9C97AA /* ProjectInventory.swift */; };
 		E6A0AF2CEFEBE6ACAD223937 /* DeepSeekVocabPruner in Frameworks */ = {isa = PBXBuildFile; productRef = 98DD4D462D63C9EF3F3D0CBF /* DeepSeekVocabPruner */; };
 		EB0EBE07CAF1086E8B283BE4 /* AddOpenRouterModelSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1E24A09C72D8EE261CF2626 /* AddOpenRouterModelSheet.swift */; };
 		ECA6CBD6041E9FACC51CE447 /* StorageSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78025A6A49CA1B66CC261C60 /* StorageSettingsTab.swift */; };
 		EF639BA28B78960E62238FD6 /* DocumentLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = F79D71A16246480BDA285AAA /* DocumentLibrary.swift */; };
+		F1E63116F8615E12F4501407 /* ProjectOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2133AF32CDCA5D3618F5831 /* ProjectOverlay.swift */; };
+		F77DAF5910B3E82778E6C0A0 /* AddAnthropicModelSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBF5D048954D3123CACC1E3A /* AddAnthropicModelSheet.swift */; };
 		FBA26B1B09F7C2D5BD92A173 /* ModelState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66B7EDF5736ADD562F713898 /* ModelState.swift */; };
 		FF2948374C976BFFBB48964E /* MCPServerLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DCFEE82C5F93850A799F110 /* MCPServerLibrary.swift */; };
 /* End PBXBuildFile section */
@@ -99,15 +111,21 @@
 		176DFA70EC539EA7AA4B00AA /* DeepSeekUI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DeepSeekUI.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		195F30DE381275E9D03FEDD7 /* APIKeysSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeysSettingsTab.swift; sourceTree = "<group>"; };
 		1B1B7D8606AFD3141C6F7C1C /* KVCacheLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVCacheLifecycle.swift; sourceTree = "<group>"; };
+		22FCAEAF5A261361C1B5D516 /* AnthropicMessageBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicMessageBuilder.swift; sourceTree = "<group>"; };
 		23A3281DC5F4329F47E67C6C /* CreateProjectSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreateProjectSheet.swift; sourceTree = "<group>"; };
 		2BC403C80460F7EA28A995E3 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		2F4D3C80A5E1D30CB4E43DB7 /* ModelLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelLibrary.swift; sourceTree = "<group>"; };
 		351D35F88BE11F664C3296E9 /* SlashCommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlashCommandPaletteView.swift; sourceTree = "<group>"; };
 		37E1136C6CDAF710F4DFADDD /* DelegationFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegationFrame.swift; sourceTree = "<group>"; };
+		3877A95F14BECACC6BE563F4 /* PrefillTraceDisclosure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrefillTraceDisclosure.swift; sourceTree = "<group>"; };
 		3896C7FCA2253F33C0C70B44 /* NativeToolHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeToolHost.swift; sourceTree = "<group>"; };
+		3A0A41539BA04BAD911EAC22 /* ServerSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSettingsTab.swift; sourceTree = "<group>"; };
+		3E3735F4B5550F6C01EAAE1C /* AssistantTurnView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantTurnView.swift; sourceTree = "<group>"; };
 		3E37F9A49ADC64872184B551 /* MarkdownText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownText.swift; sourceTree = "<group>"; };
+		41BEB2155CBE9978EB03A8B9 /* LocalModelSettingsSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelSettingsSheet.swift; sourceTree = "<group>"; };
 		460895040927C4BB6BBE32D2 /* DelegationStackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegationStackView.swift; sourceTree = "<group>"; };
 		4E7478A26DE16C6CA112CDAA /* ProjectsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectsView.swift; sourceTree = "<group>"; };
+		50CD19FC70AF54AE9BBD48EA /* LocalServerRoutes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalServerRoutes.swift; sourceTree = "<group>"; };
 		5170D8C9A0C95CC0393423D5 /* GenerationSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenerationSettingsTab.swift; sourceTree = "<group>"; };
 		5288282E84E5DC653AB136D8 /* ToolsSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsSettingsTab.swift; sourceTree = "<group>"; };
 		60AF27CD603EE92A4275AC89 /* ThemeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeStore.swift; sourceTree = "<group>"; };
@@ -125,7 +143,6 @@
 		76E7BC683EF37A0EE7DEADFF /* ReasoningDisclosure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReasoningDisclosure.swift; sourceTree = "<group>"; };
 		78025A6A49CA1B66CC261C60 /* StorageSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageSettingsTab.swift; sourceTree = "<group>"; };
 		78FE5FD28510B5B6D399D5D1 /* KeybindingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeybindingStore.swift; sourceTree = "<group>"; };
-		7CCBF77C82E3ADA361E8314A /* DeepSeekUI.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = DeepSeekUI.entitlements; sourceTree = "<group>"; };
 		7F0FE2A5C36E157A50AA7D6E /* ModelConfigSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelConfigSettingsTab.swift; sourceTree = "<group>"; };
 		8486F9D0DD24E112BE9E57D5 /* SlashCommandLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlashCommandLibrary.swift; sourceTree = "<group>"; };
 		8B08D7297AEE138B7B1B4ADA /* VocabPruneHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VocabPruneHistory.swift; sourceTree = "<group>"; };
@@ -139,12 +156,16 @@
 		AB84BE909E6E1596CB6608E5 /* ProjectDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectDetailView.swift; sourceTree = "<group>"; };
 		AC2A8ACE3A361FA6EC18B8AB /* QuantizationSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizationSettingsTab.swift; sourceTree = "<group>"; };
 		AC8DF902D87467A4E2CA1F3B /* DeepSeek-V4-Pro-MacOS */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "DeepSeek-V4-Pro-MacOS"; path = .; sourceTree = SOURCE_ROOT; };
+		AC992FA7AB95CC2253F21BA4 /* LocalServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalServer.swift; sourceTree = "<group>"; };
 		ADB6F7D3ABCA982A0A7BB498 /* OpenRouterAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenRouterAPI.swift; sourceTree = "<group>"; };
+		AE22F2F77C4834457F48D47D /* LocalServerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalServerController.swift; sourceTree = "<group>"; };
 		B17DC49FABAFA7A8B83F9939 /* ComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerView.swift; sourceTree = "<group>"; };
 		B3BFD382D52977A9FE8E042A /* ModelEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelEndpoint.swift; sourceTree = "<group>"; };
 		B4E92C856251084CD5727C57 /* ThemeSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeSettingsTab.swift; sourceTree = "<group>"; };
 		BA1CC3884BE367159F9C97AA /* ProjectInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectInventory.swift; sourceTree = "<group>"; };
 		BBD17F53285E256E1A1640C4 /* AgentsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsView.swift; sourceTree = "<group>"; };
+		C67844A75862EBB88ED91310 /* PermissionSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionSheet.swift; sourceTree = "<group>"; };
+		C76CC815805D21C0C6110C53 /* AnthropicAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicAPI.swift; sourceTree = "<group>"; };
 		C79795B340C0055B6638CA00 /* FineTuneViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FineTuneViewModel.swift; sourceTree = "<group>"; };
 		CE6FE460EA0F62A17008C5D0 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		D0941E1630122D299C425231 /* OpenRouterCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenRouterCatalog.swift; sourceTree = "<group>"; };
@@ -152,7 +173,9 @@
 		D1E24A09C72D8EE261CF2626 /* AddOpenRouterModelSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddOpenRouterModelSheet.swift; sourceTree = "<group>"; };
 		D3A143C33B1C2FC54DB1062A /* AgentEditSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentEditSheet.swift; sourceTree = "<group>"; };
 		D976460FAD6CBD28E89C31F1 /* ConvertSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConvertSheet.swift; sourceTree = "<group>"; };
+		DBF5D048954D3123CACC1E3A /* AddAnthropicModelSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddAnthropicModelSheet.swift; sourceTree = "<group>"; };
 		DC98588561E952860E2246C6 /* PermissionsSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsSettingsTab.swift; sourceTree = "<group>"; };
+		E2133AF32CDCA5D3618F5831 /* ProjectOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectOverlay.swift; sourceTree = "<group>"; };
 		E251ADE870BA78953CCF41A6 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		E6FD2C6B3C2972A072636DB4 /* ModePickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModePickerView.swift; sourceTree = "<group>"; };
 		EB8D0DEC5DC0B616C95DB258 /* BuiltInAgents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuiltInAgents.swift; sourceTree = "<group>"; };
@@ -202,8 +225,11 @@
 		1B1D4756B80CCD7D57B181F9 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				DBF5D048954D3123CACC1E3A /* AddAnthropicModelSheet.swift */,
 				D1E24A09C72D8EE261CF2626 /* AddOpenRouterModelSheet.swift */,
 				2BC403C80460F7EA28A995E3 /* ContentView.swift */,
+				41BEB2155CBE9978EB03A8B9 /* LocalModelSettingsSheet.swift */,
+				C67844A75862EBB88ED91310 /* PermissionSheet.swift */,
 				85535D2A6A769253A7E822F5 /* Agents */,
 				B8CE1BA0FEF549D7792D38DE /* Chat */,
 				3716006FA3661A2A4302C0F0 /* Convert */,
@@ -235,6 +261,8 @@
 			isa = PBXGroup;
 			children = (
 				11CB9B7C44398C5BE55087B5 /* AgentLibrary.swift */,
+				C76CC815805D21C0C6110C53 /* AnthropicAPI.swift */,
+				22FCAEAF5A261361C1B5D516 /* AnthropicMessageBuilder.swift */,
 				CE6FE460EA0F62A17008C5D0 /* AppSettings.swift */,
 				EB8D0DEC5DC0B616C95DB258 /* BuiltInAgents.swift */,
 				0F59E70898C61471DF21D787 /* ChatStore.swift */,
@@ -247,6 +275,9 @@
 				78FE5FD28510B5B6D399D5D1 /* KeybindingStore.swift */,
 				70E0AEC478A0A308F7B1FDA9 /* KeychainStore.swift */,
 				1B1B7D8606AFD3141C6F7C1C /* KVCacheLifecycle.swift */,
+				AC992FA7AB95CC2253F21BA4 /* LocalServer.swift */,
+				AE22F2F77C4834457F48D47D /* LocalServerController.swift */,
+				50CD19FC70AF54AE9BBD48EA /* LocalServerRoutes.swift */,
 				71BDF7645DAE4BCD8DBC3717 /* MCPClient.swift */,
 				0DCFEE82C5F93850A799F110 /* MCPServerLibrary.swift */,
 				B3BFD382D52977A9FE8E042A /* ModelEndpoint.swift */,
@@ -257,6 +288,7 @@
 				A228296203BF2B3BB9FCF75D /* PlaygroundViewModel.swift */,
 				BA1CC3884BE367159F9C97AA /* ProjectInventory.swift */,
 				9AA040733C8FD59ADFE80BA8 /* ProjectLibrary.swift */,
+				E2133AF32CDCA5D3618F5831 /* ProjectOverlay.swift */,
 				EDFF8DB4D4ED6E1026FF4B79 /* SkillLibrary.swift */,
 				8486F9D0DD24E112BE9E57D5 /* SlashCommandLibrary.swift */,
 				60AF27CD603EE92A4275AC89 /* ThemeStore.swift */,
@@ -342,6 +374,7 @@
 				7F0FE2A5C36E157A50AA7D6E /* ModelConfigSettingsTab.swift */,
 				DC98588561E952860E2246C6 /* PermissionsSettingsTab.swift */,
 				AC2A8ACE3A361FA6EC18B8AB /* QuantizationSettingsTab.swift */,
+				3A0A41539BA04BAD911EAC22 /* ServerSettingsTab.swift */,
 				A00ED624622FE428BBCF16F8 /* SettingsScene.swift */,
 				FFD8A0426D486473569E2098 /* SkillsSettingsTab.swift */,
 				78025A6A49CA1B66CC261C60 /* StorageSettingsTab.swift */,
@@ -397,10 +430,12 @@
 		B8CE1BA0FEF549D7792D38DE /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				3E3735F4B5550F6C01EAAE1C /* AssistantTurnView.swift */,
 				0222470499767FD248FF1AD2 /* ChatView.swift */,
 				B17DC49FABAFA7A8B83F9939 /* ComposerView.swift */,
 				460895040927C4BB6BBE32D2 /* DelegationStackView.swift */,
 				0327803E71CE18066FBAAE1E /* MessageView.swift */,
+				3877A95F14BECACC6BE563F4 /* PrefillTraceDisclosure.swift */,
 				76E7BC683EF37A0EE7DEADFF /* ReasoningDisclosure.swift */,
 			);
 			path = Chat;
@@ -426,7 +461,6 @@
 			isa = PBXGroup;
 			children = (
 				E251ADE870BA78953CCF41A6 /* Assets.xcassets */,
-				7CCBF77C82E3ADA361E8314A /* DeepSeekUI.entitlements */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -520,11 +554,15 @@
 			buildActionMask = 2147483647;
 			files = (
 				A87CEEB80465B8D334503465 /* APIKeysSettingsTab.swift in Sources */,
+				F77DAF5910B3E82778E6C0A0 /* AddAnthropicModelSheet.swift in Sources */,
 				EB0EBE07CAF1086E8B283BE4 /* AddOpenRouterModelSheet.swift in Sources */,
 				D96EC88EA808DF6FFB3E2997 /* AgentEditSheet.swift in Sources */,
 				1C25C161D5BA070D614D3EBC /* AgentLibrary.swift in Sources */,
 				18D16743BBBB742A9B42D02E /* AgentsView.swift in Sources */,
+				B5873AD6EA4294050F549647 /* AnthropicAPI.swift in Sources */,
+				6784F8DBCEEDF15F8C00A7A2 /* AnthropicMessageBuilder.swift in Sources */,
 				D39CFCAF35396A89741E1FD4 /* AppSettings.swift in Sources */,
+				3F6E48D2F8BFDD5FACA3B0FB /* AssistantTurnView.swift in Sources */,
 				DBFA83B17FB0DFDCD2A38A52 /* BuiltInAgents.swift in Sources */,
 				9022613D9C75E9ADA93B95F5 /* ChatStore.swift in Sources */,
 				0A5DDE8166FB32D1596B8E5F /* ChatView.swift in Sources */,
@@ -550,6 +588,10 @@
 				7FDF0D8C2FE390D409A794DC /* KeybindingsSettingsTab.swift in Sources */,
 				0C71E6B97980C7FE109B5F24 /* KeychainStore.swift in Sources */,
 				850FB98F800BF1508BF1E16F /* LoadingSettingsTab.swift in Sources */,
+				A16671BDC6918947A4BC5F70 /* LocalModelSettingsSheet.swift in Sources */,
+				43A5E640A1810B34ED5D9916 /* LocalServer.swift in Sources */,
+				8966EAC0A3AD5C47057BD158 /* LocalServerController.swift in Sources */,
+				83C9F3BDACD9F3039105B607 /* LocalServerRoutes.swift in Sources */,
 				771F6059B5362D38BD212802 /* MCPClient.swift in Sources */,
 				5D850D39120567518CBFE797 /* MCPServerEditSheet.swift in Sources */,
 				FF2948374C976BFFBB48964E /* MCPServerLibrary.swift in Sources */,
@@ -565,19 +607,23 @@
 				87071058A6659BFF9CAA8447 /* OpenRouterAPI.swift in Sources */,
 				86D317C29C92FA7AAAD415B0 /* OpenRouterCatalog.swift in Sources */,
 				A7FC2A44B0F79359D7E26048 /* PermissionPromptView.swift in Sources */,
+				40409D40C778A7B80D49892B /* PermissionSheet.swift in Sources */,
 				3F6EA386D68E78DD9D1CA840 /* PermissionStore.swift in Sources */,
 				92BB69F90028150346DC74DE /* PermissionsSettingsTab.swift in Sources */,
 				2F600F711B073AD7EB98EC3C /* PersistencePaths.swift in Sources */,
 				92CDFE0D0743417EE7C3908E /* PlaygroundSheet.swift in Sources */,
 				1312A4CB4E9EB301D2D26A7C /* PlaygroundViewModel.swift in Sources */,
+				DF664F5A3A17D77E6934EB51 /* PrefillTraceDisclosure.swift in Sources */,
 				1529A62A869029467F6135B1 /* PreflightSummaryView.swift in Sources */,
 				2FFFC6D619A0A5AEE4CC8A8E /* ProjectDetailView.swift in Sources */,
 				33D312C9F312335C54F3B10E /* ProjectIndexer.swift in Sources */,
 				E3B5690972144101D7A40102 /* ProjectInventory.swift in Sources */,
 				686A0171CFCBEC545FC7226D /* ProjectLibrary.swift in Sources */,
+				F1E63116F8615E12F4501407 /* ProjectOverlay.swift in Sources */,
 				038F8906252DF293DFABB854 /* ProjectsView.swift in Sources */,
 				06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */,
 				D88A4DD03F9320774C711177 /* ReasoningDisclosure.swift in Sources */,
+				0569F78D9361DE4CAC8CF21E /* ServerSettingsTab.swift in Sources */,
 				BC4BFB79EF4B0BB00E3BABFD /* SettingsScene.swift in Sources */,
 				9D5C6C6ABAE4D29D47DB3EF4 /* SkillLibrary.swift in Sources */,
 				D02F9AFB7F1589E11B2791CF /* SkillsSettingsTab.swift in Sources */,
@@ -672,7 +718,7 @@
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/DeepSeekUI/Resources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "DeepSeek Runner";
+				INFOPLIST_KEY_CFBundleDisplayName = DeepSeekUI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -692,12 +738,14 @@
 				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Sources/DeepSeekUI/Resources/DeepSeekUI.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 3;
+				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/DeepSeekUI/Resources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "DeepSeek Runner";
+				INFOPLIST_KEY_CFBundleDisplayName = DeepSeekUI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

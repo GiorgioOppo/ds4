@@ -100,8 +100,19 @@ public extension Transformer {
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: nil)
 
+            // Honor `config.prunedExperts[i]` even in the random-init
+            // path so unit tests can exercise the loader's skip
+            // behavior without writing real safetensors.
+            let droppedForLayer: Set<Int> =
+                (i < config.prunedExperts.count)
+                ? Set(config.prunedExperts[i])
+                : []
             var experts: [Expert?] = []
-            for _ in 0..<nExperts {
+            for j in 0..<nExperts {
+                if droppedForLayer.contains(j) {
+                    experts.append(nil)
+                    continue
+                }
                 let w1 = AssemblyHelpers.linear(in: dim, out: config.moeInterDim, rng: &rng)
                 let w2 = AssemblyHelpers.linear(in: config.moeInterDim, out: dim, rng: &rng)
                 let w3 = AssemblyHelpers.linear(in: dim, out: config.moeInterDim, rng: &rng)
@@ -375,8 +386,22 @@ public extension Transformer {
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: tid2eid)
 
+            // Expert-prune support: skip allocation for experts marked
+            // as dropped in config.json's `pruned_experts[i]`. The MoE
+            // dispatch path already handles `nil` slots in
+            // `MoEFFN.experts` (Layers/MoE.swift), and the gate weight
+            // rows for these ids were set to large-negative by the
+            // rewriter so the top-K kernel never picks them.
+            let droppedForLayer: Set<Int> =
+                (i < config.prunedExperts.count)
+                ? Set(config.prunedExperts[i])
+                : []
             var experts: [Expert?] = []
             for j in 0..<nExperts {
+                if droppedForLayer.contains(j) {
+                    experts.append(nil)
+                    continue
+                }
                 let ep = "\(lp).ffn.experts.\(j)"
                 experts.append(Expert(
                     w1: try loadLinear(loader, base: "\(ep).w1",

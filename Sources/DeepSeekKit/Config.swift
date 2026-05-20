@@ -63,6 +63,21 @@ public struct ModelConfig: Codable, Sendable {
     public var hcSinkhornIters: Int = 20
     public var hcEps: Float = 1e-6
 
+    /// Per-layer set of routed-expert indices that were dropped by
+    /// the expert pruner (`DeepSeekVocabPruner/ExpertRewriter.swift`).
+    /// Outer index = main layer id (0..<nLayers); each inner array
+    /// lists the expert ids in that layer whose weights are intentionally
+    /// absent from the safetensors. The loader (`Assembly.swift`) skips
+    /// allocation for these slots and stores `nil` in `MoEFFN.experts`,
+    /// so the dispatch path naturally bypasses them. The gate weight
+    /// rows for these experts are set to large-negative by the rewriter
+    /// so the kernel never picks them in top-K.
+    ///
+    /// Empty array per layer (or absent in config.json) means no
+    /// pruning — the standard path. The field is parsed from
+    /// `pruned_experts` in config.json; serializes as a list of lists.
+    public var prunedExperts: [[Int]] = []
+
     enum CodingKeys: String, CodingKey {
         case maxBatchSize = "max_batch_size"
         case maxSeqLen = "max_seq_len"
@@ -101,6 +116,7 @@ public struct ModelConfig: Codable, Sendable {
         case hcMult = "hc_mult"
         case hcSinkhornIters = "hc_sinkhorn_iters"
         case hcEps = "hc_eps"
+        case prunedExperts = "pruned_experts"
     }
 
     public init() {}
@@ -150,6 +166,7 @@ public struct ModelConfig: Codable, Sendable {
         self.hcMult             = g(.hcMult, 4)
         self.hcSinkhornIters    = g(.hcSinkhornIters, 20)
         self.hcEps              = g(.hcEps, 1e-6)
+        self.prunedExperts      = g(.prunedExperts, [])
     }
 
     /// Loads a config.json. Accepts both the Swift-port snake_case names
@@ -257,6 +274,21 @@ public struct ModelConfig: Codable, Sendable {
         self.hcMult             = getInt(["hc_mult"], 4)
         self.hcSinkhornIters    = getInt(["hc_sinkhorn_iters"], 20)
         self.hcEps              = getFloat(["hc_eps"], 1e-6)
+        // pruned_experts: per-layer list of dropped expert ids.
+        // Tolerate both [[int]] and missing field (empty default).
+        if let outer = flat["pruned_experts"] as? [Any] {
+            var rows: [[Int]] = []
+            for row in outer {
+                if let inner = row as? [Any] {
+                    rows.append(inner.compactMap(intOf))
+                } else {
+                    rows.append([])
+                }
+            }
+            self.prunedExperts = rows
+        } else {
+            self.prunedExperts = []
+        }
     }
 
     /// Per-layer effective head dimensions.
@@ -434,6 +466,13 @@ public struct ModelConfig: Codable, Sendable {
         s += "  indexNHeads=\(indexNHeads) indexHeadDim=\(indexHeadDim) indexTopk=\(indexTopk)\n"
         s += "  // hyper-connections\n"
         s += "  hcMult=\(hcMult) hcSinkhornIters=\(hcSinkhornIters) hcEps=\(hcEps)\n"
+        if !prunedExperts.isEmpty {
+            let totalDropped = prunedExperts.reduce(0) { $0 + $1.count }
+            s += "  // expert pruning\n"
+            s += "  prunedExperts: \(totalDropped) total across "
+            s += "\(prunedExperts.count) layers "
+            s += "(per-layer counts=\(prunedExperts.map { $0.count }))\n"
+        }
         s += "}\n"
         return s
     }
