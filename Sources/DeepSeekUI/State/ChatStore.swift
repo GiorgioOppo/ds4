@@ -138,6 +138,17 @@ final class ChatStore: ObservableObject {
         var turns: [TurnSummary]
     }
     private var synthCache: [UUID: SynthCacheEntry] = [:]
+
+    /// Active streaming round per chat. Present from the moment
+    /// the placeholder assistant message is appended to messages
+    /// until `.done` finalises the round and copies its payload
+    /// back into the `StoredMessage`. The streaming bubble
+    /// observes the controller directly so per-token mutations
+    /// only invalidate that subview — `conversations[idx].messages`
+    /// stays Equatable-stable for the duration of the round, and
+    /// the rest of the transcript's bubbles can skip re-render.
+    @Published private(set) var streamingControllers:
+        [UUID: StreamingRoundController] = [:]
     /// Per-conversation count of how many tool-call -> generate
     /// continuations have fired since the latest user turn. Cleared
     /// the moment a `.done` arrives without tool calls (= final
@@ -449,6 +460,10 @@ final class ChatStore: ObservableObject {
         let placeholderId = UUID()
         conversations[idx].messages.append(
             StoredMessage(id: placeholderId, role: .assistant, content: ""))
+        // PR 4: live mutation goes onto a dedicated controller so
+        // SwiftUI only re-renders the streaming bubble, not every
+        // finalised turn already on screen.
+        newStreamingController(for: id, placeholderID: placeholderId)
 
         // Snapshot the bits we need off the main actor.
         let cachedPrefix = conversations[idx].encodedTokens
@@ -671,6 +686,14 @@ final class ChatStore: ObservableObject {
                                  metrics: GenerationMetrics())
 
         let placeholderId = pt.assistantMessageID
+        // PR 4: spin up a streaming controller for the existing
+        // placeholder so the resumed apply() loop's token mutates
+        // land on the live bubble. Seed it with whatever buffer
+        // we just recovered (may be empty post-PR 4 where the
+        // round didn't checkpoint into `messages.content` during
+        // streaming) — subsequent tokens append to it.
+        newStreamingController(for: id, placeholderID: placeholderId)
+        streamingControllers[id]?.round.content = buffer
         let modeRaw = pt.mode
         // The most recent user message — used by `apply` to stamp
         // tokenCount once the turn finishes.
@@ -846,6 +869,13 @@ final class ChatStore: ObservableObject {
         guard let target = id ?? selectedID else { return }
         generationTasks[target]?.cancel()
         service.cancelCurrent(conversationID: target)
+        // PR 4: drop the streaming controller so the bubble
+        // collapses back to its value-driven form. Whatever
+        // partial content the controller had is lost — the user
+        // chose to cancel, and the placeholder message in the
+        // transcript still carries whatever was synced through
+        // `.done` (none, in the cancel-before-done case).
+        streamingControllers.removeValue(forKey: target)
     }
 
     /// User chose to throw away the interrupted assistant turn. The
@@ -876,10 +906,14 @@ final class ChatStore: ObservableObject {
             let buffer = currentBuffer(of: id)
             let newBuffer = buffer + piece
             phases[id] = .streaming(buffer: newBuffer, status: "", metrics: m)
-            if let mIdx = conversations[idx].messages.firstIndex(
-                where: { $0.id == placeholderId }) {
-                conversations[idx].messages[mIdx].content = newBuffer
-            }
+            // PR 4: live token mutation lands on the streaming
+            // controller, NOT on `messages[mIdx].content`. Keeping
+            // `messages` Equatable-stable for the round's duration
+            // means every other bubble can skip re-render — the
+            // streaming bubble is the only view observing the
+            // controller. The placeholder's `content` is stamped at
+            // `.done` from `final.content`.
+            streamingControllers[id]?.appendContent(piece)
             // Append the raw id to the on-disk pendingTurn so a
             // crash mid-stream replays this token exactly. The save
             // is debounced (~500 ms) so we don't pay disk I/O at
@@ -895,32 +929,18 @@ final class ChatStore: ObservableObject {
         case .prefillStart(let promptTokens):
             phases[id] = .prefilling(promptTokens: promptTokens,
                                       startTime: Date())
-            // Resetta il prefillTrace sul placeholder: su un resume
-            // dopo crash il placeholder rientra con il trace del
-            // turn precedente; senza azzeramento i nuovi
-            // `.prefillToken` ci appenderebbero sopra producendo un
-            // trace duplicato. Sul flusso normale (placeholder
-            // appena creato) è un no-op.
-            if let mIdx = conversations[idx].messages.firstIndex(
-                where: { $0.id == placeholderId }) {
-                conversations[idx].messages[mIdx].prefillTrace = nil
-            }
+            // PR 4: prefill trace lives on the controller during
+            // streaming. The trace is stamped back onto
+            // `messages[mIdx].prefillTrace` at `.done`.
+            streamingControllers[id]?.clearPrefillTrace()
 
         case .prefillToken(let text):
-            // Append al `prefillTrace` del placeholder. Cresce
-            // live durante il prefill (la UI legge da
-            // `placeholder.prefillTrace` per disegnare il blocco
-            // grigio collassabile fra l'user e l'assistente).
-            // Persistito nel conversation JSON al `.done` via
-            // `scheduleSave`, ma scriviamo subito qui per il
-            // crash-recovery — il debounce di scheduleSave evita
-            // di sgranchire il disco a ogni chunk.
-            if let mIdx = conversations[idx].messages.firstIndex(
-                where: { $0.id == placeholderId }) {
-                let prev = conversations[idx].messages[mIdx].prefillTrace ?? ""
-                conversations[idx].messages[mIdx].prefillTrace = prev + text
-                scheduleSave(id)
-            }
+            // PR 4: append to the controller's prefill trace
+            // instead of mutating the placeholder message. The
+            // controller is what the streaming bubble reads from;
+            // the on-disk persisted copy lands at `.done`.
+            streamingControllers[id]?.appendPrefillTrace(text)
+            scheduleSave(id)
 
         case .prefillDone(let promptTokens, let elapsed, let tokPerMin):
             var m = currentMetrics(of: id)
@@ -941,13 +961,13 @@ final class ChatStore: ObservableObject {
         case .done(let final, let promptTokens, let generatedTokens):
             // Finalize the assistant placeholder with the parsed
             // structure (reasoning + tool calls split out).
-            // Preserva l'eventuale prefillTrace accumulato durante
-            // il cold prefill — l'init non lo prende dal Message
-            // (il kit non lo conosce) quindi va riassegnato dal
-            // valore precedente.
+            // PR 4: the prefill trace lived on the streaming
+            // controller during this turn; carry it across to the
+            // finalised message so the disclosure stays usable
+            // after restart.
+            let prevTrace = streamingControllers[id]?.round.prefillTrace
             if let mIdx = conversations[idx].messages.firstIndex(
                 where: { $0.id == placeholderId }) {
-                let prevTrace = conversations[idx].messages[mIdx].prefillTrace
                 conversations[idx].messages[mIdx] = StoredMessage(
                     id: placeholderId,
                     role: .assistant,
@@ -957,6 +977,10 @@ final class ChatStore: ObservableObject {
                     tokenCount: generatedTokens.count,
                     prefillTrace: prevTrace)
             }
+            // PR 4: round is now finalised on the messages array
+            // — retire the controller so the chat returns to the
+            // value-driven render path.
+            streamingControllers.removeValue(forKey: id)
             // Stamp the user message with the share of the prompt it
             // contributed. Approximation: prompt length minus the
             // bytes already accounted for by previous messages.
@@ -1100,6 +1124,10 @@ final class ChatStore: ObservableObject {
                     promptTokens: promptTokens,
                     generatedTokens: [],
                     mode: mode.rawValue)
+                // PR 4: new placeholder → new streaming controller
+                // (the previous one was retired at `.done`).
+                self.newStreamingController(
+                    for: id, placeholderID: newPlaceholderId)
                 self.scheduleSave(id)
             }
 
@@ -1773,6 +1801,8 @@ final class ChatStore: ObservableObject {
         conversations[idx].messages.append(userMessage)
         conversations[idx].messages.append(placeholder)
         conversations[idx].retitleIfNeeded()
+        // PR 4: streaming controller for the live remote round.
+        newStreamingController(for: id, placeholderID: placeholder.id)
         phases[id] = .streaming(buffer: "",
                                  status: "Calling \(modelID)…",
                                  metrics: GenerationMetrics())
@@ -2093,6 +2123,9 @@ final class ChatStore: ObservableObject {
                 }
                 let next = StoredMessage(role: .assistant, content: "")
                 self.conversations[idx].messages.append(next)
+                // PR 4: fresh controller per remote-loop iteration.
+                self.newStreamingController(
+                    for: id, placeholderID: next.id)
                 self.phases[id] = .streaming(
                     buffer: "",
                     status: "Calling \(modelID) again with tool results…",
@@ -2119,6 +2152,12 @@ final class ChatStore: ObservableObject {
                 phases[id] else { return }
         phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
                                  status: status, metrics: metrics)
+        // PR 4: mirror the live buffer onto the streaming
+        // controller so the bubble bound to it reflects the
+        // remote-side content as it arrives. Token-level deltas
+        // come through here for remote chats (local chats route
+        // via `.token` events).
+        streamingControllers[id]?.round.content = buffer
     }
 
     /// TODO §4 follow-up: live reasoning content in the bubble.
@@ -2133,6 +2172,9 @@ final class ChatStore: ObservableObject {
                 phases[id] else { return }
         phases[id] = .streaming(buffer: buffer, reasoningBuffer: reasoning,
                                  status: status, metrics: metrics)
+        // PR 4: also mirror reasoning onto the controller for the
+        // streaming bubble's reasoning disclosure.
+        streamingControllers[id]?.setReasoning(reasoning)
     }
 
     private func updateRemoteProgress(conversationID id: UUID,
@@ -2163,14 +2205,13 @@ final class ChatStore: ObservableObject {
         if let mIdx = conversations[idx].messages.firstIndex(
             where: { $0.id == placeholderID })
         {
-            // Preserva il prefillTrace accumulato durante lo
-            // streaming remote (dump del body OpenRouter). L'init
-            // dello StoredMessage non lo prende dal `Message` del
-            // kit — il backend remoto non lo conosce — quindi va
-            // letto dal valore precedente e ripassato esplicitamente
-            // così non viene azzerato dalla riscrittura del
-            // placeholder.
-            let prevTrace = conversations[idx].messages[mIdx].prefillTrace
+            // PR 4: prefillTrace lives on the streaming controller
+            // during the remote turn (mirror of the local-`.done`
+            // path). Read it from there before retiring the
+            // controller a few lines below, so the finalised
+            // StoredMessage still carries the trace bytes for the
+            // disclosure after restart.
+            let prevTrace = streamingControllers[id]?.round.prefillTrace
             conversations[idx].messages[mIdx] = StoredMessage(
                 id: placeholderID,
                 role: .assistant,
@@ -2215,6 +2256,10 @@ final class ChatStore: ObservableObject {
             // the recovery breadcrumb.
             conversations[idx].remotePendingTurn = nil
             phases[id] = .idle
+            // PR 4: remote turn finished — retire the controller
+            // so the bubble switches back to the value-driven
+            // render path.
+            streamingControllers.removeValue(forKey: id)
         }
         scheduleSave(id)
     }
@@ -2257,14 +2302,13 @@ final class ChatStore: ObservableObject {
         }()
         guard let text = pretty else { return }
 
-        // Reset on this placeholder prima di scrivere (no doppione
-        // se per qualche motivo entriamo qua due volte).
+        // PR 4: drive the prefill trace through the streaming
+        // controller, not via direct `messages[mIdx].prefillTrace`
+        // mutation. Same isolation guarantee as the local path —
+        // chunk-by-chunk mutations invalidate only the streaming
+        // bubble.
         await MainActor.run {
-            if let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
-               let mIdx = self.conversations[cIdx].messages.firstIndex(
-                where: { $0.id == placeholderID }) {
-                self.conversations[cIdx].messages[mIdx].prefillTrace = nil
-            }
+            self.streamingControllers[conversationID]?.clearPrefillTrace()
         }
 
         let chars = Array(text)
@@ -2275,13 +2319,8 @@ final class ChatStore: ObservableObject {
             let end = min(i + chunkSize, chars.count)
             let chunk = String(chars[i..<end])
             await MainActor.run {
-                guard let cIdx = self.conversations.firstIndex(where: { $0.id == conversationID }),
-                      let mIdx = self.conversations[cIdx].messages.firstIndex(
-                        where: { $0.id == placeholderID })
-                else { return }
-                let prev = self.conversations[cIdx].messages[mIdx].prefillTrace ?? ""
-                self.conversations[cIdx].messages[mIdx].prefillTrace = prev + chunk
-                self.scheduleSave(conversationID)
+                self.streamingControllers[conversationID]?
+                    .appendPrefillTrace(chunk)
             }
             i = end
             // ~4 ms fra chunk — totalizza ~1 s per body da 10 KB.
@@ -2562,6 +2601,64 @@ final class ChatStore: ObservableObject {
         chatPersistence.scheduleManifestSave(manifest(from: c))
     }
 
+    // MARK: - streaming controller plumbing (PR 4)
+
+    /// Spin up a `StreamingRoundController` for the assistant
+    /// placeholder we just appended. `placeholderID` is the
+    /// `StoredMessage.id` of the placeholder; the turn's lead
+    /// (user / system message) is resolved via
+    /// `currentTurnLeadID`. The round index is one less than the
+    /// current count of consecutive assistants under that lead
+    /// (the placeholder we just appended is the last one).
+    ///
+    /// The previous controller for this chat — if any — is
+    /// dropped here. Tool-roundtrip continuations rely on that:
+    /// each new placeholder gets a fresh controller, and the
+    /// finalised round of the previous placeholder is already
+    /// stamped back onto `messages[mIdx]` at `.done`.
+    private func newStreamingController(
+        for chatID: UUID, placeholderID: UUID
+    ) {
+        guard let leadID = currentTurnLeadID(in: chatID) else { return }
+        let roundIdx = currentRoundIndex(in: chatID, leadID: leadID)
+        streamingControllers[chatID] = StreamingRoundController(
+            round: StoredRound(
+                id: placeholderID,
+                roundIndex: roundIdx,
+                content: ""),
+            turnID: leadID)
+    }
+
+    /// Identifier of the most recent user / system message — i.e.
+    /// the lead of the current turn. Nil for empty chats.
+    private func currentTurnLeadID(in chatID: UUID) -> UUID? {
+        guard let c = conversations.first(where: { $0.id == chatID })
+        else { return nil }
+        return c.messages
+            .reversed()
+            .first(where: { $0.role != .assistant })?.id
+    }
+
+    /// 0-based index of the LAST assistant round under `leadID`.
+    /// Called after the placeholder for the next round has been
+    /// appended — the returned value is the placeholder's own
+    /// index. Returns 0 when no assistants exist yet.
+    private func currentRoundIndex(in chatID: UUID, leadID: UUID) -> Int {
+        guard let c = conversations.first(where: { $0.id == chatID })
+        else { return 0 }
+        guard let leadIdx = c.messages.firstIndex(where: { $0.id == leadID })
+        else { return 0 }
+        var count = 0
+        var i = leadIdx + 1
+        while i < c.messages.count, c.messages[i].role == .assistant {
+            count += 1
+            i += 1
+        }
+        // `count` includes the freshly-appended placeholder, so
+        // its own 0-based index is `count - 1`.
+        return max(0, count - 1)
+    }
+
     /// PR 3b: recompute turn summaries + round payloads from
     /// `c.messages`, diff against the last sync (turn summaries
     /// memoised in `synthCache`, round payloads in `roundLRU`),
@@ -2589,6 +2686,15 @@ final class ChatStore: ObservableObject {
             fingerprint: SynthFingerprint(messages: c.messages),
             turns: newTurns)
 
+        // PR 4: the round currently being streamed lives on a
+        // controller, NOT in `messages[mIdx].content` — synthesising
+        // it would produce an empty StoredRound and clobber whatever
+        // was on disk from the previous turn. Skip it; the matching
+        // `.done` event triggers another `syncV2State` after the
+        // controller's payload has been copied back into messages,
+        // and the round file gets a proper write then.
+        let activeStreamingRoundID = streamingControllers[id]?.round.id
+
         // Per-turn diff. The Equatable on `TurnSummary` compares
         // every field, so a content-preview tweak or flag change
         // re-schedules the small turn-summary file write only.
@@ -2600,9 +2706,8 @@ final class ChatStore: ObservableObject {
             // Per-round diff via the LRU peek: if the cached payload
             // matches the freshly synthesised one, skip the write
             // entirely. Otherwise update the LRU + stage the write.
-            // Pin nothing here — PR 4 takes ownership of the
-            // streaming round's pin slot.
             for round in rounds {
+                if round.id == activeStreamingRoundID { continue }
                 let key = RoundKey(chatID: id,
                                     turnID: summary.id,
                                     roundID: round.id)

@@ -481,17 +481,32 @@ struct ChatView: View {
                             first, in: c, phase: phase))
                         .padding(.leading, 40)
                 }
-                AssistantTurnView(
-                    messages: messages,
-                    isStreamingFinal: messages.last.map {
-                        isStreamingPlaceholder($0, in: c, phase: phase)
-                    } ?? false,
-                    streamingReasoning: messages.last.flatMap {
-                        streamingReasoning(for: $0, in: c, phase: phase)
-                    },
-                    agentResolver: { name in
-                        store.agents.agents.first(where: { $0.name == name })
-                    })
+                // PR 4: while a generation is in flight on this turn,
+                // the LAST round is owned by a dedicated streaming
+                // controller — bound to its own SwiftUI subview so
+                // per-token mutations don't churn every other bubble.
+                // The finalised rounds before it still render through
+                // the regular AssistantTurnView path.
+                if let last = messages.last,
+                   isStreamingPlaceholder(last, in: c, phase: phase),
+                   let controller = store.streamingControllers[c.id]
+                {
+                    let finalized = Array(messages.dropLast())
+                    StreamingAssistantTurnView(
+                        controller: controller,
+                        finalizedRounds: finalized,
+                        agentResolver: { name in
+                            store.agents.agents.first(where: { $0.name == name })
+                        })
+                } else {
+                    AssistantTurnView(
+                        messages: messages,
+                        isStreamingFinal: false,
+                        streamingReasoning: nil,
+                        agentResolver: { name in
+                            store.agents.agents.first(where: { $0.name == name })
+                        })
+                }
             }
         }
     }
