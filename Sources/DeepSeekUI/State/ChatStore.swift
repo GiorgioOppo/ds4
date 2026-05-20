@@ -1,7 +1,6 @@
 import Foundation
 import SwiftUI
 import DeepSeekKit
-
 /// Throughput readings the UI shows alongside the streamed text. Both
 /// fields stay at 0 until the corresponding phase produces a sample.
 struct GenerationMetrics: Equatable {
