@@ -268,29 +268,44 @@ public final class Transformer {
         let traceLayers: Set<Int> = nL <= 12
             ? Set(0..<nL)
             : Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 30, nL - 1])
-        // DEEPSEEK_PERF_TRACE=1 → log a per-token breakdown of where
-        // wall-clock time went: layer I/O (ensureLayer pread), GPU
-        // execution (gpuEndTime - gpuStartTime, summed across layers),
-        // and everything else (Swift orchestration, CPU work, KV cache
-        // blits not captured above). Off by default — single env-var
-        // probe at the top of `forward` is the only overhead.
+        // Per-forward perf breakdown. `DEEPSEEK_PERF_TRACE=1` env var
+        // OR a Debug build → log where wall-clock time went on each
+        // forward pass: layer I/O (ensureLayer pread), GPU execution
+        // (gpuEndTime - gpuStartTime, summed across layers), and
+        // everything else (Swift orchestration, CPU work, KV cache
+        // blits not captured above). In Debug builds also dump the
+        // 5 slowest layers with a per-layer (io_ms, gpu_ms) split so
+        // a single outlier (one MoE layer paging extra experts, a
+        // single attention layer with a pathological context length)
+        // is immediately visible instead of being averaged out across
+        // the full layer count.
+        #if DEBUG
+        let perfTrace = true
+        #else
         let perfTrace = ProcessInfo.processInfo
             .environment["DEEPSEEK_PERF_TRACE"] == "1"
+        #endif
         let perfStart = DispatchTime.now().uptimeNanoseconds
         var perfIoNs: UInt64 = 0
         var perfGpuNs: UInt64 = 0
+        // Reserved capacity == nL keeps the array stride out of the
+        // measured hot path (no reallocs while we're timing).
+        var perfPerLayer: [(io: UInt64, gpu: UInt64)] = []
+        if perfTrace { perfPerLayer.reserveCapacity(nL) }
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
             // Tensors. (No-op in `.mmap` / `.preload` strategies.)
             let ioT0 = perfTrace ? DispatchTime.now().uptimeNanoseconds : 0
             loader?.ensureLayer(k)
-            if perfTrace {
-                perfIoNs &+= DispatchTime.now().uptimeNanoseconds &- ioT0
-            }
+            let ioNs: UInt64 = perfTrace
+                ? (DispatchTime.now().uptimeNanoseconds &- ioT0)
+                : 0
+            if perfTrace { perfIoNs &+= ioNs }
             var cmdL = Device.shared.queue.makeCommandBuffer()!
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
+            var gpuNs: UInt64 = 0
             if perfTrace {
                 // gpuStartTime / gpuEndTime are valid post-wait. They
                 // measure on-GPU execution only, excluding queue wait
@@ -298,8 +313,10 @@ public final class Transformer {
                 // against the I/O total to spot what dominates.
                 let gpu = cmdL.gpuEndTime - cmdL.gpuStartTime
                 if gpu > 0 {
-                    perfGpuNs &+= UInt64(gpu * 1_000_000_000)
+                    gpuNs = UInt64(gpu * 1_000_000_000)
+                    perfGpuNs &+= gpuNs
                 }
+                perfPerLayer.append((io: ioNs, gpu: gpuNs))
             }
             loader?.releaseLayer(k)
             MemoryLogger.snapshot(
@@ -314,9 +331,24 @@ public final class Transformer {
             let ioMs = Double(perfIoNs) / 1_000_000
             let gpuMs = Double(perfGpuNs) / 1_000_000
             let otherMs = max(0, totalMs - ioMs - gpuMs)
-            let line = String(format:
+            var line = String(format:
                 "[perf] forward layers=%d total=%.1fms io=%.1fms gpu=%.1fms other=%.1fms\n",
                 nL, totalMs, ioMs, gpuMs, otherMs)
+            // Sort by total (io + gpu) descending, pick top 5. The
+            // outliers are the layers worth investigating — averaged
+            // numbers across 61 V4 layers can hide a 200 ms layer in
+            // a 4 ms median.
+            let ranked = perfPerLayer.enumerated()
+                .sorted { ($0.element.io &+ $0.element.gpu)
+                          > ($1.element.io &+ $1.element.gpu) }
+                .prefix(5)
+            for (idx, entry) in ranked {
+                line += String(format:
+                    "[perf]   layer=%02d io=%.1fms gpu=%.1fms\n",
+                    idx,
+                    Double(entry.io) / 1_000_000,
+                    Double(entry.gpu) / 1_000_000)
+            }
             FileHandle.standardError.write(Data(line.utf8))
         }
 
