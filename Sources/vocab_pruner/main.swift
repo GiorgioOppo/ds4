@@ -195,8 +195,8 @@ let runVocabPhase = (corpus != nil) || (keepIdsFile != nil)
 let runExpertPhase = pruneExperts
 guard runVocabPhase || runExpertPhase else {
     FileHandle.standardError.write(
-        "Nothing to do: pass --corpus / --keep-ids (vocab phase) " +
-        "and/or --prune-experts (expert phase).\n".data(using: .utf8)!)
+        ("Nothing to do: pass --corpus / --keep-ids (vocab phase) " +
+         "and/or --prune-experts (expert phase).\n").data(using: .utf8)!)
     usage()
 }
 if runExpertPhase && pruneExperts {
@@ -338,9 +338,9 @@ final class StatusPrinter: @unchecked Sendable {
             }
             let totalRouted = decision.nLayers * decision.nRoutedExperts
             FileHandle.standardError.write(Data(
-                "  expert decision: drop \(decision.totalDropped) / " +
-                "\(totalRouted) (= \(decision.totalKept) kept) " +
-                "across \(decision.nLayers) layers\n".utf8))
+                ("  expert decision: drop \(decision.totalDropped) / "
+                 + "\(totalRouted) (= \(decision.totalKept) kept) "
+                 + "across \(decision.nLayers) layers\n").utf8))
             // Per-layer breakdown.
             for L in 0..<decision.nLayers {
                 let kept = decision.keepIds[L].count
