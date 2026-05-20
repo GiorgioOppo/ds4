@@ -288,6 +288,35 @@ public final class WeightLoader {
         }
     }
 
+    /// Lazy-expert mode entry point: after the MoE gate at layer K
+    /// has resolved which experts the current token wants, this preads
+    /// only those experts' weight tensors into their slot offsets.
+    /// No-op when `pool` is nil (mmap/preload strategies — every
+    /// expert is already addressable in the resident bag of buffers).
+    public func ensureExperts(layer K: Int, indices: [Int]) {
+        guard let pool = pool, !indices.isEmpty else { return }
+        // Each expert has three weight tensors. Build the flat name
+        // list and let the pool batch the preads through its serial
+        // ioQueue + cached fd path.
+        var names: [String] = []
+        names.reserveCapacity(indices.count * 3)
+        for e in indices {
+            names.append("layers.\(K).ffn.experts.\(e).w1.weight")
+            names.append("layers.\(K).ffn.experts.\(e).w2.weight")
+            names.append("layers.\(K).ffn.experts.\(e).w3.weight")
+        }
+        do {
+            try pool.ensureTensors(layer: K, names: names)
+        } catch {
+            if MemoryLogger.enabled {
+                FileHandle.standardError.write(Data(
+                    "[pool] ensureExperts(layer=\(K), n=\(indices.count)) failed: " +
+                    "\(error.localizedDescription)\n"
+                        .utf8))
+            }
+        }
+    }
+
     /// Returns the effective rotating-slot count when in pool mode,
     /// or 0 otherwise. Used by callers that want to size their own
     /// per-layer work to match the streaming window (e.g. tests,

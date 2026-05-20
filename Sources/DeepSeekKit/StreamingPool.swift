@@ -123,6 +123,26 @@ public final class StreamingPool {
     /// Accessed only from `ioQueue` (serial), so no locking needed.
     private var fdCache: [URL: Int32] = [:]
 
+    /// Per-layer index into its shard for fast byte-range lookup.
+    /// `tensorIO[name]` returns `(url, fileOffset, byteCount, slotOffset)`
+    /// for every per-layer tensor we know about (rotating slot only —
+    /// shared tensors live in mlocked sharedSlot and aren't paged).
+    /// Built once at init from the shard headers; read-only from there
+    /// on, so safe to access without locking from any thread.
+    private struct TensorIO {
+        let url: URL
+        let fileOffset: Int
+        let byteCount: Int
+        let slotOffset: Int
+    }
+    private let tensorIO: [String: TensorIO]
+
+    /// Names of non-expert tensors per layer, precomputed at init so
+    /// lazy-expert mode can call `ensureTensors(layer:names:)` without
+    /// re-filtering the header on every token. Empty for layers that
+    /// have no expert tensors (e.g. dense layers before MoE kicks in).
+    private let nonExpertNamesByLayer: [Int: [String]]
+
     /// Build the pool.
     ///
     /// - Parameter shards: parsed headers, in directory order
@@ -225,20 +245,40 @@ public final class StreamingPool {
 
         // -------- Resolve per-layer tensor locations (offsets
         //          already include the sub-slot base address) --------
-        for (layerK, _) in layerToShard {
+        var tensorIO: [String: TensorIO] = [:]
+        var nonExpertByLayer: [Int: [String]] = [:]
+        for (layerK, src) in layerToShard {
             guard let shardIdx = shardLayers.firstIndex(of: layerK) else { continue }
             let header = shards[shardIdx]
             let slotBase = (layerK % slotCount) * slotSize
+            var nonExpert: [String] = []
             for (name, entry) in header.entries {
                 let inShard = entry.dataOffsets[0]
+                let byteCount = entry.dataOffsets[1] - entry.dataOffsets[0]
                 locations[name] = TensorLocation(
                     slot: .rotating,
                     offsetInSlot: slotBase + inShard,
                     shape: entry.shape,
                     dtype: Self.parseDType(entry.dtype))
+                tensorIO[name] = TensorIO(
+                    url: src.url,
+                    fileOffset: src.dataStart + inShard,
+                    byteCount: byteCount,
+                    slotOffset: slotBase + inShard)
+                // ".ffn.experts." separator is stable across DeepSeek
+                // V2 / V3 / V4 checkpoints; the shared expert is
+                // named ".ffn.shared_experts." and stays in the
+                // non-expert bucket so it's preloaded with the rest
+                // of the layer "core" (attention proj, norms, gate).
+                if !name.contains(".ffn.experts.") {
+                    nonExpert.append(name)
+                }
             }
+            nonExpertByLayer[layerK] = nonExpert
         }
         self.tensorLocation = locations
+        self.tensorIO = tensorIO
+        self.nonExpertNamesByLayer = nonExpertByLayer
 
         // -------- mlock the shared slot --------
         if let addr = sharedSlot.contents() as UnsafeMutableRawPointer?,
@@ -283,12 +323,33 @@ public final class StreamingPool {
         FileHandle.standardError.write(Data(s.utf8))
     }
 
+    /// Lazy-expert mode toggle. Picked up at the first `ensureLayer`
+    /// call so a single flag at process launch decides the strategy:
+    ///   DEEPSEEK_LAZY_EXPERT=1 → only pread non-expert tensors at
+    ///     `ensureLayer`; the per-MoE expert tensors are loaded on
+    ///     demand by `ensureTensors(layer:names:)` once the gate has
+    ///     picked the active topK.
+    ///   anything else (default) → legacy full-shard pread.
+    /// Reduces per-token I/O on huge MoE checkpoints from ~full-shard
+    /// (~3 GB / layer at V4-Flash sizes) to ~core + 8/256 experts
+    /// (~600 MB / layer), and as a side effect keeps each GPU command
+    /// buffer's working set small enough that macOS no longer aborts
+    /// it with `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`.
+    public static let lazyExpertEnabled: Bool = {
+        ProcessInfo.processInfo
+            .environment["DEEPSEEK_LAZY_EXPERT"] == "1"
+    }()
+
     /// Ensure layer K's shard is loaded into its sub-slot. Blocks
     /// until the data is resident. Idempotent: no-op if already
     /// loaded (fast path skips the I/O queue entirely).
     public func ensureLayer(_ K: Int) throws {
         // Fast path: already resident, no queue wait. Safe because
         // `loadedLayer` is set to K *only after* the pread completes.
+        // In lazy-expert mode the same "resident" cache still applies
+        // — `loadLayerSync` writes the marker after the (smaller)
+        // non-expert pread finishes; expert tensors are tracked
+        // separately by `ensureTensors`.
         let slotIdx = K % slotCount
         stateLock.lock()
         let alreadyLoaded = slotStates[slotIdx].loadedLayer == K
@@ -302,6 +363,25 @@ public final class StreamingPool {
         var caught: Error?
         ioQueue.sync {
             do { try self.loadLayerSync(K) }
+            catch { caught = error }
+        }
+        if let e = caught { throw e }
+    }
+
+    /// Pread a specific set of named tensors from layer K's shard into
+    /// their existing slot offsets. Used by lazy-expert mode after the
+    /// MoE gate has decided which experts are active for the current
+    /// token — the caller passes only the active expert weight names
+    /// instead of triggering a full-layer pread.
+    ///
+    /// Names that aren't part of layer K's shard (or aren't in the
+    /// rotating slot at all) are silently skipped. Always serializes
+    /// through `ioQueue` so it interleaves correctly with prefetches.
+    public func ensureTensors(layer K: Int, names: [String]) throws {
+        guard !names.isEmpty else { return }
+        var caught: Error?
+        ioQueue.sync {
+            do { try self.loadTensorsSync(layer: K, names: names) }
             catch { caught = error }
         }
         if let e = caught { throw e }
@@ -329,7 +409,8 @@ public final class StreamingPool {
 
     /// Run on `ioQueue` (sync caller) or as the queue's async job.
     /// Performs the pread for layer K into its sub-slot and
-    /// updates `slotStates` atomically.
+    /// updates `slotStates` atomically. Branches between full-shard
+    /// pread (default) and lazy-expert pread (only non-expert tensors).
     private func loadLayerSync(_ K: Int) throws {
         guard let src = layerToShard[K] else {
             // Layer has no per-layer shard (probably entirely in
@@ -354,23 +435,29 @@ public final class StreamingPool {
         stateLock.unlock()
 
         do {
-            // Tell the VM we're about to touch the slot region: it
-            // reserves physical pages and skips compressing/swapping
-            // it during the pread fill. The pages will be fully
-            // overwritten anyway, so the "preserve current contents"
-            // semantics of WILLNEED don't cost us anything here.
-            let slotBase = rotatingSlot.contents()
-                .advanced(by: slotIdx * slotSize)
-            _ = posix_madvise(slotBase, src.dataByteCount,
-                              POSIX_MADV_WILLNEED)
-
-            let fd = try cachedFD(for: src.url)
-            try Self.preadInto(buffer: rotatingSlot,
-                                bufferOffset: slotIdx * slotSize,
-                                fd: fd,
-                                fileOffset: src.dataStart,
-                                byteCount: src.dataByteCount,
-                                shardName: src.url.lastPathComponent)
+            if Self.lazyExpertEnabled,
+               let nonExpert = nonExpertNamesByLayer[K],
+               !nonExpert.isEmpty {
+                // Lazy mode: only fill the non-expert tensor ranges.
+                // Expert ranges in the slot are left dormant; MoE's
+                // routing observer triggers `ensureTensors` for the
+                // active topK before the dispatch loop runs.
+                try preadTensors(layer: K, names: nonExpert,
+                                  shardURL: src.url)
+            } else {
+                // Full-shard pread (legacy path / non-MoE layers).
+                let slotBase = rotatingSlot.contents()
+                    .advanced(by: slotIdx * slotSize)
+                _ = posix_madvise(slotBase, src.dataByteCount,
+                                  POSIX_MADV_WILLNEED)
+                let fd = try cachedFD(for: src.url)
+                try Self.preadInto(buffer: rotatingSlot,
+                                    bufferOffset: slotIdx * slotSize,
+                                    fd: fd,
+                                    fileOffset: src.dataStart,
+                                    byteCount: src.dataByteCount,
+                                    shardName: src.url.lastPathComponent)
+            }
         } catch {
             // Pread failed; leave the slot poisoned (loadedLayer
             // = nil) so the next caller retries instead of
@@ -384,6 +471,45 @@ public final class StreamingPool {
         Self.log(String(format:
             "[pool] layer=%d preaded %.2f GB into sub-slot %d\n",
             K, Double(src.dataByteCount) / 1_073_741_824, slotIdx))
+    }
+
+    /// Run on `ioQueue` (sync caller). Performs targeted preads for
+    /// `names` into their pre-computed slot offsets, without touching
+    /// or rewriting any other tensor's bytes in the slot. Used by
+    /// `ensureTensors(layer:names:)`.
+    private func loadTensorsSync(layer K: Int, names: [String]) throws {
+        guard let src = layerToShard[K] else { return }
+        try preadTensors(layer: K, names: names, shardURL: src.url)
+        // The slot's "loadedLayer" marker is not flipped here: lazy
+        // mode tracks per-tensor freshness implicitly through the
+        // caller (MoE asks for the experts it needs, attention/norms
+        // are loaded by the prior ensureLayer call). If we *were* to
+        // overwrite the marker, the next prefetch for the rotating
+        // slot would skip on the cache-hit fast path even though the
+        // expert ranges from a different token are now stale.
+    }
+
+    /// Bulk pread the supplied tensor names from a single shard file.
+    /// Caller is responsible for queue serialization. Uses the cached
+    /// fd (with F_RDAHEAD) and madvises each slot range before write.
+    private func preadTensors(layer K: Int,
+                               names: [String],
+                               shardURL: URL) throws {
+        let fd = try cachedFD(for: shardURL)
+        let baseAddr = rotatingSlot.contents()
+        for name in names {
+            guard let io = tensorIO[name] else { continue }
+            // Hint VM: about to write this region, keep it resident.
+            _ = posix_madvise(baseAddr.advanced(by: io.slotOffset),
+                              io.byteCount,
+                              POSIX_MADV_WILLNEED)
+            try Self.preadInto(buffer: rotatingSlot,
+                                bufferOffset: io.slotOffset,
+                                fd: fd,
+                                fileOffset: io.fileOffset,
+                                byteCount: io.byteCount,
+                                shardName: shardURL.lastPathComponent)
+        }
     }
 
     // ---- internals ----

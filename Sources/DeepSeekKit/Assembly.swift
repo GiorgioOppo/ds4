@@ -468,6 +468,25 @@ public extension Transformer {
         // This matters for `.streaming` strategy; for `.mmap` /
         // `.preload` the loader is held but never queried.
         model.weightLoader = loader
+
+        // Wire the lazy-expert hook on every MoEFFN (main + MTP) only
+        // when streaming + lazy mode is actually on. With full-shard
+        // streaming the experts are already in the slot after
+        // `ensureLayer(K)` finishes — invoking the hook would just
+        // pre-read them a second time. `.mmap` / `.preload` leave
+        // `pool` nil so `ensureExperts` would be a no-op either way.
+        if StreamingPool.lazyExpertEnabled {
+            let lazyHook: MoEFFN.EnsureExpertsHook = { [weak loader] layerK, indices in
+                loader?.ensureExperts(layer: layerK, indices: indices)
+            }
+            for block in model.layers {
+                block.ffn.ensureExpertsHook = lazyHook
+            }
+            for mtp in model.mtp {
+                mtp.block.ffn.ensureExpertsHook = lazyHook
+            }
+        }
+
         MemoryLogger.snapshot("load:complete", force: true)
         return model
     }

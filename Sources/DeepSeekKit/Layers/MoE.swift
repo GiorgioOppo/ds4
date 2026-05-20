@@ -206,6 +206,16 @@ public final class MoEFFN {
     public typealias RoutingHook = (Int, [Int32], [Float]) -> Void
     public var routingObserver: RoutingHook?
 
+    /// Lazy-expert hook: when set, the dispatch loop calls this with
+    /// `(layerId, uniqueActiveExpertIndices)` after the gate has
+    /// resolved routing and *before* any expert is invoked. Used by
+    /// `Transformer.load` (streaming path) to point at
+    /// `WeightLoader.ensureExperts`, which preads only the needed
+    /// experts' weights from disk. Default nil → no extra work on
+    /// the inference path.
+    public typealias EnsureExpertsHook = (Int, [Int]) -> Void
+    public var ensureExpertsHook: EnsureExpertsHook?
+
     public init(config: ModelConfig, gate: Gate, experts: [Expert?], shared: Expert) {
         self.gate = gate
         self.experts = experts
@@ -245,6 +255,24 @@ public final class MoEFFN {
 
         let plan = MoEDispatch.prepare(indices: idxArr, weights: wArr,
                                         N: N, topK: topK, nExperts: nExperts)
+
+        // Lazy-expert load: pread only the active experts' weights
+        // for this token before the dispatch loop touches them.
+        // `plan.perExpertOffsets[e+1] > plan.perExpertOffsets[e]`
+        // iff expert `e` has at least one assignment this batch —
+        // same predicate the loop below uses to skip inactive experts.
+        if let hook = ensureExpertsHook {
+            var active: [Int] = []
+            active.reserveCapacity(topK * N)
+            for e in 0..<nExperts {
+                if plan.perExpertOffsets[e + 1] > plan.perExpertOffsets[e] {
+                    active.append(e)
+                }
+            }
+            if !active.isEmpty {
+                hook(layerId, active)
+            }
+        }
 
         // Layer 5/6 diagnostic: which experts get chosen, with what weight?
         if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
