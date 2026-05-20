@@ -611,7 +611,7 @@ Settimana 4-6:  T2 (GGUF + Llama)  — landed in 5 commit + factory
 Settimana 7-8:  T3 (constrained)   — enum/const/oneOf/anyOf/object/array
 ```
 
-### 10.6.bis Vocab pruning italiano-only (in scope)
+### 10.6.bis Vocab + Expert pruning italiano-only (in scope)
 
 - [x] **Vocab pruning** per use case italiano-only / latino-only:
   riduce le matrici `embed.weight` e `head.weight` da ~129k a
@@ -622,6 +622,21 @@ Settimana 7-8:  T3 (constrained)   — enum/const/oneOf/anyOf/object/array
   atteso: ~1-1.5 GB per checkpoint V4-Flash a bf16.
   **Fine-tuning resta fuori scope** (vedi §10.7); il pruning non
   lo richiede.
+
+- [x] **Expert pruning** sopra il vocab pruning: droppa esperti
+  MoE raramente attivati su un corpus IT di calibrazione. Stesso
+  CLI `vocab_pruner` con flag `--prune-experts` + `--calib-corpus`
+  + `--expert-coverage 0.99`. Le due fasi sono indipendenti
+  (entrambe opt-in via flag): si possono pipelinare in un singolo
+  comando o eseguire separatamente. Per resume da un vocab-prune
+  esistente, basta passare la directory già pruned come `--input-dir`
+  con solo le flag dell'expert phase. Implementazione: hook
+  `routingObserver` in `MoEFFN.callAsFunction` (costo zero
+  sull'inference path), nuovo facade `ExpertPruner` + checkpoint
+  `expert_pruner.json` sibling. Vedi `docs/VOCAB-PRUNING.md`.
+  Risparmio atteso: ~5-30 GB su V4-Flash production a seconda
+  di `--expert-coverage`. UI non ancora wired (l'expert phase
+  richiede `Transformer.load`, che pesa nello sheet — follow-up).
 
 ### 10.7 Out-of-scope deliberato
 

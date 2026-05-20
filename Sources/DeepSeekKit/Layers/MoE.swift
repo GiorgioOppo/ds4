@@ -194,6 +194,18 @@ public final class MoEFFN {
     public let topK: Int
     public var layerId: Int = -1
 
+    /// Optional routing observer used by the expert-prune analyzer
+    /// (see `DeepSeekVocabPruner/ExpertAnalyzer.swift`). Fires once
+    /// per forward, after the gate output has been read host-side
+    /// for the dispatch plan, with `(layerId, indices, weights)` —
+    /// both arrays of length `N*topK` flattened. Default nil → zero
+    /// overhead on the normal inference path. Not `@Sendable` to
+    /// match `Block.ObservationHook` and to allow closures that
+    /// capture mutable host-side state (the analyzer's per-layer
+    /// counter).
+    public typealias RoutingHook = (Int, [Int32], [Float]) -> Void
+    public var routingObserver: RoutingHook?
+
     public init(config: ModelConfig, gate: Gate, experts: [Expert?], shared: Expert) {
         self.gate = gate
         self.experts = experts
@@ -224,6 +236,12 @@ public final class MoEFFN {
         let wPtr = weights.buffer.contents().bindMemory(to: Float.self, capacity: N * topK)
         let idxArr = Array(UnsafeBufferPointer(start: idxPtr, count: N * topK))
         let wArr = Array(UnsafeBufferPointer(start: wPtr, count: N * topK))
+
+        // Notify the expert-prune analyzer (if attached) of the
+        // per-token routing decisions. Fires before the dispatch so
+        // the observer sees the gate's choices untouched by any
+        // sharded-out fallback.
+        routingObserver?(layerId, idxArr, wArr)
 
         let plan = MoEDispatch.prepare(indices: idxArr, weights: wArr,
                                         N: N, topK: topK, nExperts: nExperts)
