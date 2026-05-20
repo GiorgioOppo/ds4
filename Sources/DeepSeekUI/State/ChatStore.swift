@@ -2916,13 +2916,19 @@ final class ChatStore: ObservableObject {
     private func appendPendingTokenID(_ tokenId: Int32,
                                         for chatID: UUID) {
         if PersistencePaths.isV2Chat(id: chatID) {
-            guard case .local(var pt) = pendingSnapshots[chatID]
+            // `PendingSnapshot` is a tagged struct (not an enum), so
+            // we can't pattern-match an associated value out of it.
+            // Check the tag explicitly, then mutate the `local`
+            // field through a value-type round-trip.
+            guard let snap = pendingSnapshots[chatID],
+                  snap.kind == .local,
+                  var pt = snap.local
             else { return }
             pt.generatedTokens.append(tokenId)
-            let snap = PendingSnapshot.local(pt)
-            pendingSnapshots[chatID] = snap
+            let next = PendingSnapshot.local(pt)
+            pendingSnapshots[chatID] = next
             chatPersistence.schedulePendingSave(
-                chatID: chatID, snapshot: snap)
+                chatID: chatID, snapshot: next)
         } else if let cIdx = conversations.firstIndex(
             where: { $0.id == chatID })
         {
