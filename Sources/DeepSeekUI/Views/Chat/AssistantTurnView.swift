@@ -26,7 +26,7 @@ import AppKit
 ///     chronological order above the final reply.
 ///   * Final reply uses the streaming caret while in flight, then
 ///     promotes to `MarkdownText` once `.done` lands.
-struct AssistantTurnView: View {
+struct AssistantTurnView: View, Equatable {
     /// Non-empty list of assistant messages making up this turn, in
     /// chronological order. All elements MUST have `role == .assistant`
     /// — the grouping in ChatView guarantees that.
@@ -41,6 +41,20 @@ struct AssistantTurnView: View {
     var agentResolver: ((String) -> AgentConfig?)? = nil
 
     @State private var copied: Bool = false
+
+    /// `Equatable` so `ChatView` can `.equatable()`-wrap this and
+    /// skip the body re-evaluation when SwiftUI's parent body
+    /// re-runs (per-token `phases` mutate, etc.) but the actual
+    /// inputs haven't changed. `agentResolver` is intentionally
+    /// excluded from the comparison — it's a closure (not
+    /// Equatable) and in practice it's a stable `store.agents`
+    /// lookup that doesn't vary turn to turn within one session.
+    static func == (lhs: AssistantTurnView,
+                     rhs: AssistantTurnView) -> Bool {
+        lhs.messages == rhs.messages
+            && lhs.isStreamingFinal == rhs.isStreamingFinal
+            && lhs.streamingReasoning == rhs.streamingReasoning
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {

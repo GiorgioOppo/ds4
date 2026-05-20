@@ -15,11 +15,23 @@ import AppKit
 /// turn-grouping iterator). `ChatView` no longer routes assistant
 /// rows through here directly — it builds an `AssistantTurnView` with
 /// the full list of messages in the turn instead.
-struct MessageView: View {
+struct MessageView: View, Equatable {
     let message: StoredMessage
     var isStreaming: Bool = false
     var streamingReasoning: String? = nil
     var agentResolver: ((String) -> AgentConfig?)? = nil
+
+    /// PR 7: `Equatable` so `ChatView` can `.equatable()`-wrap
+    /// user / system bubbles and skip body re-eval on parent
+    /// invalidations whose input hasn't actually changed.
+    /// `agentResolver` is excluded for the same reason it is on
+    /// `AssistantTurnView`: closures aren't Equatable, and the
+    /// resolver is a stable lookup in `store.agents`.
+    static func == (lhs: MessageView, rhs: MessageView) -> Bool {
+        lhs.message == rhs.message
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.streamingReasoning == rhs.streamingReasoning
+    }
 
     var body: some View {
         switch message.role {

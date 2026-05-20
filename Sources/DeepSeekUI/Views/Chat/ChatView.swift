@@ -455,9 +455,9 @@ struct ChatView: View {
                             phase: GenerationPhase) -> some View {
         switch item {
         case .user(let msg):
-            MessageView(message: msg)
+            MessageView(message: msg).equatable()
         case .system(let msg):
-            MessageView(message: msg)
+            MessageView(message: msg).equatable()
         case .assistantTurn(let messages):
             VStack(alignment: .leading, spacing: 16) {
                 // Inline progress: the placeholder sits at the tail of
@@ -499,6 +499,16 @@ struct ChatView: View {
                             store.agents.agents.first(where: { $0.name == name })
                         })
                 } else {
+                    // PR 7: `.equatable()` tells SwiftUI to skip
+                    // body re-evaluation when AssistantTurnView's
+                    // input hasn't actually changed. ChatView body
+                    // re-runs whenever `phases` / `pendingSnapshots`
+                    // mutate (every token); without this, every
+                    // finalised bubble's body would re-execute even
+                    // though messages is identical. The Equatable
+                    // conformance lives on the view itself; the
+                    // agent-resolver closure is excluded from `==`
+                    // because store.agents is stable for the session.
                     AssistantTurnView(
                         messages: messages,
                         isStreamingFinal: false,
@@ -506,6 +516,7 @@ struct ChatView: View {
                         agentResolver: { name in
                             store.agents.agents.first(where: { $0.name == name })
                         })
+                    .equatable()
                 }
             }
         }
