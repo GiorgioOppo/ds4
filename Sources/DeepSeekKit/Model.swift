@@ -222,8 +222,12 @@ public final class Transformer {
         // Diagnostic: one line per forward call. Lets us correlate
         // pool / moe per-layer logs back to which decode step they
         // belong to (prefill = startPos 0 + large S; decode = small
-        // startPos increment + S=1). Gated on MemoryLogger.
-        if MemoryLogger.enabled {
+        // startPos increment + S=1). Gated on the lazy-expert flag
+        // directly so a debug session only needs one env var
+        // (DEEPSEEK_LAZY_EXPERT=1) — the previous MemoryLogger gate
+        // forced users to also set DEEPSEEK_MEM_LOG=1, and we lost
+        // diagnostic output when that didn't reach the binary.
+        if StreamingPool.lazyExpertEnabled {
             let idsHead = flatIds.prefix(8).map(String.init).joined(separator: ",")
             let line = "[forward] startPos=\(startPos) S=\(S) B=\(B) " +
                        "ids[:8]=\(idsHead)\n"
