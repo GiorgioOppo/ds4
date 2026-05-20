@@ -1304,17 +1304,28 @@ final class ChatStore: ObservableObject {
         let conv = conversations.first(where: { $0.id == conversationID })
         let agent = conv?.agentID.flatMap { agents.agent(id: $0) }
         let mode = agent?.agentMode ?? .build
+        let project: Project? = conv?.projectID
+            .flatMap { projects.project(id: $0) }
         let rootDir: URL = {
-            if let pid = conv?.projectID,
-               let project = projects.project(id: pid),
+            if let project,
                let root = ProjectRootBuilder.ensureBuilt(project) {
                 return root
             }
             return FileManager.default.homeDirectoryForCurrentUser
         }()
+        // Project chats accept both the symlink-farm relative paths
+        // (resolved under `rootDir`) AND the real on-disk absolute
+        // paths from the project's `sourcePaths`. Without this, the
+        // model is forced into the farm-relative addressing even
+        // when its prior context (e.g. a `git status` output)
+        // surfaces the user's real repo path.
+        let extraRoots: [URL] = (project?.sourcePaths ?? [])
+            .map { URL(fileURLWithPath: $0) }
 
         let out = await nativeTools.dispatch(
-            name: name, input: input, mode: mode, rootDirectory: rootDir)
+            name: name, input: input, mode: mode,
+            rootDirectory: rootDir,
+            additionalReadRoots: extraRoots)
         if out.isError {
             return "[error: \(out.output)]"
         }

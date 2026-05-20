@@ -140,12 +140,20 @@ final class NativeToolHost: ObservableObject {
     /// Run a native tool by registry name. The chat flow looks up
     /// the unqualified name with this method; MCP-qualified calls
     /// (`server__tool`) go to the MCP pool instead.
+    ///
+    /// `additionalReadRoots` widens the path-resolution check
+    /// beyond `rootDirectory` (typically the project's symlink
+    /// farm) to also accept absolute paths under the project's
+    /// real on-disk source folders — so a model can address a
+    /// file either via the farm or via its real path.
     func dispatch(name: String,
                   input: [String: Any],
                   mode: AgentMode,
-                  rootDirectory: URL) async -> ToolOutput {
+                  rootDirectory: URL,
+                  additionalReadRoots: [URL] = []) async -> ToolOutput {
         let context = ToolContext(
             rootDirectory: rootDirectory,
+            additionalReadRoots: additionalReadRoots,
             mode: mode,
             permission: permissionDelegate,
             environment: nil,
