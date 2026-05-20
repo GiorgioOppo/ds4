@@ -48,7 +48,14 @@ fi
 for metal in "${metal_files[@]}"; do
     name=$(basename "$metal" .metal)
     air="$air_dir/$name.air"
-    xcrun -sdk macosx metal "${metal_debug_flags[@]}" -c "$metal" -o "$air"
+    # macOS ships bash 3.2, which errors on `"${empty_array[@]}"` under
+    # `set -u`. Branch explicitly instead of relying on the array
+    # expansion to evaporate when no debug flags are set.
+    if [ "${#metal_debug_flags[@]}" -gt 0 ]; then
+        xcrun -sdk macosx metal "${metal_debug_flags[@]}" -c "$metal" -o "$air"
+    else
+        xcrun -sdk macosx metal -c "$metal" -o "$air"
+    fi
     air_files+=( "$air" )
 done
 
