@@ -268,20 +268,56 @@ public final class Transformer {
         let traceLayers: Set<Int> = nL <= 12
             ? Set(0..<nL)
             : Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 30, nL - 1])
+        // DEEPSEEK_PERF_TRACE=1 → log a per-token breakdown of where
+        // wall-clock time went: layer I/O (ensureLayer pread), GPU
+        // execution (gpuEndTime - gpuStartTime, summed across layers),
+        // and everything else (Swift orchestration, CPU work, KV cache
+        // blits not captured above). Off by default — single env-var
+        // probe at the top of `forward` is the only overhead.
+        let perfTrace = ProcessInfo.processInfo
+            .environment["DEEPSEEK_PERF_TRACE"] == "1"
+        let perfStart = DispatchTime.now().uptimeNanoseconds
+        var perfIoNs: UInt64 = 0
+        var perfGpuNs: UInt64 = 0
         for (k, layer) in layers.enumerated() {
             // Pool mode: pread layer K's shard into the rotating
             // slot BEFORE the block's forward references its
             // Tensors. (No-op in `.mmap` / `.preload` strategies.)
+            let ioT0 = perfTrace ? DispatchTime.now().uptimeNanoseconds : 0
             loader?.ensureLayer(k)
+            if perfTrace {
+                perfIoNs &+= DispatchTime.now().uptimeNanoseconds &- ioT0
+            }
             var cmdL = Device.shared.queue.makeCommandBuffer()!
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
+            if perfTrace {
+                // gpuStartTime / gpuEndTime are valid post-wait. They
+                // measure on-GPU execution only, excluding queue wait
+                // and CPU-side encoding — the right number to compare
+                // against the I/O total to spot what dominates.
+                let gpu = cmdL.gpuEndTime - cmdL.gpuStartTime
+                if gpu > 0 {
+                    perfGpuNs &+= UInt64(gpu * 1_000_000_000)
+                }
+            }
             loader?.releaseLayer(k)
             MemoryLogger.snapshot(
                 "forward:layer-\(String(format: "%02d", k))", force: true)
             if traceLayers.contains(k) {
                 traceTensorStats("layer-\(String(format: "%02d", k))", x)
             }
+        }
+        if perfTrace {
+            let totalNs = DispatchTime.now().uptimeNanoseconds &- perfStart
+            let totalMs = Double(totalNs) / 1_000_000
+            let ioMs = Double(perfIoNs) / 1_000_000
+            let gpuMs = Double(perfGpuNs) / 1_000_000
+            let otherMs = max(0, totalMs - ioMs - gpuMs)
+            let line = String(format:
+                "[perf] forward layers=%d total=%.1fms io=%.1fms gpu=%.1fms other=%.1fms\n",
+                nL, totalMs, ioMs, gpuMs, otherMs)
+            FileHandle.standardError.write(Data(line.utf8))
         }
 
         // 4. Head. `ParallelHead.callAsFunction` commits `cmdH`
