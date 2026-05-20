@@ -1,4 +1,5 @@
 import SwiftUI
+import DeepSeekKit
 import DeepSeekTools
 
 /// SwiftUI entry point for the DeepSeek-V4 macOS chat app. Owns the
@@ -33,6 +34,16 @@ struct DeepSeekUIApp: App {
     @StateObject private var serverController: LocalServerController
 
     init() {
+        // Bridge `AppSettings.lazyExpertLoad` into the DeepSeekKit
+        // `StreamingPool` toggle BEFORE InferenceService gets a chance
+        // to load a model. The pool reads the flag at every
+        // `ensureLayer` call so a later UI change also takes effect
+        // mid-session, but doing it here keeps the very first token
+        // of the first run on the right path. The kit-side default
+        // is already `true`, so this only matters for users who
+        // explicitly turned the toggle off in a prior session.
+        StreamingPool.lazyExpertEnabled = AppSettings.lazyExpertLoad
+
         let service = InferenceService()
         self.service = service
         self._documents = StateObject(wrappedValue: DocumentLibrary())

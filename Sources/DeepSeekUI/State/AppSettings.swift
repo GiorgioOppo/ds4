@@ -39,6 +39,19 @@ enum AppSettingsKey {
     /// `WeightLoader.warmupAllShards`.
     static let warmupOnLoad = "deepseek.warmupOnLoad"
 
+    /// MoE lazy-expert load (streaming strategy only). When true,
+    /// `StreamingPool.ensureLayer(K)` only preads the non-expert
+    /// tensors of layer K (attention, norms, gate, shared expert);
+    /// the per-expert weights are loaded on demand after the gate
+    /// runs, via `MoEFFN.ensureExpertsHook` → `ensureExperts`.
+    /// On checkpoints with 17×+ memory oversubscription the per-token
+    /// I/O drops from ~full-shard to ~core + (topK/nExperts) × experts
+    /// — a multi-× reduction on V4-Pro. Default `true`. Set to false
+    /// only if you're debugging a regression suspected of the lazy
+    /// path. The `DEEPSEEK_LAZY_EXPERT` env var, if present at app
+    /// launch, overrides this setting.
+    static let lazyExpertLoad = "deepseek.lazyExpertLoad"
+
     /// EXPERIMENTAL. Rilassa il match strict-prefix della KV cache
     /// in-memory a common-prefix, supportando il caso "user edita
     /// il proprio ultimo messaggio" senza full reset. Rischio basso
@@ -128,6 +141,17 @@ enum AppSettings {
     }
     static var forceLoad: Bool {
         UserDefaults.standard.bool(forKey: AppSettingsKey.forceLoad)
+    }
+    /// `bool(forKey:)` always defaults to `false`; this getter returns
+    /// `true` when the key was never written, so brand-new installs
+    /// pick up the lazy-expert path automatically (the right default
+    /// for streaming-mode MoE checkpoints).
+    static var lazyExpertLoad: Bool {
+        let ud = UserDefaults.standard
+        if ud.object(forKey: AppSettingsKey.lazyExpertLoad) == nil {
+            return true
+        }
+        return ud.bool(forKey: AppSettingsKey.lazyExpertLoad)
     }
     static var lastModelDir: String? {
         UserDefaults.standard.string(forKey: AppSettingsKey.lastModelDir)

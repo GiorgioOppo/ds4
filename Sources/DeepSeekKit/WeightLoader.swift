@@ -295,6 +295,11 @@ public final class WeightLoader {
     /// expert is already addressable in the resident bag of buffers).
     public func ensureExperts(layer K: Int, indices: [Int]) {
         guard let pool = pool, !indices.isEmpty else { return }
+        // Hook is always wired by `Transformer.load`; gate at call
+        // time so a runtime toggle (UI Settings tab, or someone
+        // flipping `StreamingPool.lazyExpertEnabled` from a debugger)
+        // takes effect on the next token without reloading the model.
+        guard StreamingPool.lazyExpertEnabled else { return }
         // Each expert has three weight tensors. Build the flat name
         // list and let the pool batch the preads through its serial
         // ioQueue + cached fd path.

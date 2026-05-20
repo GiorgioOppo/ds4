@@ -342,21 +342,35 @@ public final class StreamingPool {
     }
 
 
-    /// Lazy-expert mode toggle. Picked up at the first `ensureLayer`
-    /// call so a single flag at process launch decides the strategy:
-    ///   DEEPSEEK_LAZY_EXPERT=1 → only pread non-expert tensors at
-    ///     `ensureLayer`; the per-MoE expert tensors are loaded on
-    ///     demand by `ensureTensors(layer:names:)` once the gate has
-    ///     picked the active topK.
-    ///   anything else (default) → legacy full-shard pread.
-    /// Reduces per-token I/O on huge MoE checkpoints from ~full-shard
-    /// (~3 GB / layer at V4-Flash sizes) to ~core + 8/256 experts
-    /// (~600 MB / layer), and as a side effect keeps each GPU command
-    /// buffer's working set small enough that macOS no longer aborts
-    /// it with `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`.
-    public static let lazyExpertEnabled: Bool = {
-        ProcessInfo.processInfo
-            .environment["DEEPSEEK_LAZY_EXPERT"] == "1"
+    /// Lazy-expert mode toggle. Default ON (set at app launch from
+    /// `AppSettings.lazyExpertLoad`); each layer pread reads only the
+    /// non-expert tensors, and per-MoE expert weights are streamed in
+    /// on demand via `ensureTensors` once the gate has resolved the
+    /// active topK. Cuts per-token I/O from ~full-shard to ~core +
+    /// (topK/nExperts)×experts on huge MoE checkpoints, and as a
+    /// side effect keeps each GPU command buffer's working set small
+    /// enough that macOS stops aborting with
+    /// `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`.
+    ///
+    /// The DEEPSEEK_LAZY_EXPERT env var, if set, wins over both the
+    /// `AppSettings` value and any later mutation — useful for
+    /// bisecting from a shell without touching the UI:
+    ///   DEEPSEEK_LAZY_EXPERT=0 / =false / =off → force OFF
+    ///   anything else (or unset) → use the AppSettings value
+    /// Reads/writes are unsynchronized (single value-typed Bool, set
+    /// from the main thread at launch, read from the I/O queue) —
+    /// `nonisolated(unsafe)` matches the `TraceFlags.normTrace`
+    /// pattern used elsewhere in the codebase.
+    nonisolated(unsafe) public static var lazyExpertEnabled: Bool = {
+        if let v = ProcessInfo.processInfo
+            .environment["DEEPSEEK_LAZY_EXPERT"]?.lowercased() {
+            return !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        // Default ON. The UI bridges `AppSettings.lazyExpertLoad`
+        // into this var on app startup and on every change; until
+        // that bridge runs (e.g. CLI binaries that don't link
+        // DeepSeekUI), keep the optimisation enabled by default.
+        return true
     }()
 
     /// Ensure layer K's shard is loaded into its sub-slot. Blocks
