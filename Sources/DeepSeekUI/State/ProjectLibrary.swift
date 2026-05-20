@@ -80,19 +80,25 @@ final class ProjectLibrary: ObservableObject {
         let p = Project(name: name)
         projects.insert(p, at: 0)
         saveIndex()
+        try? ProjectRootBuilder.rebuild(p)
         return p
     }
 
     func update(_ project: Project) {
         guard let idx = projects.firstIndex(where: { $0.id == project.id }) else { return }
+        let prev = projects[idx]
         projects[idx] = project
         saveIndex()
+        if prev.sourcePaths != project.sourcePaths {
+            try? ProjectRootBuilder.rebuild(project)
+        }
     }
 
     func delete(_ id: UUID, documents: DocumentLibrary) {
         documents.purge(projectID: id)
         projects.removeAll { $0.id == id }
         saveIndex()
+        ProjectRootBuilder.remove(id: id)
     }
 
     func project(id: UUID) -> Project? {

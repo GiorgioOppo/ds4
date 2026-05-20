@@ -92,6 +92,21 @@ enum PersistencePaths {
         try projectsDir().appendingPathComponent("index.json")
     }
 
+    /// Per-project symlink-farm root. `ProjectRootBuilder` materializes
+    /// each `Project.sourcePaths` entry here as a tree of real
+    /// directories with file symlinks, so tools running with
+    /// `ToolContext.rootDirectory` set to this URL see the project
+    /// layout without us copying any bytes.
+    static func projectRootDir(id: UUID) throws -> URL {
+        let dir = try projectsDir()
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
     /// Cached snapshot of OpenRouter's `/models` response. Lives
     /// alongside `models.json` so the "Add OpenRouter model"
     /// picker has instant autocompletion at app launch instead of

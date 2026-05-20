@@ -1188,8 +1188,8 @@ final class ChatStore: ObservableObject {
         let rootDir: URL = {
             if let pid = conv?.projectID,
                let project = projects.project(id: pid),
-               let path = project.sourcePaths.first {
-                return URL(fileURLWithPath: path)
+               let root = ProjectRootBuilder.ensureBuilt(project) {
+                return root
             }
             return FileManager.default.homeDirectoryForCurrentUser
         }()
