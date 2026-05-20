@@ -270,6 +270,18 @@ public final class MoEFFN {
                 }
             }
             if !active.isEmpty {
+                // First few layers + first few decode steps: log the
+                // routing so we can spot whether lazy keeps loading the
+                // same experts (a bug) or correctly tracks per-token
+                // routing changes across decode steps.
+                if MemoryLogger.enabled && layerId < 4 {
+                    let head = active.prefix(8)
+                        .map(String.init).joined(separator: ",")
+                    let line = "[moe] layer=\(layerId) hook fired " +
+                               "active=\(active.count)/\(nExperts) " +
+                               "first8=[\(head)] N=\(N)\n"
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
                 hook(layerId, active)
             }
         }

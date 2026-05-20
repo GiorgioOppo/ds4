@@ -219,6 +219,16 @@ public final class Transformer {
         MemoryLogger.snapshot("forward:start", force: true)
 
         let flatIds: [Int32] = inputIds.flatMap { $0.map(Int32.init) }
+        // Diagnostic: one line per forward call. Lets us correlate
+        // pool / moe per-layer logs back to which decode step they
+        // belong to (prefill = startPos 0 + large S; decode = small
+        // startPos increment + S=1). Gated on MemoryLogger.
+        if MemoryLogger.enabled {
+            let idsHead = flatIds.prefix(8).map(String.init).joined(separator: ",")
+            let line = "[forward] startPos=\(startPos) S=\(S) B=\(B) " +
+                       "ids[:8]=\(idsHead)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         let cmd = Device.shared.queue.makeCommandBuffer()!
 
         // 1. embed → [B*S, dim]
