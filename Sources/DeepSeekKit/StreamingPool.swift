@@ -323,6 +323,25 @@ public final class StreamingPool {
         FileHandle.standardError.write(Data(s.utf8))
     }
 
+    /// Prints a single banner on the FIRST pread of the run, so the
+    /// log makes it obvious which path is active. Always fires (not
+    /// gated on MemoryLogger) — one line, useful when troubleshooting
+    /// "did my env var actually apply?".
+    private static var modeBannerPrinted = false
+    private static let modeBannerLock = NSLock()
+    private static func logModeOnce(_ lazy: Bool) {
+        modeBannerLock.lock()
+        let already = modeBannerPrinted
+        modeBannerPrinted = true
+        modeBannerLock.unlock()
+        guard !already else { return }
+        let msg = lazy
+            ? "[pool] streaming mode = LAZY-EXPERT (DEEPSEEK_LAZY_EXPERT=1)\n"
+            : "[pool] streaming mode = FULL-SHARD (set DEEPSEEK_LAZY_EXPERT=1 to enable lazy)\n"
+        FileHandle.standardError.write(Data(msg.utf8))
+    }
+
+
     /// Lazy-expert mode toggle. Picked up at the first `ensureLayer`
     /// call so a single flag at process launch decides the strategy:
     ///   DEEPSEEK_LAZY_EXPERT=1 → only pread non-expert tensors at
@@ -442,10 +461,12 @@ public final class StreamingPool {
                 // Expert ranges in the slot are left dormant; MoE's
                 // routing observer triggers `ensureTensors` for the
                 // active topK before the dispatch loop runs.
+                Self.logModeOnce(true)
                 try preadTensors(layer: K, names: nonExpert,
                                   shardURL: src.url)
             } else {
                 // Full-shard pread (legacy path / non-MoE layers).
+                Self.logModeOnce(false)
                 let slotBase = rotatingSlot.contents()
                     .advanced(by: slotIdx * slotSize)
                 _ = posix_madvise(slotBase, src.dataByteCount,
@@ -497,6 +518,8 @@ public final class StreamingPool {
                                shardURL: URL) throws {
         let fd = try cachedFD(for: shardURL)
         let baseAddr = rotatingSlot.contents()
+        var totalBytes = 0
+        var hitCount = 0
         for name in names {
             guard let io = tensorIO[name] else { continue }
             // Hint VM: about to write this region, keep it resident.
@@ -509,7 +532,14 @@ public final class StreamingPool {
                                 fileOffset: io.fileOffset,
                                 byteCount: io.byteCount,
                                 shardName: shardURL.lastPathComponent)
+            totalBytes += io.byteCount
+            hitCount += 1
         }
+        Self.log(String(format:
+            "[pool] layer=%d preadTensors n=%d/%d bytes=%.2f MB shard=%@\n",
+            K, hitCount, names.count,
+            Double(totalBytes) / 1_048_576,
+            shardURL.lastPathComponent as CVarArg))
     }
 
     // ---- internals ----
