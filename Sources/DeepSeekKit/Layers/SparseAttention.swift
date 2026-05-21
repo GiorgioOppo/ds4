@@ -7,12 +7,35 @@ import Metal
 public enum SparseAttention {
     private static let pipeline = Device.shared.makePipeline("sparse_attn_f32")
 
+    /// Query-tile size. `sparse_attn_f32` runs one thread per
+    /// (head, query, batch) with a scalar K-loop and a device-memory
+    /// accumulator — heavy per thread. A long prefill (M = prompt
+    /// length) packed into a single dispatch produces a multi-second
+    /// command buffer that the macOS GPU watchdog aborts with
+    /// `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`.
+    ///
+    /// `apply` therefore tiles the query dimension: each tile is its
+    /// own dispatch in its own command buffer (commit + wait), so no
+    /// single buffer monopolises the GPU. Tunable via
+    /// `DEEPSEEK_SPARSE_ATTN_TILE`; 128 is conservative enough to stay
+    /// well under the watchdog for realistic H/K/D. Decode (M == 1)
+    /// runs as a single one-row tile.
+    private static let tileM: Int = {
+        if let v = ProcessInfo.processInfo.environment["DEEPSEEK_SPARSE_ATTN_TILE"],
+           let n = Int(v), n > 0 { return n }
+        return 128
+    }()
+
     /// `q`: [B, M, H, D] f32. `kv`: [B, N, D] f32. `sink`: [H] f32.
     /// `topkIdxs`: [B, M, K] i32 (use -1 for padding entries).
     /// Returns `o`: [B, M, H, D] f32.
+    ///
+    /// `cmd` is `inout`: each query tile is committed on its own buffer
+    /// and `cmd` is replaced with a fresh one, so the caller continues
+    /// encoding onto the swapped value.
     public static func apply(q: Tensor, kv: Tensor, sink: Tensor,
                              topkIdxs: Tensor, scale: Float,
-                             in cmd: MTLCommandBuffer) -> Tensor {
+                             in cmd: inout MTLCommandBuffer) -> Tensor {
         precondition(q.dtype == .f32 && q.shape.count == 4)
         precondition(kv.dtype == .f32 && kv.shape.count == 3)
         precondition(sink.dtype == .f32 && sink.shape.count == 1)
@@ -27,24 +50,40 @@ public enum SparseAttention {
 
         let o = Tensor.empty(shape: [B, M, H, D], dtype: .f32)
 
-        let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(q.buffer, offset: q.offset, index: 0)
-        enc.setBuffer(kv.buffer, offset: kv.offset, index: 1)
-        enc.setBuffer(sink.buffer, offset: sink.offset, index: 2)
-        enc.setBuffer(topkIdxs.buffer, offset: topkIdxs.offset, index: 3)
-        enc.setBuffer(o.buffer, offset: 0, index: 4)
+        // `dims` always carries the global M — the kernel indexes
+        // q/tk/o with the absolute query position (`gid.y + mOffset`).
         var dims = SIMD4<UInt32>(UInt32(B), UInt32(M), UInt32(N), UInt32(D))
-        enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
         var misc = SIMD2<UInt32>(UInt32(H), UInt32(K))
-        enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 6)
         var s = scale
-        enc.setBytes(&s, length: 4, index: 7)
-
         let tg = MTLSize(width: min(H, 32), height: 1, depth: 1)
-        enc.dispatchThreads(MTLSize(width: H, height: M, depth: B),
-                            threadsPerThreadgroup: tg)
-        enc.endEncoding()
+
+        var m0 = 0
+        while m0 < M {
+            let rows = min(tileM, M - m0)
+            let enc = cmd.makeComputeCommandEncoder()!
+            enc.label = "sparse_attn m=[\(m0)..\(m0 + rows)) of \(M) H=\(H) K=\(K)"
+            enc.setComputePipelineState(pipeline)
+            enc.setBuffer(q.buffer, offset: q.offset, index: 0)
+            enc.setBuffer(kv.buffer, offset: kv.offset, index: 1)
+            enc.setBuffer(sink.buffer, offset: sink.offset, index: 2)
+            enc.setBuffer(topkIdxs.buffer, offset: topkIdxs.offset, index: 3)
+            enc.setBuffer(o.buffer, offset: 0, index: 4)
+            enc.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 5)
+            enc.setBytes(&misc, length: MemoryLayout.size(ofValue: misc), index: 6)
+            enc.setBytes(&s, length: 4, index: 7)
+            var mOff = UInt32(m0)
+            enc.setBytes(&mOff, length: 4, index: 8)
+
+            enc.dispatchThreads(MTLSize(width: H, height: rows, depth: B),
+                                threadsPerThreadgroup: tg)
+            enc.endEncoding()
+
+            // One command buffer per tile — bounds each buffer's GPU
+            // time under the interactivity watchdog threshold.
+            cmd.commit(); cmd.waitUntilCompleted()
+            cmd = Device.shared.makeCommandBuffer()
+            m0 += rows
+        }
         return o
     }
 

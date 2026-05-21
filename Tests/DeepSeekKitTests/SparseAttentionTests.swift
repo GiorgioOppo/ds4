@@ -22,10 +22,10 @@ final class SparseAttentionTests: XCTestCase {
         let tkT = tk.withUnsafeBytes { Tensor.from(bytes: $0, shape: [B, M, K], dtype: .i32) }
 
         let scale: Float = pow(Float(D), -0.5)
-        let cmd = Device.shared.queue.makeCommandBuffer()!
+        var cmd = Device.shared.queue.makeCommandBuffer()!
         let o = SparseAttention.apply(q: qT, kv: kvT, sink: sinkT,
-                                      topkIdxs: tkT, scale: scale, in: cmd)
-        cmd.commit(); cmd.waitUntilCompleted()
+                                      topkIdxs: tkT, scale: scale, in: &cmd)
+        // `apply` commits + waits each query tile internally.
         let gpu = o.toFloatArray()
 
         let cpu = SparseAttention.referenceCPU(q: q, kv: kv, sink: sink, tk: tk,
@@ -51,10 +51,10 @@ final class SparseAttentionTests: XCTestCase {
         let sinkT = sink.withUnsafeBytes { Tensor.from(bytes: $0, shape: [H], dtype: .f32) }
         let tkT = tk.withUnsafeBytes { Tensor.from(bytes: $0, shape: [B, M, K], dtype: .i32) }
 
-        let cmd = Device.shared.queue.makeCommandBuffer()!
+        var cmd = Device.shared.queue.makeCommandBuffer()!
         let o = SparseAttention.apply(q: qT, kv: kvT, sink: sinkT,
-                                      topkIdxs: tkT, scale: 1.0, in: cmd)
-        cmd.commit(); cmd.waitUntilCompleted()
+                                      topkIdxs: tkT, scale: 1.0, in: &cmd)
+        // `apply` commits + waits each query tile internally.
         let gpu = o.toFloatArray()
         for v in gpu { XCTAssertEqual(v, 0.0, accuracy: 1e-6) }
         _ = q; _ = kv; _ = sink; _ = tk

@@ -44,9 +44,14 @@ kernel void sparse_attn_f32(
     constant uint4&     dims    [[buffer(5)]],   // (B, M, N, D)
     constant uint2&     misc    [[buffer(6)]],   // (H, K)
     constant float&     scale   [[buffer(7)]],
+    constant uint&      mOffset [[buffer(8)]],   // query-tile start (see SparseAttention.apply)
     uint3 gid [[thread_position_in_grid]]
 ) {
-    uint h = gid.x, m = gid.y, b = gid.z;
+    // `m` is global: the grid height is one query *tile*, `mOffset` shifts
+    // it back to the absolute position so q/tk/o index correctly while the
+    // dispatch — and its command buffer — stays small enough to dodge the
+    // macOS GPU interactivity watchdog.
+    uint h = gid.x, m = gid.y + mOffset, b = gid.z;
     uint B = dims.x, M = dims.y, N = dims.z, D = dims.w;
     uint H = misc.x, K = misc.y;
     if (b >= B || m >= M || h >= H) return;

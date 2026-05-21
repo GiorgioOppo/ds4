@@ -468,7 +468,7 @@ public final class MLA {
         // ---------- Sparse attention ----------
         let qPerToken = q.reshape([B, S, nHeads, headDim])
         let o = SparseAttention.apply(q: qPerToken, kv: kvFull, sink: attnSink,
-                                       topkIdxs: topkT, scale: softmaxScale, in: cmd)
+                                       topkIdxs: topkT, scale: softmaxScale, in: &cmd)
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after sparse_attn", o)
