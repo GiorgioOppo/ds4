@@ -1378,11 +1378,11 @@ final class ChatStore: ObservableObject {
                 let qualified = "native__\(native.name)"
                 if let allowed = mcpAllowed,
                    !allowed.contains(qualified) { continue }
-                schemas.append([
+                schemas.append(Self.schemaWithExample([
                     "name": qualified,
                     "description": native.description,
                     "inputSchema": native.inputSchema.foundationValue
-                ])
+                ]))
             }
         }
 
@@ -1394,33 +1394,19 @@ final class ChatStore: ObservableObject {
             for tool in mcpPool.allTools() {
                 if let allowed = mcpAllowed,
                    !allowed.contains(tool.qualifiedName) { continue }
-                schemas.append([
+                schemas.append(Self.schemaWithExample([
                     "name": tool.qualifiedName,
                     "description": tool.description,
                     "inputSchema": tool.inputSchema
-                ])
+                ]))
             }
-        }
-
-        // Native tools (TODO §8 follow-up). The host's
-        // `schemas` already include only tools the registry made
-        // available for the current `AgentMode`; we prefix the
-        // public name with `native__` so the dispatch side can
-        // tell native from MCP without ambiguity. Agent allowlist
-        // filtering of native tools is a separate follow-up.
-        for s in nativeTools.schemas {
-            schemas.append([
-                "name": "native__\(s.name)",
-                "description": s.description,
-                "inputSchema": s.inputSchema.foundationValue,
-            ])
         }
 
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
                 .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
                 .joined(separator: "\n")
-            schemas.append([
+            schemas.append(Self.schemaWithExample([
                 "name": EncodingDSV4.delegateToolName,
                 "description":
                     """
@@ -1441,7 +1427,7 @@ final class ChatStore: ObservableObject {
                     ],
                     "required": ["agent_name", "task"]
                 ]
-            ])
+            ]))
         }
 
         if schemas.isEmpty { return nil }
@@ -1453,13 +1439,29 @@ final class ChatStore: ObservableObject {
         // prompt bloat and the first thing the KV-cache compression
         // degrades.
         let outSchemas: [[String: Any]] = Self.toolDiscoveryEnabled
-            ? [Self.listToolsSchema, Self.searchToolSchema]
+            ? [Self.schemaWithExample(Self.listToolsSchema),
+               Self.schemaWithExample(Self.searchToolSchema)]
             : schemas
         guard let data = try? JSONSerialization.data(
             withJSONObject: outSchemas,
             options: [.prettyPrinted, .sortedKeys])
         else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    /// Attach a worked `example` field to a tool-schema dict — a
+    /// ready-to-run DSML invocation derived from the dict's own
+    /// `name` and `inputSchema`. Applied to every schema the model
+    /// can see (native, MCP, delegate and the two meta-tools) so each
+    /// one ships with a concrete usage example.
+    private static func schemaWithExample(
+        _ schema: [String: Any]) -> [String: Any] {
+        var s = schema
+        let name = (schema["name"] as? String) ?? ""
+        let input = (schema["inputSchema"] as? [String: Any]) ?? [:]
+        s["example"] = EncodingDSV4.toolCallExample(name: name,
+                                                    inputSchema: input)
+        return s
     }
 
     // MARK: - Progressive tool discovery
@@ -1481,7 +1483,7 @@ final class ChatStore: ObservableObject {
             + "returns each tool's name and a short description. Call "
             + "this first to discover what you can do, then call "
             + "\(EncodingDSV4.searchToolName) to get a tool's exact "
-            + "parameter schema before invoking it.",
+            + "parameter schema and a worked example before invoking it.",
         "inputSchema": ["type": "object"]
     ]
 
@@ -1489,14 +1491,16 @@ final class ChatStore: ObservableObject {
     private static let searchToolSchema: [String: Any] = [
         "name": EncodingDSV4.searchToolName,
         "description": "Look up tools by name or keyword and return "
-            + "their full parameter schemas. Use this to learn the "
-            + "exact arguments a tool expects before invoking it.",
+            + "their full parameter schemas, each with a worked "
+            + "example invocation. Use this to learn the exact "
+            + "arguments a tool expects before invoking it.",
         "inputSchema": [
             "type": "object",
             "properties": [
                 "query": [
                     "type": "string",
-                    "description": "A tool name or keyword to search for."
+                    "description": "A tool name or keyword to search for.",
+                    "example": "read file"
                 ]
             ],
             "required": ["query"]
@@ -1523,7 +1527,8 @@ final class ChatStore: ObservableObject {
         else { return "[no tools available]" }
         return "Available tools — call \(EncodingDSV4.searchToolName) "
             + "with a name (or keyword) from this list to get its "
-            + "parameter schema before invoking it:\n\(json)"
+            + "parameter schema and a worked example before invoking "
+            + "it:\n\(json)"
     }
 
     /// `__search_tool` handler — full schemas (incl. inputSchema) of
@@ -1539,14 +1544,16 @@ final class ChatStore: ObservableObject {
 
         var all: [[String: Any]] = []
         for s in nativeTools.schemas {
-            all.append(["name": "native__\(s.name)",
-                        "description": s.description,
-                        "inputSchema": s.inputSchema.foundationValue])
+            all.append(Self.schemaWithExample([
+                "name": "native__\(s.name)",
+                "description": s.description,
+                "inputSchema": s.inputSchema.foundationValue]))
         }
         for t in mcpPool.allTools() {
-            all.append(["name": t.qualifiedName,
-                        "description": t.description,
-                        "inputSchema": t.inputSchema])
+            all.append(Self.schemaWithExample([
+                "name": t.qualifiedName,
+                "description": t.description,
+                "inputSchema": t.inputSchema]))
         }
         let matches = q.isEmpty ? all : all.filter { schema in
             let name = (schema["name"] as? String ?? "").lowercased()
@@ -1564,7 +1571,8 @@ final class ChatStore: ObservableObject {
                 options: [.prettyPrinted, .sortedKeys]),
               let json = String(data: data, encoding: .utf8)
         else { return "[\(EncodingDSV4.searchToolName) failed to serialise]" }
-        return json
+        return "Matching tools — each entry's \"example\" field is a "
+            + "ready-to-run invocation you can copy and adapt:\n" + json
     }
 
     /// Host-level entry point: invoked from the chat's tool-call

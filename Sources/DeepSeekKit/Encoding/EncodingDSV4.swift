@@ -71,13 +71,11 @@ public enum EncodingDSV4 {
     /// actually produces. `parseToolCalls` anchors on the `<｜DSML｜inv`
     /// prefix, so both forms still parse.
     ///
-    /// On top of the reference template this carries one concrete
-    /// `### Example` — a filled-in `__search_tool` call — so the model
-    /// has a worked invocation to imitate rather than only the abstract
-    /// `$PLACEHOLDER` form. `__search_tool` is used because it is the
-    /// only parametrised tool always visible under progressive
-    /// discovery; the example is plain prompt text and is never run
-    /// through `parseCompletion`.
+    /// Each schema in `toolSchemasJSON` may carry an `example` field —
+    /// a ready-to-run `<｜DSML｜tool_calls>` invocation built by
+    /// `toolCallExample`. The block points the model at it; the
+    /// example is plain prompt text and is never run through
+    /// `parseCompletion`.
     public static func toolsBlock(toolSchemasJSON: String) -> String {
         let dt = dsmlToken
         return """
@@ -94,27 +92,120 @@ public enum EncodingDSV4 {
 
             String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
-            ### Example
-
-            Replace the placeholders above with a real tool name and real values. For instance, to invoke `\(searchToolName)` with its `query` string parameter:
-
-            <\(dt)tool_calls>
-            <\(dt)inv name="\(searchToolName)">
-            <\(dt)parameter name="query" string="true">read file</\(dt)parameter>
-            </\(dt)inv>
-            </\(dt)tool_calls>
-
             If thinking_mode is enabled (triggered by \(thinkOpen)), you MUST output your complete reasoning inside \(thinkOpen)...\(thinkClose) BEFORE any tool calls or final response.
 
             Otherwise, output directly after \(thinkClose) with tool calls or final response.
 
             ### Available Tool Schemas
 
+            Each schema below carries an `example` field — a ready-to-run invocation. Copy it and adapt the argument values to your task.
+
             \(toolSchemasJSON)
 
             You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 
             """
+    }
+
+    // MARK: - Worked examples
+
+    /// Render a worked `<｜DSML｜tool_calls>` example for the tool
+    /// `name`, driven by its JSON-Schema `inputSchema`. Walks the
+    /// schema's `properties`, fills the `required` set (or every
+    /// property when none is marked required) with a type-appropriate
+    /// placeholder, and emits the exact block shape `encodeToolCalls`
+    /// produces — so the example is byte-compatible with a real call.
+    /// A schema with no usable properties yields an empty `inv` block,
+    /// itself a valid call for a no-argument tool like `__list_tools`.
+    public static func toolCallExample(name: String,
+                                       inputSchema: [String: Any]) -> String {
+        let dt = dsmlToken
+        var body = "<\(dt)inv name=\"\(escapeXMLAttr(name))\">\n"
+        for p in sampleParameters(inputSchema) {
+            let rendered = p.isString ? escapeXML(p.value) : p.value
+            body += "<\(dt)parameter name=\"\(escapeXMLAttr(p.name))\""
+                  + " string=\"\(p.isString)\">\(rendered)</\(dt)parameter>\n"
+        }
+        body += "</\(dt)inv>"
+        return "<\(dt)tool_calls>\n\(body)\n</\(dt)tool_calls>"
+    }
+
+    private struct SampleParameter {
+        let name: String
+        let value: String
+        let isString: Bool
+    }
+
+    /// Pick the parameters a worked example should show and render a
+    /// placeholder value for each. Required parameters are preferred;
+    /// when a schema marks none required, every property is shown so
+    /// the example stays illustrative.
+    private static func sampleParameters(
+        _ inputSchema: [String: Any]) -> [SampleParameter] {
+        guard let props = inputSchema["properties"] as? [String: Any],
+              !props.isEmpty else { return [] }
+        let required = (inputSchema["required"] as? [Any])?
+            .compactMap { $0 as? String } ?? []
+        let names = required.isEmpty ? props.keys.sorted() : required
+        var out: [SampleParameter] = []
+        for name in names {
+            guard let spec = props[name] as? [String: Any] else { continue }
+            out.append(sampleParameter(name: name, spec: spec))
+        }
+        return out
+    }
+
+    /// Derive one placeholder parameter from a property spec. An
+    /// explicit `example` / `default` / first `enum` value wins — it
+    /// is concrete and guaranteed valid; otherwise the value is picked
+    /// from the declared `type`.
+    private static func sampleParameter(
+        name: String, spec: [String: Any]) -> SampleParameter {
+        if let concrete = spec["example"] ?? spec["default"]
+            ?? (spec["enum"] as? [Any])?.first {
+            let r = renderScalar(concrete)
+            return SampleParameter(name: name, value: r.text,
+                                   isString: r.isString)
+        }
+        switch (spec["type"] as? String) ?? "string" {
+        case "integer", "number":
+            let minimum = (spec["minimum"] as? Int).map { String($0) } ?? "1"
+            return SampleParameter(name: name, value: minimum,
+                                   isString: false)
+        case "boolean":
+            return SampleParameter(name: name, value: "true",
+                                   isString: false)
+        case "array":
+            return SampleParameter(name: name, value: "[]",
+                                   isString: false)
+        case "object":
+            return SampleParameter(name: name, value: "{}",
+                                   isString: false)
+        default:
+            return SampleParameter(name: name, value: "example",
+                                   isString: true)
+        }
+    }
+
+    /// Render a scalar JSON value to `(text, isString)`. Strings keep
+    /// `string="true"`; numbers and booleans render in JSON form with
+    /// `string="false"`. NSNumber is inspected via `objCType` so a
+    /// boolean does not collapse to `1` / `0`.
+    private static func renderScalar(
+        _ value: Any) -> (text: String, isString: Bool) {
+        if let s = value as? String { return (s, true) }
+        if let n = value as? NSNumber {
+            let t = String(cString: n.objCType)
+            if t == "c" || t == "B" {
+                return (n.boolValue ? "true" : "false", false)
+            }
+            return ("\(n)", false)
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: value),
+           let s = String(data: data, encoding: .utf8) {
+            return (s, false)
+        }
+        return ("\(value)", false)
     }
 
     // MARK: - Encode

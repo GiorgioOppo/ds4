@@ -50,6 +50,53 @@ final class ChatTemplateTests: XCTestCase {
         XCTAssertEqual(viaTemplate, viaEncoding)
     }
 
+    /// `toolCallExample` shows only the required parameter, renders the
+    /// tool/parameter names verbatim, and flags the string type.
+    func testToolCallExampleRendersRequiredStringParam() {
+        let schema: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "path": ["type": "string", "description": "A file path."],
+                "limit": ["type": "integer", "description": "Max lines."],
+            ],
+            "required": ["path"],
+        ]
+        let example = EncodingDSV4.toolCallExample(name: "native__read",
+                                                   inputSchema: schema)
+        let dt = EncodingDSV4.dsmlToken
+        XCTAssertTrue(example.contains("<\(dt)tool_calls>"))
+        XCTAssertTrue(example.contains("name=\"native__read\""))
+        XCTAssertTrue(example.contains("name=\"path\""))
+        XCTAssertTrue(example.contains("string=\"true\""))
+        // Optional `limit` is not in `required`, so it is omitted.
+        XCTAssertFalse(example.contains("name=\"limit\""))
+    }
+
+    /// A schema with no properties yields a valid empty `inv` block —
+    /// the shape a no-argument tool such as `__list_tools` needs.
+    func testToolCallExampleNoParamsYieldsEmptyInvoke() {
+        let example = EncodingDSV4.toolCallExample(
+            name: "__list_tools", inputSchema: ["type": "object"])
+        XCTAssertTrue(example.contains("name=\"__list_tools\""))
+        XCTAssertFalse(example.contains("parameter"))
+    }
+
+    /// Non-string parameters render with `string="false"` and a JSON
+    /// value; booleans must not collapse to `1`.
+    func testToolCallExampleNonStringParam() {
+        let schema: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "recursive": ["type": "boolean", "description": "Recurse."],
+            ],
+            "required": ["recursive"],
+        ]
+        let example = EncodingDSV4.toolCallExample(name: "native__glob",
+                                                   inputSchema: schema)
+        XCTAssertTrue(example.contains("string=\"false\""))
+        XCTAssertTrue(example.contains(">true<"))
+    }
+
     /// Render a minimal Mistral-style template via the dispatcher and
     /// verify the assistant marker is appended when
     /// `add_generation_prompt` is true.
