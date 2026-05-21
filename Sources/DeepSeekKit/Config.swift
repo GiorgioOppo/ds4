@@ -290,28 +290,33 @@ public struct ModelConfig: Codable, Sendable {
             self.prunedExperts = []
         }
 
-        // Runtime override: `DEEPSEEK_TOPK_EXPERTS=N` bumps the
-        // per-token active-expert count without rebuilding the
-        // checkpoint. Useful for quick A/B on whether more experts
-        // helps a specific workload (cost is roughly linear in
-        // topK on the FFN dispatch path). Applies only to learned-
-        // routing layers — hash-routed layers (the first
-        // `nHashLayers`) read from a fixed-shape `tid2eid` lookup
-        // table whose K column was set at training time, and
-        // `Gate.init` snaps them back to that K regardless of this
-        // override. The MoE layer pulls its dispatch K from
-        // `Gate.topK` so the two stay in sync.
-        if let raw = ProcessInfo.processInfo
-            .environment["DEEPSEEK_TOPK_EXPERTS"],
-           let newK = Int(raw), newK > 0,
-           newK != self.nActivatedExperts {
+        // Per-token active-expert count. Raised to 15 by default on
+        // explicit request — this is *above* the checkpoint's trained
+        // value, so it is out-of-distribution: the gate renormalises
+        // its weights over more experts and the FFN dispatch costs
+        // ~linearly more per token. `DEEPSEEK_TOPK_EXPERTS=N` overrides
+        // the 15 (set it back to the trained value for an A/B).
+        // Clamped to the experts that actually exist and to the gate
+        // kernel's 16-slot limit (moe.metal `bestV[16]`). Applies only
+        // to learned-routing layers — the first `nHashLayers`
+        // hash-routed layers read a fixed-shape `tid2eid` table whose
+        // K was set at training time, and `Gate.init` snaps them back
+        // to it regardless of this value.
+        let requestedActiveExperts: Int = {
+            if let raw = ProcessInfo.processInfo
+                .environment["DEEPSEEK_TOPK_EXPERTS"],
+               let n = Int(raw), n > 0 { return n }
+            return 15
+        }()
+        let resolvedActiveExperts = min(requestedActiveExperts,
+                                         max(self.nRoutedExperts, 1), 16)
+        if resolvedActiveExperts != self.nActivatedExperts {
             let oldK = self.nActivatedExperts
-            self.nActivatedExperts = newK
-            let line = "[config] DEEPSEEK_TOPK_EXPERTS override: " +
-                       "nActivatedExperts \(oldK) → \(newK) " +
-                       "(applies to learned-routing layers; first " +
-                       "\(self.nHashLayers) hash-routed layer(s) " +
-                       "stay at trained K)\n"
+            self.nActivatedExperts = resolvedActiveExperts
+            let line = "[config] active experts/token: \(oldK) → " +
+                       "\(resolvedActiveExperts) (first " +
+                       "\(self.nHashLayers) hash-routed layer(s) keep " +
+                       "their trained K)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
     }
