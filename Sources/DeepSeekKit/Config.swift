@@ -456,6 +456,36 @@ public struct ModelConfig: Codable, Sendable {
             FileHandle.standardError.write(Data(("config.json was missing or stale; inferred from checkpoint:\n  "
                 + notes.joined(separator: "\n  ") + "\n").utf8))
         }
+
+        // Runtime override: `DEEPSEEK_MAX_SEQ_LEN=N` sets the context
+        // length without editing the model's config.json. Applied here,
+        // after shape inference, so the new value flows into the
+        // KV-cache budget check and every buffer `Assembly.load` sizes
+        // from `maxSeqLen` (the RoPE table, the per-layer KV caches).
+        //
+        // Long context stays feasible because per-layer compression
+        // bounds the cache: ratio-0 layers hold a fixed `windowSize`
+        // rows regardless of N, ratio-R layers grow only at `N / R`
+        // (see `projectedKVCacheBytes`). The compression is intrinsic —
+        // it is driven by the trained `compressRatios`, nothing extra
+        // has to be enabled. An over-large N is still caught by the
+        // `kvCacheTooLarge` budget gate in `Assembly.load`, so it fails
+        // loudly at load instead of jetsamming mid-run.
+        //
+        // YaRN RoPE scaling is governed by `originalSeqLen`, not this
+        // value, so overriding `maxSeqLen` only resizes buffers — it
+        // does not re-tune positional scaling.
+        if let raw = ProcessInfo.processInfo
+            .environment["DEEPSEEK_MAX_SEQ_LEN"],
+           let newLen = Int(raw), newLen > 0,
+           newLen != c.maxSeqLen {
+            let oldLen = c.maxSeqLen
+            c.maxSeqLen = newLen
+            FileHandle.standardError.write(Data(
+                ("[config] DEEPSEEK_MAX_SEQ_LEN override: maxSeqLen "
+                 + "\(oldLen) → \(newLen)\n").utf8))
+        }
+
         return c
     }
 
