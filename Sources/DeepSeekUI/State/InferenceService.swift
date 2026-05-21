@@ -287,7 +287,15 @@ final class InferenceService: @unchecked Sendable {
             }
             let tokens = Array(UnsafeBufferPointer(start: tokenPtr,
                                                      count: Int(n)))
-            // Restore in memory.
+            // Restore in memory — but only if the snapshot's KV
+            // buffers match this run's shape. A snapshot from a launch
+            // with a different maxSeqLen/windowSize would otherwise
+            // trap restoreKVCacheBytes's precondition.
+            guard model.canRestoreKVCache(snap) else {
+                FileHandle.standardError.write(Data(
+                    "[kvcache] snapshot shape mismatch — cold path\n".utf8))
+                return nil
+            }
             model.restoreKVCache(snap)
             let okMsg = "[kvcache] restored from disk: "
                 + "\(tokens.count) tokens, \(snap.totalBytes) bytes\n"
@@ -486,6 +494,11 @@ final class InferenceService: @unchecked Sendable {
               prefix.count < promptTokens.count
         else { return nil }
         for i in 0..<prefix.count where prefix[i] != promptTokens[i] {
+            return nil
+        }
+        guard model.canRestoreKVCache(snap) else {
+            FileHandle.standardError.write(Data(
+                "[toolprefix] snapshot shape mismatch — cold path\n".utf8))
             return nil
         }
         model.restoreKVCache(snap)

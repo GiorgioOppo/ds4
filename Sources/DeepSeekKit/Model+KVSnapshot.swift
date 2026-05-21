@@ -449,6 +449,45 @@ extension Transformer {
         return KVCacheSnapshot(slots: slots)
     }
 
+    /// True iff every `.mlaKV` / `.indexerKV` buffer in `snap`
+    /// matches this model's current KV-cache shape and dtype. A
+    /// snapshot saved in a run with a different `maxSeqLen` /
+    /// `windowSize` (both vary with the memory budget) or KV
+    /// compression carries incompatibly-shaped buffers; restoring it
+    /// would trap `restoreKVCacheBytes`'s preconditions. Callers that
+    /// load a snapshot from disk must gate `restoreKVCache` on this.
+    /// The compressor-state slots derive from the same run config,
+    /// so the two big KV buffers gate the whole blob.
+    public func canRestoreKVCache(_ snap: KVCacheSnapshot) -> Bool {
+        for slot in snap.slots {
+            let block: Block?
+            if slot.isMTP {
+                block = (slot.layerIndex < mtp.count)
+                    ? mtp[slot.layerIndex].block : nil
+            } else {
+                block = (slot.layerIndex < layers.count)
+                    ? layers[slot.layerIndex] : nil
+            }
+            guard let b = block else { continue }
+            switch slot.role {
+            case .mlaKV:
+                if !b.attn.acceptsKVCacheBytes(shape: slot.shape,
+                                                dtype: slot.dtype) {
+                    return false
+                }
+            case .indexerKV:
+                if let idx = b.attn.indexer,
+                   !idx.acceptsKVCacheBytes(shape: slot.shape,
+                                             dtype: slot.dtype) {
+                    return false
+                }
+            default:
+                continue
+            }
+        }
+        return true
+    }
+
     /// Re-populate every layer's KV cache from a snapshot.
     /// Two-pass design:
     ///   1) restore single-slot fields (MLA kvCache, Indexer kvCache)

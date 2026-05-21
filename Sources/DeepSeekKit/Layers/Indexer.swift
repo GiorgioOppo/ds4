@@ -84,6 +84,13 @@ public final class Indexer {
         self.compressor.kvCache = t
     }
 
+    /// Non-fatal counterpart to `restoreKVCacheBytes`'s
+    /// preconditions: whether a snapshot slot with this `shape` /
+    /// `dtype` could be restored into this layer.
+    public func acceptsKVCacheBytes(shape: [Int], dtype: DType) -> Bool {
+        shape == kvCacheShape && dtype == kvCacheDType
+    }
+
     /// Returns `[B, S, K]` Int32 indices (with -1 padding for invalid slots).
     public func callAsFunction(_ x: Tensor, qr: Tensor, startPos: Int, offset: Int,
                                 in cmd: MTLCommandBuffer) -> Tensor {
