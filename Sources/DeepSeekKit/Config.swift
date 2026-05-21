@@ -290,23 +290,23 @@ public struct ModelConfig: Codable, Sendable {
             self.prunedExperts = []
         }
 
-        // Per-token active-expert count. Raised to 15 by default on
-        // explicit request — this is *above* the checkpoint's trained
-        // value, so it is out-of-distribution: the gate renormalises
-        // its weights over more experts and the FFN dispatch costs
-        // ~linearly more per token. `DEEPSEEK_TOPK_EXPERTS=N` overrides
-        // the 15 (set it back to the trained value for an A/B).
-        // Clamped to the experts that actually exist and to the gate
-        // kernel's 16-slot limit (moe.metal `bestV[16]`). Applies only
-        // to learned-routing layers — the first `nHashLayers`
-        // hash-routed layers read a fixed-shape `tid2eid` table whose
-        // K was set at training time, and `Gate.init` snaps them back
-        // to it regardless of this value.
+        // Per-token active-expert count. Defaults to 8 on explicit
+        // request. This may differ from the checkpoint's trained value
+        // — fewer experts is cheaper (FFN dispatch cost scales
+        // ~linearly with the count), more is costlier; either way it
+        // is off-distribution, so this is an A/B knob.
+        // `DEEPSEEK_TOPK_EXPERTS=N` overrides the default. Clamped to
+        // the experts that actually exist and to the gate kernel's
+        // 16-slot limit (moe.metal `bestV[16]`). Applies only to
+        // learned-routing layers — the first `nHashLayers` hash-routed
+        // layers read a fixed-shape `tid2eid` table whose K was set at
+        // training time, and `Gate.init` snaps them back to it
+        // regardless of this value.
         let requestedActiveExperts: Int = {
             if let raw = ProcessInfo.processInfo
                 .environment["DEEPSEEK_TOPK_EXPERTS"],
                let n = Int(raw), n > 0 { return n }
-            return 15
+            return 8
         }()
         let resolvedActiveExperts = min(requestedActiveExperts,
                                          max(self.nRoutedExperts, 1), 16)
