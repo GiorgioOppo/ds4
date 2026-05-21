@@ -82,6 +82,15 @@ enum AppSettingsKey {
     /// attivo.
     static let kvCacheCompression = "deepseek.kvCacheCompression"
 
+    /// Precompute the deterministic tool prefix (BOS + tools block)
+    /// of the first chat prompt once at model load — tokens + a
+    /// KV-cache snapshot — and reuse it for every new chat's first
+    /// turn so the prefill skips re-tokenising and re-prefilling that
+    /// block. Persisted under `tool-prefix/` in Application Support,
+    /// keyed on the model + tools-block hash. Default ON (a missing
+    /// key reads as true). Vedi `InferenceService.precomputeToolPrefix`.
+    static let precomputedToolPrefix = "deepseek.precomputedToolPrefix"
+
     /// Quando attivo, sul primo turn di una conversazione (cold
     /// prefill, KV cache vuota) la UI mostra fra il messaggio
     /// dell'utente e la risposta dell'assistente un blocco

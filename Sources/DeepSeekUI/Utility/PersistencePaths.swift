@@ -356,4 +356,37 @@ enum PersistencePaths {
         }
         return dir
     }
+
+    // MARK: - Tool-prefix precompute cache
+    //
+    // A single global cache (not per-chat): the deterministic
+    // BOS + tools-block prefix every new chat's first turn shares.
+    // Precomputed once per model load; persisted so an app relaunch
+    // with the same model can skip the prefill.
+
+    /// Folder holding the precomputed tool-prefix artefacts.
+    static func toolPrefixDir() throws -> URL {
+        let appSupport = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true)
+        let dir = appSupport
+            .appendingPathComponent(appName, isDirectory: true)
+            .appendingPathComponent("tool-prefix", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// `prefix.kvcache` — the `KVCacheSnapshot` of the tool prefix.
+    static func toolPrefixKVCacheURL() throws -> URL {
+        try toolPrefixDir().appendingPathComponent("prefix.kvcache")
+    }
+
+    /// `prefix.meta.json` — validity key (model + tools hash) plus
+    /// the prefix token ids, so a stale snapshot is rejected.
+    static func toolPrefixMetaURL() throws -> URL {
+        try toolPrefixDir().appendingPathComponent("prefix.meta.json")
+    }
 }

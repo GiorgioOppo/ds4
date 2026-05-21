@@ -84,6 +84,14 @@ final class InferenceService: @unchecked Sendable {
     }
     private var cacheImage: CacheImage?
 
+    /// Precomputed tool prefix (BOS + tools block) — see
+    /// `precomputeToolPrefix`. `toolPrefixTokens` is the tokenised
+    /// prefix; `toolPrefixSnapshot` is the KV-cache state captured
+    /// after prefilling it. Both empty/nil until a successful
+    /// precompute. Accessed on `q` only.
+    private var toolPrefixTokens: [Int32] = []
+    private var toolPrefixSnapshot: KVCacheSnapshot?
+
     /// Default fallback se nessun modello è ancora caricato (es.
     /// chiamata prematura). Per V4 con ratios `[0,0,4,128,4,128,4,0]`
     /// il LCM = 128. Il valore vero viene letto runtime da
@@ -298,6 +306,152 @@ final class InferenceService: @unchecked Sendable {
             group.leave()
         }
         _ = group.wait(timeout: .now() + 5.0)
+    }
+
+    // MARK: - Precomputed tool prefix
+
+    /// FNV-1a 64-bit hash — launch-stable (Swift's `hashValue` is
+    /// per-process randomised, unusable for an on-disk key).
+    private static func fnv1a(_ s: String) -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in s.utf8 {
+            h ^= UInt64(b)
+            h = h &* 0x00000100000001B3
+        }
+        return h
+    }
+
+    /// `precomputedToolPrefix` AppStorage flag — default ON (a
+    /// missing key reads as true).
+    private static var precomputedToolPrefixEnabled: Bool {
+        UserDefaults.standard.object(
+            forKey: AppSettingsKey.precomputedToolPrefix) as? Bool ?? true
+    }
+
+    /// On-disk validity key + token payload for the tool-prefix
+    /// artefact. The snapshot is reused only when all three match.
+    private struct ToolPrefixMeta: Codable {
+        let modelKey: UInt64
+        let toolsHash: UInt64
+        let tokens: [Int32]
+    }
+
+    private static func loadToolPrefixMeta() -> ToolPrefixMeta? {
+        guard let url = try? PersistencePaths.toolPrefixMetaURL(),
+              let data = try? Data(contentsOf: url),
+              let meta = try? JSONDecoder().decode(
+                ToolPrefixMeta.self, from: data)
+        else { return nil }
+        return meta
+    }
+
+    /// Stable identity of the loaded model for the tool-prefix cache:
+    /// directory path + `config.json` size & mtime, so a reconvert at
+    /// the same path invalidates the artefact.
+    private func toolPrefixModelKey() -> UInt64 {
+        var src = self.loadedModelDir?.path ?? ""
+        if let cfg = self.loadedModelDir?
+            .appendingPathComponent("config.json"),
+           let attrs = try? FileManager.default
+            .attributesOfItem(atPath: cfg.path)
+        {
+            let size = (attrs[.size] as? Int) ?? 0
+            let mtime = ((attrs[.modificationDate] as? Date)?
+                .timeIntervalSince1970).map { Int($0) } ?? 0
+            src += "|\(size)|\(mtime)"
+        }
+        return Self.fnv1a(src)
+    }
+
+    /// Precompute the deterministic tool prefix (BOS + tools block)
+    /// shared by every new chat's first turn so that turn can skip
+    /// re-tokenising and re-prefilling it. Called by `loadModel` on
+    /// `q` once the model is ready. Loads a still-valid on-disk
+    /// artefact if present, else runs the prefill forward, snapshots
+    /// the KV cache, and persists both. Every failure is non-fatal —
+    /// it leaves the cache empty so the first turn cold-prefills.
+    fileprivate func precomputeToolPrefix() {
+        self.toolPrefixTokens = []
+        self.toolPrefixSnapshot = nil
+        guard Self.precomputedToolPrefixEnabled,
+              let model = self.transformer,
+              let tok = self._tokenizer,
+              let json = ChatStore.discoveryToolSchemasJSON
+        else { return }
+
+        let prefixString = EncodingDSV4.bosToken
+            + EncodingDSV4.toolsBlock(toolSchemasJSON: json)
+        let prefixTokens = tok.encode(prefixString).map(Int32.init)
+        guard prefixTokens.count > 1 else { return }
+
+        let modelKey = self.toolPrefixModelKey()
+        let toolsHash = Self.fnv1a(json)
+
+        // Disk hit: a still-valid artefact (same model, same tools,
+        // same token sequence) — load the snapshot, skip the prefill.
+        if let meta = Self.loadToolPrefixMeta(),
+           meta.modelKey == modelKey,
+           meta.toolsHash == toolsHash,
+           meta.tokens == prefixTokens,
+           let url = try? PersistencePaths.toolPrefixKVCacheURL(),
+           let snap = KVCacheSnapshot.load(from: url)
+        {
+            self.toolPrefixTokens = prefixTokens
+            self.toolPrefixSnapshot = snap
+            FileHandle.standardError.write(Data(
+                ("[toolprefix] loaded from disk: \(prefixTokens.count) "
+                 + "tokens, \(snap.totalBytes) bytes\n").utf8))
+            return
+        }
+
+        // Disk miss: prefill the prefix from an empty cache and
+        // snapshot the resulting KV state.
+        model.releaseCache()
+        self.cacheImage = nil
+        _ = model.forward(inputIds: [prefixTokens.map(Int)], startPos: 0)
+        let snap = model.snapshotKVCache()
+        self.toolPrefixTokens = prefixTokens
+        self.toolPrefixSnapshot = snap
+
+        // Persist (best-effort) for the next launch.
+        do {
+            let url = try PersistencePaths.toolPrefixKVCacheURL()
+            try snap.save(to: url, compression: .f16)
+            let meta = ToolPrefixMeta(modelKey: modelKey,
+                                       toolsHash: toolsHash,
+                                       tokens: prefixTokens)
+            try JSONEncoder().encode(meta).write(
+                to: PersistencePaths.toolPrefixMetaURL(), options: .atomic)
+            FileHandle.standardError.write(Data(
+                ("[toolprefix] precomputed + saved: \(prefixTokens.count) "
+                 + "tokens, \(snap.totalBytes) bytes\n").utf8))
+        } catch {
+            FileHandle.standardError.write(Data(
+                ("[toolprefix] save failed: "
+                 + "\(error.localizedDescription)\n").utf8))
+        }
+    }
+
+    /// On a fresh chat's first turn: if `promptTokens` begins with the
+    /// precomputed tool prefix, restore that prefix's KV snapshot into
+    /// the model and return the prefix tokens — the caller seeds
+    /// `cacheImage` so only the per-chat delta is prefilled. Returns
+    /// nil (caller stays on the cold path) on any mismatch.
+    private func tryPrimeFromToolPrefix(promptTokens: [Int32],
+                                          model: Transformer) -> [Int32]? {
+        let prefix = self.toolPrefixTokens
+        guard let snap = self.toolPrefixSnapshot,
+              prefix.count > 1,
+              prefix.count < promptTokens.count
+        else { return nil }
+        for i in 0..<prefix.count where prefix[i] != promptTokens[i] {
+            return nil
+        }
+        model.restoreKVCache(snap)
+        FileHandle.standardError.write(Data(
+            ("[toolprefix] primed first turn: reused \(prefix.count) "
+             + "prefix tokens\n").utf8))
+        return prefix
     }
 
     /// Quando true, `generateForConversation` accetta anche
@@ -644,6 +798,11 @@ final class InferenceService: @unchecked Sendable {
                     // closure. Niente se il flag è OFF.
                     self.setupKVLifecycle()
                     cont.resume(returning: cfg)
+                    // Warm the tool-prefix cache on `q`, right after
+                    // the load result is delivered: the model reads
+                    // as "ready" immediately, then `q` runs the
+                    // prefix prefill before any chat work can start.
+                    self.precomputeToolPrefix()
                 } catch {
                     cont.resume(throwing: error)
                 }
@@ -1257,6 +1416,24 @@ final class InferenceService: @unchecked Sendable {
                             tokens: restoredTokens,
                             mode: mode)
                     }
+                }
+
+                // Tool-prefix prime: prima turn di una chat nuova
+                // (cacheImage ancora nil dopo l'eventuale restore
+                // cross-restart sopra). Se il prompt inizia col
+                // prefisso tool precompilato, ripristina il suo
+                // snapshot KV e semina cacheImage così il blocco
+                // reuse sotto fa solo il delta prefill. Qualsiasi
+                // mismatch lascia cacheImage nil → cold path invariato.
+                if self.cacheImage == nil,
+                   Self.precomputedToolPrefixEnabled,
+                   let primed = self.tryPrimeFromToolPrefix(
+                       promptTokens: promptTokens, model: model)
+                {
+                    self.cacheImage = CacheImage(
+                        conversationID: conversationID,
+                        tokens: primed,
+                        mode: mode)
                 }
 
                 // Decide reuse vs. full reset.

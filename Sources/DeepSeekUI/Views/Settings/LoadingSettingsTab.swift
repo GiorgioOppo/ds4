@@ -21,6 +21,8 @@ struct LoadingSettingsTab: View {
     private var crossRestartKVCache: Bool = false
     @AppStorage(AppSettingsKey.kvCacheCompression)
     private var kvCacheCompression: String = "f32"
+    @AppStorage(AppSettingsKey.precomputedToolPrefix)
+    private var precomputedToolPrefix: Bool = true
 
     var body: some View {
         Form {
@@ -120,6 +122,19 @@ struct LoadingSettingsTab: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Toggle("Precompute tool prefix",
+                        isOn: $precomputedToolPrefix)
+                Text("Precompila una volta sola, al model load, il " +
+                     "prefisso deterministico delle chat (BOS + " +
+                     "blocco tool): token + snapshot KV-cache, salvati " +
+                     "in `tool-prefix/`. Ogni chat nuova salta la " +
+                     "ri-tokenizzazione e il prefill di quel blocco. " +
+                     "Costa qualche centinaio di MB (snapshot KV " +
+                     "tenuto in RAM). Default ON; ha effetto al " +
+                     "prossimo model load.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Last loaded model") {
                 if lastModelDir.isEmpty {

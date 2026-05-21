@@ -1432,18 +1432,18 @@ final class ChatStore: ObservableObject {
 
         if schemas.isEmpty { return nil }
         // Progressive tool discovery: when enabled, advertise only the
-        // two synthetic meta-tools instead of every schema. The model
-        // calls __list_tools / __search_tool to discover the rest;
-        // `executeToolCall` serves those host-side. This keeps the
+        // two synthetic meta-tools (precomputed once in
+        // `discoveryToolSchemasJSON`) instead of every schema. The
+        // model calls __list_tools / __search_tool to discover the
+        // rest; `executeToolCall` serves those host-side. Keeps the
         // system message small — the full tool block is the dominant
-        // prompt bloat and the first thing the KV-cache compression
+        // prompt bloat and the first thing KV-cache compression
         // degrades.
-        let outSchemas: [[String: Any]] = Self.toolDiscoveryEnabled
-            ? [Self.schemaWithExample(Self.listToolsSchema),
-               Self.schemaWithExample(Self.searchToolSchema)]
-            : schemas
+        if Self.toolDiscoveryEnabled {
+            return Self.discoveryToolSchemasJSON
+        }
         guard let data = try? JSONSerialization.data(
-            withJSONObject: outSchemas,
+            withJSONObject: schemas,
             options: [.prettyPrinted, .sortedKeys])
         else { return nil }
         return String(data: data, encoding: .utf8)
@@ -1454,7 +1454,7 @@ final class ChatStore: ObservableObject {
     /// `name` and `inputSchema`. Applied to every schema the model
     /// can see (native, MCP, delegate and the two meta-tools) so each
     /// one ships with a concrete usage example.
-    private static func schemaWithExample(
+    nonisolated private static func schemaWithExample(
         _ schema: [String: Any]) -> [String: Any] {
         var s = schema
         let name = (schema["name"] as? String) ?? ""
@@ -1476,36 +1476,49 @@ final class ChatStore: ObservableObject {
         return true
     }()
 
-    /// Schema for the `__list_tools` meta-tool (no arguments).
-    private static let listToolsSchema: [String: Any] = [
-        "name": EncodingDSV4.listToolsName,
-        "description": "List every tool available in this session — "
-            + "returns each tool's name and a short description. Call "
-            + "this first to discover what you can do, then call "
-            + "\(EncodingDSV4.searchToolName) to get a tool's exact "
-            + "parameter schema and a worked example before invoking it.",
-        "inputSchema": ["type": "object"]
-    ]
-
-    /// Schema for the `__search_tool` meta-tool (one `query` argument).
-    private static let searchToolSchema: [String: Any] = [
-        "name": EncodingDSV4.searchToolName,
-        "description": "Look up tools by name or keyword and return "
-            + "their full parameter schemas, each with a worked "
-            + "example invocation. Use this to learn the exact "
-            + "arguments a tool expects before invoking it.",
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "query": [
-                    "type": "string",
-                    "description": "A tool name or keyword to search for.",
-                    "example": "read file"
-                ]
-            ],
-            "required": ["query"]
+    /// The tool-schema JSON the model sees under progressive
+    /// discovery: just the two synthetic meta-tools, each with a
+    /// worked example. Deterministic — it depends only on code
+    /// constants — so it is computed once and is `nonisolated` for
+    /// `InferenceService.precomputeToolPrefix` to read off the main
+    /// actor when warming the tool-prefix cache.
+    nonisolated static let discoveryToolSchemasJSON: String? = {
+        let listTool: [String: Any] = [
+            "name": EncodingDSV4.listToolsName,
+            "description": "List every tool available in this session — "
+                + "returns each tool's name and a short description. Call "
+                + "this first to discover what you can do, then call "
+                + "\(EncodingDSV4.searchToolName) to get a tool's exact "
+                + "parameter schema and a worked example before invoking it.",
+            "inputSchema": ["type": "object"],
         ]
-    ]
+        let searchTool: [String: Any] = [
+            "name": EncodingDSV4.searchToolName,
+            "description": "Look up tools by name or keyword and return "
+                + "their full parameter schemas, each with a worked "
+                + "example invocation. Use this to learn the exact "
+                + "arguments a tool expects before invoking it.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": [
+                        "type": "string",
+                        "description": "A tool name or keyword to search for.",
+                        "example": "read file",
+                    ],
+                ],
+                "required": ["query"],
+            ],
+        ]
+        let out = [Self.schemaWithExample(listTool),
+                   Self.schemaWithExample(searchTool)]
+        guard let data = try? JSONSerialization.data(
+                withJSONObject: out,
+                options: [.prettyPrinted, .sortedKeys]),
+              let json = String(data: data, encoding: .utf8)
+        else { return nil }
+        return json
+    }()
 
     /// `__list_tools` handler — the catalogue (name + description) of
     /// every native and MCP tool, as a JSON array.
