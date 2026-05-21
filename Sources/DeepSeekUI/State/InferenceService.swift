@@ -345,9 +345,17 @@ final class InferenceService: @unchecked Sendable {
         return meta
     }
 
-    /// Stable identity of the loaded model for the tool-prefix cache:
-    /// directory path + `config.json` size & mtime, so a reconvert at
-    /// the same path invalidates the artefact.
+    /// Stable identity of the loaded model *and* its KV-cache layout
+    /// for the tool-prefix cache: directory path + `config.json` size
+    /// & mtime (a reconvert invalidates the artefact) plus the
+    /// runtime-resolved `windowSize` / `maxSeqLen` / `maxBatchSize`.
+    /// Those three fix the KV buffer shape — `[maxBatchSize,
+    /// windowSize + maxSeqLen/ratio, headDim]` — and they vary run to
+    /// run (`maxSeqLen` auto-grows with the memory budget,
+    /// `windowSize` follows `DEEPSEEK_WINDOW_MULT`), so a snapshot is
+    /// only restorable into buffers of the exact same shape. Leaving
+    /// them out let a stale snapshot pass the check and trap in
+    /// `restoreKVCache`'s shape precondition.
     private func toolPrefixModelKey() -> UInt64 {
         var src = self.loadedModelDir?.path ?? ""
         if let cfg = self.loadedModelDir?
@@ -359,6 +367,9 @@ final class InferenceService: @unchecked Sendable {
             let mtime = ((attrs[.modificationDate] as? Date)?
                 .timeIntervalSince1970).map { Int($0) } ?? 0
             src += "|\(size)|\(mtime)"
+        }
+        if let c = self.loadedConfig {
+            src += "|w\(c.windowSize)|s\(c.maxSeqLen)|b\(c.maxBatchSize)"
         }
         return Self.fnv1a(src)
     }
