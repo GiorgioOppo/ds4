@@ -15,6 +15,7 @@ struct ProjectDetailView: View {
     @State private var name: String = ""
     @State private var nameDebouncer: Task<Void, Never>? = nil
     @State private var indexing: Bool = false
+    @State private var prefilling: Bool = false
     @State private var progressText: String = ""
     @State private var indexedCount: Int = 0
     @State private var totalCount: Int = 0
@@ -63,8 +64,18 @@ struct ProjectDetailView: View {
                           || project.sourcePaths.isEmpty
                           || !service.isModelLoaded())
                 .help(indexButtonHelp)
+                Button(action: prefillAll) {
+                    Label(prefilling ? "Prefilling…" : "Prefill files",
+                           systemImage: "bolt.horizontal.circle")
+                }
+                .disabled(indexing || prefilling
+                          || documents.documents(for: project.id).isEmpty
+                          || !service.isModelLoaded())
+                .help("Run a prefill forward over each indexed file and "
+                      + "save its KV cache (.vec) to disk. Files larger "
+                      + "than the model's context window are skipped.")
             }
-            if indexing {
+            if indexing || prefilling {
                 ProgressView(value: Double(indexedCount),
                               total: Double(max(totalCount, 1))) {
                     Text(progressText)
@@ -422,6 +433,47 @@ struct ProjectDetailView: View {
             library.update(updated)
             indexing = false
             progressText = "Indexed \(indexedCount) of \(totalCount) files."
+        }
+    }
+
+    /// Step 3: run a prefill forward over every indexed file in the
+    /// project and persist each file's KV snapshot to its `.vec`.
+    /// Compute + save only; chats don't consume the `.vec` yet.
+    private func prefillAll() {
+        guard !prefilling, !indexing else { return }
+        let docs = documents.documents(for: project.id)
+        guard !docs.isEmpty else { return }
+        totalCount = docs.count
+        indexedCount = 0
+        progressText = "Prefilling…"
+        prefilling = true
+        errorMessage = nil
+
+        Task { [documents] in
+            var skipped = 0
+            for d in docs {
+                progressText = "Prefilling \(d.displayPath ?? d.name)"
+                do {
+                    let toks = try documents.tokens(of: d.id)
+                    let ok = await service.prefillDocument(id: d.id,
+                                                            tokens: toks)
+                    documents.setPrecomputedCache(ok, for: d.id)
+                    if !ok { skipped += 1 }
+                } catch {
+                    skipped += 1
+                    documents.setPrecomputedCache(false, for: d.id)
+                    errorMessage = "Prefill failed for "
+                        + "\(d.displayPath ?? d.name): "
+                        + "\(error.localizedDescription)"
+                }
+                indexedCount += 1
+            }
+            prefilling = false
+            progressText = skipped == 0
+                ? "Prefilled \(indexedCount) file(s)."
+                : "Prefilled \(indexedCount - skipped) of \(indexedCount)"
+                    + " — \(skipped) skipped (too large for the context"
+                    + " window, or save failed)."
         }
     }
 

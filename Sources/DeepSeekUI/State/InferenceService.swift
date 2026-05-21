@@ -668,6 +668,53 @@ final class InferenceService: @unchecked Sendable {
         }
     }
 
+    /// Step 3 of the vectorized-document pipeline: run a prefill
+    /// forward over `tokens` and persist the resulting KV snapshot to
+    /// the document's `.vec` file. Compute + save only — loading a
+    /// `.vec` back into a chat is a separate (tool-driven) path.
+    ///
+    /// Returns `true` when the snapshot was saved; `false` (skip)
+    /// when no model is loaded, `tokens` is empty, or it is longer
+    /// than the KV window can prefill in one pass. Leaves the live
+    /// cache released so the next chat cold-prefills cleanly.
+    func prefillDocument(id: UUID, tokens: [Int32]) async -> Bool {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Bool, Never>) in
+            q.async {
+                guard let model = self.transformer else {
+                    cont.resume(returning: false)
+                    return
+                }
+                let cap = self.loadedConfig?.maxSeqLen ?? 0
+                guard !tokens.isEmpty, cap > 0, tokens.count <= cap,
+                      let url = try? PersistencePaths.documentVecURL(id: id)
+                else {
+                    cont.resume(returning: false)
+                    return
+                }
+                model.releaseCache()
+                self.cacheImage = nil
+                _ = model.forward(inputIds: [tokens.map(Int.init)],
+                                   startPos: 0)
+                let snap = model.snapshotKVCache()
+                var ok = false
+                do {
+                    try snap.save(to: url, compression: .f16)
+                    ok = true
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        ("[docprefill] save failed for \(id): "
+                         + "\(error.localizedDescription)\n").utf8))
+                }
+                // Leave the live cache released so the next chat
+                // cold-prefills (or re-primes the tool prefix) cleanly.
+                model.releaseCache()
+                self.cacheImage = nil
+                cont.resume(returning: ok)
+            }
+        }
+    }
+
     private let q = DispatchQueue(label: "deepseek.inference", qos: .userInitiated)
 
     /// Cancellazione per-conversazione. Il prefill/decode loop legge

@@ -157,6 +157,17 @@ final class DocumentLibrary: ObservableObject {
         }
     }
 
+    /// Flag a document as having (or no longer having) a persisted
+    /// `.vec` KV-cache file. Called by Step 3's prefill pass after a
+    /// prefill forward. `@Published` fires so the Projects-tab
+    /// per-file icon refreshes.
+    func setPrecomputedCache(_ has: Bool, for id: UUID) {
+        guard let idx = documents.firstIndex(where: { $0.id == id }),
+              documents[idx].hasPrecomputedCache != has else { return }
+        documents[idx].hasPrecomputedCache = has
+        saveIndex()
+    }
+
     // MARK: - persistence
 
     private func load() {
