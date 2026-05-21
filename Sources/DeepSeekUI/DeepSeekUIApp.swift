@@ -55,6 +55,12 @@ struct DeepSeekUIApp: App {
             StreamingPool.lazyExpertEnabled = AppSettings.lazyExpertLoad
         }
 
+        // Bridge the UI's per-token active-expert override into
+        // ModelConfig. No env-var guard needed: ModelConfig.init reads
+        // DEEPSEEK_TOPK_EXPERTS before this override, so the env var
+        // still wins.
+        ModelConfig.activeExpertsOverride = AppSettings.activeExpertsOverride
+
         let service = InferenceService()
         self.service = service
         self._documents = StateObject(wrappedValue: DocumentLibrary())

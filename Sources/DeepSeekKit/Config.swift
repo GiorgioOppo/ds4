@@ -290,25 +290,24 @@ public struct ModelConfig: Codable, Sendable {
             self.prunedExperts = []
         }
 
-        // Per-token active-expert count. Defaults to 16 on explicit
-        // request — the gate kernel's 16-slot ceiling (see the clamp
-        // below). This is above the checkpoint's trained value, so it
-        // is off-distribution: the gate renormalises over more experts
-        // and the FFN dispatch cost scales ~linearly with the count —
-        // and under lazy-expert streaming so does the per-token expert
-        // weight I/O. This is an A/B knob.
-        // `DEEPSEEK_TOPK_EXPERTS=N` overrides the default. Clamped to
-        // the experts that actually exist and to the gate kernel's
-        // 16-slot limit (moe.metal `bestV[16]`). Applies only to
-        // learned-routing layers — the first `nHashLayers` hash-routed
-        // layers read a fixed-shape `tid2eid` table whose K was set at
-        // training time, and `Gate.init` snaps them back to it
-        // regardless of this value.
+        // Per-token active-expert count. Default 8. FFN dispatch cost
+        // scales ~linearly with the count — and under lazy-expert
+        // streaming so does the per-token expert weight I/O — while a
+        // count above the checkpoint's trained value is
+        // off-distribution. An A/B knob.
+        // Precedence: `DEEPSEEK_TOPK_EXPERTS=N`, then the UI override
+        // (`activeExpertsOverride`), then the default. Clamped to the
+        // experts that exist and to the gate kernel's 16-slot limit
+        // (moe.metal `bestV[16]`). Applies only to learned-routing
+        // layers — the first `nHashLayers` hash-routed layers read a
+        // fixed-shape `tid2eid` table whose K was set at training
+        // time, and `Gate.init` snaps them back to it regardless.
         let requestedActiveExperts: Int = {
             if let raw = ProcessInfo.processInfo
                 .environment["DEEPSEEK_TOPK_EXPERTS"],
                let n = Int(raw), n > 0 { return n }
-            return 16
+            if let n = ModelConfig.activeExpertsOverride, n > 0 { return n }
+            return 8
         }()
         let resolvedActiveExperts = min(requestedActiveExperts,
                                          max(self.nRoutedExperts, 1), 16)
@@ -322,6 +321,12 @@ public struct ModelConfig: Codable, Sendable {
             FileHandle.standardError.write(Data(line.utf8))
         }
     }
+
+    /// UI-supplied override for the per-token active-expert count,
+    /// bridged from `AppSettings` by `DeepSeekUIApp` (mirrors
+    /// `StreamingPool.lazyExpertEnabled`). `nil` → the built-in
+    /// default. `DEEPSEEK_TOPK_EXPERTS`, when set, still wins over it.
+    nonisolated(unsafe) public static var activeExpertsOverride: Int? = nil
 
     /// Per-layer effective head dimensions.
     public var nopeHeadDim: Int { headDim - ropeHeadDim }

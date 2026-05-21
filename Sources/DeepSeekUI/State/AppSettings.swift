@@ -52,6 +52,15 @@ enum AppSettingsKey {
     /// launch, overrides this setting.
     static let lazyExpertLoad = "deepseek.lazyExpertLoad"
 
+    /// When true, the per-token active-expert count is taken from
+    /// `activeExpertsPerToken` instead of the engine's built-in
+    /// default. Bridged into `ModelConfig.activeExpertsOverride`.
+    static let overrideActiveExperts = "deepseek.overrideActiveExperts"
+    /// Per-token active-expert count used when `overrideActiveExperts`
+    /// is on. Applied on the next model load; clamped engine-side to
+    /// [1, 16].
+    static let activeExpertsPerToken = "deepseek.activeExpertsPerToken"
+
     /// EXPERIMENTAL. Rilassa il match strict-prefix della KV cache
     /// in-memory a common-prefix, supportando il caso "user edita
     /// il proprio ultimo messaggio" senza full reset. Rischio basso
@@ -161,6 +170,19 @@ enum AppSettings {
     static var lazyExpertLoad: Bool {
         UserDefaults.standard.bool(forKey: AppSettingsKey.lazyExpertLoad)
     }
+
+    /// The per-token active-expert override the UI has configured:
+    /// `activeExpertsPerToken` when `overrideActiveExperts` is on,
+    /// else `nil` (engine uses its built-in default). Bridged into
+    /// `ModelConfig.activeExpertsOverride` by `DeepSeekUIApp`.
+    static var activeExpertsOverride: Int? {
+        guard UserDefaults.standard.bool(
+            forKey: AppSettingsKey.overrideActiveExperts) else { return nil }
+        let n = UserDefaults.standard.integer(
+            forKey: AppSettingsKey.activeExpertsPerToken)
+        return n > 0 ? n : nil
+    }
+
     static var lastModelDir: String? {
         UserDefaults.standard.string(forKey: AppSettingsKey.lastModelDir)
     }

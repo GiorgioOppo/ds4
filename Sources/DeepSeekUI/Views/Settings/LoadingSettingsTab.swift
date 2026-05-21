@@ -23,6 +23,10 @@ struct LoadingSettingsTab: View {
     private var kvCacheCompression: String = "f32"
     @AppStorage(AppSettingsKey.precomputedToolPrefix)
     private var precomputedToolPrefix: Bool = true
+    @AppStorage(AppSettingsKey.overrideActiveExperts)
+    private var overrideActiveExperts: Bool = false
+    @AppStorage(AppSettingsKey.activeExpertsPerToken)
+    private var activeExpertsPerToken: Int = 8
 
     var body: some View {
         Form {
@@ -63,6 +67,28 @@ struct LoadingSettingsTab: View {
                      "degeneri (loop di `<|begin_of_sentence|>`). " +
                      "Attiva solo se vuoi aiutare a fare bisect. " +
                      "Override env: `DEEPSEEK_LAZY_EXPERT=1` forza ON.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Override active experts per token",
+                        isOn: $overrideActiveExperts)
+                    .onChange(of: overrideActiveExperts) { _, _ in
+                        ModelConfig.activeExpertsOverride =
+                            AppSettings.activeExpertsOverride
+                    }
+                if overrideActiveExperts {
+                    Stepper("Experts per token: \(activeExpertsPerToken)",
+                             value: $activeExpertsPerToken, in: 1...16)
+                        .onChange(of: activeExpertsPerToken) { _, _ in
+                            ModelConfig.activeExpertsOverride =
+                                AppSettings.activeExpertsOverride
+                        }
+                }
+                Text("Quanti expert il gate attiva per token sui layer " +
+                     "a routing appreso (i primi n_hash_layers restano " +
+                     "al K addestrato). Default 8, tetto del kernel 16. " +
+                     "Si applica al prossimo caricamento del modello. " +
+                     "`DEEPSEEK_TOPK_EXPERTS=N` ha la precedenza.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
