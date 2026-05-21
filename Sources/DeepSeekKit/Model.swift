@@ -123,7 +123,7 @@ public final class ParallelHead {
 
         // 3. y[N, D] = Σ_h pre[N, h] * x[N, h, D]
         let y = Tensor.empty(shape: [N, D], dtype: .f32)
-        let cmd2 = Device.shared.queue.makeCommandBuffer()!
+        let cmd2 = Device.shared.makeCommandBuffer()
         do {
             let enc = cmd2.makeComputeCommandEncoder()!
             enc.setComputePipelineState(Self.pCollapse)
@@ -219,7 +219,7 @@ public final class Transformer {
         MemoryLogger.snapshot("forward:start", force: true)
 
         let flatIds: [Int32] = inputIds.flatMap { $0.map(Int32.init) }
-        let cmd = Device.shared.queue.makeCommandBuffer()!
+        let cmd = Device.shared.makeCommandBuffer()
 
         // 1. embed → [B*S, dim]
         let h = embed.lookup(flatIds, in: cmd)
@@ -302,7 +302,7 @@ public final class Transformer {
                 ? (DispatchTime.now().uptimeNanoseconds &- ioT0)
                 : 0
             if perfTrace { perfIoNs &+= ioNs }
-            var cmdL = Device.shared.queue.makeCommandBuffer()!
+            var cmdL = Device.shared.makeCommandBuffer()
             x = layer(x, startPos: startPos, inputIds: flatIds, in: &cmdL)
             cmdL.commit(); cmdL.waitUntilCompleted()
             var gpuNs: UInt64 = 0
@@ -357,7 +357,7 @@ public final class Transformer {
         // (collapse + norm + slice + lm_head) on a fresh cmd2 that
         // it also commits before returning. Caller must NOT commit
         // cmdH again — double-commit traps inside Metal.
-        let cmdH = Device.shared.queue.makeCommandBuffer()!
+        let cmdH = Device.shared.makeCommandBuffer()
         let logits = head(x, hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase,
                           norm: norm, in: cmdH)
         MemoryLogger.snapshot("forward:complete", force: true)

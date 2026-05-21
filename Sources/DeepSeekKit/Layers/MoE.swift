@@ -106,7 +106,7 @@ public final class Gate {
             // back to the caller so its later `cmd.commit()` doesn't
             // try to commit an already-committed buffer.
             cmd.commit(); cmd.waitUntilCompleted()
-            let scoreCmd = Device.shared.queue.makeCommandBuffer()!
+            let scoreCmd = Device.shared.makeCommandBuffer()
             let logits = weight(x, in: scoreCmd)
             scoreCmd.commit(); scoreCmd.waitUntilCompleted()
             let logitsPtr = logits.buffer.contents()
@@ -148,7 +148,7 @@ public final class Gate {
             // Replace the caller's already-committed cmd so its
             // upcoming `cmd.commit()` (the MoEFFN drain at gate +1)
             // runs against a fresh buffer.
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
             return (weights, indices)
         }
 
@@ -309,7 +309,7 @@ public final class MoEFFN {
 
         // Swap in a fresh command buffer for the rest of the work; the
         // committed one above can no longer accept encoders.
-        cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd = Device.shared.makeCommandBuffer()
 
         // 2. Gather tokens per expert.
         let gathered = MoEDispatch.gather(xFlat, plan: plan, in: cmd)
@@ -338,7 +338,7 @@ public final class MoEFFN {
             if perExpertTrace {
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[\(layerId)] expert[\(e)] in  (count=\(count))", slice)
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
             }
             // Layer-6 byte-level dump of expert 56 and expert 66's w1 weight + scale.
             // Compare against the on-disk content from the safetensors python dump
@@ -377,7 +377,7 @@ public final class MoEFFN {
                     try? inData.write(to: url)
                     FileHandle.standardError.write(Data("moe[6] expert[\(e)] dumped input to \(url.path)\n".utf8))
                 }
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
 
                 let g = expert.w1(slice, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
@@ -387,7 +387,7 @@ public final class MoEFFN {
                     try? Data(bytes: gPtr, count: g.count * MemoryLayout<Float>.size)
                         .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_g.bin"))
                 }
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
 
                 let u = expert.w3(slice, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
@@ -397,17 +397,17 @@ public final class MoEFFN {
                     try? Data(bytes: uPtr, count: u.count * MemoryLayout<Float>.size)
                         .write(to: URL(fileURLWithPath: "/tmp/moe6_e\(e)_u.bin"))
                 }
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
 
                 let h = Elementwise.siluMul(g, u, swigluLimit: expert.swigluLimit, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[6] expert[\(e)] siluMul(g,u)", h)
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
 
                 let y = expert.w2(h, in: cmd)
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[6] expert[\(e)] w2(h)", y)
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
                 outSlice = y
             } else {
                 outSlice = expert(slice, in: cmd)
@@ -415,7 +415,7 @@ public final class MoEFFN {
             if perExpertTrace {
                 cmd.commit(); cmd.waitUntilCompleted()
                 traceTensorStats("moe[\(layerId)] expert[\(e)] out (count=\(count))", outSlice)
-                cmd = Device.shared.queue.makeCommandBuffer()!
+                cmd = Device.shared.makeCommandBuffer()
             }
             // Copy into outs.
             let blit2 = cmd.makeBlitCommandEncoder()!
@@ -436,7 +436,7 @@ public final class MoEFFN {
         if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] routed-only (post-scatter)", y)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
 
         // 5. Add shared expert output. Leave cmd uncommitted; the caller
@@ -446,7 +446,7 @@ public final class MoEFFN {
         if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] shared-only", sharedOut)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
 
         Elementwise.addInPlace(y, sharedOut, in: cmd)
@@ -454,7 +454,7 @@ public final class MoEFFN {
         if TraceFlags.normTrace && (layerId >= 2 && layerId <= 7) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("moe[\(layerId)] final (routed+shared)", y)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
 
         return y.reshape(shape)

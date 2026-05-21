@@ -65,7 +65,7 @@ public final class Block {
             guard TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) else { return }
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("block[\(layerId)] \(name)", t)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
 
         // ---- Attention sublayer ----

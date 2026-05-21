@@ -168,6 +168,7 @@ public final class Linear {
                               useSG: Bool = false,
                               in cmd: MTLCommandBuffer) {
         let enc = cmd.makeComputeCommandEncoder()!
+        enc.label = "gemm.dense\(useSG ? ".sg" : ".scalar") M=\(M) N=\(outFeatures) K=\(inFeatures)"
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(x.buffer, offset: x.offset, index: 0)
         enc.setBuffer(weight.buffer, offset: weight.offset, index: 1)
@@ -230,6 +231,7 @@ public final class Linear {
         }
 
         let enc = cmd.makeComputeCommandEncoder()!
+        enc.label = "gemm.fp8.\(useGEMV ? "gemv" : (useSG ? "sg" : "SCALAR")) M=\(M) N=\(N) K=\(K)"
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(qbytes.buffer, offset: 0, index: 0)
         enc.setBuffer(act.scales.buffer, offset: 0, index: 1)
@@ -269,6 +271,7 @@ public final class Linear {
         guard let qbytes = act.qbytes else { fatalError("ActQuant did not produce qbytes") }
 
         let enc = cmd.makeComputeCommandEncoder()!
+        enc.label = "gemm.fp4 M=\(M) N=\(outFeatures) K=\(inFeatures)"
         enc.setComputePipelineState(Self.pFP4)
         enc.setBuffer(qbytes.buffer, offset: 0, index: 0)
         enc.setBuffer(act.scales.buffer, offset: 0, index: 1)

@@ -115,4 +115,87 @@ public final class Device {
         defer { pipelineCacheLock.unlock() }
         return pipelineCache.count
     }
+
+    // MARK: - Command buffers + watchdog diagnostics
+
+    /// Diagnostic switch. `true` unless `DEEPSEEK_GPU_DEBUG=0` is set in
+    /// the environment. When on, every command buffer made through
+    /// `makeCommandBuffer` records per-encoder execution status, so a GPU
+    /// watchdog abort (`...ImpactingInteractivity`) can be pinned to the
+    /// exact kernel. It costs some GPU overhead — set the env var to `0`
+    /// (or revert this diagnostic commit) once the offending kernel is
+    /// identified.
+    public static let gpuDebug: Bool = {
+        if let v = ProcessInfo.processInfo.environment["DEEPSEEK_GPU_DEBUG"] {
+            return v != "0" && v.lowercased() != "false"
+        }
+        return true
+    }()
+
+    /// Create a command buffer on the shared queue. The buffer is labelled
+    /// with its call site (`file:line`, plus an optional `context`) and
+    /// carries a completion handler that prints a diagnostic if the GPU
+    /// aborts it — most importantly the macOS watchdog error
+    /// `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, which the
+    /// forward path otherwise swallows in silence (no `.error` check
+    /// anywhere in `Model.forward`).
+    ///
+    /// With `gpuDebug` on the buffer also records per-encoder execution
+    /// status, so the diagnostic names the exact encoder that faulted —
+    /// label the encoders (see `Linear.dispatchGEMM` / `fp8Forward`) for
+    /// kernel-level detail including the M/N/K dims.
+    public func makeCommandBuffer(_ context: String = "",
+                                   file: String = #fileID,
+                                   line: Int = #line) -> MTLCommandBuffer {
+        let cb: MTLCommandBuffer
+        if Self.gpuDebug {
+            let desc = MTLCommandBufferDescriptor()
+            desc.errorOptions = .encoderExecutionStatus
+            guard let b = queue.makeCommandBuffer(descriptor: desc) else {
+                fatalError("makeCommandBuffer(descriptor:) returned nil")
+            }
+            cb = b
+        } else {
+            guard let b = queue.makeCommandBuffer() else {
+                fatalError("makeCommandBuffer() returned nil")
+            }
+            cb = b
+        }
+        cb.label = context.isEmpty ? "\(file):\(line)"
+                                   : "\(file):\(line) \(context)"
+        cb.addCompletedHandler { Device.reportIfAborted($0) }
+        return cb
+    }
+
+    /// Completion-handler hook: dumps a diagnostic to stderr when a
+    /// command buffer finishes in the `.error` state. Runs on a
+    /// Metal-internal thread; the whole message is built first and
+    /// written in a single `write` so lines from concurrent buffers
+    /// don't interleave.
+    private static func reportIfAborted(_ buf: MTLCommandBuffer) {
+        guard let err = buf.error as NSError? else { return }
+        var msg = "[gpu-watchdog] command buffer '\(buf.label ?? "?")' ABORTED\n"
+        msg += "[gpu-watchdog]   \(err.domain) code=\(err.code): "
+             + "\(err.localizedDescription)\n"
+        if let infos = err.userInfo[MTLCommandBufferEncoderInfoErrorKey]
+                        as? [MTLCommandBufferEncoderInfo] {
+            for (i, info) in infos.enumerated() {
+                let lbl = info.label.isEmpty ? "<unlabelled>" : info.label
+                msg += "[gpu-watchdog]   encoder[\(i)] state="
+                     + "\(Device.encoderState(info.errorState)): \(lbl)\n"
+            }
+        }
+        FileHandle.standardError.write(Data(msg.utf8))
+    }
+
+    private static func encoderState(_ s: MTLCommandEncoderErrorState) -> String {
+        switch s {
+        case .unknown:    return "unknown"
+        case .completed:  return "completed"
+        case .affected:   return "affected"
+        case .pending:    return "pending"
+        case .faulted:    return "FAULTED"
+        @unknown default: return "?"
+        }
+    }
 }

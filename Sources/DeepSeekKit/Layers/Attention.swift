@@ -211,7 +211,7 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after wqA+qNorm", qrFlat)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         let qr = qrFlat.reshape([B, S, qLoraRank])
 
@@ -220,7 +220,7 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after wqB", q)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         q = q.reshape([B * S, nHeads, headDim])
 
@@ -276,7 +276,7 @@ public final class MLA {
         // silent numerical corruption. Every commit-and-renew site in
         // this codebase (MoEFFN, Model.forward, the trace-gated splits
         // below) drains before renewing for exactly this reason.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
@@ -284,7 +284,7 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after wkv+kvNorm", kvFlat)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         // RoPE on rope tail (interpret as [B*S, 1, head_dim]).
         rope.apply(kvFlat.reshape([B * S, 1, headDim]),
@@ -304,12 +304,12 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] kv after fp8-QAT", kvFlat)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         let kv = kvFlat.reshape([B, S, headDim])
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- Topk indices ----------
         // All built directly on GPU into a single [B, S, kWin+kComp] i32
@@ -366,7 +366,7 @@ public final class MLA {
         }
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- KV cache write ----------
         let bytesPerRow = headDim * MemoryLayout<Float>.size
@@ -463,7 +463,7 @@ public final class MLA {
         // single kernel in an MLA layer (large QK matmul + softmax +
         // KV gather), so isolating it from the preceding KV-write
         // blits gives the watchdog the most headroom.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- Sparse attention ----------
         let qPerToken = q.reshape([B, S, nHeads, headDim])
@@ -472,11 +472,11 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after sparse_attn", o)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- Inverse RoPE ----------
         rope.apply(o.reshape([B * S, nHeads, headDim]),
@@ -484,7 +484,7 @@ public final class MLA {
 
         // Stage boundary before the final output projection (`wo_b`)
         // — see comment above the first cmd-split.
-        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.makeCommandBuffer()
 
         // ---------- Grouped output: einsum("bsgd,grd->bsgr"), then wo_b ----------
         let perGroupD = nHeads * headDim / nGroups
@@ -501,14 +501,14 @@ public final class MLA {
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after einsum wo_a", oR)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         let oFlat = oR.reshape([B * S, nGroups * oLoraRank])
         let result = woB(oFlat, in: cmd).reshape([B, S, dim])
         if TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) {
             cmd.commit(); cmd.waitUntilCompleted()
             traceTensorStats("mla[\(layerId)] after wo_b", result)
-            cmd = Device.shared.queue.makeCommandBuffer()!
+            cmd = Device.shared.makeCommandBuffer()
         }
         return result
     }
