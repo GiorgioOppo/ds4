@@ -389,14 +389,10 @@ struct ChatView: View {
         // `ThroughputBar` surfaces them once the streaming buffer
         // starts filling.
         switch phase {
-        case .prefilling(let promptTokens, _):
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
-                Text("Prefilling \(promptTokens) tokens…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.leading, 40)
+        case .prefilling:
+            // The dedicated PrefillTokenStreamView is the prefill
+            // indicator now — this row would duplicate its counter.
+            EmptyView()
         case .streaming(_, _, let status, _) where !status.isEmpty:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
@@ -487,6 +483,16 @@ struct ChatView: View {
                    shouldShowInlineProgress(for: last, in: c, phase: phase)
                 {
                     inlineProgress(phase)
+                }
+                // Dedicated prefill-token indicator: streams the
+                // prompt's real BPE tokens, one chip per token id,
+                // while the prefill forward runs.
+                if let last = messages.last,
+                   isPrefillingPlaceholder(last, in: c, phase: phase),
+                   let controller = store.streamingControllers[c.id]
+                {
+                    PrefillTokenStreamView(controller: controller)
+                        .padding(.leading, 40)
                 }
                 // Prefill trace: stamped on the FIRST round of the
                 // first cold turn (later roundtrips reuse the warm

@@ -972,6 +972,7 @@ final class ChatStore: ObservableObject {
             // streaming. The trace is stamped back onto
             // `messages[mIdx].prefillTrace` at `.done`.
             streamingControllers[id]?.clearPrefillTrace()
+            streamingControllers[id]?.beginPrefillTokens(total: promptTokens)
 
         case .prefillToken(let text):
             // PR 4: append to the controller's prefill trace
@@ -980,6 +981,11 @@ final class ChatStore: ObservableObject {
             // the on-disk persisted copy lands at `.done`.
             streamingControllers[id]?.appendPrefillTrace(text)
             scheduleSave(id)
+
+        case .prefillTokenProcessed(let text):
+            // Dedicated prefill-token indicator (separate from the
+            // gray trace block). Transient controller state, no save.
+            streamingControllers[id]?.appendPrefillTokenStep(text)
 
         case .prefillDone(let promptTokens, let elapsed, let tokPerMin):
             var m = currentMetrics(of: id)

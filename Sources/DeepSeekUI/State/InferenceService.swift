@@ -33,6 +33,13 @@ enum GenerationEvent: Sendable {
     /// transformer ingests (token boundaries collapsed back into
     /// readable text).
     case prefillToken(text: String)
+    /// One real BPE token of the prompt, decoded as the dedicated
+    /// prefill-token indicator walks the delta. Unlike `prefillToken`
+    /// (24-char chunks feeding the gray trace block) this fires once
+    /// per token id, paced, so the indicator can animate token by
+    /// token. `text` is empty when an id only carries a partial
+    /// multi-byte char the next id completes.
+    case prefillTokenProcessed(text: String)
     /// Emitted right before the prefill forward pass starts. The UI uses
     /// it to swap the bubble into a "prefilling" indicator (no text
     /// streamed yet because no tokens have been sampled).
@@ -1574,6 +1581,46 @@ final class InferenceService: @unchecked Sendable {
                             if perChunkDelay > 0 {
                                 Thread.sleep(forTimeInterval: perChunkDelay)
                             }
+                        }
+                    }
+                }
+
+                // Dedicated prefill-token indicator: walk the delta
+                // one real BPE token at a time and stream each to the
+                // UI. Decoding a single id in isolation corrupts a
+                // multi-byte UTF-8 char split across a token boundary,
+                // so we re-decode the running prefix and emit only the
+                // newly-stable scalars — the same guard the decode
+                // loop uses. One event per token id (text is empty
+                // when an id only carries a partial char) so the
+                // indicator counts ids 1:1. Synthetic pacing, capped
+                // ~0.6 s total; the real prefill forward is unaffected.
+                do {
+                    let total = deltaTokens.count
+                    let perToken = total > 0
+                        ? min(0.015, 0.6 / Double(total)) : 0
+                    var emitted = 0
+                    var idx = 0
+                    while idx < total {
+                        if self.isCancelled(for: conversationID) { break }
+                        let prefix = deltaTokens[0...idx].map(Int.init)
+                        let scalars = Array(tok.decode(prefix).unicodeScalars)
+                        var stable = scalars.count
+                        while stable > emitted
+                              && scalars[stable - 1].value == 0xFFFD {
+                            stable -= 1
+                        }
+                        var piece = ""
+                        if stable > emitted {
+                            for s in emitted..<stable {
+                                piece.unicodeScalars.append(scalars[s])
+                            }
+                            emitted = stable
+                        }
+                        continuation.yield(.prefillTokenProcessed(text: piece))
+                        idx += 1
+                        if perToken > 0 {
+                            Thread.sleep(forTimeInterval: perToken)
                         }
                     }
                 }

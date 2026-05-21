@@ -60,6 +60,29 @@ final class StreamingRoundController: ObservableObject {
         round.prefillTrace = nil
     }
 
+    // MARK: - Prefill-token indicator
+
+    /// Real BPE tokens of the current prefill delta, pushed one at a
+    /// time by `.prefillTokenProcessed`. Drives the dedicated
+    /// prefill-token indicator. Transient — kept off `round`, so it is
+    /// never persisted; reset at every `.prefillStart`.
+    @Published var prefillTokenSteps: [String] = []
+    /// Token count of the current prefill delta, from `.prefillStart`;
+    /// the indicator shows `prefillTokenSteps.count` out of this.
+    @Published var prefillTokenTotal: Int = 0
+
+    /// Reset the prefill-token indicator state for a new prefill.
+    func beginPrefillTokens(total: Int) {
+        prefillTokenSteps.removeAll(keepingCapacity: true)
+        prefillTokenTotal = total
+    }
+
+    /// Append one decoded prefill token. Single `@Published` mutation
+    /// → only the prefill indicator re-renders.
+    func appendPrefillTokenStep(_ piece: String) {
+        prefillTokenSteps.append(piece)
+    }
+
     /// Live reasoning buffer for the round. Mutated by the remote
     /// path's `reasoning_content` delta events (local generation
     /// surfaces reasoning only at `.done`).
