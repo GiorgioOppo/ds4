@@ -264,13 +264,19 @@ public final class MLA {
         // projection) stays under macOS's interactive-priority GPU
         // watchdog threshold (~250 ms per cmd buffer; longer triggers
         // `kIOGPUCommandBufferCallbackErrorImpactingInteractivity` and
-        // aborts the cmd buffer mid-execution). No `waitUntilCompleted`
-        // — the GPU executes the chunks in order, the host doesn't
-        // block here. Internal commit-and-WAIT for the few stages
-        // that need host-side intermediates stays gated on
-        // `TraceFlags.normTrace`; in production this stage-split is
-        // the only thing that fires.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        // aborts the cmd buffer mid-execution).
+        //
+        // The `waitUntilCompleted()` is mandatory, not optional. Metal's
+        // automatic hazard tracking only orders dependent work *within*
+        // a single command buffer; across two separate command buffers
+        // it does not insert the dependency, and the later stages here
+        // consume buffers the earlier stages wrote (e.g. sparse-attn
+        // reads `q`/`kvCache`). Committing without draining lets the
+        // next stage's kernels race the previous stage's writes →
+        // silent numerical corruption. Every commit-and-renew site in
+        // this codebase (MoEFFN, Model.forward, the trace-gated splits
+        // below) drains before renewing for exactly this reason.
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- KV path ----------
         // kv = kv_norm(wkv(x))  → [B, S, head_dim]
@@ -303,7 +309,7 @@ public final class MLA {
         let kv = kvFlat.reshape([B, S, headDim])
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Topk indices ----------
         // All built directly on GPU into a single [B, S, kWin+kComp] i32
@@ -360,7 +366,7 @@ public final class MLA {
         }
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- KV cache write ----------
         let bytesPerRow = headDim * MemoryLayout<Float>.size
@@ -457,7 +463,7 @@ public final class MLA {
         // single kernel in an MLA layer (large QK matmul + softmax +
         // KV gather), so isolating it from the preceding KV-write
         // blits gives the watchdog the most headroom.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Sparse attention ----------
         let qPerToken = q.reshape([B, S, nHeads, headDim])
@@ -470,7 +476,7 @@ public final class MLA {
         }
 
         // Stage boundary — see comment above the first cmd-split.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Inverse RoPE ----------
         rope.apply(o.reshape([B * S, nHeads, headDim]),
@@ -478,7 +484,7 @@ public final class MLA {
 
         // Stage boundary before the final output projection (`wo_b`)
         // — see comment above the first cmd-split.
-        cmd.commit(); cmd = Device.shared.queue.makeCommandBuffer()!
+        cmd.commit(); cmd.waitUntilCompleted(); cmd = Device.shared.queue.makeCommandBuffer()!
 
         // ---------- Grouped output: einsum("bsgd,grd->bsgr"), then wo_b ----------
         let perGroupD = nHeads * headDim / nGroups
