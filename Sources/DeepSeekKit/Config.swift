@@ -462,6 +462,36 @@ public struct ModelConfig: Codable, Sendable {
                 + notes.joined(separator: "\n  ") + "\n").utf8))
         }
 
+        // Sliding-window size — how many of the most recent tokens are
+        // kept raw / uncompressed. Multiplied by `DEEPSEEK_WINDOW_MULT`
+        // (default 16, so the raw window is 16× the checkpoint's value)
+        // on explicit request, to keep more recent context exact.
+        //
+        // WARNING: out-of-distribution. The DSA sliding-window
+        // attention was trained with the checkpoint's window
+        // (typically 128); a wider window changes the softmax
+        // distribution the trained weights see and usually degrades
+        // output. It also enlarges every layer's KV cache and the
+        // sparse-attention cost (SparseAttention tiles down to
+        // compensate for the watchdog). `DEEPSEEK_WINDOW_MULT=1`
+        // restores the trained value. Applied before the maxSeqLen
+        // auto-grow below so the wider window is counted in the budget.
+        let windowMult: Int = {
+            if let raw = ProcessInfo.processInfo
+                .environment["DEEPSEEK_WINDOW_MULT"],
+               let n = Int(raw), n > 0 { return n }
+            return 16
+        }()
+        if windowMult > 1 {
+            let oldWin = c.windowSize
+            c.windowSize = oldWin * windowMult
+            FileHandle.standardError.write(Data(
+                ("[config] windowSize ×\(windowMult): \(oldWin) → "
+                 + "\(c.windowSize) — raw window widened "
+                 + "(out-of-distribution; DEEPSEEK_WINDOW_MULT=1 to "
+                 + "restore the trained value)\n").utf8))
+        }
+
         // maxSeqLen resolution — it sizes the RoPE table and every
         // per-layer KV cache; per-layer compression keeps the cache
         // sub-linear (ratio-R layers grow at N/R, ratio-0 layers stay

@@ -57,9 +57,16 @@ public enum SparseAttention {
         var s = scale
         let tg = MTLSize(width: min(H, 32), height: 1, depth: 1)
 
+        // Per-thread cost is ∝ K (the topk width = window + compressed).
+        // `tileM` was calibrated for K≈640 (the default 128 window);
+        // when a wider sliding window inflates K, shrink the row tile
+        // ∝ 640/K so per-tile GPU work — and the command buffer — stays
+        // under the interactivity watchdog. Never grow it past `tileM`.
+        let rowsPerTile = max(1, min(tileM, tileM * 640 / max(K, 1)))
+
         var m0 = 0
         while m0 < M {
-            let rows = min(tileM, M - m0)
+            let rows = min(rowsPerTile, M - m0)
             let enc = cmd.makeComputeCommandEncoder()!
             enc.label = "sparse_attn m=[\(m0)..\(m0 + rows)) of \(M) H=\(H) K=\(K)"
             enc.setComputePipelineState(pipeline)
