@@ -244,6 +244,17 @@ public enum EncodingDSV4 {
             work.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
         }
 
+        // Diagnostic: `invoke name=` is pure ASCII, so it survives even
+        // if the ｜DSML｜ marker bytes were mangled upstream (e.g. by
+        // per-token detokenisation). If it is present yet nothing
+        // parsed, the format/corruption is real — dump the raw
+        // completion so the exact mismatch is visible.
+        if toolCalls.isEmpty && text.contains("invoke name=") {
+            FileHandle.standardError.write(Data(
+                ("[toolparse] 'invoke name=' present but parsed 0 tool "
+                 + "calls — raw completion follows:\n\(text)\n").utf8))
+        }
+
         return Message(role: .assistant,
                        content: work.trimmingCharacters(in: .whitespacesAndNewlines),
                        reasoningContent: reasoning,

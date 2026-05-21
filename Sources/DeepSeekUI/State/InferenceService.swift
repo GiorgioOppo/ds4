@@ -970,7 +970,6 @@ final class InferenceService: @unchecked Sendable {
                 //    every 500 ms so the UI ticker updates without
                 //    flooding the actor mailbox.
                 var generated: [Int] = []
-                var generatedText = ""
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 for step in 0..<maxTokens {
@@ -982,8 +981,12 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
+                    // Stream the per-token piece for live display only.
+                    // The completion is re-decoded from the full id list
+                    // at finalize time — `decode([a]) + decode([b])`
+                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
+                    // the ｜DSML｜ tool-call markers) split across tokens.
                     let piece = tok.decode([nextId])
-                    generatedText += piece
                     continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
@@ -1017,7 +1020,7 @@ final class InferenceService: @unchecked Sendable {
                 // 4. Finalize: re-parse through EncodingDSV4 so any
                 //    `<think>` block is split off into reasoningContent
                 //    and tool_calls into structured ToolCall objects.
-                let final = EncodingDSV4.parseCompletion(generatedText,
+                let final = EncodingDSV4.parseCompletion(tok.decode(generated),
                                                            mode: mode)
                 let promptOut = promptIds.map(Int32.init)
                 let generatedOut = generated.map(Int32.init)
@@ -1080,7 +1083,6 @@ final class InferenceService: @unchecked Sendable {
                 let stops = tok.stopTokenIds
 
                 var generated: [Int] = []
-                var generatedText = ""
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 for step in 0..<maxTokens {
@@ -1092,8 +1094,12 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
+                    // Stream the per-token piece for live display only.
+                    // The completion is re-decoded from the full id list
+                    // at finalize time — `decode([a]) + decode([b])`
+                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
+                    // the ｜DSML｜ tool-call markers) split across tokens.
                     let piece = tok.decode([nextId])
-                    generatedText += piece
                     continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
@@ -1124,7 +1130,7 @@ final class InferenceService: @unchecked Sendable {
                     elapsed: elapsed,
                     tokPerMin: genTPM))
 
-                let final = EncodingDSV4.parseCompletion(generatedText,
+                let final = EncodingDSV4.parseCompletion(tok.decode(generated),
                                                            mode: mode)
                 let generatedOut = generated.map(Int32.init)
                 continuation.yield(.done(final: final,
@@ -1407,7 +1413,6 @@ final class InferenceService: @unchecked Sendable {
                 let stops = tok.stopTokenIds
 
                 var generated: [Int] = []
-                var generatedText = ""
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 // The decode loop continues from where prefill stopped.
@@ -1424,8 +1429,12 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
+                    // Stream the per-token piece for live display only.
+                    // The completion is re-decoded from the full id list
+                    // at finalize time — `decode([a]) + decode([b])`
+                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
+                    // the ｜DSML｜ tool-call markers) split across tokens.
                     let piece = tok.decode([nextId])
-                    generatedText += piece
                     continuation.yield(.token(text: piece, id: Int32(nextId)))
 
                     let now = Date()
@@ -1475,7 +1484,7 @@ final class InferenceService: @unchecked Sendable {
                     elapsed: elapsed,
                     tokPerMin: genTPM))
 
-                let final = EncodingDSV4.parseCompletion(generatedText,
+                let final = EncodingDSV4.parseCompletion(tok.decode(generated),
                                                            mode: mode)
                 let generatedOut = generated.map(Int32.init)
 
