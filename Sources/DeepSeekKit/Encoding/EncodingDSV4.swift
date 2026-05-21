@@ -43,6 +43,15 @@ public enum EncodingDSV4 {
     /// can't collide with a real MCP server called "delegate".
     public static let delegateToolName = "__delegate_to_agent"
 
+    /// Synthetic host tools for progressive tool discovery. Instead of
+    /// dumping every tool schema into the system message, only these
+    /// two are advertised: `__list_tools` returns the catalogue
+    /// (name + description), `__search_tool` returns a tool's full
+    /// parameter schema on demand. Same `__`-prefixed namespace as
+    /// `delegateToolName`, served host-side — never routed to MCP.
+    public static let listToolsName = "__list_tools"
+    public static let searchToolName = "__search_tool"
+
     /// Reasoning instruction prepended to the system message in `.max` mode.
     /// Mirrors REASONING_EFFORT_MAX (encoding_dsv4.py:64-67).
     public static let reasoningEffortMax: String = """

@@ -1229,6 +1229,16 @@ final class ChatStore: ObservableObject {
     private func executeToolCall(_ call: ToolCall,
                                   conversationID: UUID,
                                   hostAgentID: UUID?) async -> String {
+        // Synthetic tool-discovery meta-tools — served host-side, never
+        // routed to MCP. Intercepted before every other branch since
+        // their `__`-prefixed names would otherwise fall through to
+        // `mcpPool.invokeQualified` and fail.
+        if call.name == EncodingDSV4.listToolsName {
+            return listToolsResponse()
+        }
+        if call.name == EncodingDSV4.searchToolName {
+            return searchToolResponse(argsJSON: call.args)
+        }
         if call.name == EncodingDSV4.delegateToolName {
             return await executeSubAgentDelegation(
                 argsJSON: call.args,
@@ -1435,11 +1445,126 @@ final class ChatStore: ObservableObject {
         }
 
         if schemas.isEmpty { return nil }
+        // Progressive tool discovery: when enabled, advertise only the
+        // two synthetic meta-tools instead of every schema. The model
+        // calls __list_tools / __search_tool to discover the rest;
+        // `executeToolCall` serves those host-side. This keeps the
+        // system message small — the full tool block is the dominant
+        // prompt bloat and the first thing the KV-cache compression
+        // degrades.
+        let outSchemas: [[String: Any]] = Self.toolDiscoveryEnabled
+            ? [Self.listToolsSchema, Self.searchToolSchema]
+            : schemas
         guard let data = try? JSONSerialization.data(
-            withJSONObject: schemas,
+            withJSONObject: outSchemas,
             options: [.prettyPrinted, .sortedKeys])
         else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: - Progressive tool discovery
+
+    /// `true` by default; `DEEPSEEK_TOOL_DISCOVERY=0` disables it,
+    /// restoring the old behaviour of injecting every tool schema.
+    static let toolDiscoveryEnabled: Bool = {
+        if let v = ProcessInfo.processInfo
+            .environment["DEEPSEEK_TOOL_DISCOVERY"] {
+            return v != "0" && v.lowercased() != "false"
+        }
+        return true
+    }()
+
+    /// Schema for the `__list_tools` meta-tool (no arguments).
+    private static let listToolsSchema: [String: Any] = [
+        "name": EncodingDSV4.listToolsName,
+        "description": "List every tool available in this session — "
+            + "returns each tool's name and a short description. Call "
+            + "this first to discover what you can do, then call "
+            + "\(EncodingDSV4.searchToolName) to get a tool's exact "
+            + "parameter schema before invoking it.",
+        "inputSchema": ["type": "object"]
+    ]
+
+    /// Schema for the `__search_tool` meta-tool (one `query` argument).
+    private static let searchToolSchema: [String: Any] = [
+        "name": EncodingDSV4.searchToolName,
+        "description": "Look up tools by name or keyword and return "
+            + "their full parameter schemas. Use this to learn the "
+            + "exact arguments a tool expects before invoking it.",
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "query": [
+                    "type": "string",
+                    "description": "A tool name or keyword to search for."
+                ]
+            ],
+            "required": ["query"]
+        ]
+    ]
+
+    /// `__list_tools` handler — the catalogue (name + description) of
+    /// every native and MCP tool, as a JSON array.
+    private func listToolsResponse() -> String {
+        var entries: [[String: String]] = []
+        for s in nativeTools.schemas {
+            entries.append(["name": "native__\(s.name)",
+                            "description": s.description])
+        }
+        for t in mcpPool.allTools() {
+            entries.append(["name": t.qualifiedName,
+                            "description": t.description])
+        }
+        guard !entries.isEmpty,
+              let data = try? JSONSerialization.data(
+                withJSONObject: entries,
+                options: [.prettyPrinted, .sortedKeys]),
+              let json = String(data: data, encoding: .utf8)
+        else { return "[no tools available]" }
+        return "Available tools — call \(EncodingDSV4.searchToolName) "
+            + "with a name (or keyword) from this list to get its "
+            + "parameter schema before invoking it:\n\(json)"
+    }
+
+    /// `__search_tool` handler — full schemas (incl. inputSchema) of
+    /// the native/MCP tools whose name or description matches `query`.
+    private func searchToolResponse(argsJSON: String) -> String {
+        var query = ""
+        if let data = argsJSON.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data)
+                        as? [String: Any] {
+            query = (obj["query"] as? String) ?? ""
+        }
+        let q = query.lowercased()
+
+        var all: [[String: Any]] = []
+        for s in nativeTools.schemas {
+            all.append(["name": "native__\(s.name)",
+                        "description": s.description,
+                        "inputSchema": s.inputSchema.foundationValue])
+        }
+        for t in mcpPool.allTools() {
+            all.append(["name": t.qualifiedName,
+                        "description": t.description,
+                        "inputSchema": t.inputSchema])
+        }
+        let matches = q.isEmpty ? all : all.filter { schema in
+            let name = (schema["name"] as? String ?? "").lowercased()
+            let desc = (schema["description"] as? String ?? "").lowercased()
+            return name.contains(q) || desc.contains(q)
+        }
+        if matches.isEmpty {
+            return "[\(EncodingDSV4.searchToolName)] no tool matches "
+                + "\"\(query)\". Call \(EncodingDSV4.listToolsName) to "
+                + "see every available tool."
+        }
+        let capped = Array(matches.prefix(10))
+        guard let data = try? JSONSerialization.data(
+                withJSONObject: capped,
+                options: [.prettyPrinted, .sortedKeys]),
+              let json = String(data: data, encoding: .utf8)
+        else { return "[\(EncodingDSV4.searchToolName) failed to serialise]" }
+        return json
     }
 
     /// Host-level entry point: invoked from the chat's tool-call
