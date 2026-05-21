@@ -300,35 +300,31 @@ public final class WeightLoader {
         // flipping `StreamingPool.lazyExpertEnabled` from a debugger)
         // takes effect on the next token without reloading the model.
         guard StreamingPool.lazyExpertEnabled else { return }
-        // Each expert has up to six tensors when the checkpoint is
-        // FP8-quantized (V3 / V4 default storage): w1/w2/w3 each have
-        // a `.weight` (quantized payload) AND a `.scale` (per-block
-        // dequant factors). Both are addressed by the same slot
-        // offsets recorded at index time, so they have to be preaded
-        // together — loading `.weight` alone leaves the kernel
-        // reading whatever the slot held from a previous layer's
-        // pread (most likely zero-init or another layer's experts),
-        // and the dispatch silently produces garbage activations.
-        // That's the smoking gun behind the BOS-loop bug seen in
-        // lazy-expert mode: the prefill's last-position logits
-        // collapse to the BOS row because every MoE block's output
-        // is random noise.
+        // Every quantized expert linear is a `.weight` payload PLUS a
+        // dequant scale that MUST be preaded with it: weight and scale
+        // share the slot, and a missing scale leaves the kernel
+        // dequantising from stale slot bytes → garbage activations →
+        // the degenerate-logits / BOS-loop bug.
         //
-        // `ensureTensors` silently skips names not present in the
-        // layer's shard (`StreamingPool.ensureTensors` doc, around
-        // the `loadTensorsSync` definition), so listing `.scale`
-        // unconditionally is safe for fp16/bf16 checkpoints where
-        // it doesn't exist.
+        // The scale's tensor name varies by checkpoint origin:
+        // post-converter it is `<base>.scale`, HF-native FP8/FP4
+        // releases name it `<base>.weight_scale_inv`. `loadLinear`
+        // (the full-shard path) tries both, so this path must too —
+        // listing only `.scale` silently skipped the scale on an
+        // HF-native FP4 checkpoint (the constructed name never
+        // matched `tensorIO`), which IS the lazy-expert
+        // degenerate-output regression. `ensureTensors` silently
+        // skips names absent from the shard, so listing every variant
+        // is safe — whichever exists is the one that loads.
         var names: [String] = []
-        names.reserveCapacity(indices.count * 6)
+        names.reserveCapacity(indices.count * 9)
         for e in indices {
             let prefix = "layers.\(K).ffn.experts.\(e)"
-            names.append("\(prefix).w1.weight")
-            names.append("\(prefix).w1.scale")
-            names.append("\(prefix).w2.weight")
-            names.append("\(prefix).w2.scale")
-            names.append("\(prefix).w3.weight")
-            names.append("\(prefix).w3.scale")
+            for w in ["w1", "w2", "w3"] {
+                names.append("\(prefix).\(w).weight")
+                names.append("\(prefix).\(w).scale")
+                names.append("\(prefix).\(w).weight_scale_inv")
+            }
         }
         do {
             try pool.ensureTensors(layer: K, names: names)
