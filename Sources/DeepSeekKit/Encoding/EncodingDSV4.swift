@@ -235,23 +235,39 @@ public enum EncodingDSV4 {
         }
 
         var toolCalls: [ToolCall] = []
-        let openTag = "<\(dsmlToken)tool_calls>"
-        let closeTag = "</\(dsmlToken)tool_calls>"
-        if let openRange = work.range(of: openTag),
-           let closeRange = work.range(of: closeTag, range: openRange.upperBound..<work.endIndex) {
-            let block = String(work[openRange.upperBound..<closeRange.lowerBound])
-            toolCalls = parseToolCalls(block)
-            work.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
+        // Tool-calls block. Anchor on `<｜DSML｜tool_c` — a prefix of
+        // `tool_calls` that survives the model truncating the keyword.
+        // The DSML keywords come out imprecise (observed: `tool_calls`
+        // → `tool_c`, `invoke` → `inv`); only the `<｜DSML｜` marker and
+        // the `name="…"` / `string="…"` attributes are reliable. The
+        // body runs to the matching close, or — if the model mangled
+        // or dropped the close — to the end of the text.
+        let openAnchor = "<\(dsmlToken)tool_c"
+        let closeAnchor = "</\(dsmlToken)tool_c"
+        if let openA = work.range(of: openAnchor),
+           let openTagEnd = work.range(of: ">",
+                                        range: openA.upperBound..<work.endIndex) {
+            let bodyStart = openTagEnd.upperBound
+            let closeA = work.range(of: closeAnchor,
+                                     range: bodyStart..<work.endIndex)
+            let bodyEnd = closeA?.lowerBound ?? work.endIndex
+            toolCalls = parseToolCalls(String(work[bodyStart..<bodyEnd]))
+            // Strip the whole block (including the close tag when
+            // present) from the content shown to the user.
+            var removeEnd = work.endIndex
+            if let closeA,
+               let ce = work.range(of: ">",
+                                    range: closeA.upperBound..<work.endIndex) {
+                removeEnd = ce.upperBound
+            }
+            work.removeSubrange(openA.lowerBound..<removeEnd)
         }
 
-        // Diagnostic: `invoke name=` is pure ASCII, so it survives even
-        // if the ｜DSML｜ marker bytes were mangled upstream (e.g. by
-        // per-token detokenisation). If it is present yet nothing
-        // parsed, the format/corruption is real — dump the raw
-        // completion so the exact mismatch is visible.
-        if toolCalls.isEmpty && text.contains("invoke name=") {
+        // Diagnostic: an invoke marker is present yet nothing parsed —
+        // dump the raw completion so the mismatch is visible.
+        if toolCalls.isEmpty && text.contains("<\(dsmlToken)inv") {
             FileHandle.standardError.write(Data(
-                ("[toolparse] 'invoke name=' present but parsed 0 tool "
+                ("[toolparse] invoke marker present but parsed 0 tool "
                  + "calls — raw completion follows:\n\(text)\n").utf8))
         }
 
@@ -261,43 +277,51 @@ public enum EncodingDSV4 {
                        toolCalls: toolCalls)
     }
 
-    /// Parse the `<｜DSML｜invoke …>` calls inside the body of a
-    /// tool_calls section. Each invoke produces one ToolCall whose
-    /// `args` is a JSON dict reconstructed from the inner parameters.
+    /// Parse the invoke calls inside the body of a tool_calls section.
+    /// Each produces one ToolCall whose `args` is a JSON dict rebuilt
+    /// from the inner `<｜DSML｜parameter …>` frames.
     ///
-    /// Anchored on the *opening* tags only. Local models reliably emit
-    /// `<｜DSML｜invoke name="…">` and the self-delimiting
-    /// `<｜DSML｜parameter …>…</｜DSML｜parameter>` frames, but are sloppy
-    /// with the `</｜DSML｜invoke>` close — observed output misspells it
-    /// (`</｜DSML｜inv>`), drops it, emits stray bare opens, or doubles
-    /// the close. Requiring an exact close tag therefore dropped
-    /// otherwise-valid calls entirely. Each call's parameter span runs
-    /// from its `name="…">` to the next invoke-open (or end of body);
-    /// `parseParameters` only picks up real parameter frames, so any
-    /// malformed close tags in between are ignored.
+    /// Anchored on `<｜DSML｜inv` — a prefix of both the correct
+    /// `invoke` open and the model's frequent truncation `inv`
+    /// (observed: `<｜DSML｜inv name="web">`, and in earlier output a
+    /// full `<｜DSML｜invoke name="…">`; the model is inconsistent).
+    /// Close tags start with `</` so the anchor skips them, and
+    /// `parameter` tags don't start with `inv`. Each call's parameter
+    /// span runs from its tag's `>` to the next invoke anchor (or end
+    /// of body) — no close tag is required, and `parseParameters` only
+    /// picks up real parameter frames, so stray / mangled / doubled
+    /// tags in between are ignored. A bare `<｜DSML｜inv>` carrying no
+    /// `name="…"` is skipped.
     private static func parseToolCalls(_ body: String) -> [ToolCall] {
         let dt = dsmlToken
         var calls: [ToolCall] = []
         var cursor = body.startIndex
-        let invokeOpenPrefix = "<\(dt)invoke name=\""
+        let invokeAnchor = "<\(dt)inv"
 
-        while let openStart = body.range(of: invokeOpenPrefix,
-                                          range: cursor..<body.endIndex) {
-            // Tool name: from after the prefix to the closing `">`.
-            guard let nameClose = body.range(of: "\">",
-                                              range: openStart.upperBound..<body.endIndex)
+        while let anchor = body.range(of: invokeAnchor,
+                                       range: cursor..<body.endIndex) {
+            // The open tag ends at the next `>`.
+            guard let tagEnd = body.range(of: ">",
+                                           range: anchor.upperBound..<body.endIndex)
             else { break }
-            let name = String(body[openStart.upperBound..<nameClose.lowerBound])
+            let tagInner = body[anchor.upperBound..<tagEnd.lowerBound]
 
-            // Parameter span: this call's `">` up to the next
-            // invoke-open, or the end of the body. No `</｜DSML｜invoke>`
-            // required — see the note above.
-            let spanStart = nameClose.upperBound
-            let spanEnd = body.range(of: invokeOpenPrefix,
+            // Parameter span: this tag's `>` to the next invoke anchor
+            // (or end of body).
+            let spanStart = tagEnd.upperBound
+            let spanEnd = body.range(of: invokeAnchor,
                                       range: spanStart..<body.endIndex)?.lowerBound
                           ?? body.endIndex
-            let args = parseParameters(String(body[spanStart..<spanEnd]))
-            calls.append(ToolCall(name: name, args: args))
+
+            // A real invoke carries `name="…"`; a bare `<｜DSML｜inv>`
+            // does not — skip those stray markers.
+            if let nameAttr = tagInner.range(of: "name=\""),
+               let nameEnd = tagInner.range(of: "\"",
+                                             range: nameAttr.upperBound..<tagInner.endIndex) {
+                let name = String(tagInner[nameAttr.upperBound..<nameEnd.lowerBound])
+                let args = parseParameters(String(body[spanStart..<spanEnd]))
+                calls.append(ToolCall(name: name, args: args))
+            }
             cursor = spanEnd
         }
         return calls
