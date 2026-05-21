@@ -290,11 +290,13 @@ public struct ModelConfig: Codable, Sendable {
             self.prunedExperts = []
         }
 
-        // Per-token active-expert count. Defaults to 8 on explicit
-        // request. This may differ from the checkpoint's trained value
-        // — fewer experts is cheaper (FFN dispatch cost scales
-        // ~linearly with the count), more is costlier; either way it
-        // is off-distribution, so this is an A/B knob.
+        // Per-token active-expert count. Defaults to 16 on explicit
+        // request — the gate kernel's 16-slot ceiling (see the clamp
+        // below). This is above the checkpoint's trained value, so it
+        // is off-distribution: the gate renormalises over more experts
+        // and the FFN dispatch cost scales ~linearly with the count —
+        // and under lazy-expert streaming so does the per-token expert
+        // weight I/O. This is an A/B knob.
         // `DEEPSEEK_TOPK_EXPERTS=N` overrides the default. Clamped to
         // the experts that actually exist and to the gate kernel's
         // 16-slot limit (moe.metal `bestV[16]`). Applies only to
@@ -306,7 +308,7 @@ public struct ModelConfig: Codable, Sendable {
             if let raw = ProcessInfo.processInfo
                 .environment["DEEPSEEK_TOPK_EXPERTS"],
                let n = Int(raw), n > 0 { return n }
-            return 8
+            return 16
         }()
         let resolvedActiveExperts = min(requestedActiveExperts,
                                          max(self.nRoutedExperts, 1), 16)
