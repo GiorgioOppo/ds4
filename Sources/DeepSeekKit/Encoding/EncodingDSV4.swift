@@ -261,29 +261,44 @@ public enum EncodingDSV4 {
                        toolCalls: toolCalls)
     }
 
-    /// Parse `<｜DSML｜invoke>...</｜DSML｜invoke>` blocks inside the body of
-    /// a tool_calls section. Each invoke produces one ToolCall whose
+    /// Parse the `<｜DSML｜invoke …>` calls inside the body of a
+    /// tool_calls section. Each invoke produces one ToolCall whose
     /// `args` is a JSON dict reconstructed from the inner parameters.
+    ///
+    /// Anchored on the *opening* tags only. Local models reliably emit
+    /// `<｜DSML｜invoke name="…">` and the self-delimiting
+    /// `<｜DSML｜parameter …>…</｜DSML｜parameter>` frames, but are sloppy
+    /// with the `</｜DSML｜invoke>` close — observed output misspells it
+    /// (`</｜DSML｜inv>`), drops it, emits stray bare opens, or doubles
+    /// the close. Requiring an exact close tag therefore dropped
+    /// otherwise-valid calls entirely. Each call's parameter span runs
+    /// from its `name="…">` to the next invoke-open (or end of body);
+    /// `parseParameters` only picks up real parameter frames, so any
+    /// malformed close tags in between are ignored.
     private static func parseToolCalls(_ body: String) -> [ToolCall] {
         let dt = dsmlToken
         var calls: [ToolCall] = []
         var cursor = body.startIndex
         let invokeOpenPrefix = "<\(dt)invoke name=\""
-        let invokeClose = "</\(dt)invoke>"
 
         while let openStart = body.range(of: invokeOpenPrefix,
                                           range: cursor..<body.endIndex) {
-            // Find the closing quote for the name.
+            // Tool name: from after the prefix to the closing `">`.
             guard let nameClose = body.range(of: "\">",
-                                              range: openStart.upperBound..<body.endIndex),
-                  let invokeEnd = body.range(of: invokeClose,
-                                              range: nameClose.upperBound..<body.endIndex)
+                                              range: openStart.upperBound..<body.endIndex)
             else { break }
             let name = String(body[openStart.upperBound..<nameClose.lowerBound])
-            let inner = String(body[nameClose.upperBound..<invokeEnd.lowerBound])
-            let args = parseParameters(inner)
+
+            // Parameter span: this call's `">` up to the next
+            // invoke-open, or the end of the body. No `</｜DSML｜invoke>`
+            // required — see the note above.
+            let spanStart = nameClose.upperBound
+            let spanEnd = body.range(of: invokeOpenPrefix,
+                                      range: spanStart..<body.endIndex)?.lowerBound
+                          ?? body.endIndex
+            let args = parseParameters(String(body[spanStart..<spanEnd]))
             calls.append(ToolCall(name: name, args: args))
-            cursor = invokeEnd.upperBound
+            cursor = spanEnd
         }
         return calls
     }
