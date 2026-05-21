@@ -474,7 +474,8 @@ Pezzi scaffoldati nel merge di llama.cpp-gap. Storia: vedi
 
 - [ ] **GGUF writer**. Simmetrico al reader; permetterebbe al
   converter di produrre un GGUF leggibile da llama.cpp. Low
-  priority — interop bidirezionale.
+  priority — interop bidirezionale. Piano dettagliato: §12 +
+  [`docs/IMATRIX-GGUF-PLAN.md`](docs/IMATRIX-GGUF-PLAN.md) Fase 4.
 
 - [ ] **`{% macro %}` / `{% set %}` / `include` / inheritance**
   in `JinjaTemplate.swift`. Nessuno dei template in circolazione
@@ -798,6 +799,37 @@ PyTorch reference).
 - Settings → API Keys: aggiungere campi per Tavily / Brave / Serper
   + picker per `webSearchProvider`. Keys già scrivibili via Keychain
   programmaticamente.
+
+---
+
+## 12. imatrix + quantizzazioni mancanti + GGUF writer
+
+Bozza completa e tracker d'implementazione:
+[`docs/IMATRIX-GGUF-PLAN.md`](docs/IMATRIX-GGUF-PLAN.md). Scope
+confermato: import/export imatrix, dtype GGUF mancanti in lettura,
+quantizzatore imatrix-driven, GGUF writer, larghezze 3/5/6-bit native.
+Stima ordine di grandezza ~40-55 gg; critical path Fasi 0→1→2→4, con
+3 e 5 parallelizzabili.
+
+- [ ] **Pre-flight** — riconciliare i doc stantii (`docs/GGUF.md`
+  §"Cosa NON funziona" vs §10.2 LANDED; pre-mul AWQ
+  `converter/main.swift:40` vs §0) prima della Fase 2.
+- [ ] **Fase 0 — Fondamenta** — `GGUFNameMap.swift` (bridge nomi
+  llama.cpp↔V4, incl. leaf MLA + slicing expert MoE), estensione
+  `CalibrationStats.perChannelMeanSq`.
+- [ ] **Fase 1 — imatrix I/O** — `IMatrix.swift`: reader `.dat` +
+  GGUF, writer, bridge → `CalibrationStats`, flag CLI
+  `--emit-imatrix` / `--imatrix`.
+- [ ] **Fase 2 — Quantizzatore imatrix-driven** — `ImatrixQuant.swift`,
+  `QuantMethod.imatrix`, output nei layout INT esistenti (GEMM kernel
+  invariati).
+- [ ] **Fase 3 — Lettura dtype GGUF mancanti** — `Q4_1`/`Q5_0`/`Q5_1`/
+  `Q8_1`, `Q2_K`/`Q3_K`, famiglia `IQ`. Additivo e non-breaking, una
+  PR per dtype.
+- [ ] **Fase 4 — GGUF writer** — `GGUFWriter.swift` + quantize-on-write
+  (dettaglia l'item "GGUF writer" di §9).
+- [ ] **Fase 5 — Larghezze 3/5/6-bit native** — `Int{3,5,6}Quant.swift`
+  + kernel; priorità più bassa (valutare vs "INT4 + imatrix").
 
 ---
 
