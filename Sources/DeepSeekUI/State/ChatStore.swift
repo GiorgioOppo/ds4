@@ -1485,9 +1485,9 @@ final class ChatStore: ObservableObject {
     nonisolated static let discoveryToolSchemasJSON: String? = {
         let listTool: [String: Any] = [
             "name": EncodingDSV4.listToolsName,
-            "description": "List every tool available in this session — "
-                + "returns each tool's name and a short description. Call "
-                + "this first to discover what you can do, then call "
+            "description": "Lists the tools available in this session — "
+                + "returns each tool's name and a short description. When a "
+                + "tool would help, consult this, then call "
                 + "\(EncodingDSV4.searchToolName) to get a tool's exact "
                 + "parameter schema and a worked example before invoking it.",
             "inputSchema": ["type": "object"],

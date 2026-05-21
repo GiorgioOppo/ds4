@@ -71,6 +71,10 @@ public enum EncodingDSV4 {
     /// actually produces. `parseToolCalls` anchors on the `<｜DSML｜inv`
     /// prefix, so both forms still parse.
     ///
+    /// The framing prose is deliberately softer than the reference:
+    /// tools are presented as optional, to be used only when the
+    /// request needs one, so the model answers directly when it can.
+    ///
     /// Each schema in `toolSchemasJSON` may carry an `example` field —
     /// a ready-to-run `<｜DSML｜tool_calls>` invocation built by
     /// `toolCallExample`. The block points the model at it; the
@@ -81,7 +85,7 @@ public enum EncodingDSV4 {
         return """
             ## Tools
 
-            You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<\(dt)tool_calls>" block like the following:
+            You have an optional set of tools available. Use one only when the user's request genuinely needs it — for example to read a file, search, or run code. If you can answer from your own knowledge, reply directly without calling a tool or mentioning that tools are available. When you do need a tool, invoke it by writing a "<\(dt)tool_calls>" block like the following:
 
             <\(dt)tool_calls>
             <\(dt)inv name="$TOOL_NAME">
@@ -102,7 +106,7 @@ public enum EncodingDSV4 {
 
             \(toolSchemasJSON)
 
-            You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+            When you invoke a tool, follow the tool name and parameter schemas defined above exactly.
 
             """
     }
