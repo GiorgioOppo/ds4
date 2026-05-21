@@ -748,12 +748,18 @@ private struct PrefillTokenStreamView: View {
         HStack(spacing: 6) {
             Image(systemName: "square.grid.2x2")
                 .font(.caption2)
-            Text("Prefill · \(done) / \(total) token")
+            // Always spinning while the panel is up: it is visible for
+            // the whole `.prefilling` phase, and the real forward
+            // keeps running long after the synthetic token reveal
+            // (done == total) finishes — so the spinner is the only
+            // liveness signal during that window.
+            ProgressView()
+                .controlSize(.mini)
+            Text(done < total
+                  ? "Prefill · \(done) / \(total) token"
+                  : "Prefill · \(total) token · processing…")
                 .font(.caption)
                 .monospacedDigit()
-            if done < total {
-                ProgressView().controlSize(.mini)
-            }
             Spacer()
         }
         .foregroundStyle(.secondary)
