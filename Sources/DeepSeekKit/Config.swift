@@ -470,24 +470,27 @@ public struct ModelConfig: Codable, Sendable {
         }
 
         // Sliding-window size — how many of the most recent tokens are
-        // kept raw / uncompressed. Multiplied by `DEEPSEEK_WINDOW_MULT`
-        // (default 16, so the raw window is 16× the checkpoint's value)
-        // on explicit request, to keep more recent context exact.
+        // kept raw / uncompressed. Defaults to the checkpoint's trained
+        // value (in-distribution); `DEEPSEEK_WINDOW_MULT=N` with N > 1
+        // widens the raw window N× as an opt-in experiment.
         //
         // WARNING: out-of-distribution. The DSA sliding-window
         // attention was trained with the checkpoint's window
         // (typically 128); a wider window changes the softmax
-        // distribution the trained weights see and usually degrades
-        // output. It also enlarges every layer's KV cache and the
-        // sparse-attention cost (SparseAttention tiles down to
-        // compensate for the watchdog). `DEEPSEEK_WINDOW_MULT=1`
-        // restores the trained value. Applied before the maxSeqLen
-        // auto-grow below so the wider window is counted in the budget.
+        // distribution the trained weights see and degrades output.
+        // A 16× window shipped as the default and collapsed V4-Pro
+        // generation into degenerate logits (the BOS-loop / garbage
+        // output) regardless of the streaming load mode — restoring
+        // the trained value (mult = 1) is the fix. A widened window
+        // also enlarges every layer's KV cache and the sparse-
+        // attention cost (SparseAttention tiles down to compensate
+        // for the watchdog). Applied before the maxSeqLen auto-grow
+        // below so a widened window is still counted in the budget.
         let windowMult: Int = {
             if let raw = ProcessInfo.processInfo
                 .environment["DEEPSEEK_WINDOW_MULT"],
                let n = Int(raw), n > 0 { return n }
-            return 16
+            return 1
         }()
         if windowMult > 1 {
             let oldWin = c.windowSize
