@@ -970,6 +970,7 @@ final class InferenceService: @unchecked Sendable {
                 //    every 500 ms so the UI ticker updates without
                 //    flooding the actor mailbox.
                 var generated: [Int] = []
+                var emittedScalars = 0
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 for step in 0..<maxTokens {
@@ -981,13 +982,30 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
-                    // Stream the per-token piece for live display only.
-                    // The completion is re-decoded from the full id list
-                    // at finalize time — `decode([a]) + decode([b])`
-                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
-                    // the ｜DSML｜ tool-call markers) split across tokens.
-                    let piece = tok.decode([nextId])
-                    continuation.yield(.token(text: piece, id: Int32(nextId)))
+                    // Live display: re-decode the whole id list and emit
+                    // only the newly-stable text. Per-token decode
+                    // (`decode([a]) + decode([b])`) corrupts a multi-byte
+                    // UTF-8 char split across a token boundary — e.g. ｜
+                    // (U+FF5C) in the ｜DSML｜ tool markers; a full
+                    // re-decode never does. A trailing U+FFFD is an
+                    // incomplete char the next token finishes, so hold it
+                    // back. `.done` replaces the stream with the parsed
+                    // final content anyway, so a held tail is harmless.
+                    let scalars = Array(tok.decode(generated).unicodeScalars)
+                    var stable = scalars.count
+                    while stable > emittedScalars
+                          && scalars[stable - 1].value == 0xFFFD {
+                        stable -= 1
+                    }
+                    if stable > emittedScalars {
+                        var delta = ""
+                        for i in emittedScalars..<stable {
+                            delta.unicodeScalars.append(scalars[i])
+                        }
+                        emittedScalars = stable
+                        continuation.yield(.token(text: delta,
+                                                   id: Int32(nextId)))
+                    }
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {
@@ -1083,6 +1101,7 @@ final class InferenceService: @unchecked Sendable {
                 let stops = tok.stopTokenIds
 
                 var generated: [Int] = []
+                var emittedScalars = 0
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 for step in 0..<maxTokens {
@@ -1094,13 +1113,30 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
-                    // Stream the per-token piece for live display only.
-                    // The completion is re-decoded from the full id list
-                    // at finalize time — `decode([a]) + decode([b])`
-                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
-                    // the ｜DSML｜ tool-call markers) split across tokens.
-                    let piece = tok.decode([nextId])
-                    continuation.yield(.token(text: piece, id: Int32(nextId)))
+                    // Live display: re-decode the whole id list and emit
+                    // only the newly-stable text. Per-token decode
+                    // (`decode([a]) + decode([b])`) corrupts a multi-byte
+                    // UTF-8 char split across a token boundary — e.g. ｜
+                    // (U+FF5C) in the ｜DSML｜ tool markers; a full
+                    // re-decode never does. A trailing U+FFFD is an
+                    // incomplete char the next token finishes, so hold it
+                    // back. `.done` replaces the stream with the parsed
+                    // final content anyway, so a held tail is harmless.
+                    let scalars = Array(tok.decode(generated).unicodeScalars)
+                    var stable = scalars.count
+                    while stable > emittedScalars
+                          && scalars[stable - 1].value == 0xFFFD {
+                        stable -= 1
+                    }
+                    if stable > emittedScalars {
+                        var delta = ""
+                        for i in emittedScalars..<stable {
+                            delta.unicodeScalars.append(scalars[i])
+                        }
+                        emittedScalars = stable
+                        continuation.yield(.token(text: delta,
+                                                   id: Int32(nextId)))
+                    }
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {
@@ -1413,6 +1449,7 @@ final class InferenceService: @unchecked Sendable {
                 let stops = tok.stopTokenIds
 
                 var generated: [Int] = []
+                var emittedScalars = 0
                 let decodeStart = Date()
                 var lastSample = decodeStart
                 // The decode loop continues from where prefill stopped.
@@ -1429,13 +1466,30 @@ final class InferenceService: @unchecked Sendable {
                     if stops.contains(nextId) { break }
                     generated.append(nextId)
 
-                    // Stream the per-token piece for live display only.
-                    // The completion is re-decoded from the full id list
-                    // at finalize time — `decode([a]) + decode([b])`
-                    // mangles any multi-byte UTF-8 char (e.g. ｜ U+FF5C in
-                    // the ｜DSML｜ tool-call markers) split across tokens.
-                    let piece = tok.decode([nextId])
-                    continuation.yield(.token(text: piece, id: Int32(nextId)))
+                    // Live display: re-decode the whole id list and emit
+                    // only the newly-stable text. Per-token decode
+                    // (`decode([a]) + decode([b])`) corrupts a multi-byte
+                    // UTF-8 char split across a token boundary — e.g. ｜
+                    // (U+FF5C) in the ｜DSML｜ tool markers; a full
+                    // re-decode never does. A trailing U+FFFD is an
+                    // incomplete char the next token finishes, so hold it
+                    // back. `.done` replaces the stream with the parsed
+                    // final content anyway, so a held tail is harmless.
+                    let scalars = Array(tok.decode(generated).unicodeScalars)
+                    var stable = scalars.count
+                    while stable > emittedScalars
+                          && scalars[stable - 1].value == 0xFFFD {
+                        stable -= 1
+                    }
+                    if stable > emittedScalars {
+                        var delta = ""
+                        for i in emittedScalars..<stable {
+                            delta.unicodeScalars.append(scalars[i])
+                        }
+                        emittedScalars = stable
+                        continuation.yield(.token(text: delta,
+                                                   id: Int32(nextId)))
+                    }
 
                     let now = Date()
                     if now.timeIntervalSince(lastSample) >= 0.5 {
