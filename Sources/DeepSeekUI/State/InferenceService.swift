@@ -328,6 +328,23 @@ final class InferenceService: @unchecked Sendable {
         return h
     }
 
+    /// FNV-1a 64-bit over a token sequence — the launch-stable hash
+    /// of `fnv1a(_:String)` applied to the four little-endian bytes
+    /// of each id. Fingerprints the tool-prefix token sequence for
+    /// the on-disk artefact.
+    private static func fnv1a(_ tokens: [Int32]) -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for t in tokens {
+            var v = UInt32(bitPattern: t)
+            for _ in 0..<4 {
+                h ^= UInt64(v & 0xFF)
+                h = h &* 0x00000100000001B3
+                v >>= 8
+            }
+        }
+        return h
+    }
+
     /// `precomputedToolPrefix` AppStorage flag — default ON (a
     /// missing key reads as true).
     private static var precomputedToolPrefixEnabled: Bool {
@@ -335,12 +352,15 @@ final class InferenceService: @unchecked Sendable {
             forKey: AppSettingsKey.precomputedToolPrefix) as? Bool ?? true
     }
 
-    /// On-disk validity key + token payload for the tool-prefix
-    /// artefact. The snapshot is reused only when all three match.
+    /// On-disk validity key for the tool-prefix artefact: model
+    /// identity, a hash of the tools JSON, and a hash of the prefill
+    /// token sequence. The snapshot is reused only when all three
+    /// match. `tokensHash` is optional so a pre-hash artefact decodes
+    /// as `nil` and always fails the check — forcing a recompute.
     private struct ToolPrefixMeta: Codable {
         let modelKey: UInt64
         let toolsHash: UInt64
-        let tokens: [Int32]
+        let tokensHash: UInt64?
     }
 
     private static func loadToolPrefixMeta() -> ToolPrefixMeta? {
@@ -404,13 +424,16 @@ final class InferenceService: @unchecked Sendable {
 
         let modelKey = self.toolPrefixModelKey()
         let toolsHash = Self.fnv1a(json)
+        let tokensHash = Self.fnv1a(prefixTokens)
 
         // Disk hit: a still-valid artefact (same model, same tools,
         // same token sequence) — load the snapshot, skip the prefill.
+        // A pre-hash artefact has `tokensHash == nil`, so the
+        // `== tokensHash` test fails and we fall through to recompute.
         if let meta = Self.loadToolPrefixMeta(),
            meta.modelKey == modelKey,
            meta.toolsHash == toolsHash,
-           meta.tokens == prefixTokens,
+           meta.tokensHash == tokensHash,
            let url = try? PersistencePaths.toolPrefixKVCacheURL(),
            let snap = KVCacheSnapshot.load(from: url)
         {
@@ -437,7 +460,7 @@ final class InferenceService: @unchecked Sendable {
             try snap.save(to: url, compression: .f16)
             let meta = ToolPrefixMeta(modelKey: modelKey,
                                        toolsHash: toolsHash,
-                                       tokens: prefixTokens)
+                                       tokensHash: tokensHash)
             try JSONEncoder().encode(meta).write(
                 to: PersistencePaths.toolPrefixMetaURL(), options: .atomic)
             FileHandle.standardError.write(Data(
