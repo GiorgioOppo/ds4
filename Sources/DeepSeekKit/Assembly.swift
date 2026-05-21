@@ -225,6 +225,14 @@ public extension Transformer {
             Double(kvProjected) / 1_073_741_824.0,
             config.maxSeqLen, config.maxBatchSize).utf8))
 
+        // MoE expert counts — printed at load so the effective routing
+        // width is visible without `--print-config`. `nActivatedExperts`
+        // already reflects any `DEEPSEEK_TOPK_EXPERTS` override.
+        FileHandle.standardError.write(Data(String(
+            format: "MoE experts: routed=%d activated/token=%d shared=%d.\n",
+            config.nRoutedExperts, config.nActivatedExperts,
+            config.nSharedExperts).utf8))
+
         var rng = MiniRNG(seed: 0xDEADC0DE)
         let dim = config.dim
         let hc = config.hcMult
