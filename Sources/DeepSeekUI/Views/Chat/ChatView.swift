@@ -8,7 +8,7 @@ struct ChatView: View {
     @ObservedObject var modelState: ModelState
     @State private var draft: String = ""
 
-    @AppStorage("deepseek.temperature")       private var temperature: Double = 0.7
+    @AppStorage("deepseek.temperature")       private var temperature: Double = 0.1
     @AppStorage("deepseek.topK")              private var topK: Int = 0
     @AppStorage("deepseek.topP")              private var topP: Double = 1.0
     @AppStorage("deepseek.repPenalty")        private var repPenalty: Double = 1.0
@@ -602,10 +602,8 @@ struct ChatView: View {
         let agent = store.selectedConversation?.agentID
             .flatMap { store.agents.agent(id: $0) }
 
-        // Sliders write to AppStorage in a slightly wider range
-        // than the model accepts; clamp into the supported
-        // [0.5, 1.0] window so an out-of-band value from an older
-        // build doesn't crash the sampler.
+        // Clamp into the supported [0, 1] window so an out-of-band
+        // value from an older build doesn't crash the sampler.
         let temp = agent?.temperature ?? temperature
         let tp   = agent?.topP        ?? topP
         let tk   = agent?.topK        ?? topK
@@ -613,7 +611,7 @@ struct ChatView: View {
         let mt   = agent?.maxTokens   ?? maxTokens
         let modeStr = agent?.defaultMode ?? modeRaw
 
-        let clampedT = min(1.0, max(0.5, temp))
+        let clampedT = min(1.0, max(0.0, temp))
         let options = SamplingOptions(
             temperature: Float(clampedT),
             topK: tk, topP: Float(tp),

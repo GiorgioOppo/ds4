@@ -4,7 +4,7 @@ import SwiftUI
 /// same @AppStorage keys ChatView reads, so changes take effect on
 /// the next Send (no restart).
 struct GenerationSettingsTab: View {
-    @AppStorage("deepseek.temperature") private var temperature: Double = 0.7
+    @AppStorage("deepseek.temperature") private var temperature: Double = 0.1
     @AppStorage("deepseek.topK")        private var topK: Int = 0
     @AppStorage("deepseek.topP")        private var topP: Double = 1.0
     @AppStorage("deepseek.repPenalty")  private var repPenalty: Double = 1.0
@@ -16,21 +16,20 @@ struct GenerationSettingsTab: View {
             Section("Sampling") {
                 LabeledContent("Temperature") {
                     HStack {
-                        // Clamped to [0.5, 1.0]: temperature=0 makes V4-Flash
-                        // MoE fall into greedy-argmax fixed points (the model
-                        // loops on filler tokens like 好的好的好的…). Anything
-                        // above ~1 over-flattens the routing distribution
-                        // and produces gibberish in a different way. Values
-                        // around 0.7–0.9 give the most coherent samples.
+                        // Range [0, 1]. 0 is greedy argmax — on V4-Flash
+                        // MoE very low values can settle into fixed points
+                        // (the model loops on filler tokens like 好的好的…);
+                        // raise it if you see that. Values around 0.7–0.9
+                        // give the most varied-yet-coherent samples.
                         Slider(value: $temperature,
-                                in: 0.5...1.0,
+                                in: 0...1,
                                 step: 0.05) {
                             EmptyView()
                         } minimumValueLabel: {
-                            Text("0.5").font(.caption2.monospaced())
+                            Text("0").font(.caption2.monospaced())
                                 .foregroundStyle(.tertiary)
                         } maximumValueLabel: {
-                            Text("1.0").font(.caption2.monospaced())
+                            Text("1").font(.caption2.monospaced())
                                 .foregroundStyle(.tertiary)
                         }
                         Text(String(format: "%.2f", temperature))
@@ -81,11 +80,11 @@ struct GenerationSettingsTab: View {
         .formStyle(.grouped)
         .padding()
         .onAppear {
-            // One-shot migration: if the stored value pre-dates the
-            // 0.5–1.0 clamp (older builds used 0…2), pull it into the
-            // new range so the slider doesn't render off-track.
-            if temperature < 0.5 { temperature = 0.5 }
-            if temperature > 1.0 { temperature = 1.0 }
+            // One-shot migration: clamp a value stored by an older
+            // build (ranges 0…2 or 0.5…1.0) into the current [0, 1]
+            // range so the slider doesn't render off-track.
+            if temperature < 0 { temperature = 0 }
+            if temperature > 1 { temperature = 1 }
         }
     }
 }
