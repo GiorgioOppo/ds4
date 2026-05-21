@@ -462,33 +462,58 @@ public struct ModelConfig: Codable, Sendable {
                 + notes.joined(separator: "\n  ") + "\n").utf8))
         }
 
-        // Runtime override: `DEEPSEEK_MAX_SEQ_LEN=N` sets the context
-        // length without editing the model's config.json. Applied here,
-        // after shape inference, so the new value flows into the
-        // KV-cache budget check and every buffer `Assembly.load` sizes
-        // from `maxSeqLen` (the RoPE table, the per-layer KV caches).
+        // maxSeqLen resolution — it sizes the RoPE table and every
+        // per-layer KV cache; per-layer compression keeps the cache
+        // sub-linear (ratio-R layers grow at N/R, ratio-0 layers stay
+        // at `windowSize`).
         //
-        // Long context stays feasible because per-layer compression
-        // bounds the cache: ratio-0 layers hold a fixed `windowSize`
-        // rows regardless of N, ratio-R layers grow only at `N / R`
-        // (see `projectedKVCacheBytes`). The compression is intrinsic —
-        // it is driven by the trained `compressRatios`, nothing extra
-        // has to be enabled. An over-large N is still caught by the
-        // `kvCacheTooLarge` budget gate in `Assembly.load`, so it fails
-        // loudly at load instead of jetsamming mid-run.
+        // `DEEPSEEK_MAX_SEQ_LEN=N` pins it explicitly. Otherwise it is
+        // auto-grown to the largest value whose projected KV cache
+        // (`projectedKVCacheBytes`) still fits ~50% of the process
+        // memory budget — more retained context on machines that can
+        // afford it, without ever risking the `kvCacheTooLarge` abort
+        // at load. Only raised, never lowered, hard-capped at 128K.
         //
-        // YaRN RoPE scaling is governed by `originalSeqLen`, not this
-        // value, so overriding `maxSeqLen` only resizes buffers — it
-        // does not re-tune positional scaling.
+        // YaRN RoPE scaling keys off `originalSeqLen`, not this value,
+        // so changing maxSeqLen only resizes buffers — it does not
+        // re-tune positional scaling.
         if let raw = ProcessInfo.processInfo
             .environment["DEEPSEEK_MAX_SEQ_LEN"],
-           let newLen = Int(raw), newLen > 0,
-           newLen != c.maxSeqLen {
-            let oldLen = c.maxSeqLen
-            c.maxSeqLen = newLen
-            FileHandle.standardError.write(Data(
-                ("[config] DEEPSEEK_MAX_SEQ_LEN override: maxSeqLen "
-                 + "\(oldLen) → \(newLen)\n").utf8))
+           let pinned = Int(raw), pinned > 0 {
+            if pinned != c.maxSeqLen {
+                let oldLen = c.maxSeqLen
+                c.maxSeqLen = pinned
+                FileHandle.standardError.write(Data(
+                    ("[config] DEEPSEEK_MAX_SEQ_LEN override: maxSeqLen "
+                     + "\(oldLen) → \(pinned)\n").utf8))
+            }
+        } else {
+            let budget = SystemProbe.effectiveProcessBudget()
+            if budget > 0 {
+                let target = UInt64(Double(budget) * 0.5)
+                let hardCap = 131_072
+                func fits(_ length: Int) -> Bool {
+                    var probe = c
+                    probe.maxSeqLen = length
+                    return probe.projectedKVCacheBytes <= target
+                }
+                if c.maxSeqLen < hardCap, fits(c.maxSeqLen) {
+                    var lo = c.maxSeqLen
+                    var hi = hardCap
+                    while lo < hi {
+                        let mid = lo + (hi - lo + 1) / 2
+                        if fits(mid) { lo = mid } else { hi = mid - 1 }
+                    }
+                    if lo > c.maxSeqLen {
+                        let oldLen = c.maxSeqLen
+                        c.maxSeqLen = lo
+                        FileHandle.standardError.write(Data(
+                            ("[config] maxSeqLen auto-grown \(oldLen) → "
+                             + "\(lo) (KV cache ≈ 50% of memory budget; "
+                             + "set DEEPSEEK_MAX_SEQ_LEN to override)\n").utf8))
+                    }
+                }
+            }
         }
 
         return c
