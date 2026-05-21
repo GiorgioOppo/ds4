@@ -189,8 +189,8 @@ enum LocalServerRoutes {
                             totalGeneratedTokens += 1
                         case .done(let msg, _, _):
                             finalMessage = msg
-                        case .status, .prefillToken, .prefillStart,
-                             .prefillDone, .generationProgress:
+                        case .status, .prefillToken, .prefillTokenProcessed,
+                             .prefillStart, .prefillDone, .generationProgress:
                             continue
                         }
                     }
