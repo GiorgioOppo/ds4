@@ -1510,8 +1510,8 @@ final class ChatStore: ObservableObject {
                 "required": ["query"],
             ],
         ]
-        let out = [Self.schemaWithExample(listTool),
-                   Self.schemaWithExample(searchTool)]
+        let out = [ChatStore.schemaWithExample(listTool),
+                   ChatStore.schemaWithExample(searchTool)]
         guard let data = try? JSONSerialization.data(
                 withJSONObject: out,
                 options: [.prettyPrinted, .sortedKeys]),
