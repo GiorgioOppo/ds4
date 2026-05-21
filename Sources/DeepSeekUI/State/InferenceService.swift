@@ -408,7 +408,7 @@ final class InferenceService: @unchecked Sendable {
         // snapshot the resulting KV state.
         model.releaseCache()
         self.cacheImage = nil
-        _ = model.forward(inputIds: [prefixTokens.map(Int)], startPos: 0)
+        _ = model.forward(inputIds: [prefixTokens.map(Int.init)], startPos: 0)
         let snap = model.snapshotKVCache()
         self.toolPrefixTokens = prefixTokens
         self.toolPrefixSnapshot = snap
