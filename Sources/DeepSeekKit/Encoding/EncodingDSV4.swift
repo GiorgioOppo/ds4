@@ -70,6 +70,14 @@ public enum EncodingDSV4 {
     /// `invoke`), so the instruction it reads is aligned to what it
     /// actually produces. `parseToolCalls` anchors on the `<｜DSML｜inv`
     /// prefix, so both forms still parse.
+    ///
+    /// On top of the reference template this carries one concrete
+    /// `### Example` — a filled-in `__search_tool` call — so the model
+    /// has a worked invocation to imitate rather than only the abstract
+    /// `$PLACEHOLDER` form. `__search_tool` is used because it is the
+    /// only parametrised tool always visible under progressive
+    /// discovery; the example is plain prompt text and is never run
+    /// through `parseCompletion`.
     public static func toolsBlock(toolSchemasJSON: String) -> String {
         let dt = dsmlToken
         return """
@@ -85,6 +93,16 @@ public enum EncodingDSV4 {
             </\(dt)tool_calls>
 
             String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+            ### Example
+
+            Replace the placeholders above with a real tool name and real values. For instance, to invoke `\(searchToolName)` with its `query` string parameter:
+
+            <\(dt)tool_calls>
+            <\(dt)inv name="\(searchToolName)">
+            <\(dt)parameter name="query" string="true">read file</\(dt)parameter>
+            </\(dt)inv>
+            </\(dt)tool_calls>
 
             If thinking_mode is enabled (triggered by \(thinkOpen)), you MUST output your complete reasoning inside \(thinkOpen)...\(thinkClose) BEFORE any tool calls or final response.
 
