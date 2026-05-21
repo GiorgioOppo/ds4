@@ -54,7 +54,13 @@ public enum EncodingDSV4 {
         """
 
     /// Tools section block, prepended to the system message when the request
-    /// includes tool schemas. Mirrors TOOLS_TEMPLATE (encoding_dsv4.py:70-95).
+    /// includes tool schemas. Mirrors TOOLS_TEMPLATE (encoding_dsv4.py:70-95),
+    /// except the invoke tag is the short `<｜DSML｜inv …>` form, not the
+    /// reference's `<｜DSML｜invoke …>`. The local model reliably truncates
+    /// the keyword to `inv` when generating (it cannot consistently emit
+    /// `invoke`), so the instruction it reads is aligned to what it
+    /// actually produces. `parseToolCalls` anchors on the `<｜DSML｜inv`
+    /// prefix, so both forms still parse.
     public static func toolsBlock(toolSchemasJSON: String) -> String {
         let dt = dsmlToken
         return """
@@ -63,10 +69,10 @@ public enum EncodingDSV4 {
             You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<\(dt)tool_calls>" block like the following:
 
             <\(dt)tool_calls>
-            <\(dt)invoke name="$TOOL_NAME">
+            <\(dt)inv name="$TOOL_NAME">
             <\(dt)parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</\(dt)parameter>
             ...
-            </\(dt)invoke>
+            </\(dt)inv>
             </\(dt)tool_calls>
 
             String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
@@ -186,9 +192,9 @@ public enum EncodingDSV4 {
         let dt = dsmlToken
         var inner = ""
         for tc in calls {
-            inner += "<\(dt)invoke name=\"\(escapeXMLAttr(tc.name))\">\n"
+            inner += "<\(dt)inv name=\"\(escapeXMLAttr(tc.name))\">\n"
             inner += encodeArguments(tc.args)
-            inner += "</\(dt)invoke>\n"
+            inner += "</\(dt)inv>\n"
         }
         // Drop the trailing newline before the close to match the reference.
         if inner.hasSuffix("\n") { inner.removeLast() }
