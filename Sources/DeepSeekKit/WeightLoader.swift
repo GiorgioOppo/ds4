@@ -725,7 +725,7 @@ public final class WeightLoader {
         // "writes to a never-read variable").
         let useCk = checksum != 0xFF ? "ok" : "max"
         let summary = String(format:
-            "[warmup] done in %.2fs (%.2f GB/s effective) [checksum:%s]\n",
+            "[warmup] done in %.2fs (%.2f GB/s effective) [checksum:%@]\n",
             elapsed,
             Double(totalBytes) / 1e9 / max(elapsed, 0.001),
             useCk)
