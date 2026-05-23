@@ -52,7 +52,7 @@ struct LoadingSettingsTab: View {
                         // Push the new value to DeepSeekKit so the
                         // change takes effect on the very next layer
                         // pread without needing a model reload.
-                        StreamingPool.lazyExpertEnabled = newValue
+                        // Feature disabled in MLX backend.
                     }
                 Text("⚠️ Sperimentale, default OFF. Su strategy " +
                      "`streaming` carica per token solo i tensor " +

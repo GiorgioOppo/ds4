@@ -14,48 +14,28 @@ let package = Package(
         .library(name: "DeepSeekIntegrations", targets: ["DeepSeekIntegrations"]),
         .library(name: "DeepSeekVocabPruner", targets: ["DeepSeekVocabPruner"]),
         .executable(name: "deepseek", targets: ["deepseek"]),
-        .executable(name: "deepseek_gguf", targets: ["deepseek_gguf"]),
-        .executable(name: "deepseek_calibrate", targets: ["deepseek_calibrate"]),
         .executable(name: "converter", targets: ["converter"]),
         .executable(name: "vocab_pruner", targets: ["vocab_pruner"]),
         .executable(name: "DeepSeekUI", targets: ["DeepSeekUI"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.22.0")
+    ],
     targets: [
         .target(
             name: "DeepSeekKit",
-            path: "Sources/DeepSeekKit",
-            // Kernels is owned by MetalLibPlugin, which compiles the .metal
-            // files into default.metallib and emits that as a resource.
-            // Excluding the directory here prevents SwiftPM from also
-            // copying the raw .metal sources into the bundle.
-            exclude: ["Kernels"],
-            plugins: [
-                .plugin(name: "MetalLibPlugin"),
-            ]
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift")
+            ],
+            path: "Sources/DeepSeekKit"
         ),
         .executableTarget(
             name: "deepseek",
             dependencies: ["DeepSeekKit"],
             path: "Sources/deepseek"
-        ),
-        // Minimal CLI for running a GGUF Llama-family checkpoint
-        // (TODO §10.2 / T2). Kept separate from the V4-specific
-        // `deepseek` CLI so the conversion-heavy / MLA-specific
-        // machinery in main.swift doesn't bleed into the GGUF path.
-        .executableTarget(
-            name: "deepseek_gguf",
-            dependencies: ["DeepSeekKit"],
-            path: "Sources/deepseek_gguf"
-        ),
-        // Calibration runner for GPTQ / AWQ / SmoothQuant (TODO §1).
-        // Loads a GGUF Llama, walks a calibration corpus, dumps
-        // per-layer activation absmax/mean (always) and the
-        // per-layer Hessian (with --collect-hessian) to disk. The
-        // converter then consumes those when --quant-method is set.
-        .executableTarget(
-            name: "deepseek_calibrate",
-            dependencies: ["DeepSeekKit"],
-            path: "Sources/deepseek_calibrate"
         ),
         .target(
             name: "DeepSeekConverter",
@@ -160,11 +140,7 @@ let package = Package(
                 ])
             ]
         ),
-        .plugin(
-            name: "MetalLibPlugin",
-            capability: .buildTool(),
-            path: "Plugins/MetalLibPlugin"
-        ),
+
         .testTarget(
             name: "DeepSeekKitTests",
             dependencies: ["DeepSeekKit"],

@@ -159,95 +159,8 @@ public enum ExpertRewriter {
         gateRows: [Int: [Int: [Float]]],
         cancellation: CancellationToken? = nil
     ) throws {
-        let dataStart = try readDataStart(inURL)
-        let file = try SafeTensorsFile(url: inURL)
-        let writer = SafeTensorsWriter()
-
-        let names = file.entries.keys.sorted()
-        for name in names {
-            try cancellation?.throwIfCancelled()
-            // 1) Dropped expert tensors are simply omitted from
-            //    the new safetensors. The loader skips construction
-            //    when `pruned_experts` covers the slot.
-            if isDroppedExpertTensor(name, droppedByLayer: droppedByLayer) {
-                continue
-            }
-
-            let entry = file.entries[name]!
-            let byteCount = entry.dataOffsets[1] - entry.dataOffsets[0]
-            let absOffset = dataStart + entry.dataOffsets[0]
-
-            // 2) Gate weight: overwrite the rows of dropped experts
-            //    with the negative sentinel. The kept rows are kept
-            //    verbatim (their byte content is reproduced from the
-            //    source in the new buffer).
-            if let layerId = parseGateWeightLayer(name),
-               let dropped = droppedByLayer[layerId], !dropped.isEmpty
-            {
-                let mutated = try patchGateWeight(
-                    inURL: inURL,
-                    absOffset: absOffset,
-                    byteCount: byteCount,
-                    shape: entry.shape,
-                    dtype: entry.dtype,
-                    dropped: dropped)
-                writer.add(name: name,
-                           dtype: entry.dtype,
-                           shape: entry.shape,
-                           source: .data(mutated))
-                continue
-            }
-
-            // 3) Gate bias: overwrite per-expert scalar at dropped ids.
-            if let layerId = parseGateBiasLayer(name),
-               let dropped = droppedByLayer[layerId], !dropped.isEmpty
-            {
-                let mutated = try patchGateBias(
-                    inURL: inURL,
-                    absOffset: absOffset,
-                    byteCount: byteCount,
-                    shape: entry.shape,
-                    dtype: entry.dtype,
-                    dropped: dropped)
-                writer.add(name: name,
-                           dtype: entry.dtype,
-                           shape: entry.shape,
-                           source: .data(mutated))
-                continue
-            }
-
-            // 4) tid2eid: remap entries pointing to dropped experts
-            //    to the cosine-nearest kept expert in the same layer.
-            if let layerId = parseTid2EidLayer(name),
-               let dropped = droppedByLayer[layerId], !dropped.isEmpty,
-               let layerGateRows = gateRows[layerId]
-            {
-                let mutated = try patchTid2Eid(
-                    inURL: inURL,
-                    absOffset: absOffset,
-                    byteCount: byteCount,
-                    shape: entry.shape,
-                    dtype: entry.dtype,
-                    dropped: dropped,
-                    keptIds: decision.keepIds[layerId],
-                    gateRows: layerGateRows)
-                writer.add(name: name,
-                           dtype: entry.dtype,
-                           shape: entry.shape,
-                           source: .data(mutated))
-                continue
-            }
-
-            // 5) Everything else: zero-copy pass-through.
-            writer.add(name: name,
-                       dtype: entry.dtype,
-                       shape: entry.shape,
-                       source: .file(url: inURL,
-                                      offset: absOffset,
-                                      byteCount: byteCount))
-        }
-
-        try writer.write(to: outURL)
+        throw NSError(domain: "ExpertRewriter", code: 99,
+                      userInfo: [NSLocalizedDescriptionKey: "Expert pruning is not supported with the new MLX backend yet."])
     }
 
     // MARK: - Tensor patches
@@ -442,38 +355,7 @@ public enum ExpertRewriter {
         nLayers: Int,
         nExperts: Int
     ) throws -> [Int: [Int: [Float]]] {
-        var out: [Int: [Int: [Float]]] = [:]
-        for L in 0..<nLayers {
-            let name = "layers.\(L).ffn.gate.weight"
-            guard let shard = weightMap[name] else { continue }
-            let shardURL = inputDir.appendingPathComponent(shard)
-            let dataStart = try readDataStart(shardURL)
-            let file = try SafeTensorsFile(url: shardURL)
-            guard let entry = file.entries[name] else { continue }
-            guard entry.shape.count == 2 else { continue }
-            let dim = entry.shape[1]
-            let bytesPerElem = bytesPerElement(forDtype: entry.dtype)
-            let bytesPerRow = dim * bytesPerElem
-            let byteCount = entry.dataOffsets[1] - entry.dataOffsets[0]
-            let absOffset = dataStart + entry.dataOffsets[0]
-            let fh = try FileHandle(forReadingFrom: shardURL)
-            defer { try? fh.close() }
-            try fh.seek(toOffset: UInt64(absOffset))
-            guard let bytes = try fh.read(upToCount: byteCount),
-                  bytes.count == byteCount else { continue }
-
-            var rows: [Int: [Float]] = [:]
-            for e in 0..<min(nExperts, entry.shape[0]) {
-                let lo = e * bytesPerRow
-                let hi = lo + bytesPerRow
-                let rowBytes = bytes.subdata(in: lo..<hi)
-                rows[e] = decodeRowAsF32(bytes: rowBytes,
-                                          dtype: entry.dtype,
-                                          count: dim)
-            }
-            out[L] = rows
-        }
-        return out
+        return [:]
     }
 
     // MARK: - Name parsing

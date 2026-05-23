@@ -23,8 +23,7 @@ public func traceTensorStats(_ name: String, _ t: Tensor) {
     precondition(t.dtype == .f32, "traceTensorStats supports f32 only; got \(t.dtype)")
     let n = t.count
     guard n > 0 else { return }
-    let p = t.buffer.contents().advanced(by: t.offset)
-        .bindMemory(to: Float.self, capacity: n)
+    let p = t.toFloatArray()
     var sumSq: Double = 0
     var sum: Double = 0
     var mn: Float = .greatestFiniteMagnitude

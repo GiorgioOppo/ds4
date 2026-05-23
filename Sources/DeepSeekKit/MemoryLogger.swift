@@ -155,7 +155,8 @@ public enum MemoryLogger {
 
     private static func currentSample() -> Sample {
         var s = Sample()
-        s.mtl = UInt64(max(0, Device.shared.mtl.currentAllocatedSize))
+        let device = MTLCreateSystemDefaultDevice()!
+        s.mtl = UInt64(max(0, device.currentAllocatedSize))
 
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(

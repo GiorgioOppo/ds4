@@ -1,8 +1,7 @@
 import Foundation
-import Metal
+import MLX
+import MLXNN
 
-/// One transformer block with HC mixing wrapping attention and FFN.
-/// Mirrors `Block` in `Reference/inference/model.py` lines 647–700.
 public final class Block {
     public let layerId: Int
     public let attn: MLA
@@ -20,20 +19,6 @@ public final class Block {
     public let hcFfnBase: Tensor
     public let hcFfnScale: Tensor
 
-    /// Optional observation hooks used by `V4CalibrationRunner`
-    /// (TODO §1). `preAttnObserver` fires with `yNorm` (the input
-    /// to MLA's wq_a / wkv) just before the attention sub-layer;
-    /// `preFfnObserver` fires with `yNorm2` (the input to the MoE
-    /// expert gates / up projections) just before the FFN
-    /// sub-layer. The closure is responsible for any
-    /// `commit + waitUntilCompleted` it needs to read the
-    /// activation bytes — it can rotate `cmd` to a fresh buffer
-    /// after sync. Default nil → zero overhead on the inference
-    /// path.
-    public typealias ObservationHook = (Tensor, inout MTLCommandBuffer) -> Void
-    public var preAttnObserver: ObservationHook?
-    public var preFfnObserver: ObservationHook?
-
     public init(layerId: Int, config: ModelConfig,
                 attn: MLA, ffn: MoEFFN,
                 attnNorm: RMSNorm, ffnNorm: RMSNorm,
@@ -49,67 +34,33 @@ public final class Block {
         self.hcFfnFn = hcFfnFn; self.hcFfnBase = hcFfnBase; self.hcFfnScale = hcFfnScale
     }
 
-    /// `x`: [B, S, hc, D] f32. Returns same shape.
-    ///
-    /// `cmd` is `inout`: both `attn` (when the indexer is enabled) and
-    /// `ffn` need to commit-and-wait mid-flight to read GPU output back to
-    /// host. They replace `cmd` with a fresh buffer on swap; the rest of
-    /// this method continues encoding into the swapped value.
-    public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int32],
-                                in cmd: inout MTLCommandBuffer) -> Tensor {
-        precondition(x.dtype == .f32 && x.shape.count == 4)
-        let B = x.shape[0], S = x.shape[1]
+    public func callAsFunction(_ x: Tensor, startPos: Int, inputIds: [Int32]) -> Tensor {
+        let B = x.shape[0]
+        let S = x.shape[1]
         let N = B * S
 
-        @inline(__always) func traceHere(_ name: String, _ t: Tensor) {
-            guard TraceFlags.normTrace && (layerId == 0 || layerId == 5 || layerId == 6) else { return }
-            cmd.commit(); cmd.waitUntilCompleted()
-            traceTensorStats("block[\(layerId)] \(name)", t)
-            cmd = Device.shared.makeCommandBuffer()
-        }
+        let xFlat = Tensor(array: x.array.reshaped([N, hcMult, dim]), dtype: x.dtype)
 
-        // ---- Attention sublayer ----
-        let xFlat = x.reshape([N, hcMult, dim])
-
-        let attnPre = hc.pre(x: xFlat, hcFn: hcAttnFn,
-                             hcScale: hcAttnScale, hcBase: hcAttnBase, in: cmd)
-        traceHere("after hc.pre(attn).y", attnPre.y)
-        traceHere("after hc.pre(attn).post", attnPre.post)
-        traceHere("after hc.pre(attn).comb", attnPre.comb)
-        // attnPre.y: [N, dim]
-        let yNorm = attnNorm(attnPre.y, in: cmd).reshape([B, S, dim])
-        traceHere("after attnNorm", yNorm)
-        // Calibration hook (TODO §1) — yNorm is the input to MLA's
-        // wq_a / wkv. The observer commits + reads + records, then
-        // rotates `cmd` to a fresh buffer via the inout.
-        preAttnObserver?(yNorm, &cmd)
-        let attnOut = attn(yNorm, startPos: startPos, in: &cmd)       // [B, S, dim]
-        traceHere("after attn (MLA returned)", attnOut)
-
-        let xMid = hc.post(x: attnOut.reshape([N, dim]),
+        let attnPre = hc.pre(x: xFlat, hcFn: hcAttnFn, hcScale: hcAttnScale, hcBase: hcAttnBase)
+        
+        let yNorm = attnNorm(attnPre.y).array.reshaped([B, S, dim])
+        
+        let attnOut = attn(Tensor(array: yNorm, dtype: .f32), startPos: startPos)
+        
+        let xMid = hc.post(x: Tensor(array: attnOut.array.reshaped([N, dim]), dtype: .f32),
                            residual: xFlat,
-                           post: attnPre.post, comb: attnPre.comb, in: cmd)
-        // BF16 round-trip on the residual stream — mirrors the reference's
-        traceHere("after hc.post(attn)", xMid)
-        // xMid: [N, hc, dim]
+                           post: attnPre.post, comb: attnPre.comb)
 
-        // ---- FFN sublayer ----
-        let ffnPre = hc.pre(x: xMid, hcFn: hcFfnFn,
-                            hcScale: hcFfnScale, hcBase: hcFfnBase, in: cmd)
-        traceHere("after hc.pre(ffn).y", ffnPre.y)
-        let yNorm2 = ffnNorm(ffnPre.y, in: cmd).reshape([B, S, dim])
-        traceHere("after ffnNorm", yNorm2)
-        // Calibration hook (TODO §1) — yNorm2 is the input to the
-        // MoE expert gate/up projections (pre-routing; every expert
-        // sees the routed subset of this, the same per-channel
-        // statistics serve all of them as an approximation).
-        preFfnObserver?(yNorm2, &cmd)
-        let ffnOut = ffn(yNorm2, inputIds: inputIds, in: &cmd)        // [B, S, dim]
-        traceHere("after ffn", ffnOut)
-        let xOut = hc.post(x: ffnOut.reshape([N, dim]),
+        let ffnPre = hc.pre(x: xMid, hcFn: hcFfnFn, hcScale: hcFfnScale, hcBase: hcFfnBase)
+        
+        let yNorm2 = ffnNorm(ffnPre.y).array.reshaped([B, S, dim])
+        
+        let ffnOut = ffn(Tensor(array: yNorm2, dtype: .f32), inputIds: inputIds)
+        
+        let xOut = hc.post(x: Tensor(array: ffnOut.array.reshaped([N, dim]), dtype: .f32),
                            residual: xMid,
-                           post: ffnPre.post, comb: ffnPre.comb, in: cmd)
-        traceHere("after hc.post(ffn)", xOut)
-        return xOut.reshape([B, S, hcMult, dim])
+                           post: ffnPre.post, comb: ffnPre.comb)
+                           
+        return Tensor(array: xOut.array.reshaped([B, S, hcMult, dim]), dtype: x.dtype)
     }
 }

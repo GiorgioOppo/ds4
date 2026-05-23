@@ -1,135 +1,56 @@
 import Foundation
-import Metal
+import MLX
+import MLXNN
 
-/// HC mixing-tensor splitter with Sinkhorn-normalized comb matrix.
-/// Mirrors `hc_split_sinkhorn` in
-/// `Reference/inference/kernel.py` lines 371–438.
 public final class HCSinkhorn {
     public let hcMult: Int
     public let sinkhornIters: Int
     public let hcEps: Float
 
-    private let pipeline: MTLComputePipelineState
-
     public init(hcMult: Int, sinkhornIters: Int, hcEps: Float) {
         self.hcMult = hcMult
         self.sinkhornIters = sinkhornIters
         self.hcEps = hcEps
-
-        // Function constants veicolati attraverso `PipelineConstants`
-        // così la pipeline viene cachata da `Device.shared.makePipeline`
-        // e condivisa fra istanze con gli stessi parametri.
-        let constants = PipelineConstants { c in
-            c.setUInt32(UInt32(hcMult), at: 4)
-            c.setUInt32(UInt32(sinkhornIters), at: 5)
-            c.setFloat(hcEps, at: 6)
-        }
-        self.pipeline = Device.shared.makePipeline(
-            "hc_split_sinkhorn_f32", constants: constants)
     }
 
     public struct Output {
-        public let pre: Tensor      // [n, hc]
-        public let post: Tensor     // [n, hc]
-        public let comb: Tensor     // [n, hc, hc]
+        public let pre: Tensor
+        public let post: Tensor
+        public let comb: Tensor
     }
 
-    /// `mixes`: [n, (2+hc)*hc] f32. `hcScale`: [3] f32. `hcBase`: [(2+hc)*hc] f32.
-    public func split(mixes: Tensor, hcScale: Tensor, hcBase: Tensor,
-                      in cmd: MTLCommandBuffer) -> Output {
-        precondition(mixes.dtype == .f32 && hcScale.dtype == .f32 && hcBase.dtype == .f32)
-        precondition(mixes.shape.count == 2)
+    public func split(mixes: Tensor, hcScale: Tensor, hcBase: Tensor) -> Output {
         let n = mixes.shape[0]
-        let mixHc = mixes.shape[1]
-        precondition(mixHc == (2 + hcMult) * hcMult)
-        precondition(hcScale.count == 3)
-        precondition(hcBase.count == mixHc)
-
-        let pre = Tensor.empty(shape: [n, hcMult], dtype: .f32)
-        let post = Tensor.empty(shape: [n, hcMult], dtype: .f32)
-        let comb = Tensor.empty(shape: [n, hcMult, hcMult], dtype: .f32)
-
-        let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(mixes.buffer, offset: mixes.offset, index: 0)
-        enc.setBuffer(hcScale.buffer, offset: hcScale.offset, index: 1)
-        enc.setBuffer(hcBase.buffer, offset: hcBase.offset, index: 2)
-        enc.setBuffer(pre.buffer, offset: 0, index: 3)
-        enc.setBuffer(post.buffer, offset: 0, index: 4)
-        enc.setBuffer(comb.buffer, offset: 0, index: 5)
-
-        // shared: hc*hc (comb) + hc (rowSum) + hc (colSum)
-        let sharedBytes = (hcMult * hcMult + 2 * hcMult) * MemoryLayout<Float>.size
-        enc.setThreadgroupMemoryLength(sharedBytes, index: 0)
-
-        let tg = MTLSize(width: hcMult * hcMult, height: 1, depth: 1)
-        enc.dispatchThreadgroups(MTLSize(width: n, height: 1, depth: 1),
-                                 threadsPerThreadgroup: tg)
-        enc.endEncoding()
-
-        return Output(pre: pre, post: post, comb: comb)
-    }
-
-    // MARK: - Pure-Swift reference (test only)
-
-    public struct CPURow {
-        public var pre: [Float]
-        public var post: [Float]
-        public var comb: [[Float]]
-    }
-
-    /// Apply the same math on host. Used as ground truth in tests.
-    public func referenceCPU(mixes: [Float], hcScale: [Float], hcBase: [Float]) -> CPURow {
         let hc = hcMult
-        precondition(mixes.count == (2 + hc) * hc)
-        precondition(hcScale.count == 3)
-        precondition(hcBase.count == (2 + hc) * hc)
-
-        var pre = [Float](repeating: 0, count: hc)
-        var post = [Float](repeating: 0, count: hc)
-        for j in 0..<hc {
-            let p = sigmoid(mixes[j] * hcScale[0] + hcBase[j]) + hcEps
-            let q = 2 * sigmoid(mixes[j + hc] * hcScale[1] + hcBase[j + hc])
-            pre[j] = p
-            post[j] = q
-        }
-
-        var comb = Array(repeating: Array(repeating: Float(0), count: hc), count: hc)
-        for j in 0..<hc {
-            for k in 0..<hc {
-                let idx = j * hc + k + 2 * hc
-                comb[j][k] = mixes[idx] * hcScale[2] + hcBase[idx]
-            }
-        }
-        // row softmax
-        for j in 0..<hc {
-            let m = comb[j].max()!
-            var s: Float = 0
-            for k in 0..<hc { comb[j][k] = exp(comb[j][k] - m); s += comb[j][k] }
-            for k in 0..<hc { comb[j][k] = comb[j][k] / s + hcEps }
-        }
-        // initial col-norm
-        for k in 0..<hc {
-            var s: Float = 0
-            for j in 0..<hc { s += comb[j][k] }
-            for j in 0..<hc { comb[j][k] /= (s + hcEps) }
-        }
-        // sinkhorn iters - 1 alternations
+        
+        let mArr = mixes.array
+        let sArr = hcScale.array
+        let bArr = hcBase.array
+        
+        let p_mix = mArr[0..., 0..<hc]
+        let q_mix = mArr[0..., hc..<(2*hc)]
+        let c_mix = mArr[0..., (2*hc)...]
+        
+        let p_base = bArr[0..<hc]
+        let q_base = bArr[hc..<(2*hc)]
+        let c_base = bArr[(2*hc)...]
+        
+        let preArr = sigmoid(p_mix * sArr[0] + p_base) + hcEps
+        let postArr = 2 * sigmoid(q_mix * sArr[1] + q_base)
+        
+        var combArr = c_mix * sArr[2] + c_base
+        combArr = combArr.reshaped([n, hc, hc])
+        
+        combArr = softmax(combArr, axis: 2) + hcEps
+        combArr = combArr / (combArr.sum(axes: [1], keepDims: true) + hcEps)
+        
         for _ in 1..<sinkhornIters {
-            for j in 0..<hc {
-                var s: Float = 0
-                for k in 0..<hc { s += comb[j][k] }
-                for k in 0..<hc { comb[j][k] /= (s + hcEps) }
-            }
-            for k in 0..<hc {
-                var s: Float = 0
-                for j in 0..<hc { s += comb[j][k] }
-                for j in 0..<hc { comb[j][k] /= (s + hcEps) }
-            }
+            combArr = combArr / (combArr.sum(axes: [2], keepDims: true) + hcEps)
+            combArr = combArr / (combArr.sum(axes: [1], keepDims: true) + hcEps)
         }
-
-        return CPURow(pre: pre, post: post, comb: comb)
+        
+        return Output(pre: Tensor(array: preArr, dtype: .f32),
+                      post: Tensor(array: postArr, dtype: .f32),
+                      comb: Tensor(array: combArr, dtype: .f32))
     }
-
-    private func sigmoid(_ x: Float) -> Float { 1.0 / (1.0 + exp(-x)) }
 }

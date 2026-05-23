@@ -50,10 +50,6 @@ struct DeepSeekUIApp: App {
         // `UserDefaults` (false for users who never touched the
         // toggle), and the "DEEPSEEK_LAZY_EXPERT=1 forces it on"
         // contract advertised in the kit comment is broken.
-        if ProcessInfo.processInfo
-            .environment["DEEPSEEK_LAZY_EXPERT"] == nil {
-            StreamingPool.lazyExpertEnabled = AppSettings.lazyExpertLoad
-        }
 
         // Bridge the UI's per-token active-expert override into
         // ModelConfig. No env-var guard needed: ModelConfig.init reads

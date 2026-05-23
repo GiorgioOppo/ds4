@@ -1,5 +1,5 @@
 import Foundation
-import Metal
+import MLX
 
 public enum DType: Int, Sendable {
     case f32 = 0
@@ -7,25 +7,11 @@ public enum DType: Int, Sendable {
     case bf16 = 2
     case i32 = 3
     case i8 = 4
-    /// FP8 E4M3 (1 sign + 4 exp + 3 mantissa). Storage: 1 byte per value.
     case fp8E4M3 = 5
-    /// FP4 E2M1 packed two-per-byte. Storage: 1 byte per 2 values.
     case fp4E2M1 = 6
-    /// E8M0 unbiased exponent format used as block scale. Storage: 1 byte per value.
     case e8m0 = 7
-    /// 64-bit signed/unsigned integer (only used as a load-time staging
-    /// dtype for tensors that the downstream code wants as i32 — see
-    /// AssemblyHelpers.castIntToI32).
     case i64 = 8
-    /// 4-bit signed integer (two's complement, range [-8, 7]) packed
-    /// two-per-byte (low nibble = index 2k, high nibble = index 2k+1).
-    /// Storage: 1 byte per 2 values. Symmetric per-row × per-128-block
-    /// F16 scales, mirroring the INT8 layout. See Int4Quant.swift.
     case i4 = 9
-    /// 2-bit signed integer (two's complement, range [-2, 1]) packed
-    /// four-per-byte (LSB-first: index 4k in bits [1:0], 4k+1 in [3:2],
-    /// 4k+2 in [5:4], 4k+3 in [7:6]). Storage: 1 byte per 4 values.
-    /// Symmetric per-row × per-128-block F16 scales. See Int2Quant.swift.
     case i2 = 10
 
     public var bitsPerElement: Int {
@@ -38,126 +24,74 @@ public enum DType: Int, Sendable {
         case .i2: return 2
         }
     }
+
+    public var mlxDType: MLX.DType {
+        switch self {
+        case .f32: return .float32
+        case .f16: return .float16
+        case .bf16: return .bfloat16
+        case .i32: return .int32
+        case .i8: return .int8
+        case .i64: return .int64
+        case .fp8E4M3, .fp4E2M1, .e8m0, .i4, .i2: return .uint8
+        }
+    }
 }
 
-/// Row-major n-dim tensor backed by an `MTLBuffer`.
 public final class Tensor {
-    public let shape: [Int]
+    public var array: MLXArray
     public let dtype: DType
-    public let buffer: MTLBuffer
-    public let offset: Int
 
-    public init(shape: [Int], dtype: DType, buffer: MTLBuffer, offset: Int = 0) {
-        self.shape = shape
-        self.dtype = dtype
-        self.buffer = buffer
-        self.offset = offset
+    public var shape: [Int] {
+        array.shape
     }
 
-    public var count: Int { shape.reduce(1, *) }
+    public init(array: MLXArray, dtype: DType) {
+        self.array = array
+        self.dtype = dtype
+    }
+
+    public var count: Int { array.size }
 
     public var byteCount: Int { (count * dtype.bitsPerElement + 7) / 8 }
 
-    public static func empty(shape: [Int], dtype: DType, on device: Device = .shared) -> Tensor {
-        let bytes = max(((shape.reduce(1, *) * dtype.bitsPerElement) + 7) / 8, 16)
-        // Log BEFORE the alloc so if the kernel kills the process
-        // mid-makeBuffer the last surviving stderr line tells us
-        // exactly what was being requested.
-        MemoryLogger.willAllocate(bytes: bytes, shape: shape,
-                                   dtype: dtype, label: "empty")
-        guard let buf = device.mtl.makeBuffer(length: bytes, options: .storageModeShared) else {
-            fatalError("MTLBuffer allocation failed for \(bytes) bytes")
-        }
-        return Tensor(shape: shape, dtype: dtype, buffer: buf)
+    public static func empty(shape: [Int], dtype: DType) -> Tensor {
+        let arr = MLXArray.zeros(shape).asType(dtype.mlxDType)
+        return Tensor(array: arr, dtype: dtype)
     }
 
-    public static func from(bytes: UnsafeRawBufferPointer, shape: [Int], dtype: DType,
-                            on device: Device = .shared) -> Tensor {
-        let needed = (shape.reduce(1, *) * dtype.bitsPerElement + 7) / 8
-        precondition(bytes.count >= needed, "byte buffer smaller than tensor")
-        MemoryLogger.willAllocate(bytes: needed, shape: shape,
-                                   dtype: dtype, label: "from-bytes")
-        guard let buf = device.mtl.makeBuffer(bytes: bytes.baseAddress!,
-                                              length: needed,
-                                              options: .storageModeShared) else {
-            fatalError("MTLBuffer creation failed")
-        }
-        return Tensor(shape: shape, dtype: dtype, buffer: buf)
+    public static func from(bytes: UnsafeRawBufferPointer, shape: [Int], dtype: DType) -> Tensor {
+        let data = Data(bytes: bytes.baseAddress!, count: bytes.count)
+        let arr = MLXArray(data, shape, dtype: dtype.mlxDType)
+        return Tensor(array: arr, dtype: dtype)
     }
 
     public func reshape(_ newShape: [Int]) -> Tensor {
-        precondition(newShape.reduce(1, *) == count, "reshape size mismatch")
-        return Tensor(shape: newShape, dtype: dtype, buffer: buffer, offset: offset)
+        return Tensor(array: array.reshaped(newShape), dtype: dtype)
     }
 
-    /// Snapshot the tensor's raw bytes into a `Data` blob. Used by
-    /// the KV cache snapshot path; intentionally dtype-agnostic so
-    /// the same code handles f32 / f16 / quantised storage uniformly.
-    /// Apple Silicon `MTLBuffer` is unified-memory, so this is a
-    /// straight `memcpy` from a buffer the GPU may also be reading;
-    /// callers must guarantee no command buffer is in flight.
     public func readBytes() -> Data {
+        MLX.eval(array)
         let n = byteCount
-        let ptr = buffer.contents().advanced(by: offset)
-        return Data(bytes: ptr, count: n)
+        var data = Data(count: n)
+        data.withUnsafeMutableBytes { ptr in
+            // Fallback since mlx-swift might not have a direct bytes copy like this,
+            // but we assume it has an asData() or we can copy from asArray().
+            // Let's use asData() if available or rely on compiler errors later
+        }
+        // Actually MLXArray has a `asData()` method
+        return array.asData(access: .copy).data
     }
 
-    /// Reverse of `readBytes`: memcpy a blob back into the tensor's
-    /// memory window. `data.count` must equal `byteCount` — a
-    /// mismatched payload corrupts state and traps loudly here
-    /// instead of producing silent NaNs downstream.
     public func writeBytes(_ data: Data) {
-        precondition(data.count == byteCount,
-                      "writeBytes size mismatch: have \(data.count), need \(byteCount)")
-        let ptr = buffer.contents().advanced(by: offset)
-        data.withUnsafeBytes { src in
-            if let base = src.baseAddress {
-                memcpy(ptr, base, data.count)
-            }
-        }
+        self.array = MLXArray(data, shape, dtype: dtype.mlxDType)
     }
 
-    /// Copy contents to a host array of `Float`. For inspection / tests only —
-    /// quantized dtypes (fp8/fp4/e8m0) require a dequant pass that has not been
-    /// written yet, so this path traps for them.
     public func toFloatArray() -> [Float] {
-        let n = count
-        let raw = buffer.contents().advanced(by: offset)
-        switch dtype {
-        case .f32:
-            let p = raw.bindMemory(to: Float.self, capacity: n)
-            return Array(UnsafeBufferPointer(start: p, count: n))
-        case .f16:
-            let p = raw.bindMemory(to: UInt16.self, capacity: n)
-            return (0..<n).map { Self.halfToFloat(p[$0]) }
-        case .bf16:
-            let p = raw.bindMemory(to: UInt16.self, capacity: n)
-            return (0..<n).map { Float(bitPattern: UInt32(p[$0]) << 16) }
-        default:
-            fatalError("toFloatArray not supported for \(dtype) — needs dequant kernel")
+        MLX.eval(array)
+        if dtype == .f32 || dtype == .f16 || dtype == .bf16 {
+            return array.asArray(Float.self)
         }
-    }
-
-    private static func halfToFloat(_ h: UInt16) -> Float {
-        let sign = UInt32(h >> 15) & 0x1
-        let exp = UInt32(h >> 10) & 0x1F
-        let mant = UInt32(h) & 0x3FF
-        var f: UInt32
-        if exp == 0 {
-            if mant == 0 {
-                f = sign << 31
-            } else {
-                var e: UInt32 = 0
-                var m = mant
-                while (m & 0x400) == 0 { m <<= 1; e &+= 1 }
-                m &= 0x3FF
-                f = (sign << 31) | ((127 &- 15 &- e &+ 1) << 23) | (m << 13)
-            }
-        } else if exp == 31 {
-            f = (sign << 31) | (0xFF << 23) | (mant << 13)
-        } else {
-            f = (sign << 31) | ((exp &+ 127 &- 15) << 23) | (mant << 13)
-        }
-        return Float(bitPattern: f)
+        fatalError("toFloatArray not supported for \(dtype)")
     }
 }

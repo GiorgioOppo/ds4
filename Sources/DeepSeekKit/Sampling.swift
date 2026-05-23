@@ -4,6 +4,7 @@ import Accelerate
 #if canImport(Darwin)
 import Darwin
 #endif
+import MLX
 
 /// Mix wall-clock nanoseconds + pid into a 64-bit LCG seed. Avoids
 /// the trap where two runs of the CLI with `--temperature > 0` would
@@ -169,116 +170,18 @@ public struct SamplingOptions {
 /// vocabSize-length logits buffer is essentially free and avoids new
 /// Metal kernels.
 public enum Sampler {
-    private static let argmaxP = Device.shared.makePipeline("argmax_f32")
-    private static let argmax1P = Device.shared.makePipeline("argmax_f32_stage1")
-    private static let argmax2P = Device.shared.makePipeline("argmax_f32_stage2")
-    private static let tempP = Device.shared.makePipeline("apply_temperature")
 
-    /// Soglia oltre cui l'argmax usa il path multi-stage. Sotto, il
-    /// single-threadgroup kernel è già abbastanza veloce. Empirico:
-    /// per V < 8192 il dispatch overhead supera il guadagno della
-    /// parallelizzazione fra threadgroup.
-    private static let argmaxMultiStageThreshold = 8192
-
-    /// Dimensione del tile per il path multi-stage. Ogni threadgroup
-    /// gestisce `argmaxTileSize` elementi. Per V=130k → 64
-    /// threadgroup paralleli (= sufficienti per saturare una Apple
-    /// GPU da 10-40 core).
-    private static let argmaxTileSize = 2048
-
-    /// Greedy argmax. GPU-side reduction.
-    ///
-    /// Per V piccolo usa un singolo threadgroup (256 thread).
-    /// Per V grande (≥ 8192 logit) usa multi-stage:
-    ///   - Stage 1: M = ceil(V/2048) threadgroup paralleli, ognuno
-    ///     produce il proprio (val, idx) parziale.
-    ///   - Stage 2: 1 threadgroup riduce gli M parziali al risultato
-    ///     finale.
-    /// Su vocab 130k passa da ~1 shader core attivo a ~M core,
-    /// riducendo la latenza dell'argmax di ~5-8×.
     public static func argmax(_ logits: Tensor) -> Int {
         precondition(logits.dtype == .f32 && logits.shape.count == 2 && logits.shape[0] == 1)
-        let V = logits.shape[1]
-        let outBuf = Device.shared.mtl.makeBuffer(length: 4, options: .storageModeShared)!
-
-        if V < argmaxMultiStageThreshold {
-            // Path singolo threadgroup (legacy).
-            let cmd = Device.shared.queue.makeCommandBuffer()!
-            let enc = cmd.makeComputeCommandEncoder()!
-            enc.setComputePipelineState(argmaxP)
-            enc.setBuffer(logits.buffer, offset: logits.offset, index: 0)
-            enc.setBuffer(outBuf, offset: 0, index: 1)
-            var v = UInt32(V)
-            enc.setBytes(&v, length: 4, index: 2)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            enc.endEncoding()
-            cmd.commit(); cmd.waitUntilCompleted()
-            return Int(outBuf.contents().load(as: UInt32.self))
-        }
-
-        // Path multi-stage.
-        let tileSize = argmaxTileSize
-        let M = (V + tileSize - 1) / tileSize
-        // Buffer per i (val, idx) parziali. private storage va bene
-        // — il bufer è prodotto e consumato dalla GPU, mai letto dal
-        // host.
-        let partVBuf = Device.shared.mtl.makeBuffer(
-            length: M * MemoryLayout<Float>.size, options: .storageModePrivate)!
-        let partIBuf = Device.shared.mtl.makeBuffer(
-            length: M * MemoryLayout<UInt32>.size, options: .storageModePrivate)!
-
-        let cmd = Device.shared.queue.makeCommandBuffer()!
-
-        // Stage 1.
-        let enc1 = cmd.makeComputeCommandEncoder()!
-        enc1.setComputePipelineState(argmax1P)
-        enc1.setBuffer(logits.buffer, offset: logits.offset, index: 0)
-        enc1.setBuffer(partVBuf, offset: 0, index: 1)
-        enc1.setBuffer(partIBuf, offset: 0, index: 2)
-        var dims = SIMD2<UInt32>(UInt32(V), UInt32(tileSize))
-        enc1.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 3)
-        let simdW1 = argmax1P.threadExecutionWidth
-        let tg1 = max(simdW1, min(256, argmax1P.maxTotalThreadsPerThreadgroup))
-        enc1.dispatchThreadgroups(MTLSize(width: M, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: tg1, height: 1, depth: 1))
-        enc1.endEncoding()
-
-        // Stage 2.
-        let enc2 = cmd.makeComputeCommandEncoder()!
-        enc2.setComputePipelineState(argmax2P)
-        enc2.setBuffer(partVBuf, offset: 0, index: 0)
-        enc2.setBuffer(partIBuf, offset: 0, index: 1)
-        enc2.setBuffer(outBuf, offset: 0, index: 2)
-        var m32 = UInt32(M)
-        enc2.setBytes(&m32, length: 4, index: 3)
-        let simdW2 = argmax2P.threadExecutionWidth
-        let tg2 = max(simdW2, min(M, 256))
-        enc2.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: tg2, height: 1, depth: 1))
-        enc2.endEncoding()
-
-        cmd.commit(); cmd.waitUntilCompleted()
-        return Int(outBuf.contents().load(as: UInt32.self))
+        MLX.eval(logits.array)
+        return MLX.argMax(logits.array, axis: 1).item(Int.self)
     }
 
-    /// In-place GPU temperature scaling. T == 0 leaves logits untouched
-    /// (caller should switch to argmax).
     public static func applyTemperature(_ logits: Tensor, _ T: Float) {
         precondition(logits.dtype == .f32)
         if T == 0.0 { return }
-        let V = logits.count
-        let cmd = Device.shared.queue.makeCommandBuffer()!
-        let enc = cmd.makeComputeCommandEncoder()!
-        enc.setComputePipelineState(tempP)
-        enc.setBuffer(logits.buffer, offset: logits.offset, index: 0)
-        var v = UInt32(V); var t = T
-        enc.setBytes(&v, length: 4, index: 1)
-        enc.setBytes(&t, length: 4, index: 2)
-        enc.dispatchThreads(MTLSize(width: V, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-        enc.endEncoding()
-        cmd.commit(); cmd.waitUntilCompleted()
+        logits.array = logits.array / MLXArray(T)
+        MLX.eval(logits.array)
     }
 
     /// Full sampling pipeline. Reads the logits buffer to host once and

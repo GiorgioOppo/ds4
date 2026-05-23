@@ -129,45 +129,8 @@ public enum VocabRewriter {
                                        outURL: URL,
                                        decision: KeepDecision,
                                        cancellation: CancellationToken? = nil) throws {
-        let dataStart = try readDataStart(inURL)
-        let file = try SafeTensorsFile(url: inURL)
-        let writer = SafeTensorsWriter()
-
-        // Ordine deterministico per riproducibilità.
-        let names = file.entries.keys.sorted()
-        for name in names {
-            if shouldSkipTensor(name) { continue }
-            let entry = file.entries[name]!
-            let byteCount = entry.dataOffsets[1] - entry.dataOffsets[0]
-            let absOffset = dataStart + entry.dataOffsets[0]
-
-            if isVocabTensor(name) {
-                // Riga-wise slicing: shape originale [vocabSize, dim].
-                let sliced = try sliceVocabTensor(
-                    inURL: inURL,
-                    absOffset: absOffset,
-                    byteCount: byteCount,
-                    originalShape: entry.shape,
-                    dtype: entry.dtype,
-                    decision: decision,
-                    cancellation: cancellation)
-                let newShape = [decision.newVocabSize] + Array(entry.shape.dropFirst())
-                writer.add(name: name,
-                           dtype: entry.dtype,
-                           shape: newShape,
-                           source: .data(sliced))
-            } else {
-                // Pass-through: zero-copy stream da file originale.
-                writer.add(name: name,
-                           dtype: entry.dtype,
-                           shape: entry.shape,
-                           source: .file(url: inURL,
-                                          offset: absOffset,
-                                          byteCount: byteCount))
-            }
-        }
-
-        try writer.write(to: outURL)
+        throw NSError(domain: "VocabRewriter", code: 99,
+                      userInfo: [NSLocalizedDescriptionKey: "Vocab pruning is not supported with the new MLX backend yet."])
     }
 
     /// Slice riga-wise di un tensor `[vocabSize, dim]`. Per ogni

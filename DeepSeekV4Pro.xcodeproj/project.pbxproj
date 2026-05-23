@@ -14,7 +14,6 @@
 		06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC2A8ACE3A361FA6EC18B8AB /* QuantizationSettingsTab.swift */; };
 		0A5DDE8166FB32D1596B8E5F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0222470499767FD248FF1AD2 /* ChatView.swift */; };
 		0C243435F5B0CD1136F3F76D /* ProjectRootBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */; };
-		F1E2D3C4B5A6789012345670 /* ProjectSourceAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */; };
 		0C71E6B97980C7FE109B5F24 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70E0AEC478A0A308F7B1FDA9 /* KeychainStore.swift */; };
 		0C7A64D3A626579E1052CD1F /* FineTuneSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1D364357AE00BBF63AF90D1 /* FineTuneSheet.swift */; };
 		1312A4CB4E9EB301D2D26A7C /* PlaygroundViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A228296203BF2B3BB9FCF75D /* PlaygroundViewModel.swift */; };
@@ -54,6 +53,7 @@
 		678F688995F1160F9519D2A9 /* ModePickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6FD2C6B3C2972A072636DB4 /* ModePickerView.swift */; };
 		686A0171CFCBEC545FC7226D /* ProjectLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AA040733C8FD59ADFE80BA8 /* ProjectLibrary.swift */; };
 		6ABBC4FDDBBCBF35CAC4FD30 /* ConvertSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D976460FAD6CBD28E89C31F1 /* ConvertSheet.swift */; };
+		7319057B12DFE20C7E288C78 /* ProjectSourceAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5CC6BDB0CA960B2F47DFB00 /* ProjectSourceAccess.swift */; };
 		771F6059B5362D38BD212802 /* MCPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71BDF7645DAE4BCD8DBC3717 /* MCPClient.swift */; };
 		7FDF0D8C2FE390D409A794DC /* KeybindingsSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = F69DA699B1A59D3590114BF6 /* KeybindingsSettingsTab.swift */; };
 		83C9F3BDACD9F3039105B607 /* LocalServerRoutes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50CD19FC70AF54AE9BBD48EA /* LocalServerRoutes.swift */; };
@@ -111,7 +111,6 @@
 		0327803E71CE18066FBAAE1E /* MessageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageView.swift; sourceTree = "<group>"; };
 		09F5D228AC2E872A59FD6E74 /* VocabPrunerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VocabPrunerSheet.swift; sourceTree = "<group>"; };
 		0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectRootBuilder.swift; sourceTree = "<group>"; };
-		F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSourceAccess.swift; sourceTree = "<group>"; };
 		0C96B656B104FD6FD206B3B2 /* PlaygroundSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaygroundSheet.swift; sourceTree = "<group>"; };
 		0DCFEE82C5F93850A799F110 /* MCPServerLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPServerLibrary.swift; sourceTree = "<group>"; };
 		0F59E70898C61471DF21D787 /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
@@ -174,6 +173,7 @@
 		B17DC49FABAFA7A8B83F9939 /* ComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerView.swift; sourceTree = "<group>"; };
 		B3BFD382D52977A9FE8E042A /* ModelEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelEndpoint.swift; sourceTree = "<group>"; };
 		B4E92C856251084CD5727C57 /* ThemeSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeSettingsTab.swift; sourceTree = "<group>"; };
+		B5CC6BDB0CA960B2F47DFB00 /* ProjectSourceAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSourceAccess.swift; sourceTree = "<group>"; };
 		BA1CC3884BE367159F9C97AA /* ProjectInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectInventory.swift; sourceTree = "<group>"; };
 		BBD17F53285E256E1A1640C4 /* AgentsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsView.swift; sourceTree = "<group>"; };
 		C67844A75862EBB88ED91310 /* PermissionSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionSheet.swift; sourceTree = "<group>"; };
@@ -266,7 +266,7 @@
 				92D4D689386B87F267B6BE6E /* PersistencePaths.swift */,
 				F7070411545DE289BB1571C6 /* ProjectIndexer.swift */,
 				0AF301067D195094815BFAE7 /* ProjectRootBuilder.swift */,
-				F2E3D4C5B6A7891023456701 /* ProjectSourceAccess.swift */,
+				B5CC6BDB0CA960B2F47DFB00 /* ProjectSourceAccess.swift */,
 			);
 			path = Utility;
 			sourceTree = "<group>";
@@ -544,6 +544,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				7CACE61D61408D8AEF1709A3 /* XCLocalSwiftPackageReference "." */,
+				E22CE85D2FC1922800C78715 /* XCRemoteSwiftPackageReference "mlx-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 3390AC43A61A45EFE5657946 /* Products */;
@@ -641,7 +642,7 @@
 				686A0171CFCBEC545FC7226D /* ProjectLibrary.swift in Sources */,
 				F1E63116F8615E12F4501407 /* ProjectOverlay.swift in Sources */,
 				0C243435F5B0CD1136F3F76D /* ProjectRootBuilder.swift in Sources */,
-				F1E2D3C4B5A6789012345670 /* ProjectSourceAccess.swift in Sources */,
+				7319057B12DFE20C7E288C78 /* ProjectSourceAccess.swift in Sources */,
 				038F8906252DF293DFABB854 /* ProjectsView.swift in Sources */,
 				06754A66A5B9B254EA34DF05 /* QuantizationSettingsTab.swift in Sources */,
 				D88A4DD03F9320774C711177 /* ReasoningDisclosure.swift in Sources */,
@@ -735,21 +736,20 @@
 				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Sources/DeepSeekUI/Resources/DeepSeekUI.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/DeepSeekUI/Resources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = DeeSpeekUI;
+				INFOPLIST_KEY_CFBundleDisplayName = DeepSeekUI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.v4pro.ui;
 				PRODUCT_NAME = DeepSeekUI;
 				SDKROOT = macosx;
@@ -762,21 +762,20 @@
 				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Sources/DeepSeekUI/Resources/DeepSeekUI.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_APP_SANDBOX = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/DeepSeekUI/Resources/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = DeeSpeekUI;
+				INFOPLIST_KEY_CFBundleDisplayName = DeepSeekUI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.deepseek.v4pro.ui;
 				PRODUCT_NAME = DeepSeekUI;
 				SDKROOT = macosx;
@@ -882,6 +881,17 @@
 			relativePath = .;
 		};
 /* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		E22CE85D2FC1922800C78715 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.31.3;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		107A8CC2762D532528470F71 /* DeepSeekIntegrations */ = {

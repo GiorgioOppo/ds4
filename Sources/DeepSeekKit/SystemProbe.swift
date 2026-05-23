@@ -59,7 +59,7 @@ public enum SystemProbe {
     /// the user can correlate jetsam events with a model that exceeds
     /// this number.
     public static func mtlRecommendedWorkingSet() -> UInt64 {
-        Device.shared.mtl.recommendedMaxWorkingSetSize
+        MTLCreateSystemDefaultDevice()!.recommendedMaxWorkingSetSize
     }
 
     /// Cap for how many shards we read in parallel when preloading. A
@@ -103,7 +103,7 @@ public enum SystemProbe {
     /// Marketing string esposta da `MTLDevice.name`. Su Apple Silicon
     /// è la forma "Apple M<N> [Pro|Max|Ultra]" o "Apple M<N>".
     public static func gpuName() -> String {
-        Device.shared.mtl.name
+        MTLCreateSystemDefaultDevice()!.name
     }
 
     /// Tabella interna chip → numero di GPU core, esposta `internal`
