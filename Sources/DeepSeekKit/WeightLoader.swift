@@ -111,14 +111,28 @@ public final class WeightLoader {
         }
         
         // Identify global (non-layer) tensors and pre-load them.
-        // These are small relative to total model size.
+        // "Global" = always-resident. Includes the embed/lm_head/top-
+        // level norm/hc_head params that every token needs.
+        //
+        // EXPLICITLY EXCLUDE:
+        //   - `layers.*` — those are streamed per-layer in forward.
+        //   - `mtp.*`    — MTP layers carry a full transformer block
+        //                  (256 routed experts, MLA, etc. ≈ 6 GB per
+        //                  block on V4-Pro). They are NOT invoked by
+        //                  the current `Transformer.forward` (mtp:
+        //                  [] passed in Assembly.load), so preloading
+        //                  them just pins 6 GB resident forever and
+        //                  was a major contributor to the >25 GB
+        //                  peak the user observed.
+        //   - `compressor.*`/`indexer.*` at top level — same reason,
+        //                  not wired in the current MLX forward.
         for name in index.keys {
-            if !name.hasPrefix("layers.") {
-                globalNames.insert(name)
-            }
+            if name.hasPrefix("layers.") { continue }
+            if name.hasPrefix("mtp.") { continue }
+            globalNames.insert(name)
         }
-        
-        // Pre-load global tensors (embed, head, norm, hc_head_*)
+
+        // Pre-load global tensors (embed, head, norm, hc_head_*).
         preloadTensors(names: globalNames)
     }
     
@@ -240,13 +254,41 @@ public final class WeightLoader {
 
     private func ensureNames(_ toLoad: [(String, TensorMeta)]) {
         guard !toLoad.isEmpty else { return }
-        DispatchQueue.concurrentPerform(iterations: toLoad.count) { i in
-            let (name, meta) = toLoad[i]
-            guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
-            self.cacheLock.lock()
-            self.cache[name] = arr
-            self.cacheLock.unlock()
+        // Bound concurrent disk reads. `DispatchQueue.concurrentPerform`
+        // fans out to `iterations` workers in parallel — for a bulk
+        // load of 256 routed experts × 6 tensors (≈ 1500 items) every
+        // outstanding read holds a `Data` buffer in RAM until the
+        // MLXArray copy completes, so the in-flight buffer total can
+        // approach the sum of every tensor still to load. Cap the
+        // fan-out so the transient peak is bounded by
+        // `maxConcurrent × avg_tensor_size`. Override via
+        // DEEPSEEK_LOAD_CONCURRENCY.
+        let maxConcurrent: Int = {
+            if let raw = ProcessInfo.processInfo.environment["DEEPSEEK_LOAD_CONCURRENCY"],
+               let n = Int(raw), n >= 1 { return n }
+            return 8
+        }()
+
+        let semaphore = DispatchSemaphore(value: maxConcurrent)
+        let group = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .userInitiated)
+
+        for (name, meta) in toLoad {
+            semaphore.wait()
+            group.enter()
+            queue.async { [weak self] in
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+                guard let self = self else { return }
+                guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
+                self.cacheLock.lock()
+                self.cache[name] = arr
+                self.cacheLock.unlock()
+            }
         }
+        group.wait()
     }
 
     /// Load layer `K`'s non-routed-expert tensors into cache. Called by

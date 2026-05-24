@@ -151,69 +151,68 @@ public final class MoEFFN {
         MLX.eval(counts)
         let countsArr = counts.asArray(Int32.self)
 
-        // Active expert list for this batch. Per-expert streaming only
-        // pays off when the active set is much smaller than
-        // `nRoutedExperts`. With N=128 prefill tokens × topK=8 = 1024
-        // routings across 256 experts, by pigeonhole nearly every
-        // expert gets some traffic — `activeExperts` ≈ nExperts. In
-        // that regime "stream only what's active" reduces to "stream
-        // all 256 individually", which is the worst of both worlds:
-        // full memory footprint AND maximum disk I/O contention. Use
-        // the decode path (N==1, topK=8 active) for the win it was
-        // designed for, and bulk-load the full routed set on prefill.
+        // Active expert list for this batch.
         var activeExperts: [Int] = []
         for e in 0..<nExperts {
             if countsArr[e] > 0, experts[e] != nil {
                 activeExperts.append(e)
             }
         }
-        let bulkLoad = (N > 1)
-        let toLoad: [Int] = bulkLoad
-            ? (0..<nExperts).filter { experts[$0] != nil }
-            : activeExperts
-        weightLoader?.ensureExperts(layer: layerId, indices: toLoad)
+        // Chunk size for the expert dispatch loop. In prefill the active
+        // set may cover most/all of `nRoutedExperts` (256 on V4-Pro,
+        // each ~24 MB of FP4 weights); bulk-loading the lot would pin
+        // ~6 GB of routed-expert weights resident for the whole
+        // dispatch. Chunking caps the resident routed footprint at
+        // `chunkSize × per-expert-size` (32 → ~768 MB) at the cost of
+        // re-issuing the disk fetch per chunk. Decode (N==1) bypasses
+        // chunking and falls back to per-expert load.
+        let chunkSize: Int = {
+            if let raw = ProcessInfo.processInfo.environment["DEEPSEEK_MOE_CHUNK_EXPERTS"],
+               let n = Int(raw), n > 0 { return n }
+            return 32
+        }()
 
         var yFlat = MLXArray.zeros([N, dim]).asType(x.array.dtype)
 
-        for e in activeExperts {
-            // We already filtered out nil entries above.
-            let expert = experts[e]!
+        var dispatchOffset = 0
+        while dispatchOffset < activeExperts.count {
+            let dispatchEnd = min(dispatchOffset + chunkSize, activeExperts.count)
+            let chunk = Array(activeExperts[dispatchOffset..<dispatchEnd])
 
-            // Per-token weight for expert e: sum(weights * (indices==e)) over topK.
-            // The reference's `weights[idx, top, None]` indexing collapses to
-            // exactly this when each token routes each expert at most once,
-            // which holds for V4 (topk picks distinct expert ids).
-            let mask = (indices .== e).asType(weights.dtype)   // [N, topK]
-            let perTokenW = (weights * mask).sum(axes: [1])    // [N]
+            // Pull only this chunk's experts in from disk (parallel
+            // load bounded by WeightLoader's load-concurrency cap).
+            weightLoader?.ensureExperts(layer: layerId, indices: chunk)
 
-            let expertOut = expert(xFlat).array                // [N, dim]
-            yFlat = yFlat + expertOut * perTokenW.expandedDimensions(axes: [1])
+            for e in chunk {
+                // We already filtered out nil entries above.
+                let expert = experts[e]!
 
-            // In the prefill/bulk-load path we materialize after every
-            // expert. The lazy graph would otherwise hold the
-            // dequantized weight temporary (~30–60 MB at bf16 for a
-            // 4096×4096 expert) AND the matmul output for every iter
-            // simultaneously — for the full 256-expert layer that's
-            // ~15 GB of transient live in addition to the 6 GB of
-            // resident expert weights, which is what pushed peak RAM
-            // to >25 GB. Decode (per-expert streaming) doesn't need
-            // this since `activeExperts.count` is at most `topK`.
-            if bulkLoad {
+                // Per-token weight for expert e: sum(weights * (indices==e))
+                // over topK. The reference's `weights[idx, top, None]`
+                // indexing collapses to exactly this when each token
+                // routes each expert at most once, which holds for V4.
+                let mask = (indices .== e).asType(weights.dtype)   // [N, topK]
+                let perTokenW = (weights * mask).sum(axes: [1])    // [N]
+
+                let expertOut = expert(xFlat).array                // [N, dim]
+                yFlat = yFlat + expertOut * perTokenW.expandedDimensions(axes: [1])
+
+                // Materialize after every expert to keep the dequant
+                // temporary (~30–60 MB at bf16) from accumulating in
+                // the lazy graph. Without this MLX could hold all
+                // `chunkSize` experts' temps live for the whole
+                // dispatch chunk.
                 MLX.eval(yFlat)
-                MLX.GPU.clearCache()
             }
+
+            // Release this chunk's experts before loading the next.
+            // This is what bounds the resident routed-expert
+            // footprint per layer to `chunkSize × per-expert-size`.
+            weightLoader?.releaseExperts(layer: layerId, indices: chunk)
+            MLX.GPU.clearCache()
+
+            dispatchOffset = dispatchEnd
         }
-        // Materialize before releasing weights — MLX is lazy and the
-        // unevaluated expert(xFlat) graph nodes still reference the
-        // MLXArrays we're about to drop.
-        MLX.eval(yFlat)
-        weightLoader?.releaseExperts(layer: layerId, indices: toLoad)
-        // Drain MLX's buffer pool: the dequantized weight temporaries
-        // for each of `topK` experts (~30–60 MB at bf16 for a 4096×4096
-        // expert linear) are otherwise retained for reuse, and on a
-        // tight-RAM run the high-water-mark stays elevated even
-        // though our cache says the experts are gone.
-        MLX.GPU.clearCache()
 
         let sharedOut = sharedExpert(xFlat).array
         yFlat = yFlat + sharedOut
