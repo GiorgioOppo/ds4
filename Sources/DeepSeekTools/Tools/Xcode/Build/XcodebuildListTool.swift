@@ -9,15 +9,15 @@ public struct XcodebuildListTool: Tool {
         ToolSchema(
             name: "xcodebuild_list",
             description:
-                "List schemes, targets, and build configurations in an Xcode project or workspace. " +
-                "Provide either 'workspace' (.xcworkspace) or 'project' (.xcodeproj); if neither, " +
-                "xcodebuild auto-detects in the agent root. JSON output by default.",
+                "Elenca scheme, target e configurazioni di build in un progetto Xcode o workspace. " +
+                "Fornisci 'workspace' (.xcworkspace) o 'project' (.xcodeproj); se nessuno dei due, " +
+                "xcodebuild rileva automaticamente nella root dell'agente. Output JSON per default.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "workspace": SchemaBuilder.string(description: "Path to .xcworkspace, relative to agent root."),
-                    "project": SchemaBuilder.string(description: "Path to .xcodeproj, relative to agent root."),
-                    "json": SchemaBuilder.boolean(description: "Emit JSON. Default true.", defaultValue: true),
+                    "workspace": SchemaBuilder.string(description: "Path del .xcworkspace, relativo alla root dell'agente."),
+                    "project": SchemaBuilder.string(description: "Path del .xcodeproj, relativo alla root dell'agente."),
+                    "json": SchemaBuilder.boolean(description: "Emette JSON. Default true.", defaultValue: true),
                 ]
             )
         )

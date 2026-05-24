@@ -10,14 +10,14 @@ public struct OtoolInfoTool: Tool {
         ToolSchema(
             name: "otool_info",
             description:
-                "Inspect a Mach-O binary. 'mode' picks the section: " +
+                "Ispeziona un binario Mach-O. 'mode' seleziona la sezione: " +
                 "'header' (-h), 'loadcommands' (-l), 'libraries' (-L), 'symbols' (-Iv), 'archs' (-fh).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Mach-O binary path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del binario Mach-O, relativo alla root dell'agente."),
                     "mode": SchemaBuilder.string(
-                        description: "What to dump. Default 'header'.",
+                        description: "Cosa fare il dump. Default 'header'.",
                         enumValues: ["header", "loadcommands", "libraries", "symbols", "archs"]),
                 ],
                 required: ["path"]

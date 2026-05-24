@@ -7,11 +7,11 @@ public struct SimctlUninstallTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "simctl_uninstall",
-            description: "Uninstall an app from a simulator.",
+            description: "Disinstalla un'app da un simulator.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "UDID, name, or 'booted'."),
+                    "device": SchemaBuilder.string(description: "UDID, nome, o 'booted'."),
                     "bundleId": SchemaBuilder.string(description: "Bundle identifier."),
                 ],
                 required: ["device", "bundleId"]

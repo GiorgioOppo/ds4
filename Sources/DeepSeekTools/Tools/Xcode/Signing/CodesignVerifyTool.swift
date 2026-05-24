@@ -11,15 +11,15 @@ public struct CodesignVerifyTool: Tool {
         ToolSchema(
             name: "codesign_verify",
             description:
-                "Verify the code signature of a binary or .app bundle. " +
-                "Returns exit 0 + 'satisfies its Designated Requirement' on success; " +
-                "non-zero exit + details on failure.",
+                "Verifica la firma di codice di un binario o bundle .app. " +
+                "Restituisce exit 0 + 'satisfies its Designated Requirement' in caso di successo; " +
+                "exit non zero + dettagli in caso di fallimento.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Binary or .app path, relative to agent root."),
-                    "strict": SchemaBuilder.boolean(description: "--strict flag. Default false.", defaultValue: false),
-                    "deep": SchemaBuilder.boolean(description: "--deep flag (recurse). Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Path del binario o .app, relativo alla root dell'agente."),
+                    "strict": SchemaBuilder.boolean(description: "Flag --strict. Default false.", defaultValue: false),
+                    "deep": SchemaBuilder.boolean(description: "Flag --deep (ricorsivo). Default false.", defaultValue: false),
                 ],
                 required: ["path"]
             )

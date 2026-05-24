@@ -10,15 +10,15 @@ public struct SimctlListTool: Tool {
         ToolSchema(
             name: "simctl_list",
             description:
-                "Inventory simulators, runtimes (iOS / visionOS / watchOS / tvOS), device types, and " +
-                "device pairs. Pick the 'category' to scope output.",
+                "Inventario di simulator, runtime (iOS / visionOS / watchOS / tvOS), tipi di device e " +
+                "coppie di device. Scegli 'category' per restringere l'output.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "category": SchemaBuilder.string(
-                        description: "Category to list. Default 'devices'.",
+                        description: "Categoria da elencare. Default 'devices'.",
                         enumValues: ["devices", "devicetypes", "runtimes", "pairs", "all"]),
-                    "json": SchemaBuilder.boolean(description: "Emit JSON. Default true.", defaultValue: true),
+                    "json": SchemaBuilder.boolean(description: "Emette JSON. Default true.", defaultValue: true),
                 ]
             )
         )

@@ -13,18 +13,18 @@ public struct XcresulttoolGetTool: Tool {
         ToolSchema(
             name: "xcresulttool_get",
             description:
-                "Extract data from a .xcresult bundle. " +
-                "'kind' picks: 'summary' (test-results summary), 'tests' (full test-results JSON), " +
-                "'object' (raw object graph — legacy Xcode 15 style, requires 'id'), " +
+                "Estrae dati da un bundle .xcresult. " +
+                "'kind' seleziona: 'summary' (riepilogo dei test-results), 'tests' (JSON completo dei test-results), " +
+                "'object' (object graph raw — stile legacy Xcode 15, richiede 'id'), " +
                 "'log' (build log).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "xcresultPath": SchemaBuilder.string(description: ".xcresult bundle, relative to agent root."),
+                    "xcresultPath": SchemaBuilder.string(description: "Bundle .xcresult, relativo alla root dell'agente."),
                     "kind": SchemaBuilder.string(
-                        description: "What to extract. Default 'summary'.",
+                        description: "Cosa estrarre. Default 'summary'.",
                         enumValues: ["summary", "tests", "object", "log"]),
-                    "id": SchemaBuilder.string(description: "Object id (for kind='object')."),
+                    "id": SchemaBuilder.string(description: "Id dell'oggetto (per kind='object')."),
                 ],
                 required: ["xcresultPath"]
             )

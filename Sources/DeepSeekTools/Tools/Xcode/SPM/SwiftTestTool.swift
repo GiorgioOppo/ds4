@@ -9,18 +9,18 @@ public struct SwiftTestTool: Tool {
         ToolSchema(
             name: "swift_test",
             description:
-                "Run the tests of a Swift Package Manager package (XCTest and Swift Testing both work). " +
-                "Use this for a package with Package.swift — no scheme or destination needed. " +
-                "For tests inside an Xcode project use 'xcodebuild_test' (which requires scheme + destination). " +
-                "'filter' is forwarded to --filter (regex). 'parallel' enables --parallel.",
+                "Esegue i test di un pacchetto Swift Package Manager (funzionano sia XCTest sia Swift Testing). " +
+                "Usalo per un pacchetto con Package.swift — non serve scheme né destination. " +
+                "Per test dentro un progetto Xcode usa 'xcodebuild_test' (che richiede scheme + destination). " +
+                "'filter' viene passato a --filter (regex). 'parallel' abilita --parallel.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "packagePath": SchemaBuilder.string(description: "Directory containing Package.swift. Default agent root."),
-                    "filter": SchemaBuilder.string(description: "Regex passed to --filter."),
-                    "parallel": SchemaBuilder.boolean(description: "Run tests in parallel. Default false.", defaultValue: false),
+                    "packagePath": SchemaBuilder.string(description: "Directory contenente Package.swift. Default: root dell'agente."),
+                    "filter": SchemaBuilder.string(description: "Regex passata a --filter."),
+                    "parallel": SchemaBuilder.boolean(description: "Esegue i test in parallelo. Default false.", defaultValue: false),
                     "configuration": SchemaBuilder.string(
-                        description: "Build configuration. Default debug.",
+                        description: "Configurazione di build. Default debug.",
                         enumValues: ["debug", "release"]),
                     "timeoutSeconds": SchemaBuilder.integer(description: "Timeout. Default 900.", minimum: 1),
                 ]

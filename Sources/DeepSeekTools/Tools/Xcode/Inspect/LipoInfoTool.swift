@@ -9,13 +9,13 @@ public struct LipoInfoTool: Tool {
         ToolSchema(
             name: "lipo_info",
             description:
-                "Print the architectures present in a Mach-O binary (single-arch, fat/universal, " +
-                "or arm64+arm64e for legacy iOS slices).",
+                "Stampa le architetture presenti in un binario Mach-O (single-arch, fat/universal, " +
+                "o arm64+arm64e per slice iOS legacy).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Mach-O binary, relative to agent root."),
-                    "detailed": SchemaBuilder.boolean(description: "Use -detailed_info for slice offsets/sizes. Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Binario Mach-O, relativo alla root dell'agente."),
+                    "detailed": SchemaBuilder.boolean(description: "Usa -detailed_info per offset/dimensione delle slice. Default false.", defaultValue: false),
                 ],
                 required: ["path"]
             )

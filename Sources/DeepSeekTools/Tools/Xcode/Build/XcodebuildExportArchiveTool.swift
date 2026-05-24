@@ -10,14 +10,14 @@ public struct XcodebuildExportArchiveTool: Tool {
         ToolSchema(
             name: "xcodebuild_exportarchive",
             description:
-                "Export a .xcarchive to .ipa/.app/.pkg using an exportOptions.plist. " +
-                "All three paths (archive, export dir, options plist) must be inside the agent root.",
+                "Esporta un .xcarchive in .ipa/.app/.pkg usando un exportOptions.plist. " +
+                "Tutti e tre i path (archivio, directory di export, plist delle opzioni) devono trovarsi dentro la root dell'agente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "archivePath": SchemaBuilder.string(description: ".xcarchive path, relative to agent root."),
-                    "exportPath": SchemaBuilder.string(description: "Output directory, relative to agent root."),
-                    "exportOptionsPlist": SchemaBuilder.string(description: "exportOptions.plist path, relative to agent root."),
+                    "archivePath": SchemaBuilder.string(description: "Path del .xcarchive, relativo alla root dell'agente."),
+                    "exportPath": SchemaBuilder.string(description: "Directory di output, relativa alla root dell'agente."),
+                    "exportOptionsPlist": SchemaBuilder.string(description: "Path di exportOptions.plist, relativo alla root dell'agente."),
                 ],
                 required: ["archivePath", "exportPath", "exportOptionsPlist"]
             )

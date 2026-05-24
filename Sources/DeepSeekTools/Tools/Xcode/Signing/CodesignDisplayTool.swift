@@ -9,14 +9,14 @@ public struct CodesignDisplayTool: Tool {
         ToolSchema(
             name: "codesign_display",
             description:
-                "Display the signing identity, team, entitlements, and designated requirement of a " +
-                "signed binary or bundle.",
+                "Visualizza l'identità di firma, il team, gli entitlements e il designated requirement di un " +
+                "binario o bundle firmato.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Binary or .app path, relative to agent root."),
-                    "entitlements": SchemaBuilder.boolean(description: "Include entitlements. Default true.", defaultValue: true),
-                    "requirements": SchemaBuilder.boolean(description: "Include designated requirement. Default true.", defaultValue: true),
+                    "path": SchemaBuilder.string(description: "Path del binario o .app, relativo alla root dell'agente."),
+                    "entitlements": SchemaBuilder.boolean(description: "Include gli entitlements. Default true.", defaultValue: true),
+                    "requirements": SchemaBuilder.boolean(description: "Include il designated requirement. Default true.", defaultValue: true),
                 ],
                 required: ["path"]
             )

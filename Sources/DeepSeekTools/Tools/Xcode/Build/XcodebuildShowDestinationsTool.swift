@@ -10,14 +10,14 @@ public struct XcodebuildShowDestinationsTool: Tool {
         ToolSchema(
             name: "xcodebuild_showdestinations",
             description:
-                "List the destinations available for a scheme (simulators, real devices, my Mac, Mac Catalyst, …). " +
-                "Provide 'scheme' and 'workspace' or 'project'.",
+                "Elenca le destinazioni disponibili per uno scheme (simulator, dispositivi reali, my Mac, Mac Catalyst, …). " +
+                "Fornisci 'scheme' e 'workspace' o 'project'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "scheme": SchemaBuilder.string(description: "Scheme name."),
-                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relative to agent root."),
-                    "project": SchemaBuilder.string(description: ".xcodeproj, relative to agent root."),
+                    "scheme": SchemaBuilder.string(description: "Nome dello scheme."),
+                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relativo alla root dell'agente."),
+                    "project": SchemaBuilder.string(description: ".xcodeproj, relativo alla root dell'agente."),
                 ],
                 required: ["scheme"]
             )

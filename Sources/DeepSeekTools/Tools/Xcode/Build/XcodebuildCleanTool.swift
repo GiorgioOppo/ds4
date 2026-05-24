@@ -10,15 +10,15 @@ public struct XcodebuildCleanTool: Tool {
         ToolSchema(
             name: "xcodebuild_clean",
             description:
-                "Remove build products and intermediates for a scheme. " +
-                "Provide 'scheme' and 'workspace' or 'project'.",
+                "Rimuove i prodotti di build e gli intermediate per uno scheme. " +
+                "Fornisci 'scheme' e 'workspace' o 'project'.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "scheme": SchemaBuilder.string(description: "Scheme name."),
-                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relative to agent root."),
-                    "project": SchemaBuilder.string(description: ".xcodeproj, relative to agent root."),
-                    "derivedDataPath": SchemaBuilder.string(description: "DerivedData dir, relative to agent root."),
+                    "scheme": SchemaBuilder.string(description: "Nome dello scheme."),
+                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relativo alla root dell'agente."),
+                    "project": SchemaBuilder.string(description: ".xcodeproj, relativo alla root dell'agente."),
+                    "derivedDataPath": SchemaBuilder.string(description: "Directory DerivedData, relativa alla root dell'agente."),
                 ],
                 required: ["scheme"]
             )

@@ -15,14 +15,14 @@ public struct DevicectlInstallTool: Tool {
         ToolSchema(
             name: "devicectl_install",
             description:
-                "Install an app on a real device. Requires the device's identifier " +
-                "(from devicectl_list) and a signed .app or .ipa bundle inside the agent root. " +
-                "Categorized as dangerous — affects physical hardware.",
+                "Installa un'app su un dispositivo reale. Richiede l'identificatore del dispositivo " +
+                "(da devicectl_list) e un bundle .app o .ipa firmato dentro la root dell'agente. " +
+                "Categorizzato come dangerous — coinvolge hardware fisico.",
             category: .dangerous,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "Device identifier (UDID or name from devicectl_list)."),
-                    "appPath": SchemaBuilder.string(description: ".app or .ipa, relative to agent root."),
+                    "device": SchemaBuilder.string(description: "Identificatore del dispositivo (UDID o nome da devicectl_list)."),
+                    "appPath": SchemaBuilder.string(description: ".app o .ipa, relativo alla root dell'agente."),
                 ],
                 required: ["device", "appPath"]
             )

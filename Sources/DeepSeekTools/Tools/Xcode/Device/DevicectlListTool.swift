@@ -11,12 +11,12 @@ public struct DevicectlListTool: Tool {
         ToolSchema(
             name: "devicectl_list",
             description:
-                "List real connected devices (iPhone / iPad / Vision Pro / Apple TV). " +
-                "Set 'json=true' for machine-parseable output. Requires Xcode 15+.",
+                "Elenca i dispositivi reali connessi (iPhone / iPad / Vision Pro / Apple TV). " +
+                "Imposta 'json=true' per un output parsabile da macchina. Richiede Xcode 15+.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "json": SchemaBuilder.boolean(description: "Emit JSON. Default true.", defaultValue: true),
+                    "json": SchemaBuilder.boolean(description: "Emette JSON. Default true.", defaultValue: true),
                 ]
             )
         )

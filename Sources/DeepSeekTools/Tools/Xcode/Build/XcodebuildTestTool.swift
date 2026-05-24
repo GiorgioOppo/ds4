@@ -9,26 +9,26 @@ public struct XcodebuildTestTool: Tool {
         ToolSchema(
             name: "xcodebuild_test",
             description:
-                "Run XCTest / Swift Testing of a scheme inside an Xcode project on a simulator or device. " +
-                "Use this for app targets where the tests need a destination (UI tests on iOS sim, " +
-                "visionOS tests on the Vision Pro simulator, macOS app unit tests, etc.). " +
-                "For a Swift Package Manager package (no scheme/destination) use 'swift_test' — simpler and faster. " +
-                "Always pass 'destination' explicitly; the xcodebuild default frequently picks a generic iOS " +
-                "destination that fails to build. Pair with 'xcresulttool_get' on the produced 'resultBundlePath' " +
-                "to parse failures.",
+                "Esegue XCTest / Swift Testing di uno scheme dentro un progetto Xcode su un simulator o device. " +
+                "Usalo per target di app in cui i test richiedono una destinazione (UI test su simulator iOS, " +
+                "test visionOS sul simulator Vision Pro, unit test di app macOS, ecc.). " +
+                "Per un pacchetto Swift Package Manager (senza scheme/destination) usa 'swift_test' — più semplice e veloce. " +
+                "Passa sempre 'destination' esplicitamente; il default di xcodebuild spesso sceglie una destinazione iOS " +
+                "generica che non riesce a buildare. Combinalo con 'xcresulttool_get' sul 'resultBundlePath' prodotto " +
+                "per analizzare i fallimenti.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "scheme": SchemaBuilder.string(description: "Scheme name."),
-                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relative to agent root."),
-                    "project": SchemaBuilder.string(description: ".xcodeproj, relative to agent root."),
-                    "destination": SchemaBuilder.string(description: "xcodebuild destination string."),
-                    "configuration": SchemaBuilder.string(description: "Build configuration."),
-                    "testPlan": SchemaBuilder.string(description: "Test plan name."),
-                    "onlyTesting": SchemaBuilder.array(itemsType: "string", description: "Test identifiers to run."),
-                    "skipTesting": SchemaBuilder.array(itemsType: "string", description: "Test identifiers to skip."),
-                    "resultBundlePath": SchemaBuilder.string(description: ".xcresult output path, relative to agent root."),
-                    "derivedDataPath": SchemaBuilder.string(description: "DerivedData dir, relative to agent root. Default 'build/'."),
+                    "scheme": SchemaBuilder.string(description: "Nome dello scheme."),
+                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relativo alla root dell'agente."),
+                    "project": SchemaBuilder.string(description: ".xcodeproj, relativo alla root dell'agente."),
+                    "destination": SchemaBuilder.string(description: "Stringa di destinazione xcodebuild."),
+                    "configuration": SchemaBuilder.string(description: "Configurazione di build."),
+                    "testPlan": SchemaBuilder.string(description: "Nome del test plan."),
+                    "onlyTesting": SchemaBuilder.array(itemsType: "string", description: "Identificatori dei test da eseguire."),
+                    "skipTesting": SchemaBuilder.array(itemsType: "string", description: "Identificatori dei test da saltare."),
+                    "resultBundlePath": SchemaBuilder.string(description: "Path di output del .xcresult, relativo alla root dell'agente."),
+                    "derivedDataPath": SchemaBuilder.string(description: "Directory DerivedData, relativa alla root dell'agente. Default 'build/'."),
                     "timeoutSeconds": SchemaBuilder.integer(description: "Timeout. Default 900.", minimum: 1),
                 ],
                 required: ["scheme"]

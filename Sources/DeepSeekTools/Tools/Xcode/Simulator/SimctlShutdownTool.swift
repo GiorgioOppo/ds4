@@ -8,12 +8,12 @@ public struct SimctlShutdownTool: Tool {
         ToolSchema(
             name: "simctl_shutdown",
             description:
-                "Shut down a simulator. 'device' accepts a UDID, a display name, the literal 'all', " +
-                "or 'booted' (every running simulator).",
+                "Spegne un simulator. 'device' accetta un UDID, un nome visualizzato, il letterale 'all', " +
+                "o 'booted' (ogni simulator in esecuzione).",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "UDID, name, 'all', or 'booted'."),
+                    "device": SchemaBuilder.string(description: "UDID, nome, 'all', o 'booted'."),
                 ],
                 required: ["device"]
             )

@@ -10,12 +10,12 @@ public struct SimctlBootTool: Tool {
         ToolSchema(
             name: "simctl_boot",
             description:
-                "Boot a simulator. 'device' is a UDID or a display name (e.g. 'iPhone 15', " +
-                "'Apple Vision Pro'). Already-booted devices return a non-fatal error.",
+                "Avvia un simulator. 'device' è un UDID o un nome visualizzato (es. 'iPhone 15', " +
+                "'Apple Vision Pro'). I device già avviati restituiscono un errore non fatale.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "Simulator UDID or name."),
+                    "device": SchemaBuilder.string(description: "UDID o nome del simulator."),
                 ],
                 required: ["device"]
             )

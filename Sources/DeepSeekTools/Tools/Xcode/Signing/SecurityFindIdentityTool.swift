@@ -10,13 +10,13 @@ public struct SecurityFindIdentityTool: Tool {
         ToolSchema(
             name: "security_find_identity",
             description:
-                "List code-signing identities (Developer ID, Apple Distribution, etc.) in the keychain. " +
-                "Default scope: only valid identities. Set 'validOnly=false' to include expired ones.",
+                "Elenca le identità di firma del codice (Developer ID, Apple Distribution, ecc.) nel keychain. " +
+                "Scope di default: solo identità valide. Imposta 'validOnly=false' per includere quelle scadute.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "validOnly": SchemaBuilder.boolean(description: "Only show valid identities. Default true.", defaultValue: true),
-                    "keychain": SchemaBuilder.string(description: "Specific keychain to query (default: search list)."),
+                    "validOnly": SchemaBuilder.boolean(description: "Mostra solo identità valide. Default true.", defaultValue: true),
+                    "keychain": SchemaBuilder.string(description: "Keychain specifico da interrogare (default: la search list)."),
                 ]
             )
         )

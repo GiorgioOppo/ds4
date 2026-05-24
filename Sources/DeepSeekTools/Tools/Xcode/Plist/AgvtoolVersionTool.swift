@@ -10,18 +10,18 @@ public struct AgvtoolVersionTool: Tool {
         ToolSchema(
             name: "agvtool_version",
             description:
-                "Read or update an Xcode project's version. " +
+                "Legge o aggiorna la versione di un progetto Xcode. " +
                 "operation='read-build' / 'read-marketing' / 'next-build' / 'set-build' / 'set-marketing'. " +
-                "'set-*' and 'next-*' write Info.plist + project files. " +
-                "'projectDir' must be the directory containing the .xcodeproj.",
+                "'set-*' e 'next-*' scrivono su Info.plist + file di progetto. " +
+                "'projectDir' deve essere la directory che contiene il .xcodeproj.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "operation": SchemaBuilder.string(
-                        description: "What to do.",
+                        description: "Cosa fare.",
                         enumValues: ["read-build", "read-marketing", "next-build", "set-build", "set-marketing"]),
-                    "projectDir": SchemaBuilder.string(description: "Directory containing the .xcodeproj. Default agent root."),
-                    "value": SchemaBuilder.string(description: "Value for set-build / set-marketing."),
+                    "projectDir": SchemaBuilder.string(description: "Directory contenente il .xcodeproj. Default: root dell'agente."),
+                    "value": SchemaBuilder.string(description: "Valore per set-build / set-marketing."),
                 ],
                 required: ["operation"]
             )

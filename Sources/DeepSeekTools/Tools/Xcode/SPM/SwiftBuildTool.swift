@@ -9,21 +9,21 @@ public struct SwiftBuildTool: Tool {
         ToolSchema(
             name: "swift_build",
             description:
-                "Build a Swift Package Manager package (the directory MUST contain a Package.swift). " +
-                "Use this for SPM libraries, CLI tools, server-side Swift, and any package that doesn't " +
-                "have a .xcodeproj/.xcworkspace. " +
-                "For an Xcode project (iOS / macOS / visionOS app targets) use 'xcodebuild_build' instead. " +
-                "'packagePath' defaults to the agent root; 'configuration' is debug or release; " +
-                "'target' / 'product' scopes the build.",
+                "Compila un pacchetto Swift Package Manager (la directory DEVE contenere un Package.swift). " +
+                "Usalo per librerie SPM, CLI tool, Swift lato server e qualsiasi pacchetto che non abbia " +
+                "un .xcodeproj/.xcworkspace. " +
+                "Per un progetto Xcode (target di app iOS / macOS / visionOS) usa invece 'xcodebuild_build'. " +
+                "'packagePath' è per default la root dell'agente; 'configuration' è debug o release; " +
+                "'target' / 'product' restringe la build.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "packagePath": SchemaBuilder.string(description: "Directory containing Package.swift. Default agent root."),
+                    "packagePath": SchemaBuilder.string(description: "Directory contenente Package.swift. Default: root dell'agente."),
                     "configuration": SchemaBuilder.string(
-                        description: "Build configuration. Default debug.",
+                        description: "Configurazione di build. Default debug.",
                         enumValues: ["debug", "release"]),
-                    "target": SchemaBuilder.string(description: "Build a specific target."),
-                    "product": SchemaBuilder.string(description: "Build a specific product."),
+                    "target": SchemaBuilder.string(description: "Compila uno specifico target."),
+                    "product": SchemaBuilder.string(description: "Compila uno specifico product."),
                     "timeoutSeconds": SchemaBuilder.integer(description: "Timeout. Default 600.", minimum: 1),
                 ]
             )

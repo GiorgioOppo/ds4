@@ -10,25 +10,25 @@ public struct XcodebuildBuildTool: Tool {
         ToolSchema(
             name: "xcodebuild_build",
             description:
-                "Build a scheme from an Xcode project (.xcodeproj) or workspace (.xcworkspace). " +
-                "Use this for macOS / iOS / iPadOS / visionOS / watchOS / tvOS app targets and any " +
-                "build that needs a specific simulator/device destination. " +
-                "For a pure Swift Package Manager package (Package.swift, no .xcodeproj) use 'swift_build' instead. " +
-                "Before calling, use 'xcodebuild_list' to discover schemes and 'xcodebuild_showdestinations' " +
-                "to pick a valid destination string. " +
-                "'destination' = 'platform=iOS Simulator,name=iPhone 15' etc.; " +
-                "'noCodesign=true' disables signing (typical for simulator/CI builds).",
+                "Compila uno scheme da un progetto Xcode (.xcodeproj) o workspace (.xcworkspace). " +
+                "Usalo per target di app macOS / iOS / iPadOS / visionOS / watchOS / tvOS e per ogni " +
+                "build che richieda una specifica destinazione simulator/device. " +
+                "Per un pacchetto puro Swift Package Manager (Package.swift, senza .xcodeproj) usa invece 'swift_build'. " +
+                "Prima di chiamarlo, usa 'xcodebuild_list' per scoprire gli scheme e 'xcodebuild_showdestinations' " +
+                "per scegliere una stringa di destinazione valida. " +
+                "'destination' = 'platform=iOS Simulator,name=iPhone 15' ecc.; " +
+                "'noCodesign=true' disabilita la firma (tipico per build simulator/CI).",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "scheme": SchemaBuilder.string(description: "Scheme name (from xcodebuild_list)."),
-                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relative to agent root."),
-                    "project": SchemaBuilder.string(description: ".xcodeproj, relative to agent root."),
-                    "destination": SchemaBuilder.string(description: "xcodebuild destination string."),
-                    "configuration": SchemaBuilder.string(description: "Build configuration (e.g. Debug, Release)."),
-                    "sdk": SchemaBuilder.string(description: "SDK name (e.g. iphonesimulator, macosx, xrsimulator)."),
-                    "derivedDataPath": SchemaBuilder.string(description: "DerivedData dir, relative to agent root. Default 'build/'."),
-                    "noCodesign": SchemaBuilder.boolean(description: "Disable code signing. Default false.", defaultValue: false),
+                    "scheme": SchemaBuilder.string(description: "Nome dello scheme (da xcodebuild_list)."),
+                    "workspace": SchemaBuilder.string(description: ".xcworkspace, relativo alla root dell'agente."),
+                    "project": SchemaBuilder.string(description: ".xcodeproj, relativo alla root dell'agente."),
+                    "destination": SchemaBuilder.string(description: "Stringa di destinazione xcodebuild."),
+                    "configuration": SchemaBuilder.string(description: "Configurazione di build (es. Debug, Release)."),
+                    "sdk": SchemaBuilder.string(description: "Nome dell'SDK (es. iphonesimulator, macosx, xrsimulator)."),
+                    "derivedDataPath": SchemaBuilder.string(description: "Directory DerivedData, relativa alla root dell'agente. Default 'build/'."),
+                    "noCodesign": SchemaBuilder.boolean(description: "Disabilita la firma del codice. Default false.", defaultValue: false),
                     "timeoutSeconds": SchemaBuilder.integer(description: "Timeout. Default 600.", minimum: 1),
                 ],
                 required: ["scheme"]

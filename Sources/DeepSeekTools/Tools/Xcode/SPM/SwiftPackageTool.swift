@@ -13,20 +13,20 @@ public struct SwiftPackageTool: Tool {
         ToolSchema(
             name: "swift_package",
             description:
-                "Run a `swift package` subcommand. " +
-                "Supported: 'resolve' (fetch deps), 'update' (bump deps), 'init' (create a new package " +
-                "— requires 'initType' and 'name'), 'describe' (read-only summary), 'clean'.",
+                "Esegue un subcomando `swift package`. " +
+                "Supportati: 'resolve' (recupera le dipendenze), 'update' (aggiorna le dipendenze), 'init' (crea un nuovo pacchetto " +
+                "— richiede 'initType' e 'name'), 'describe' (riepilogo in sola lettura), 'clean'.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "command": SchemaBuilder.string(
-                        description: "Subcommand.",
+                        description: "Subcomando.",
                         enumValues: ["resolve", "update", "init", "describe", "clean"]),
-                    "packagePath": SchemaBuilder.string(description: "Directory containing Package.swift. Default agent root."),
+                    "packagePath": SchemaBuilder.string(description: "Directory contenente Package.swift. Default: root dell'agente."),
                     "initType": SchemaBuilder.string(
-                        description: "Required for 'init'. Type of package.",
+                        description: "Richiesto per 'init'. Tipo di pacchetto.",
                         enumValues: ["library", "executable", "tool", "build-tool-plugin", "command-plugin", "macro", "empty"]),
-                    "name": SchemaBuilder.string(description: "Required for 'init'. Package name."),
+                    "name": SchemaBuilder.string(description: "Richiesto per 'init'. Nome del pacchetto."),
                 ],
                 required: ["command"]
             )

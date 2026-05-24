@@ -7,11 +7,11 @@ public struct PlutilLintTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "plutil_lint",
-            description: "Validate a plist file's syntax. Exit 0 + 'OK' on success.",
+            description: "Valida la sintassi di un file plist. Exit 0 + 'OK' in caso di successo.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Plist file, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "File plist, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

@@ -9,13 +9,13 @@ public struct SimctlInstallTool: Tool {
         ToolSchema(
             name: "simctl_install",
             description:
-                "Install a .app bundle on a simulator. The simulator must already be booted " +
-                "(use simctl_boot first). The app path must resolve inside the agent root.",
+                "Installa un bundle .app su un simulator. Il simulator deve essere già avviato " +
+                "(usa prima simctl_boot). Il path dell'app deve risolvere dentro la root dell'agente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "UDID, name, or 'booted'."),
-                    "appPath": SchemaBuilder.string(description: ".app bundle, relative to agent root."),
+                    "device": SchemaBuilder.string(description: "UDID, nome, o 'booted'."),
+                    "appPath": SchemaBuilder.string(description: "Bundle .app, relativo alla root dell'agente."),
                 ],
                 required: ["device", "appPath"]
             )

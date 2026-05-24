@@ -10,14 +10,14 @@ public struct SimctlScreenshotTool: Tool {
         ToolSchema(
             name: "simctl_screenshot",
             description:
-                "Capture a screenshot of a booted simulator. Output file is written inside the agent root.",
+                "Cattura uno screenshot di un simulator avviato. Il file di output viene scritto dentro la root dell'agente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "UDID, name, or 'booted'."),
-                    "outputPath": SchemaBuilder.string(description: "Output image path, relative to agent root."),
+                    "device": SchemaBuilder.string(description: "UDID, nome, o 'booted'."),
+                    "outputPath": SchemaBuilder.string(description: "Path dell'immagine di output, relativo alla root dell'agente."),
                     "format": SchemaBuilder.string(
-                        description: "Image format. Default png.",
+                        description: "Formato dell'immagine. Default png.",
                         enumValues: ["png", "tiff", "bmp", "gif", "jpeg"]),
                 ],
                 required: ["device", "outputPath"]

@@ -9,12 +9,12 @@ public struct SimctlEraseTool: Tool {
         ToolSchema(
             name: "simctl_erase",
             description:
-                "Erase a simulator's contents and settings back to fresh-install. " +
-                "The target must be shut down first (use simctl_shutdown). 'device' accepts UDID, name, or 'all'.",
+                "Cancella contenuti e impostazioni di un simulator riportandolo allo stato di fresh-install. " +
+                "Il bersaglio deve essere prima spento (usa simctl_shutdown). 'device' accetta UDID, nome, o 'all'.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "device": SchemaBuilder.string(description: "UDID, name, or 'all'."),
+                    "device": SchemaBuilder.string(description: "UDID, nome, o 'all'."),
                 ],
                 required: ["device"]
             )

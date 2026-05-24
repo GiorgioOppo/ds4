@@ -10,12 +10,12 @@ public struct XcodebuildShowSdksTool: Tool {
         ToolSchema(
             name: "xcodebuild_showsdks",
             description:
-                "List every SDK installed in the active Xcode (macOS, iOS, iOS Simulator, visionOS, " +
-                "visionOS Simulator, watchOS, tvOS, etc).",
+                "Elenca ogni SDK installato nell'Xcode attivo (macOS, iOS, iOS Simulator, visionOS, " +
+                "visionOS Simulator, watchOS, tvOS, ecc).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "json": SchemaBuilder.boolean(description: "Emit JSON. Default true.", defaultValue: true),
+                    "json": SchemaBuilder.boolean(description: "Emette JSON. Default true.", defaultValue: true),
                 ]
             )
         )

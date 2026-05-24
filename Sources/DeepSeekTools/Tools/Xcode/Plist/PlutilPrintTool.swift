@@ -9,15 +9,15 @@ public struct PlutilPrintTool: Tool {
         ToolSchema(
             name: "plutil_print",
             description:
-                "Print a plist file in a parseable format. " +
-                "'format' picks 'human' (default, plutil -p), 'json', or 'xml1'. " +
-                "Output is written to stdout (the file on disk is not converted).",
+                "Stampa un file plist in un formato parsabile. " +
+                "'format' seleziona 'human' (default, plutil -p), 'json', o 'xml1'. " +
+                "L'output è scritto su stdout (il file su disco non viene convertito).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Plist file, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "File plist, relativo alla root dell'agente."),
                     "format": SchemaBuilder.string(
-                        description: "Output format.",
+                        description: "Formato di output.",
                         enumValues: ["human", "json", "xml1"]),
                 ],
                 required: ["path"]
