@@ -23,9 +23,9 @@ public enum AgentMode: String, Codable, Sendable, CaseIterable {
     public var summary: String {
         switch self {
         case .build:
-            return "Full tool access. Mutations and shell use the permission policy."
+            return "Accesso completo agli strumenti. Le modifiche e l'uso della shell passano dalla policy dei permessi."
         case .plan:
-            return "Read-only exploration. Edits and patches are denied; shell prompts."
+            return "Esplorazione in sola lettura. Modifiche e patch sono negate; la shell richiede sempre conferma."
         }
     }
 }
