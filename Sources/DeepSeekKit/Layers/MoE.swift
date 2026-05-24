@@ -47,46 +47,45 @@ public final class Gate {
         let xArr = x.array
         let N = xArr.shape[0]
 
+        // Reference: scores = activation(linear(x, weight)); bias shifts the
+        // scores used for topk only, then gather() picks original_scores.
+        // Renormalization runs only when score_func != "softmax".
+        let logits = weight(x).array
+        let scores: MLXArray = {
+            switch scoreFunc {
+            case .softmax: return softmax(logits, axis: 1)
+            case .sigmoid: return sigmoid(logits)
+            case .sqrtsoftplus:
+                let absL = abs(logits)
+                let sp = maximum(logits, MLXArray(Float(0))) + log(MLXArray(Float(1)) + exp(-absL))
+                return sqrt(sp)
+            }
+        }()
+
         if hashRouting {
             guard let tid = tid2eid else { fatalError("hash routing requires tid2eid") }
             let inputIdsArr = MLXArray(inputIds).reshaped([N])
             let indices = tid.array[inputIdsArr]
-            
-            let logits = weight(x).array
-            let gatheredLogits = takeAlong(logits, indices, axis: 1)
-            
-            var w = gatheredLogits
-            if scoreFunc == .sqrtsoftplus {
-                let absW = abs(w)
-                let sp = maximum(w, MLXArray(0.0)) + log(MLXArray(1.0) + exp(-absW))
-                w = sqrt(sp)
-            } else if scoreFunc == .sigmoid {
-                w = sigmoid(w)
+
+            var w = takeAlong(scores, indices, axis: 1)
+            if scoreFunc != .softmax {
+                let sumW = w.sum(axes: [1], keepDims: true)
+                w = w / maximum(sumW, MLXArray(Float(1e-12)))
             }
-            
-            let sumW = w.sum(axes: [1], keepDims: true)
-            w = (w / maximum(sumW, 1e-12)) * routeScale
-            
+            w = w * routeScale
             return (w, indices)
         }
 
-        let logits = weight(x).array
-        let sortedIndices = argSort(logits, axis: 1)[0..., (nExperts - topK)..<nExperts]
+        // Score-based routing: bias is applied for top-K *selection* only.
+        let scoresForTopK = bias.map { scores + $0.array } ?? scores
+        let sortedIndices = argSort(scoresForTopK, axis: 1)[0..., (nExperts - topK)..<nExperts]
         let indicesR = sortedIndices[0..., .stride(by: -1)]
-        
-        let valuesR = takeAlong(logits, indicesR, axis: 1)
-        
-        var w = valuesR
-        if scoreFunc == .softmax {
-            w = softmax(w, axis: 1)
-        } else if scoreFunc == .sigmoid {
-            w = sigmoid(w)
-        } else if scoreFunc == .sqrtsoftplus {
-            let absW = abs(w)
-            let sp = maximum(w, MLXArray(0.0)) + log(MLXArray(1.0) + exp(-absW))
-            w = sqrt(sp)
+
+        var w = takeAlong(scores, indicesR, axis: 1)
+        if scoreFunc != .softmax {
+            let sumW = w.sum(axes: [1], keepDims: true)
+            w = w / maximum(sumW, MLXArray(Float(1e-12)))
         }
-        
         w = w * routeScale
         return (w, indicesR)
     }
@@ -135,26 +134,39 @@ public final class MoEFFN {
         let xFlat = Tensor(array: x.array.reshaped([N, dim]), dtype: x.dtype)
 
         let (weights, indices) = gate(xFlat, inputIds: inputIds)
+        // indices: [N, topK] int, weights: [N, topK] float
+
+        // Compute per-expert routed-token counts in one pass, then sync once
+        // so we can skip experts with zero tokens. The reference does this
+        // via `torch.bincount`. Without the skip we'd run every expert on
+        // every token — defeats sparse MoE.
+        let allExpertIds = MLXArray((0..<nExperts).map { Int32($0) })
+        let idxFlat = indices.reshaped([N * topK])
+        let oneHot = (idxFlat.expandedDimensions(axes: [1]) .== allExpertIds.expandedDimensions(axes: [0]))
+        let counts = oneHot.asType(.int32).sum(axes: [0])
+        MLX.eval(counts)
+        let countsArr = counts.asArray(Int32.self)
 
         var yFlat = MLXArray.zeros([N, dim]).asType(x.array.dtype)
-        
+
         for e in 0..<nExperts {
-            guard let expert = experts[e] else { continue }
-            let mask = (indices .== e)
-            let tokenHasExpert = mask.any(axes: [1])
-            
-            let wIndices = argMax(mask.asType(.int32), axis: 1)
-            let w = takeAlong(weights, wIndices.expandedDimensions(axes: [1]), axis: 1).reshaped([N])
-            
-            let expertOut = expert(xFlat).array
-            let scaledOut = expertOut * w.expandedDimensions(axes: [1])
-            let contribution = MLX.where(tokenHasExpert.expandedDimensions(axes: [1]), scaledOut, MLXArray.zeros(like: scaledOut))
-            
-            yFlat = yFlat + contribution
-            
-            if e % 8 == 7 {
-                MLX.eval(yFlat)
+            if countsArr[e] == 0 { continue }
+            guard let expert = experts[e] else {
+                // A pruned expert was selected: skip silently. The expert
+                // rewriter is expected to set the gate row to -inf so this
+                // branch is unreachable in a correctly-pruned checkpoint.
+                continue
             }
+
+            // Per-token weight for expert e: sum(weights * (indices==e)) over topK.
+            // The reference's `weights[idx, top, None]` indexing collapses to
+            // exactly this when each token routes each expert at most once,
+            // which holds for V4 (topk picks distinct expert ids).
+            let mask = (indices .== e).asType(weights.dtype)   // [N, topK]
+            let perTokenW = (weights * mask).sum(axes: [1])    // [N]
+
+            let expertOut = expert(xFlat).array                // [N, dim]
+            yFlat = yFlat + expertOut * perTokenW.expandedDimensions(axes: [1])
         }
         MLX.eval(yFlat)
 
