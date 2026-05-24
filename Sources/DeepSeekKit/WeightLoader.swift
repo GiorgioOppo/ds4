@@ -59,6 +59,14 @@ public final class WeightLoader {
     public var shardCount: Int { shardURLs.count }
     
     private var shardURLs: [URL] = []
+
+    /// One memory-mapped `Data` per shard file, populated at init time and
+    /// kept alive for the lifetime of the loader. We slice these `Data`s to
+    /// extract individual tensor byte ranges; the underlying mapping lets
+    /// the kernel page cache hold hot tensors across token decodes, which
+    /// is the primary win in the streaming-from-disk regime (the same
+    /// `topK` expert sets are touched every token at the same layer).
+    private var shardData: [URL: Data] = [:]
     
     // MARK: - Discovery
     
@@ -93,7 +101,29 @@ public final class WeightLoader {
         }
         
         self.shardURLs = candidates
-        
+
+        // Memory-map every shard once. `.mappedIfSafe` returns a mapped
+        // Data on local volumes (where mmap is cheap) and falls back to a
+        // real read on network / removable mounts. The mapping itself is
+        // virtual-address-space only — RSS only grows for pages we
+        // actually touch, and the kernel can reclaim untouched pages
+        // under pressure. Per-tensor reads below then become a `Data`
+        // slice (no syscall) and the kernel page-caches the touched
+        // ranges across token decodes — exactly what we want for the
+        // per-expert streaming loop.
+        let mmapLock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: candidates.count) { i in
+            let url = candidates[i]
+            do {
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                mmapLock.lock()
+                self.shardData[url] = data
+                mmapLock.unlock()
+            } catch {
+                print("[WeightLoader] Failed to mmap \(url.lastPathComponent): \(error)")
+            }
+        }
+
         // Parse headers in parallel — only reads the first few KB of each file
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: candidates.count) { i in
@@ -193,22 +223,47 @@ public final class WeightLoader {
     }
     
     // MARK: - On-demand tensor loading
-    
-    /// Load a single tensor from disk by reading only its byte range.
+
+    /// Build an MLXArray from a slice of a memory-mapped shard. The shard
+    /// was mmap'd once at init (see `shardData` in init), so this is now
+    /// a pointer-arithmetic slice + the single copy that `MLXArray(_:_:dtype:)`
+    /// performs internally to land the bytes in the MLX allocator. No
+    /// `FileHandle`, no `seek`, no explicit `read` syscall — the kernel
+    /// page-caches the touched ranges across token decodes, which is the
+    /// primary win for the per-expert streaming loop (the same `topK`
+    /// expert sets are touched every token at the same layer).
+    ///
+    /// Falls back to a real read if the shard wasn't mmap'd (init failure
+    /// on that file or network mount); in that case we open the handle
+    /// per-call as before.
     private func loadTensorFromDisk(name: String, meta: TensorMeta) -> MLXArray? {
+        let absOffset = meta.dataOffset + meta.offsetBegin
+        let endOffset = meta.dataOffset + meta.offsetEnd
+        let byteCount = meta.offsetEnd - meta.offsetBegin
+        let (_, mlxDType) = dtypeFromString(meta.dtype)
+
+        // Fast path: mmap'd shard, slice + single MLX-side copy.
+        if let shard = shardData[meta.shardURL] {
+            guard absOffset >= 0,
+                  endOffset <= shard.count,
+                  byteCount == endOffset - absOffset
+            else {
+                print("[WeightLoader] Out-of-range slice for '\(name)' "
+                      + "(\(absOffset)..\(endOffset) vs shard size \(shard.count))")
+                return nil
+            }
+            let slice = shard.subdata(in: absOffset..<endOffset)
+            return MLXArray(slice, meta.shape, dtype: mlxDType)
+        }
+
+        // Fallback: shard mmap failed at init. Open handle per-call.
         do {
             let fh = try FileHandle(forReadingFrom: meta.shardURL)
             defer { try? fh.close() }
-            
-            let absOffset = UInt64(meta.dataOffset + meta.offsetBegin)
-            let byteCount = meta.offsetEnd - meta.offsetBegin
-            
-            try fh.seek(toOffset: absOffset)
-            guard let data = try fh.read(upToCount: byteCount), data.count == byteCount else {
-                return nil
-            }
-            
-            let (_, mlxDType) = dtypeFromString(meta.dtype)
+            try fh.seek(toOffset: UInt64(absOffset))
+            guard let data = try fh.read(upToCount: byteCount),
+                  data.count == byteCount
+            else { return nil }
             return MLXArray(data, meta.shape, dtype: mlxDType)
         } catch {
             print("[WeightLoader] Error loading tensor '\(name)': \(error)")
