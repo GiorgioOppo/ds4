@@ -151,7 +151,12 @@ public final class MoEFFN {
             let contribution = MLX.where(tokenHasExpert.expandedDimensions(axes: [1]), scaledOut, MLXArray.zeros(like: scaledOut))
             
             yFlat = yFlat + contribution
+            
+            if e % 8 == 7 {
+                MLX.eval(yFlat)
+            }
         }
+        MLX.eval(yFlat)
 
         let sharedOut = sharedExpert(xFlat).array
         yFlat = yFlat + sharedOut

@@ -113,9 +113,18 @@ public final class Transformer {
         let hBroadcasted = broadcast(hExpanded, to: [B * S, hc, config.dim])
         var x = hBroadcasted.reshaped([B, S, hc, config.dim])
 
+        // Prefetch layer 0 before we start
+        weightLoader?.ensureLayer(0)
+        
         for (k, layer) in layers.enumerated() {
-            weightLoader?.ensureLayer(k)
+            // Start prefetching next layer in background while current executes
+            if k + 1 < layers.count {
+                weightLoader?.prefetchLayer(k + 1)
+            }
             x = layer(Tensor(array: x, dtype: .f32), startPos: startPos, inputIds: flatIds).array
+            // Force evaluation before releasing weights
+            MLX.eval(x)
+            // Release current layer's weights to free RAM
             weightLoader?.releaseLayer(k)
         }
 
@@ -125,12 +134,35 @@ public final class Transformer {
     }
 
     public func releaseCache() {
-        // MLX doesn't have explicit buffer commits, but we can clear things if needed.
+        for layer in layers {
+            layer.attn.setKVCache(nil)
+        }
     }
 
     @discardableResult
     public func rewindKVTo(pos: Int) -> Bool {
-        // Just keeping the API signature.
-        return true
+        var success = true
+        for layer in layers {
+            if !layer.attn.rewindKVTo(pos: pos) {
+                success = false
+            }
+        }
+        return success
+    }
+
+    public func snapshotKVCache() -> KVCacheSnapshot {
+        let caches = layers.map { $0.attn.kvCache }
+        return KVCacheSnapshot(layerCaches: caches)
+    }
+
+    public func canRestoreKVCache(_ snap: KVCacheSnapshot) -> Bool {
+        return snap.layerCaches.count == layers.count
+    }
+
+    public func restoreKVCache(_ snap: KVCacheSnapshot) {
+        guard canRestoreKVCache(snap) else { return }
+        for (i, layer) in layers.enumerated() {
+            layer.attn.setKVCache(snap.layerCaches[i])
+        }
     }
 }

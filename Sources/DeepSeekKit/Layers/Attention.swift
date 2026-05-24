@@ -78,6 +78,10 @@ public final class MLA {
         return false
     }
 
+    public func setKVCache(_ cache: MLXArray?) {
+        self.kvCache = cache
+    }
+
     public func callAsFunction(_ xIn: Tensor, startPos: Int) -> Tensor {
         let x = xIn.array
         let B = x.shape[0]
@@ -95,6 +99,8 @@ public final class MLA {
 
         var kv = kvNorm(wkv(Tensor(array: x.reshaped([B * S, x.shape[2]]), dtype: .f32))).array
         kv = rope.apply(Tensor(array: kv.reshaped([B * S, 1, headDim]), dtype: .f32), startPos: startPos, inverse: false).array
+        kv = kv.reshaped([B * S, headDim])
+        kv = simulateFP8KV(kv, nopeHeadDim: nopeHeadDim, headDim: headDim)
         kv = kv.reshaped([B, S, headDim])
 
         if let cache = kvCache {
@@ -102,6 +108,7 @@ public final class MLA {
         } else {
             kvCache = kv
         }
+        MLX.eval(kvCache!)
         let currentKV = kvCache!
 
         let qPerToken = q.reshaped([B, S, nHeads, headDim]).transposed(0, 2, 1, 3) // [B, nHeads, S, headDim]
@@ -110,7 +117,12 @@ public final class MLA {
 
         var o: MLXArray
         if S > 1 {
-            let mask = MLXNN.MultiHeadAttention.createAdditiveCausalMask(S, dtype: q.dtype)
+            let L = currentKV.shape[1]
+            var mask = MLXNN.MultiHeadAttention.createAdditiveCausalMask(S, dtype: q.dtype)
+            if L > S {
+                let historyMask = MLXArray.zeros([S, L - S]).asType(q.dtype)
+                mask = concatenated([historyMask, mask], axis: 1)
+            }
             o = MLXFast.scaledDotProductAttention(queries: qPerToken, keys: kPerToken, values: vPerToken, scale: softmaxScale, mask: mask)
         } else {
             o = MLXFast.scaledDotProductAttention(queries: qPerToken, keys: kPerToken, values: vPerToken, scale: softmaxScale, mask: nil)
@@ -121,13 +133,18 @@ public final class MLA {
         o = rope.apply(Tensor(array: o, dtype: .f32), startPos: startPos, inverse: true).array
 
         let perGroupD = nHeads * headDim / nGroups
-        let oView = o.reshaped([B, S, nGroups, perGroupD])
-        let woAR = woA.weight.array.reshaped([nGroups, oLoraRank, perGroupD])
+        let oView = o.reshaped([B, S, nGroups, perGroupD]) // [B, S, nGroups, perGroupD]
+        let woAR = woA.getDequantizedWeight().reshaped([nGroups, oLoraRank, perGroupD]) // [nGroups, oLoraRank, perGroupD]
         
-        let oViewExpanded = oView.expandedDimensions(axes: [3])
-        let woARExpanded = woAR.expandedDimensions(axes: [0, 1])
-        
-        let oR = (oViewExpanded * woARExpanded).sum(axes: [-1])
+        var oGroupResults: [MLXArray] = []
+        for g in 0..<nGroups {
+            let oG = oView[0..., 0..., g, 0...] // [B, S, perGroupD]
+            let wG = woAR[g, 0..., 0...] // [oLoraRank, perGroupD]
+            let wG_T = wG.transposed() // [perGroupD, oLoraRank]
+            let oR_G = matmul(oG, wG_T) // [B, S, oLoraRank]
+            oGroupResults.append(oR_G.expandedDimensions(axes: [2])) // [B, S, 1, oLoraRank]
+        }
+        let oR = concatenated(oGroupResults, axis: 2) // [B, S, nGroups, oLoraRank]
 
         let oFlat = oR.reshaped([B * S, nGroups * oLoraRank])
         var result = woB(Tensor(array: oFlat, dtype: .f32)).array
@@ -135,4 +152,34 @@ public final class MLA {
 
         return Tensor(array: result, dtype: .f32)
     }
+
+    private func simulateFP8KV(_ x: MLXArray, nopeHeadDim: Int, headDim: Int) -> MLXArray {
+        let B_S = x.shape[0]
+        
+        let nopeSlice = x[0..., 0..<nopeHeadDim]
+        let ropeSlice = x[0..., nopeHeadDim..<headDim]
+        
+        let blocks = nopeHeadDim / 64
+        let blocked = nopeSlice.reshaped([B_S, blocks, 64])
+        
+        let amax = maximum(abs(blocked).max(axes: [-1], keepDims: true), MLXArray(Float32(1e-4)))
+        let ln2 = MLXArray(Float32(log(2.0)))
+        let log2Amax = log(amax / MLXArray(Float32(448.0))) / ln2
+        let scale = exp(ceil(log2Amax) * ln2)
+        let scaled = clip(blocked / scale, min: MLXArray(Float32(-448.0)), max: MLXArray(Float32(448.0)))
+        
+        let absScaled = abs(scaled)
+        let log2Abs = log(maximum(absScaled, MLXArray(Float32(1e-9)))) / ln2
+        let p = exp(floor(log2Abs) * ln2)
+        let m = scaled / p
+        let roundedM = round(m * MLXArray(Float32(8.0))) / MLXArray(Float32(8.0))
+        let yRounded = roundedM * p
+        
+        let quantized = MLX.where(absScaled .< MLXArray(Float32(0.001)), MLXArray.zeros(like: scaled), yRounded)
+        let unscaled = (quantized * scale).reshaped([B_S, nopeHeadDim])
+        
+        return concatenated([unscaled, ropeSlice], axis: 1)
+    }
+
+    private var dim: Int { wkv.inFeatures }
 }

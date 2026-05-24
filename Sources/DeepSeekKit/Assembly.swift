@@ -61,11 +61,6 @@ public extension Transformer {
             let attnSink = AssemblyHelpers.randomTensor([config.nHeads], rng: &rng, scale: 0.1)
 
             let ratio = config.compressRatios[i]
-            let kvCacheRows = config.windowSize +
-                (ratio > 0 ? config.maxSeqLen / ratio : 0)
-            let kvCache = Tensor.empty(shape: [config.maxBatchSize, max(kvCacheRows, 1), config.headDim],
-                                        dtype: .f32)
-
             let rope = RoPE(ropeHeadDim: config.ropeHeadDim,
                             freqs: RoPE.makeFreqs(config: config, useYarn: ratio > 0))
 
@@ -75,7 +70,7 @@ public extension Transformer {
                           woA: woA, woB: woB,
                           attnSink: attnSink,
                           rope: rope,
-                          kvCache: kvCache)
+                          kvCache: nil)
 
             // ---- MoE FFN ----
             // Gate logits stay in FP32 (see real-load path comment).
@@ -222,52 +217,48 @@ public extension Transformer {
         MemoryLogger.snapshot("load:embed+head-built", force: true)
 
         // ---------- Per-layer ----------
-        var blocks: [Block] = []
-        for i in 0..<nLayers {
+        var blocksOpt: [Block?] = Array(repeating: nil, count: nLayers)
+        let blocksLock = NSLock()
+        
+        DispatchQueue.concurrentPerform(iterations: nLayers) { i in
+            var rng = MiniRNG(seed: 0xDEADC0DE &+ UInt64(i))
             let lp = "layers.\(i)"
             let attnNorm = RMSNorm(
-                weight: (try loader.tryLoad(["\(lp).attn_norm.weight"]))
+                weight: (try? loader.tryLoad(["\(lp).attn_norm.weight"]))
                     ?? AssemblyHelpers.onesTensor([dim]),
                 eps: config.normEps)
             let ffnNorm = RMSNorm(
-                weight: (try loader.tryLoad(["\(lp).ffn_norm.weight"]))
+                weight: (try? loader.tryLoad(["\(lp).ffn_norm.weight"]))
                     ?? AssemblyHelpers.onesTensor([dim]),
                 eps: config.normEps)
 
             // ---- MLA ----
-            let wqA = try loadLinear(loader, base: "\(lp).attn.wq_a",
+            let wqA = try! loadLinear(loader, base: "\(lp).attn.wq_a",
                                       inF: dim, outF: config.qLoraRank, rng: &rng)
             let qNorm = RMSNorm(
-                weight: (try loader.tryLoad(["\(lp).attn.q_norm.weight"]))
+                weight: (try? loader.tryLoad(["\(lp).attn.q_norm.weight"]))
                     ?? AssemblyHelpers.onesTensor([config.qLoraRank]),
                 eps: config.normEps)
-            let wqB = try loadLinear(loader, base: "\(lp).attn.wq_b",
+            let wqB = try! loadLinear(loader, base: "\(lp).attn.wq_b",
                                       inF: config.qLoraRank,
                                       outF: config.nHeads * config.headDim, rng: &rng)
-            let wkv = try loadLinear(loader, base: "\(lp).attn.wkv",
+            let wkv = try! loadLinear(loader, base: "\(lp).attn.wkv",
                                       inF: dim, outF: config.headDim, rng: &rng)
             let kvNorm = RMSNorm(
-                weight: (try loader.tryLoad(["\(lp).attn.kv_norm.weight"]))
+                weight: (try? loader.tryLoad(["\(lp).attn.kv_norm.weight"]))
                     ?? AssemblyHelpers.onesTensor([config.headDim]),
                 eps: config.normEps)
             let perGroupD = config.nHeads * config.headDim / config.oGroups
-            let woA = try loadLinear(loader, base: "\(lp).attn.wo_a",
+            let woA = try! loadLinear(loader, base: "\(lp).attn.wo_a",
                                       inF: perGroupD,
                                       outF: config.oGroups * config.oLoraRank, rng: &rng)
-            let woB = try loadLinear(loader, base: "\(lp).attn.wo_b",
+            let woB = try! loadLinear(loader, base: "\(lp).attn.wo_b",
                                       inF: config.oGroups * config.oLoraRank,
                                       outF: dim, rng: &rng)
-            let attnSink = (try loader.tryLoad(["\(lp).attn.attn_sink"]))
+            let attnSink = (try? loader.tryLoad(["\(lp).attn.attn_sink"]))
                 ?? AssemblyHelpers.randomTensor([config.nHeads], rng: &rng, scale: 0.1)
 
             let ratio = config.compressRatios[i]
-
-            let kvCacheRows = config.windowSize +
-                (ratio > 0 ? config.maxSeqLen / ratio : 0)
-            let kvCacheShape = [config.maxBatchSize,
-                                 max(kvCacheRows, 1),
-                                 config.headDim]
-            let kvCache = Tensor.empty(shape: kvCacheShape, dtype: .f32)
 
             let rope = RoPE(ropeHeadDim: config.ropeHeadDim,
                             freqs: RoPE.makeFreqs(config: config, useYarn: ratio > 0))
@@ -277,37 +268,21 @@ public extension Transformer {
                           wkv: wkv, kvNorm: kvNorm,
                           woA: woA, woB: woB,
                           attnSink: attnSink, rope: rope,
-                          kvCache: kvCache)
+                          kvCache: nil)
 
             // ---- MoE FFN ----
-            // Gate logits MUST stay in FP32: model.py:566 spells out
-            //   scores = linear(x.float(), self.weight.float())
-            // i.e. the projection is run in FP32 explicitly. Quantising the
-            // logits to BF16 (~7 mantissa bits) before sqrt(softplus) + topk
-            // perturbs which experts get selected, and on V4-Flash that
-            // perturbation shows up as an 8.4× residual-stream cliff at the
-            // first SCORE-routed layer (= the first layer past
-            // `n_hash_layers`). Hash-routed layers are spared because their
-            // expert indices come from a precomputed token→expert table —
-            // only the weights are affected, not the routing.
-            let gateW = try loadLinear(loader, base: "\(lp).ffn.gate",
+            let gateW = try! loadLinear(loader, base: "\(lp).ffn.gate",
                                         inF: dim, outF: nExperts,
                                         castOutputToBF16: false, rng: &rng)
             let gateBias: Tensor? = i < config.nHashLayers ? nil :
-                ((try loader.tryLoad(["\(lp).ffn.gate.bias"]))
+                ((try? loader.tryLoad(["\(lp).ffn.gate.bias"]))
                  ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
             let tid2eid: Tensor? = i < config.nHashLayers
-                ? (try loader.tryLoad(["\(lp).ffn.gate.tid2eid"])).map(AssemblyHelpers.castIntToI32)
+                ? (try? loader.tryLoad(["\(lp).ffn.gate.tid2eid"])).map(AssemblyHelpers.castIntToI32)
                 : nil
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: tid2eid)
 
-            // Expert-prune support: skip allocation for experts marked
-            // as dropped in config.json's `pruned_experts[i]`. The MoE
-            // dispatch path already handles `nil` slots in
-            // `MoEFFN.experts` (Layers/MoE.swift), and the gate weight
-            // rows for these ids were set to large-negative by the
-            // rewriter so the top-K kernel never picks them.
             let droppedForLayer: Set<Int> =
                 (i < config.prunedExperts.count)
                 ? Set(config.prunedExperts[i])
@@ -320,21 +295,21 @@ public extension Transformer {
                 }
                 let ep = "\(lp).ffn.experts.\(j)"
                 experts.append(Expert(
-                    w1: try loadLinear(loader, base: "\(ep).w1",
+                    w1: try! loadLinear(loader, base: "\(ep).w1",
                                         inF: dim, outF: config.moeInterDim, rng: &rng),
-                    w2: try loadLinear(loader, base: "\(ep).w2",
+                    w2: try! loadLinear(loader, base: "\(ep).w2",
                                         inF: config.moeInterDim, outF: dim, rng: &rng),
-                    w3: try loadLinear(loader, base: "\(ep).w3",
+                    w3: try! loadLinear(loader, base: "\(ep).w3",
                                         inF: dim, outF: config.moeInterDim, rng: &rng),
                     swigluLimit: config.swigluLimit))
             }
             let sep = "\(lp).ffn.shared_experts"
             let sharedExpert = Expert(
-                w1: try loadLinear(loader, base: "\(sep).w1",
+                w1: try! loadLinear(loader, base: "\(sep).w1",
                                     inF: dim, outF: config.moeInterDim, rng: &rng),
-                w2: try loadLinear(loader, base: "\(sep).w2",
+                w2: try! loadLinear(loader, base: "\(sep).w2",
                                     inF: config.moeInterDim, outF: dim, rng: &rng),
-                w3: try loadLinear(loader, base: "\(sep).w3",
+                w3: try! loadLinear(loader, base: "\(sep).w3",
                                     inF: dim, outF: config.moeInterDim, rng: &rng),
                 swigluLimit: config.swigluLimit)
             let moe = MoEFFN(config: config, gate: gate,
@@ -342,27 +317,33 @@ public extension Transformer {
             moe.layerId = i
 
             // ---- HC params ----
-            let hcAttnFn = (try loader.tryLoad(["\(lp).hc_attn_fn"]))
+            let hcAttnFn = (try? loader.tryLoad(["\(lp).hc_attn_fn"]))
                 ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
-            let hcAttnBase = (try loader.tryLoad(["\(lp).hc_attn_base"]))
+            let hcAttnBase = (try? loader.tryLoad(["\(lp).hc_attn_base"]))
                 ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
-            let hcAttnScale = (try loader.tryLoad(["\(lp).hc_attn_scale"]))
+            let hcAttnScale = (try? loader.tryLoad(["\(lp).hc_attn_scale"]))
                 ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
-            let hcFfnFn = (try loader.tryLoad(["\(lp).hc_ffn_fn"]))
+            let hcFfnFn = (try? loader.tryLoad(["\(lp).hc_ffn_fn"]))
                 ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
-            let hcFfnBase = (try loader.tryLoad(["\(lp).hc_ffn_base"]))
+            let hcFfnBase = (try? loader.tryLoad(["\(lp).hc_ffn_base"]))
                 ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
-            let hcFfnScale = (try loader.tryLoad(["\(lp).hc_ffn_scale"]))
+            let hcFfnScale = (try? loader.tryLoad(["\(lp).hc_ffn_scale"]))
                 ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
 
-            blocks.append(Block(layerId: i, config: config,
+            let block = Block(layerId: i, config: config,
                                 attn: mla, ffn: moe,
                                 attnNorm: attnNorm, ffnNorm: ffnNorm,
                                 hcAttnFn: hcAttnFn, hcAttnBase: hcAttnBase,
                                 hcAttnScale: hcAttnScale,
                                 hcFfnFn: hcFfnFn, hcFfnBase: hcFfnBase,
-                                hcFfnScale: hcFfnScale))
+                                hcFfnScale: hcFfnScale)
+            
+            blocksLock.lock()
+            blocksOpt[i] = block
+            blocksLock.unlock()
         }
+        
+        let blocks = blocksOpt.compactMap { $0 }
         MemoryLogger.snapshot("load:layers-built", force: true)
 
         if !loader.missing.isEmpty {
@@ -403,45 +384,27 @@ internal func loadLinear(_ loader: WeightLoader, base: String,
                          inF: Int, outF: Int,
                          castOutputToBF16: Bool = false,
                          rng: inout MiniRNG) throws -> Linear {
-    if var w = try loader.tryLoad(["\(base).weight"]) {
-        // V4-Flash-HF stores routed-expert FP4 weights as raw I8/U8
-        // bytes (each byte packs two E2M1 nibbles) because safetensors
-        // has no native FP4 dtype. Our `Linear.callAsFunction` switch
-        // on `.i8` dispatches the W8A16 INT8 kernel, which reads the
-        // bytes as signed [-128, 127] integers and multiplies by an
-        // F16 group scale — completely the wrong math, so expert
-        // outputs blow up to 1e25 and NaN the whole block.
-        //
-        // Reinterpret the tensor as FP4 with the LOGICAL shape (last
-        // dim doubled) when the name matches a routed expert. The
-        // converter's CLI already does the same reinterpretation
-        // (Sources/converter/main.swift:568) — this is just the
-        // inference-side equivalent so we can run the HF checkpoint
-        // directly without converting.
-        if base.contains(".experts.") && (w.dtype == .i8) {
-            let packedLast = w.shape.last ?? 0
-            let logicalShape = Array(w.shape.dropLast()) + [packedLast * 2]
-            w = Tensor(array: w.array.reshaped(logicalShape), dtype: .fp4E2M1)
+    
+    let wNames = ["\(base).weight"]
+    let sNames = ["\(base).scale", "\(base).weight_scale_inv"]
+    
+    if let dt = loader.dtype(ofAny: wNames) {
+        let weightName = wNames.first { loader.dtype(of: $0) != nil }!
+        let scaleName = sNames.first { loader.dtype(of: $0) != nil }
+        
+        var wDtype = dt
+        if base.contains(".experts.") && wDtype == .i8 {
+            wDtype = .fp4E2M1
         }
-
-        // Only quantized dtypes carry a `.scale` companion. Asking for
-        // one on bf16/f32 paths adds noise to the missing-tensor report
-        // and does nothing useful (Linear's switch ignores `scale` for
-        // those dtypes).
-        let needsScale = w.dtype == .i8
-                      || w.dtype == .i4
-                      || w.dtype == .i2
-                      || w.dtype == .fp8E4M3
-                      || w.dtype == .fp4E2M1
-        // Names: post-converter we use `<base>.scale`, but HF-native
-        // FP8/FP4 release stores it as `<base>.weight_scale_inv`. Try
-        // both so the same code path serves both directories.
-        let scale: Tensor? = needsScale
-            ? try loader.tryLoad(["\(base).scale", "\(base).weight_scale_inv"])
-            : nil
-        return Linear(inFeatures: inF, outFeatures: outF, weight: w, scale: scale,
+        
+        return Linear(inFeatures: inF, outFeatures: outF,
+                      weightName: weightName,
+                      scaleName: scaleName,
+                      weightDType: wDtype,
+                      loader: loader,
                       castOutputToBF16: castOutputToBF16)
     }
+    
     return AssemblyHelpers.linear(in: inF, out: outF, rng: &rng)
 }
 

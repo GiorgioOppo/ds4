@@ -1,8 +1,11 @@
 import Foundation
+import MLX
 
 // MARK: - Legacy KV Cache Stubs
 
 public struct KVCacheSnapshot: @unchecked Sendable {
+    public let layerCaches: [MLXArray?]
+
     public enum DiskCompression: Sendable {
         case f16, bf16, f32
     }
@@ -14,13 +17,6 @@ public struct KVCacheSnapshot: @unchecked Sendable {
 public struct KVCacheFile: Sendable {
     public static let manifestMagic: UInt32 = 0x4B56434D
     public static func coldSaveAlignedCount(_ count: Int) -> Int { return count }
-}
-
-// In MLX, we don't snapshot explicit KV buffers this way for now.
-public extension Transformer {
-    func snapshotKVCache() -> KVCacheSnapshot { return KVCacheSnapshot() }
-    func canRestoreKVCache(_ snap: KVCacheSnapshot) -> Bool { return false }
-    func restoreKVCache(_ snap: KVCacheSnapshot) {}
 }
 
 public struct LoadPlan: Sendable {

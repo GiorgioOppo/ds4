@@ -1,5 +1,6 @@
 import Foundation
 import DeepSeekKit
+import MLX
 
 /// One event in a streaming generation: an incremental token text,
 /// a finalized parsed Message (Reasoning extracted, tool calls
@@ -457,7 +458,15 @@ final class InferenceService: @unchecked Sendable {
         // snapshot the resulting KV state.
         model.releaseCache()
         self.cacheImage = nil
-        _ = model.forward(inputIds: [prefixTokens.map(Int.init)], startPos: 0)
+        let promptIds = prefixTokens.map(Int.init)
+        let chunkSize = 128
+        var logitsTemp: Tensor? = nil
+        for i in stride(from: 0, to: promptIds.count, by: chunkSize) {
+            let end = min(i + chunkSize, promptIds.count)
+            let chunk = Array(promptIds[i..<end])
+            logitsTemp = model.forward(inputIds: [chunk], startPos: i)
+            MLX.eval(logitsTemp!.array)
+        }
         let snap = model.snapshotKVCache()
         self.toolPrefixTokens = prefixTokens
         self.toolPrefixSnapshot = snap
@@ -694,8 +703,15 @@ final class InferenceService: @unchecked Sendable {
                 }
                 model.releaseCache()
                 self.cacheImage = nil
-                _ = model.forward(inputIds: [tokens.map(Int.init)],
-                                   startPos: 0)
+                let promptIds = tokens.map(Int.init)
+                let chunkSize = 128
+                var logitsTemp: Tensor? = nil
+                for i in stride(from: 0, to: promptIds.count, by: chunkSize) {
+                    let end = min(i + chunkSize, promptIds.count)
+                    let chunk = Array(promptIds[i..<end])
+                    logitsTemp = model.forward(inputIds: [chunk], startPos: i)
+                    MLX.eval(logitsTemp!.array)
+                }
                 let snap = model.snapshotKVCache()
                 var ok = false
                 do {
@@ -1209,7 +1225,22 @@ final class InferenceService: @unchecked Sendable {
                 //    weights page through the streaming slot).
                 continuation.yield(.prefillStart(promptTokens: promptIds.count))
                 let prefillStart = Date()
-                var logits = model.forward(inputIds: [promptIds], startPos: 0)
+                
+                var logitsTemp: Tensor? = nil
+                let chunkSize = 128
+                for i in stride(from: 0, to: promptIds.count, by: chunkSize) {
+                    if self.isCancelled() { break }
+                    let end = min(i + chunkSize, promptIds.count)
+                    let chunk = Array(promptIds[i..<end])
+                    logitsTemp = model.forward(inputIds: [chunk], startPos: i)
+                    MLX.eval(logitsTemp!.array)
+                }
+                guard let finalLogits = logitsTemp else {
+                    continuation.finish(throwing: NSError(domain: "Inference", code: 3))
+                    return
+                }
+                var logits = finalLogits
+
                 let prefillElapsed = Date().timeIntervalSince(prefillStart)
                 let prefillTPM = prefillElapsed > 0
                     ? Double(promptIds.count) / prefillElapsed * 60
@@ -1347,7 +1378,20 @@ final class InferenceService: @unchecked Sendable {
                 let promptIds = promptTokens.map(Int.init)
                 continuation.yield(.prefillStart(promptTokens: promptIds.count))
                 let prefillStart = Date()
-                var logits = model.forward(inputIds: [promptIds], startPos: 0)
+                var logitsTemp: Tensor? = nil
+                let chunkSize = 128
+                for i in stride(from: 0, to: promptIds.count, by: chunkSize) {
+                    if self.isCancelled() { break }
+                    let end = min(i + chunkSize, promptIds.count)
+                    let chunk = Array(promptIds[i..<end])
+                    logitsTemp = model.forward(inputIds: [chunk], startPos: i)
+                    MLX.eval(logitsTemp!.array)
+                }
+                guard let finalLogits = logitsTemp else {
+                    continuation.finish(throwing: NSError(domain: "Inference", code: 3))
+                    return
+                }
+                var logits = finalLogits
                 let prefillElapsed = Date().timeIntervalSince(prefillStart)
                 let prefillTPM = prefillElapsed > 0
                     ? Double(promptIds.count) / prefillElapsed * 60
@@ -1737,7 +1781,24 @@ final class InferenceService: @unchecked Sendable {
                 } else {
                     // Cold path: full multi-token prefill from startPos 0.
                     let ids = deltaTokens.map(Int.init)
-                    logits = model.forward(inputIds: [ids], startPos: 0)
+                    var logitsTemp: Tensor? = nil
+                    let chunkSize = 128
+                    for i in stride(from: 0, to: ids.count, by: chunkSize) {
+                        if self.isCancelled(for: conversationID) { break }
+                        let end = min(i + chunkSize, ids.count)
+                        let chunk = Array(ids[i..<end])
+                        logitsTemp = model.forward(inputIds: [chunk], startPos: i)
+                        MLX.eval(logitsTemp!.array)
+                    }
+                    guard let ll = logitsTemp else {
+                        continuation.finish(throwing: NSError(
+                            domain: "InferenceService", code: 3, userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Cancelled before prefill could produce logits."
+                            ]))
+                        return
+                    }
+                    logits = ll
                 }
 
                 let prefillElapsed = Date().timeIntervalSince(prefillStart)

@@ -1,23 +1,72 @@
 import Foundation
 import MLX
 
+// MARK: - Safetensors header types
+
+/// Represents a single tensor's metadata from the safetensors header.
+private struct TensorMeta {
+    let dtype: String       // e.g. "F32", "BF16", "F16", "I8", "I32", "I64", "U8", "F8_E4M3"
+    let shape: [Int]
+    let offsetBegin: Int    // relative to data section start
+    let offsetEnd: Int      // relative to data section start
+    let shardURL: URL
+    let dataOffset: Int     // absolute file offset = 8 + headerSize
+}
+
+/// Parses safetensors dtype string to our DType enum.
+private func dtypeFromString(_ s: String) -> (DType, MLX.DType) {
+    switch s.uppercased() {
+    case "F32", "FLOAT32":      return (.f32, .float32)
+    case "F16", "FLOAT16":      return (.f16, .float16)
+    case "BF16", "BFLOAT16":    return (.bf16, .bfloat16)
+    case "I32", "INT32":        return (.i32, .int32)
+    case "I8", "INT8":          return (.i8, .int8)
+    case "I64", "INT64":        return (.i64, .int64)
+    case "U8", "UINT8":         return (.fp8E4M3, .uint8)  // quantization types stored as uint8
+    case "F8_E4M3":             return (.fp8E4M3, .uint8)
+    case "F8_E8M0":             return (.e8m0, .uint8)
+    default:                    return (.f32, .float32)
+    }
+}
+
+// MARK: - WeightLoader (Streaming)
+
 public final class WeightLoader {
     public let directory: URL
-    private var arrays: [String: MLXArray] = [:]
+    
+    /// Index: tensor name → metadata (shape, dtype, file offset, shard).
+    /// Built at init by parsing only the JSON headers — NO tensor data loaded.
+    private var index: [String: TensorMeta] = [:]
+    
+    /// Cache of currently-loaded MLXArrays. Populated on-demand by
+    /// `ensureLayer` and cleared by `releaseLayer`.
+    private var cache: [String: MLXArray] = [:]
+    private let cacheLock = NSLock()
+    
+    /// Set of tensor names that were requested but not found in any shard.
+    private let missingLock = NSLock()
     public private(set) var missing: Set<String> = []
     
-    public var streamingEnabled: Bool = false
-    public var streamingSlotCount: Int { 0 }
+    /// Global tensors (embed, norm, head, hc_head_*) are always kept resident
+    /// because they're used on every forward pass.
+    private var globalNames: Set<String> = []
     
-    public var totalKnownNames: Int { arrays.count }
-    public var allKnownNames: [String] { Array(arrays.keys) }
-    public var shardCount: Int { 1 } // Simplified
+    public var streamingEnabled: Bool = true
+    public var streamingSlotCount: Int { 2 }  // current + prefetch
+    
+    public var totalKnownNames: Int { index.count }
+    public var allKnownNames: [String] { Array(index.keys) }
+    public var shardCount: Int { shardURLs.count }
+    
+    private var shardURLs: [URL] = []
+    
+    // MARK: - Discovery
     
     public static func discoverShards(in directory: URL) throws -> [(url: URL, byteCount: UInt64)] {
         let fm = FileManager.default
         let contents = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
         let candidates = contents
-            .filter { $0.pathExtension == "safetensors" || $0.pathExtension == "safetensors.lz4" }
+            .filter { $0.pathExtension == "safetensors" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         
         return try candidates.map { url in
@@ -26,6 +75,8 @@ public final class WeightLoader {
             return (url: url, byteCount: size)
         }
     }
+    
+    // MARK: - Init (header-only — O(KB) RAM)
     
     public init(directory: URL) throws {
         self.directory = directory
@@ -41,41 +92,266 @@ public final class WeightLoader {
             ])
         }
         
-        for url in candidates {
-            // Load using MLX
+        self.shardURLs = candidates
+        
+        // Parse headers in parallel — only reads the first few KB of each file
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: candidates.count) { i in
+            let url = candidates[i]
             do {
-                let loaded = try MLX.loadArrays(url: url)
-                for (k, v) in loaded {
-                    arrays[k] = v
+                let metas = try Self.parseHeader(url: url)
+                lock.lock()
+                for (name, meta) in metas {
+                    self.index[name] = meta
                 }
+                lock.unlock()
             } catch {
-                print("Failed to load \(url): \(error)")
+                print("[WeightLoader] Failed to parse header of \(url.lastPathComponent): \(error)")
             }
+        }
+        
+        // Identify global (non-layer) tensors and pre-load them.
+        // These are small relative to total model size.
+        for name in index.keys {
+            if !name.hasPrefix("layers.") {
+                globalNames.insert(name)
+            }
+        }
+        
+        // Pre-load global tensors (embed, head, norm, hc_head_*)
+        preloadTensors(names: globalNames)
+    }
+    
+    // MARK: - Header parsing
+    
+    /// Parses only the JSON header of a safetensors file. Returns
+    /// tensor name → TensorMeta without reading any tensor data.
+    private static func parseHeader(url: URL) throws -> [String: TensorMeta] {
+        let fh = try FileHandle(forReadingFrom: url)
+        defer { try? fh.close() }
+        
+        // First 8 bytes: little-endian uint64 header size
+        guard let sizeData = try fh.read(upToCount: 8), sizeData.count == 8 else {
+            throw NSError(domain: "WeightLoader", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to read header size from \(url.lastPathComponent)"
+            ])
+        }
+        let headerSize = sizeData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        
+        // Read the JSON header
+        guard let jsonData = try fh.read(upToCount: Int(headerSize)) else {
+            throw NSError(domain: "WeightLoader", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to read header JSON from \(url.lastPathComponent)"
+            ])
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            throw NSError(domain: "WeightLoader", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid header JSON in \(url.lastPathComponent)"
+            ])
+        }
+        
+        let dataStartOffset = 8 + Int(headerSize)
+        var result: [String: TensorMeta] = [:]
+        
+        for (key, value) in json {
+            // Skip the __metadata__ key
+            if key == "__metadata__" { continue }
+            
+            guard let info = value as? [String: Any],
+                  let dtypeStr = info["dtype"] as? String,
+                  let shape = info["shape"] as? [Int],
+                  let offsets = info["data_offsets"] as? [Int],
+                  offsets.count == 2
+            else { continue }
+            
+            result[key] = TensorMeta(
+                dtype: dtypeStr,
+                shape: shape,
+                offsetBegin: offsets[0],
+                offsetEnd: offsets[1],
+                shardURL: url,
+                dataOffset: dataStartOffset
+            )
+        }
+        
+        return result
+    }
+    
+    // MARK: - On-demand tensor loading
+    
+    /// Load a single tensor from disk by reading only its byte range.
+    private func loadTensorFromDisk(name: String, meta: TensorMeta) -> MLXArray? {
+        do {
+            let fh = try FileHandle(forReadingFrom: meta.shardURL)
+            defer { try? fh.close() }
+            
+            let absOffset = UInt64(meta.dataOffset + meta.offsetBegin)
+            let byteCount = meta.offsetEnd - meta.offsetBegin
+            
+            try fh.seek(toOffset: absOffset)
+            guard let data = try fh.read(upToCount: byteCount), data.count == byteCount else {
+                return nil
+            }
+            
+            let (_, mlxDType) = dtypeFromString(meta.dtype)
+            return MLXArray(data, meta.shape, dtype: mlxDType)
+        } catch {
+            print("[WeightLoader] Error loading tensor '\(name)': \(error)")
+            return nil
         }
     }
     
+    /// Pre-load a set of tensor names into the cache (used for globals).
+    private func preloadTensors(names: Set<String>) {
+        let namesToLoad = names.filter { index[$0] != nil }
+        let nameArray = Array(namesToLoad)
+        
+        DispatchQueue.concurrentPerform(iterations: nameArray.count) { i in
+            let name = nameArray[i]
+            guard let meta = self.index[name] else { return }
+            guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
+            self.cacheLock.lock()
+            self.cache[name] = arr
+            self.cacheLock.unlock()
+        }
+    }
+    
+    // MARK: - Layer streaming API
+    
+    /// Load all tensors for layer `K` into cache.
+    /// Called by `Transformer.forward()` before processing layer K.
+    public func ensureLayer(_ K: Int) {
+        let prefix = "layers.\(K)."
+        var toLoad: [(String, TensorMeta)] = []
+        
+        for (name, meta) in index {
+            if name.hasPrefix(prefix) {
+                cacheLock.lock()
+                let alreadyCached = cache[name] != nil
+                cacheLock.unlock()
+                if !alreadyCached {
+                    toLoad.append((name, meta))
+                }
+            }
+        }
+        
+        guard !toLoad.isEmpty else { return }
+        
+        // Load tensors for this layer in parallel
+        DispatchQueue.concurrentPerform(iterations: toLoad.count) { i in
+            let (name, meta) = toLoad[i]
+            guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
+            self.cacheLock.lock()
+            self.cache[name] = arr
+            self.cacheLock.unlock()
+        }
+        
+        // Merge into main cache
+        cacheLock.lock()
+        for (name, _) in toLoad {
+            if let arr = cache[name] { /* already there */ }
+        }
+        cacheLock.unlock()
+    }
+    
+    /// Load expert tensors for layer K on demand.
+    public func ensureExperts(layer K: Int, indices: [Int]) {
+        var toLoad: [(String, TensorMeta)] = []
+        
+        for e in indices {
+            let prefix = "layers.\(K).ffn.experts.\(e)."
+            for (name, meta) in index {
+                if name.hasPrefix(prefix) {
+                    cacheLock.lock()
+                    let alreadyCached = cache[name] != nil
+                    cacheLock.unlock()
+                    if !alreadyCached {
+                        toLoad.append((name, meta))
+                    }
+                }
+            }
+        }
+        
+        guard !toLoad.isEmpty else { return }
+        
+        DispatchQueue.concurrentPerform(iterations: toLoad.count) { i in
+            let (name, meta) = toLoad[i]
+            guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
+            self.cacheLock.lock()
+            self.cache[name] = arr
+            self.cacheLock.unlock()
+        }
+    }
+    
+    /// Start loading layer K+1 in background while layer K executes.
+    public func prefetchLayer(_ layerIndex: Int) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.ensureLayer(layerIndex)
+        }
+    }
+    
+    /// Release all tensors for layer `K` from cache, freeing RAM.
+    public func releaseLayer(_ layerIndex: Int) {
+        let prefix = "layers.\(layerIndex)."
+        cacheLock.lock()
+        for name in cache.keys {
+            if name.hasPrefix(prefix) {
+                cache.removeValue(forKey: name)
+            }
+        }
+        cacheLock.unlock()
+    }
+    
+    // MARK: - Tensor access API (used during Assembly)
     
     public func load(_ name: String) throws -> Tensor? {
-        if let arr = arrays[name] {
-            let dt: DType
-            switch arr.dtype {
-            case .float32: dt = .f32
-            case .float16: dt = .f16
-            case .bfloat16: dt = .bf16
-            case .int32: dt = .i32
-            case .int8: dt = .i8
-            case .int64: dt = .i64
-            case .uint8: dt = .fp8E4M3 // Assumption for quantization types
-            default: dt = .f32
-            }
+        // Check cache first
+        cacheLock.lock()
+        if let arr = cache[name] {
+            cacheLock.unlock()
+            let (dt, _) = index[name].map { dtypeFromString($0.dtype) } ?? (.f32, .float32)
             return Tensor(array: arr, dtype: dt)
         }
+        cacheLock.unlock()
+        
+        // Not cached — try to load from disk on demand
+        if let meta = index[name] {
+            if let arr = loadTensorFromDisk(name: name, meta: meta) {
+                let (dt, _) = dtypeFromString(meta.dtype)
+                // Cache it if it's a global tensor
+                if globalNames.contains(name) {
+                    cacheLock.lock()
+                    cache[name] = arr
+                    cacheLock.unlock()
+                }
+                return Tensor(array: arr, dtype: dt)
+            }
+        }
+        
+        missingLock.lock()
         missing.insert(name)
+        missingLock.unlock()
         return nil
     }
     
+    public func dtype(of name: String) -> DType? {
+        if let dtypeStr = index[name]?.dtype {
+            let (dt, _) = dtypeFromString(dtypeStr)
+            return dt
+        }
+        return nil
+    }
+
+    public func dtype(ofAny candidates: [String]) -> DType? {
+        for n in candidates {
+            if let dt = dtype(of: n) { return dt }
+        }
+        return nil
+    }
+
     public func shape(of name: String) -> [Int]? {
-        return arrays[name]?.shape
+        return index[name]?.shape
     }
     
     public func shape(ofAny candidates: [String]) -> [Int]? {
@@ -89,17 +365,15 @@ public final class WeightLoader {
         for n in candidates {
             if let t = try load(n) { return t }
         }
+        missingLock.lock()
         for n in candidates { missing.insert(n) }
+        missingLock.unlock()
         return nil
     }
     
-    public func ensureLayer(_ K: Int) {}
-    public func ensureExperts(layer K: Int, indices: [Int]) {}
-    public func prefetchLayer(_ layerIndex: Int) {}
-    public func releaseLayer(_ layerIndex: Int) {}
-    
     @discardableResult
     public func warmupAllShards(memoryGuardRatio: Double = 1.5) -> Bool {
+        // In streaming mode, warmup is a no-op — we load on demand.
         return true
     }
 }
