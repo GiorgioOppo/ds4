@@ -129,32 +129,66 @@ public final class MLA {
         MLX.eval(kvCache!)
         let currentKV = kvCache!   // bf16
 
+        // Sliding-window attention.
+        //
+        // The model was trained with `windowSize` = 128 raw KV plus the
+        // compressed long-range path on ratio>0 layers (Compressor +
+        // Indexer + attention sink). The MLX port does not implement
+        // the compressed path; we keep only the sliding window, which
+        // is in-distribution for layers with `compressRatio == 0` and
+        // a degradation (no long-range context) for ratio>0 layers —
+        // strictly better than vanilla SDPA on the full unbounded KV,
+        // which puts the model at positions it never saw at training
+        // time and collapses generation onto regurgitated prompt
+        // tokens.
+        //
+        // We slice the cache to the in-window range so SDPA only
+        // computes over the keys that can actually contribute; an
+        // additive mask enforces the per-query window + causal limits
+        // within that slice.
+        let cacheLen = currentKV.shape[1]
+        let attendStart = max(0, startPos - (windowSize - 1))
+        let kvSlice = attendStart > 0
+            ? currentKV[0..., attendStart..<cacheLen, 0...]
+            : currentKV
+        let L = kvSlice.shape[1]
+
         // Run SDPA in bf16 to match the cached K/V dtype and pick up the
         // bf16 kernel. q comes in f32 (rsqrt + RoPE done in f32 above) —
         // cast at the SDPA boundary so RoPE numerics stay full precision.
         let qPerToken = q.reshaped([B, S, nHeads, headDim])
             .transposed(0, 2, 1, 3)
             .asType(.bfloat16)                          // [B, nHeads, S, headDim] bf16
-        let kPerToken = currentKV.expandedDimensions(axes: [1])  // [B, 1, S_total, headDim] bf16
-        let vPerToken = currentKV.expandedDimensions(axes: [1])
+        let kPerToken = kvSlice.expandedDimensions(axes: [1])  // [B, 1, L, headDim] bf16
+        let vPerToken = kvSlice.expandedDimensions(axes: [1])
 
-        var o: MLXArray
-        if S > 1 {
-            let L = currentKV.shape[1]
-            var mask = MLXNN.MultiHeadAttention.createAdditiveCausalMask(S, dtype: .bfloat16)
-            if L > S {
-                let historyMask = MLXArray.zeros([S, L - S]).asType(.bfloat16)
-                mask = concatenated([historyMask, mask], axis: 1)
-            }
-            o = MLXFast.scaledDotProductAttention(queries: qPerToken, keys: kPerToken, values: vPerToken, scale: softmaxScale, mask: mask)
-        } else {
-            o = MLXFast.scaledDotProductAttention(queries: qPerToken, keys: kPerToken, values: vPerToken, scale: softmaxScale, mask: nil)
-        }
+        // Build the sliding-window causal additive mask of shape (S, L).
+        //   Row i  → query at absolute position `startPos + i`
+        //   Col j  → key   at absolute position `attendStart + j`
+        // Allowed iff:
+        //   (attendStart + j) ≤ (startPos + i)               -- causal
+        //   (startPos + i) - (attendStart + j) < windowSize  -- sliding window
+        let queryPos = MLXArray((0..<S).map { Int32(startPos + $0) })
+            .reshaped([S, 1])
+        let keyPos = MLXArray((0..<L).map { Int32(attendStart + $0) })
+            .reshaped([1, L])
+        let diff = queryPos - keyPos                                 // [S, L]
+        // Use bool→int8 conversion + multiply for logical AND.
+        let causal = (diff .>= 0).asType(.int8)
+        let inWin  = (diff .< Int32(windowSize)).asType(.int8)
+        let allowedF = (causal * inWin).asType(.bfloat16)            // 1.0 / 0.0
+        // additive bias: 0 where allowed, -1e9 elsewhere (safe vs -inf).
+        let mask = (MLXArray(Float(1.0)) - allowedF).asType(.bfloat16)
+            * MLXArray(Float(-1e9)).asType(.bfloat16)
+
+        let o0 = MLXFast.scaledDotProductAttention(
+            queries: qPerToken, keys: kPerToken, values: vPerToken,
+            scale: softmaxScale, mask: mask)
 
         // Cast back to f32 for the inverse-RoPE + woA/woB tail. The
         // subsequent matmuls expect f32 weights as currently produced
         // by `Linear.getDequantizedWeight()`.
-        o = o.asType(.float32).transposed(0, 2, 1, 3).reshaped([B * S, nHeads, headDim])
+        var o = o0.asType(.float32).transposed(0, 2, 1, 3).reshaped([B * S, nHeads, headDim])
 
         o = rope.apply(Tensor(array: o, dtype: .f32), startPos: startPos, inverse: true).array
 
