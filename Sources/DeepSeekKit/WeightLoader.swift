@@ -297,13 +297,19 @@ public final class WeightLoader {
     /// inherit the residents.
     public func releaseExperts(layer K: Int, indices: [Int]) {
         cacheLock.lock()
+        // Collect first, mutate after — iterating `cache.keys` while
+        // calling `removeValue` is undefined behavior in Swift and can
+        // silently skip entries (which would leak expert weights
+        // across layers).
+        var keysToRemove: [String] = []
         for e in indices {
             let prefix = "layers.\(K).ffn.experts.\(e)."
-            for name in cache.keys {
-                if name.hasPrefix(prefix) {
-                    cache.removeValue(forKey: name)
-                }
+            for name in cache.keys where name.hasPrefix(prefix) {
+                keysToRemove.append(name)
             }
+        }
+        for name in keysToRemove {
+            cache.removeValue(forKey: name)
         }
         cacheLock.unlock()
     }
@@ -323,12 +329,23 @@ public final class WeightLoader {
     public func releaseLayer(_ layerIndex: Int) {
         let prefix = "layers.\(layerIndex)."
         cacheLock.lock()
-        for name in cache.keys {
-            if name.hasPrefix(prefix) {
-                cache.removeValue(forKey: name)
-            }
+        var keysToRemove: [String] = []
+        for name in cache.keys where name.hasPrefix(prefix) {
+            keysToRemove.append(name)
+        }
+        for name in keysToRemove {
+            cache.removeValue(forKey: name)
         }
         cacheLock.unlock()
+    }
+
+    /// Returns the number of tensors currently held in the on-demand
+    /// cache (globals are counted too). Useful to verify that the
+    /// streaming releases are actually freeing entries between layers.
+    public var cachedTensorCount: Int {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache.count
     }
     
     // MARK: - Tensor access API (used during Assembly)

@@ -186,6 +186,12 @@ public final class MoEFFN {
         // MLXArrays we're about to drop.
         MLX.eval(yFlat)
         weightLoader?.releaseExperts(layer: layerId, indices: activeExperts)
+        // Drain MLX's buffer pool: the dequantized weight temporaries
+        // for each of `topK` experts (~30–60 MB at bf16 for a 4096×4096
+        // expert linear) are otherwise retained for reuse, and on a
+        // tight-RAM run the high-water-mark stays elevated even
+        // though our cache says the experts are gone.
+        MLX.GPU.clearCache()
 
         let sharedOut = sharedExpert(xFlat).array
         yFlat = yFlat + sharedOut

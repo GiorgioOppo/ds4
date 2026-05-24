@@ -110,7 +110,9 @@ public final class Transformer {
 
         // Prefetch layer 0 before we start
         weightLoader?.ensureLayer(0)
-        
+
+        let debugStream = ProcessInfo.processInfo.environment["DEEPSEEK_STREAMING_DEBUG"] != nil
+
         for (k, layer) in layers.enumerated() {
             // Start prefetching next layer in background while current executes
             if k + 1 < layers.count {
@@ -121,6 +123,16 @@ public final class Transformer {
             MLX.eval(x)
             // Release current layer's weights to free RAM
             weightLoader?.releaseLayer(k)
+            // Return MLX's internal buffer pool to the system. Without
+            // this MLX keeps freed buffers for reuse, and on a tight-
+            // RAM system that pool can grow to the size of the largest
+            // recent peak — defeating per-expert streaming.
+            MLX.GPU.clearCache()
+
+            if debugStream, let loader = weightLoader {
+                FileHandle.standardError.write(Data(
+                    "[stream] layer \(k) done; cache=\(loader.cachedTensorCount) tensors\n".utf8))
+            }
         }
 
         let logits = head(Tensor(array: x, dtype: .f32), hcFn: hcHeadFn, hcScale: hcHeadScale, hcBase: hcHeadBase, norm: norm)
