@@ -486,20 +486,50 @@ public struct ModelConfig: Codable, Sendable {
         // attention cost (SparseAttention tiles down to compensate
         // for the watchdog). Applied before the maxSeqLen auto-grow
         // below so a widened window is still counted in the budget.
-        let windowMult: Int = {
-            if let raw = ProcessInfo.processInfo
-                .environment["DEEPSEEK_WINDOW_MULT"],
-               let n = Int(raw), n > 0 { return n }
-            return 1
-        }()
-        if windowMult > 1 {
-            let oldWin = c.windowSize
-            c.windowSize = oldWin * windowMult
+        //
+        // Precedence (first hit wins):
+        //   DEEPSEEK_WINDOW_SIZE=N → set windowSize to N tokens directly.
+        //     Use this when you want a specific long-context window
+        //     (e.g. 10000 to cover entire chat sessions raw, beyond
+        //     which there is no compressed-long-range path because
+        //     Compressor/Indexer are not yet ported to the MLX
+        //     backend).
+        //   DEEPSEEK_WINDOW_MULT=N → multiply the trained windowSize
+        //     by N. Legacy knob, kept for compatibility.
+        //   Otherwise → trained value (typically 128).
+        //
+        // OOD warning: the checkpoint was trained with windowSize=128
+        // plus a learned Compressor for everything older. With a
+        // larger raw window the model attends to positions it never
+        // saw at training; the sliding-window mask in MLA limits the
+        // damage by capping attention to the last `windowSize` keys,
+        // but quality degrades vs the reference sparse-attn path.
+        let oldWin = c.windowSize
+        if let raw = ProcessInfo.processInfo
+            .environment["DEEPSEEK_WINDOW_SIZE"],
+           let n = Int(raw), n > 0, n != oldWin {
+            c.windowSize = n
             FileHandle.standardError.write(Data(
-                ("[config] windowSize ×\(windowMult): \(oldWin) → "
-                 + "\(c.windowSize) — raw window widened "
-                 + "(out-of-distribution; DEEPSEEK_WINDOW_MULT=1 to "
-                 + "restore the trained value)\n").utf8))
+                ("[config] DEEPSEEK_WINDOW_SIZE override: windowSize "
+                 + "\(oldWin) → \(n) (out-of-distribution; the trained "
+                 + "raw window is \(oldWin) tokens — the model has no "
+                 + "Compressor/Indexer in the MLX backend, so positions "
+                 + "older than \(n) tokens are not visible at all)\n").utf8))
+        } else {
+            let windowMult: Int = {
+                if let raw = ProcessInfo.processInfo
+                    .environment["DEEPSEEK_WINDOW_MULT"],
+                   let n = Int(raw), n > 0 { return n }
+                return 1
+            }()
+            if windowMult > 1 {
+                c.windowSize = oldWin * windowMult
+                FileHandle.standardError.write(Data(
+                    ("[config] windowSize ×\(windowMult): \(oldWin) → "
+                     + "\(c.windowSize) — raw window widened "
+                     + "(out-of-distribution; DEEPSEEK_WINDOW_MULT=1 to "
+                     + "restore the trained value)\n").utf8))
+            }
         }
 
         // maxSeqLen resolution — it sizes the RoPE table and every
