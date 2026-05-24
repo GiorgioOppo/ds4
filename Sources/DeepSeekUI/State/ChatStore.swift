@@ -1410,13 +1410,13 @@ final class ChatStore: ObservableObject {
 
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
-                .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
+                .map { "- \($0.name): \($0.summary.isEmpty ? "(nessuna descrizione)" : $0.summary)" }
                 .joined(separator: "\n")
             schemas.append(Self.schemaWithExample([
                 "name": EncodingDSV4.delegateToolName,
                 "description":
                     """
-                    Delegate a focused sub-task to another agent. The named agent will run independently with its own system prompt and produce a single textual reply that becomes this tool's output. Use it when a sub-task is better handled by a specialist agent. Available agents:
+                    Delega un sotto-compito focalizzato a un altro agente. L'agente specificato verrà eseguito in modo indipendente con il proprio prompt di sistema e produrrà una singola risposta testuale che diventa l'output di questo strumento. Usalo quando un sotto-compito è gestito meglio da un agente specializzato. Agenti disponibili:
                     \(roster)
                     """,
                 "inputSchema": [
@@ -1424,11 +1424,11 @@ final class ChatStore: ObservableObject {
                     "properties": [
                         "agent_name": [
                             "type": "string",
-                            "description": "Exact name of the agent to invoke."
+                            "description": "Nome esatto dell'agente da invocare."
                         ],
                         "task": [
                             "type": "string",
-                            "description": "Self-contained instructions for the sub-agent. Include everything it needs — it doesn't see this conversation's history."
+                            "description": "Istruzioni autonome per il sotto-agente. Includi tutto ciò che gli serve — non vede la cronologia di questa conversazione."
                         ]
                     ],
                     "required": ["agent_name", "task"]
@@ -1491,26 +1491,29 @@ final class ChatStore: ObservableObject {
     nonisolated static let discoveryToolSchemasJSON: String? = {
         let listTool: [String: Any] = [
             "name": EncodingDSV4.listToolsName,
-            "description": "Lists the tools available in this session — "
-                + "returns each tool's name and a short description. When a "
-                + "tool would help, consult this, then call "
-                + "\(EncodingDSV4.searchToolName) to get a tool's exact "
-                + "parameter schema and a worked example before invoking it.",
+            "description": "Elenca gli strumenti disponibili in questa "
+                + "sessione — restituisce il nome e una breve "
+                + "descrizione di ciascuno. Quando uno strumento può "
+                + "servire, consulta questo elenco e poi chiama "
+                + "\(EncodingDSV4.searchToolName) per ottenere lo "
+                + "schema esatto dei parametri e un esempio pratico, "
+                + "prima di invocarlo.",
             "inputSchema": ["type": "object"],
         ]
         let searchTool: [String: Any] = [
             "name": EncodingDSV4.searchToolName,
-            "description": "Look up tools by name or keyword and return "
-                + "their full parameter schemas, each with a worked "
-                + "example invocation. Use this to learn the exact "
-                + "arguments a tool expects before invoking it.",
+            "description": "Cerca strumenti per nome o parola chiave e "
+                + "restituisce i loro schemi completi dei parametri, "
+                + "ciascuno con un esempio pratico di invocazione. "
+                + "Usalo per scoprire gli argomenti esatti che uno "
+                + "strumento richiede prima di invocarlo.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "query": [
                         "type": "string",
-                        "description": "A tool name or keyword to search for.",
-                        "example": "read file",
+                        "description": "Un nome o una parola chiave dello strumento da cercare.",
+                        "example": "leggi file",
                     ],
                 ],
                 "required": ["query"],
@@ -1543,11 +1546,11 @@ final class ChatStore: ObservableObject {
                 withJSONObject: entries,
                 options: [.prettyPrinted, .sortedKeys]),
               let json = String(data: data, encoding: .utf8)
-        else { return "[no tools available]" }
-        return "Available tools — call \(EncodingDSV4.searchToolName) "
-            + "with a name (or keyword) from this list to get its "
-            + "parameter schema and a worked example before invoking "
-            + "it:\n\(json)"
+        else { return "[nessuno strumento disponibile]" }
+        return "Strumenti disponibili — chiama \(EncodingDSV4.searchToolName) "
+            + "con un nome (o una parola chiave) di questa lista per "
+            + "ottenere lo schema dei parametri e un esempio pratico, "
+            + "prima di invocarlo:\n\(json)"
     }
 
     /// `__search_tool` handler — full schemas (incl. inputSchema) of
@@ -1580,18 +1583,20 @@ final class ChatStore: ObservableObject {
             return name.contains(q) || desc.contains(q)
         }
         if matches.isEmpty {
-            return "[\(EncodingDSV4.searchToolName)] no tool matches "
-                + "\"\(query)\". Call \(EncodingDSV4.listToolsName) to "
-                + "see every available tool."
+            return "[\(EncodingDSV4.searchToolName)] nessuno strumento "
+                + "corrisponde a \"\(query)\". Chiama "
+                + "\(EncodingDSV4.listToolsName) per vedere tutti gli "
+                + "strumenti disponibili."
         }
         let capped = Array(matches.prefix(10))
         guard let data = try? JSONSerialization.data(
                 withJSONObject: capped,
                 options: [.prettyPrinted, .sortedKeys]),
               let json = String(data: data, encoding: .utf8)
-        else { return "[\(EncodingDSV4.searchToolName) failed to serialise]" }
-        return "Matching tools — each entry's \"example\" field is a "
-            + "ready-to-run invocation you can copy and adapt:\n" + json
+        else { return "[\(EncodingDSV4.searchToolName) serializzazione fallita]" }
+        return "Strumenti corrispondenti — il campo \"example\" di "
+            + "ogni voce è un'invocazione pronta all'uso che puoi "
+            + "copiare e adattare:\n" + json
     }
 
     /// Host-level entry point: invoked from the chat's tool-call
@@ -2610,7 +2615,7 @@ final class ChatStore: ObservableObject {
         // attraverso `executeSubAgentDelegation`.
         if !delegableAgents.isEmpty {
             let roster = delegableAgents
-                .map { "- \($0.name): \($0.summary.isEmpty ? "(no summary)" : $0.summary)" }
+                .map { "- \($0.name): \($0.summary.isEmpty ? "(nessuna descrizione)" : $0.summary)" }
                 .joined(separator: "\n")
             schemas.append([
                 "type": "function",
@@ -2618,7 +2623,7 @@ final class ChatStore: ObservableObject {
                     "name": EncodingDSV4.delegateToolName,
                     "description":
                         """
-                        Delegate a focused sub-task to another agent. The named agent will run independently with its own system prompt and produce a single textual reply that becomes this tool's output. Use it when a sub-task is better handled by a specialist agent. Available agents:
+                        Delega un sotto-compito focalizzato a un altro agente. L'agente specificato verrà eseguito in modo indipendente con il proprio prompt di sistema e produrrà una singola risposta testuale che diventa l'output di questo strumento. Usalo quando un sotto-compito è gestito meglio da un agente specializzato. Agenti disponibili:
                         \(roster)
                         """,
                     "parameters": [
@@ -2626,11 +2631,11 @@ final class ChatStore: ObservableObject {
                         "properties": [
                             "agent_name": [
                                 "type": "string",
-                                "description": "Exact name of the agent to invoke."
+                                "description": "Nome esatto dell'agente da invocare."
                             ],
                             "task": [
                                 "type": "string",
-                                "description": "Clear, self-contained description of what the sub-agent should do."
+                                "description": "Descrizione chiara e autonoma di ciò che il sotto-agente deve fare."
                             ]
                         ],
                         "required": ["agent_name", "task"]

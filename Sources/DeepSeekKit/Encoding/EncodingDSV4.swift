@@ -55,9 +55,9 @@ public enum EncodingDSV4 {
     /// Reasoning instruction prepended to the system message in `.max` mode.
     /// Mirrors REASONING_EFFORT_MAX (encoding_dsv4.py:64-67).
     public static let reasoningEffortMax: String = """
-        Reasoning Effort: Absolute maximum with no shortcuts permitted.
-        You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
-        Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.
+        Sforzo di ragionamento: massimo assoluto, nessuna scorciatoia permessa.
+        DEVI essere molto rigoroso nel ragionamento e scomporre il problema in modo esaustivo per risolvere la causa radice, mettendo alla prova la tua logica contro tutti i percorsi possibili, casi limite e scenari avversi.
+        Scrivi esplicitamente l'intero processo di deliberazione, documentando ogni passaggio intermedio, alternativa considerata e ipotesi scartata, in modo che assolutamente nessuna assunzione resti non verificata.
 
 
         """
@@ -83,30 +83,30 @@ public enum EncodingDSV4 {
     public static func toolsBlock(toolSchemasJSON: String) -> String {
         let dt = dsmlToken
         return """
-            ## Tools
+            ## Strumenti
 
-            You have an optional set of tools available. Use one only when the user's request genuinely needs it — for example to read a file, search, or run code. If you can answer from your own knowledge, reply directly without calling a tool or mentioning that tools are available. When you do need a tool, invoke it by writing a "<\(dt)tool_calls>" block like the following:
+            Hai a disposizione un insieme opzionale di strumenti. Usane uno solo quando la richiesta dell'utente lo richiede davvero — ad esempio per leggere un file, fare una ricerca o eseguire codice. Se puoi rispondere con le tue conoscenze, rispondi direttamente senza chiamare uno strumento né menzionare che gli strumenti sono disponibili. Quando hai bisogno di uno strumento, invocalo scrivendo un blocco "<\(dt)tool_calls>" come il seguente:
 
             <\(dt)tool_calls>
-            <\(dt)inv name="$TOOL_NAME">
-            <\(dt)parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</\(dt)parameter>
+            <\(dt)inv name="$NOME_STRUMENTO">
+            <\(dt)parameter name="$NOME_PARAMETRO" string="true|false">$VALORE_PARAMETRO</\(dt)parameter>
             ...
             </\(dt)inv>
             </\(dt)tool_calls>
 
-            String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+            I parametri di tipo stringa vanno specificati così come sono con `string="true"`. Per tutti gli altri tipi (numeri, booleani, array, oggetti), passa il valore in formato JSON con `string="false"`.
 
-            If thinking_mode is enabled (triggered by \(thinkOpen)), you MUST output your complete reasoning inside \(thinkOpen)...\(thinkClose) BEFORE any tool calls or final response.
+            Se la modalità di ragionamento è attiva (avviata da \(thinkOpen)), DEVI produrre il tuo ragionamento completo dentro \(thinkOpen)...\(thinkClose) PRIMA di qualsiasi chiamata a strumento o risposta finale.
 
-            Otherwise, output directly after \(thinkClose) with tool calls or final response.
+            Altrimenti, scrivi direttamente dopo \(thinkClose) le chiamate agli strumenti o la risposta finale.
 
-            ### Available Tool Schemas
+            ### Schemi degli strumenti disponibili
 
-            Each schema below carries an `example` field — a ready-to-run invocation. Copy it and adapt the argument values to your task.
+            Ogni schema qui sotto contiene un campo `example` — un'invocazione pronta all'uso. Copiala e adatta i valori degli argomenti al tuo compito.
 
             \(toolSchemasJSON)
 
-            When you invoke a tool, follow the tool name and parameter schemas defined above exactly.
+            Quando invochi uno strumento, segui esattamente il nome e gli schemi dei parametri definiti sopra.
 
             """
     }
