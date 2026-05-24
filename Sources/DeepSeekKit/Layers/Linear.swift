@@ -11,6 +11,19 @@ import MLXNN
 // does not produce.
 private let fp4Lut = MLXArray((0..<16).map { Float(dequantE2M1(UInt8($0))) }).asType(.bfloat16)
 private let e8m0Lut = MLXArray((0..<256).map { Float(dequantE8M0(UInt8($0))) }).asType(.bfloat16)
+// FP8 E4M3 byte → float LUT. Without this, the W8A8 path would multiply
+// the raw uint8 byte (treated as integer 0..255) by the block scale,
+// producing weights ~33× larger than intended for typical magnitudes.
+// NaN encodings (0x7F, 0xFF) are replaced with 0 — they never appear
+// in a trained checkpoint and would otherwise propagate NaN through
+// the matmul.
+private let fp8E4M3Lut: MLXArray = {
+    let values = (0..<256).map { (i: Int) -> Float in
+        let v = dequantE4M3(UInt8(i))
+        return v.isNaN ? 0 : v
+    }
+    return MLXArray(values).asType(.bfloat16)
+}()
 
 public final class Linear {
     public let inFeatures: Int
@@ -86,6 +99,7 @@ public final class Linear {
         let w = self.weight
         var wArr = w.array
         let isFP4 = weightDType == .fp4E2M1
+        let isFP8 = weightDType == .fp8E4M3
 
         if isFP4 {
             let u8Arr = wArr.asType(.uint8)
@@ -112,33 +126,40 @@ public final class Linear {
                 unpacked = scaled.reshaped([outFeatures, inFeatures])
             }
             wArr = unpacked                                        // bf16
-        } else if let s = self.scale, s.shape.count == 2 {
-            // Block scaled FP8 weights (DeepSeek W8A8).
-            var sArr = s.array
+        } else if isFP8 {
+            // FP8 E4M3 weights: each byte encodes a float in [-448, +448]
+            // via the IEEE-style sign/exp/mantissa layout (see
+            // dequantE4M3). Decode through the LUT FIRST — the previous
+            // code skipped this step and ran the matmul against the raw
+            // uint8 byte values, producing weights ~33× too large.
+            var wDecoded = take(fp8E4M3Lut, wArr.asType(.uint8))   // bf16
 
-            if s.dtype == .e8m0 {
-                sArr = take(e8m0Lut, sArr.asType(.uint8))         // bf16
-            } else if sArr.dtype == .uint8 {
-                // Loader didn't tag it .e8m0 but the bytes are E8M0.
-                sArr = take(e8m0Lut, sArr)                         // bf16
-            } else if sArr.dtype != .bfloat16 {
-                sArr = sArr.asType(.bfloat16)
+            if let s = self.scale, s.shape.count == 2 {
+                // Block scale [outBlocks, inBlocks] (DeepSeek W8A8 layout).
+                var sArr = s.array
+                if s.dtype == .e8m0 {
+                    sArr = take(e8m0Lut, sArr.asType(.uint8))     // bf16
+                } else if sArr.dtype == .uint8 {
+                    sArr = take(e8m0Lut, sArr)                     // bf16
+                } else if sArr.dtype != .bfloat16 {
+                    sArr = sArr.asType(.bfloat16)
+                }
+
+                let outBlocks = s.shape[0]
+                let inBlocks = s.shape[1]
+                let outBlockSize = outFeatures / outBlocks
+                let inBlockSize = inFeatures / inBlocks
+
+                let wReshaped = wDecoded
+                    .reshaped([outBlocks, outBlockSize, inBlocks, inBlockSize])
+                let sReshaped = sArr.reshaped([outBlocks, 1, inBlocks, 1])
+                wDecoded = (wReshaped * sReshaped)
+                    .reshaped([outFeatures, inFeatures])
             }
-
-            // Expected scale shape is [outBlocks, inBlocks].
-            let outBlocks = s.shape[0]
-            let inBlocks = s.shape[1]
-            let outBlockSize = outFeatures / outBlocks
-            let inBlockSize = inFeatures / inBlocks
-
-            // Promote weight bytes to bf16 (not f32) so the [outF, inF]
-            // multiply temporary is half the size of the old f32 path.
-            let wReshaped = wArr.asType(.bfloat16)
-                .reshaped([outBlocks, outBlockSize, inBlocks, inBlockSize])
-            let sReshaped = sArr.reshaped([outBlocks, 1, inBlocks, 1])
-
-            let scaled = wReshaped * sReshaped                     // bf16
-            wArr = scaled.reshaped([outFeatures, inFeatures])
+            // For FP8 with 1D scale (per-row) or no scale: leave wDecoded
+            // as-is. callAsFunction's tail will multiply by the per-row
+            // scale after the matmul.
+            wArr = wDecoded
         }
         return wArr
     }
