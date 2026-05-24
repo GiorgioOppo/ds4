@@ -246,13 +246,6 @@ public final class WeightLoader {
             self.cache[name] = arr
             self.cacheLock.unlock()
         }
-        
-        // Merge into main cache
-        cacheLock.lock()
-        for (name, _) in toLoad {
-            if let arr = cache[name] { /* already there */ }
-        }
-        cacheLock.unlock()
     }
     
     /// Load expert tensors for layer K on demand.

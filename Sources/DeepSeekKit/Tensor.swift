@@ -72,14 +72,6 @@ public final class Tensor {
 
     public func readBytes() -> Data {
         MLX.eval(array)
-        let n = byteCount
-        var data = Data(count: n)
-        data.withUnsafeMutableBytes { ptr in
-            // Fallback since mlx-swift might not have a direct bytes copy like this,
-            // but we assume it has an asData() or we can copy from asArray().
-            // Let's use asData() if available or rely on compiler errors later
-        }
-        // Actually MLXArray has a `asData()` method
         return array.asData(access: .copy).data
     }
 

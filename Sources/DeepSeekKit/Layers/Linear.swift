@@ -75,15 +75,6 @@ public final class Linear {
         self.useW8A8Activations = false
     }
     
-    /// Drop cached weight data to free RAM (for streaming mode).
-    /// Next call to `callAsFunction` will reload from disk.
-    public func evict() {
-        if _weightName != nil {
-            _weight = nil
-            _scale = nil
-        }
-    }
-
     public func getDequantizedWeight() -> MLXArray {
         let w = self.weight
         var wArr = w.array
