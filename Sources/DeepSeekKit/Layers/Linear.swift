@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXFast
 
 // Dequantization LUTs in bf16 so the unpack tensor (one entry per
 // weight element — [outFeatures, inFeatures]) is half the size of the
@@ -58,9 +59,25 @@ public final class Linear {
     public let castOutputToBF16: Bool
     public let useW8A8Activations: Bool
     public var inverseChannelScale: Tensor? = nil
-    
+
     /// Original dtype of the weight (needed for FP4 detection even in lazy mode)
     public let weightDType: DType
+
+    /// When true, `callAsFunction` routes through
+    /// `MLXFast.quantizedMatmul` over a re-quantized (groupSize=64,
+    /// bits=4) form of the weight. The triplet is computed lazily on
+    /// first call (running the existing `getDequantizedWeight()` once
+    /// to bf16 then `MLX.quantized(...)`), stored in the loader cache
+    /// under synthetic keys, and reused. `releaseExperts` drops those
+    /// keys via the layer-prefix sweep, so streaming semantics are
+    /// preserved.
+    ///
+    /// Default false. Wired to `true` for routed-expert linears in
+    /// Assembly.load when DEEPSEEK_MLX_QUANT=1. The DeepSeek-specific
+    /// FP4-E2M1 + E8M0-block-scale and FP8-E4M3 + 128×128-block-scale
+    /// formats are not natively supported by MLX's quantized GEMM
+    /// kernel, hence the one-time re-quant at load time.
+    public var useMLXQuant: Bool = false
 
     // Eager init (existing API)
     public init(inFeatures: Int, outFeatures: Int, weight: Tensor, scale: Tensor?,
@@ -95,6 +112,66 @@ public final class Linear {
         self.useW8A8Activations = false
     }
     
+    /// Re-quantize this Linear's weight into MLX's native 4-bit linear
+    /// quantization format (groupSize=64) and cache the triplet in the
+    /// loader cache under synthetic keys. Returns the cached triplet on
+    /// subsequent calls.
+    ///
+    /// The DeepSeek checkpoint formats (FP4-E2M1 + E8M0 32-element
+    /// block scales for experts, FP8-E4M3 + 128×128 block scales for
+    /// MLA) are not natively supported by `MLXFast.quantizedMatmul`,
+    /// which expects MLX's standard linear `(int4|int8) + fp scales +
+    /// fp biases` layout. So we do one round-trip at first use:
+    ///
+    ///   raw weight (FP4/FP8) → getDequantizedWeight() → bf16 [out, in]
+    ///                       → quantized(_, groupSize: 64, bits: 4)
+    ///                       → (qw, scales, biases)
+    ///
+    /// The triplet lives in the loader cache under `<base>.mlxq.{w,s,b}`.
+    /// The expert-streaming `releaseExperts` already releases everything
+    /// matching `layers.K.ffn.experts.E.` so the synthetic keys are
+    /// dropped on layer release without any extra wiring.
+    ///
+    /// Returns nil for eager-mode Linears (no `_loader`) — the caller
+    /// must fall back to the standard path.
+    public func getMLXQuant() -> (w: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        guard let loader = _loader, let weightName = _weightName else {
+            return nil
+        }
+        // Synthetic key namespace derived from the weight name (e.g.
+        // "layers.0.ffn.experts.5.w1.weight" → base
+        // "layers.0.ffn.experts.5.w1"). The triplet keys sit under the
+        // same expert prefix so `releaseExperts(layer: K, indices: [E])`
+        // picks them up.
+        let dotWeight = ".weight"
+        let base = weightName.hasSuffix(dotWeight)
+            ? String(weightName.dropLast(dotWeight.count))
+            : weightName
+        let qWKey = "\(base).mlxq.w"
+        let qSKey = "\(base).mlxq.scales"
+        let qBKey = "\(base).mlxq.biases"
+
+        if let qW = loader.lookupRaw(qWKey),
+           let qS = loader.lookupRaw(qSKey),
+           let qB = loader.lookupRaw(qBKey) {
+            return (qW, qS, qB)
+        }
+
+        // Cache miss: dequant to bf16 (existing code path), then
+        // re-quantize. The bf16 temp is dropped at end of this scope.
+        let bf16 = getDequantizedWeight().asType(.bfloat16)
+        let (qW, qS, qB) = quantized(bf16, groupSize: 64, bits: 4)
+        // Force materialization so the bf16 temp can be freed by the
+        // next clearCache (called by MoE after dispatch).
+        MLX.eval(qW)
+        MLX.eval(qS)
+        MLX.eval(qB)
+        loader.storeRaw(qWKey, qW)
+        loader.storeRaw(qSKey, qS)
+        loader.storeRaw(qBKey, qB)
+        return (qW, qS, qB)
+    }
+
     public func getDequantizedWeight() -> MLXArray {
         let w = self.weight
         var wArr = w.array
@@ -169,6 +246,39 @@ public final class Linear {
 
         if let invScale = inverseChannelScale {
             xArr = xArr * invScale.array
+        }
+
+        // Fast path: pre-quantized triplet + fused MLX kernel. Avoids
+        // the [outFeatures, inFeatures] bf16 dequant temporary entirely
+        // (≈32 MB for a routed expert, larger for MLA matrices). Enabled
+        // per-Linear via `useMLXQuant`, set in Assembly under
+        // DEEPSEEK_MLX_QUANT=1.
+        if useMLXQuant, let triple = getMLXQuant() {
+            // MLXFast expects bf16/fp16 activations against the
+            // quantized weight. Match the dtype of the scales.
+            let xBf16 = xArr.dtype == .bfloat16 ? xArr : xArr.asType(.bfloat16)
+            let yArr = MLXFast.quantizedMatmul(
+                xBf16, triple.w,
+                scales: triple.scales,
+                biases: triple.biases,
+                transpose: true,
+                groupSize: 64,
+                bits: 4)
+            var outArr = yArr
+            // Per-row scale (1D) is applied post-matmul — same as the
+            // dequant path. 2D block scales are baked into the
+            // requantized weight.
+            if let s = scale, s.shape.count != 2 {
+                let sBf16 = s.array.dtype == .bfloat16
+                    ? s.array : s.array.asType(.bfloat16)
+                outArr = outArr * sBf16
+            }
+            if castOutputToBF16 {
+                if outArr.dtype != .bfloat16 { outArr = outArr.asType(.bfloat16) }
+            } else if outArr.dtype != .float32 {
+                outArr = outArr.asType(.float32)
+            }
+            return Tensor(array: outArr, dtype: castOutputToBF16 ? .bf16 : .f32)
         }
 
         let wArr = getDequantizedWeight()

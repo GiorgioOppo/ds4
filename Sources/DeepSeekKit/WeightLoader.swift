@@ -444,6 +444,29 @@ public final class WeightLoader {
         defer { cacheLock.unlock() }
         return cache.count
     }
+
+    /// Read-only access to a cached MLXArray by name. Returns nil on miss.
+    /// Used by Linear's MLX-quant path to look up the re-quantized
+    /// triplet under synthetic keys without going through `load` (which
+    /// wraps in a Tensor and would also trigger an on-disk fallback for
+    /// a name that doesn't exist on disk).
+    public func lookupRaw(_ name: String) -> MLXArray? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache[name]
+    }
+
+    /// Store an MLXArray under an arbitrary name. Lifetime tied to the
+    /// cache: removed on `releaseLayer` / `releaseExperts` if the name
+    /// matches the released prefix. Used by Linear to stash re-quantized
+    /// triplets under synthetic keys (`<base>.mlxq.w`, `.scales`,
+    /// `.biases`) right next to the canonical weight name so the
+    /// existing prefix-based release machinery picks them up.
+    public func storeRaw(_ name: String, _ arr: MLXArray) {
+        cacheLock.lock()
+        cache[name] = arr
+        cacheLock.unlock()
+    }
     
     // MARK: - Tensor access API (used during Assembly)
     

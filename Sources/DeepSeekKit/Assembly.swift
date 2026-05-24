@@ -165,6 +165,22 @@ public extension Transformer {
         }()
         MLX.GPU.set(cacheLimit: cacheLimitMB * 1024 * 1024)
 
+        // Opt-in: route routed-expert Linears through MLX's fused
+        // 4-bit quantized GEMM (groupSize=64). One-time re-quant at
+        // expert-load time (in Linear.getMLXQuant) eliminates the
+        // [outFeatures, inFeatures] bf16 dequant temporary per call —
+        // ≈32 MB per expert × 8 active experts × 7 layers in decode.
+        // Numerical drift: bf16 → int4 round-trip; validate before
+        // shipping on by default. See plan file.
+        let mlxQuantExperts: Bool = ProcessInfo.processInfo
+            .environment["DEEPSEEK_MLX_QUANT"] == "1"
+        if mlxQuantExperts {
+            FileHandle.standardError.write(Data(
+                "[config] DEEPSEEK_MLX_QUANT=1 — routed-expert Linears "
+                + "will use MLXFast.quantizedMatmul (groupSize=64, "
+                + "bits=4) after one-time re-quant.\n".utf8))
+        }
+
         let loader = try WeightLoader(directory: weightsDir)
 
         MemoryLogger.snapshot("load:after-mmap", force: true)
@@ -310,13 +326,19 @@ public extension Transformer {
                     continue
                 }
                 let ep = "\(lp).ffn.experts.\(j)"
+                let w1 = try! loadLinear(loader, base: "\(ep).w1",
+                                          inF: dim, outF: config.moeInterDim, rng: &rng)
+                let w2 = try! loadLinear(loader, base: "\(ep).w2",
+                                          inF: config.moeInterDim, outF: dim, rng: &rng)
+                let w3 = try! loadLinear(loader, base: "\(ep).w3",
+                                          inF: dim, outF: config.moeInterDim, rng: &rng)
+                if mlxQuantExperts {
+                    w1.useMLXQuant = true
+                    w2.useMLXQuant = true
+                    w3.useMLXQuant = true
+                }
                 experts.append(Expert(
-                    w1: try! loadLinear(loader, base: "\(ep).w1",
-                                        inF: dim, outF: config.moeInterDim, rng: &rng),
-                    w2: try! loadLinear(loader, base: "\(ep).w2",
-                                        inF: config.moeInterDim, outF: dim, rng: &rng),
-                    w3: try! loadLinear(loader, base: "\(ep).w3",
-                                        inF: dim, outF: config.moeInterDim, rng: &rng),
+                    w1: w1, w2: w2, w3: w3,
                     swigluLimit: config.swigluLimit))
             }
             let sep = "\(lp).ffn.shared_experts"
