@@ -17,7 +17,7 @@ public struct OtoolInfoTool: Tool {
                 properties: [
                     "path": SchemaBuilder.string(description: "Path del binario Mach-O, relativo alla root dell'agente."),
                     "mode": SchemaBuilder.string(
-                        description: "Cosa fare il dump. Default 'header'.",
+                        description: "Sezione da estrarre. Default 'header'.",
                         enumValues: ["header", "loadcommands", "libraries", "symbols", "archs"]),
                 ],
                 required: ["path"]
