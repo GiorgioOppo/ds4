@@ -13,15 +13,15 @@ public struct EnvTool: Tool {
         ToolSchema(
             name: "env",
             description:
-                "List environment variables. Secrets (matching *_TOKEN, *_KEY, *_SECRET, *_PASSWORD, " +
-                "AWS_*, OPENAI_*, ANTHROPIC_*, GH_TOKEN, GITHUB_TOKEN) are redacted by default. " +
-                "Use 'pattern' (substring) to filter by name. Set 'unsafe=true' to bypass redaction " +
-                "(requires .dangerous consent).",
+                "Elenca le variabili d'ambiente. I segreti (che corrispondono a *_TOKEN, *_KEY, *_SECRET, *_PASSWORD, " +
+                "AWS_*, OPENAI_*, ANTHROPIC_*, GH_TOKEN, GITHUB_TOKEN) sono oscurati per default. " +
+                "Usa 'pattern' (sottostringa) per filtrare per nome. Imposta 'unsafe=true' per bypassare l'oscuramento " +
+                "(richiede consenso .dangerous).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pattern": SchemaBuilder.string(description: "Substring filter on variable names (case-insensitive)."),
-                    "unsafe": SchemaBuilder.boolean(description: "Disable secret redaction. Default false.", defaultValue: false),
+                    "pattern": SchemaBuilder.string(description: "Filtro sottostringa sui nomi delle variabili (case-insensitive)."),
+                    "unsafe": SchemaBuilder.boolean(description: "Disattiva l'oscuramento dei segreti. Default false.", defaultValue: false),
                 ]
             )
         )

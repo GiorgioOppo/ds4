@@ -28,16 +28,16 @@ public struct ShellTool: Tool {
         ToolSchema(
             name: "shell",
             description:
-                "Execute a shell command in the agent's working directory. " +
-                "Returns combined stdout+stderr (truncated to 32 KB) and the " +
-                "exit code. Always prefer dedicated tools (read/edit/grep) " +
-                "when one fits — shell is for everything else.",
+                "Esegue un comando shell nella working directory dell'agente. " +
+                "Restituisce stdout+stderr combinati (troncati a 32 KB) e il " +
+                "codice di uscita. Preferisci sempre i tool dedicati (read/edit/grep) " +
+                "quando uno è adatto — shell è per tutto il resto.",
             category: .dangerous,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "command": SchemaBuilder.string(description: "The shell command to run."),
-                    "cwd": SchemaBuilder.string(description: "Working directory, relative to agent root. Default: root."),
-                    "timeout": SchemaBuilder.integer(description: "Per-call timeout in seconds. Default 120.", minimum: 1),
+                    "command": SchemaBuilder.string(description: "Il comando shell da eseguire."),
+                    "cwd": SchemaBuilder.string(description: "Working directory, relativa alla root dell'agente. Default: root."),
+                    "timeout": SchemaBuilder.integer(description: "Timeout per chiamata in secondi. Default 120.", minimum: 1),
                 ],
                 required: ["command"]
             )

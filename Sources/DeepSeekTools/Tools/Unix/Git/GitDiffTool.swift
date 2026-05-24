@@ -8,17 +8,17 @@ public struct GitDiffTool: Tool {
         ToolSchema(
             name: "git_diff",
             description:
-                "Show a diff. mode='working' (default, vs index), 'staged' (index vs HEAD), " +
-                "or 'commit' (one commit's diff, requires 'rev'). 'path' scopes to one file/directory.",
+                "Mostra un diff. mode='working' (default, vs index), 'staged' (index vs HEAD), " +
+                "o 'commit' (diff di un singolo commit, richiede 'rev'). 'path' restringe a un file/directory.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "mode": SchemaBuilder.string(
-                        description: "Diff source. Default 'working'.",
+                        description: "Sorgente del diff. Default 'working'.",
                         enumValues: ["working", "staged", "commit"]),
-                    "rev": SchemaBuilder.string(description: "Revision (for mode='commit')."),
-                    "path": SchemaBuilder.string(description: "Scope to one path, relative to agent root."),
-                    "statOnly": SchemaBuilder.boolean(description: "Show --stat instead of the patch. Default false.", defaultValue: false),
+                    "rev": SchemaBuilder.string(description: "Revisione (per mode='commit')."),
+                    "path": SchemaBuilder.string(description: "Restringe a un singolo path, relativo alla root dell'agente."),
+                    "statOnly": SchemaBuilder.boolean(description: "Mostra --stat invece della patch. Default false.", defaultValue: false),
                 ]
             )
         )

@@ -15,25 +15,25 @@ public struct FindTool: Tool {
         ToolSchema(
             name: "find",
             description:
-                "Recursively walk a directory tree under the agent root and filter entries by exact " +
-                "filename, type (file/dir/symlink), size range, or modification time. " +
-                "Use this when you have an attribute-based query ('all .swift files modified in the last week'). " +
-                "For one directory's immediate contents use 'ls'; for wildcard pattern matching by name " +
-                "('Sources/**/*.swift') use 'glob' — it's faster and the regex translation handles globs natively. " +
-                "Output is one matching path per line, capped at 'limit' (default 500).",
+                "Attraversa ricorsivamente un albero di directory sotto la root dell'agente e filtra le entry per " +
+                "nome di file esatto, tipo (file/dir/symlink), intervallo di dimensione o data di modifica. " +
+                "Usalo quando hai una query basata su attributi ('tutti i file .swift modificati nell'ultima settimana'). " +
+                "Per il contenuto immediato di una singola directory usa 'ls'; per il matching per nome con wildcard " +
+                "('Sources/**/*.swift') usa 'glob' — è più veloce e la traduzione in regex gestisce i glob in modo nativo. " +
+                "L'output è un path corrispondente per riga, limitato da 'limit' (default 500).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Root directory, relative to agent root. Default '.'."),
-                    "name": SchemaBuilder.string(description: "Exact filename to match (no wildcards). Optional."),
+                    "path": SchemaBuilder.string(description: "Directory di partenza, relativa alla root dell'agente. Default '.'."),
+                    "name": SchemaBuilder.string(description: "Nome file esatto da trovare (senza wildcard). Opzionale."),
                     "type": SchemaBuilder.string(
-                        description: "Restrict to one kind: 'file', 'dir', 'symlink'.",
+                        description: "Restringe a un solo tipo: 'file', 'dir', 'symlink'.",
                         enumValues: ["file", "dir", "symlink"]),
-                    "minSize": SchemaBuilder.integer(description: "Minimum size in bytes.", minimum: 0),
-                    "maxSize": SchemaBuilder.integer(description: "Maximum size in bytes.", minimum: 0),
-                    "mtimeNewerThanDays": SchemaBuilder.integer(description: "Only entries modified within the last N days.", minimum: 1),
-                    "followSymlinks": SchemaBuilder.boolean(description: "Follow symlinks (with cycle detection). Default false.", defaultValue: false),
-                    "limit": SchemaBuilder.integer(description: "Max results. Default 500.", minimum: 1),
+                    "minSize": SchemaBuilder.integer(description: "Dimensione minima in byte.", minimum: 0),
+                    "maxSize": SchemaBuilder.integer(description: "Dimensione massima in byte.", minimum: 0),
+                    "mtimeNewerThanDays": SchemaBuilder.integer(description: "Solo entry modificate negli ultimi N giorni.", minimum: 1),
+                    "followSymlinks": SchemaBuilder.boolean(description: "Segue i symlink (con rilevamento dei cicli). Default false.", defaultValue: false),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di risultati. Default 500.", minimum: 1),
                 ]
             )
         )

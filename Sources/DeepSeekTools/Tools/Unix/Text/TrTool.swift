@@ -10,18 +10,18 @@ public struct TrTool: Tool {
         ToolSchema(
             name: "tr",
             description:
-                "Translate or delete characters in a string or file. " +
-                "Provide 'input' (string) or 'path' (file). With 'from'/'to' (equal length), " +
-                "translate each character in 'from' to its counterpart in 'to'. " +
-                "With 'delete', remove every character that appears in it.",
+                "Traduce o cancella caratteri in una stringa o in un file. " +
+                "Fornisci 'input' (stringa) o 'path' (file). Con 'from'/'to' (di pari lunghezza), " +
+                "traduce ogni carattere di 'from' nel corrispondente di 'to'. " +
+                "Con 'delete', rimuove ogni carattere che vi compare.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "input": SchemaBuilder.string(description: "Inline text. Alternative to 'path'."),
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "from": SchemaBuilder.string(description: "Source character set (each char ↔ same-index char of 'to')."),
-                    "to": SchemaBuilder.string(description: "Target character set, same length as 'from'."),
-                    "delete": SchemaBuilder.string(description: "Characters to remove. Used alone (no 'from'/'to')."),
+                    "input": SchemaBuilder.string(description: "Testo inline. Alternativa a 'path'."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "from": SchemaBuilder.string(description: "Set di caratteri di origine (ogni carattere corrisponde a quello di pari indice in 'to')."),
+                    "to": SchemaBuilder.string(description: "Set di caratteri di destinazione, stessa lunghezza di 'from'."),
+                    "delete": SchemaBuilder.string(description: "Caratteri da rimuovere. Usato da solo (senza 'from'/'to')."),
                 ]
             )
         )

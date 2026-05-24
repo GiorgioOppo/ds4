@@ -11,19 +11,19 @@ public struct LsTool: Tool {
         ToolSchema(
             name: "ls",
             description:
-                "List the immediate children of one directory (non-recursive). " +
-                "Use this when you know the directory and want to see what's directly inside it. " +
-                "For a recursive walk filtered by attribute use 'find'; for pattern matching by name " +
-                "across the tree use 'glob'. " +
-                "'long=true' adds permissions/size/mtime; 'all=true' includes dotfiles; " +
-                "'limit' caps the number of entries (default 1000).",
+                "Elenca i figli immediati di una directory (non ricorsivo). " +
+                "Usalo quando conosci la directory e vuoi vedere cosa contiene direttamente. " +
+                "Per un walk ricorsivo filtrato per attributo usa 'find'; per il matching per nome con pattern " +
+                "sull'intero albero usa 'glob'. " +
+                "'long=true' aggiunge permessi/dimensione/mtime; 'all=true' include i dotfile; " +
+                "'limit' limita il numero di entry (default 1000).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Directory, relative to agent root. Default '.'."),
-                    "all": SchemaBuilder.boolean(description: "Include dotfiles. Default false.", defaultValue: false),
-                    "long": SchemaBuilder.boolean(description: "Verbose format. Default false.", defaultValue: false),
-                    "limit": SchemaBuilder.integer(description: "Max entries. Default 1000.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Directory, relativa alla root dell'agente. Default '.'."),
+                    "all": SchemaBuilder.boolean(description: "Include i dotfile. Default false.", defaultValue: false),
+                    "long": SchemaBuilder.boolean(description: "Formato dettagliato. Default false.", defaultValue: false),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di entry. Default 1000.", minimum: 1),
                 ]
             )
         )

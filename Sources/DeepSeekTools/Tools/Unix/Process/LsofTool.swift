@@ -10,13 +10,13 @@ public struct LsofTool: Tool {
         ToolSchema(
             name: "lsof",
             description:
-                "List open files. Provide 'pid' to inspect one process, or 'path' to find who holds a file. " +
-                "Without arguments, lists every open file the current user can see.",
+                "Elenca i file aperti. Fornisci 'pid' per ispezionare un singolo processo, o 'path' per trovare chi tiene aperto un file. " +
+                "Senza argomenti, elenca ogni file aperto visibile all'utente corrente.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pid": SchemaBuilder.integer(description: "Process ID to inspect.", minimum: 1),
-                    "path": SchemaBuilder.string(description: "File path to look up (absolute or relative to agent root)."),
+                    "pid": SchemaBuilder.integer(description: "PID del processo da ispezionare.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file da cercare (assoluto o relativo alla root dell'agente)."),
                 ]
             )
         )

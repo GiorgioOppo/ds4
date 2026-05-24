@@ -11,13 +11,13 @@ public struct WebFetchTool: Tool {
         ToolSchema(
             name: "webfetch",
             description:
-                "GET a URL and return the response body. HTML is reduced to " +
-                "plain text unless raw=true. Capped at 1 MB.",
+                "Effettua una GET di una URL e restituisce il body della risposta. L'HTML viene ridotto a " +
+                "testo semplice, a meno che raw=true. Limitato a 1 MB.",
             category: .network,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "url": SchemaBuilder.string(description: "Absolute URL (http/https only)."),
-                    "raw": SchemaBuilder.boolean(description: "Return body as-is. Default false."),
+                    "url": SchemaBuilder.string(description: "URL assoluta (solo http/https)."),
+                    "raw": SchemaBuilder.boolean(description: "Restituisce il body così com'è. Default false."),
                 ],
                 required: ["url"]
             )

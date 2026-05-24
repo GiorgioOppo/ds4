@@ -11,16 +11,16 @@ public struct JqTool: Tool {
         ToolSchema(
             name: "jq",
             description:
-                "Run a jq filter against a JSON file or inline string. Requires jq installed " +
-                "(brew install jq, MacPorts, or Nix). For trivial property lookups consider Foundation " +
-                "JSON parsing instead.",
+                "Esegue un filtro jq su un file JSON o su una stringa inline. Richiede jq installato " +
+                "(brew install jq, MacPorts, o Nix). Per lookup banali di proprietà valuta invece il parsing " +
+                "JSON di Foundation.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "filter": SchemaBuilder.string(description: "jq expression (e.g. '.users[0].name')."),
-                    "input": SchemaBuilder.string(description: "Inline JSON string. Alternative to 'path'."),
-                    "path": SchemaBuilder.string(description: "JSON file path, relative to agent root."),
-                    "raw": SchemaBuilder.boolean(description: "Raw output (-r) — strip JSON quoting from strings. Default false.", defaultValue: false),
+                    "filter": SchemaBuilder.string(description: "Espressione jq (es. '.users[0].name')."),
+                    "input": SchemaBuilder.string(description: "Stringa JSON inline. Alternativa a 'path'."),
+                    "path": SchemaBuilder.string(description: "Path del file JSON, relativo alla root dell'agente."),
+                    "raw": SchemaBuilder.boolean(description: "Output raw (-r) — rimuove le virgolette JSON dalle stringhe. Default false.", defaultValue: false),
                 ],
                 required: ["filter"]
             )

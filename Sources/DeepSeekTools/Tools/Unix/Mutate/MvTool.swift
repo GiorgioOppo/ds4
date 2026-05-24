@@ -11,14 +11,14 @@ public struct MvTool: Tool {
         ToolSchema(
             name: "mv",
             description:
-                "Move or rename a file/directory inside the agent root. " +
-                "Refuses to overwrite an existing destination unless 'force=true'.",
+                "Sposta o rinomina un file/directory dentro la root dell'agente. " +
+                "Si rifiuta di sovrascrivere una destinazione esistente a meno che 'force=true'.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "src": SchemaBuilder.string(description: "Source path, relative to agent root."),
-                    "dst": SchemaBuilder.string(description: "Destination path, relative to agent root."),
-                    "force": SchemaBuilder.boolean(description: "Overwrite an existing destination. Default false.", defaultValue: false),
+                    "src": SchemaBuilder.string(description: "Path di origine, relativo alla root dell'agente."),
+                    "dst": SchemaBuilder.string(description: "Path di destinazione, relativo alla root dell'agente."),
+                    "force": SchemaBuilder.boolean(description: "Sovrascrive una destinazione esistente. Default false.", defaultValue: false),
                 ],
                 required: ["src", "dst"]
             )

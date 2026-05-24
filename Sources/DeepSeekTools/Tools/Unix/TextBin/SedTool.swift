@@ -12,17 +12,17 @@ public struct SedTool: Tool {
         ToolSchema(
             name: "sed",
             description:
-                "Run a sed substitution against a file and return the result on stdout (file is NOT modified). " +
-                "Provide 'pattern' (regex), 'replacement', and 'path'. " +
-                "For on-disk edits use 'edit' or 'apply_patch' instead.",
+                "Esegue una sostituzione sed su un file e restituisce il risultato su stdout (il file NON viene modificato). " +
+                "Fornisci 'pattern' (regex), 'replacement', e 'path'. " +
+                "Per modifiche su disco usa invece 'edit' o 'apply_patch'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pattern": SchemaBuilder.string(description: "Search regex (sed BRE by default, ERE with extended=true)."),
-                    "replacement": SchemaBuilder.string(description: "Replacement string."),
-                    "path": SchemaBuilder.string(description: "Input file, relative to agent root."),
-                    "global": SchemaBuilder.boolean(description: "Replace all occurrences per line (g flag). Default true.", defaultValue: true),
-                    "extended": SchemaBuilder.boolean(description: "Use extended regex (-E). Default false.", defaultValue: false),
+                    "pattern": SchemaBuilder.string(description: "Regex di ricerca (sed BRE per default, ERE con extended=true)."),
+                    "replacement": SchemaBuilder.string(description: "Stringa di sostituzione."),
+                    "path": SchemaBuilder.string(description: "File di input, relativo alla root dell'agente."),
+                    "global": SchemaBuilder.boolean(description: "Sostituisce tutte le occorrenze per riga (flag g). Default true.", defaultValue: true),
+                    "extended": SchemaBuilder.boolean(description: "Usa regex estesa (-E). Default false.", defaultValue: false),
                 ],
                 required: ["pattern", "replacement", "path"]
             )

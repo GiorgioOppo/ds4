@@ -10,11 +10,11 @@ public struct Sha1Tool: Tool {
         ToolSchema(
             name: "sha1",
             description:
-                "SHA-1 hex digest of a file. Legacy — NOT collision-resistant. Prefer sha256 for new code.",
+                "Digest SHA-1 esadecimale di un file. Legacy — NON resistente alle collisioni. Per nuovo codice preferisci sha256.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

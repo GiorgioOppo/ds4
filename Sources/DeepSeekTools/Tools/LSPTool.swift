@@ -22,18 +22,18 @@ public struct LSPTool: Tool {
         ToolSchema(
             name: "lsp",
             description:
-                "[stub] Language Server Protocol queries (definition, hover, " +
-                "references, diagnostics). Not yet wired up to a real LSP " +
-                "client — registers only so the surface is reserved.",
+                "[stub] Query Language Server Protocol (definition, hover, " +
+                "references, diagnostics). Non ancora collegato a un client LSP " +
+                "reale — viene registrato solo per riservare la superficie.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "operation": SchemaBuilder.string(
-                        description: "One of: definition, hover, references, diagnostics.",
+                        description: "Uno tra: definition, hover, references, diagnostics.",
                         enumValues: ["definition", "hover", "references", "diagnostics"]),
-                    "path": SchemaBuilder.string(description: "File path."),
-                    "line": SchemaBuilder.integer(description: "1-based line number.", minimum: 1),
-                    "column": SchemaBuilder.integer(description: "1-based column.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file."),
+                    "line": SchemaBuilder.integer(description: "Numero di riga, a base 1.", minimum: 1),
+                    "column": SchemaBuilder.integer(description: "Colonna, a base 1.", minimum: 1),
                 ],
                 required: ["operation", "path"]
             )

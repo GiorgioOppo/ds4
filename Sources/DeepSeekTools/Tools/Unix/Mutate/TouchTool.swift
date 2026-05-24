@@ -9,12 +9,12 @@ public struct TouchTool: Tool {
         ToolSchema(
             name: "touch",
             description:
-                "Create an empty file at 'path' if missing, or bump its mtime to now if present. " +
-                "Sandboxed to agent root.",
+                "Crea un file vuoto in 'path' se mancante, o aggiorna il suo mtime ad adesso se presente. " +
+                "Confinato alla root dell'agente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

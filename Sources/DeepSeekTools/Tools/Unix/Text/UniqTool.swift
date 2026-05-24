@@ -8,14 +8,14 @@ public struct UniqTool: Tool {
         ToolSchema(
             name: "uniq",
             description:
-                "Drop adjacent duplicate lines (NOT a global dedupe — pre-sort with 'sort' if you want that). " +
-                "Set 'count=true' to prefix each line with its occurrence count.",
+                "Rimuove le righe duplicate adiacenti (NON è una dedup globale — pre-ordina con 'sort' se ne hai bisogno). " +
+                "Imposta 'count=true' per anteporre a ciascuna riga il numero di occorrenze.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "count": SchemaBuilder.boolean(description: "Prefix each line with its run length. Default false.", defaultValue: false),
-                    "caseInsensitive": SchemaBuilder.boolean(description: "Case-insensitive compare. Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "count": SchemaBuilder.boolean(description: "Antepone a ciascuna riga la lunghezza della sua sequenza. Default false.", defaultValue: false),
+                    "caseInsensitive": SchemaBuilder.boolean(description: "Confronto case-insensitive. Default false.", defaultValue: false),
                 ],
                 required: ["path"]
             )

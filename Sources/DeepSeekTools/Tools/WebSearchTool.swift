@@ -17,13 +17,13 @@ public struct WebSearchTool: Tool {
         ToolSchema(
             name: "websearch",
             description:
-                "Search the web and return a short ranked list of {title, " +
-                "url, snippet}. Use 'webfetch' to read a result page in full.",
+                "Cerca sul web e restituisce una breve lista ordinata di {title, " +
+                "url, snippet}. Usa 'webfetch' per leggere per intero una pagina dei risultati.",
             category: .network,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "query": SchemaBuilder.string(description: "Search query."),
-                    "limit": SchemaBuilder.integer(description: "Max results. Default 5.", minimum: 1),
+                    "query": SchemaBuilder.string(description: "Query di ricerca."),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di risultati. Default 5.", minimum: 1),
                 ],
                 required: ["query"]
             )

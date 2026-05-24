@@ -9,14 +9,14 @@ public struct DateTool: Tool {
         ToolSchema(
             name: "date",
             description:
-                "Current date/time. Formats: 'iso8601' (default), 'epoch' (seconds since 1970), 'rfc3339', 'human'.",
+                "Data/ora corrente. Formati: 'iso8601' (default), 'epoch' (secondi dal 1970), 'rfc3339', 'human'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "format": SchemaBuilder.string(
-                        description: "Output format. Default 'iso8601'.",
+                        description: "Formato di output. Default 'iso8601'.",
                         enumValues: ["iso8601", "epoch", "rfc3339", "human"]),
-                    "utc": SchemaBuilder.boolean(description: "Use UTC instead of local time. Default false.", defaultValue: false),
+                    "utc": SchemaBuilder.boolean(description: "Usa UTC invece dell'ora locale. Default false.", defaultValue: false),
                 ]
             )
         )

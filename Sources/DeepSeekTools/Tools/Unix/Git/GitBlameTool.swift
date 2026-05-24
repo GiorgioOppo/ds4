@@ -8,14 +8,14 @@ public struct GitBlameTool: Tool {
         ToolSchema(
             name: "git_blame",
             description:
-                "Show line-by-line authorship for a file. Optional 'startLine'+'endLine' " +
-                "to restrict to a range.",
+                "Mostra l'autorialità riga per riga di un file. Opzionalmente 'startLine'+'endLine' " +
+                "per restringere a un intervallo.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "startLine": SchemaBuilder.integer(description: "1-based starting line.", minimum: 1),
-                    "endLine": SchemaBuilder.integer(description: "1-based ending line.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "startLine": SchemaBuilder.integer(description: "Riga di partenza, a base 1.", minimum: 1),
+                    "endLine": SchemaBuilder.integer(description: "Riga finale, a base 1.", minimum: 1),
                 ],
                 required: ["path"]
             )

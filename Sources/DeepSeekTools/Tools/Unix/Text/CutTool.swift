@@ -8,16 +8,16 @@ public struct CutTool: Tool {
         ToolSchema(
             name: "cut",
             description:
-                "Extract fields (split by 'delimiter') or character ranges from each line. " +
-                "Provide either 'fields' (1-based indices) with optional 'delimiter' (default tab), " +
-                "or 'characters' (1-based ranges) without 'delimiter'.",
+                "Estrae campi (separati da 'delimiter') o intervalli di caratteri da ogni riga. " +
+                "Fornisci 'fields' (indici a base 1) con 'delimiter' opzionale (default tab), " +
+                "oppure 'characters' (intervalli a base 1) senza 'delimiter'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "delimiter": SchemaBuilder.string(description: "Field separator. Default '\\t'."),
-                    "fields": SchemaBuilder.array(itemsType: "integer", description: "1-based field indices to keep."),
-                    "characters": SchemaBuilder.array(itemsType: "integer", description: "1-based character positions to keep."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "delimiter": SchemaBuilder.string(description: "Separatore di campo. Default '\\t'."),
+                    "fields": SchemaBuilder.array(itemsType: "integer", description: "Indici di campo a base 1 da mantenere."),
+                    "characters": SchemaBuilder.array(itemsType: "integer", description: "Posizioni di carattere a base 1 da mantenere."),
                 ],
                 required: ["path"]
             )

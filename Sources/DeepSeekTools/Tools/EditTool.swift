@@ -12,17 +12,17 @@ public struct EditTool: Tool {
         ToolSchema(
             name: "edit",
             description:
-                "Replace an exact substring inside a file. 'oldString' must " +
-                "appear exactly once unless 'replaceAll' is true. Preserve " +
-                "whitespace and indentation verbatim — the matcher is exact.",
+                "Sostituisce una sottostringa esatta all'interno di un file. 'oldString' deve " +
+                "comparire esattamente una volta, a meno che 'replaceAll' sia true. Preserva " +
+                "spazi e indentazione alla lettera — il matcher è esatto.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File to edit."),
-                    "oldString": SchemaBuilder.string(description: "Exact text to replace."),
-                    "newString": SchemaBuilder.string(description: "Replacement."),
+                    "path": SchemaBuilder.string(description: "File da modificare."),
+                    "oldString": SchemaBuilder.string(description: "Testo esatto da sostituire."),
+                    "newString": SchemaBuilder.string(description: "Sostituzione."),
                     "replaceAll": SchemaBuilder.boolean(
-                        description: "Replace every occurrence. Default false.",
+                        description: "Sostituisce ogni occorrenza. Default false.",
                         defaultValue: false),
                 ],
                 required: ["path", "oldString", "newString"]
@@ -31,7 +31,7 @@ public struct EditTool: Tool {
     }
 
     public func permissionSummary(input: [String: Any]) -> String {
-        "edit \(input["path"] as? String ?? "?")"
+        "modifica \(input["path"] as? String ?? "?")"
     }
 
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {

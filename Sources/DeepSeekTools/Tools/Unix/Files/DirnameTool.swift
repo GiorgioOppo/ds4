@@ -8,11 +8,11 @@ public struct DirnameTool: Tool {
         ToolSchema(
             name: "dirname",
             description:
-                "Return the directory part of a path. Purely string-based; no filesystem access.",
+                "Restituisce la parte directory di un path. Puramente basato su stringhe; nessun accesso al filesystem.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Any path string."),
+                    "path": SchemaBuilder.string(description: "Una qualsiasi stringa di path."),
                 ],
                 required: ["path"]
             )

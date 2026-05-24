@@ -10,13 +10,13 @@ public struct ChmodTool: Tool {
         ToolSchema(
             name: "chmod",
             description:
-                "Set POSIX permissions on a file or directory inside the agent root. " +
-                "'mode' must be octal digits (e.g. '755', '0644'). Symbolic specs like 'u+x' are not supported.",
+                "Imposta i permessi POSIX su un file o directory dentro la root dell'agente. " +
+                "'mode' deve essere in cifre ottali (es. '755', '0644'). Le forme simboliche come 'u+x' non sono supportate.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Path, relative to agent root."),
-                    "mode": SchemaBuilder.string(description: "Octal permission triplet (3 or 4 digits)."),
+                    "path": SchemaBuilder.string(description: "Path, relativo alla root dell'agente."),
+                    "mode": SchemaBuilder.string(description: "Tripletta di permessi in ottale (3 o 4 cifre)."),
                 ],
                 required: ["path", "mode"]
             )

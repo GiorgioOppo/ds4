@@ -9,18 +9,18 @@ public struct CommTool: Tool {
         ToolSchema(
             name: "comm",
             description:
-                "Compare two sorted files line by line. Output columns: " +
-                "1 = only in A, 2 = only in B, 3 = in both. " +
-                "Suppress any column via 'suppress1'/'suppress2'/'suppress3'. " +
-                "Files must already be sorted — use 'sort' first if needed.",
+                "Confronta riga per riga due file ordinati. Colonne di output: " +
+                "1 = solo in A, 2 = solo in B, 3 = in entrambi. " +
+                "Nascondi una qualunque colonna tramite 'suppress1'/'suppress2'/'suppress3'. " +
+                "I file devono essere già ordinati — usa 'sort' prima se necessario.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pathA": SchemaBuilder.string(description: "First sorted file."),
-                    "pathB": SchemaBuilder.string(description: "Second sorted file."),
-                    "suppress1": SchemaBuilder.boolean(description: "Hide column 1 (A-only).", defaultValue: false),
-                    "suppress2": SchemaBuilder.boolean(description: "Hide column 2 (B-only).", defaultValue: false),
-                    "suppress3": SchemaBuilder.boolean(description: "Hide column 3 (common).", defaultValue: false),
+                    "pathA": SchemaBuilder.string(description: "Primo file ordinato."),
+                    "pathB": SchemaBuilder.string(description: "Secondo file ordinato."),
+                    "suppress1": SchemaBuilder.boolean(description: "Nasconde la colonna 1 (solo A).", defaultValue: false),
+                    "suppress2": SchemaBuilder.boolean(description: "Nasconde la colonna 2 (solo B).", defaultValue: false),
+                    "suppress3": SchemaBuilder.boolean(description: "Nasconde la colonna 3 (in comune).", defaultValue: false),
                 ],
                 required: ["pathA", "pathB"]
             )

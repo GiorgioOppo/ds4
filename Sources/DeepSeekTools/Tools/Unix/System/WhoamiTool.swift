@@ -7,7 +7,7 @@ public struct WhoamiTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "whoami",
-            description: "Print the effective user name.",
+            description: "Stampa il nome utente effettivo.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(properties: [:])
         )

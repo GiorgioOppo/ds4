@@ -15,16 +15,16 @@ public struct PlanTool: Tool {
         ToolSchema(
             name: "plan",
             description:
-                "Read or replace the current high-level plan for the chat. " +
-                "Use operation='read' to see the current plan; 'write' to " +
-                "replace it with 'text'. Use freely; cheap and side-effect-free.",
+                "Legge o sostituisce il piano ad alto livello corrente per la chat. " +
+                "Usa operation='read' per vedere il piano corrente; 'write' per " +
+                "sostituirlo con 'text'. Usalo liberamente: è economico e senza effetti collaterali.",
             category: .planning,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "operation": SchemaBuilder.string(
-                        description: "'read' or 'write'.",
+                        description: "'read' o 'write'.",
                         enumValues: ["read", "write"]),
-                    "text": SchemaBuilder.string(description: "New plan body (write only)."),
+                    "text": SchemaBuilder.string(description: "Nuovo corpo del piano (solo per write)."),
                 ],
                 required: ["operation"]
             )

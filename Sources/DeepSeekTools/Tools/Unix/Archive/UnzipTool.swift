@@ -8,15 +8,15 @@ public struct UnzipTool: Tool {
         ToolSchema(
             name: "unzip",
             description:
-                "Extract a .zip archive. Both the archive and the destination must be inside the agent root. " +
-                "Set operation='list' to just list the contents without extracting.",
+                "Estrae un archivio .zip. Sia l'archivio sia la destinazione devono trovarsi dentro la root dell'agente. " +
+                "Imposta operation='list' per elencare solo il contenuto senza estrarlo.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "archive": SchemaBuilder.string(description: ".zip path, relative to agent root."),
-                    "destination": SchemaBuilder.string(description: "Destination dir, relative to agent root. Default = archive parent."),
+                    "archive": SchemaBuilder.string(description: "Path del .zip, relativo alla root dell'agente."),
+                    "destination": SchemaBuilder.string(description: "Directory di destinazione, relativa alla root dell'agente. Default = directory padre dell'archivio."),
                     "operation": SchemaBuilder.string(
-                        description: "What to do.",
+                        description: "Cosa fare.",
                         enumValues: ["extract", "list"]),
                 ],
                 required: ["archive"]

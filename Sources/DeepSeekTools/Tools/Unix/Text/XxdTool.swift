@@ -9,15 +9,15 @@ public struct XxdTool: Tool {
         ToolSchema(
             name: "xxd",
             description:
-                "Hex dump a file in canonical 16-bytes-per-row layout. " +
-                "Optional 'offset' / 'length' (bytes) to dump a slice. " +
-                "Output is capped at 32 KB.",
+                "Esegue un hex dump di un file nel layout canonico a 16 byte per riga. " +
+                "'offset' / 'length' (byte) opzionali per fare dump di una porzione. " +
+                "L'output è limitato a 32 KB.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "offset": SchemaBuilder.integer(description: "Starting byte offset. Default 0.", minimum: 0),
-                    "length": SchemaBuilder.integer(description: "Max bytes to dump. Default 4096.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "offset": SchemaBuilder.integer(description: "Offset di partenza in byte. Default 0.", minimum: 0),
+                    "length": SchemaBuilder.integer(description: "Numero massimo di byte da fare dump. Default 4096.", minimum: 1),
                 ],
                 required: ["path"]
             )

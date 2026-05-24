@@ -8,16 +8,16 @@ public struct SortTool: Tool {
         ToolSchema(
             name: "sort",
             description:
-                "Sort the lines of a file. Default: lexicographic ascending. " +
-                "Set 'numeric=true' for numeric sort, 'reverse=true' to descend, 'unique=true' to dedupe.",
+                "Ordina le righe di un file. Default: lessicografico crescente. " +
+                "Imposta 'numeric=true' per ordinamento numerico, 'reverse=true' per decrescente, 'unique=true' per deduplicare.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "numeric": SchemaBuilder.boolean(description: "Numeric (vs lex) sort. Default false.", defaultValue: false),
-                    "reverse": SchemaBuilder.boolean(description: "Reverse the result. Default false.", defaultValue: false),
-                    "unique": SchemaBuilder.boolean(description: "Drop adjacent duplicates after sort. Default false.", defaultValue: false),
-                    "caseInsensitive": SchemaBuilder.boolean(description: "Case-insensitive compare. Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "numeric": SchemaBuilder.boolean(description: "Ordinamento numerico (vs lessicografico). Default false.", defaultValue: false),
+                    "reverse": SchemaBuilder.boolean(description: "Inverte il risultato. Default false.", defaultValue: false),
+                    "unique": SchemaBuilder.boolean(description: "Rimuove i duplicati adiacenti dopo l'ordinamento. Default false.", defaultValue: false),
+                    "caseInsensitive": SchemaBuilder.boolean(description: "Confronto case-insensitive. Default false.", defaultValue: false),
                 ],
                 required: ["path"]
             )

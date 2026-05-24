@@ -13,17 +13,17 @@ public struct TarTool: Tool {
         ToolSchema(
             name: "tar",
             description:
-                "Operate on a tar archive. operation='list' prints the contents; " +
-                "operation='extract' extracts into 'destination' (must be inside the agent root). " +
-                "Auto-detects gzip/bzip2/xz compression. Archive creation is not supported in this tool.",
+                "Opera su un archivio tar. operation='list' stampa il contenuto; " +
+                "operation='extract' estrae in 'destination' (deve trovarsi dentro la root dell'agente). " +
+                "Rileva automaticamente la compressione gzip/bzip2/xz. La creazione di archivi non è supportata da questo tool.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "operation": SchemaBuilder.string(
-                        description: "What to do.",
+                        description: "Cosa fare.",
                         enumValues: ["list", "extract"]),
-                    "archive": SchemaBuilder.string(description: "Archive path, relative to agent root."),
-                    "destination": SchemaBuilder.string(description: "Extract destination dir, relative to agent root. Required for extract."),
+                    "archive": SchemaBuilder.string(description: "Path dell'archivio, relativo alla root dell'agente."),
+                    "destination": SchemaBuilder.string(description: "Directory di destinazione per l'estrazione, relativa alla root dell'agente. Obbligatoria per extract."),
                 ],
                 required: ["operation", "archive"]
             )

@@ -9,14 +9,14 @@ public struct GzipTool: Tool {
         ToolSchema(
             name: "gzip",
             description:
-                "Compress a file with gzip. Default replaces 'X' with 'X.gz'; " +
-                "'keep=true' keeps the original alongside.",
+                "Comprime un file con gzip. Per default sostituisce 'X' con 'X.gz'; " +
+                "'keep=true' mantiene l'originale a fianco.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "keep": SchemaBuilder.boolean(description: "Keep the original file. Default false.", defaultValue: false),
-                    "level": SchemaBuilder.integer(description: "Compression level 1-9. Default 6.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "keep": SchemaBuilder.boolean(description: "Mantiene il file originale. Default false.", defaultValue: false),
+                    "level": SchemaBuilder.integer(description: "Livello di compressione da 1 a 9. Default 6.", minimum: 1),
                 ],
                 required: ["path"]
             )

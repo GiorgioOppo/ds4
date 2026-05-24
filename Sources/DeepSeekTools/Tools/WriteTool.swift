@@ -10,13 +10,13 @@ public struct WriteTool: Tool {
         ToolSchema(
             name: "write",
             description:
-                "Create or completely overwrite a UTF-8 file. Creates parent " +
-                "directories as needed. Prefer 'edit' for partial changes.",
+                "Crea o sovrascrive completamente un file UTF-8. Crea le directory " +
+                "padre quando necessario. Preferisci 'edit' per modifiche parziali.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Target file path."),
-                    "content": SchemaBuilder.string(description: "Full file content."),
+                    "path": SchemaBuilder.string(description: "Path del file di destinazione."),
+                    "content": SchemaBuilder.string(description: "Contenuto completo del file."),
                 ],
                 required: ["path", "content"]
             )
@@ -24,7 +24,7 @@ public struct WriteTool: Tool {
     }
 
     public func permissionSummary(input: [String: Any]) -> String {
-        "write \(input["path"] as? String ?? "?")"
+        "scrivi \(input["path"] as? String ?? "?")"
     }
 
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {

@@ -9,14 +9,14 @@ public struct DuTool: Tool {
         ToolSchema(
             name: "du",
             description:
-                "Disk usage of a directory tree. Returns one 'size path' line per direct child when 'summarize=false', " +
-                "or a single line for the root otherwise. Sizes are bytes. Symlinks not followed.",
+                "Uso del disco per un albero di directory. Restituisce una riga 'size path' per ogni figlio diretto quando 'summarize=false', " +
+                "o una singola riga per la root altrimenti. Le dimensioni sono in byte. I symlink non vengono seguiti.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Directory, relative to agent root. Default '.'."),
-                    "summarize": SchemaBuilder.boolean(description: "If true, print only the grand total.", defaultValue: false),
-                    "humanReadable": SchemaBuilder.boolean(description: "Format sizes as KB/MB/GB. Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Directory, relativa alla root dell'agente. Default '.'."),
+                    "summarize": SchemaBuilder.boolean(description: "Se true, stampa solo il totale complessivo.", defaultValue: false),
+                    "humanReadable": SchemaBuilder.boolean(description: "Formatta le dimensioni come KB/MB/GB. Default false.", defaultValue: false),
                 ]
             )
         )

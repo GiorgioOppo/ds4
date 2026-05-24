@@ -18,15 +18,15 @@ public struct AwkTool: Tool {
         ToolSchema(
             name: "awk",
             description:
-                "Run an awk program against a file, return stdout. Provide 'program' (awk source) " +
-                "and 'path' (input file). Caveat: awk programs can read files outside the agent root via " +
-                "'getline < \"...\"' — prefer typed tools (cut/tr/grep) when possible.",
+                "Esegue un programma awk su un file e restituisce stdout. Fornisci 'program' (sorgente awk) " +
+                "e 'path' (file di input). Attenzione: i programmi awk possono leggere file fuori dalla root dell'agente tramite " +
+                "'getline < \"...\"' — preferisci, quando possibile, i tool tipizzati (cut/tr/grep).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "program": SchemaBuilder.string(description: "awk source (one or more rules)."),
-                    "path": SchemaBuilder.string(description: "Input file, relative to agent root."),
-                    "fieldSeparator": SchemaBuilder.string(description: "Field separator (-F). Default whitespace."),
+                    "program": SchemaBuilder.string(description: "Sorgente awk (una o più regole)."),
+                    "path": SchemaBuilder.string(description: "File di input, relativo alla root dell'agente."),
+                    "fieldSeparator": SchemaBuilder.string(description: "Separatore di campo (-F). Default: spazi bianchi."),
                 ],
                 required: ["program", "path"]
             )

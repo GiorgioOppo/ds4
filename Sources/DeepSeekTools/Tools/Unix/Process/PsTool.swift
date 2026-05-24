@@ -8,12 +8,12 @@ public struct PsTool: Tool {
         ToolSchema(
             name: "ps",
             description:
-                "Snapshot the process list. By default returns the current user's processes with " +
-                "PID/CPU/MEM/CMD. Set 'all=true' for every process (system-wide).",
+                "Snapshot della lista dei processi. Per default restituisce i processi dell'utente corrente con " +
+                "PID/CPU/MEM/CMD. Imposta 'all=true' per ogni processo (a livello di sistema).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "all": SchemaBuilder.boolean(description: "Include all users' processes. Default false.", defaultValue: false),
+                    "all": SchemaBuilder.boolean(description: "Include i processi di tutti gli utenti. Default false.", defaultValue: false),
                 ]
             )
         )

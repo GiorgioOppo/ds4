@@ -8,14 +8,14 @@ public struct ZipTool: Tool {
         ToolSchema(
             name: "zip",
             description:
-                "Create a .zip archive from one or more inputs. Recursive (-r) by default. " +
-                "All inputs and the archive destination must be inside the agent root.",
+                "Crea un archivio .zip da uno o più input. Ricorsivo (-r) per default. " +
+                "Tutti gli input e la destinazione dell'archivio devono trovarsi dentro la root dell'agente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "archive": SchemaBuilder.string(description: "Output .zip path, relative to agent root."),
-                    "inputs": SchemaBuilder.array(itemsType: "string", description: "Files/dirs to include, relative to agent root."),
-                    "recursive": SchemaBuilder.boolean(description: "Recurse into directories. Default true.", defaultValue: true),
+                    "archive": SchemaBuilder.string(description: "Path del .zip di output, relativo alla root dell'agente."),
+                    "inputs": SchemaBuilder.array(itemsType: "string", description: "File o directory da includere, relativi alla root dell'agente."),
+                    "recursive": SchemaBuilder.boolean(description: "Discende nelle directory. Default true.", defaultValue: true),
                 ],
                 required: ["archive", "inputs"]
             )

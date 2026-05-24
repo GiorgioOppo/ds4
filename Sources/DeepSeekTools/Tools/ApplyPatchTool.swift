@@ -18,13 +18,13 @@ public struct ApplyPatchTool: Tool {
         ToolSchema(
             name: "apply_patch",
             description:
-                "Apply a unified-diff patch to one or more files. Supports " +
-                "create (--- /dev/null) and delete (+++ /dev/null). " +
-                "Rejects on any hunk mismatch — there is no fuzzy matching.",
+                "Applica una patch in formato unified-diff a uno o più file. Supporta " +
+                "la creazione (--- /dev/null) e la cancellazione (+++ /dev/null). " +
+                "Rifiuta su qualsiasi mismatch di hunk — non c'è fuzzy matching.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "patch": SchemaBuilder.string(description: "Full unified diff body."),
+                    "patch": SchemaBuilder.string(description: "Corpo completo dello unified diff."),
                 ],
                 required: ["patch"]
             )

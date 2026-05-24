@@ -8,13 +8,13 @@ public struct BasenameTool: Tool {
         ToolSchema(
             name: "basename",
             description:
-                "Return the last path component. With 'suffix' set, strip it from the result if present. " +
-                "Purely string-based; no filesystem access.",
+                "Restituisce l'ultimo componente del path. Con 'suffix' impostato, lo rimuove dal risultato se presente. " +
+                "Puramente basato su stringhe; nessun accesso al filesystem.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Any path string."),
-                    "suffix": SchemaBuilder.string(description: "Optional suffix to strip (e.g. '.swift')."),
+                    "path": SchemaBuilder.string(description: "Una qualsiasi stringa di path."),
+                    "suffix": SchemaBuilder.string(description: "Suffisso opzionale da rimuovere (es. '.swift')."),
                 ],
                 required: ["path"]
             )

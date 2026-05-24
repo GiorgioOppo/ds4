@@ -21,15 +21,15 @@ public struct KillTool: Tool {
         ToolSchema(
             name: "kill",
             description:
-                "Send a signal to a process owned by the current user. " +
-                "Default signal: TERM. Forbidden targets: PID 1, PID 0, and the agent process itself. " +
-                "PIDs owned by other users are rejected.",
+                "Invia un segnale a un processo di proprietà dell'utente corrente. " +
+                "Segnale di default: TERM. Bersagli vietati: PID 1, PID 0, e il processo dell'agente stesso. " +
+                "I PID di proprietà di altri utenti vengono rifiutati.",
             category: .dangerous,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pid": SchemaBuilder.integer(description: "Target PID.", minimum: 2),
+                    "pid": SchemaBuilder.integer(description: "PID bersaglio.", minimum: 2),
                     "signal": SchemaBuilder.string(
-                        description: "Signal name. Default TERM.",
+                        description: "Nome del segnale. Default TERM.",
                         enumValues: ["TERM", "INT", "HUP", "QUIT", "KILL", "USR1", "USR2"]),
                 ],
                 required: ["pid"]

@@ -11,14 +11,14 @@ public struct RepoCloneTool: Tool {
         ToolSchema(
             name: "repo_clone",
             description:
-                "Shallow git clone (depth=1) of a remote into a subdirectory " +
-                "of the agent root. Uses the user's local git credentials.",
+                "Esegue uno shallow git clone (depth=1) di un remoto in una sottodirectory " +
+                "della root dell'agente. Usa le credenziali git locali dell'utente.",
             category: .dangerous,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "url": SchemaBuilder.string(description: "Git remote URL (https or ssh)."),
-                    "destination": SchemaBuilder.string(description: "Subdirectory name. Default: repo basename."),
-                    "depth": SchemaBuilder.integer(description: "Clone depth. Default 1.", minimum: 1),
+                    "url": SchemaBuilder.string(description: "URL del remote git (https o ssh)."),
+                    "destination": SchemaBuilder.string(description: "Nome della sottodirectory. Default: basename del repository."),
+                    "depth": SchemaBuilder.integer(description: "Profondità del clone. Default 1.", minimum: 1),
                 ],
                 required: ["url"]
             )

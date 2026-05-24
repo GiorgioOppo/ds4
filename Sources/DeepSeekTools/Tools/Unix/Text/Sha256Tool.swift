@@ -9,11 +9,11 @@ public struct Sha256Tool: Tool {
         ToolSchema(
             name: "sha256",
             description:
-                "SHA-256 hex digest of a file. Cryptographically secure for integrity checking.",
+                "Digest SHA-256 esadecimale di un file. Crittograficamente sicuro per controlli di integrità.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

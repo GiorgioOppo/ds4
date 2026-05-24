@@ -9,15 +9,15 @@ public struct Base64Tool: Tool {
         ToolSchema(
             name: "base64",
             description:
-                "Base64 encode or decode. Provide 'input' (string) or 'path' (file). " +
-                "Set 'decode=true' to decode (default is encode). " +
-                "Output is the encoded/decoded payload as a UTF-8 string (or '<binary>' marker if not text).",
+                "Codifica o decodifica base64. Fornisci 'input' (stringa) o 'path' (file). " +
+                "Imposta 'decode=true' per decodificare (il default è encode). " +
+                "L'output è il payload codificato/decodificato come stringa UTF-8 (o marker '<binary>' se non è testo).",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "input": SchemaBuilder.string(description: "Inline text. Alternative to 'path'."),
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "decode": SchemaBuilder.boolean(description: "Decode instead of encode. Default false.", defaultValue: false),
+                    "input": SchemaBuilder.string(description: "Testo inline. Alternativa a 'path'."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "decode": SchemaBuilder.boolean(description: "Decodifica invece di codificare. Default false.", defaultValue: false),
                 ]
             )
         )

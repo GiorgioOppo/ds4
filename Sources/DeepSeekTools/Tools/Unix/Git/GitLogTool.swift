@@ -10,15 +10,15 @@ public struct GitLogTool: Tool {
         ToolSchema(
             name: "git_log",
             description:
-                "Show commit history of the agent root. Default --oneline -n 20 keeps output bounded. " +
-                "Pass 'path' to scope to one file/directory.",
+                "Mostra la storia dei commit della root dell'agente. Il default --oneline -n 20 mantiene l'output limitato. " +
+                "Passa 'path' per restringere a un singolo file/directory.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "n": SchemaBuilder.integer(description: "Number of commits. Default 20.", minimum: 1),
-                    "path": SchemaBuilder.string(description: "Scope to one path, relative to agent root."),
-                    "since": SchemaBuilder.string(description: "Only commits newer than this (e.g. '2 weeks ago')."),
-                    "author": SchemaBuilder.string(description: "Match commit author."),
+                    "n": SchemaBuilder.integer(description: "Numero di commit. Default 20.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Restringe a un singolo path, relativo alla root dell'agente."),
+                    "since": SchemaBuilder.string(description: "Solo commit più recenti di questa data (es. '2 weeks ago')."),
+                    "author": SchemaBuilder.string(description: "Filtra per autore del commit."),
                 ]
             )
         )

@@ -8,17 +8,17 @@ public struct HeadTool: Tool {
         ToolSchema(
             name: "head",
             description:
-                "Print the first N lines of a file (default 10). " +
-                "Use this when you need a small prefix — e.g. the first few lines of a log, " +
-                "the shebang of a script, the header of a CSV. " +
-                "For the whole file use 'read'; for the tail use 'tail'. " +
-                "'bytes' counts bytes instead of lines.",
+                "Stampa le prime N righe di un file (default 10). " +
+                "Usalo quando ti serve un piccolo prefisso — es. le prime righe di un log, " +
+                "lo shebang di uno script, l'header di un CSV. " +
+                "Per l'intero file usa 'read'; per la coda usa 'tail'. " +
+                "'bytes' conta i byte invece delle righe.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
-                    "lines": SchemaBuilder.integer(description: "Lines to print. Default 10.", minimum: 1),
-                    "bytes": SchemaBuilder.integer(description: "If set, print this many bytes and ignore 'lines'.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
+                    "lines": SchemaBuilder.integer(description: "Righe da stampare. Default 10.", minimum: 1),
+                    "bytes": SchemaBuilder.integer(description: "Se impostato, stampa questo numero di byte e ignora 'lines'.", minimum: 1),
                 ],
                 required: ["path"]
             )

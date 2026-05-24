@@ -12,14 +12,14 @@ public struct RepoOverviewTool: Tool {
         ToolSchema(
             name: "repo_overview",
             description:
-                "Compact textual summary of a repository: tree (depth-limited), " +
-                "file-count by extension, contents of README and the top " +
-                "package manifests. Read-only.",
+                "Riepilogo testuale compatto di un repository: albero (limitato in profondità), " +
+                "conteggio dei file per estensione, contenuti del README e dei principali " +
+                "manifest di package. Sola lettura.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Repo root, relative to agent root. Default: '.'."),
-                    "maxDepth": SchemaBuilder.integer(description: "Tree depth cap. Default 3.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Root del repository, relativa alla root dell'agente. Default: '.'."),
+                    "maxDepth": SchemaBuilder.integer(description: "Profondità massima dell'albero. Default 3.", minimum: 1),
                 ],
                 required: []
             )

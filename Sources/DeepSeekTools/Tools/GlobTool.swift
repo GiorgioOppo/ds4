@@ -12,14 +12,14 @@ public struct GlobTool: Tool {
         ToolSchema(
             name: "glob",
             description:
-                "Match files inside the working directory by glob pattern " +
-                "(e.g. 'Sources/**/*.swift'). Returns up to 'limit' paths " +
-                "sorted by recent modification.",
+                "Trova i file all'interno della working directory tramite pattern glob " +
+                "(es. 'Sources/**/*.swift'). Restituisce fino a 'limit' path " +
+                "ordinati per modifica più recente.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pattern": SchemaBuilder.string(description: "Glob pattern."),
-                    "limit": SchemaBuilder.integer(description: "Max results. Default 200.", minimum: 1),
+                    "pattern": SchemaBuilder.string(description: "Pattern glob."),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di risultati. Default 200.", minimum: 1),
                 ],
                 required: ["pattern"]
             )

@@ -12,12 +12,12 @@ public struct UnameTool: Tool {
         ToolSchema(
             name: "uname",
             description:
-                "Kernel info: 'kernel' (default), 'machine' (CPU arch), 'release' (kernel version), 'all'.",
+                "Informazioni sul kernel: 'kernel' (default), 'machine' (architettura CPU), 'release' (versione del kernel), 'all'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "field": SchemaBuilder.string(
-                        description: "Which field to print. Default 'kernel'.",
+                        description: "Quale campo stampare. Default 'kernel'.",
                         enumValues: ["kernel", "machine", "release", "all"]),
                 ]
             )

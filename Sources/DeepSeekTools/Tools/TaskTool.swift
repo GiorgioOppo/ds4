@@ -13,9 +13,9 @@ public struct TaskTool: Tool {
         ToolSchema(
             name: "task",
             description:
-                "Manage the active task list. Operations: 'list' returns the " +
-                "current items; 'set' replaces them ('titles' array); 'update' " +
-                "flips one item's status by 'id'.",
+                "Gestisce la lista dei task attivi. Operazioni: 'list' restituisce gli " +
+                "elementi correnti; 'set' li sostituisce (array 'titles'); 'update' " +
+                "cambia lo stato di un elemento tramite 'id'.",
             category: .planning,
             inputSchema: SchemaBuilder.object(
                 properties: [
@@ -23,10 +23,10 @@ public struct TaskTool: Tool {
                         description: "'list' | 'set' | 'update'.",
                         enumValues: ["list", "set", "update"]),
                     "titles": SchemaBuilder.array(itemsType: "string",
-                                                  description: "For 'set': new task titles."),
-                    "id": SchemaBuilder.string(description: "Task UUID (update)."),
+                                                  description: "Per 'set': nuovi titoli dei task."),
+                    "id": SchemaBuilder.string(description: "UUID del task (update)."),
                     "status": SchemaBuilder.string(
-                        description: "New status (update).",
+                        description: "Nuovo stato (update).",
                         enumValues: ["pending", "inProgress", "done", "skipped"]),
                 ],
                 required: ["operation"]

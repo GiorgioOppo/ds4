@@ -9,12 +9,12 @@ public struct GitStatusTool: Tool {
         ToolSchema(
             name: "git_status",
             description:
-                "Show modified, staged, and untracked files in the agent root. " +
-                "Uses --porcelain=v1 for stable parseable output.",
+                "Mostra file modificati, in staged e non tracciati nella root dell'agente. " +
+                "Usa --porcelain=v1 per un output stabile e parsabile.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "showIgnored": SchemaBuilder.boolean(description: "Include ignored files. Default false.", defaultValue: false),
+                    "showIgnored": SchemaBuilder.boolean(description: "Include i file ignorati. Default false.", defaultValue: false),
                 ]
             )
         )

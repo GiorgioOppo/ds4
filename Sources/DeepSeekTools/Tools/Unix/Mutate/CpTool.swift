@@ -14,16 +14,16 @@ public struct CpTool: Tool {
         ToolSchema(
             name: "cp",
             description:
-                "Copy a file or directory inside the agent root. " +
-                "Set 'recursive=true' to copy a directory tree. " +
-                "Refuses to overwrite an existing destination unless 'force=true'.",
+                "Copia un file o una directory dentro la root dell'agente. " +
+                "Imposta 'recursive=true' per copiare un albero di directory. " +
+                "Si rifiuta di sovrascrivere una destinazione esistente a meno che 'force=true'.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "src": SchemaBuilder.string(description: "Source path, relative to agent root."),
-                    "dst": SchemaBuilder.string(description: "Destination path, relative to agent root."),
-                    "recursive": SchemaBuilder.boolean(description: "Allow copying a directory tree. Default false.", defaultValue: false),
-                    "force": SchemaBuilder.boolean(description: "Overwrite an existing destination. Default false.", defaultValue: false),
+                    "src": SchemaBuilder.string(description: "Path di origine, relativo alla root dell'agente."),
+                    "dst": SchemaBuilder.string(description: "Path di destinazione, relativo alla root dell'agente."),
+                    "recursive": SchemaBuilder.boolean(description: "Consente la copia di un albero di directory. Default false.", defaultValue: false),
+                    "force": SchemaBuilder.boolean(description: "Sovrascrive una destinazione esistente. Default false.", defaultValue: false),
                 ],
                 required: ["src", "dst"]
             )

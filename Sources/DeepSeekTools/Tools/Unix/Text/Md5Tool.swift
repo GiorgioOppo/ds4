@@ -14,11 +14,11 @@ public struct Md5Tool: Tool {
         ToolSchema(
             name: "md5",
             description:
-                "MD5 hex digest of a file. NOT cryptographically secure — use for checksums only.",
+                "Digest MD5 esadecimale di un file. NON crittograficamente sicuro — usalo solo per checksum.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

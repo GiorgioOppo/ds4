@@ -9,13 +9,13 @@ public struct MkdirTool: Tool {
         ToolSchema(
             name: "mkdir",
             description:
-                "Create a directory under the agent root. Creates intermediate parents by default. " +
-                "Set 'parents=false' to require an existing parent.",
+                "Crea una directory sotto la root dell'agente. Per default crea anche i parent intermedi. " +
+                "Imposta 'parents=false' per richiedere un parent già esistente.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Directory path, relative to agent root."),
-                    "parents": SchemaBuilder.boolean(description: "Create intermediate directories. Default true.", defaultValue: true),
+                    "path": SchemaBuilder.string(description: "Path della directory, relativo alla root dell'agente."),
+                    "parents": SchemaBuilder.boolean(description: "Crea le directory intermedie. Default true.", defaultValue: true),
                 ],
                 required: ["path"]
             )

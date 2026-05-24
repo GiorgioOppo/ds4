@@ -10,7 +10,7 @@ public struct IdTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "id",
-            description: "Print real/effective UID and GID. Output is 'uid=N euid=N gid=N egid=N user=NAME'.",
+            description: "Stampa UID e GID reale/effettivo. L'output è 'uid=N euid=N gid=N egid=N user=NAME'.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(properties: [:])
         )

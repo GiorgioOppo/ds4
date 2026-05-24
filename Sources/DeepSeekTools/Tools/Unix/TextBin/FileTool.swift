@@ -8,11 +8,11 @@ public struct FileTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "file",
-            description: "Detect file type (text/binary/format) using libmagic via /usr/bin/file.",
+            description: "Rileva il tipo di file (text/binary/format) usando libmagic tramite /usr/bin/file.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

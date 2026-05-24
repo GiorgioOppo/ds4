@@ -12,17 +12,17 @@ public struct TodoTool: Tool {
         ToolSchema(
             name: "todo",
             description:
-                "Manage a list of TODO items that outlive the current task. " +
-                "Operations: 'list', 'add' (with 'title'), 'check'/'uncheck' " +
-                "(with 'id').",
+                "Gestisce una lista di TODO che sopravvivono al task corrente. " +
+                "Operazioni: 'list', 'add' (con 'title'), 'check'/'uncheck' " +
+                "(con 'id').",
             category: .planning,
             inputSchema: SchemaBuilder.object(
                 properties: [
                     "operation": SchemaBuilder.string(
                         description: "'list' | 'add' | 'check' | 'uncheck'.",
                         enumValues: ["list", "add", "check", "uncheck"]),
-                    "title": SchemaBuilder.string(description: "TODO body (add)."),
-                    "id": SchemaBuilder.string(description: "TODO UUID (check/uncheck)."),
+                    "title": SchemaBuilder.string(description: "Corpo del TODO (add)."),
+                    "id": SchemaBuilder.string(description: "UUID del TODO (check/uncheck)."),
                 ],
                 required: ["operation"]
             )

@@ -13,15 +13,15 @@ public struct RmTool: Tool {
         ToolSchema(
             name: "rm",
             description:
-                "Delete a file or (with recursive=true) a directory tree inside the agent root. " +
-                "Recursive deletes and directory deletes REQUIRE 'confirm: true' — explicit opt-in beyond " +
-                "the regular permission prompt. Refuses to delete the agent root itself.",
+                "Cancella un file o (con recursive=true) un albero di directory dentro la root dell'agente. " +
+                "Le cancellazioni ricorsive e quelle di directory RICHIEDONO 'confirm: true' — opt-in esplicito oltre " +
+                "al normale prompt di permesso. Si rifiuta di cancellare la root dell'agente stessa.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Path to remove, relative to agent root."),
-                    "recursive": SchemaBuilder.boolean(description: "Allow removing a directory tree. Default false.", defaultValue: false),
-                    "confirm": SchemaBuilder.boolean(description: "Required for recursive or directory deletes.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Path da rimuovere, relativo alla root dell'agente."),
+                    "recursive": SchemaBuilder.boolean(description: "Consente la rimozione di un albero di directory. Default false.", defaultValue: false),
+                    "confirm": SchemaBuilder.boolean(description: "Richiesto per cancellazioni ricorsive o di directory.", defaultValue: false),
                 ],
                 required: ["path"]
             )

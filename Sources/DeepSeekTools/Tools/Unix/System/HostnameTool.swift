@@ -7,7 +7,7 @@ public struct HostnameTool: Tool {
     public var schema: ToolSchema {
         ToolSchema(
             name: "hostname",
-            description: "Print the host name.",
+            description: "Stampa il nome dell'host.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(properties: [:])
         )

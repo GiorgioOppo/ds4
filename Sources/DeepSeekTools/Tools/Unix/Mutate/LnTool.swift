@@ -11,13 +11,13 @@ public struct LnTool: Tool {
         ToolSchema(
             name: "ln",
             description:
-                "Create a symbolic link inside the agent root. Both the link path and the target " +
-                "must resolve inside the root — a link to outside is rejected. Hard links are not supported.",
+                "Crea un link simbolico dentro la root dell'agente. Sia il path del link sia il target " +
+                "devono risolvere dentro la root — un link verso l'esterno viene rifiutato. Gli hard link non sono supportati.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "target": SchemaBuilder.string(description: "Target path (what the link points to), relative to agent root."),
-                    "linkPath": SchemaBuilder.string(description: "Path where the link is created, relative to agent root."),
+                    "target": SchemaBuilder.string(description: "Path di destinazione (a cosa punta il link), relativo alla root dell'agente."),
+                    "linkPath": SchemaBuilder.string(description: "Path in cui viene creato il link, relativo alla root dell'agente."),
                 ],
                 required: ["target", "linkPath"]
             )

@@ -14,16 +14,16 @@ public struct GrepTool: Tool {
         ToolSchema(
             name: "grep",
             description:
-                "Search for a regex inside files under the agent root. " +
-                "Returns 'path:line:match' lines, capped at 'limit'. " +
-                "Use 'glob' to narrow which files to scan.",
+                "Cerca una regex all'interno dei file sotto la root dell'agente. " +
+                "Restituisce righe 'path:line:match', limitate da 'limit'. " +
+                "Usa 'glob' per restringere i file da scansionare.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "pattern": SchemaBuilder.string(description: "Regex (NSRegularExpression dialect)."),
-                    "glob": SchemaBuilder.string(description: "Optional glob to filter files. Default '**/*'."),
+                    "pattern": SchemaBuilder.string(description: "Regex (dialetto NSRegularExpression)."),
+                    "glob": SchemaBuilder.string(description: "Glob opzionale per filtrare i file. Default '**/*'."),
                     "caseInsensitive": SchemaBuilder.boolean(description: "Default false.", defaultValue: false),
-                    "limit": SchemaBuilder.integer(description: "Max match lines. Default 200.", minimum: 1),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di righe di match. Default 200.", minimum: 1),
                 ],
                 required: ["pattern"]
             )

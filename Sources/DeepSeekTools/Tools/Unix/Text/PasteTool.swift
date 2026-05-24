@@ -8,13 +8,13 @@ public struct PasteTool: Tool {
         ToolSchema(
             name: "paste",
             description:
-                "Merge lines of two or more files side by side, separated by 'delimiter' (default tab). " +
-                "Shorter files are padded with empty strings to match the longest.",
+                "Unisce righe di due o più file affiancate, separate da 'delimiter' (default tab). " +
+                "I file più corti vengono riempiti con stringhe vuote per pareggiare il più lungo.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "paths": SchemaBuilder.array(itemsType: "string", description: "File paths, relative to agent root."),
-                    "delimiter": SchemaBuilder.string(description: "Joiner between columns. Default '\\t'."),
+                    "paths": SchemaBuilder.array(itemsType: "string", description: "Path dei file, relativi alla root dell'agente."),
+                    "delimiter": SchemaBuilder.string(description: "Separatore tra colonne. Default '\\t'."),
                 ],
                 required: ["paths"]
             )

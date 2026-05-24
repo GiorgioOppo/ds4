@@ -8,12 +8,12 @@ public struct GunzipTool: Tool {
         ToolSchema(
             name: "gunzip",
             description:
-                "Decompress a .gz file. Default replaces 'X.gz' with 'X'; 'keep=true' keeps the original.",
+                "Decomprime un file .gz. Per default sostituisce 'X.gz' con 'X'; 'keep=true' mantiene l'originale.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: ".gz file path, relative to agent root."),
-                    "keep": SchemaBuilder.boolean(description: "Keep the .gz file. Default false.", defaultValue: false),
+                    "path": SchemaBuilder.string(description: "Path del file .gz, relativo alla root dell'agente."),
+                    "keep": SchemaBuilder.boolean(description: "Mantiene il file .gz. Default false.", defaultValue: false),
                 ],
                 required: ["path"]
             )

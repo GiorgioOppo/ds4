@@ -10,12 +10,12 @@ public struct StatTool: Tool {
         ToolSchema(
             name: "stat",
             description:
-                "Return file metadata as key=value lines: type, size, perms, owner, group, mtime, ctime, atime. " +
-                "Sandboxed to the agent root.",
+                "Restituisce i metadati del file come righe key=value: type, size, perms, owner, group, mtime, ctime, atime. " +
+                "Confinato alla root dell'agente.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "File path, relative to agent root."),
+                    "path": SchemaBuilder.string(description: "Path del file, relativo alla root dell'agente."),
                 ],
                 required: ["path"]
             )

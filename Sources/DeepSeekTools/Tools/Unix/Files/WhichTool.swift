@@ -10,13 +10,13 @@ public struct WhichTool: Tool {
         ToolSchema(
             name: "which",
             description:
-                "Locate an executable on PATH. Returns the absolute path or a not_found error. " +
-                "Pure Swift PATH lookup — does not execute the binary.",
+                "Localizza un eseguibile su PATH. Restituisce il path assoluto o un errore not_found. " +
+                "Lookup PATH in puro Swift — non esegue il binario.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "command": SchemaBuilder.string(description: "Command name (no path components)."),
-                    "all": SchemaBuilder.boolean(description: "Return all matches, not just the first. Default false.", defaultValue: false),
+                    "command": SchemaBuilder.string(description: "Nome del comando (senza componenti di path)."),
+                    "all": SchemaBuilder.boolean(description: "Restituisce tutti i match, non solo il primo. Default false.", defaultValue: false),
                 ],
                 required: ["command"]
             )

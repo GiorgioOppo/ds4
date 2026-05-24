@@ -8,14 +8,14 @@ public struct WcTool: Tool {
         ToolSchema(
             name: "wc",
             description:
-                "Count lines, words, and bytes in files under the agent root. " +
-                "Returns one line per input as 'lines words bytes path', plus a 'total' line if multiple paths.",
+                "Conta righe, parole e byte nei file sotto la root dell'agente. " +
+                "Restituisce una riga per input come 'lines words bytes path', più una riga 'total' in caso di più path.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "paths": SchemaBuilder.array(itemsType: "string", description: "File paths, relative to agent root."),
+                    "paths": SchemaBuilder.array(itemsType: "string", description: "Path dei file, relativi alla root dell'agente."),
                     "mode": SchemaBuilder.string(
-                        description: "Restrict counters: 'lines', 'words', 'bytes', or 'all' (default).",
+                        description: "Restringe i contatori: 'lines', 'words', 'bytes', o 'all' (default).",
                         enumValues: ["lines", "words", "bytes", "all"]),
                 ],
                 required: ["paths"]

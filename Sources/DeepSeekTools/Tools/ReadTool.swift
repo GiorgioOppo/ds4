@@ -11,15 +11,15 @@ public struct ReadTool: Tool {
         ToolSchema(
             name: "read",
             description:
-                "Read a UTF-8 text file inside the agent's working directory. " +
-                "Output is line-numbered. For very large files, supply 'offset' " +
-                "and 'limit' (1-based) to read a window instead of the whole file.",
+                "Legge un file di testo UTF-8 all'interno della working directory dell'agente. " +
+                "L'output è numerato per riga. Per file molto grandi, fornisci 'offset' " +
+                "e 'limit' (a base 1) per leggere una finestra invece dell'intero file.",
             category: .readOnly,
             inputSchema: SchemaBuilder.object(
                 properties: [
-                    "path": SchemaBuilder.string(description: "Path relative to the agent root, or absolute."),
-                    "offset": SchemaBuilder.integer(description: "1-based starting line.", minimum: 1),
-                    "limit": SchemaBuilder.integer(description: "Maximum number of lines to read.", minimum: 1),
+                    "path": SchemaBuilder.string(description: "Path relativo alla root dell'agente, oppure assoluto."),
+                    "offset": SchemaBuilder.integer(description: "Riga di partenza, a base 1.", minimum: 1),
+                    "limit": SchemaBuilder.integer(description: "Numero massimo di righe da leggere.", minimum: 1),
                 ],
                 required: ["path"]
             )
@@ -27,7 +27,7 @@ public struct ReadTool: Tool {
     }
 
     public func permissionSummary(input: [String: Any]) -> String {
-        "read \(input["path"] as? String ?? "?")"
+        "leggi \(input["path"] as? String ?? "?")"
     }
 
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {
