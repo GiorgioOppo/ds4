@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MLX
 
 /// Factory functions that build a `Transformer` from a `ModelConfig`.
 ///
@@ -149,6 +150,21 @@ public extension Transformer {
                       warmupOnLoad: Bool = false,
                       useMapSharedWeights: Bool = false) throws -> Transformer {
         MemoryLogger.snapshot("load:start", force: true)
+
+        // Bound MLX's internal buffer pool. Without this MLX keeps freed
+        // GPU/unified-memory buffers around to satisfy future allocs
+        // and the pool grows to the lifetime peak — on V4-Pro that's
+        // the 256-expert MoE layer dequant burst, ~10+ GB. With a
+        // 1 GB cap MLX returns excess buffers to the system instead
+        // of hoarding them, at the cost of a few extra allocs per
+        // forward. Tunable via DEEPSEEK_MLX_CACHE_MB.
+        let cacheLimitMB: Int = {
+            if let raw = ProcessInfo.processInfo.environment["DEEPSEEK_MLX_CACHE_MB"],
+               let n = Int(raw), n >= 0 { return n }
+            return 1024
+        }()
+        MLX.GPU.set(cacheLimit: cacheLimitMB * 1024 * 1024)
+
         let loader = try WeightLoader(directory: weightsDir)
 
         MemoryLogger.snapshot("load:after-mmap", force: true)

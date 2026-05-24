@@ -188,6 +188,20 @@ public final class MoEFFN {
 
             let expertOut = expert(xFlat).array                // [N, dim]
             yFlat = yFlat + expertOut * perTokenW.expandedDimensions(axes: [1])
+
+            // In the prefill/bulk-load path we materialize after every
+            // expert. The lazy graph would otherwise hold the
+            // dequantized weight temporary (~30–60 MB at bf16 for a
+            // 4096×4096 expert) AND the matmul output for every iter
+            // simultaneously — for the full 256-expert layer that's
+            // ~15 GB of transient live in addition to the 6 GB of
+            // resident expert weights, which is what pushed peak RAM
+            // to >25 GB. Decode (per-expert streaming) doesn't need
+            // this since `activeExperts.count` is at most `topK`.
+            if bulkLoad {
+                MLX.eval(yFlat)
+                MLX.GPU.clearCache()
+            }
         }
         // Materialize before releasing weights — MLX is lazy and the
         // unevaluated expert(xFlat) graph nodes still reference the

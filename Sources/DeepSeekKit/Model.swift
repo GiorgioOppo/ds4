@@ -120,6 +120,14 @@ public final class Transformer {
         let allowPrefetch = (S == 1)
 
         for (k, layer) in layers.enumerated() {
+            // Strict per-layer streaming: bulk-load layer K's non-
+            // expert weights NOW. Without prefetch this isn't a no-op
+            // — `loader.load` would otherwise fall back to a
+            // sequential on-demand disk fetch for every Linear inside
+            // layer.forward (one read per matrix, no I/O batching).
+            // `ensureLayer` is idempotent so re-entry from the K==0
+            // preload above is harmless.
+            weightLoader?.ensureLayer(k)
             // Start prefetching next layer in background while current executes
             if allowPrefetch, k + 1 < layers.count {
                 weightLoader?.prefetchLayer(k + 1)
