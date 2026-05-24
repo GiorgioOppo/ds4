@@ -108,6 +108,19 @@ public final class MLA {
         } else {
             kvCache = kv
         }
+        // For layers trained as pure sliding-window (compressRatio == 0)
+        // the reference keeps only the most recent `windowSize` tokens in
+        // KV. Without this cap the cache grows unbounded for long
+        // contexts and re-uses positions outside training distribution.
+        // Layers with compressRatio > 0 would normally keep
+        // `windowSize + maxSeqLen/ratio` rows (compressed long-range +
+        // raw window) — without the Compressor we can't reconstruct the
+        // compressed half, so they currently grow unchecked. Tracked in
+        // TODO: restore Compressor / sparse-attn path.
+        if compressRatio == 0, let cache = kvCache, cache.shape[1] > windowSize {
+            let s = cache.shape[1]
+            kvCache = cache[0..., (s - windowSize)..<s, 0...]
+        }
         MLX.eval(kvCache!)
         let currentKV = kvCache!
 
