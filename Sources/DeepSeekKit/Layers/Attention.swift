@@ -14,6 +14,7 @@ public final class MLA {
     public let qLoraRank: Int
     public let windowSize: Int
     public let compressRatio: Int
+    public let maxSeqLen: Int
     public let eps: Float
     public let softmaxScale: Float
 
@@ -47,6 +48,7 @@ public final class MLA {
         self.qLoraRank = config.qLoraRank
         self.windowSize = config.windowSize
         self.compressRatio = config.compressRatios[layerId]
+        self.maxSeqLen = config.maxSeqLen
         self.eps = config.normEps
         self.softmaxScale = pow(Float(config.headDim), -0.5)
         
@@ -115,18 +117,22 @@ public final class MLA {
         } else {
             kvCache = kvBf16
         }
-        // For layers trained as pure sliding-window (compressRatio == 0)
-        // the reference keeps only the most recent `windowSize` tokens in
-        // KV. Without this cap the cache grows unbounded for long
-        // contexts and re-uses positions outside training distribution.
-        // Layers with compressRatio > 0 would normally keep
-        // `windowSize + maxSeqLen/ratio` rows (compressed long-range +
-        // raw window) — without the Compressor we can't reconstruct the
-        // compressed half, so they currently grow unchecked. Tracked in
-        // TODO: restore Compressor / sparse-attn path.
-        if compressRatio == 0, let cache = kvCache, cache.shape[1] > windowSize {
+        // Cap the KV cache length per layer:
+        //   ratio == 0 → pure sliding window of `windowSize` rows
+        //     (matches the reference's circular buffer behavior).
+        //   ratio  > 0 → design budget of `windowSize + maxSeqLen/ratio`
+        //     rows, matching `projectedKVCacheBytes` in Config. Without
+        //     the Compressor we can't legitimately fill the "compressed
+        //     long-range" half — it ends up as FIFO raw KV — but capping
+        //     at the same budget keeps memory bounded for long contexts
+        //     instead of growing without limit. TODO: restore Compressor
+        //     / sparse-attn path for correct long-range semantics.
+        let cacheCap: Int = compressRatio == 0
+            ? windowSize
+            : windowSize + (maxSeqLen / compressRatio)
+        if let cache = kvCache, cache.shape[1] > cacheCap {
             let s = cache.shape[1]
-            kvCache = cache[0..., (s - windowSize)..<s, 0...]
+            kvCache = cache[0..., (s - cacheCap)..<s, 0...]
         }
         MLX.eval(kvCache!)
         let currentKV = kvCache!   // bf16
