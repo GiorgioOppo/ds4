@@ -118,6 +118,10 @@ public final class MoEFFN {
     public let nExperts: Int
     public let topK: Int
     public var layerId: Int = -1
+    /// Per-token expert streaming: after the gate runs, only the
+    /// `topK` active experts are pulled in from disk; the rest stay
+    /// off-RAM. Wired by `Assembly.load` for non-eager strategies.
+    public weak var weightLoader: WeightLoader? = nil
 
     public init(config: ModelConfig, gate: Gate, experts: [Expert?], shared: Expert) {
         self.gate = gate
@@ -147,16 +151,25 @@ public final class MoEFFN {
         MLX.eval(counts)
         let countsArr = counts.asArray(Int32.self)
 
+        // Active expert list for this batch. With `topK≈8` and `nRoutedExperts≈256`
+        // we usually load <topK·N> experts per token. We pull only those
+        // from disk under streaming and release them before exiting so the
+        // resident working-set of a MoE layer scales with `topK`, not
+        // `nRoutedExperts` (~32× memory reduction in the default V4 profile).
+        var activeExperts: [Int] = []
+        activeExperts.reserveCapacity(min(Int(topK) * N, nExperts))
+        for e in 0..<nExperts {
+            if countsArr[e] > 0, experts[e] != nil {
+                activeExperts.append(e)
+            }
+        }
+        weightLoader?.ensureExperts(layer: layerId, indices: activeExperts)
+
         var yFlat = MLXArray.zeros([N, dim]).asType(x.array.dtype)
 
-        for e in 0..<nExperts {
-            if countsArr[e] == 0 { continue }
-            guard let expert = experts[e] else {
-                // A pruned expert was selected: skip silently. The expert
-                // rewriter is expected to set the gate row to -inf so this
-                // branch is unreachable in a correctly-pruned checkpoint.
-                continue
-            }
+        for e in activeExperts {
+            // We already filtered out nil entries above.
+            let expert = experts[e]!
 
             // Per-token weight for expert e: sum(weights * (indices==e)) over topK.
             // The reference's `weights[idx, top, None]` indexing collapses to
@@ -168,7 +181,11 @@ public final class MoEFFN {
             let expertOut = expert(xFlat).array                // [N, dim]
             yFlat = yFlat + expertOut * perTokenW.expandedDimensions(axes: [1])
         }
+        // Materialize before releasing weights — MLX is lazy and the
+        // unevaluated expert(xFlat) graph nodes still reference the
+        // MLXArrays we're about to drop.
         MLX.eval(yFlat)
+        weightLoader?.releaseExperts(layer: layerId, indices: activeExperts)
 
         let sharedOut = sharedExpert(xFlat).array
         yFlat = yFlat + sharedOut

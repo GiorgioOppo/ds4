@@ -366,12 +366,15 @@ public extension Transformer {
         // `.preload` the loader is held but never queried.
         model.weightLoader = loader
 
-        // Wire the lazy-expert hook on every MoEFFN (main + MTP)
-        // unconditionally — the hook checks `StreamingPool
-        // .lazyExpertEnabled` at call time, so flipping the UI toggle
-        // (or `DEEPSEEK_LAZY_EXPERT` env var) takes effect on the next
-        // token without a model reload. `.mmap` / `.preload` leave
-        // `pool` nil so `ensureExperts` returns immediately either way.
+        // Wire per-MoE expert streaming. Each MoEFFN pulls in only its
+        // `topK` active routed experts from disk after the gate runs
+        // and releases them before the next layer, keeping the
+        // resident MoE working-set proportional to `topK` instead of
+        // `nRoutedExperts`. `Transformer.forward` keeps the
+        // non-expert prefetch / release on the layer level.
+        for block in blocks {
+            block.ffn.weightLoader = loader
+        }
 
         MemoryLogger.snapshot("load:complete", force: true)
         return model

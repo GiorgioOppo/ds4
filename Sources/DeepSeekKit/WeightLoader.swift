@@ -218,27 +218,28 @@ public final class WeightLoader {
     }
     
     // MARK: - Layer streaming API
-    
-    /// Load all tensors for layer `K` into cache.
-    /// Called by `Transformer.forward()` before processing layer K.
-    public func ensureLayer(_ K: Int) {
-        let prefix = "layers.\(K)."
-        var toLoad: [(String, TensorMeta)] = []
-        
-        for (name, meta) in index {
-            if name.hasPrefix(prefix) {
-                cacheLock.lock()
-                let alreadyCached = cache[name] != nil
-                cacheLock.unlock()
-                if !alreadyCached {
-                    toLoad.append((name, meta))
-                }
+
+    /// Returns true if `name` belongs to a routed (non-shared) expert
+    /// under any layer — i.e. `layers.<K>.ffn.experts.<E>.*`. These are
+    /// the tensors we defer to MoE-time loading so we only ever hold
+    /// `topK` (≈ 8) of `nRoutedExperts` (≈ 256) per layer resident.
+    private static func isRoutedExpertTensor(_ name: String) -> Bool {
+        // Cheap structural test: split on '.' and look for the segment
+        // pattern `ffn.experts.<int>`. The shared expert
+        // (`ffn.shared_experts.*`) is NOT routed and stays resident.
+        let parts = name.split(separator: ".")
+        guard parts.count >= 4 else { return false }
+        for i in 0..<(parts.count - 2) {
+            if parts[i] == "ffn", parts[i + 1] == "experts",
+               Int(parts[i + 2]) != nil {
+                return true
             }
         }
-        
+        return false
+    }
+
+    private func ensureNames(_ toLoad: [(String, TensorMeta)]) {
         guard !toLoad.isEmpty else { return }
-        
-        // Load tensors for this layer in parallel
         DispatchQueue.concurrentPerform(iterations: toLoad.count) { i in
             let (name, meta) = toLoad[i]
             guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
@@ -247,11 +248,34 @@ public final class WeightLoader {
             self.cacheLock.unlock()
         }
     }
-    
-    /// Load expert tensors for layer K on demand.
+
+    /// Load layer `K`'s non-routed-expert tensors into cache. Called by
+    /// `Transformer.forward()` before processing layer K. Routed
+    /// experts are loaded on demand by `MoEFFN` once the gate has run
+    /// and we know which `topK` ids are active — that cuts the
+    /// resident working set of a MoE layer from `nRoutedExperts × FFN`
+    /// to `topK × FFN`.
+    public func ensureLayer(_ K: Int) {
+        let prefix = "layers.\(K)."
+        var toLoad: [(String, TensorMeta)] = []
+
+        for (name, meta) in index {
+            guard name.hasPrefix(prefix) else { continue }
+            if Self.isRoutedExpertTensor(name) { continue }
+            cacheLock.lock()
+            let alreadyCached = cache[name] != nil
+            cacheLock.unlock()
+            if !alreadyCached {
+                toLoad.append((name, meta))
+            }
+        }
+        ensureNames(toLoad)
+    }
+
+    /// Load the given routed experts of layer `K` into cache. Idempotent.
     public func ensureExperts(layer K: Int, indices: [Int]) {
         var toLoad: [(String, TensorMeta)] = []
-        
+
         for e in indices {
             let prefix = "layers.\(K).ffn.experts.\(e)."
             for (name, meta) in index {
@@ -265,26 +289,37 @@ public final class WeightLoader {
                 }
             }
         }
-        
-        guard !toLoad.isEmpty else { return }
-        
-        DispatchQueue.concurrentPerform(iterations: toLoad.count) { i in
-            let (name, meta) = toLoad[i]
-            guard let arr = self.loadTensorFromDisk(name: name, meta: meta) else { return }
-            self.cacheLock.lock()
-            self.cache[name] = arr
-            self.cacheLock.unlock()
-        }
+        ensureNames(toLoad)
     }
-    
-    /// Start loading layer K+1 in background while layer K executes.
+
+    /// Drop the given routed experts of layer `K` from cache. Called
+    /// by `MoEFFN` after the dispatch loop so the next layer doesn't
+    /// inherit the residents.
+    public func releaseExperts(layer K: Int, indices: [Int]) {
+        cacheLock.lock()
+        for e in indices {
+            let prefix = "layers.\(K).ffn.experts.\(e)."
+            for name in cache.keys {
+                if name.hasPrefix(prefix) {
+                    cache.removeValue(forKey: name)
+                }
+            }
+        }
+        cacheLock.unlock()
+    }
+
+    /// Start loading layer K+1's non-expert tensors in background
+    /// while layer K executes. The routed experts of layer K+1 are
+    /// fetched after its own gate runs, so they're not prefetched.
     public func prefetchLayer(_ layerIndex: Int) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.ensureLayer(layerIndex)
         }
     }
-    
+
     /// Release all tensors for layer `K` from cache, freeing RAM.
+    /// Removes both shared and routed-expert entries (the latter are
+    /// usually already released by MoEFFN, but this is idempotent).
     public func releaseLayer(_ layerIndex: Int) {
         let prefix = "layers.\(layerIndex)."
         cacheLock.lock()
