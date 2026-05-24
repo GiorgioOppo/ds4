@@ -38,33 +38,28 @@ public final class ParallelHead {
         let B = xArr.shape[0], S = xArr.shape[1], HC = xArr.shape[2], D = xArr.shape[3]
         let N = B * S
         let hcDim = HC * D
-        let hcMult = HC
 
         let xFlat = xArr.reshaped([N, hcDim])
 
         let rsqrtVal = rsqrt(mean(square(xFlat), axes: [-1], keepDims: true) + normEps)
 
-        let lin = Linear(inFeatures: hcDim, outFeatures: hcMult,
-                         weight: hcFn, scale: nil,
-                         castOutputToBF16: false)
-        let mixes = lin(Tensor(array: xFlat, dtype: .f32)).array
-        
+        // hc_head: xFlat [N, hcDim] · hcFn.T [hcDim, hcMult] → [N, hcMult]
+        let mixes = matmul(xFlat, hcFn.array.transposed())
         let mixesScaled = mixes * rsqrtVal
-        
         let pre = sigmoid(mixesScaled * hcScale.array + hcBase.array) + hcEps
-        
+
         let yArr = (pre.expandedDimensions(axes: [2]) * xArr.reshaped([N, HC, D])).sum(axes: [1])
-        
+
         let yNorm = norm(Tensor(array: yArr, dtype: .f32)).array.reshaped([B, S, D])
-        
-        let lastTok = yNorm[0..., (S-1)..., 0...]
-        let lastTokReshaped = lastTok.reshaped([B, D])
-        
-        let lmHead = Linear(inFeatures: dim, outFeatures: vocabSize,
-                            weight: weight, scale: nil,
-                            castOutputToBF16: false)
-        let logits = lmHead(Tensor(array: lastTokReshaped, dtype: .f32))
-        return logits
+
+        // Match the reference contract: emit logits only for the last
+        // position (sampling expects [B, V]). Per-position logits would
+        // be needed for MTP / speculative decoding — left as a TODO.
+        let lastTok = yNorm[0..., (S - 1)..., 0...].reshaped([B, D])
+
+        // lm_head: lastTok [B, D] · weight.T [D, V] → [B, V]
+        let logits = matmul(lastTok, weight.array.transposed())
+        return Tensor(array: logits, dtype: .f32)
     }
 }
 
