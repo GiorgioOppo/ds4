@@ -112,10 +112,16 @@ public final class Transformer {
         weightLoader?.ensureLayer(0)
 
         let debugStream = ProcessInfo.processInfo.environment["DEEPSEEK_STREAMING_DEBUG"] != nil
+        // Disable layer prefetch during prefill: when MoEFFN bulk-loads
+        // the full routed-expert set (N > 1 path), having a second
+        // layer's non-experts in flight alongside the current layer's
+        // ~5–6 GB of routed experts doubles the peak. Decode (S=1)
+        // keeps the prefetch since the streaming working-set is small.
+        let allowPrefetch = (S == 1)
 
         for (k, layer) in layers.enumerated() {
             // Start prefetching next layer in background while current executes
-            if k + 1 < layers.count {
+            if allowPrefetch, k + 1 < layers.count {
                 weightLoader?.prefetchLayer(k + 1)
             }
             x = layer(Tensor(array: x, dtype: .f32), startPos: startPos, inputIds: flatIds).array

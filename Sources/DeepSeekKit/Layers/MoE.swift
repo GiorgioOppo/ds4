@@ -151,19 +151,27 @@ public final class MoEFFN {
         MLX.eval(counts)
         let countsArr = counts.asArray(Int32.self)
 
-        // Active expert list for this batch. With `topK≈8` and `nRoutedExperts≈256`
-        // we usually load <topK·N> experts per token. We pull only those
-        // from disk under streaming and release them before exiting so the
-        // resident working-set of a MoE layer scales with `topK`, not
-        // `nRoutedExperts` (~32× memory reduction in the default V4 profile).
+        // Active expert list for this batch. Per-expert streaming only
+        // pays off when the active set is much smaller than
+        // `nRoutedExperts`. With N=128 prefill tokens × topK=8 = 1024
+        // routings across 256 experts, by pigeonhole nearly every
+        // expert gets some traffic — `activeExperts` ≈ nExperts. In
+        // that regime "stream only what's active" reduces to "stream
+        // all 256 individually", which is the worst of both worlds:
+        // full memory footprint AND maximum disk I/O contention. Use
+        // the decode path (N==1, topK=8 active) for the win it was
+        // designed for, and bulk-load the full routed set on prefill.
         var activeExperts: [Int] = []
-        activeExperts.reserveCapacity(min(Int(topK) * N, nExperts))
         for e in 0..<nExperts {
             if countsArr[e] > 0, experts[e] != nil {
                 activeExperts.append(e)
             }
         }
-        weightLoader?.ensureExperts(layer: layerId, indices: activeExperts)
+        let bulkLoad = (N > 1)
+        let toLoad: [Int] = bulkLoad
+            ? (0..<nExperts).filter { experts[$0] != nil }
+            : activeExperts
+        weightLoader?.ensureExperts(layer: layerId, indices: toLoad)
 
         var yFlat = MLXArray.zeros([N, dim]).asType(x.array.dtype)
 
@@ -185,7 +193,7 @@ public final class MoEFFN {
         // unevaluated expert(xFlat) graph nodes still reference the
         // MLXArrays we're about to drop.
         MLX.eval(yFlat)
-        weightLoader?.releaseExperts(layer: layerId, indices: activeExperts)
+        weightLoader?.releaseExperts(layer: layerId, indices: toLoad)
         // Drain MLX's buffer pool: the dequantized weight temporaries
         // for each of `topK` experts (~30–60 MB at bf16 for a 4096×4096
         // expert linear) are otherwise retained for reuse, and on a
