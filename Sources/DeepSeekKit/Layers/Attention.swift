@@ -117,23 +117,15 @@ public final class MLA {
         } else {
             kvCache = kvBf16
         }
-        // Cap the KV cache length per layer:
-        //   ratio == 0 → pure sliding window of `windowSize` rows
-        //     (matches the reference's circular buffer behavior).
-        //   ratio  > 0 → design budget of `windowSize + maxSeqLen/ratio`
-        //     rows, matching `projectedKVCacheBytes` in Config. Without
-        //     the Compressor we can't legitimately fill the "compressed
-        //     long-range" half — it ends up as FIFO raw KV — but capping
-        //     at the same budget keeps memory bounded for long contexts
-        //     instead of growing without limit. TODO: restore Compressor
-        //     / sparse-attn path for correct long-range semantics.
-        let cacheCap: Int = compressRatio == 0
-            ? windowSize
-            : windowSize + (maxSeqLen / compressRatio)
-        if let cache = kvCache, cache.shape[1] > cacheCap {
-            let s = cache.shape[1]
-            kvCache = cache[0..., (s - cacheCap)..<s, 0...]
-        }
+        // NOTE: previous revisions trimmed the cache here to enforce
+        // a per-layer cap (windowSize for ratio==0, windowSize+maxSeq
+        // /ratio for ratio>0). That broke prefill: when the prompt
+        // exceeded the cap, the early queries lost their own positions
+        // from the key set and the model collapsed to repeating a
+        // single token. Restoring unbounded growth pending a proper
+        // sliding-window *mask* (instead of cache truncation) for
+        // ratio==0 layers. Memory cost: O(seq_len × head_dim × bf16)
+        // per layer — bounded by maxSeqLen.
         MLX.eval(kvCache!)
         let currentKV = kvCache!   // bf16
 
