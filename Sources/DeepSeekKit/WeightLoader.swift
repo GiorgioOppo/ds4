@@ -22,6 +22,15 @@ private func dtypeFromString(_ s: String) -> (DType, MLX.DType) {
     case "I32", "INT32":        return (.i32, .int32)
     case "I8", "INT8":          return (.i8, .int8)
     case "I64", "INT64":        return (.i64, .int64)
+    // mlx-community packed quantization: weight stored as uint32
+    // with `pack_factor = 32/bits` elements per uint32. The MLX
+    // quantizedMatmul / dequantized free functions REQUIRE the
+    // weight tensor to be uint32 — without this mapping it falls
+    // to f32 (default) and everything downstream silently produces
+    // wrong shapes (e.g. dequantize emits [outF, inF/8] instead of
+    // [outF, inF], cascading into the broadcast error we hit).
+    case "U16", "UINT16":       return (.i32, .uint16)
+    case "U32", "UINT32":       return (.i32, .uint32)
     case "U8", "UINT8":         return (.fp8E4M3, .uint8)  // quantization types stored as uint8
     case "F8_E4M3":             return (.fp8E4M3, .uint8)
     case "F8_E8M0":             return (.e8m0, .uint8)
