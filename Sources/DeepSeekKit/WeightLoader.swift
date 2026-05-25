@@ -67,6 +67,13 @@ public final class WeightLoader {
     /// is the primary win in the streaming-from-disk regime (the same
     /// `topK` expert sets are touched every token at the same layer).
     private var shardData: [URL: Data] = [:]
+
+    /// Set of original HF-style names that we aliased into our canonical
+    /// naming (see `registerHFAliases`). We skip preloading these as
+    /// "globals" because their canonical alias will be preloaded instead
+    /// — preloading both would double the resident size of embed /
+    /// lm_head (~1 GB each in MLX-native int4 form).
+    private var hfOriginalNames: Set<String> = []
     
     // MARK: - Discovery
     
@@ -140,6 +147,24 @@ public final class WeightLoader {
             }
         }
         
+        // Register HF-style aliases for the MLX-native (mlx-community)
+        // checkpoint family. The original loader expects DeepSeek's
+        // converted naming (`embed.weight`, `layers.K.attn.wq_a.weight`,
+        // `layers.K.ffn.shared_experts.w1.weight`); the HF checkpoint
+        // uses `model.X` prefix + `gate_proj`/`up_proj`/`down_proj`
+        // names. We add the canonical (our) names as aliases pointing
+        // at the same `TensorMeta`, so every downstream lookup keeps
+        // working unchanged. The original HF names also stay in the
+        // index so the new `switch_mlp` packed-expert path (added
+        // separately) can find its tensors directly.
+        //
+        // Untouched: `model.layers.K.ffn.switch_mlp.*` (packed expert
+        // tensors — they need a dedicated MoE module, no 1:1 alias to
+        // per-expert names), and `model.layers.K.attn.compressor.*` /
+        // `attn.indexer.*` / `mtp.*` whose modules are not wired yet
+        // in the MLX backend.
+        Self.registerHFAliases(in: &index, originals: &hfOriginalNames)
+
         // Identify global (non-layer) tensors and pre-load them.
         // "Global" = always-resident. Includes the embed/lm_head/top-
         // level norm/hc_head params that every token needs.
@@ -159,6 +184,10 @@ public final class WeightLoader {
         for name in index.keys {
             if name.hasPrefix("layers.") { continue }
             if name.hasPrefix("mtp.") { continue }
+            // Skip HF-original names that were aliased to a canonical
+            // form: their alias will be preloaded once and the original
+            // can be resolved on demand if needed.
+            if hfOriginalNames.contains(name) { continue }
             globalNames.insert(name)
         }
 
@@ -222,6 +251,90 @@ public final class WeightLoader {
         return result
     }
     
+    /// Translate one HF-style tensor name to its canonical
+    /// (DeepSeek-converted) equivalent, or nil when no translation
+    /// applies.
+    ///
+    /// Handles:
+    ///   - `model.X`           → `X`              (model.X prefix strip)
+    ///   - `model.embed_tokens.{weight,scales,biases}`
+    ///                         → `embed.{weight,scales,biases}`
+    ///   - inside `.shared_experts.`:
+    ///       gate_proj → w1, up_proj → w3, down_proj → w2
+    ///
+    /// Does NOT translate `switch_mlp.*` (packed routed-experts; the
+    /// SwitchMLP MoE module loads those by their HF name directly) or
+    /// the `compressor.*` / `indexer.*` / `mtp.*` subtrees whose
+    /// downstream wiring is still pending.
+    private static func hfAlias(for name: String) -> String? {
+        if name == "model.embed_tokens.weight"  { return "embed.weight" }
+        if name == "model.embed_tokens.scales"  { return "embed.scales" }
+        if name == "model.embed_tokens.biases"  { return "embed.biases" }
+        if name == "model.norm.weight"          { return "norm.weight" }
+        if name == "lm_head.weight" { return "head.weight" }
+        if name == "lm_head.scales" { return "head.scales" }
+        if name == "lm_head.biases" { return "head.biases" }
+
+        guard name.hasPrefix("model.") else { return nil }
+        var s = String(name.dropFirst("model.".count))
+
+        // shared_experts gate_proj/up_proj/down_proj → w1/w3/w2.
+        // Apply only when the segment is exactly within `.shared_experts.`
+        // (so we don't accidentally rewrite a tensor under `.switch_mlp.`
+        // or any other module that uses the same projection names).
+        if s.contains(".shared_experts.") {
+            s = s.replacingOccurrences(
+                of: ".shared_experts.gate_proj",
+                with: ".shared_experts.w1")
+            s = s.replacingOccurrences(
+                of: ".shared_experts.up_proj",
+                with: ".shared_experts.w3")
+            s = s.replacingOccurrences(
+                of: ".shared_experts.down_proj",
+                with: ".shared_experts.w2")
+        }
+
+        // Don't alias switch_mlp.* (per-expert packed) — the dedicated
+        // SwitchMLP MoE module loads those by HF name directly. Keeping
+        // them unaliased prevents accidental clashes with our
+        // per-expert naming.
+        if s.contains(".switch_mlp.") { return nil }
+
+        // Don't alias compressor/indexer/mtp — modules not yet wired.
+        // Leaving them only under the HF name signals that they're not
+        // expected to be consumed by the current forward path.
+        if s.contains(".compressor.") || s.contains(".indexer.")
+           || s.hasPrefix("mtp.") {
+            return nil
+        }
+
+        return s
+    }
+
+    /// Add HF-style aliases to `index` so the existing loader code that
+    /// looks up DeepSeek-converted names finds the MLX-native HF
+    /// checkpoint's tensors. Idempotent; never overwrites a real name
+    /// already present in the index.
+    private static func registerHFAliases(in index: inout [String: TensorMeta],
+                                           originals: inout Set<String>) {
+        var added = 0
+        // Snapshot keys to avoid mutating-while-iterating.
+        for name in Array(index.keys) {
+            guard let alias = hfAlias(for: name) else { continue }
+            if index[alias] == nil, let meta = index[name] {
+                index[alias] = meta
+                originals.insert(name)
+                added += 1
+            }
+        }
+        if added > 0 {
+            FileHandle.standardError.write(Data(
+                "[loader] registered \(added) HF-style aliases "
+                + "(model.X → X, gate_proj/up_proj/down_proj → w1/w3/w2 "
+                + "inside shared_experts)\n".utf8))
+        }
+    }
+
     // MARK: - On-demand tensor loading
 
     /// Build an MLXArray from a slice of a memory-mapped shard. The shard
