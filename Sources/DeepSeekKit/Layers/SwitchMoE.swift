@@ -147,64 +147,73 @@ public final class SwitchMoEFFN: FFNModule {
             return Tensor(array: sharedOnly.reshaped(shape), dtype: x.dtype)
         }
 
-        // The kernel `gather_qmm` follows the SwitchLinear convention
-        // used by mlx-lm: x has shape `[..., M, K]` (≥3D), the rhs
-        // indices have shape `[..., topk]` with one more trailing axis
-        // than x's leading dims, and the output is
-        // `[..., topk, M, N]`. For MoE row-vector dispatch M=1, so:
+        // The kernel `gather_qmm` requires `x` to be ≥3D `(B, M, K)`
+        // and `lhs_indices`/`rhs_indices` to be 1D arrays of length
+        // `B'` (the output batch). It does NOT broadcast a 1D x-batch
+        // against a 2D indices tensor — the previous attempt to pass
+        // `indices = [N, K]` (2D) with x of shape `[N, 1, dim]` (1D
+        // batch axis) crashed with
+        //   [broadcast_shapes] Shapes (128) and (128,6) cannot be broadcast
+        // because the kernel tries to broadcast x.batch=(N,) against
+        // indices=(N, K) before dispatch. So we flatten both batches:
         //
-        //   x  expanded to [N, 1, dim]
-        //   indices                    [N, topk]
-        //   gate_proj/up_proj output   [N, topk, 1, inter_dim]
-        //   swiglu output (same shape)
-        //   down_proj input            [N, topk, 1, inter_dim]
-        //   down_proj output           [N, topk, 1, dim]
+        //   x  expanded to [N, 1, dim]      (3D: B=N, M=1, K=dim)
+        //   lhs_indices    [N*K] = (0,0,...,1,1,...) repeating each
+        //                                token K times — picks the
+        //                                source x-row per output.
+        //   rhs_indices    [N*K] = indices.flatten()
+        //   gate/up output  [N*K, 1, inter_dim]
+        //   swiglu output   [N*K, 1, inter_dim]
+        //   down_proj input [N*K, 1, inter_dim]    (already 3D batched)
+        //   down_proj lhs   [N*K] identity
+        //   down_proj rhs   [N*K] = same indices
+        //   down_proj output [N*K, 1, dim]
         //
-        // Previous attempt fed a 2D x and 1D lhs/rhs indices, which the
-        // kernel silently broadcast (yielding a [B, M=128, N] tensor
-        // 128× larger than expected and a downstream `[reshape]`
-        // crash). lhs_indices is dropped — the per-token gather is
-        // implicit in matching x's leading axes against rhs_indices'.
+        // The output then reshapes to `[N, K, dim]` for the weighted
+        // sum over topK. Memory cost vs the 2D-indices ideal: zero —
+        // we materialize only the [N*K] index arrays, not a tiled x.
         let xBf16 = xFlat.array.dtype == .bfloat16
             ? xFlat.array
             : xFlat.array.asType(.bfloat16)
         let xExp = xBf16.expandedDimensions(axes: [1])    // [N, 1, dim]
-        let idx2D = indices.asType(.int32)                // [N, K]
+        let lhsIdxs = MLXArray((0..<N).flatMap {
+            Array(repeating: Int32($0), count: K)
+        })                                                 // [N*K]
+        let rhsIdxs = indices.reshaped([N * K]).asType(.int32)  // [N*K]
 
-        // gate_proj · x  →  [N, K, 1, inter_dim]
+        // gate_proj · x  →  [N*K, 1, inter_dim]
         let yGate = gatherQuantizedMatmul(
             xExp, gateT.w,
             scales: gateT.scales, biases: gateT.biases,
-            rhsIndices: idx2D,
+            lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
             transpose: true,
             groupSize: gateProj.groupSize, bits: gateProj.bits,
             mode: SwitchProj.parseMode(gateProj.mode))
 
-        // up_proj   · x  →  [N, K, 1, inter_dim]
+        // up_proj   · x  →  [N*K, 1, inter_dim]
         let yUp = gatherQuantizedMatmul(
             xExp, upT.w,
             scales: upT.scales, biases: upT.biases,
-            rhsIndices: idx2D,
+            lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
             transpose: true,
             groupSize: upProj.groupSize, bits: upProj.bits,
             mode: SwitchProj.parseMode(upProj.mode))
 
         // SwiGLU: silu(gate) * up, optional symmetric clamp.
-        var hMid = (yGate * sigmoid(yGate)) * yUp     // [N, K, 1, inter]
+        var hMid = (yGate * sigmoid(yGate)) * yUp     // [N*K, 1, inter]
         if swigluLimit > 0 {
             let lim = MLXArray(Float(swigluLimit)).asType(.bfloat16)
             let nlim = MLXArray(Float(-swigluLimit)).asType(.bfloat16)
             hMid = MLX.minimum(MLX.maximum(hMid, nlim), lim)
         }
 
-        // down_proj · h  →  [N, K, 1, dim]
-        // h is already per-(token, expert) gathered; rhs_indices on the
-        // same idx2D matches x's leading [N, K] axes and selects the
-        // matching expert slice of the down_proj packed weight.
+        // down_proj · h  →  [N*K, 1, dim]
+        // hMid is already 3D `[N*K, 1, inter]`; lhs_indices is identity.
+        let lhsIdxsDown = MLXArray((0..<(N * K)).map { Int32($0) })
         let yDown = gatherQuantizedMatmul(
             hMid, downT.w,
             scales: downT.scales, biases: downT.biases,
-            rhsIndices: idx2D,
+            lhsIndices: lhsIdxsDown, rhsIndices: rhsIdxs,
             transpose: true,
             groupSize: downProj.groupSize, bits: downProj.bits,
             mode: SwitchProj.parseMode(downProj.mode))
