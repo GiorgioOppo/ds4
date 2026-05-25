@@ -284,12 +284,10 @@ public final class WeightLoader {
         guard name.hasPrefix("model.") else { return nil }
         var s = String(name.dropFirst("model.".count))
 
-        // Don't alias `indexer.*` — module not yet wired in the MLX
-        // backend (the Indexer's top-k learned scoring path is left as
-        // a follow-up; layers with ratio==4 fall back to Compressor-
-        // only attention until then). Leaving these un-aliased
-        // prevents `ensureLayer` from pulling them in for no reason.
-        if s.contains(".indexer.") { return nil }
+        // `.indexer.*` IS aliased now — the Indexer module is wired
+        // for ratio==4 layers and needs its weights loaded by
+        // `ensureLayer(K)` together with the rest of the layer's
+        // tensors.
 
         // `mtp.*` IS aliased now (MTP wiring landed): strip the
         // `model.` prefix so MTPBlock's Linears (in lazy mode) find

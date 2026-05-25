@@ -37,6 +37,15 @@ public final class MLA {
     /// staying in-distribution. Nil for `compressRatio == 0` layers.
     public var compressor: Compressor? = nil
 
+    /// Optional learned top-K selector over the compressor's output.
+    /// Wired only for `compressRatio == 4` layers in the reference.
+    /// When present, MLA uses the top-K indices to mask its attention:
+    /// queries can only attend to the K compressed positions that the
+    /// Indexer scored highest. When nil, MLA attends to ALL compressed
+    /// positions (correctness-preserving but loses the learned
+    /// sparsity).
+    public var indexer: Indexer? = nil
+
     /// Raw sliding-window KV cache. Same semantics as the previous
     /// `kvCache` (per-token KV writes + sliding window mask at
     /// attention time). [B, S_window, headDim] bf16.
@@ -83,6 +92,7 @@ public final class MLA {
         kvCache = nil
         compressedCache = nil
         compressor?.releaseState()
+        indexer?.releaseCache()
     }
 
     @discardableResult
@@ -172,6 +182,20 @@ public final class MLA {
             }
         }
 
+        // Indexer (ratio==4 layers): compute top-K compressed-position
+        // indices per query. We use them below to mask the compressed
+        // columns of the attention KV so each query only attends to
+        // its top-K selected positions. The Indexer maintains its OWN
+        // compressed KV cache (separate from MLA's `compressedCache`,
+        // narrower latent — index_head_dim vs head_dim).
+        var indexerTopK: MLXArray? = nil
+        if let idx = indexer {
+            if idx.freqs == nil { idx.freqs = rope.freqs }
+            indexerTopK = idx(xIn,
+                              qr: Tensor(array: qrFlat, dtype: .f32),
+                              startPos: startPos)
+        }
+
         // Sliding-window attention.
         //
         // The model was trained with `windowSize` = 128 raw KV plus the
@@ -242,7 +266,42 @@ public final class MLA {
             * MLXArray(Float(-1e9)).asType(.bfloat16)
         let mask: MLXArray
         if Lcomp > 0 {
-            let maskComp = MLXArray.zeros([S, Lcomp]).asType(.bfloat16)
+            // Build the compressed-columns mask.
+            //
+            // Without Indexer (ratio==128 layers or no top-K): allow
+            // ALL compressed positions for all queries (causality
+            // fudge of up to `ratio-1` tokens accepted).
+            //
+            // With Indexer (ratio==4 layers): only allow the top-K
+            // positions per query that the Indexer scored highest.
+            // We build the mask via one-hot expansion of the top-K
+            // indices: matches[s, k, j] = 1 iff topkIdxs[s, k] == j,
+            // then any over the K axis gives allowed[s, j].
+            let maskComp: MLXArray
+            if let topk = indexerTopK {
+                // topk: [B, S, K] int32. Use any-equal over K axis.
+                // For B=1 in this path; squeeze the batch dim for the
+                // mask construction (downstream broadcasts across B
+                // anyway).
+                let K = topk.shape[2]
+                let topk2D = topk.reshaped([B * S, K])
+                let jRange = MLXArray((0..<Lcomp).map { Int32($0) })
+                    .reshaped([1, 1, Lcomp])
+                let topk3D = topk2D.expandedDimensions(axes: [2])
+                // matches: [B*S, K, Lcomp] bool
+                let matches = (topk3D .== jRange)
+                // allowed: [B*S, Lcomp] bool — any column j matches any of the K idxs
+                let allowed = matches.asType(.int8).sum(axes: [1]).asType(.bfloat16)
+                let allowedF = (allowed .> 0).asType(.bfloat16)
+                let maskCompFlat = (MLXArray(Float(1.0)) - allowedF).asType(.bfloat16)
+                    * MLXArray(Float(-1e9)).asType(.bfloat16)
+                // Reshape from [B*S, Lcomp] to [S, Lcomp] (we have B=1
+                // in inference paths). If B > 1 in the future the
+                // attention mask path needs reworking anyway.
+                maskComp = maskCompFlat.reshaped([S, Lcomp])
+            } else {
+                maskComp = MLXArray.zeros([S, Lcomp]).asType(.bfloat16)
+            }
             mask = concatenated([maskComp, maskRaw], axis: 1)
         } else {
             mask = maskRaw

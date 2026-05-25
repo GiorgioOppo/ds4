@@ -308,12 +308,6 @@ public extension Transformer {
             // the overlap region (shared with the next group), the
             // second half is the current group's main KV. Non-overlap
             // (ratio > 4, typically 128) keeps coff=1.
-            //
-            // Indexer (top-k learned scoring over compressed entries)
-            // is still NOT wired — ratio==4 layers attend to ALL
-            // compressed entries via the mask in MLA, which is a
-            // quality trade-off vs the trained sparse-attn but
-            // correctness-preserving.
             if ratio > 0 {
                 let cbase = "\(lp).attn.compressor"
                 let coff = (ratio == 4) ? 2 : 1
@@ -336,6 +330,53 @@ public extension Transformer {
                     headDim: config.headDim, rotate: false,
                     ape: apeComp, wkv: wkvComp, wgate: wgateComp,
                     norm: normComp)
+            }
+
+            // Indexer wiring for `ratio == 4` layers only. Builds a
+            // separate compressed KV (narrower latent: index_head_dim,
+            // typically 128) and uses learned scoring + top-K to
+            // restrict which compressed positions each query attends
+            // to. Skipped for ratio==128 layers and ratio==0 layers —
+            // they have no Indexer in the trained model.
+            if ratio == 4 {
+                let ibase = "\(lp).attn.indexer"
+                let indexHeadDim = config.indexHeadDim
+                let indexNHeads = config.indexNHeads
+                let wqBIdx = try! loadLinear(
+                    loader, base: "\(ibase).wq_b",
+                    inF: config.qLoraRank,
+                    outF: indexNHeads * indexHeadDim, rng: &rng)
+                let weightsProj = try! loadLinear(
+                    loader, base: "\(ibase).weights_proj",
+                    inF: dim, outF: indexNHeads, rng: &rng)
+                // Indexer's internal Compressor: width = index_head_dim
+                // (narrower than MLA's), rotate=true (Hadamard) in the
+                // reference but skipped here.
+                let icbase = "\(ibase).compressor"
+                let coffIdx = (ratio == 4) ? 2 : 1
+                let icOut = coffIdx * indexHeadDim
+                let wkvIdx = try! loadLinear(
+                    loader, base: "\(icbase).wkv",
+                    inF: dim, outF: icOut, rng: &rng)
+                let wgateIdx = try! loadLinear(
+                    loader, base: "\(icbase).wgate",
+                    inF: dim, outF: icOut, rng: &rng)
+                let apeIdx = (try? loader.tryLoad(["\(icbase).ape"]))
+                    ?? AssemblyHelpers.randomTensor(
+                        [ratio, icOut], rng: &rng, scale: 0.02)
+                let normIdx = RMSNorm(
+                    weight: (try? loader.tryLoad(["\(icbase).norm.weight"]))
+                        ?? AssemblyHelpers.onesTensor([indexHeadDim]),
+                    eps: config.normEps)
+                let innerCompressor = Compressor(
+                    config: config, compressRatio: ratio,
+                    headDim: indexHeadDim, rotate: true,
+                    ape: apeIdx, wkv: wkvIdx, wgate: wgateIdx,
+                    norm: normIdx)
+                mla.indexer = Indexer(
+                    config: config, wqB: wqBIdx,
+                    weightsProj: weightsProj,
+                    compressor: innerCompressor)
             }
 
             // ---- MoE FFN ----
