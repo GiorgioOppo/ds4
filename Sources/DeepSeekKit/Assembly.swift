@@ -463,6 +463,30 @@ public extension Transformer {
         let blocks = blocksOpt.compactMap { $0 }
         MemoryLogger.snapshot("load:layers-built", force: true)
 
+        // MTP (multi-token-prediction) blocks. Built only when
+        // DEEPSEEK_MTP=1 is set in the environment — they are NOT
+        // invoked by `Transformer.forward` (speculative decoding
+        // wiring still needs to land in InferenceService), so
+        // constructing them by default would just hold ~6 GB of
+        // weights' metadata in the loader index for no benefit. With
+        // the flag on, the MTPBlock is built and embed/head weak
+        // refs are wired, ready for a future speculative-decode
+        // caller. The MTP weights themselves remain off the
+        // preloaded globals set (excluded by the mtp.* / model.mtp.*
+        // filter in init) — they lazy-load on the first MTP
+        // invocation.
+        var mtpBlocks: [MTPBlock] = []
+        let mtpEnabled = ProcessInfo.processInfo
+            .environment["DEEPSEEK_MTP"] == "1"
+        if mtpEnabled && config.nMtpLayers > 0 {
+            mtpBlocks = buildMTPBlocks(
+                config: config,
+                loader: loader,
+                mlxQuantExperts: mlxQuantExperts)
+            FileHandle.standardError.write(Data(
+                "[config] DEEPSEEK_MTP=1 — built \(mtpBlocks.count) MTPBlock(s)\n".utf8))
+        }
+
         if !loader.missing.isEmpty {
             FileHandle.standardError.write(Data("""
             \(loader.missing.count) tensor name(s) were not found in the
@@ -472,10 +496,18 @@ public extension Transformer {
             """.utf8))
         }
 
-        let model = Transformer(config: config, embed: embed, layers: blocks, mtp: [],
+        let model = Transformer(config: config, embed: embed, layers: blocks, mtp: mtpBlocks,
                                  norm: norm, head: head,
                                  hcHeadFn: hcHeadFn, hcHeadBase: hcHeadBase,
                                  hcHeadScale: hcHeadScale)
+        // Wire the embed/head weak refs on each MTP block. The
+        // refs let MTPBlock.callAsFunction reach the model's shared
+        // embed (for projecting the predicted token's id) and head
+        // (for emitting logits from the MTP-augmented hidden state).
+        for mtp in model.mtp {
+            mtp.embed = embed
+            mtp.head = head
+        }
         // Park the WeightLoader on the model so its `shardLayers`
         // index lives as long as the model and `forward(...)` can
         // call `prefetchLayer` / `releaseLayer` between blocks.
@@ -493,8 +525,241 @@ public extension Transformer {
             block.ffn.weightLoader = loader
         }
 
+        // MTP blocks also get the loader on their FFN for streaming.
+        for mtp in model.mtp {
+            mtp.block.ffn.weightLoader = loader
+        }
+
         MemoryLogger.snapshot("load:complete", force: true)
         return model
+    }
+
+    /// Build the MTP block list. Mirrors the per-main-layer construction
+    /// loop with `mtp.j` prefix instead of `layers.K`. Sequential rather
+    /// than parallel because `nMtpLayers` is typically 1 — the
+    /// parallelism overhead would dominate. Inner Block (decoder layer)
+    /// is created at layerId = nLayers + j and uses
+    /// `compressRatios[layerId]` if in range, else 0.
+    ///
+    /// The MTP weights live under `mtp.j.X` (post-alias from
+    /// `model.mtp.j.X`); ensureLayer doesn't pick them up so the
+    /// Linears load on demand the first time they're invoked.
+    private static func buildMTPBlocks(
+        config: ModelConfig,
+        loader: WeightLoader,
+        mlxQuantExperts: Bool) -> [MTPBlock]
+    {
+        let dim = config.dim
+        let hc = config.hcMult
+        let mixHc = (2 + hc) * hc
+        let nExperts = config.nRoutedExperts
+
+        var result: [MTPBlock] = []
+        for j in 0..<config.nMtpLayers {
+            var rng = MiniRNG(seed: 0xDEADC0DE &+ 0xAA00 &+ UInt64(j))
+            let lp = "mtp.\(j)"
+            let mtpLayerId = config.nLayers + j
+            let ratio = mtpLayerId < config.compressRatios.count
+                ? config.compressRatios[mtpLayerId]
+                : 0
+
+            // --- Inner Block (mirror of main layer loop) ---
+            let attnNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).attn_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+            let ffnNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).ffn_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+
+            // MLA
+            let wqA = try! loadLinear(loader, base: "\(lp).attn.wq_a",
+                                       inF: dim, outF: config.qLoraRank, rng: &rng)
+            let qNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).attn.q_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([config.qLoraRank]),
+                eps: config.normEps)
+            let wqB = try! loadLinear(loader, base: "\(lp).attn.wq_b",
+                                       inF: config.qLoraRank,
+                                       outF: config.nHeads * config.headDim, rng: &rng)
+            let wkv = try! loadLinear(loader, base: "\(lp).attn.wkv",
+                                       inF: dim, outF: config.headDim, rng: &rng)
+            let kvNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).attn.kv_norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([config.headDim]),
+                eps: config.normEps)
+            let perGroupD = config.nHeads * config.headDim / config.oGroups
+            let woA = try! loadLinear(loader, base: "\(lp).attn.wo_a",
+                                       inF: perGroupD,
+                                       outF: config.oGroups * config.oLoraRank, rng: &rng)
+            let woB = try! loadLinear(loader, base: "\(lp).attn.wo_b",
+                                       inF: config.oGroups * config.oLoraRank,
+                                       outF: dim, rng: &rng)
+            let attnSink = (try? loader.tryLoad(["\(lp).attn.attn_sink"]))
+                ?? AssemblyHelpers.randomTensor([config.nHeads], rng: &rng, scale: 0.1)
+            let rope = RoPE(ropeHeadDim: config.ropeHeadDim,
+                            freqs: RoPE.makeFreqs(config: config, useYarn: ratio > 0))
+            // MLA layerId uses the MTP-aware index so RoPE / compress
+            // semantics line up with the rest of the model.
+            let mla = MLA(config: config, layerId: mtpLayerId,
+                          wqA: wqA, qNorm: qNorm, wqB: wqB,
+                          wkv: wkv, kvNorm: kvNorm,
+                          woA: woA, woB: woB,
+                          attnSink: attnSink, rope: rope,
+                          kvCache: nil)
+            // Compressor: only for non-overlap layers (ratio>0 && !=4)
+            // — same rule as the main layer loop.
+            if ratio > 0 && ratio != 4 {
+                let cbase = "\(lp).attn.compressor"
+                let wkvComp = try! loadLinear(loader, base: "\(cbase).wkv",
+                                               inF: dim, outF: config.headDim, rng: &rng)
+                let wgateComp = try! loadLinear(loader, base: "\(cbase).wgate",
+                                                 inF: dim, outF: config.headDim, rng: &rng)
+                let apeComp = (try? loader.tryLoad(["\(cbase).ape"]))
+                    ?? AssemblyHelpers.randomTensor(
+                        [ratio, config.headDim], rng: &rng, scale: 0.02)
+                let normComp = RMSNorm(
+                    weight: (try? loader.tryLoad(["\(cbase).norm.weight"]))
+                        ?? AssemblyHelpers.onesTensor([config.headDim]),
+                    eps: config.normEps)
+                mla.compressor = Compressor(
+                    config: config, compressRatio: ratio,
+                    headDim: config.headDim, rotate: false,
+                    ape: apeComp, wkv: wkvComp, wgate: wgateComp,
+                    norm: normComp)
+            }
+
+            // MoE / FFN (same branch as main layers).
+            let gateW = try! loadLinear(loader, base: "\(lp).ffn.gate",
+                                         inF: dim, outF: nExperts,
+                                         castOutputToBF16: false, rng: &rng)
+            let gateBias: Tensor? = mtpLayerId < config.nHashLayers ? nil :
+                ((try? loader.tryLoad(["\(lp).ffn.gate.bias"]))
+                 ?? AssemblyHelpers.randomTensor([nExperts], rng: &rng, scale: 0.0))
+            let tid2eid: Tensor? = mtpLayerId < config.nHashLayers
+                ? (try? loader.tryLoad(["\(lp).ffn.gate.tid2eid"]))
+                    .map(AssemblyHelpers.castIntToI32)
+                : nil
+            let gate = Gate(config: config, layerId: mtpLayerId,
+                            weight: gateW, bias: gateBias, tid2eid: tid2eid)
+
+            let sep = "\(lp).ffn.shared_experts"
+            let sharedExpert = Expert(
+                w1: try! loadLinear(loader, base: "\(sep).w1",
+                                    inF: dim, outF: config.moeInterDim, rng: &rng),
+                w2: try! loadLinear(loader, base: "\(sep).w2",
+                                    inF: config.moeInterDim, outF: dim, rng: &rng),
+                w3: try! loadLinear(loader, base: "\(sep).w3",
+                                    inF: dim, outF: config.moeInterDim, rng: &rng),
+                swigluLimit: config.swigluLimit)
+
+            let ffn: any FFNModule
+            if config.isMLXNative {
+                let baseGate = "\(lp).ffn.switch_mlp.gate_proj"
+                let baseUp   = "\(lp).ffn.switch_mlp.up_proj"
+                let baseDown = "\(lp).ffn.switch_mlp.down_proj"
+                let specGate = config.mlxQuantSpec(for: "model." + baseGate)
+                    ?? ModelConfig.MLXQuantSpec(groupSize: 32, bits: 4, mode: "mxfp4")
+                let specUp = config.mlxQuantSpec(for: "model." + baseUp) ?? specGate
+                let specDown = config.mlxQuantSpec(for: "model." + baseDown) ?? specGate
+                let gateProj = SwitchProj(
+                    nExperts: nExperts, inFeatures: dim, outFeatures: config.moeInterDim,
+                    base: baseGate, groupSize: specGate.groupSize,
+                    bits: specGate.bits, mode: specGate.mode, loader: loader)
+                let upProj = SwitchProj(
+                    nExperts: nExperts, inFeatures: dim, outFeatures: config.moeInterDim,
+                    base: baseUp, groupSize: specUp.groupSize,
+                    bits: specUp.bits, mode: specUp.mode, loader: loader)
+                let downProj = SwitchProj(
+                    nExperts: nExperts, inFeatures: config.moeInterDim, outFeatures: dim,
+                    base: baseDown, groupSize: specDown.groupSize,
+                    bits: specDown.bits, mode: specDown.mode, loader: loader)
+                let switchFFN = SwitchMoEFFN(
+                    config: config, gate: gate,
+                    gateProj: gateProj, upProj: upProj, downProj: downProj,
+                    sharedExpert: sharedExpert)
+                switchFFN.layerId = mtpLayerId
+                ffn = switchFFN
+            } else {
+                var experts: [Expert?] = []
+                for k in 0..<nExperts {
+                    let ep = "\(lp).ffn.experts.\(k)"
+                    let w1 = try! loadLinear(loader, base: "\(ep).w1",
+                                              inF: dim, outF: config.moeInterDim, rng: &rng)
+                    let w2 = try! loadLinear(loader, base: "\(ep).w2",
+                                              inF: config.moeInterDim, outF: dim, rng: &rng)
+                    let w3 = try! loadLinear(loader, base: "\(ep).w3",
+                                              inF: dim, outF: config.moeInterDim, rng: &rng)
+                    if mlxQuantExperts {
+                        w1.useMLXQuant = true
+                        w2.useMLXQuant = true
+                        w3.useMLXQuant = true
+                    }
+                    experts.append(Expert(w1: w1, w2: w2, w3: w3,
+                                          swigluLimit: config.swigluLimit))
+                }
+                let moe = MoEFFN(config: config, gate: gate,
+                                  experts: experts, shared: sharedExpert)
+                moe.layerId = mtpLayerId
+                ffn = moe
+            }
+
+            // HC params
+            let hcAttnFn = (try? loader.tryLoad(["\(lp).hc_attn_fn"]))
+                ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
+            let hcAttnBase = (try? loader.tryLoad(["\(lp).hc_attn_base"]))
+                ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
+            let hcAttnScale = (try? loader.tryLoad(["\(lp).hc_attn_scale"]))
+                ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
+            let hcFfnFn = (try? loader.tryLoad(["\(lp).hc_ffn_fn"]))
+                ?? AssemblyHelpers.randomTensor([mixHc, hc * dim], rng: &rng, scale: 0.02)
+            let hcFfnBase = (try? loader.tryLoad(["\(lp).hc_ffn_base"]))
+                ?? AssemblyHelpers.randomTensor([mixHc], rng: &rng, scale: 0.0)
+            let hcFfnScale = (try? loader.tryLoad(["\(lp).hc_ffn_scale"]))
+                ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
+
+            let innerBlock = Block(
+                layerId: mtpLayerId, config: config,
+                attn: mla, ffn: ffn,
+                attnNorm: attnNorm, ffnNorm: ffnNorm,
+                hcAttnFn: hcAttnFn, hcAttnBase: hcAttnBase, hcAttnScale: hcAttnScale,
+                hcFfnFn: hcFfnFn, hcFfnBase: hcFfnBase, hcFfnScale: hcFfnScale)
+
+            // --- MTP-specific projections + norms + head params ---
+            let eProj = try! loadLinear(loader, base: "\(lp).e_proj",
+                                         inF: dim, outF: dim, rng: &rng)
+            let hProj = try! loadLinear(loader, base: "\(lp).h_proj",
+                                         inF: dim, outF: dim, rng: &rng)
+            let eNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).enorm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+            let hNorm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).hnorm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+            let norm = RMSNorm(
+                weight: (try? loader.tryLoad(["\(lp).norm.weight"]))
+                    ?? AssemblyHelpers.onesTensor([dim]),
+                eps: config.normEps)
+            let hcHeadFn = (try? loader.tryLoad(["\(lp).hc_head_fn"]))
+                ?? AssemblyHelpers.randomTensor([hc, hc * dim], rng: &rng, scale: 0.02)
+            let hcHeadBase = (try? loader.tryLoad(["\(lp).hc_head_base"]))
+                ?? AssemblyHelpers.randomTensor([hc], rng: &rng, scale: 0.0)
+            let hcHeadScale = (try? loader.tryLoad(["\(lp).hc_head_scale"]))
+                ?? AssemblyHelpers.randomTensor([1], rng: &rng, scale: 0.5)
+
+            let mtp = MTPBlock(
+                block: innerBlock,
+                eProj: eProj, hProj: hProj,
+                eNorm: eNorm, hNorm: hNorm, norm: norm,
+                hcHeadFn: hcHeadFn,
+                hcHeadBase: hcHeadBase,
+                hcHeadScale: hcHeadScale)
+            result.append(mtp)
+        }
+        return result
     }
 }
 

@@ -291,8 +291,12 @@ public final class WeightLoader {
         // prevents `ensureLayer` from pulling them in for no reason.
         if s.contains(".indexer.") { return nil }
 
-        // mtp.* — not wired in forward (yet).
-        if s.hasPrefix("mtp.") { return nil }
+        // `mtp.*` IS aliased now (MTP wiring landed): strip the
+        // `model.` prefix so MTPBlock's Linears (in lazy mode) find
+        // their weights via canonical names. Note that mtp tensors
+        // are STILL excluded from globalNames preload — they only
+        // load on-demand if/when MTP is actually invoked. The
+        // alias only makes the names discoverable.
 
         // `.compressor.` IS aliased now (Compressor module wired in
         // MLA) — small weights (~2 MB per layer per projection),
