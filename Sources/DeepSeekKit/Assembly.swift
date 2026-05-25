@@ -315,32 +315,7 @@ public extension Transformer {
             let gate = Gate(config: config, layerId: i,
                             weight: gateW, bias: gateBias, tid2eid: tid2eid)
 
-            let droppedForLayer: Set<Int> =
-                (i < config.prunedExperts.count)
-                ? Set(config.prunedExperts[i])
-                : []
-            var experts: [Expert?] = []
-            for j in 0..<nExperts {
-                if droppedForLayer.contains(j) {
-                    experts.append(nil)
-                    continue
-                }
-                let ep = "\(lp).ffn.experts.\(j)"
-                let w1 = try! loadLinear(loader, base: "\(ep).w1",
-                                          inF: dim, outF: config.moeInterDim, rng: &rng)
-                let w2 = try! loadLinear(loader, base: "\(ep).w2",
-                                          inF: config.moeInterDim, outF: dim, rng: &rng)
-                let w3 = try! loadLinear(loader, base: "\(ep).w3",
-                                          inF: dim, outF: config.moeInterDim, rng: &rng)
-                if mlxQuantExperts {
-                    w1.useMLXQuant = true
-                    w2.useMLXQuant = true
-                    w3.useMLXQuant = true
-                }
-                experts.append(Expert(
-                    w1: w1, w2: w2, w3: w3,
-                    swigluLimit: config.swigluLimit))
-            }
+            // Shared expert (same layout in both checkpoint families).
             let sep = "\(lp).ffn.shared_experts"
             let sharedExpert = Expert(
                 w1: try! loadLinear(loader, base: "\(sep).w1",
@@ -350,9 +325,86 @@ public extension Transformer {
                 w3: try! loadLinear(loader, base: "\(sep).w3",
                                     inF: dim, outF: config.moeInterDim, rng: &rng),
                 swigluLimit: config.swigluLimit)
-            let moe = MoEFFN(config: config, gate: gate,
-                             experts: experts, shared: sharedExpert)
-            moe.layerId = i
+
+            // Routed experts: branch by checkpoint format.
+            //  • MLX-native (mlx-community): single packed tensor per
+            //    projection, dispatched via SwitchMoEFFN +
+            //    MLXFast.gatherQuantizedMatmul.
+            //  • Custom DeepSeek (original): 256 separate Linear×3 per
+            //    layer, dispatched via MoEFFN's per-expert loop.
+            let ffn: any FFNModule
+            if config.isMLXNative {
+                // Per-tensor quant spec from config.json. Falls back to
+                // (groupSize=32, bits=4, mode="mxfp4") which is the
+                // observed default for switch_mlp.{gate,up,down}_proj
+                // in the mlx-community checkpoint.
+                let baseGate = "\(lp).ffn.switch_mlp.gate_proj"
+                let baseUp   = "\(lp).ffn.switch_mlp.up_proj"
+                let baseDown = "\(lp).ffn.switch_mlp.down_proj"
+                let specGate = config.mlxQuantSpec(for: "model." + baseGate)
+                    ?? ModelConfig.MLXQuantSpec(groupSize: 32, bits: 4, mode: "mxfp4")
+                let specUp = config.mlxQuantSpec(for: "model." + baseUp)
+                    ?? specGate
+                let specDown = config.mlxQuantSpec(for: "model." + baseDown)
+                    ?? specGate
+
+                let gateProj = SwitchProj(
+                    nExperts: nExperts,
+                    inFeatures: dim, outFeatures: config.moeInterDim,
+                    base: baseGate,
+                    groupSize: specGate.groupSize, bits: specGate.bits,
+                    mode: specGate.mode, loader: loader)
+                let upProj = SwitchProj(
+                    nExperts: nExperts,
+                    inFeatures: dim, outFeatures: config.moeInterDim,
+                    base: baseUp,
+                    groupSize: specUp.groupSize, bits: specUp.bits,
+                    mode: specUp.mode, loader: loader)
+                let downProj = SwitchProj(
+                    nExperts: nExperts,
+                    inFeatures: config.moeInterDim, outFeatures: dim,
+                    base: baseDown,
+                    groupSize: specDown.groupSize, bits: specDown.bits,
+                    mode: specDown.mode, loader: loader)
+
+                let switchFFN = SwitchMoEFFN(
+                    config: config, gate: gate,
+                    gateProj: gateProj, upProj: upProj, downProj: downProj,
+                    sharedExpert: sharedExpert)
+                switchFFN.layerId = i
+                ffn = switchFFN
+            } else {
+                let droppedForLayer: Set<Int> =
+                    (i < config.prunedExperts.count)
+                    ? Set(config.prunedExperts[i])
+                    : []
+                var experts: [Expert?] = []
+                for j in 0..<nExperts {
+                    if droppedForLayer.contains(j) {
+                        experts.append(nil)
+                        continue
+                    }
+                    let ep = "\(lp).ffn.experts.\(j)"
+                    let w1 = try! loadLinear(loader, base: "\(ep).w1",
+                                              inF: dim, outF: config.moeInterDim, rng: &rng)
+                    let w2 = try! loadLinear(loader, base: "\(ep).w2",
+                                              inF: config.moeInterDim, outF: dim, rng: &rng)
+                    let w3 = try! loadLinear(loader, base: "\(ep).w3",
+                                              inF: dim, outF: config.moeInterDim, rng: &rng)
+                    if mlxQuantExperts {
+                        w1.useMLXQuant = true
+                        w2.useMLXQuant = true
+                        w3.useMLXQuant = true
+                    }
+                    experts.append(Expert(
+                        w1: w1, w2: w2, w3: w3,
+                        swigluLimit: config.swigluLimit))
+                }
+                let moe = MoEFFN(config: config, gate: gate,
+                                 experts: experts, shared: sharedExpert)
+                moe.layerId = i
+                ffn = moe
+            }
 
             // ---- HC params ----
             let hcAttnFn = (try? loader.tryLoad(["\(lp).hc_attn_fn"]))
@@ -369,7 +421,7 @@ public extension Transformer {
                 ?? AssemblyHelpers.randomTensor([3], rng: &rng, scale: 0.5)
 
             let block = Block(layerId: i, config: config,
-                                attn: mla, ffn: moe,
+                                attn: mla, ffn: ffn,
                                 attnNorm: attnNorm, ffnNorm: ffnNorm,
                                 hcAttnFn: hcAttnFn, hcAttnBase: hcAttnBase,
                                 hcAttnScale: hcAttnScale,

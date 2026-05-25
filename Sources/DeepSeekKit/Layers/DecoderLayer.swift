@@ -5,7 +5,11 @@ import MLXNN
 public final class Block {
     public let layerId: Int
     public let attn: MLA
-    public let ffn: MoEFFN
+    /// FFN layer. Concrete type is either `MoEFFN` (per-expert layout,
+    /// custom DeepSeek checkpoint) or `SwitchMoEFFN` (packed-expert
+    /// layout, MLX-native checkpoint). Selected by Assembly.load based
+    /// on `ModelConfig.isMLXNative`.
+    public let ffn: any FFNModule
     public let attnNorm: RMSNorm
     public let ffnNorm: RMSNorm
     public let hc: HyperConnections
@@ -20,7 +24,7 @@ public final class Block {
     public let hcFfnScale: Tensor
 
     public init(layerId: Int, config: ModelConfig,
-                attn: MLA, ffn: MoEFFN,
+                attn: MLA, ffn: any FFNModule,
                 attnNorm: RMSNorm, ffnNorm: RMSNorm,
                 hcAttnFn: Tensor, hcAttnBase: Tensor, hcAttnScale: Tensor,
                 hcFfnFn: Tensor, hcFfnBase: Tensor, hcFfnScale: Tensor) {

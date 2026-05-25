@@ -110,7 +110,18 @@ public final class Expert {
     }
 }
 
-public final class MoEFFN {
+/// Polymorphic interface implemented by both the per-expert
+/// `MoEFFN` (custom DeepSeek FP4/FP8 checkpoint with 256 separate
+/// Linear instances) and the packed-expert `SwitchMoEFFN` (MLX-native
+/// checkpoint with 3 quantized tensors per layer). `Block` holds an
+/// `any FFNModule` so the same decoder layer can run either layout.
+public protocol FFNModule: AnyObject {
+    var layerId: Int { get set }
+    var weightLoader: WeightLoader? { get set }
+    func callAsFunction(_ x: Tensor, inputIds: [Int32]) -> Tensor
+}
+
+public final class MoEFFN: FFNModule {
     public let gate: Gate
     public let experts: [Expert?]
     public let sharedExpert: Expert

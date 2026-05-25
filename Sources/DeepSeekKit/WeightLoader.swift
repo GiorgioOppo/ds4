@@ -184,6 +184,12 @@ public final class WeightLoader {
         for name in index.keys {
             if name.hasPrefix("layers.") { continue }
             if name.hasPrefix("mtp.") { continue }
+            // HF-original layer/MTP tensors that we deliberately did
+            // NOT alias (compressor/indexer/MTP body). Skip — they'd
+            // get pre-loaded into the always-resident globals and
+            // pin hundreds of MB per layer.
+            if name.hasPrefix("model.layers.") { continue }
+            if name.hasPrefix("model.mtp.") { continue }
             // Skip HF-original names that were aliased to a canonical
             // form: their alias will be preloaded once and the original
             // can be resolved on demand if needed.
@@ -278,10 +284,19 @@ public final class WeightLoader {
         guard name.hasPrefix("model.") else { return nil }
         var s = String(name.dropFirst("model.".count))
 
+        // Don't alias compressor/indexer — modules not yet wired in the
+        // MLX backend. We DELIBERATELY leave these under the HF-only
+        // name so the streaming `ensureLayer(K)` (which loads
+        // `layers.K.*`) doesn't pull in ~hundreds of MB per layer that
+        // no code currently reads.
+        if s.contains(".compressor.") || s.contains(".indexer.") {
+            return nil
+        }
+
+        // mtp.* — same reason, not wired.
+        if s.hasPrefix("mtp.") { return nil }
+
         // shared_experts gate_proj/up_proj/down_proj → w1/w3/w2.
-        // Apply only when the segment is exactly within `.shared_experts.`
-        // (so we don't accidentally rewrite a tensor under `.switch_mlp.`
-        // or any other module that uses the same projection names).
         if s.contains(".shared_experts.") {
             s = s.replacingOccurrences(
                 of: ".shared_experts.gate_proj",
@@ -294,20 +309,11 @@ public final class WeightLoader {
                 with: ".shared_experts.w2")
         }
 
-        // Don't alias switch_mlp.* (per-expert packed) — the dedicated
-        // SwitchMLP MoE module loads those by HF name directly. Keeping
-        // them unaliased prevents accidental clashes with our
-        // per-expert naming.
-        if s.contains(".switch_mlp.") { return nil }
-
-        // Don't alias compressor/indexer/mtp — modules not yet wired.
-        // Leaving them only under the HF name signals that they're not
-        // expected to be consumed by the current forward path.
-        if s.contains(".compressor.") || s.contains(".indexer.")
-           || s.hasPrefix("mtp.") {
-            return nil
-        }
-
+        // `switch_mlp.{gate_proj,up_proj,down_proj}` (per-layer packed
+        // routed experts): keep the internal naming intact, just strip
+        // the `model.` prefix so `ensureLayer(K)` (prefix `layers.K.`)
+        // pulls them in like any other layer tensor. The SwitchMoEFFN
+        // module reads them by the canonical post-alias name.
         return s
     }
 
