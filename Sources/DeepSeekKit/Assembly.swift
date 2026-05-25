@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import MLX
+import MLXFast
 
 /// Factory functions that build a `Transformer` from a `ModelConfig`.
 ///
@@ -226,7 +227,23 @@ public extension Transformer {
         let nExperts = config.nRoutedExperts
 
         // ---------- Top-level ----------
-        let embedW = (try loader.tryLoad(["embed.weight", "model.embed.weight"]))
+        //
+        // embed.weight and lm_head.weight need the FULL unpacked
+        // [vocab, dim] tensor: `ParallelEmbedding.lookup` indexes
+        // it directly (no quantizedMatmul fast path), and
+        // `ParallelHead` does `matmul(x, weight.T)` for logits.
+        //
+        // For MLX-native checkpoints these are stored in the packed
+        // triplet form `(weight uint32 [vocab, dim/8], scales, biases)`.
+        // We dequantize once at load and pin the bf16 result as a
+        // global — same memory cost as a regular fp16 embed (~1 GB
+        // for vocab=129280, dim=4096).
+        //
+        // `loadFullDequantized` handles both paths: returns the
+        // full unpacked bf16 weight for MLX-native triplets, or
+        // the raw weight for non-quantized checkpoints.
+        let embedW = AssemblyHelpers.loadFullDequantized(
+                loader, bases: ["embed", "model.embed_tokens"])
             ?? AssemblyHelpers.randomTensor([config.vocabSize, dim], rng: &rng, scale: 0.02)
         let embed = ParallelEmbedding(vocabSize: config.vocabSize, dim: dim, weight: embedW)
 
@@ -234,7 +251,8 @@ public extension Transformer {
             ?? AssemblyHelpers.onesTensor([dim])
         let norm = RMSNorm(weight: normW, eps: config.normEps)
 
-        let lmHeadW = (try loader.tryLoad(["head.weight", "lm_head.weight"]))
+        let lmHeadW = AssemblyHelpers.loadFullDequantized(
+                loader, bases: ["head", "lm_head"])
             ?? AssemblyHelpers.randomTensor([config.vocabSize, dim], rng: &rng, scale: 0.02)
         let head = ParallelHead(vocabSize: config.vocabSize, dim: dim,
                                 normEps: config.normEps, hcEps: config.hcEps,
@@ -872,6 +890,64 @@ internal enum AssemblyHelpers {
         let n = shape.reduce(1, *)
         let arr = [Float](repeating: 1.0, count: n)
         return arr.withUnsafeBytes { Tensor.from(bytes: $0, shape: shape, dtype: .f32) }
+    }
+
+    /// Loads a weight that needs to be in its FULL unpacked form
+    /// (used by `ParallelEmbedding.lookup` and `ParallelHead`'s
+    /// matmul — they index/multiply the weight directly, no
+    /// quantizedMatmul fast path available).
+    ///
+    /// Probes each `base` in order:
+    /// - If `<base>.scales` is present in the loader index, this is
+    ///   an MLX-native quantized triplet → loads
+    ///   (weight uint32, scales, biases) and calls
+    ///   `dequantized(...)` to get the full [out, in] bf16 weight.
+    /// - Otherwise, loads `<base>.weight` directly.
+    ///
+    /// Returns nil if no base resolves to a loadable weight (caller
+    /// falls back to random init).
+    ///
+    /// Background: in MLX-native checkpoints `embed.weight` (aliased
+    /// from `model.embed_tokens.weight`) is stored packed as
+    /// `[vocabSize, dim / pack_factor]` (e.g. [129280, 512] for
+    /// dim=4096, bits=4 → pack_factor=8). Passing the packed tensor
+    /// to `ParallelEmbedding` produces shapes that fail to broadcast
+    /// downstream — exactly the
+    /// "[broadcast_shapes] Shapes (128,1,512) and (128,4,4096)"
+    /// error users hit on the first forward pass.
+    static func loadFullDequantized(
+        _ loader: WeightLoader,
+        bases: [String]) -> Tensor?
+    {
+        for base in bases {
+            let weightName = "\(base).weight"
+            let scalesName = "\(base).scales"
+            let biasesName = "\(base).biases"
+
+            // MLX-native triplet path.
+            if loader.dtype(of: scalesName) != nil,
+               let qWArr = (try? loader.load(weightName))?.array,
+               let qSArr = (try? loader.load(scalesName))?.array
+            {
+                let qBArr = (try? loader.load(biasesName))?.array
+                    ?? MLXArray.zeros(like: qSArr)
+                // groupSize=64, bits=4 matches the affine default in
+                // the mlx-community DeepSeek-V4 checkpoint for
+                // embed/lm_head (verified in the per-tensor overrides
+                // dumped at load time).
+                let full = dequantized(
+                    qWArr, scales: qSArr, biases: qBArr,
+                    groupSize: 64, bits: 4)
+                MLX.eval(full)
+                return Tensor(array: full, dtype: .bf16)
+            }
+
+            // Non-quantized path: load weight as-is.
+            if let t = try? loader.load(weightName) {
+                return t
+            }
+        }
+        return nil
     }
 
     /// Returns a copy of `t` as an i32 tensor. Used at load time for
