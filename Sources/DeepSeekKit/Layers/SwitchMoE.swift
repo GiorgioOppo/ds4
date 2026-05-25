@@ -147,61 +147,70 @@ public final class SwitchMoEFFN: FFNModule {
             return Tensor(array: sharedOnly.reshaped(shape), dtype: x.dtype)
         }
 
-        // lhs_indices: for output position i ∈ [0, N*K), which row of x?
-        //   i / K → token row (each token contributes K outputs).
-        // rhs_indices: which expert slice of the packed weight?
-        //   indices.flatten()[i] → expert id for this output position.
-        let lhsIdxs = MLXArray((0..<N).flatMap {
-            Array(repeating: Int32($0), count: K)
-        })
-        let rhsIdxs = indices.reshaped([N * K]).asType(.int32)
-
-        // Activations in bf16 to match the quantized GEMM kernel.
+        // The kernel `gather_qmm` follows the SwitchLinear convention
+        // used by mlx-lm: x has shape `[..., M, K]` (≥3D), the rhs
+        // indices have shape `[..., topk]` with one more trailing axis
+        // than x's leading dims, and the output is
+        // `[..., topk, M, N]`. For MoE row-vector dispatch M=1, so:
+        //
+        //   x  expanded to [N, 1, dim]
+        //   indices                    [N, topk]
+        //   gate_proj/up_proj output   [N, topk, 1, inter_dim]
+        //   swiglu output (same shape)
+        //   down_proj input            [N, topk, 1, inter_dim]
+        //   down_proj output           [N, topk, 1, dim]
+        //
+        // Previous attempt fed a 2D x and 1D lhs/rhs indices, which the
+        // kernel silently broadcast (yielding a [B, M=128, N] tensor
+        // 128× larger than expected and a downstream `[reshape]`
+        // crash). lhs_indices is dropped — the per-token gather is
+        // implicit in matching x's leading axes against rhs_indices'.
         let xBf16 = xFlat.array.dtype == .bfloat16
             ? xFlat.array
             : xFlat.array.asType(.bfloat16)
+        let xExp = xBf16.expandedDimensions(axes: [1])    // [N, 1, dim]
+        let idx2D = indices.asType(.int32)                // [N, K]
 
-        // gate_proj  · x  →  [N*K, inter_dim]
+        // gate_proj · x  →  [N, K, 1, inter_dim]
         let yGate = gatherQuantizedMatmul(
-            xBf16, gateT.w,
+            xExp, gateT.w,
             scales: gateT.scales, biases: gateT.biases,
-            lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
+            rhsIndices: idx2D,
             transpose: true,
             groupSize: gateProj.groupSize, bits: gateProj.bits,
             mode: SwitchProj.parseMode(gateProj.mode))
 
-        // up_proj    · x  →  [N*K, inter_dim]
+        // up_proj   · x  →  [N, K, 1, inter_dim]
         let yUp = gatherQuantizedMatmul(
-            xBf16, upT.w,
+            xExp, upT.w,
             scales: upT.scales, biases: upT.biases,
-            lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
+            rhsIndices: idx2D,
             transpose: true,
             groupSize: upProj.groupSize, bits: upProj.bits,
             mode: SwitchProj.parseMode(upProj.mode))
 
-        // SwiGLU: silu(gate) * up. Optional clamp to swigluLimit per
-        // the reference (Expert.callAsFunction reference logic) —
-        // present in the trained model for stability.
-        var hMid = (yGate * sigmoid(yGate)) * yUp
+        // SwiGLU: silu(gate) * up, optional symmetric clamp.
+        var hMid = (yGate * sigmoid(yGate)) * yUp     // [N, K, 1, inter]
         if swigluLimit > 0 {
             let lim = MLXArray(Float(swigluLimit)).asType(.bfloat16)
             let nlim = MLXArray(Float(-swigluLimit)).asType(.bfloat16)
             hMid = MLX.minimum(MLX.maximum(hMid, nlim), lim)
         }
 
-        // down_proj  · h  →  [N*K, dim]
-        // h is already per-output row (no further lhs_indices gather);
-        // we still need rhs_indices to pick the right expert slice.
-        let lhsIdxsDown = MLXArray((0..<(N * K)).map { Int32($0) })
+        // down_proj · h  →  [N, K, 1, dim]
+        // h is already per-(token, expert) gathered; rhs_indices on the
+        // same idx2D matches x's leading [N, K] axes and selects the
+        // matching expert slice of the down_proj packed weight.
         let yDown = gatherQuantizedMatmul(
             hMid, downT.w,
             scales: downT.scales, biases: downT.biases,
-            lhsIndices: lhsIdxsDown, rhsIndices: rhsIdxs,
+            rhsIndices: idx2D,
             transpose: true,
             groupSize: downProj.groupSize, bits: downProj.bits,
             mode: SwitchProj.parseMode(downProj.mode))
 
-        // Per-token weighted sum across topK.
+        // Per-token weighted sum across topK: drop the dummy M=1 axis,
+        // then weighted reduction.
         let yDownReshaped = yDown.reshaped([N, K, dim])
         let wExpanded = weights.asType(.bfloat16)
             .expandedDimensions(axes: [2])             // [N, K, 1]
