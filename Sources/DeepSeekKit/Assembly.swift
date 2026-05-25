@@ -924,17 +924,18 @@ internal enum AssemblyHelpers {
             let scalesName = "\(base).scales"
             let biasesName = "\(base).biases"
 
-            // MLX-native triplet path.
+            // MLX-native triplet path. embed/head/lm_head are stored
+            // as affine quant (groupSize=64) in the mlx-community
+            // DeepSeek-V4 checkpoint — the per-tensor overrides only
+            // change the routed experts (switch_mlp), which go through
+            // SwitchMoEFFN, not this helper. So we don't need to thread
+            // the mxfp4 mode through here.
             if loader.dtype(of: scalesName) != nil,
                let qWArr = (try? loader.load(weightName))?.array,
                let qSArr = (try? loader.load(scalesName))?.array
             {
                 let qBArr = (try? loader.load(biasesName))?.array
                     ?? MLXArray.zeros(like: qSArr)
-                // groupSize=64, bits=4 matches the affine default in
-                // the mlx-community DeepSeek-V4 checkpoint for
-                // embed/lm_head (verified in the per-tensor overrides
-                // dumped at load time).
                 let full = dequantized(
                     qWArr, scales: qSArr, biases: qBArr,
                     groupSize: 64, bits: 4)

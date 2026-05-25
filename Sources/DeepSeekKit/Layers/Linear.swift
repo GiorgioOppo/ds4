@@ -218,10 +218,12 @@ public final class Linear {
     public func getFullyDequantizedWeight() -> MLXArray {
         if let triple = getMLXQuant() {
             // MLX-native source: invert the int4 quant.
-            // groupSize=64, bits=4 is the affine-mode default; matches
-            // attention/shared/embed in the user's checkpoint. mxfp4
-            // (groupSize=32) is only used by SwitchMLP which doesn't
-            // come through this code path.
+            // groupSize=64 + biases is the affine default for the
+            // mlx-community DeepSeek-V4 checkpoint on all paths that
+            // hit this code (per-group MLA woA reshape, embed/head
+            // fully-decoded). The mxfp4 switch_mlp routed experts go
+            // through SwitchMoEFFN / gatherQuantizedMatmul instead and
+            // never reach this method.
             let biases = triple.biases ?? MLXArray.zeros(
                 like: triple.scales)
             return dequantized(
@@ -326,13 +328,21 @@ public final class Linear {
             // against the quantized weight. Match the dtype of the
             // scales.
             let xBf16 = xArr.dtype == .bfloat16 ? xArr : xArr.asType(.bfloat16)
+            // Same inference as getFullyDequantizedWeight: biases ⇒
+            // affine/64, no biases ⇒ mxfp4/32. The mlx C++ binding
+            // rejects nil biases under the default .affine mode with
+            // "[*qmm] Biases must be provided for affine quantization."
+            let mode: QuantizationMode = triple.biases != nil
+                ? .affine : .mxfp4
+            let groupSize = triple.biases != nil ? 64 : 32
             let yArr = quantizedMatmul(
                 xBf16, triple.w,
                 scales: triple.scales,
                 biases: triple.biases,
                 transpose: true,
-                groupSize: 64,
-                bits: 4)
+                groupSize: groupSize,
+                bits: 4,
+                mode: mode)
             var outArr = yArr
             // Per-row scale (1D) is applied post-matmul — same as the
             // dequant path. 2D block scales are baked into the

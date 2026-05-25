@@ -60,6 +60,22 @@ public final class SwitchProj {
         let qB = (try? loader.load(biasesName))?.array
         return (qW, qS, qB)
     }
+
+    /// Convert a `config.json` quantization `mode` string into the
+    /// mlx-swift `QuantizationMode` enum expected by the kernel.
+    /// Only the two cases the mlx-community DeepSeek-V4 checkpoint
+    /// uses — `affine` (everything except routed experts) and
+    /// `mxfp4` (the switch_mlp packed tensors) — are mapped.
+    /// Anything else falls back to `.affine`; if biases are absent the
+    /// kernel will fail loudly with "[*qmm] Biases must be provided for
+    /// affine quantization", which is the same outcome as before this
+    /// helper existed (default mode was hardcoded to affine).
+    public static func parseMode(_ s: String) -> QuantizationMode {
+        switch s.lowercased() {
+        case "mxfp4": return .mxfp4
+        default:      return .affine
+        }
+    }
 }
 
 /// Packed-expert MoE FFN for the MLX-native (mlx-community)
@@ -151,7 +167,8 @@ public final class SwitchMoEFFN: FFNModule {
             scales: gateT.scales, biases: gateT.biases,
             lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
             transpose: true,
-            groupSize: gateProj.groupSize, bits: gateProj.bits)
+            groupSize: gateProj.groupSize, bits: gateProj.bits,
+            mode: SwitchProj.parseMode(gateProj.mode))
 
         // up_proj    · x  →  [N*K, inter_dim]
         let yUp = gatherQuantizedMatmul(
@@ -159,7 +176,8 @@ public final class SwitchMoEFFN: FFNModule {
             scales: upT.scales, biases: upT.biases,
             lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
             transpose: true,
-            groupSize: upProj.groupSize, bits: upProj.bits)
+            groupSize: upProj.groupSize, bits: upProj.bits,
+            mode: SwitchProj.parseMode(upProj.mode))
 
         // SwiGLU: silu(gate) * up. Optional clamp to swigluLimit per
         // the reference (Expert.callAsFunction reference logic) —
@@ -180,7 +198,8 @@ public final class SwitchMoEFFN: FFNModule {
             scales: downT.scales, biases: downT.biases,
             lhsIndices: lhsIdxsDown, rhsIndices: rhsIdxs,
             transpose: true,
-            groupSize: downProj.groupSize, bits: downProj.bits)
+            groupSize: downProj.groupSize, bits: downProj.bits,
+            mode: SwitchProj.parseMode(downProj.mode))
 
         // Per-token weighted sum across topK.
         let yDownReshaped = yDown.reshaped([N, K, dim])
