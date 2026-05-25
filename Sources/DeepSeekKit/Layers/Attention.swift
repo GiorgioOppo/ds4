@@ -248,9 +248,45 @@ public final class MLA {
             mask = maskRaw
         }
 
-        let o0 = MLXFast.scaledDotProductAttention(
-            queries: qPerToken, keys: kPerToken, values: vPerToken,
-            scale: softmaxScale, mask: mask)
+        // Manual SDPA with attention sink. The fused
+        // `MLXFast.scaledDotProductAttention` doesn't support the
+        // per-head sink logit the model was trained with — we trade
+        // its kernel-level fusion for one extra concat + softmax +
+        // slice to insert the sink column.
+        //
+        // The attention sink is a virtual "first key" with a per-head
+        // fixed pre-softmax logit `attnSink[h]`. Its v contribution
+        // is dropped after softmax (it never had a paired v), so the
+        // effective behaviour is: the model can "vent" attention
+        // probability mass into the sink when no real key is a good
+        // match, stabilising the softmax. Without the sink the model
+        // is forced to spread mass over real keys even when none is
+        // appropriate — that's exactly the degenerate-output regime.
+        //
+        // Implementation:
+        //   qk      = q @ k.T * scale + mask           [B, H, S, L]
+        //   sink    = attnSink reshaped+broadcast      [B, H, S, 1]
+        //   logits  = concat(sink, qk, axis=-1)        [B, H, S, L+1]
+        //   probs   = softmax(logits, axis=-1)         [B, H, S, L+1]
+        //   real    = probs[..., 1:]                   [B, H, S, L]
+        //   o0      = real @ v                         [B, H, S, headDim]
+        let kT = kPerToken.transposed(0, 1, 3, 2)       // [B, 1, headDim, L]
+        var qk = matmul(qPerToken, kT)                  // [B, H, S, L] bf16
+            * MLXArray(Float(softmaxScale)).asType(.bfloat16)
+        // Add the (S, L) mask: broadcasts across B and H automatically.
+        qk = qk + mask
+
+        // Sink column [B, H, S, 1]. attnSink is [H] — reshape and
+        // broadcast.
+        let sinkReshaped = attnSink.array.asType(.bfloat16)
+            .reshaped([1, nHeads, 1, 1])
+        let sinkExpanded = broadcast(sinkReshaped, to: [B, nHeads, S, 1])
+        let allLogits = concatenated([sinkExpanded, qk], axis: -1)
+        let allProbs = softmax(allLogits, axis: -1)
+        // Drop the sink column for the v multiplication.
+        let realProbs = allProbs[0..., 0..., 0..., 1...]
+
+        let o0 = matmul(realProbs, vPerToken)           // [B, H, S, headDim]
 
         // Cast back to f32 for the inverse-RoPE + woA/woB tail. The
         // subsequent matmuls expect f32 weights as currently produced
