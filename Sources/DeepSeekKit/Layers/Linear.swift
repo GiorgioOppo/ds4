@@ -138,15 +138,32 @@ public final class Linear {
         guard let loader = _loader, let weightName = _weightName else {
             return nil
         }
+        let dotWeight = ".weight"
+        let base = weightName.hasSuffix(dotWeight)
+            ? String(weightName.dropLast(dotWeight.count))
+            : weightName
+
+        // Path A — MLX-native checkpoint: the triplet is ALREADY stored
+        // on disk under `<base>.{weight,scales,biases}`. No re-quant
+        // needed; just load. This is the mlx-community-style format.
+        let nativeScalesName = "\(base).scales"
+        let nativeBiasesName = "\(base).biases"
+        if loader.dtype(of: nativeScalesName) != nil,
+           loader.dtype(of: nativeBiasesName) != nil {
+            if let qW = (try? loader.load(weightName))?.array,
+               let qS = (try? loader.load(nativeScalesName))?.array,
+               let qB = (try? loader.load(nativeBiasesName))?.array {
+                return (qW, qS, qB)
+            }
+            return nil
+        }
+
+        // Path B — old custom-format checkpoint (FP4/FP8 + block scale).
         // Synthetic key namespace derived from the weight name (e.g.
         // "layers.0.ffn.experts.5.w1.weight" → base
         // "layers.0.ffn.experts.5.w1"). The triplet keys sit under the
         // same expert prefix so `releaseExperts(layer: K, indices: [E])`
         // picks them up.
-        let dotWeight = ".weight"
-        let base = weightName.hasSuffix(dotWeight)
-            ? String(weightName.dropLast(dotWeight.count))
-            : weightName
         let qWKey = "\(base).mlxq.w"
         let qSKey = "\(base).mlxq.scales"
         let qBKey = "\(base).mlxq.biases"
@@ -170,6 +187,19 @@ public final class Linear {
         loader.storeRaw(qSKey, qS)
         loader.storeRaw(qBKey, qB)
         return (qW, qS, qB)
+    }
+
+    /// True when the underlying checkpoint has the MLX-native quant
+    /// triplet (`<base>.scales` + `<base>.biases`) for this Linear's
+    /// weight. Cheap probe — does not load anything. Used by
+    /// `callAsFunction` to auto-enable the `MLXFast.quantizedMatmul`
+    /// fast path even when `useMLXQuant` wasn't explicitly set.
+    private func hasMLXNativeTriplet() -> Bool {
+        guard let loader = _loader, let weightName = _weightName,
+              weightName.hasSuffix(".weight") else { return false }
+        let base = String(weightName.dropLast(".weight".count))
+        return loader.dtype(of: "\(base).scales") != nil
+            && loader.dtype(of: "\(base).biases") != nil
     }
 
     public func getDequantizedWeight() -> MLXArray {
@@ -250,10 +280,16 @@ public final class Linear {
 
         // Fast path: pre-quantized triplet + fused MLX kernel. Avoids
         // the [outFeatures, inFeatures] bf16 dequant temporary entirely
-        // (≈32 MB for a routed expert, larger for MLA matrices). Enabled
-        // per-Linear via `useMLXQuant`, set in Assembly under
-        // DEEPSEEK_MLX_QUANT=1.
-        if useMLXQuant, let triple = getMLXQuant() {
+        // (≈32 MB for a routed expert, larger for MLA matrices).
+        //
+        // Activated in two cases:
+        //   1. MLX-native checkpoint: the triplet (.weight + .scales +
+        //      .biases) is already on disk. Auto-detected via
+        //      `hasMLXNativeTriplet()`, no env flag needed.
+        //   2. Old custom-format checkpoint with DEEPSEEK_MLX_QUANT=1:
+        //      Linear re-quantizes once on first use, caches.
+        let preferMLXQuant = useMLXQuant || hasMLXNativeTriplet()
+        if preferMLXQuant, let triple = getMLXQuant() {
             // MLXFast expects bf16/fp16 activations against the
             // quantized weight. Match the dtype of the scales.
             let xBf16 = xArr.dtype == .bfloat16 ? xArr : xArr.asType(.bfloat16)
