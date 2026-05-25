@@ -492,64 +492,85 @@ public struct ModelConfig: Codable, Sendable {
             c.nLayers = inferredNLayers
         }
 
-        // vocab_size + dim: from embed.weight shape [vocab, dim].
-        if let s = loader.shape(ofAny: ["embed.weight", "model.embed.weight"]),
-           s.count == 2 {
-            if s[0] != c.vocabSize {
-                notes.append("vocab_size: \(c.vocabSize) → \(s[0]) (from embed.weight)")
-                c.vocabSize = s[0]
-            }
-            if s[1] != c.dim {
-                notes.append("dim: \(c.dim) → \(s[1]) (from embed.weight)")
-                c.dim = s[1]
-            }
-        }
-
-        // q_lora_rank + n_heads: from layers.0.attn.wq_b.weight shape
-        // [n_heads * head_dim, q_lora_rank].
-        if let s = loader.shape(of: "layers.0.attn.wq_b.weight"), s.count == 2 {
-            let inferredQLora = s[1]
-            if inferredQLora != c.qLoraRank {
-                notes.append("q_lora_rank: \(c.qLoraRank) → \(inferredQLora) (from wq_b)")
-                c.qLoraRank = inferredQLora
-            }
-            if c.headDim > 0 && s[0] % c.headDim == 0 {
-                let inferredHeads = s[0] / c.headDim
-                if inferredHeads != c.nHeads {
-                    notes.append("n_heads: \(c.nHeads) → \(inferredHeads) (from wq_b / head_dim)")
-                    c.nHeads = inferredHeads
+        // Shape-based inference is GATED by `!isMLXNative`.
+        //
+        // The mlx-community quantized format packs weights as `uint32`
+        // along the inner axis with `pack_factor = 32 / bits` (= 8 for
+        // bits=4). So `embed.weight` is stored as `[vocab_size, dim/8]`,
+        // `wq_b` as `[n_heads*head_dim, q_lora_rank/8]`, etc. Reading
+        // dim/q_lora_rank/etc. from the LAST axis of the stored tensor
+        // gives 1/8 the true value and triggers catastrophic broadcast
+        // errors downstream (e.g. "[broadcast_shapes] Shapes (128,512)
+        // and (4096) cannot be broadcast" because dim/8=512 instead of
+        // dim=4096).
+        //
+        // For MLX-native we trust `config.json` for shape parameters
+        // — its `hidden_size` / `q_lora_rank` / `o_lora_rank` /
+        // `moe_intermediate_size` are the canonical values. For the
+        // custom DeepSeek FP4/FP8 checkpoint family the probes still
+        // help recover from incomplete config.json files.
+        if !c.isMLXNative {
+            // vocab_size + dim: from embed.weight shape [vocab, dim].
+            if let s = loader.shape(ofAny: ["embed.weight", "model.embed.weight"]),
+               s.count == 2 {
+                if s[0] != c.vocabSize {
+                    notes.append("vocab_size: \(c.vocabSize) → \(s[0]) (from embed.weight)")
+                    c.vocabSize = s[0]
+                }
+                if s[1] != c.dim {
+                    notes.append("dim: \(c.dim) → \(s[1]) (from embed.weight)")
+                    c.dim = s[1]
                 }
             }
         }
 
-        // o_lora_rank: from layers.0.attn.wo_b.weight shape [dim, o_groups * o_lora_rank].
-        if let s = loader.shape(of: "layers.0.attn.wo_b.weight"),
-           s.count == 2, c.oGroups > 0, s[1] % c.oGroups == 0 {
-            let inferredOLora = s[1] / c.oGroups
-            if inferredOLora != c.oLoraRank {
-                notes.append("o_lora_rank: \(c.oLoraRank) → \(inferredOLora) (from wo_b / o_groups)")
-                c.oLoraRank = inferredOLora
+        if !c.isMLXNative {
+            // q_lora_rank + n_heads: from layers.0.attn.wq_b.weight shape
+            // [n_heads * head_dim, q_lora_rank].
+            if let s = loader.shape(of: "layers.0.attn.wq_b.weight"), s.count == 2 {
+                let inferredQLora = s[1]
+                if inferredQLora != c.qLoraRank {
+                    notes.append("q_lora_rank: \(c.qLoraRank) → \(inferredQLora) (from wq_b)")
+                    c.qLoraRank = inferredQLora
+                }
+                if c.headDim > 0 && s[0] % c.headDim == 0 {
+                    let inferredHeads = s[0] / c.headDim
+                    if inferredHeads != c.nHeads {
+                        notes.append("n_heads: \(c.nHeads) → \(inferredHeads) (from wq_b / head_dim)")
+                        c.nHeads = inferredHeads
+                    }
+                }
             }
-        }
 
-        // moe_inter_dim: from layers.0.ffn.experts.0.w1.weight shape
-        // [moe_inter_dim, dim].
-        if let s = loader.shape(of: "layers.0.ffn.experts.0.w1.weight"), s.count == 2 {
-            if s[0] != c.moeInterDim {
-                notes.append("moe_inter_dim: \(c.moeInterDim) → \(s[0]) (from expert.w1)")
-                c.moeInterDim = s[0]
+            // o_lora_rank: from layers.0.attn.wo_b.weight shape [dim, o_groups * o_lora_rank].
+            if let s = loader.shape(of: "layers.0.attn.wo_b.weight"),
+               s.count == 2, c.oGroups > 0, s[1] % c.oGroups == 0 {
+                let inferredOLora = s[1] / c.oGroups
+                if inferredOLora != c.oLoraRank {
+                    notes.append("o_lora_rank: \(c.oLoraRank) → \(inferredOLora) (from wo_b / o_groups)")
+                    c.oLoraRank = inferredOLora
+                }
             }
-        }
 
-        // index_n_heads: from indexer wq_b on the first ratio==4 layer.
-        // Shape [index_n_heads * index_head_dim, q_lora_rank].
-        if let firstRatio4 = c.compressRatios.firstIndex(of: 4),
-           let s = loader.shape(of: "layers.\(firstRatio4).attn.indexer.wq_b.weight"),
-           s.count == 2, c.indexHeadDim > 0, s[0] % c.indexHeadDim == 0 {
-            let inferredIdxH = s[0] / c.indexHeadDim
-            if inferredIdxH != c.indexNHeads {
-                notes.append("index_n_heads: \(c.indexNHeads) → \(inferredIdxH) (from indexer.wq_b / index_head_dim)")
-                c.indexNHeads = inferredIdxH
+            // moe_inter_dim: from layers.0.ffn.experts.0.w1.weight shape
+            // [moe_inter_dim, dim].
+            if let s = loader.shape(of: "layers.0.ffn.experts.0.w1.weight"), s.count == 2 {
+                if s[0] != c.moeInterDim {
+                    notes.append("moe_inter_dim: \(c.moeInterDim) → \(s[0]) (from expert.w1)")
+                    c.moeInterDim = s[0]
+                }
+            }
+
+            // index_n_heads: from indexer wq_b on the first ratio==4 layer.
+            // Shape [index_n_heads * index_head_dim, q_lora_rank].
+            if let firstRatio4 = c.compressRatios.firstIndex(of: 4),
+               let s = loader.shape(of: "layers.\(firstRatio4).attn.indexer.wq_b.weight"),
+               s.count == 2, c.indexHeadDim > 0, s[0] % c.indexHeadDim == 0 {
+                let inferredIdxH = s[0] / c.indexHeadDim
+                if inferredIdxH != c.indexNHeads {
+                    notes.append("index_n_heads: \(c.indexNHeads) → \(inferredIdxH) (from indexer.wq_b / index_head_dim)")
+                    c.indexNHeads = inferredIdxH
+                }
             }
         }
 
