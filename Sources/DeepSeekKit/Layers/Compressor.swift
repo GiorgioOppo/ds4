@@ -269,7 +269,9 @@ public final class Compressor {
     /// Norm the compressed nope dims and apply RoPE to the rope dims.
     /// Mirrors the Python `apply_rotary_emb(kv[..., -rd:], freqs_cis)`
     /// step. `startCompressIdx` is the absolute compressed-cache index
-    /// of the first new entry (used to look up the right RoPE freqs).
+    /// of the first new entry. Compressed entry k corresponds to the
+    /// raw absolute position `k * compressRatio`; we use that to look
+    /// up the right RoPE freqs (stride = compressRatio).
     private func applyNormAndRoPE(compressed: MLXArray, B: Int, nNew: Int,
                                     d: Int, rd: Int,
                                     startCompressIdx: Int) -> MLXArray {
@@ -277,18 +279,25 @@ public final class Compressor {
         let varx = mean(square(compressed), axes: [-1], keepDims: true)
         let normed = compressed * rsqrt(varx + normEps) * norm.weight.array
 
-        // Skip RoPE if freqs not provided yet (defensive — parent should
-        // always assign before forward).
         guard let freqs = freqs else { return normed }
-        let freqSlice = freqs.array[
-            startCompressIdx..<(startCompressIdx + nNew), 0..., 0...]
+
+        // Stride-ratio gather: compressed entry k uses raw RoPE position
+        // `k * ratio`. Build the position index list explicitly and
+        // gather via `take` (slicing with stride isn't a 1-liner in
+        // mlx-swift; explicit indices are clearer).
+        let positions = (0..<nNew).map {
+            Int32((startCompressIdx + $0) * compressRatio)
+        }
+        let freqIdxs = MLXArray(positions)
+        let freqGathered = take(freqs.array, freqIdxs, axis: 0)
+        // freqGathered: [nNew, rd/2, 2]
 
         let nopePart = normed[0..., 0..., 0..<(d - rd)]
         let ropePart = normed[0..., 0..., (d - rd)..<d]
             .reshaped([B, nNew, rd / 2, 2])
 
-        let cosFreq = freqSlice[0..., 0..., 0].expandedDimensions(axes: [0])
-        let sinFreq = freqSlice[0..., 0..., 1].expandedDimensions(axes: [0])
+        let cosFreq = freqGathered[0..., 0..., 0].expandedDimensions(axes: [0])
+        let sinFreq = freqGathered[0..., 0..., 1].expandedDimensions(axes: [0])
 
         let x0 = ropePart[0..., 0..., 0..., 0]
         let x1 = ropePart[0..., 0..., 0..., 1]

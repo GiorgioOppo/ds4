@@ -284,17 +284,20 @@ public final class WeightLoader {
         guard name.hasPrefix("model.") else { return nil }
         var s = String(name.dropFirst("model.".count))
 
-        // Don't alias compressor/indexer — modules not yet wired in the
-        // MLX backend. We DELIBERATELY leave these under the HF-only
-        // name so the streaming `ensureLayer(K)` (which loads
-        // `layers.K.*`) doesn't pull in ~hundreds of MB per layer that
-        // no code currently reads.
-        if s.contains(".compressor.") || s.contains(".indexer.") {
-            return nil
-        }
+        // Don't alias `indexer.*` — module not yet wired in the MLX
+        // backend (the Indexer's top-k learned scoring path is left as
+        // a follow-up; layers with ratio==4 fall back to Compressor-
+        // only attention until then). Leaving these un-aliased
+        // prevents `ensureLayer` from pulling them in for no reason.
+        if s.contains(".indexer.") { return nil }
 
-        // mtp.* — same reason, not wired.
+        // mtp.* — not wired in forward (yet).
         if s.hasPrefix("mtp.") { return nil }
+
+        // `.compressor.` IS aliased now (Compressor module wired in
+        // MLA) — small weights (~2 MB per layer per projection),
+        // loaded as part of `ensureLayer(K)` like every other layer
+        // tensor.
 
         // shared_experts gate_proj/up_proj/down_proj → w1/w3/w2.
         if s.contains(".shared_experts.") {

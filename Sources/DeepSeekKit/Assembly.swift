@@ -302,6 +302,33 @@ public extension Transformer {
                           attnSink: attnSink, rope: rope,
                           kvCache: nil)
 
+            // Compressor wiring: only for non-overlap layers (ratio>0
+            // and ratio != 4). ratio == 4 layers need the overlap path
+            // + Indexer for full quality — those will land later; in
+            // the meantime they fall back to sliding-window only.
+            // ratio == 0 layers don't need compression at all.
+            if ratio > 0 && ratio != 4 {
+                let cbase = "\(lp).attn.compressor"
+                let wkvComp = try! loadLinear(
+                    loader, base: "\(cbase).wkv",
+                    inF: dim, outF: config.headDim, rng: &rng)
+                let wgateComp = try! loadLinear(
+                    loader, base: "\(cbase).wgate",
+                    inF: dim, outF: config.headDim, rng: &rng)
+                let apeComp = (try? loader.tryLoad(["\(cbase).ape"]))
+                    ?? AssemblyHelpers.randomTensor(
+                        [ratio, config.headDim], rng: &rng, scale: 0.02)
+                let normComp = RMSNorm(
+                    weight: (try? loader.tryLoad(["\(cbase).norm.weight"]))
+                        ?? AssemblyHelpers.onesTensor([config.headDim]),
+                    eps: config.normEps)
+                mla.compressor = Compressor(
+                    config: config, compressRatio: ratio,
+                    headDim: config.headDim, rotate: false,
+                    ape: apeComp, wkv: wkvComp, wgate: wgateComp,
+                    norm: normComp)
+            }
+
             // ---- MoE FFN ----
             let gateW = try! loadLinear(loader, base: "\(lp).ffn.gate",
                                         inF: dim, outF: nExperts,

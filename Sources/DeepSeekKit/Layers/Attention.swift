@@ -28,8 +28,24 @@ public final class MLA {
     public let attnSink: Tensor
 
     public let rope: RoPE
-    
+
+    /// Optional KV-compressor for layers with `compressRatio > 0`.
+    /// Aggregates `compressRatio` consecutive raw tokens into one
+    /// "compressed memory" entry; the entries are concatenated to the
+    /// raw sliding window as additional keys/values at attention time,
+    /// extending effective context past the trained `windowSize` while
+    /// staying in-distribution. Nil for `compressRatio == 0` layers.
+    public var compressor: Compressor? = nil
+
+    /// Raw sliding-window KV cache. Same semantics as the previous
+    /// `kvCache` (per-token KV writes + sliding window mask at
+    /// attention time). [B, S_window, headDim] bf16.
     public private(set) var kvCache: MLXArray?
+
+    /// Compressed long-range KV cache. Populated by `compressor` —
+    /// one entry per `compressRatio` raw tokens. [B, S_compressed,
+    /// headDim] bf16. Nil until the first compressed entry is emitted.
+    public private(set) var compressedCache: MLXArray?
 
     public init(config: ModelConfig, layerId: Int,
                 wqA: Linear, qNorm: RMSNorm, wqB: Linear,
@@ -65,6 +81,8 @@ public final class MLA {
 
     public func releaseCache() {
         kvCache = nil
+        compressedCache = nil
+        compressor?.releaseState()
     }
 
     @discardableResult
@@ -129,6 +147,31 @@ public final class MLA {
         MLX.eval(kvCache!)
         let currentKV = kvCache!   // bf16
 
+        // Invoke the Compressor (if present) to emit / update compressed
+        // long-range KV entries. Each entry aggregates `compressRatio`
+        // consecutive raw tokens via softmax-weighted pooling. Wired
+        // only for layers with `compressRatio > 0` (and the non-overlap
+        // path, i.e. ratio != 4 for now). The compressed entries are
+        // concatenated to the raw sliding window as additional keys
+        // at SDPA time, restoring the architectural "memory" past the
+        // trained window.
+        if let comp = compressor {
+            // Make sure the Compressor has its RoPE freqs (gather at
+            // stride=ratio from MLA's full freqs table). Set once.
+            if comp.freqs == nil { comp.freqs = rope.freqs }
+            // xIn is [B, S, dim] — exactly what Compressor expects.
+            if let newCompressed = comp(xIn, startPos: startPos) {
+                let newCompressedBf16 = newCompressed.array.asType(.bfloat16)
+                if let existing = compressedCache {
+                    compressedCache = concatenated(
+                        [existing, newCompressedBf16], axis: 1)
+                } else {
+                    compressedCache = newCompressedBf16
+                }
+                MLX.eval(compressedCache!)
+            }
+        }
+
         // Sliding-window attention.
         //
         // The model was trained with `windowSize` = 128 raw KV plus the
@@ -148,10 +191,23 @@ public final class MLA {
         // within that slice.
         let cacheLen = currentKV.shape[1]
         let attendStart = max(0, startPos - (windowSize - 1))
-        let kvSlice = attendStart > 0
+        let rawSlice = attendStart > 0
             ? currentKV[0..., attendStart..<cacheLen, 0...]
             : currentKV
-        let L = kvSlice.shape[1]
+        let Lraw = rawSlice.shape[1]
+        let Lcomp = compressedCache?.shape[1] ?? 0
+
+        // Full attention KV is the compressed long-range entries
+        // followed by the raw sliding-window slice. Order matters: the
+        // mask construction below assumes compressed columns come
+        // first.
+        let fullKV: MLXArray
+        if Lcomp > 0, let comp = compressedCache {
+            fullKV = concatenated([comp, rawSlice], axis: 1)
+        } else {
+            fullKV = rawSlice
+        }
+        let L = fullKV.shape[1]
 
         // Run SDPA in bf16 to match the cached K/V dtype and pick up the
         // bf16 kernel. q comes in f32 (rsqrt + RoPE done in f32 above) —
@@ -159,27 +215,38 @@ public final class MLA {
         let qPerToken = q.reshaped([B, S, nHeads, headDim])
             .transposed(0, 2, 1, 3)
             .asType(.bfloat16)                          // [B, nHeads, S, headDim] bf16
-        let kPerToken = kvSlice.expandedDimensions(axes: [1])  // [B, 1, L, headDim] bf16
-        let vPerToken = kvSlice.expandedDimensions(axes: [1])
+        let kPerToken = fullKV.expandedDimensions(axes: [1])  // [B, 1, L, headDim] bf16
+        let vPerToken = fullKV.expandedDimensions(axes: [1])
 
-        // Build the sliding-window causal additive mask of shape (S, L).
-        //   Row i  → query at absolute position `startPos + i`
-        //   Col j  → key   at absolute position `attendStart + j`
-        // Allowed iff:
-        //   (attendStart + j) ≤ (startPos + i)               -- causal
-        //   (startPos + i) - (attendStart + j) < windowSize  -- sliding window
+        // Build the additive mask of shape (S, L).
+        //
+        // Layout:
+        //   columns [0..Lcomp)        → compressed entries (always
+        //                                allowed for all queries — they
+        //                                live in the older-than-window
+        //                                past). Causality fudge of up
+        //                                to `compressRatio - 1` tokens
+        //                                is accepted as a quality
+        //                                trade-off.
+        //   columns [Lcomp..L)        → raw sliding-window KV. Standard
+        //                                causal + window mask applies.
         let queryPos = MLXArray((0..<S).map { Int32(startPos + $0) })
             .reshaped([S, 1])
-        let keyPos = MLXArray((0..<L).map { Int32(attendStart + $0) })
-            .reshaped([1, L])
-        let diff = queryPos - keyPos                                 // [S, L]
-        // Use bool→int8 conversion + multiply for logical AND.
-        let causal = (diff .>= 0).asType(.int8)
-        let inWin  = (diff .< Int32(windowSize)).asType(.int8)
-        let allowedF = (causal * inWin).asType(.bfloat16)            // 1.0 / 0.0
-        // additive bias: 0 where allowed, -1e9 elsewhere (safe vs -inf).
-        let mask = (MLXArray(Float(1.0)) - allowedF).asType(.bfloat16)
+        let keyPosRaw = MLXArray((0..<Lraw).map { Int32(attendStart + $0) })
+            .reshaped([1, Lraw])
+        let diffRaw = queryPos - keyPosRaw                             // [S, Lraw]
+        let causal = (diffRaw .>= 0).asType(.int8)
+        let inWin  = (diffRaw .< Int32(windowSize)).asType(.int8)
+        let allowedRawF = (causal * inWin).asType(.bfloat16)           // 1.0 / 0.0
+        let maskRaw = (MLXArray(Float(1.0)) - allowedRawF).asType(.bfloat16)
             * MLXArray(Float(-1e9)).asType(.bfloat16)
+        let mask: MLXArray
+        if Lcomp > 0 {
+            let maskComp = MLXArray.zeros([S, Lcomp]).asType(.bfloat16)
+            mask = concatenated([maskComp, maskRaw], axis: 1)
+        } else {
+            mask = maskRaw
+        }
 
         let o0 = MLXFast.scaledDotProductAttention(
             queries: qPerToken, keys: kPerToken, values: vPerToken,
