@@ -261,14 +261,24 @@ public final class MLA {
 
         let perGroupD = nHeads * headDim / nGroups
         let oView = o.reshaped([B, S, nGroups, perGroupD]) // [B, S, nGroups, perGroupD]
-        let woAR = woA.getDequantizedWeight().reshaped([nGroups, oLoraRank, perGroupD]) // [nGroups, oLoraRank, perGroupD]
-        
+        // `getFullyDequantizedWeight()` returns [outFeatures=nGroups*oLoraRank,
+        // inFeatures=perGroupD] regardless of source format (custom FP4/FP8
+        // or MLX-native int4 triplet — for the latter it invokes MLX's
+        // `dequantized()` to invert the quant). The reshape then folds the
+        // first axis into the per-group structure expected by the math.
+        let woAFull = woA.getFullyDequantizedWeight()
+        let woAR = woAFull.reshaped([nGroups, oLoraRank, perGroupD])
+
         var oGroupResults: [MLXArray] = []
         for g in 0..<nGroups {
             let oG = oView[0..., 0..., g, 0...] // [B, S, perGroupD]
             let wG = woAR[g, 0..., 0...] // [oLoraRank, perGroupD]
             let wG_T = wG.transposed() // [perGroupD, oLoraRank]
-            let oR_G = matmul(oG, wG_T) // [B, S, oLoraRank]
+            // Cast weight to oG's dtype: oG is f32 (post-RoPE), wG may
+            // be bf16 (from MLX-native dequant). matmul requires matching.
+            let wG_T_cast = wG_T.dtype == oG.dtype
+                ? wG_T : wG_T.asType(oG.dtype)
+            let oR_G = matmul(oG, wG_T_cast) // [B, S, oLoraRank]
             oGroupResults.append(oR_G.expandedDimensions(axes: [2])) // [B, S, 1, oLoraRank]
         }
         let oR = concatenated(oGroupResults, axis: 2) // [B, S, nGroups, oLoraRank]

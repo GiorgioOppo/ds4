@@ -206,6 +206,34 @@ public final class Linear {
             && loader.dtype(of: "\(base).biases") != nil
     }
 
+    /// Returns the FULLY dequantized [outFeatures, inFeatures] weight,
+    /// regardless of source format. Use this when downstream code
+    /// needs to reshape / slice the weight in custom ways (e.g. the
+    /// per-group woA matmul in MLA) — paths that bypass `callAsFunction`
+    /// and therefore can't go through `MLXFast.quantizedMatmul`.
+    ///
+    /// For MLX-native triplets (which `getDequantizedWeight()` would
+    /// otherwise return in their packed int4 form), invokes MLX's
+    /// `dequantized()` to invert the quantization.
+    public func getFullyDequantizedWeight() -> MLXArray {
+        if let triple = getMLXQuant() {
+            // MLX-native source: invert the int4 quant.
+            // groupSize=64, bits=4 is the affine-mode default; matches
+            // attention/shared/embed in the user's checkpoint. mxfp4
+            // (groupSize=32) is only used by SwitchMLP which doesn't
+            // come through this code path.
+            let biases = triple.biases ?? MLXArray.zeros(
+                like: triple.scales)
+            return dequantized(
+                triple.w,
+                scales: triple.scales,
+                biases: biases,
+                groupSize: 64,
+                bits: 4)
+        }
+        return getDequantizedWeight()
+    }
+
     public func getDequantizedWeight() -> MLXArray {
         let w = self.weight
         var wArr = w.array
