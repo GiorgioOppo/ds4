@@ -337,10 +337,10 @@ public final class WeightLoader {
             }
         }
         if added > 0 {
-            FileHandle.standardError.write(Data(
-                "[loader] registered \(added) HF-style aliases "
-                + "(model.X → X, gate_proj/up_proj/down_proj → w1/w3/w2 "
-                + "inside shared_experts)\n".utf8))
+            let msg = "[loader] registered \(added) HF-style aliases "
+                    + "(model.X → X, gate_proj/up_proj/down_proj → w1/w3/w2 "
+                    + "inside shared_experts)\n"
+            FileHandle.standardError.write(Data(msg.utf8))
         }
     }
 

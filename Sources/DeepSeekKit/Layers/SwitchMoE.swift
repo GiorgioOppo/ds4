@@ -124,9 +124,9 @@ public final class SwitchMoEFFN: FFNModule {
               let upT   = upProj.getPackedTriple(),
               let downT = downProj.getPackedTriple()
         else {
-            FileHandle.standardError.write(Data(
-                "[SwitchMoE layer=\(layerId)] missing packed weight; "
-                + "routed-expert contribution skipped this step.\n".utf8))
+            let msg = "[SwitchMoE layer=\(layerId)] missing packed weight; "
+                    + "routed-expert contribution skipped this step.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
             let sharedOnly = sharedExpert(xFlat).array
             return Tensor(array: sharedOnly.reshaped(shape), dtype: x.dtype)
         }

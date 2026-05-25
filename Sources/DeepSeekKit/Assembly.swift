@@ -175,10 +175,10 @@ public extension Transformer {
         let mlxQuantExperts: Bool = ProcessInfo.processInfo
             .environment["DEEPSEEK_MLX_QUANT"] == "1"
         if mlxQuantExperts {
-            FileHandle.standardError.write(Data(
-                "[config] DEEPSEEK_MLX_QUANT=1 — routed-expert Linears "
-                + "will use MLXFast.quantizedMatmul (groupSize=64, "
-                + "bits=4) after one-time re-quant.\n".utf8))
+            let msg = "[config] DEEPSEEK_MLX_QUANT=1 — routed-expert Linears "
+                    + "will use quantizedMatmul (groupSize=64, "
+                    + "bits=4) after one-time re-quant.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
         }
 
         let loader = try WeightLoader(directory: weightsDir)
