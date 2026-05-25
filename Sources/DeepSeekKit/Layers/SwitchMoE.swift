@@ -47,17 +47,17 @@ public final class SwitchProj {
     }
 
     /// Returns the (packed weight, scales, biases) triplet from the
-    /// loader cache (or via on-demand disk read if not cached). All
-    /// three must resolve or this returns nil — the caller falls
-    /// back to a no-op contribution for this layer.
+    /// loader cache (or via on-demand disk read if not cached). For
+    /// `mxfp4` mode the checkpoint stores no biases; `biases` is then
+    /// returned as nil and the kernel handles that path natively.
     public func getPackedTriple() -> (w: MLXArray,
                                        scales: MLXArray,
-                                       biases: MLXArray)? {
+                                       biases: MLXArray?)? {
         guard let loader = loader else { return nil }
         guard let qW = (try? loader.load(weightName))?.array,
-              let qS = (try? loader.load(scalesName))?.array,
-              let qB = (try? loader.load(biasesName))?.array
+              let qS = (try? loader.load(scalesName))?.array
         else { return nil }
+        let qB = (try? loader.load(biasesName))?.array
         return (qW, qS, qB)
     }
 }
@@ -146,7 +146,7 @@ public final class SwitchMoEFFN: FFNModule {
             : xFlat.array.asType(.bfloat16)
 
         // gate_proj  · x  →  [N*K, inter_dim]
-        let yGate = MLXFast.gatherQuantizedMatmul(
+        let yGate = gatherQuantizedMatmul(
             xBf16, gateT.w,
             scales: gateT.scales, biases: gateT.biases,
             lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
@@ -154,7 +154,7 @@ public final class SwitchMoEFFN: FFNModule {
             groupSize: gateProj.groupSize, bits: gateProj.bits)
 
         // up_proj    · x  →  [N*K, inter_dim]
-        let yUp = MLXFast.gatherQuantizedMatmul(
+        let yUp = gatherQuantizedMatmul(
             xBf16, upT.w,
             scales: upT.scales, biases: upT.biases,
             lhsIndices: lhsIdxs, rhsIndices: rhsIdxs,
@@ -175,7 +175,7 @@ public final class SwitchMoEFFN: FFNModule {
         // h is already per-output row (no further lhs_indices gather);
         // we still need rhs_indices to pick the right expert slice.
         let lhsIdxsDown = MLXArray((0..<(N * K)).map { Int32($0) })
-        let yDown = MLXFast.gatherQuantizedMatmul(
+        let yDown = gatherQuantizedMatmul(
             hMid, downT.w,
             scales: downT.scales, biases: downT.biases,
             lhsIndices: lhsIdxsDown, rhsIndices: rhsIdxs,

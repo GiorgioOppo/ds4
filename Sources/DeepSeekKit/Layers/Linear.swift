@@ -134,7 +134,11 @@ public final class Linear {
     ///
     /// Returns nil for eager-mode Linears (no `_loader`) — the caller
     /// must fall back to the standard path.
-    public func getMLXQuant() -> (w: MLXArray, scales: MLXArray, biases: MLXArray)? {
+    /// Returns the (w, scales, biases) triplet. `biases` is optional —
+    /// some MLX quantization modes (notably `mxfp4`) don't carry an
+    /// explicit additive bias; the downstream kernel handles nil
+    /// directly.
+    public func getMLXQuant() -> (w: MLXArray, scales: MLXArray, biases: MLXArray?)? {
         guard let loader = _loader, let weightName = _weightName else {
             return nil
         }
@@ -146,16 +150,16 @@ public final class Linear {
         // Path A — MLX-native checkpoint: the triplet is ALREADY stored
         // on disk under `<base>.{weight,scales,biases}`. No re-quant
         // needed; just load. This is the mlx-community-style format.
+        // `biases` is optional: present for affine mode, absent for
+        // mxfp4.
         let nativeScalesName = "\(base).scales"
         let nativeBiasesName = "\(base).biases"
-        if loader.dtype(of: nativeScalesName) != nil,
-           loader.dtype(of: nativeBiasesName) != nil {
-            if let qW = (try? loader.load(weightName))?.array,
-               let qS = (try? loader.load(nativeScalesName))?.array,
-               let qB = (try? loader.load(nativeBiasesName))?.array {
-                return (qW, qS, qB)
-            }
-            return nil
+        if loader.dtype(of: nativeScalesName) != nil {
+            guard let qW = (try? loader.load(weightName))?.array,
+                  let qS = (try? loader.load(nativeScalesName))?.array
+            else { return nil }
+            let qB = (try? loader.load(nativeBiasesName))?.array
+            return (qW, qS, qB)
         }
 
         // Path B — old custom-format checkpoint (FP4/FP8 + block scale).
@@ -182,10 +186,10 @@ public final class Linear {
         // next clearCache (called by MoE after dispatch).
         MLX.eval(qW)
         MLX.eval(qS)
-        MLX.eval(qB)
+        if let qB = qB { MLX.eval(qB) }
         loader.storeRaw(qWKey, qW)
         loader.storeRaw(qSKey, qS)
-        loader.storeRaw(qBKey, qB)
+        if let qB = qB { loader.storeRaw(qBKey, qB) }
         return (qW, qS, qB)
     }
 
@@ -290,10 +294,11 @@ public final class Linear {
         //      Linear re-quantizes once on first use, caches.
         let preferMLXQuant = useMLXQuant || hasMLXNativeTriplet()
         if preferMLXQuant, let triple = getMLXQuant() {
-            // MLXFast expects bf16/fp16 activations against the
-            // quantized weight. Match the dtype of the scales.
+            // The quantized kernel expects bf16/fp16 activations
+            // against the quantized weight. Match the dtype of the
+            // scales.
             let xBf16 = xArr.dtype == .bfloat16 ? xArr : xArr.asType(.bfloat16)
-            let yArr = MLXFast.quantizedMatmul(
+            let yArr = quantizedMatmul(
                 xBf16, triple.w,
                 scales: triple.scales,
                 biases: triple.biases,
