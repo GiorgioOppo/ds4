@@ -78,6 +78,60 @@ public struct ModelConfig: Codable, Sendable {
     /// `pruned_experts` in config.json; serializes as a list of lists.
     public var prunedExperts: [[Int]] = []
 
+    // MARK: - MLX-native quantized checkpoint detection
+    //
+    // The HuggingFace mlx-community-style checkpoint ships its weights
+    // already in MLX's native quantized format: each weight is stored
+    // as `(weight, scales, biases)` triplet under a uniform name like
+    // `model.layers.K.ffn.switch_mlp.gate_proj.{weight,scales,biases}`,
+    // and `config.json` carries a top-level `"quantization"` dict
+    // describing the (groupSize, bits, mode) — globally and per-layer.
+    //
+    // This contrasts with the custom DeepSeek FP4-E2M1+E8M0 / FP8-E4M3
+    // checkpoint our original loader was written for, where every
+    // expert is a separate Linear and the dequant has to do a LUT
+    // round-trip via `Linear.getDequantizedWeight()` before matmul.
+    //
+    // When `quantization` is present, set `isMLXNative = true` and the
+    // Assembly takes a different code path: HF-name translation in
+    // the loader, `SwitchMLP` packed-expert MoE, direct
+    // `MLXFast.quantizedMatmul` over loaded triplets (no re-quant
+    // pass needed), and — eventually — the Compressor/Indexer/MTP
+    // modules whose weights are present in this checkpoint family.
+
+    /// True when `config.json` contained a top-level `quantization`
+    /// block. Drives the Assembly's choice of loader + module
+    /// implementations.
+    public var isMLXNative: Bool = false
+
+    /// Default MLX quant: (groupSize, bits, mode). Populated from the
+    /// top-level `quantization.{group_size,bits,mode}` keys.
+    public var mlxQuantDefault: MLXQuantSpec? = nil
+
+    /// Per-tensor MLX quant overrides, keyed by the tensor's logical
+    /// name (HF-style, e.g. `model.layers.0.ffn.switch_mlp.gate_proj`).
+    /// Empty when no overrides are present.
+    public var mlxQuantOverrides: [String: MLXQuantSpec] = [:]
+
+    /// A single MLX quantization spec.
+    public struct MLXQuantSpec: Codable, Sendable, Equatable {
+        public var groupSize: Int
+        public var bits: Int
+        public var mode: String
+
+        public init(groupSize: Int, bits: Int, mode: String) {
+            self.groupSize = groupSize; self.bits = bits; self.mode = mode
+        }
+    }
+
+    /// Resolve the quant spec for a given tensor logical name. Per-
+    /// tensor override wins over the default; nil when the checkpoint
+    /// is not MLX-native or the tensor isn't quantized.
+    public func mlxQuantSpec(for name: String) -> MLXQuantSpec? {
+        if let override = mlxQuantOverrides[name] { return override }
+        return mlxQuantDefault
+    }
+
     enum CodingKeys: String, CodingKey {
         case maxBatchSize = "max_batch_size"
         case maxSeqLen = "max_seq_len"
@@ -288,6 +342,41 @@ public struct ModelConfig: Codable, Sendable {
             self.prunedExperts = rows
         } else {
             self.prunedExperts = []
+        }
+
+        // MLX-native quantized checkpoint: parse the top-level
+        // `quantization` dict. Structure (mlx-community style):
+        //   "quantization": {
+        //     "group_size": 64, "bits": 4, "mode": "affine",
+        //     "model.layers.0.attn.wq_a": { "group_size": 64, "bits": 4, "mode": "affine" },
+        //     "model.layers.0.ffn.switch_mlp.gate_proj": { "group_size": 32, "bits": 4, "mode": "mxfp4" },
+        //     ...
+        //   }
+        // The top-level (group_size, bits, mode) keys are the default;
+        // anything else with a value of `{group_size, bits, mode}` is a
+        // per-tensor override.
+        if let q = flat["quantization"] as? [String: Any] {
+            self.isMLXNative = true
+            let defGroup = intOf(q["group_size"] as Any) ?? 64
+            let defBits  = intOf(q["bits"] as Any) ?? 4
+            let defMode  = (q["mode"] as? String) ?? "affine"
+            self.mlxQuantDefault = MLXQuantSpec(
+                groupSize: defGroup, bits: defBits, mode: defMode)
+            for (k, v) in q {
+                if k == "group_size" || k == "bits" || k == "mode" { continue }
+                guard let inner = v as? [String: Any],
+                      let g = intOf(inner["group_size"] as Any),
+                      let b = intOf(inner["bits"] as Any),
+                      let m = inner["mode"] as? String
+                else { continue }
+                self.mlxQuantOverrides[k] = MLXQuantSpec(
+                    groupSize: g, bits: b, mode: m)
+            }
+            FileHandle.standardError.write(Data(
+                ("[config] MLX-native quantized checkpoint detected: "
+                 + "default (group=\(defGroup), bits=\(defBits), "
+                 + "mode=\(defMode)), \(mlxQuantOverrides.count) per-tensor "
+                 + "overrides\n").utf8))
         }
 
         // Per-token active-expert count. Default 8. FFN dispatch cost
