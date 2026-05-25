@@ -302,22 +302,31 @@ public extension Transformer {
                           attnSink: attnSink, rope: rope,
                           kvCache: nil)
 
-            // Compressor wiring: only for non-overlap layers (ratio>0
-            // and ratio != 4). ratio == 4 layers need the overlap path
-            // + Indexer for full quality — those will land later; in
-            // the meantime they fall back to sliding-window only.
-            // ratio == 0 layers don't need compression at all.
-            if ratio > 0 && ratio != 4 {
+            // Compressor wiring for all `ratio > 0` layers. `coff`
+            // doubles for the overlap path (ratio==4), so wkv/wgate
+            // and `ape` carry 2× the channels: the first half feeds
+            // the overlap region (shared with the next group), the
+            // second half is the current group's main KV. Non-overlap
+            // (ratio > 4, typically 128) keeps coff=1.
+            //
+            // Indexer (top-k learned scoring over compressed entries)
+            // is still NOT wired — ratio==4 layers attend to ALL
+            // compressed entries via the mask in MLA, which is a
+            // quality trade-off vs the trained sparse-attn but
+            // correctness-preserving.
+            if ratio > 0 {
                 let cbase = "\(lp).attn.compressor"
+                let coff = (ratio == 4) ? 2 : 1
+                let compOut = coff * config.headDim
                 let wkvComp = try! loadLinear(
                     loader, base: "\(cbase).wkv",
-                    inF: dim, outF: config.headDim, rng: &rng)
+                    inF: dim, outF: compOut, rng: &rng)
                 let wgateComp = try! loadLinear(
                     loader, base: "\(cbase).wgate",
-                    inF: dim, outF: config.headDim, rng: &rng)
+                    inF: dim, outF: compOut, rng: &rng)
                 let apeComp = (try? loader.tryLoad(["\(cbase).ape"]))
                     ?? AssemblyHelpers.randomTensor(
-                        [ratio, config.headDim], rng: &rng, scale: 0.02)
+                        [ratio, compOut], rng: &rng, scale: 0.02)
                 let normComp = RMSNorm(
                     weight: (try? loader.tryLoad(["\(cbase).norm.weight"]))
                         ?? AssemblyHelpers.onesTensor([config.headDim]),
@@ -608,17 +617,20 @@ public extension Transformer {
                           woA: woA, woB: woB,
                           attnSink: attnSink, rope: rope,
                           kvCache: nil)
-            // Compressor: only for non-overlap layers (ratio>0 && !=4)
-            // — same rule as the main layer loop.
-            if ratio > 0 && ratio != 4 {
+            // Compressor: for ALL ratio>0 layers. coff doubles for the
+            // overlap path (ratio==4) — same rule as the main layer
+            // construction.
+            if ratio > 0 {
                 let cbase = "\(lp).attn.compressor"
+                let coff = (ratio == 4) ? 2 : 1
+                let compOut = coff * config.headDim
                 let wkvComp = try! loadLinear(loader, base: "\(cbase).wkv",
-                                               inF: dim, outF: config.headDim, rng: &rng)
+                                               inF: dim, outF: compOut, rng: &rng)
                 let wgateComp = try! loadLinear(loader, base: "\(cbase).wgate",
-                                                 inF: dim, outF: config.headDim, rng: &rng)
+                                                 inF: dim, outF: compOut, rng: &rng)
                 let apeComp = (try? loader.tryLoad(["\(cbase).ape"]))
                     ?? AssemblyHelpers.randomTensor(
-                        [ratio, config.headDim], rng: &rng, scale: 0.02)
+                        [ratio, compOut], rng: &rng, scale: 0.02)
                 let normComp = RMSNorm(
                     weight: (try? loader.tryLoad(["\(cbase).norm.weight"]))
                         ?? AssemblyHelpers.onesTensor([config.headDim]),

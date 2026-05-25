@@ -86,12 +86,10 @@ public final class Compressor {
     @discardableResult
     public func callAsFunction(_ x: Tensor, startPos: Int) -> Tensor? {
         guard let kvCacheTarget = kvCache else {
-            FileHandle.standardError.write(Data(
-                "[Compressor] kvCache not assigned; skipping forward\n".utf8))
+            let msg = "[Compressor] kvCache not assigned; skipping forward\n"
+            FileHandle.standardError.write(Data(msg.utf8))
             return nil
         }
-        // Overlap path (ratio == 4) not yet implemented; bail.
-        if overlap { return nil }
 
         let xArr = x.array
         let B = xArr.shape[0]
@@ -99,23 +97,41 @@ public final class Compressor {
         let ratio = compressRatio
         let d = headDim
         let rd = ropeHeadDim
+        // coff = 1 for non-overlap layers (ratio > 4), 2 for overlap
+        // layers (ratio == 4). The wkv/wgate output is coff*d channels;
+        // the rolling state is [B, coff*ratio, coff*d].
+        let coff = overlap ? 2 : 1
+        let outDim = coff * d
 
         // Compute kv and score from x. Reference does this in f32 for
         // pooling precision; we follow.
         let xF = xArr.dtype == .float32 ? xArr : xArr.asType(.float32)
         let kvFlat = wkv(Tensor(array: xF.reshaped([B * S, dim]), dtype: .f32)).array
         let scoreFlat = wgate(Tensor(array: xF.reshaped([B * S, dim]), dtype: .f32)).array
-        let kv = kvFlat.reshaped([B, S, d])
-        let score = scoreFlat.reshaped([B, S, d])
+        let kv = kvFlat.reshaped([B, S, outDim])
+        let score = scoreFlat.reshaped([B, S, outDim])
 
         if startPos == 0 {
-            return forwardPrefill(kv: kv, score: score, B: B, S: S, ratio: ratio,
-                                   d: d, rd: rd, kvCache: kvCacheTarget,
-                                   xDtype: xArr.dtype)
+            if overlap {
+                return forwardPrefillOverlap(kv: kv, score: score, B: B, S: S,
+                                              ratio: ratio, d: d, rd: rd,
+                                              kvCache: kvCacheTarget, xDtype: xArr.dtype)
+            } else {
+                return forwardPrefill(kv: kv, score: score, B: B, S: S, ratio: ratio,
+                                       d: d, rd: rd, kvCache: kvCacheTarget,
+                                       xDtype: xArr.dtype)
+            }
         } else {
-            return forwardDecode(kv: kv, score: score, B: B, ratio: ratio,
-                                  d: d, rd: rd, kvCache: kvCacheTarget,
-                                  startPos: startPos, xDtype: xArr.dtype)
+            if overlap {
+                return forwardDecodeOverlap(kv: kv, score: score, B: B,
+                                             ratio: ratio, d: d, rd: rd,
+                                             kvCache: kvCacheTarget, startPos: startPos,
+                                             xDtype: xArr.dtype)
+            } else {
+                return forwardDecode(kv: kv, score: score, B: B, ratio: ratio,
+                                      d: d, rd: rd, kvCache: kvCacheTarget,
+                                      startPos: startPos, xDtype: xArr.dtype)
+            }
         }
     }
 
@@ -169,6 +185,175 @@ public final class Compressor {
         return Tensor(array: compressed.asType(xDtype), dtype: .f32)
     }
 
+    // MARK: - Prefill overlap path (ratio == 4)
+
+    /// Overlap prefill. Each compressed entry now aggregates `2*ratio`
+    /// raw tokens via softmax-weighted pooling — the current group's
+    /// `ratio` tokens (from positions `[d, 2d)` of the wkv output)
+    /// plus the previous group's `ratio` tokens (from positions
+    /// `[0, d)`). The first group has no previous → those slots get
+    /// filled with `-inf` (score) / `0` (kv) so they zero-out via
+    /// softmax.
+    private func forwardPrefillOverlap(kv: MLXArray, score: MLXArray,
+                                        B: Int, S: Int, ratio: Int,
+                                        d: Int, rd: Int,
+                                        kvCache: MLXArray,
+                                        xDtype: MLX.DType) -> Tensor? {
+        let cutoff = S - (S % ratio)
+        let remainder = S - cutoff
+
+        // Initialise state with the last `ratio` tokens of the aligned
+        // prefix — they form the OVERLAP for the next decode-time
+        // emit. Plus the remainder in the "current" half.
+        if cutoff >= ratio {
+            ensureState(B: B)
+            // kv_state[:, :ratio]   <- kv[:, cutoff-ratio : cutoff]   (prev's "first" buffer)
+            // score_state[:, :ratio] <- score[:, cutoff-ratio : cutoff] + ape
+            let kvOverlap = kv[0..., (cutoff - ratio)..<cutoff, 0...]
+            let scoreOverlap = score[0..., (cutoff - ratio)..<cutoff, 0...] +
+                               ape.array.expandedDimensions(axes: [0])
+            kvState = updateStateSlot(state: kvState!, start: 0, count: ratio,
+                                       value: kvOverlap)
+            scoreState = updateStateSlot(state: scoreState!, start: 0, count: ratio,
+                                          value: scoreOverlap)
+        }
+        if remainder > 0 {
+            ensureState(B: B)
+            let kvRem = kv[0..., cutoff..<S, 0...]
+            let scoreRem = score[0..., cutoff..<S, 0...] +
+                           ape.array[0..<remainder, 0...].expandedDimensions(axes: [0])
+            // For overlap, the "current" half starts at offset = ratio.
+            kvState = updateStateSlot(state: kvState!, start: ratio, count: remainder,
+                                       value: kvRem)
+            scoreState = updateStateSlot(state: scoreState!, start: ratio, count: remainder,
+                                          value: scoreRem)
+        }
+
+        guard cutoff >= ratio else { return nil }
+
+        // Group the aligned prefix: [B, nGroups, ratio, 2*d]
+        let nGroups = cutoff / ratio
+        let kvGroups = kv[0..., 0..<cutoff, 0...]
+            .reshaped([B, nGroups, ratio, 2 * d])
+        let scoreGroups = (score[0..., 0..<cutoff, 0...] +
+                           ape.array.expandedDimensions(axes: [0, 1]))
+            .reshaped([B, nGroups, ratio, 2 * d])
+
+        // overlap_transform → [B, nGroups, 2*ratio, d]: current group's
+        // [d, 2d) channels go into positions [ratio, 2*ratio); the
+        // previous group's [0, d) channels (shifted +1 along the
+        // nGroups axis, with the first slot zero-filled) go into
+        // positions [0, ratio).
+        let kvOT = overlapTransform(kvGroups, B: B, nGroups: nGroups,
+                                     ratio: ratio, d: d, fill: 0)
+        let scoreOT = overlapTransform(scoreGroups, B: B, nGroups: nGroups,
+                                        ratio: ratio, d: d, fill: -1e30)
+
+        let attn = softmax(scoreOT, axis: 2)             // [B, nGroups, 2*ratio, d]
+        var compressed = (kvOT * attn).sum(axes: [2])    // [B, nGroups, d]
+
+        compressed = applyNormAndRoPE(compressed: compressed,
+                                       B: B, nNew: nGroups, d: d, rd: rd,
+                                       startCompressIdx: 0)
+        writeCacheSlice(kvCache: kvCache, start: 0, count: nGroups, value: compressed)
+        return Tensor(array: compressed.asType(xDtype), dtype: .f32)
+    }
+
+    // MARK: - Decode overlap path
+
+    /// Overlap decode. Writes the new raw token's kv to the "current"
+    /// half of the state buffer (slot `ratio + start_pos % ratio`).
+    /// On a group boundary (i.e. `(start_pos+1) % ratio == 0`), emits
+    /// one compressed entry that aggregates `2*ratio` raw tokens via
+    /// the previous group's first-half channels + the current group's
+    /// second-half channels — then shifts current → previous for the
+    /// next group.
+    private func forwardDecodeOverlap(kv: MLXArray, score: MLXArray,
+                                       B: Int, ratio: Int, d: Int, rd: Int,
+                                       kvCache: MLXArray,
+                                       startPos: Int, xDtype: MLX.DType) -> Tensor? {
+        ensureState(B: B)
+        let slot = ratio + (startPos % ratio)
+
+        let kvNew = kv[0..., 0..<1, 0...]                          // [B, 1, 2*d]
+        let scoreNew = score[0..., 0..<1, 0...] +
+                       ape.array[(startPos % ratio)..<((startPos % ratio) + 1), 0...]
+                         .expandedDimensions(axes: [0])             // [B, 1, 2*d]
+        kvState = updateStateSlot(state: kvState!, start: slot, count: 1, value: kvNew)
+        scoreState = updateStateSlot(state: scoreState!, start: slot, count: 1, value: scoreNew)
+
+        let shouldEmit = ((startPos + 1) % ratio) == 0
+        guard shouldEmit else { return nil }
+
+        // Gather: prev's "first" half channels [:d] + current's "second"
+        // half channels [d:2d] → [B, 2*ratio, d]
+        let prevHalf = kvState![0..., 0..<ratio, 0..<d]
+        let currHalf = kvState![0..., ratio..<(2 * ratio), d..<(2 * d)]
+        let kvFull = concatenated([prevHalf, currHalf], axis: 1)
+
+        let prevScore = scoreState![0..., 0..<ratio, 0..<d]
+        let currScore = scoreState![0..., ratio..<(2 * ratio), d..<(2 * d)]
+        let scoreFull = concatenated([prevScore, currScore], axis: 1)
+
+        let attn = softmax(scoreFull, axis: 1)                     // [B, 2*ratio, d]
+        var compressed = (kvFull * attn).sum(axes: [1], keepDims: true)  // [B, 1, d]
+
+        compressed = applyNormAndRoPE(compressed: compressed,
+                                       B: B, nNew: 1, d: d, rd: rd,
+                                       startCompressIdx: startPos / ratio)
+        writeCacheSlice(kvCache: kvCache, start: startPos / ratio, count: 1, value: compressed)
+
+        // Shift: current → previous for the next group. The "current"
+        // half (slots [ratio..2*ratio)) becomes the "previous" half
+        // (slots [0..ratio)) for the next compression.
+        let curKVSlab = kvState![0..., ratio..<(2 * ratio), 0...]
+        let curScoreSlab = scoreState![0..., ratio..<(2 * ratio), 0...]
+        kvState = updateStateSlot(state: kvState!, start: 0, count: ratio,
+                                   value: curKVSlab)
+        scoreState = updateStateSlot(state: scoreState!, start: 0, count: ratio,
+                                      value: curScoreSlab)
+        // Reset the "current" half to zeros / -inf for the new group.
+        let zeroCurr = MLXArray.zeros([B, ratio, 2 * d]).asType(.float32)
+        let negCurr = MLXArray.zeros([B, ratio, 2 * d]).asType(.float32) +
+                      MLXArray(Float(-1e30)).asType(.float32)
+        kvState = updateStateSlot(state: kvState!, start: ratio, count: ratio,
+                                   value: zeroCurr)
+        scoreState = updateStateSlot(state: scoreState!, start: ratio, count: ratio,
+                                      value: negCurr)
+
+        return Tensor(array: compressed.asType(xDtype), dtype: .f32)
+    }
+
+    // MARK: - overlap_transform helper
+
+    /// Mirrors `Compressor.overlap_transform` from the Python reference
+    /// (model.py:307-314). Input `[B, nGroups, ratio, 2*d]`, output
+    /// `[B, nGroups, 2*ratio, d]`.
+    /// - First `ratio` slots: previous group's `[0..d)` channels
+    ///   (shifted +1 along nGroups; first slot is `fill`).
+    /// - Second `ratio` slots: current group's `[d..2*d)` channels.
+    private func overlapTransform(_ tensor: MLXArray,
+                                    B: Int, nGroups: Int,
+                                    ratio: Int, d: Int,
+                                    fill: Float) -> MLXArray {
+        // Split along the last axis.
+        let firstHalf = tensor[0..., 0..., 0..., 0..<d]        // [B, nGroups, ratio, d]
+        let secondHalf = tensor[0..., 0..., 0..., d..<(2 * d)] // [B, nGroups, ratio, d]
+
+        // Shift firstHalf down by 1 along nGroups (axis=1), filling the
+        // first slot with `fill`. This gives "previous group's first
+        // half" for each output position.
+        let fillSlab = MLXArray.zeros([B, 1, ratio, d]).asType(tensor.dtype) +
+                       MLXArray(Float(fill)).asType(tensor.dtype)
+        let shifted = nGroups > 1
+            ? concatenated([fillSlab, firstHalf[0..., 0..<(nGroups - 1), 0..., 0...]],
+                            axis: 1)
+            : fillSlab
+
+        // Concat along the ratio axis (axis=2): [shifted | secondHalf]
+        return concatenated([shifted, secondHalf], axis: 2)
+    }
+
     // MARK: - Decode path
 
     private func forwardDecode(kv: MLXArray, score: MLXArray,
@@ -214,15 +399,20 @@ public final class Compressor {
 
     /// Allocates `kvState` and `scoreState` on first use. `scoreState`
     /// is initialised to a large negative (effectively -inf for
-    /// softmax) so unused slots do not dilute the weighted sum.
+    /// softmax) so unused slots do not dilute the weighted sum. Shape
+    /// is `[B, coff*ratio, coff*d]` — twice as wide on both axes for
+    /// overlap layers.
     private func ensureState(B: Int) {
         let ratio = compressRatio
         let d = headDim
+        let coff = overlap ? 2 : 1
+        let stateLen = coff * ratio
+        let stateDim = coff * d
         if kvState == nil {
-            kvState = MLXArray.zeros([B, ratio, d]).asType(.float32)
+            kvState = MLXArray.zeros([B, stateLen, stateDim]).asType(.float32)
         }
         if scoreState == nil {
-            scoreState = MLXArray.zeros([B, ratio, d]).asType(.float32) +
+            scoreState = MLXArray.zeros([B, stateLen, stateDim]).asType(.float32) +
                          MLXArray(Float(-1e30)).asType(.float32)
         }
     }
