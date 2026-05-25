@@ -164,11 +164,15 @@ public final class Compressor {
         guard cutoff >= ratio else { return nil }   // not enough for one group
 
         // Group the aligned prefix into [B, cutoff/ratio, ratio, d].
+        // `ape` is shape `[ratio, d]` — must reshape `score` to 4D
+        // FIRST, then add: 3D score `[B, cutoff, d]` + 4D
+        // `ape.expanded(0,1)` `[1, 1, ratio, d]` does not broadcast
+        // and aborts with [broadcast_shapes] (cutoff != ratio).
         let nGroups = cutoff / ratio
         let kvGroups = kv[0..., 0..<cutoff, 0...].reshaped([B, nGroups, ratio, d])
-        let scoreGroups = (score[0..., 0..<cutoff, 0...] +
-                           ape.array.expandedDimensions(axes: [0, 1]))
+        let scoreGroups = score[0..., 0..<cutoff, 0...]
             .reshaped([B, nGroups, ratio, d])
+            + ape.array.expandedDimensions(axes: [0, 1])
 
         // Softmax over the group axis, weighted sum → one compressed entry per group.
         let attn = softmax(scoreGroups, axis: 2)        // [B, nGroups, ratio, d]
@@ -231,13 +235,16 @@ public final class Compressor {
 
         guard cutoff >= ratio else { return nil }
 
-        // Group the aligned prefix: [B, nGroups, ratio, 2*d]
+        // Group the aligned prefix: [B, nGroups, ratio, 2*d].
+        // Same reshape-then-add ordering as the non-overlap path: a 3D
+        // score `[B, cutoff, 2*d]` plus a 4D `ape.expanded(0,1)`
+        // `[1, 1, ratio, 2*d]` doesn't broadcast (cutoff vs ratio).
         let nGroups = cutoff / ratio
         let kvGroups = kv[0..., 0..<cutoff, 0...]
             .reshaped([B, nGroups, ratio, 2 * d])
-        let scoreGroups = (score[0..., 0..<cutoff, 0...] +
-                           ape.array.expandedDimensions(axes: [0, 1]))
+        let scoreGroups = score[0..., 0..<cutoff, 0...]
             .reshaped([B, nGroups, ratio, 2 * d])
+            + ape.array.expandedDimensions(axes: [0, 1])
 
         // overlap_transform → [B, nGroups, 2*ratio, d]: current group's
         // [d, 2d) channels go into positions [ratio, 2*ratio); the
