@@ -199,13 +199,19 @@ public final class SwitchMoEFFN: FFNModule {
             groupSize: upProj.groupSize, bits: upProj.bits,
             mode: SwitchProj.parseMode(upProj.mode))
 
-        // SwiGLU: silu(gate) * up, optional symmetric clamp.
-        var hMid = (yGate * sigmoid(yGate)) * yUp     // [N*K, 1, inter]
+        // SwiGLU with the reference clamp (model.py Expert.forward):
+        // `up` clamped symmetrically to [-limit, limit], `gate` only on
+        // the max side, applied to the projections BEFORE silu/multiply
+        // (not to their product). No-op at the default swiglu_limit==0.
+        var g = yGate
+        var u = yUp
         if swigluLimit > 0 {
             let lim = MLXArray(Float(swigluLimit)).asType(.bfloat16)
             let nlim = MLXArray(Float(-swigluLimit)).asType(.bfloat16)
-            hMid = MLX.minimum(MLX.maximum(hMid, nlim), lim)
+            u = MLX.minimum(MLX.maximum(u, nlim), lim)   // symmetric
+            g = MLX.minimum(g, lim)                      // max side only
         }
+        let hMid = (g * sigmoid(g)) * u                  // [N*K, 1, inter]
 
         // down_proj · h  →  [N*K, 1, dim]
         // hMid is already 3D `[N*K, 1, inter]`; lhs_indices is identity.

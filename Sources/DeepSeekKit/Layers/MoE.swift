@@ -103,8 +103,19 @@ public final class Expert {
     }
 
     public func callAsFunction(_ x: Tensor) -> Tensor {
-        let g = w1(x).array
-        let u = w3(x).array
+        var g = w1(x).array
+        var u = w3(x).array
+        // SwiGLU clamp, matching the reference Expert.forward
+        // (model.py): `up` is clamped symmetrically to [-limit, limit]
+        // and `gate` only on the max side, BEFORE silu/multiply. No-op
+        // at the default `swiglu_limit == 0`.
+        if swigluLimit > 0 {
+            let limG = MLXArray(Float(swigluLimit)).asType(g.dtype)
+            let limU = MLXArray(Float(swigluLimit)).asType(u.dtype)
+            let nlimU = MLXArray(Float(-swigluLimit)).asType(u.dtype)
+            u = MLX.minimum(MLX.maximum(u, nlimU), limU)   // symmetric
+            g = MLX.minimum(g, limG)                       // max side only
+        }
         let h = (g * sigmoid(g)) * u
         return w2(Tensor(array: h, dtype: x.dtype))
     }
