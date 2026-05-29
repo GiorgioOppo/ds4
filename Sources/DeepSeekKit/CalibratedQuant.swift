@@ -238,19 +238,18 @@ public func quantizeBF16ToInt8Calibrated(
 /// `Int8Quant.swift`, qui replicato per non dover esporre il
 /// privato).
 ///
-/// ⚠️ LIMITAZIONE: AWQ per essere matematicamente corretto richiede
-/// che al runtime le activations vengano divise per `s` per-channel
-/// PRIMA di entrare nel layer (la moltiplicazione dei pesi per `s`
-/// e la divisione delle activations per `s` si cancellano in
-/// esatto). Questo modulo NON wira ancora quell'inverse-scale —
-/// quindi il path produce un quant valido ma matematicamente
-/// shiftato. Per il QAT scenario (re-train brevemente dopo la
-/// quant) è comunque utile; per drop-in inference va aggiunto un
-/// vettore di scales per-channel che `Linear.forward` legge e
-/// applica via `Elementwise.scale` prima del GEMM.
-///
-/// Follow-up: aggiungere un campo `inverseChannelScale: Tensor?`
-/// a `Linear` + un pre-mul nel forward quando presente.
+/// ⚠️ LIMITAZIONE (lato I/O, non runtime): AWQ per essere
+/// matematicamente corretto richiede che al runtime le activations
+/// vengano moltiplicate per `1/s` per-channel PRIMA del GEMM (la
+/// moltiplicazione dei pesi per `s` e quella delle activations per
+/// `1/s` si cancellano in esatto). Quel pre-mul ESISTE già:
+/// `Linear` applica `inverseChannelScale` nel suo forward quando il
+/// tensore è presente. Ciò che MANCA è la PERSISTENZA — il converter
+/// non scrive ancora il vettore `1/s` come tensore sidecar nel
+/// checkpoint e il loader non lo rilegge, quindi finché quel
+/// round-trip I/O non è cablato i pesi sarebbero matematicamente
+/// shiftati. Per questo il converter rifiuta `--quant-method
+/// awq|smoothQuant` invece di emettere pesi silenziosamente errati.
 /// AWQ output tuple. `inverseChannelScale` is `1 / s[c]` ready to
 /// plug into `Linear.inverseChannelScale`: the runtime applies it
 /// as `x' = x · inverseChannelScale` before the GEMM, recovering
@@ -402,11 +401,12 @@ public func awqQuantizeBF16ToInt8(
 ///      (default `clampRange = 5`) to keep individual scales
 ///      bounded.
 ///
-/// Same caveat as AWQ: the math is only exact when the runtime
-/// activations get divided by `s` per channel BEFORE entering the
-/// layer. Today the engine doesn't apply that inverse scale — same
-/// follow-up as the AWQ note: add `inverseChannelScale: Tensor?`
-/// to `Linear` and pre-multiply in the forward.
+/// Same caveat as AWQ — and it's a PERSISTENCE gap, not a runtime
+/// one: the math is only exact when the runtime activations get
+/// multiplied by `1/s` per channel before the GEMM. The engine
+/// already does that (`Linear.inverseChannelScale`); what's missing
+/// is the converter persisting `1/s` to the checkpoint, so the
+/// converter refuses `--quant-method smoothQuant` for now.
 public func smoothQuantBF16ToInt8(
     srcURL: URL, srcOffset: Int,
     outDim: Int, inDim: Int,
