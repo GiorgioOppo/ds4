@@ -196,17 +196,20 @@ public final class MLA {
                               startPos: startPos)
         }
 
-        // Sliding-window attention.
+        // Sliding-window attention (+ optional compressed long-range KV).
         //
-        // The model was trained with `windowSize` = 128 raw KV plus the
+        // The model was trained with `windowSize` raw KV plus a
         // compressed long-range path on ratio>0 layers (Compressor +
-        // Indexer + attention sink). The MLX port does not implement
-        // the compressed path; we keep only the sliding window, which
-        // is in-distribution for layers with `compressRatio == 0` and
-        // a degradation (no long-range context) for ratio>0 layers —
-        // strictly better than vanilla SDPA on the full unbounded KV,
-        // which puts the model at positions it never saw at training
-        // time and collapses generation onto regurgitated prompt
+        // Indexer + attention sink). That path IS built below (it reads
+        // `compressedCache` / `indexerTopK`), but it only activates once
+        // `compressedCache` is populated — and today MLA never assigns
+        // `compressor.kvCache`, so the Compressor short-circuits (returns
+        // nil) and `Lcomp` stays 0. Until that wiring lands we run the
+        // sliding window alone: in-distribution for `compressRatio == 0`
+        // layers, a degradation (no long-range context) for ratio>0
+        // layers — still strictly better than vanilla SDPA over the full
+        // unbounded KV, which puts the model at positions it never saw at
+        // training time and collapses generation onto regurgitated prompt
         // tokens.
         //
         // We slice the cache to the in-window range so SDPA only
