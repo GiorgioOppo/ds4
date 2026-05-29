@@ -60,9 +60,6 @@ public final class WeightLoader {
     /// because they're used on every forward pass.
     private var globalNames: Set<String> = []
     
-    public var streamingEnabled: Bool = true
-    public var streamingSlotCount: Int { 2 }  // current + prefetch
-    
     public var totalKnownNames: Int { index.count }
     public var allKnownNames: [String] { Array(index.keys) }
     public var shardCount: Int { shardURLs.count }
@@ -224,10 +221,30 @@ public final class WeightLoader {
                 NSLocalizedDescriptionKey: "Failed to read header size from \(url.lastPathComponent)"
             ])
         }
-        let headerSize = sizeData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
-        
-        // Read the JSON header
-        guard let jsonData = try fh.read(upToCount: Int(headerSize)) else {
+        // `loadUnaligned` is the alignment-safe read (`load(as:)` is UB
+        // if the buffer isn't 8-byte aligned).
+        let headerSize = sizeData.withUnsafeBytes {
+            $0.loadUnaligned(as: UInt64.self).littleEndian
+        }
+
+        // Bound the header read: the safetensors header is a small JSON
+        // blob. Reject implausible sizes up front so a truncated/corrupt
+        // shard can't trigger a multi-GB allocation or a read past EOF.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = attrs?[.size] as? Int
+        let maxHeader: UInt64 = 512 * 1024 * 1024   // 512 MB ceiling
+        guard headerSize > 0, headerSize <= maxHeader,
+              fileSize.map({ 8 + Int(headerSize) <= $0 }) ?? true else {
+            throw NSError(domain: "WeightLoader", code: 5, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Implausible safetensors header size \(headerSize) in \(url.lastPathComponent)"
+            ])
+        }
+
+        // Read the JSON header (verify the full count — `read` can
+        // return short on a truncated file).
+        guard let jsonData = try fh.read(upToCount: Int(headerSize)),
+              jsonData.count == Int(headerSize) else {
             throw NSError(domain: "WeightLoader", code: 3, userInfo: [
                 NSLocalizedDescriptionKey: "Failed to read header JSON from \(url.lastPathComponent)"
             ])
