@@ -900,16 +900,43 @@ final class ChatStore: ObservableObject {
     /// per-conv nel service così se il run è già dentro al
     /// prefill/decode esce dopo il token corrente. Le altre chat in
     /// volo (locale + remote) restano intatte.
+    ///
+    /// PR/UX: prima di droppare lo streaming controller, ne copia
+    /// il contenuto parziale nel `StoredMessage` placeholder. Senza
+    /// questo, la risposta a metà visibile sulla bolla sparisce
+    /// quando il bubble torna alla render value-driven — l'utente
+    /// si aspetta "interrompi qui", non "scarta tutto".
     func cancel(of id: UUID? = nil) {
         guard let target = id ?? selectedID else { return }
+        // Snapshot della porzione già renderizzata prima di lasciare
+        // andare il controller. Cattura anche `reasoningContent` quando
+        // il modello (R1 / o1-style) sta streamando il blocco di
+        // ragionamento — niente senso preservare il testo finale e
+        // perdere le righe di reasoning che l'utente stava leggendo.
+        if let controller = streamingControllers[target],
+           let idx = conversations.firstIndex(where: { $0.id == target }),
+           let mIdx = conversations[idx].messages.firstIndex(
+            where: { $0.id == controller.round.id })
+        {
+            let partial = controller.round.content
+            let partialReasoning = controller.round.reasoningContent
+            if !partial.isEmpty || (partialReasoning?.isEmpty == false) {
+                if !partial.isEmpty {
+                    conversations[idx].messages[mIdx].content = partial
+                }
+                if let r = partialReasoning, !r.isEmpty {
+                    conversations[idx].messages[mIdx].reasoningContent = r
+                }
+                scheduleSave(target)
+            }
+        }
         generationTasks[target]?.cancel()
         service.cancelCurrent(conversationID: target)
         // PR 4: drop the streaming controller so the bubble
-        // collapses back to its value-driven form. Whatever
-        // partial content the controller had is lost — the user
-        // chose to cancel, and the placeholder message in the
-        // transcript still carries whatever was synced through
-        // `.done` (none, in the cancel-before-done case).
+        // collapses back to its value-driven form. The partial
+        // content the controller had is already stamped onto the
+        // placeholder above, so the value-driven render keeps
+        // showing what the user already read.
         streamingControllers.removeValue(forKey: target)
     }
 
