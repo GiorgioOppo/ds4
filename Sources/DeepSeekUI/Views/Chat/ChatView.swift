@@ -278,7 +278,50 @@ struct ChatView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(Color.orange.opacity(0.08))
+        } else if let rt = c.remotePendingTurn, isIdle {
+            // Remote analog of the local resume banner. The remote
+            // backend is stateless, so "resume" re-issues the call
+            // — same user prompt, same history — instead of picking
+            // up where the previous stream left off byte-for-byte.
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .foregroundStyle(Color.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Remote turn interrupted")
+                        .font(.callout.bold())
+                    Text(remotePendingSubtitle(rt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Resume") {
+                    resumeRemoteCurrent()
+                }
+                .buttonStyle(.borderedProminent)
+                Button {
+                    store.discardRemotePendingTurn(of: c.id)
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Drop the empty placeholder")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.08))
         }
+    }
+
+    /// "Started 3m ago — re-issuing sends the same prompt and the
+    /// chat history through the same provider." The relative time
+    /// lets the user gauge whether a fresh request is still
+    /// reasonable or the chat has gone stale.
+    private func remotePendingSubtitle(_ rt: RemotePendingTurn) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        let when = formatter.localizedString(for: rt.issuedAt,
+                                              relativeTo: Date())
+        return "Issued \(when). Resume re-sends the same prompt to the remote provider."
     }
 
     /// Send abilitato per QUESTA chat: dipende dal suo endpoint
@@ -592,6 +635,19 @@ struct ChatView: View {
         store.resumePendingTurn(of: id,
                                   options: resolved.options,
                                   maxTokens: resolved.maxTokens)
+    }
+
+    /// Re-issue a remote (OpenRouter / Anthropic) turn that died
+    /// mid-stream. Mirrors `resumeCurrent`'s sampler resolution so
+    /// the resumed call uses whatever the chat would currently send
+    /// — agent overrides when an agent is attached, the Generation
+    /// tab's sliders otherwise.
+    private func resumeRemoteCurrent() {
+        guard let id = store.selectedID else { return }
+        let resolved = resolveSampling()
+        store.resumeRemotePendingTurn(of: id,
+                                        options: resolved.options,
+                                        maxTokens: resolved.maxTokens)
     }
 
     /// Compose the sampling configuration for this turn. The

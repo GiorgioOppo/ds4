@@ -926,6 +926,117 @@ final class ChatStore: ObservableObject {
         scheduleSave(id)
     }
 
+    /// Discard an interrupted remote turn. Removes the orphan empty
+    /// assistant placeholder from the transcript (no content was
+    /// ever streamed onto disk for a remote turn — the controller
+    /// owns the live buffer in-memory, so dropping the placeholder
+    /// is non-destructive) and clears the recovery breadcrumb so
+    /// the banner stops showing. The user message that kicked off
+    /// the turn stays — the chat reads naturally as "I asked X but
+    /// got no answer", which the user can follow up however they
+    /// like.
+    func discardRemotePendingTurn(of id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }),
+              let rt = conversations[idx].remotePendingTurn else { return }
+        if let mIdx = conversations[idx].messages.firstIndex(
+            where: { $0.id == rt.assistantMessageID }),
+           conversations[idx].messages[mIdx].role == .assistant,
+           conversations[idx].messages[mIdx].content.isEmpty,
+           conversations[idx].messages[mIdx].toolCalls.isEmpty
+        {
+            conversations[idx].messages.remove(at: mIdx)
+        }
+        setRemotePending(nil, for: id)
+        phases[id] = .idle
+        scheduleSave(id)
+    }
+
+    /// Re-issue a remote turn that died mid-stream. Re-uses the
+    /// saved `assistantMessageID` so the existing placeholder bubble
+    /// fills in with the new response instead of appearing as a
+    /// second empty bubble next to the first. The user message
+    /// already lives in `messages` from the original send call, so
+    /// `runRemoteLoop` picks it up via `dropLast()` like any
+    /// follow-up iteration.
+    ///
+    /// The remote side is stateless (OpenRouter / Anthropic don't
+    /// retain partial completions), so "resume" means "ask again
+    /// with the same prompt and the same chat history". The new
+    /// response will not be byte-identical to the one the user saw
+    /// before the crash — that's the cost of running a stateless
+    /// backend.
+    func resumeRemotePendingTurn(of id: UUID,
+                                   options: SamplingOptions,
+                                   maxTokens: Int) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }),
+              let rt = conversations[idx].remotePendingTurn else { return }
+        switch phase(of: id) {
+        case .streaming, .prefilling: return
+        default: break
+        }
+        // Resolve the endpoint stored on the conversation. We
+        // intentionally don't fall back to `modelState.loadedEndpoint`
+        // here — the user picked this chat's provider when they
+        // started it, and silently switching providers mid-resume
+        // would be confusing.
+        guard let endpoint = conversations[idx].endpoint else { return }
+        let provider: RemoteProvider
+        let modelID: String
+        switch endpoint {
+        case .openRouter(let m): provider = .openRouter; modelID = m
+        case .anthropic(let m):  provider = .anthropic;  modelID = m
+        case .localDirectory:    return
+        }
+        let apiKey = KeychainStore.get(account: provider.keychainAccount) ?? ""
+        guard !apiKey.isEmpty else {
+            phases[id] = .error(
+                "\(provider.displayName) API key not configured. "
+                + "Add it from Settings → API Keys.")
+            return
+        }
+
+        let mode = ThinkingMode(rawValue: rt.mode) ?? .chat
+        let placeholderID = rt.assistantMessageID
+        let userMessageID = rt.userMessageID
+        // Reset the streaming controller so chunks land on the
+        // existing bubble. Whatever the in-memory controller held
+        // before the relaunch is gone — we start fresh from empty.
+        newStreamingController(for: id, placeholderID: placeholderID)
+        phases[id] = .streaming(buffer: "",
+                                 status: "Resuming \(modelID)…",
+                                 metrics: GenerationMetrics())
+        lastSamplingOptions[id] = (options, maxTokens)
+        toolRoundtrips[id] = 0
+        // Refresh the breadcrumb's `issuedAt` so the banner doesn't
+        // keep showing "started 3 hours ago" after the retry kicks
+        // in. Cleared on `finalizeRemoteIteration` like a fresh
+        // send.
+        setRemotePending(RemotePendingTurn(
+            assistantMessageID: placeholderID,
+            userMessageID: userMessageID,
+            userText: rt.userText,
+            mode: rt.mode,
+            issuedAt: Date()), for: id)
+        scheduleSave(id)
+
+        generationTasks[id]?.cancel()
+        let task = Task { [weak self] in
+            defer { self?.generationTasks.removeValue(forKey: id) }
+            guard let self else { return }
+            await self.runRemoteLoop(
+                conversationID: id,
+                initialPlaceholderID: placeholderID,
+                userMessageID: userMessageID,
+                provider: provider,
+                modelID: modelID,
+                mode: mode,
+                options: options,
+                maxTokens: maxTokens,
+                apiKey: apiKey)
+        }
+        generationTasks[id] = task
+    }
+
     private func apply(event: GenerationEvent,
                         to id: UUID,
                         placeholderId: UUID,
@@ -2107,11 +2218,29 @@ final class ChatStore: ObservableObject {
                            agent: AgentConfig?)? = await MainActor.run {
                 guard let idx = self.conversations.firstIndex(where: { $0.id == id })
                 else { return nil }
-                let history = Array(self.conversations[idx]
-                    .messages.dropLast())  // drop the in-progress placeholder
+                let history = self.conversations[idx].messages
+                    .dropLast()  // drop the in-progress placeholder
+                    .filter { msg in
+                        // Skip orphan assistant placeholders left
+                        // behind by a previous remote turn that died
+                        // mid-stream before `finalizeRemoteIteration`
+                        // could stamp the final content. Sending such
+                        // a placeholder downstream materialises as
+                        // `{"role":"assistant"}` on OpenRouter (no
+                        // content, no tool_calls) — the provider
+                        // either 400s with "content is required" or
+                        // routes a request that drops the previous
+                        // turn from context, which is what the user
+                        // experiences as "doesn't consider the
+                        // current session". The placeholder stays
+                        // visible in the transcript; it just isn't
+                        // re-sent.
+                        guard msg.role == .assistant else { return true }
+                        return !msg.content.isEmpty || !msg.toolCalls.isEmpty
+                    }
                 let agent = self.conversations[idx].agentID
                     .flatMap { self.agents.agent(id: $0) }
-                return (history, agent)
+                return (Array(history), agent)
             }
             guard let snapshot else { return }
 
