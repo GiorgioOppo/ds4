@@ -221,6 +221,7 @@ public func symlinkPermissionDeniedMessage(
 ) -> String {
     "macOS sandbox blocked the read through a symlink. "
     + "'\(relative)' resolves to '\(resolved.path)'. "
-    + "Grant access to '\(grantParent.path)' from "
-    + "Settings → Project to make it readable."
+    + "Open Settings → Projects, pick this project, and use "
+    + "\"Grant access\" on '\(grantParent.path)' under "
+    + "\"Linked external folders\" to make it readable."
 }
