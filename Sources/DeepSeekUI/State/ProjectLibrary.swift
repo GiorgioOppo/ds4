@@ -47,6 +47,21 @@ struct Project: Codable, Identifiable, Hashable {
     /// (sconsigliato per progetti grandi).
     var maxInventoryFiles: Int?
 
+    /// Parent directories of symlink targets that landed outside
+    /// every entry in `sourcePaths` during the last farm rebuild.
+    /// The ProjectDetailView surfaces them with a "Grant access"
+    /// affordance so the user can extend the security-scoped
+    /// bookmark set with one NSOpenPanel pick instead of grinding
+    /// through each file's permission failure at read time.
+    ///
+    /// Recomputed on every `ProjectRootBuilder.rebuild` — the list
+    /// shrinks as the user grants access (the granted dir becomes
+    /// a `sourcePaths` entry, so its descendants no longer count
+    /// as external) and grows when new external symlinks appear in
+    /// the source. Optional + nil-default for backward compat with
+    /// projects persisted before this field existed.
+    var pendingSymlinkRoots: [String]?
+
     init(id: UUID = UUID(),
          name: String,
          sourcePaths: [String] = [],
@@ -55,7 +70,8 @@ struct Project: Codable, Identifiable, Hashable {
          lastIndexedAt: Date? = nil,
          modelFingerprint: String? = nil,
          contextMode: ProjectContextMode? = nil,
-         maxInventoryFiles: Int? = nil) {
+         maxInventoryFiles: Int? = nil,
+         pendingSymlinkRoots: [String]? = nil) {
         self.id = id
         self.name = name
         self.sourcePaths = sourcePaths
@@ -65,6 +81,7 @@ struct Project: Codable, Identifiable, Hashable {
         self.modelFingerprint = modelFingerprint
         self.contextMode = contextMode
         self.maxInventoryFiles = maxInventoryFiles
+        self.pendingSymlinkRoots = pendingSymlinkRoots
     }
 
     /// Modalità effettiva (override per-progetto o default
@@ -102,27 +119,90 @@ final class ProjectLibrary: ObservableObject {
     }
 
     func create(name: String) -> Project {
-        let p = Project(name: name)
+        var p = Project(name: name)
+        // Empty sourcePaths → rebuild is a no-op; no discoveries
+        // possible. Still call it so the empty farm root exists on
+        // disk for downstream code that checks for it.
+        if let result = try? ProjectRootBuilder.rebuild(p) {
+            p.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
+                ? nil
+                : result.externalSymlinkRoots
+        }
         projects.insert(p, at: 0)
         saveIndex()
-        try? ProjectRootBuilder.rebuild(p)
         return p
     }
 
     func update(_ project: Project) {
         guard let idx = projects.firstIndex(where: { $0.id == project.id }) else { return }
         let prev = projects[idx]
-        projects[idx] = project
-        saveIndex()
-        if prev.sourcePaths != project.sourcePaths {
-            try? ProjectRootBuilder.rebuild(project)
+        var next = project
+        // Rebuild BEFORE the save so the discovery result lands in
+        // `next.pendingSymlinkRoots` before we persist — otherwise
+        // we'd write twice (once with stale discovery, once with
+        // fresh).
+        if prev.sourcePaths != project.sourcePaths,
+           let result = try? ProjectRootBuilder.rebuild(project)
+        {
+            next.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
+                ? nil
+                : result.externalSymlinkRoots
         }
+        projects[idx] = next
+        saveIndex()
         // Always refresh the vault when bookmarks change — even if the
         // path list is identical, the user may have re-picked a folder
         // to recover sandbox access after a stale grant.
         if prev.sourceBookmarks != project.sourceBookmarks {
             refreshAccess(for: project)
         }
+    }
+
+    /// Promote a previously-discovered external symlink root into a
+    /// real `sourcePaths` entry now that the user has granted access
+    /// via NSOpenPanel. `path` is the URL.path the picker returned
+    /// (may be exactly the discovered path or a chosen ancestor of
+    /// it — the rebuild's allowed-roots check handles either form).
+    /// `bookmark` is the security-scoped blob, persisted alongside
+    /// the path so the grant survives the next launch.
+    ///
+    /// Re-uses `update(_:)`'s pipeline: the rebuild fires, discovery
+    /// re-runs, and the granted path's descendants drop out of
+    /// `pendingSymlinkRoots` on their own.
+    func grantSymlinkRoot(path: String,
+                           bookmark: Data,
+                           for projectID: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        else { return }
+        var updated = projects[idx]
+        var bookmarks = updated.sourceBookmarks ?? []
+        while bookmarks.count < updated.sourcePaths.count {
+            bookmarks.append(Data())
+        }
+        if let existing = updated.sourcePaths.firstIndex(of: path) {
+            bookmarks[existing] = bookmark
+        } else {
+            updated.sourcePaths.append(path)
+            bookmarks.append(bookmark)
+        }
+        updated.sourceBookmarks = bookmarks
+        update(updated)
+    }
+
+    /// User dismissed an external symlink root from the "Grant
+    /// access" list — they know the link is intentional dead weight
+    /// (build artefact, generated tag, etc.) and don't want the
+    /// banner to keep nagging. The dismissal is one-shot: the next
+    /// rebuild rediscovers the same path if the source-side link
+    /// is still there. For a sticky ignore, the user should remove
+    /// the link upstream or skip the source folder altogether.
+    func dismissSymlinkRoot(path: String, for projectID: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        else { return }
+        guard var pending = projects[idx].pendingSymlinkRoots else { return }
+        pending.removeAll { $0 == path }
+        projects[idx].pendingSymlinkRoots = pending.isEmpty ? nil : pending
+        saveIndex()
     }
 
     func delete(_ id: UUID, documents: DocumentLibrary) {

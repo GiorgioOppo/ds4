@@ -26,6 +26,10 @@ struct ProjectDetailView: View {
             header
             Divider()
             sources
+            if project.pendingSymlinkRoots?.isEmpty == false {
+                Divider()
+                pendingSymlinkSection
+            }
             Divider()
             contextModeSection
             Divider()
@@ -192,6 +196,88 @@ struct ProjectDetailView: View {
                 .frame(minHeight: 80, maxHeight: 140)
             }
         }
+    }
+
+    // MARK: - external symlink targets ("Grant access" affordance)
+
+    /// Surfaces directories discovered during the last farm rebuild
+    /// where one or more source-side symlinks land outside every
+    /// granted `sourcePaths` entry. Without an explicit grant for
+    /// those directories, the macOS sandbox refuses to open() through
+    /// the link and the model sees a confusing "permission denied"
+    /// instead of the file. One NSOpenPanel pick per directory
+    /// unlocks every sibling link landing there.
+    @ViewBuilder
+    private var pendingSymlinkSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Linked external folders").font(.headline)
+                Spacer()
+                Text("\(project.pendingSymlinkRoots?.count ?? 0)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Color.orange.opacity(0.18),
+                                 in: Capsule())
+            }
+            Text("Some files inside your sources are symlinks pointing at the directories below. Grant access to make them readable; dismiss to ignore until the next rebuild.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let pending = project.pendingSymlinkRoots {
+                List {
+                    ForEach(pending, id: \.self) { path in
+                        HStack {
+                            Image(systemName: "link.badge.plus")
+                                .foregroundStyle(.orange)
+                            Text(path)
+                                .font(.callout.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Grant access") {
+                                grantAccess(to: path)
+                            }
+                            .controlSize(.small)
+                            Button {
+                                library.dismissSymlinkRoot(
+                                    path: path, for: project.id)
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Dismiss this entry from the list")
+                        }
+                    }
+                }
+                .frame(minHeight: 60, maxHeight: 140)
+            }
+        }
+    }
+
+    /// NSOpenPanel pre-pointed at `suggestedPath` so the user can
+    /// either confirm the suggestion or navigate to a containing
+    /// directory and grant the broader scope in one click. The
+    /// resulting URL becomes a `sourcePaths` entry on the project
+    /// and the rebuild's allowed-roots check picks up every symlink
+    /// landing under it on the next pass.
+    private func grantAccess(to suggestedPath: String) {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: suggestedPath)
+        panel.message = "DeepSeek can't open files linked from this folder. Grant access here so the symlinks resolve."
+        panel.prompt = "Grant"
+        guard panel.runModal() == .OK,
+              let url = panel.urls.first,
+              let bookmark = ProjectSourceAccess.makeBookmark(for: url)
+        else { return }
+        library.grantSymlinkRoot(path: url.path,
+                                  bookmark: bookmark,
+                                  for: project.id)
+        #endif
     }
 
     // MARK: - context mode (paths-only vs indexed-content)
