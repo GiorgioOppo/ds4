@@ -235,9 +235,19 @@ struct ProjectDetailView: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
+                            // On macOS, a SwiftUI `Button` inside a
+                            // `List` row needs an explicit `.buttonStyle`
+                            // — without one the tap is captured by the
+                            // row's selection gesture and the action
+                            // never fires. `.bordered` matches the
+                            // visual weight the user expects from a
+                            // primary action, while the dismiss X
+                            // stays `.borderless` so it doesn't
+                            // compete for attention.
                             Button("Grant access") {
                                 grantAccess(to: path)
                             }
+                            .buttonStyle(.bordered)
                             .controlSize(.small)
                             Button {
                                 library.dismissSymlinkRoot(
