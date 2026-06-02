@@ -13,13 +13,20 @@ import Foundation
 /// - file → symlinked directly under the project root by basename
 ///
 /// Symlinks inside the source tree are handled as follows:
-/// - A symlinked **file** is mirrored as a symlink in the farm pointing
-///   at the link's resolved real target. This lets `find`, `du`, and
-///   any UnixWalker-based tool reach files that the user reached via
-///   convenience links (e.g. `current -> v2/build.swift`).
-/// - A symlinked **directory** is still skipped — descending into it
-///   risks scan cycles, and the user already has the real directory
-///   reachable through another `sourcePaths` entry when they need it.
+/// - A symlinked **file whose target stays inside this `sourcePaths`
+///   entry** is mirrored as a farm symlink pointing at the resolved
+///   real target. Internal convenience links (e.g. `current ->
+///   v2/build.swift`) survive into the farm and are reachable by
+///   every read/write tool.
+/// - A symlinked file whose target falls **outside** the source
+///   folder is skipped. The macOS sandbox bookmark is granted per
+///   `sourcePaths` entry, so the farm can't actually read through
+///   those links — surfacing them would leave the model staring at
+///   a `read` that fails with a confusing "permission denied"
+///   instead of just not seeing the file.
+/// - A symlinked **directory** is skipped — descending risks scan
+///   cycles, and the real dir is reachable via another `sourcePaths`
+///   entry when needed.
 ///
 /// Name collisions between source entries (or files that share a
 /// basename at the same level) get `-2`, `-3`, … suffixes.
@@ -142,13 +149,23 @@ enum ProjectRootBuilder {
                 try fm.createDirectory(at: target,
                                         withIntermediateDirectories: true)
             } else if isLink {
-                // File symlink: mirror it pointing at the resolved real
-                // target so `readlink` in the farm goes one hop instead
-                // of chaining through the source-side link, and so the
-                // entry survives the source-side link being repointed
-                // until the next rebuild.
-                let realTarget = URL(fileURLWithPath:
-                    (item.path as NSString).resolvingSymlinksInPath)
+                // File symlink. Only mirror it when its resolved
+                // target stays inside this source folder — a link
+                // out to `/Users/...` or another sourcePath would
+                // either fail at read time (the macOS sandbox grants
+                // a security-scoped bookmark per `sourcePaths` entry
+                // only) or duplicate an entry that another mirror
+                // pass already surfaces. Surfacing a known-broken
+                // link in the farm is worse than hiding it: the
+                // model sees a `*.md` file, tries `read`, and gets a
+                // "couldn't be opened because you don't have
+                // permission" error.
+                let resolved = (item.path as NSString).resolvingSymlinksInPath
+                let srcReal = (src.path as NSString).resolvingSymlinksInPath
+                let withinSrc = resolved == srcReal
+                    || resolved.hasPrefix(srcReal + "/")
+                guard withinSrc else { continue }
+                let realTarget = URL(fileURLWithPath: resolved)
                 try fm.createSymbolicLink(at: target,
                                           withDestinationURL: realTarget)
             } else {
