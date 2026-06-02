@@ -398,31 +398,27 @@ for newName in plan.keys.sorted() {
                         r = try quantizeBF16ToInt8(
                             srcURL: weightURL, srcOffset: weightOffset,
                             outDim: outDim, inDim: inDim)
-                    case .awq:
-                        let stats = calibStats!  // forced by effectiveMethod resolution
-                        let res = try awqQuantizeBF16ToInt8(
-                            srcURL: weightURL, srcOffset: weightOffset,
-                            outDim: outDim, inDim: inDim,
-                            actAbsMax: stats.perChannelAbsMax,
-                            alpha: 0.5)
-                        r = (res.weight, res.scale)
-                        // The inverseChannelScale produced by AWQ
-                        // would belong as a sidecar tensor consumed
-                        // by `Linear.inverseChannelScale` at load
-                        // time. Not yet written here — the loader
-                        // doesn't read it either, so emitting it
-                        // would just bloat the safetensors output.
-                        // Documented follow-up.
-                        _ = res.inverseChannelScale
-                    case .smoothQuant:
-                        let stats = calibStats!
-                        let res = try smoothQuantBF16ToInt8(
-                            srcURL: weightURL, srcOffset: weightOffset,
-                            outDim: outDim, inDim: inDim,
-                            actAbsMax: stats.perChannelAbsMax,
-                            alpha: 0.5)
-                        r = (res.weight, res.scale)
-                        _ = res.inverseChannelScale
+                    case .awq, .smoothQuant:
+                        // AWQ / SmoothQuant smooth the weights by a
+                        // per-channel factor s (W' = W·s) and depend on
+                        // the runtime cancelling it via 1/s
+                        // (`Linear.inverseChannelScale`, which IS applied
+                        // at load time). That sidecar vector is NOT
+                        // persisted to the output checkpoint here, so the
+                        // emitted weights would be silently WRONG — worse
+                        // than plain RTN. Refuse rather than ship bad
+                        // weights until the inverse-scale round-trip is
+                        // implemented (the safetensors writer that would
+                        // emit the sidecar was removed in the MLX
+                        // migration).
+                        throw NSError(domain: "converter", code: 20, userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "--quant-method \(effectiveMethod) is not supported in this "
+                              + "build: it requires persisting the per-channel inverse scale "
+                              + "(Linear.inverseChannelScale), which is not emitted here — so "
+                              + "the weights would be silently wrong (worse than RTN). "
+                              + "Use --quant-method rtn or gptq."
+                        ])
                     case .gptq:
                         let H = calibHessian!  // forced by effectiveMethod
                         r = try gptqQuantizeBF16ToInt8(

@@ -556,12 +556,42 @@ public extension Transformer {
         }
 
         if !loader.missing.isEmpty {
+            let missingCount = loader.missing.count
+            let known = loader.totalKnownNames
+            let fraction = known > 0 ? Double(missingCount) / Double(known) : 1.0
+            let pct = String(format: "%.1f", fraction * 100)
+            let sample = loader.missing.sorted().prefix(12).joined(separator: "\n    ")
+            let env = ProcessInfo.processInfo.environment
+            let strict = env["DEEPSEEK_STRICT_WEIGHTS"] == "1"
+            let allowMissing = env["DEEPSEEK_ALLOW_MISSING_WEIGHTS"] == "1"
+            // Losing a large fraction of the checkpoint means the
+            // tensor-name mapping is broken and the model would emit
+            // noise — refuse by default. A handful of missing tensors
+            // (optional / MTP) only warns.
+            let catastrophic = fraction >= 0.5
+
             FileHandle.standardError.write(Data("""
-            \(loader.missing.count) tensor name(s) were not found in the
-            checkpoint and were filled with random init. First few:
-              \(loader.missing.prefix(8).joined(separator: "\n  "))
+
+            ┌─ WEIGHT LOAD WARNING ──────────────────────────────────────
+            │ \(missingCount) of \(known) checkpoint tensor name(s) (\(pct)%) were NOT
+            │ found and were filled with RANDOM init. Output for these
+            │ will be garbage — usually a tensor-name mapping bug.
+            │ First few:
+            │   \(sample)
+            │ Override with DEEPSEEK_ALLOW_MISSING_WEIGHTS=1, or fail on
+            │ ANY missing tensor with DEEPSEEK_STRICT_WEIGHTS=1.
+            └────────────────────────────────────────────────────────────
 
             """.utf8))
+
+            if (strict || catastrophic) && !allowMissing {
+                throw NSError(domain: "Assembly", code: 10, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(missingCount)/\(known) weight tensors missing (\(pct)%); "
+                      + "refusing to run with random-init weights. "
+                      + "Set DEEPSEEK_ALLOW_MISSING_WEIGHTS=1 to override."
+                ])
+            }
         }
 
         let model = Transformer(config: config, embed: embed, layers: blocks, mtp: mtpBlocks,

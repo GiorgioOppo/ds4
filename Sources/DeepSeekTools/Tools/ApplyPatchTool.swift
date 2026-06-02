@@ -63,6 +63,10 @@ public struct ApplyPatchTool: Tool {
         var source: String
         var target: String
         var hunks: [Hunk]
+        /// True when a `\ No newline at end of file` marker applied to
+        /// the NEW side's last line — i.e. the resulting file must NOT
+        /// end with a trailing newline. Standard diffs (no marker) do.
+        var newHasNoFinalNewline: Bool = false
     }
 
     private struct Hunk {
@@ -78,6 +82,9 @@ public struct ApplyPatchTool: Tool {
         var current: FileHunks?
         var inHunk = false
         var currentHunk: Hunk?
+        // Side of the most recent content line, so a following
+        // `\ No newline at end of file` marker can be attributed to it.
+        var lastSide: Character? = nil
         var i = 0
         while i < lines.count {
             let line = lines[i]
@@ -89,6 +96,7 @@ public struct ApplyPatchTool: Tool {
                 let source = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
                 current = FileHunks(source: source, target: "", hunks: [])
                 inHunk = false
+                lastSide = nil
             } else if line.hasPrefix("+++ ") {
                 let target = String(line.dropFirst(4)).trimmingCharacters(in: .whitespaces)
                 current?.target = target
@@ -113,13 +121,21 @@ public struct ApplyPatchTool: Tool {
                 case " ":
                     h.oldLines.append(body)
                     h.newLines.append(body)
+                    lastSide = " "
                 case "+":
                     h.newLines.append(body)
+                    lastSide = "+"
                 case "-":
                     h.oldLines.append(body)
+                    lastSide = "-"
                 case "\\":
-                    // "\ No newline at end of file" — ignored
-                    break
+                    // "\ No newline at end of file" applies to the
+                    // immediately preceding line's side. Record it for
+                    // the NEW side so a created file's trailing newline
+                    // is suppressed to match the diff.
+                    if lastSide == "+" || lastSide == " " {
+                        current?.newHasNoFinalNewline = true
+                    }
                 default:
                     // Out-of-hunk content marks hunk end.
                     inHunk = false
@@ -157,7 +173,10 @@ public struct ApplyPatchTool: Tool {
         let url = try resolveInsideRoot(path, context: context)
 
         if file.source == "/dev/null" {
-            // Creation.
+            // Creation. A unified diff's content lines each denote a
+            // newline-terminated line, so the created file ends with a
+            // trailing newline UNLESS a `\ No newline at end of file`
+            // marker said otherwise.
             var created: [String] = []
             for h in file.hunks {
                 created.append(contentsOf: h.newLines)
@@ -165,13 +184,11 @@ public struct ApplyPatchTool: Tool {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true)
-            try created.joined(separator: "\n").write(
-                to: url, atomically: true, encoding: .utf8)
-            return
-        }
-        if file.target == "/dev/null" {
-            // Deletion.
-            try FileManager.default.removeItem(at: url)
+            var text = created.joined(separator: "\n")
+            if !file.newHasNoFinalNewline && !created.isEmpty {
+                text += "\n"
+            }
+            try text.write(to: url, atomically: true, encoding: .utf8)
             return
         }
 
@@ -179,10 +196,31 @@ public struct ApplyPatchTool: Tool {
               let original = String(data: data, encoding: .utf8) else {
             throw ToolError.notFound(path)
         }
-        var lines = original.components(separatedBy: "\n")
-        // Apply hunks in reverse order so prior offsets don't shift
-        // the indexes of later ones.
-        for h in file.hunks.reversed() {
+        let lines = original.components(separatedBy: "\n")
+        // Verify every hunk's `-`/context lines against the actual file
+        // content (in reverse so earlier edits don't shift later
+        // indexes). This runs for BOTH in-place patching and `/dev/null`
+        // deletion, so a delete won't remove a file whose contents have
+        // drifted from the patch.
+        let patched = try applyHunks(file.hunks, to: lines, path: path)
+
+        if file.target == "/dev/null" {
+            // Deletion — context already verified above.
+            try FileManager.default.removeItem(at: url)
+            return
+        }
+        try patched.joined(separator: "\n").write(
+            to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Apply `hunks` to `lines` in reverse order (so earlier edits don't
+    /// shift later indexes), verifying each hunk's `-`/context lines
+    /// against the actual content. Throws on any mismatch — no fuzzy
+    /// matching. Returns the patched lines.
+    private func applyHunks(_ hunks: [Hunk], to lines: [String],
+                            path: String) throws -> [String] {
+        var lines = lines
+        for h in hunks.reversed() {
             let start = max(0, h.oldStart - 1)
             let end = start + h.oldLines.count
             guard end <= lines.count else {
@@ -195,8 +233,7 @@ public struct ApplyPatchTool: Tool {
             }
             lines.replaceSubrange(start..<end, with: h.newLines)
         }
-        try lines.joined(separator: "\n").write(
-            to: url, atomically: true, encoding: .utf8)
+        return lines
     }
 
     /// Drop `a/` / `b/` prefixes the way `git diff` emits them.
