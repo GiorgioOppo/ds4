@@ -40,7 +40,11 @@ public struct CpTool: Tool {
         let recursive = input.optionalBool("recursive") ?? false
         let force = input.optionalBool("force") ?? false
         let src = try resolveInsideRoot(srcRel, context: context)
-        let dst = try resolveInsideRoot(dstRel, context: context)
+        // Dst side gates the write: a sneaky symlink at dstRel would
+        // land the copy outside the trust boundary. Source side is a
+        // pure read, so it's OK to follow farm symlinks transparently.
+        let dst = try resolveInsideRoot(dstRel, context: context,
+                                         checkResolvedTarget: true)
         let fm = FileManager.default
 
         guard fm.fileExists(atPath: src.path) else {

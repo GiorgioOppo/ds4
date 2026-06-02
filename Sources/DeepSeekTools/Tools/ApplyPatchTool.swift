@@ -170,7 +170,8 @@ public struct ApplyPatchTool: Tool {
     private func applyFile(_ file: FileHunks, context: ToolContext) throws {
         let rawTarget = file.target == "/dev/null" ? file.source : file.target
         let path = stripPathPrefix(rawTarget)
-        let url = try resolveInsideRoot(path, context: context)
+        let url = try resolveInsideRoot(path, context: context,
+                                         checkResolvedTarget: true)
 
         if file.source == "/dev/null" {
             // Creation. A unified diff's content lines each denote a

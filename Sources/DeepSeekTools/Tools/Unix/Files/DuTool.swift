@@ -31,6 +31,10 @@ public struct DuTool: Tool {
         let summarize = input.optionalBool("summarize") ?? false
         let human = input.optionalBool("humanReadable") ?? false
         let root = try resolveInsideRoot(rel, context: context)
+        // Trust the project's symlink farm so file-symlinks inside the
+        // agent root that resolve into the user's `additionalReadRoots`
+        // contribute to the disk total instead of being silently skipped.
+        let trustedRoots = [context.rootDirectory] + context.additionalReadRoots
 
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDir) else {
@@ -42,7 +46,8 @@ public struct DuTool: Tool {
         }
 
         if summarize {
-            let total = totalSize(root, isCancelled: context.isCancelled)
+            let total = totalSize(root, trustedRoots: trustedRoots,
+                                  isCancelled: context.isCancelled)
             return ToolOutput(output: "\(format(total, human: human)) \(rel)")
         }
 
@@ -51,7 +56,8 @@ public struct DuTool: Tool {
         for child in (try? FileManager.default.contentsOfDirectory(atPath: root.path).sorted()) ?? [] {
             if context.isCancelled() { break }
             let url = root.appendingPathComponent(child)
-            let size = totalSize(url, isCancelled: context.isCancelled)
+            let size = totalSize(url, trustedRoots: trustedRoots,
+                                 isCancelled: context.isCancelled)
             grand += size
             let childRel = rel == "." ? child : "\(rel)/\(child)"
             lines.append("\(format(size, human: human)) \(childRel)")
@@ -61,23 +67,33 @@ public struct DuTool: Tool {
                           metadata: ["total": "\(grand)"])
     }
 
-    private func totalSize(_ url: URL, isCancelled: @Sendable () -> Bool) -> Int64 {
+    private func totalSize(_ url: URL,
+                           trustedRoots: [URL],
+                           isCancelled: @Sendable () -> Bool) -> Int64 {
         var total: Int64 = 0
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue {
             return sizeOf(url)
         }
-        UnixWalker.walk(root: url, isCancelled: isCancelled) { entry in
-            if !entry.isDirectory && !entry.isSymlink {
-                total += self.sizeOf(entry.url)
+        let opts = UnixWalker.Options(trustedRoots: trustedRoots)
+        UnixWalker.walk(root: url, options: opts, isCancelled: isCancelled) { entry in
+            // Followed symlinks land here as `isSymlink: true`; their
+            // resolved target is a real file, so we resolve and charge
+            // its size to the total. `attributesOfItem` doesn't follow
+            // links, so we canonicalise first.
+            if !entry.isDirectory {
+                total += self.sizeOf(entry.url, followLink: entry.isSymlink)
             }
             return true
         }
         return total
     }
 
-    private func sizeOf(_ url: URL) -> Int64 {
-        ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value) ?? 0
+    private func sizeOf(_ url: URL, followLink: Bool = false) -> Int64 {
+        let path = followLink
+            ? (url.path as NSString).resolvingSymlinksInPath
+            : url.path
+        return ((try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value) ?? 0
     }
 
     private func format(_ bytes: Int64, human: Bool) -> String {

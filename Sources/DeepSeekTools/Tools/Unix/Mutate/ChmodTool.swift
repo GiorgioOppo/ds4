@@ -33,7 +33,8 @@ public struct ChmodTool: Tool {
         guard let mode = Int(modeStr, radix: 8), mode >= 0, mode <= 0o7777 else {
             throw ToolError.invalidInput("'mode' must be octal (e.g. '755'), got '\(modeStr)'")
         }
-        let url = try resolveInsideRoot(rel, context: context)
+        let url = try resolveInsideRoot(rel, context: context,
+                                         checkResolvedTarget: true)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ToolError.notFound("'\(rel)' does not exist")
         }

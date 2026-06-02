@@ -34,7 +34,12 @@ public struct MvTool: Tool {
         let dstRel = try input.string("dst")
         let force = input.optionalBool("force") ?? false
         let src = try resolveInsideRoot(srcRel, context: context)
-        let dst = try resolveInsideRoot(dstRel, context: context)
+        // Dst side gates the write: a sneaky symlink at dstRel would
+        // land the moved entry outside the trust boundary. Src side
+        // operates on the link itself (moveItem renames the symlink),
+        // so the default check is enough there.
+        let dst = try resolveInsideRoot(dstRel, context: context,
+                                         checkResolvedTarget: true)
         let fm = FileManager.default
 
         guard fm.fileExists(atPath: src.path) else {

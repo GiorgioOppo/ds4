@@ -12,11 +12,17 @@ import Foundation
 ///   with every contained file replaced by a symlink to the original
 /// - file → symlinked directly under the project root by basename
 ///
-/// Symlinks inside the source tree are not followed: a symlinked
-/// directory could loop back into the scan, and a symlinked file is
-/// re-mirrored when its real path is visited elsewhere in the same
-/// source list. Name collisions between source entries (or files that
-/// share a basename at the same level) get `-2`, `-3`, … suffixes.
+/// Symlinks inside the source tree are handled as follows:
+/// - A symlinked **file** is mirrored as a symlink in the farm pointing
+///   at the link's resolved real target. This lets `find`, `du`, and
+///   any UnixWalker-based tool reach files that the user reached via
+///   convenience links (e.g. `current -> v2/build.swift`).
+/// - A symlinked **directory** is still skipped — descending into it
+///   risks scan cycles, and the user already has the real directory
+///   reachable through another `sourcePaths` entry when they need it.
+///
+/// Name collisions between source entries (or files that share a
+/// basename at the same level) get `-2`, `-3`, … suffixes.
 enum ProjectRootBuilder {
 
     /// Wipes the project's root and rebuilds the symlink farm from
@@ -118,17 +124,33 @@ enum ProjectRootBuilder {
 
         while let item = it.nextObject() as? URL {
             let vals = try? item.resourceValues(forKeys: Set(keys))
-            if vals?.isSymbolicLink == true {
-                if vals?.isDirectory == true { it.skipDescendants() }
+            let isLink = vals?.isSymbolicLink == true
+            let isDir = vals?.isDirectory == true
+            // Directory symlink: skip descent to avoid scan cycles. We
+            // still don't emit a symlink for the directory itself —
+            // the user can add the real dir to `sourcePaths` if they
+            // need it materialised in the farm.
+            if isLink && isDir {
+                it.skipDescendants()
                 continue
             }
             let prefix = src.path
             guard item.path.hasPrefix(prefix + "/") else { continue }
             let rel = String(item.path.dropFirst(prefix.count + 1))
             let target = dst.appendingPathComponent(rel)
-            if vals?.isDirectory == true {
+            if isDir {
                 try fm.createDirectory(at: target,
                                         withIntermediateDirectories: true)
+            } else if isLink {
+                // File symlink: mirror it pointing at the resolved real
+                // target so `readlink` in the farm goes one hop instead
+                // of chaining through the source-side link, and so the
+                // entry survives the source-side link being repointed
+                // until the next rebuild.
+                let realTarget = URL(fileURLWithPath:
+                    (item.path as NSString).resolvingSymlinksInPath)
+                try fm.createSymbolicLink(at: target,
+                                          withDestinationURL: realTarget)
             } else {
                 try fm.createSymbolicLink(at: target,
                                           withDestinationURL: item)

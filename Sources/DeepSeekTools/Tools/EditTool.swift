@@ -40,7 +40,8 @@ public struct EditTool: Tool {
         let newString = try input.string("newString")
         let replaceAll = input.optionalBool("replaceAll") ?? false
 
-        let url = try resolveInsideRoot(path, context: context)
+        let url = try resolveInsideRoot(path, context: context,
+                                         checkResolvedTarget: true)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ToolError.notFound(path)
         }

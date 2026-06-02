@@ -56,12 +56,25 @@ public struct FindTool: Tool {
 
         var matches: [String] = []
         let cutoff: Date? = mtimeDays.map { Date(timeIntervalSinceNow: -Double($0 * 86_400)) }
-        let opts = UnixWalker.Options(followSymlinks: follow)
+        // Trust the project's symlink farm: links inside the agent root
+        // that resolve into `additionalReadRoots` (the user's real
+        // source folders) are followed even when the user didn't pass
+        // `followSymlinks=true`. Links pointing outside that boundary
+        // are still rejected.
+        let opts = UnixWalker.Options(
+            followSymlinks: follow,
+            trustedRoots: [context.rootDirectory] + context.additionalReadRoots)
 
         UnixWalker.walk(root: root, options: opts, isCancelled: context.isCancelled) { entry in
             if let typeFilter {
                 switch typeFilter {
-                case "file": if entry.isDirectory || entry.isSymlink { return true }
+                // A trusted symlink-to-file is reported by the walker
+                // with `isDirectory=false, isSymlink=true`; under the
+                // farm strategy the model expects it to count as a
+                // "file" because the underlying entry IS a file. We
+                // therefore filter only by `isDirectory`. Users who
+                // want the links themselves can pass type=symlink.
+                case "file": if entry.isDirectory { return true }
                 case "dir": if !entry.isDirectory { return true }
                 case "symlink": if !entry.isSymlink { return true }
                 default: break

@@ -30,7 +30,8 @@ public struct WriteTool: Tool {
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {
         let path = try input.string("path")
         let content = try input.string("content")
-        let url = try resolveInsideRoot(path, context: context)
+        let url = try resolveInsideRoot(path, context: context,
+                                         checkResolvedTarget: true)
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir,
                                                 withIntermediateDirectories: true)

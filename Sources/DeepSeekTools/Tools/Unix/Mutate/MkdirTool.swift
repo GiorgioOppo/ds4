@@ -29,7 +29,8 @@ public struct MkdirTool: Tool {
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {
         let rel = try input.string("path")
         let parents = input.optionalBool("parents") ?? true
-        let url = try resolveInsideRoot(rel, context: context)
+        let url = try resolveInsideRoot(rel, context: context,
+                                         checkResolvedTarget: true)
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
             var isDir: ObjCBool = false

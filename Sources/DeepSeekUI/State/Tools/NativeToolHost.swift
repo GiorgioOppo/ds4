@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import DeepSeekTools
+import DeepSeekIntegrations
 
 /// `MainActor`-side owner of the native tool runtime. Bundles the
 /// `ToolRegistry`, the `PlanStore`, and the bridges that turn a
@@ -73,6 +74,15 @@ final class NativeToolHost: ObservableObject {
                     includeUnixTools: enableUnix,
                     includeXcodeTools: enableXcode,
                     shellUsesSandbox: useSandbox,
+                    // Per-call profile renderer: bakes the project's
+                    // real source folders (delivered via
+                    // `ToolContext.additionalReadRoots`) into the
+                    // seatbelt allow-rules so reads through the
+                    // symlink farm aren't denied at the resolved
+                    // target.
+                    shellSandboxProfileBuilder: { extras in
+                        Sandbox.renderProfile(extraReadRoots: extras)
+                    },
                     webSearchProvider: searchProvider))
             self.schemas = await registry.availableSchemas(mode: .build)
         }

@@ -1,7 +1,8 @@
 import Foundation
 
 /// Create a symbolic link. Both the link path AND the target must
-/// resolve inside the agent root — otherwise a link inside the root
+/// resolve inside the trust boundary (the agent root or any
+/// `additionalReadRoots` entry) — otherwise a link inside the root
 /// would silently widen the sandbox for any subsequent reads through
 /// it. Hard links are NOT supported (would also need cross-fs check).
 public struct LnTool: Tool {
@@ -11,8 +12,9 @@ public struct LnTool: Tool {
         ToolSchema(
             name: "ln",
             description:
-                "Crea un link simbolico dentro la root dell'agente. Sia il path del link sia il target " +
-                "devono risolvere dentro la root — un link verso l'esterno viene rifiutato. Gli hard link non sono supportati.",
+                "Crea un link simbolico nello spazio di lavoro dell'agente. Sia il path del link sia il target " +
+                "devono risolvere dentro la root o le source aggiuntive del progetto — un link verso l'esterno viene rifiutato. " +
+                "Gli hard link non sono supportati.",
             category: .mutating,
             inputSchema: SchemaBuilder.object(
                 properties: [
@@ -31,9 +33,16 @@ public struct LnTool: Tool {
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {
         let targetRel = try input.string("target")
         let linkRel = try input.string("linkPath")
-        // Both calls validate the path stays inside the root.
+        // Both calls validate the path stays inside the root or any
+        // `additionalReadRoots` entry; `linkPath` additionally enforces
+        // the resolved-target check so a sneaky symlink in the agent
+        // root can't make us materialise the new link outside the
+        // trust boundary. The `target` string is stored verbatim
+        // inside the link payload (no open() at creation time), so the
+        // default boundary check covers it.
         let target = try resolveInsideRoot(targetRel, context: context)
-        let linkPath = try resolveInsideRoot(linkRel, context: context)
+        let linkPath = try resolveInsideRoot(linkRel, context: context,
+                                              checkResolvedTarget: true)
         let fm = FileManager.default
         if fm.fileExists(atPath: linkPath.path) {
             throw ToolError.invalidInput("link path already exists: \(linkRel)")

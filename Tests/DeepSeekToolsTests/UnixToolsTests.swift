@@ -355,6 +355,107 @@ final class UnixToolsTests: XCTestCase {
         _ = attrs.removeValue(forKey: .type)
     }
 
+    // MARK: - symlink farm traversal
+
+    private func ctxWithExtras(_ root: URL, extras: [URL]) -> ToolContext {
+        ToolContext(rootDirectory: root,
+                    additionalReadRoots: extras,
+                    permission: AutoPermissionDelegate(allowDangerous: true))
+    }
+
+    /// `find` must surface farm-style symlinks (link inside root, target
+    /// inside an `additionalReadRoots` entry) — without this, every
+    /// project chat using the symlink farm would see an empty find.
+    func testFindFollowsTrustedSymlink() async throws {
+        let farm = try makeTempRoot()
+        let realSource = try makeTempRoot()
+        try write("hello", to: "main.swift", in: realSource)
+        try FileManager.default.createSymbolicLink(
+            at: farm.appendingPathComponent("main.swift"),
+            withDestinationURL: realSource.appendingPathComponent("main.swift"))
+        let out = try await FindTool().run(
+            input: ["name": "main.swift"],
+            context: ctxWithExtras(farm, extras: [realSource]))
+        XCTAssertTrue(out.output.contains("main.swift"))
+    }
+
+    /// A symlink pointing OUTSIDE the trust boundary stays skipped:
+    /// the farm-strategy concession is scoped to additionalReadRoots,
+    /// not a blanket "follow everything".
+    func testFindSkipsUntrustedSymlink() async throws {
+        let farm = try makeTempRoot()
+        let untrusted = try makeTempRoot()
+        try write("secret", to: "leak.txt", in: untrusted)
+        try FileManager.default.createSymbolicLink(
+            at: farm.appendingPathComponent("leak.txt"),
+            withDestinationURL: untrusted.appendingPathComponent("leak.txt"))
+        let out = try await FindTool().run(
+            input: ["name": "leak.txt"],
+            context: ctxWithExtras(farm, extras: []))
+        XCTAssertFalse(out.output.contains("leak.txt"))
+    }
+
+    /// `du` must count bytes through farm symlinks; without trusted-
+    /// root awareness the farm would always report 0.
+    func testDuChargesTrustedSymlinkSize() async throws {
+        let farm = try makeTempRoot()
+        let realSource = try makeTempRoot()
+        let payload = String(repeating: "a", count: 1000)
+        try write(payload, to: "big.txt", in: realSource)
+        try FileManager.default.createSymbolicLink(
+            at: farm.appendingPathComponent("big.txt"),
+            withDestinationURL: realSource.appendingPathComponent("big.txt"))
+        let out = try await DuTool().run(
+            input: ["summarize": true],
+            context: ctxWithExtras(farm, extras: [realSource]))
+        XCTAssertTrue(out.output.contains("1000"))
+    }
+
+    /// `write` must refuse a path whose resolved target sneaks outside
+    /// the trust boundary via a symlink in the agent root.
+    func testWriteRefusesSymlinkEscape() async throws {
+        let root = try makeTempRoot()
+        let outside = try makeTempRoot()
+        try write("orig", to: "victim.txt", in: outside)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("sneak.txt"),
+            withDestinationURL: outside.appendingPathComponent("victim.txt"))
+        do {
+            _ = try await WriteTool().run(
+                input: ["path": "sneak.txt", "content": "owned"],
+                context: ctx(root))
+            XCTFail("expected permissionDenied")
+        } catch let err as ToolError {
+            guard case .permissionDenied = err else {
+                XCTFail("expected permissionDenied, got \(err)")
+                return
+            }
+        }
+        let after = try String(
+            contentsOf: outside.appendingPathComponent("victim.txt"),
+            encoding: .utf8)
+        XCTAssertEqual(after, "orig")
+    }
+
+    /// `write` through a farm symlink whose target IS in
+    /// additionalReadRoots must succeed — the boundary widens for the
+    /// project's real source folders.
+    func testWriteThroughFarmSymlinkSucceeds() async throws {
+        let farm = try makeTempRoot()
+        let realSource = try makeTempRoot()
+        try write("orig", to: "file.txt", in: realSource)
+        try FileManager.default.createSymbolicLink(
+            at: farm.appendingPathComponent("file.txt"),
+            withDestinationURL: realSource.appendingPathComponent("file.txt"))
+        _ = try await WriteTool().run(
+            input: ["path": "file.txt", "content": "updated"],
+            context: ctxWithExtras(farm, extras: [realSource]))
+        let after = try String(
+            contentsOf: realSource.appendingPathComponent("file.txt"),
+            encoding: .utf8)
+        XCTAssertEqual(after, "updated")
+    }
+
     func testChmodOctal() async throws {
         let root = try makeTempRoot()
         try write("x", to: "f.txt", in: root)

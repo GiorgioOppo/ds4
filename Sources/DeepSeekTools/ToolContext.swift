@@ -77,8 +77,20 @@ public struct ToolContext: Sendable {
 /// roots is accepted. This is how project-bound chats can address
 /// files either through the symlink farm (`relative` form) or via
 /// the real absolute path on the user's disk.
+///
+/// `checkResolvedTarget` opts into a second pass that resolves any
+/// symlinks in the result and verifies the **real** path still falls
+/// inside `rootDirectory` ∪ `additionalReadRoots`. Use it from
+/// mutating tools (write, edit, apply_patch) so a sneaky symlink
+/// inside the agent root can't be used to mutate a file outside the
+/// trust boundary. Read-only tools generally leave it off: the
+/// symlink farm relies on followed reads landing on the user's real
+/// source, which is exactly what the second pass would reject if the
+/// source path isn't listed in `additionalReadRoots` — and we want
+/// reads to still succeed in that edge case rather than fail hard.
 public func resolveInsideRoot(_ relative: String,
-                              context: ToolContext) throws -> URL {
+                              context: ToolContext,
+                              checkResolvedTarget: Bool = false) throws -> URL {
     let resolved: URL
     if relative.hasPrefix("/") {
         resolved = URL(fileURLWithPath: relative).standardizedFileURL
@@ -103,6 +115,35 @@ public func resolveInsideRoot(_ relative: String,
         if !permitted {
             throw ToolError.permissionDenied(
                 "path '\(relative)' resolves outside the agent's root")
+        }
+        if checkResolvedTarget {
+            // Anti-escape: if any path component is a symlink that
+            // points outside both `rootDirectory` and
+            // `additionalReadRoots`, refuse the call. We only check
+            // the real path here — the prefix check above is what
+            // gates the "user typed an outside path" case.
+            let realPath = (resolvedPath as NSString).resolvingSymlinksInPath
+            if realPath != resolvedPath {
+                var realPermitted = pathIsWithin(
+                    realPath,
+                    root: (rootPath as NSString).resolvingSymlinksInPath)
+                if !realPermitted {
+                    for extra in context.additionalReadRoots {
+                        let extraReal = (extra.standardizedFileURL.path
+                                         as NSString).resolvingSymlinksInPath
+                        if pathIsWithin(realPath, root: extraReal) {
+                            realPermitted = true
+                            break
+                        }
+                    }
+                }
+                if !realPermitted {
+                    throw ToolError.permissionDenied(
+                        "path '\(relative)' resolves through a symlink to "
+                        + "'\(realPath)', which is outside the agent's "
+                        + "trust boundary")
+                }
+            }
         }
     }
     return resolved

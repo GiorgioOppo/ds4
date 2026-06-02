@@ -20,6 +20,7 @@ public enum DefaultTools {
                                 includeUnixTools: Bool = false,
                                 includeXcodeTools: Bool = false,
                                 shellUsesSandbox: Bool = false,
+                                shellSandboxProfileBuilder: (@Sendable ([URL]) -> String)? = nil,
                                 webSearchProvider: WebSearchProvider? = nil) -> [Tool] {
         var tools: [Tool] = [
             ReadTool(),
@@ -34,7 +35,9 @@ public enum DefaultTools {
             TodoTool(store: planStore),
         ]
         if includeShell {
-            tools.append(ShellTool(useSandbox: shellUsesSandbox))
+            tools.append(ShellTool(
+                useSandbox: shellUsesSandbox,
+                profileBuilder: shellSandboxProfileBuilder))
         }
         if includeNetwork {
             tools.append(WebFetchTool())
