@@ -25,6 +25,8 @@ struct ProjectDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
+            importStrategySection
+            Divider()
             sources
             if project.pendingSymlinkRoots?.isEmpty == false {
                 Divider()
@@ -196,6 +198,84 @@ struct ProjectDetailView: View {
                 .frame(minHeight: 80, maxHeight: 140)
             }
         }
+    }
+
+    // MARK: - import strategy (copy / symlink / git)
+
+    /// One-glance summary of how this project's sources land in the
+    /// farm, with the matching "Refresh" / "Pull" affordance. Hidden
+    /// for projects with no sources and no clone URL — the section
+    /// would carry no useful action.
+    @ViewBuilder
+    private var importStrategySection: some View {
+        let strategy = project.effectiveImportStrategy
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Import strategy").font(.headline)
+                Spacer()
+                Text(strategy.displayName)
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+            }
+            Text(strategyDescription(strategy))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let url = gitURLString(strategy) {
+                Text(url)
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.tertiary)
+            }
+            HStack(spacing: 8) {
+                Spacer()
+                if case .gitClone = strategy {
+                    Button {
+                        library.refresh(project.id)
+                    } label: {
+                        Label("Pull", systemImage: "arrow.down.circle")
+                    }
+                    .controlSize(.small)
+                } else if strategy == .copy && !project.sourcePaths.isEmpty {
+                    Button {
+                        library.refresh(project.id)
+                    } label: {
+                        Label("Re-import", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.small)
+                    .help("Re-copy every source folder. Any edits the "
+                          + "agent made in the project will be replaced "
+                          + "by the upstream content.")
+                }
+            }
+        }
+    }
+
+    private func strategyDescription(_ s: ProjectImportStrategy) -> String {
+        switch s {
+        case .copy:
+            return "The project holds copies of your source files; the "
+                + "agent's tools read and write the copy, never the "
+                + "original. Use \"Re-import\" to pick up upstream "
+                + "edits."
+        case .symlinkFarm:
+            return "The project links each file back to your real source "
+                + "folder. Live updates from your disk; agent edits "
+                + "land on the original file."
+        case .gitClone:
+            return "The project is a shallow clone of a remote Git "
+                + "repository. Use \"Pull\" to fast-forward to the "
+                + "current upstream."
+        }
+    }
+
+    private func gitURLString(_ s: ProjectImportStrategy) -> String? {
+        if case .gitClone(let url, let branch) = s {
+            if let branch, !branch.isEmpty { return "\(url) (\(branch))" }
+            return url
+        }
+        return nil
     }
 
     // MARK: - external symlink targets ("Grant access" affordance)

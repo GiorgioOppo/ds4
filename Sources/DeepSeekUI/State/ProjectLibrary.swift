@@ -1,6 +1,55 @@
 import Foundation
 import SwiftUI
 
+/// How the project's `sourcePaths` get materialised into the farm
+/// root. Picked at create time, persisted on the `Project`, applied
+/// by `ProjectRootBuilder.rebuild`. Legacy projects (decoded from
+/// JSON written before this field existed) default to
+/// `.symlinkFarm` so their behaviour doesn't change at upgrade.
+enum ProjectImportStrategy: Codable, Hashable {
+    /// Original behaviour: real directories with one symlink per
+    /// file pointing back at the user's on-disk source. Picks up
+    /// upstream edits live; requires an active security-scoped
+    /// bookmark for every read; surfaces out-of-source links
+    /// through the discover+grant flow.
+    case symlinkFarm
+
+    /// Resolve every symlink and copy bytes from `sourcePaths` into
+    /// the farm. Self-contained after the import: tools read/write
+    /// the in-container copy, never the user's real folders. The
+    /// farm is initialised as a Git repo (`git init` + baseline
+    /// commit) so the user can `git diff` to see what the agent
+    /// changed and `git checkout` to roll back. Updates are
+    /// explicit via "Re-import" in `ProjectDetailView`.
+    case copy
+
+    /// Shallow `git clone` of a remote repository into the farm.
+    /// Self-contained; "Pull" updates from upstream. Requires the
+    /// app to be allowed to spawn `git` (non-App-Store builds, or
+    /// stub with future entitlements).
+    case gitClone(repoURL: String, branch: String?)
+
+    /// Stable id used for the SwiftUI Picker selection. Each
+    /// variant collapses to one canonical id even when the
+    /// associated values differ.
+    var pickerID: String {
+        switch self {
+        case .symlinkFarm: return "symlink"
+        case .copy:        return "copy"
+        case .gitClone:    return "git"
+        }
+    }
+
+    /// User-facing label.
+    var displayName: String {
+        switch self {
+        case .symlinkFarm: return "Symlink farm"
+        case .copy:        return "Copy"
+        case .gitClone:    return "Clone from Git"
+        }
+    }
+}
+
 /// A user-defined project: a name plus a list of source paths (files
 /// or directories). Indexing walks those paths and produces one
 /// `VectorizedDocument` per discovered text file, tagged with the
@@ -59,8 +108,25 @@ struct Project: Codable, Identifiable, Hashable {
     /// a `sourcePaths` entry, so its descendants no longer count
     /// as external) and grows when new external symlinks appear in
     /// the source. Optional + nil-default for backward compat with
-    /// projects persisted before this field existed.
+    /// projects persisted before this field existed. Only populated
+    /// for `importStrategy == .symlinkFarm` — copy / git modes are
+    /// self-contained and don't need a grant flow.
     var pendingSymlinkRoots: [String]?
+
+    /// How `ProjectRootBuilder` materialises `sourcePaths` into the
+    /// farm. Optional + nil-default for projects persisted before
+    /// the field existed — they migrate on the next rebuild via
+    /// `ProjectLibrary`. New projects default to `.copy` so the
+    /// sandbox isn't paying the bookmark-per-read tax for everyone.
+    var importStrategy: ProjectImportStrategy?
+
+    /// Effective strategy used by the rebuild pipeline. Legacy
+    /// projects with a nil field map to `.symlinkFarm` so their
+    /// behaviour stays bit-identical until the user (or
+    /// `ProjectLibrary`'s migration path) flips them.
+    var effectiveImportStrategy: ProjectImportStrategy {
+        importStrategy ?? .symlinkFarm
+    }
 
     init(id: UUID = UUID(),
          name: String,
@@ -71,7 +137,8 @@ struct Project: Codable, Identifiable, Hashable {
          modelFingerprint: String? = nil,
          contextMode: ProjectContextMode? = nil,
          maxInventoryFiles: Int? = nil,
-         pendingSymlinkRoots: [String]? = nil) {
+         pendingSymlinkRoots: [String]? = nil,
+         importStrategy: ProjectImportStrategy? = nil) {
         self.id = id
         self.name = name
         self.sourcePaths = sourcePaths
@@ -82,6 +149,7 @@ struct Project: Codable, Identifiable, Hashable {
         self.contextMode = contextMode
         self.maxInventoryFiles = maxInventoryFiles
         self.pendingSymlinkRoots = pendingSymlinkRoots
+        self.importStrategy = importStrategy
     }
 
     /// Modalità effettiva (override per-progetto o default
@@ -118,11 +186,18 @@ final class ProjectLibrary: ObservableObject {
         load()
     }
 
-    func create(name: String) -> Project {
-        var p = Project(name: name)
-        // Empty sourcePaths → rebuild is a no-op; no discoveries
-        // possible. Still call it so the empty farm root exists on
-        // disk for downstream code that checks for it.
+    /// Default strategy used by `create(name:)`. New projects land
+    /// on `.copy` so the agent's tools mutate the in-container copy
+    /// rather than the user's real files, and the sandbox doesn't
+    /// pay the bookmark-per-read tax. Legacy projects (decoded
+    /// with `importStrategy == nil`) are upgraded by the
+    /// `load()` path.
+    static let defaultImportStrategy: ProjectImportStrategy = .copy
+
+    func create(name: String,
+                strategy: ProjectImportStrategy = ProjectLibrary
+                    .defaultImportStrategy) -> Project {
+        var p = Project(name: name, importStrategy: strategy)
         if let result = try? ProjectRootBuilder.rebuild(p) {
             p.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
                 ? nil
@@ -133,6 +208,31 @@ final class ProjectLibrary: ObservableObject {
         return p
     }
 
+    /// Re-run the farm rebuild for a project, refreshing the import.
+    /// Used by the "Re-import" / "Pull" buttons in
+    /// `ProjectDetailView`. For `.symlinkFarm` it's a no-op-ish
+    /// recompute of the discovered list; for `.copy` it re-reads
+    /// the source folders and overwrites the farm; for
+    /// `.gitClone` it `git pull`s on top of the existing clone
+    /// instead of doing a fresh shallow clone.
+    func refresh(_ projectID: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        else { return }
+        let project = projects[idx]
+        switch project.effectiveImportStrategy {
+        case .gitClone:
+            ProjectRootBuilder.pullClone(project)
+        default:
+            if let result = try? ProjectRootBuilder.rebuild(project) {
+                projects[idx].pendingSymlinkRoots =
+                    result.externalSymlinkRoots.isEmpty
+                        ? nil
+                        : result.externalSymlinkRoots
+            }
+        }
+        saveIndex()
+    }
+
     func update(_ project: Project) {
         guard let idx = projects.firstIndex(where: { $0.id == project.id }) else { return }
         let prev = projects[idx]
@@ -140,8 +240,12 @@ final class ProjectLibrary: ObservableObject {
         // Rebuild BEFORE the save so the discovery result lands in
         // `next.pendingSymlinkRoots` before we persist — otherwise
         // we'd write twice (once with stale discovery, once with
-        // fresh).
-        if prev.sourcePaths != project.sourcePaths,
+        // fresh). Strategy changes also trigger a rebuild because
+        // the farm layout differs (symlinks vs bytes vs clone).
+        let sourcesChanged = prev.sourcePaths != project.sourcePaths
+        let strategyChanged = prev.effectiveImportStrategy
+            != project.effectiveImportStrategy
+        if (sourcesChanged || strategyChanged),
            let result = try? ProjectRootBuilder.rebuild(project)
         {
             next.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
@@ -261,7 +365,53 @@ final class ProjectLibrary: ObservableObject {
             for project in projects {
                 refreshAccess(for: project)
             }
+            migrateLegacyProjectsToCopy()
         }
+    }
+
+    /// Walk every loaded project; for any with `importStrategy == nil`
+    /// (i.e. persisted before the field existed), set the strategy to
+    /// `.copy` and rebuild so the legacy symlink farm gets replaced
+    /// with an in-container copy. We do this AFTER `refreshAccess`
+    /// has activated the security-scoped bookmarks — the copy reads
+    /// the source folders directly, which only works while the
+    /// bookmarks are live.
+    ///
+    /// Failure mode: if the rebuild can't read a source (stale
+    /// bookmark, removed folder), we silently keep the strategy at
+    /// nil so the next launch re-tries. The user can still open the
+    /// project and re-pick the sources from the detail view.
+    private func migrateLegacyProjectsToCopy() {
+        var migrated = false
+        for i in projects.indices {
+            guard projects[i].importStrategy == nil,
+                  !projects[i].sourcePaths.isEmpty
+            else { continue }
+            var candidate = projects[i]
+            candidate.importStrategy = .copy
+            // Try the copy rebuild. If it throws or the farm ends up
+            // empty (every source unreadable), back off to the
+            // legacy symlinkFarm path so the user isn't left with a
+            // hollow project.
+            guard let result = try? ProjectRootBuilder.rebuild(candidate),
+                  farmIsNonEmpty(result.root)
+            else {
+                continue
+            }
+            projects[i] = candidate
+            migrated = true
+        }
+        if migrated { saveIndex() }
+    }
+
+    /// Cheap "did the copy materialise anything?" check used by the
+    /// legacy migration. A folder counts as populated when it has
+    /// at least one entry. Avoids the deep-walk we'd need to
+    /// verify byte-equality with the source.
+    private func farmIsNonEmpty(_ root: URL) -> Bool {
+        let entries = (try? FileManager.default
+            .contentsOfDirectory(atPath: root.path)) ?? []
+        return !entries.isEmpty
     }
 
     /// (Re)create the per-project access vault from the project's
