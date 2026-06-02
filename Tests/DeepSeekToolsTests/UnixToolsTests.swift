@@ -456,6 +456,57 @@ final class UnixToolsTests: XCTestCase {
         XCTAssertEqual(after, "updated")
     }
 
+    /// `sandboxBlockedSymlinkTarget` returns the resolved parent
+    /// when a sandbox EPERM lands on a symlinked path. The host
+    /// uses this to push the parent dir into the project's
+    /// "Grant access" list.
+    func testSandboxBlockedSymlinkTargetIdentifiesParent() throws {
+        let farm = try makeTempRoot()
+        let outside = try makeTempRoot()
+        try write("hi", to: "leaf.txt", in: outside)
+        let linkURL = farm.appendingPathComponent("leaf.txt")
+        try FileManager.default.createSymbolicLink(
+            at: linkURL,
+            withDestinationURL: outside.appendingPathComponent("leaf.txt"))
+        let err = NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileReadNoPermissionError,
+                          userInfo: nil)
+        let parent = sandboxBlockedSymlinkTarget(
+            from: err, accessedFrom: linkURL)
+        XCTAssertEqual(
+            parent?.path,
+            (outside.path as NSString).resolvingSymlinksInPath)
+    }
+
+    /// EPERM on a path that isn't a symlink resolves to itself →
+    /// the helper returns nil so callers fall through to their
+    /// existing "real" permission-denied path. Otherwise we'd
+    /// nudge the user toward granting access to a directory they
+    /// already own and the sheet would look broken.
+    func testSandboxBlockedSymlinkTargetIgnoresNonLinkPaths() throws {
+        let root = try makeTempRoot()
+        try write("hi", to: "regular.txt", in: root)
+        let url = root.appendingPathComponent("regular.txt")
+        let err = NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileReadNoPermissionError,
+                          userInfo: nil)
+        XCTAssertNil(sandboxBlockedSymlinkTarget(
+            from: err, accessedFrom: url))
+    }
+
+    /// A non-EPERM error must fall through — we don't want to
+    /// rewrite e.g. a UTF-8 decode failure into a permission
+    /// banner.
+    func testSandboxBlockedSymlinkTargetIgnoresOtherErrors() throws {
+        let root = try makeTempRoot()
+        let url = root.appendingPathComponent("anything.txt")
+        let err = NSError(domain: NSCocoaErrorDomain,
+                          code: NSFileNoSuchFileError,
+                          userInfo: nil)
+        XCTAssertNil(sandboxBlockedSymlinkTarget(
+            from: err, accessedFrom: url))
+    }
+
     func testChmodOctal() async throws {
         let root = try makeTempRoot()
         try write("x", to: "f.txt", in: root)

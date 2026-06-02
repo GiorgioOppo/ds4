@@ -32,7 +32,26 @@ public struct HeadTool: Tool {
     public func run(input: [String: Any], context: ToolContext) async throws -> ToolOutput {
         let rel = try input.string("path")
         let url = try resolveInsideRoot(rel, context: context)
-        guard let data = try? Data(contentsOf: url) else {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            // Sandbox-blocked symlink target → push the parent into
+            // the project's pending list and explain how to grant
+            // access instead of returning the opaque
+            // "cannot read" string.
+            if let parent = sandboxBlockedSymlinkTarget(
+                from: error, accessedFrom: url)
+            {
+                context.reportSymlinkTargetNeeded?(parent)
+                let resolved = URL(fileURLWithPath:
+                    (url.path as NSString).resolvingSymlinksInPath)
+                throw ToolError.permissionDenied(
+                    symlinkPermissionDeniedMessage(
+                        relative: rel,
+                        resolved: resolved,
+                        grantParent: parent))
+            }
             throw ToolError.notFound("cannot read '\(rel)'")
         }
 

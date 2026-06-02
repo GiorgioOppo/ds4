@@ -1448,10 +1448,31 @@ final class ChatStore: ObservableObject {
         let extraRoots: [URL] = (project?.sourcePaths ?? [])
             .map { URL(fileURLWithPath: $0) }
 
+        // When a file-reading tool hits EPERM on a sym-link target
+        // the host pushes the resolved parent dir into the project's
+        // pending list so the ProjectDetailView's "Grant access"
+        // section grows in real time. Captures `library` by weak
+        // ref + `projectID` by value so the closure stays Sendable
+        // and survives across actor hops without retaining the
+        // ChatStore.
+        let onPending: (@Sendable (URL) -> Void)? = {
+            guard let pid = project?.id else { return nil }
+            let library = self.projects
+            let reporter: @Sendable (URL) -> Void = { [weak library] parent in
+                guard let library else { return }
+                Task { @MainActor in
+                    library.notePendingSymlinkRoot(
+                        path: parent.path, for: pid)
+                }
+            }
+            return reporter
+        }()
+
         let out = await nativeTools.dispatch(
             name: name, input: input, mode: mode,
             rootDirectory: rootDir,
-            additionalReadRoots: extraRoots)
+            additionalReadRoots: extraRoots,
+            onPendingSymlinkTarget: onPending)
         if out.isError {
             return "[error: \(out.output)]"
         }

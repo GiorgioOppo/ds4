@@ -36,7 +36,30 @@ public struct ReadTool: Tool {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw ToolError.notFound(path)
         }
-        let data = try Data(contentsOf: url)
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            // The macOS sandbox surfaces a "follow-symlink-to-
+            // un-bookmarked-target" failure as EPERM
+            // (NSFileReadNoPermissionError). Detect it, report the
+            // target's parent to the host so the project's pending
+            // list grows in real time, and rewrite the error into
+            // something actionable.
+            if let parent = sandboxBlockedSymlinkTarget(
+                from: error, accessedFrom: url)
+            {
+                context.reportSymlinkTargetNeeded?(parent)
+                let resolved = URL(fileURLWithPath:
+                    (url.path as NSString).resolvingSymlinksInPath)
+                throw ToolError.permissionDenied(
+                    symlinkPermissionDeniedMessage(
+                        relative: path,
+                        resolved: resolved,
+                        grantParent: parent))
+            }
+            throw error
+        }
         guard let text = String(data: data, encoding: .utf8) else {
             throw ToolError.invalidInput("file is not valid UTF-8")
         }

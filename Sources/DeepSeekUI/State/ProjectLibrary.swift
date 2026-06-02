@@ -189,6 +189,34 @@ final class ProjectLibrary: ObservableObject {
         update(updated)
     }
 
+    /// Add `path` to a project's `pendingSymlinkRoots` from outside
+    /// the rebuild pipeline. Called by `ChatStore` when a file-
+    /// reading tool catches an EPERM mid-chat on a path that
+    /// resolved through a symlink: the discovery rebuild only runs
+    /// at create/edit time, so a link created (or first followed)
+    /// after the last rebuild wouldn't otherwise show up in the
+    /// Grant Access list until the user manually triggered a
+    /// refresh.
+    ///
+    /// No-op when the path is already in `sourcePaths` (race: the
+    /// user granted access just as a tool was running) or already
+    /// in `pendingSymlinkRoots`. Cheap to call repeatedly — the
+    /// dedupe keeps the disk write rare.
+    func notePendingSymlinkRoot(path: String, for projectID: UUID) {
+        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        else { return }
+        let project = projects[idx]
+        // Already covered by a granted source → nothing to do; the
+        // EPERM was a stale bookmark or a race, not a missing grant.
+        if project.sourcePaths.contains(path) { return }
+        var pending = project.pendingSymlinkRoots ?? []
+        if pending.contains(path) { return }
+        pending.append(path)
+        pending.sort()  // mirror ProjectRootBuilder's stable ordering
+        projects[idx].pendingSymlinkRoots = pending
+        saveIndex()
+    }
+
     /// User dismissed an external symlink root from the "Grant
     /// access" list — they know the link is intentional dead weight
     /// (build artefact, generated tag, etc.) and don't want the

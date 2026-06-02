@@ -156,18 +156,29 @@ final class NativeToolHost: ObservableObject {
     /// farm) to also accept absolute paths under the project's
     /// real on-disk source folders — so a model can address a
     /// file either via the farm or via its real path.
+    ///
+    /// `onPendingSymlinkTarget` is invoked when a file-reading tool
+    /// (`read`, `head`, `tail`) catches an EPERM on a path that
+    /// resolves through a symlink. The chat layer wires it to push
+    /// the discovered parent onto the active project's
+    /// `pendingSymlinkRoots` so it shows up in the "Grant access"
+    /// list without waiting for the next rebuild. Nil for project-
+    /// less chats.
     func dispatch(name: String,
                   input: [String: Any],
                   mode: AgentMode,
                   rootDirectory: URL,
-                  additionalReadRoots: [URL] = []) async -> ToolOutput {
+                  additionalReadRoots: [URL] = [],
+                  onPendingSymlinkTarget: (@Sendable (URL) -> Void)? = nil
+    ) async -> ToolOutput {
         let context = ToolContext(
             rootDirectory: rootDirectory,
             additionalReadRoots: additionalReadRoots,
             mode: mode,
             permission: permissionDelegate,
             environment: nil,
-            isCancelled: { false } // wired from chat in InferenceService
+            isCancelled: { false }, // wired from chat in InferenceService
+            reportSymlinkTargetNeeded: onPendingSymlinkTarget
         )
         return await registry.dispatch(name: name, input: input, context: context)
     }
