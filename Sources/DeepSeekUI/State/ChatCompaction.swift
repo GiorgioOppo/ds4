@@ -1,16 +1,8 @@
 import Foundation
 
-/// Stable marker prepended to the synthetic system message that
-/// `ChatStore.compactOlderTurns(of:keepLastN:)` writes in place of
-/// the compacted prefix. Wrapped in a nonisolated enum so the
-/// constant has no actor isolation to inherit — neither from a
-/// surrounding `@MainActor` class nor from Swift 6's implicit
-/// top-level-let inference — and stays readable from any
-/// generic-predicate closure in `ChatView`'s compaction banner
-/// or the future re-encoder that recognises summary messages.
-enum ChatCompactionConstants {
-    static let marker = "[compacted summary of older turns]"
-}
+// `ChatCompactionConstants.marker` lives in its own file
+// (`ChatCompactionConstants.swift`) so this file's compile health
+// can't affect symbol visibility for the marker in `ChatView`.
 
 /// Compaction reduces long chat history by replacing older turns
 /// with a model-generated summary. Works against the same
