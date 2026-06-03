@@ -1,6 +1,5 @@
 import SwiftUI
 import DeepSeekKit
-
 /// Single-conversation chat surface bound to the currently-selected
 /// `ChatStore` conversation. Reads sampler defaults from `@AppStorage`.
 struct ChatView: View {
