@@ -87,12 +87,15 @@ public enum UnixBinary {
         process.standardOutput = stdout
         process.standardError = stderr
 
-        // Drain accumulators. NSLock keeps the readabilityHandler
-        // callbacks (Foundation thread) safe against the main task.
-        let lock = NSLock()
-        var outData = Data()
-        var errData = Data()
-        let cap = outputCap
+        // Drain accumulators. `StreamBuffer` owns the lock-protected
+        // byte array; both the readabilityHandler (Foundation queue)
+        // and the main task call its sync `append`/`snapshot`
+        // methods, which lock internally. Wrapping into a Sendable
+        // class is what keeps Swift 6 strict-concurrency happy —
+        // capturing a plain `var Data` across handler + main task
+        // is a data race the compiler now refuses to compile.
+        let outBuf = StreamBuffer(cap: outputCap)
+        let errBuf = StreamBuffer(cap: outputCap)
 
         stdout.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
@@ -100,11 +103,7 @@ public enum UnixBinary {
                 handle.readabilityHandler = nil
                 return
             }
-            lock.lock()
-            if outData.count < cap {
-                outData.append(chunk.prefix(cap - outData.count))
-            }
-            lock.unlock()
+            outBuf.append(chunk)
         }
         stderr.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
@@ -112,11 +111,7 @@ public enum UnixBinary {
                 handle.readabilityHandler = nil
                 return
             }
-            lock.lock()
-            if errData.count < cap {
-                errData.append(chunk.prefix(cap - errData.count))
-            }
-            lock.unlock()
+            errBuf.append(chunk)
         }
 
         // CRITICAL: set the termination handler BEFORE run(). A child
@@ -163,16 +158,10 @@ public enum UnixBinary {
         stderr.fileHandleForReading.readabilityHandler = nil
         let tailOut = stdout.fileHandleForReading.availableData
         let tailErr = stderr.fileHandleForReading.availableData
-        lock.lock()
-        if outData.count < cap {
-            outData.append(tailOut.prefix(cap - outData.count))
-        }
-        if errData.count < cap {
-            errData.append(tailErr.prefix(cap - errData.count))
-        }
-        let outSnap = outData
-        let errSnap = errData
-        lock.unlock()
+        outBuf.append(tailOut)
+        errBuf.append(tailErr)
+        let outSnap = outBuf.snapshot()
+        let errSnap = errBuf.snapshot()
 
         if timedOut {
             throw ToolError.timeout(after: timeout)
@@ -210,6 +199,37 @@ public enum UnixBinary {
         if body.utf8.count <= max { return body }
         let prefix = String(body.prefix(max))
         return prefix + "\n[output truncated at \(max) bytes]"
+    }
+}
+
+/// Bounded byte accumulator shared between Foundation's
+/// `readabilityHandler` callbacks (which fire on a background
+/// queue) and the async `runBinary` body. Owns its own `NSLock`
+/// inside sync `append`/`snapshot` methods so Swift 6's strict
+/// concurrency model doesn't have to track a `var Data` captured
+/// across two execution contexts.
+///
+/// The cap is enforced on every append: once `buf` reaches `cap`
+/// bytes, further chunks are dropped (the `runBinary` body
+/// appends a "truncated at N bytes" footer downstream). Marked
+/// `@unchecked Sendable` because the lock makes concurrent
+/// access safe by construction, but the compiler can't prove it.
+private final class StreamBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buf = Data()
+    private let cap: Int
+
+    init(cap: Int) { self.cap = cap }
+
+    func append(_ chunk: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard buf.count < cap else { return }
+        buf.append(chunk.prefix(cap - buf.count))
+    }
+
+    func snapshot() -> Data {
+        lock.lock(); defer { lock.unlock() }
+        return buf
     }
 }
 
