@@ -3177,6 +3177,25 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    // MARK: - extension-facing helpers
+
+    /// `phases` is `@Published private(set)`, so extensions defined in
+    /// other files (`ChatCompaction.swift`) can read it but not write
+    /// it. This thin wrapper exposes a typed setter without widening
+    /// the `private(set)` contract for the rest of the module —
+    /// callers go through `setPhase(_:for:)` instead of touching the
+    /// dictionary directly.
+    func setPhase(_ phase: GenerationPhase, for id: UUID) {
+        phases[id] = phase
+    }
+
+    /// `scheduleSave(_:)` is `private`, so the same cross-file
+    /// extension can't reach it directly. Wrap it under an internal
+    /// name that mirrors what the extension would have written.
+    func requestSave(_ id: UUID) {
+        scheduleSave(id)
+    }
+
     private func flushSave(_ id: UUID) async {
         guard let c = conversations.first(where: { $0.id == id }) else { return }
         let isV2 = PersistencePaths.isV2Chat(id: id)

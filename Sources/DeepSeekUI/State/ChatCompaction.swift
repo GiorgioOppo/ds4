@@ -64,26 +64,29 @@ extension ChatStore {
         let toCompact = Array(conversations[idx].messages.prefix(cutoff))
         guard !toCompact.isEmpty else { return }
 
-        phases[conversationID] = .streaming(
-            buffer: "", status: "Compacting older turns…",
-            metrics: GenerationMetrics())
+        setPhase(.streaming(buffer: "",
+                              status: "Compacting older turns…",
+                              metrics: GenerationMetrics()),
+                  for: conversationID)
 
         let summary: String
         do {
             summary = try await runCompactionRequest(
                 messages: toCompact, endpoint: endpoint)
         } catch {
-            phases[conversationID] = .error(
+            setPhase(.error(
                 "Compaction failed: " +
                 ((error as? LocalizedError)?.errorDescription
-                 ?? error.localizedDescription))
+                 ?? error.localizedDescription)),
+                      for: conversationID)
             return
         }
         let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            phases[conversationID] = .error(
+            setPhase(.error(
                 "Compaction returned an empty summary; the older "
-                + "turns were left untouched.")
+                + "turns were left untouched."),
+                      for: conversationID)
             return
         }
 
@@ -103,8 +106,8 @@ extension ChatStore {
         // from scratch on the next turn is the correct fix.
         conversations[idx].encodedTokens = nil
         conversations[idx].lastEncodedMode = nil
-        phases[conversationID] = .idle
-        scheduleSave(conversationID)
+        setPhase(.idle, for: conversationID)
+        requestSave(conversationID)
     }
 
     /// Drive the summarisation request against whichever provider
@@ -227,14 +230,19 @@ extension ChatStore {
                     "Anthropic API key missing."])
         }
         let userMsg = StoredMessage(role: .user, content: userPrompt)
+        // Explicit `Float()` wrappers: `AnthropicMessageBuilder.buildBody`
+        // declares `temperature: Float? = nil`, and Swift 6's stricter
+        // literal-inference path won't silently promote a `Double`
+        // literal across the `Float?` boundary. Drop `topP` so the
+        // builder uses its nil-default — Anthropic treats it as
+        // "disabled" anyway, identical to passing 1.0.
         let body = AnthropicMessageBuilder.buildBody(
             model: modelID,
             maxTokens: 1024,
             history: [userMsg],
             agentSystem: system,
             tools: nil,
-            temperature: 0.3,
-            topP: 1.0)
+            temperature: Float(0.3))
         let client = AnthropicClient()
         var summary = ""
         for try await chunk in client.streamMessages(
