@@ -70,7 +70,7 @@ enum ProjectRebuildStatus: Equatable {
 /// scan. `modelFingerprint` is recorded at index time so the chat
 /// loader (later step) can refuse to use a project whose tokens were
 /// produced against a different model.
-struct Project: Codable, Identifiable, Hashable {
+struct Project: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     var name: String
     /// Absolute filesystem paths. May point at single files or whole
@@ -262,12 +262,28 @@ final class ProjectLibrary: ObservableObject {
                     {
                         // Existing clone → "Pull" semantics, not a
                         // fresh shallow clone over an already-populated
-                        // farm root.
-                        ProjectRootBuilder.pullClone(project)
-                        outcome = .success(.init(
-                            root: try PersistencePaths.projectRootDir(
-                                id: projectID),
-                            externalSymlinkRoots: []))
+                        // farm root. Surface git errors so the
+                        // user sees "Pull failed: …" in the
+                        // banner.
+                        switch ProjectRootBuilder.pullClone(project) {
+                        case .success:
+                            outcome = .success(.init(
+                                root: try PersistencePaths.projectRootDir(
+                                    id: projectID),
+                                externalSymlinkRoots: []))
+                        case .spawnFailed(let msg):
+                            outcome = .failure(NSError(
+                                domain: "ProjectLibrary", code: 3,
+                                userInfo: [NSLocalizedDescriptionKey:
+                                            "git pull: \(msg)"]))
+                        case .gitError(let exit, let log):
+                            let snippet = log.trimmingCharacters(
+                                in: .whitespacesAndNewlines)
+                            outcome = .failure(NSError(
+                                domain: "ProjectLibrary", code: 4,
+                                userInfo: [NSLocalizedDescriptionKey:
+                                            "git pull exit \(exit): \(snippet)"]))
+                        }
                     } else {
                         let result = try ProjectRootBuilder.rebuild(project)
                         outcome = .success(result)

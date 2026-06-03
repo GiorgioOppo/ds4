@@ -77,13 +77,17 @@ enum ProjectRootBuilder {
     /// `git pull` an existing `.gitClone` farm so the user picks up
     /// upstream changes without losing local edits the agent may
     /// have committed. No-op for projects using a different
-    /// strategy. Best-effort: a failed pull leaves the farm in its
-    /// pre-pull state.
-    static func pullClone(_ project: Project) {
+    /// strategy. Returns the outcome so the caller can surface
+    /// "Pull failed: …" via the same status banner the initial
+    /// clone uses.
+    @discardableResult
+    static func pullClone(_ project: Project) -> GitOutcome {
         guard case .gitClone = project.effectiveImportStrategy,
               let root = try? PersistencePaths.projectRootDir(id: project.id)
-        else { return }
-        _ = run(git: ["pull", "--ff-only"], cwd: root)
+        else {
+            return .spawnFailed(message: "project is not a git clone")
+        }
+        return run(git: ["pull", "--ff-only"], cwd: root)
     }
 
     /// Deletes the project's farm root. Idempotent — missing
@@ -243,8 +247,9 @@ enum ProjectRootBuilder {
         let gitDir = root.appendingPathComponent(".git",
                                                   isDirectory: true)
         if fm.fileExists(atPath: gitDir.path) { return }
-        let init_ = run(git: ["init", "-q"], cwd: root)
-        guard init_ else { return }
+        guard case .success = run(git: ["init", "-q"], cwd: root) else {
+            return
+        }
         _ = run(git: ["add", "-A"], cwd: root)
         // Identity is required for `commit` to succeed even on a
         // brand-new repo. We set it as a one-shot via env so the
@@ -260,8 +265,10 @@ enum ProjectRootBuilder {
 
     /// Shallow-clone the upstream repo into the farm root. When the
     /// user picked a branch, that's what we clone; otherwise we let
-    /// git resolve the default. Failures throw so the caller knows
-    /// the rebuild didn't produce a usable farm.
+    /// git resolve the default. Failures throw with the error
+    /// surface decoded from `GitOutcome` — sandbox blocks vs git
+    /// errors get different messages so the user can act
+    /// accordingly.
     private static func rebuildGitClone(repoURL: String,
                                           branch: String?,
                                           root: URL) throws {
@@ -282,11 +289,27 @@ enum ProjectRootBuilder {
         }
         args.append(repoURL)
         args.append(stagingURL.path)
-        if !run(git: args, cwd: parent) {
+        switch run(git: args, cwd: parent) {
+        case .success: break
+        case .spawnFailed(let message):
             throw NSError(
                 domain: "ProjectRootBuilder", code: 1,
                 userInfo: [NSLocalizedDescriptionKey:
-                            "git clone failed for \(repoURL)"])
+                            "Couldn't spawn git: \(message). "
+                            + "App Store sandboxed builds block "
+                            + "subprocess execution — switch to "
+                            + "Copy or Symlink mode, or rebuild "
+                            + "with the non-sandboxed entitlements."])
+        case .gitError(let exit, let log):
+            let snippet = log.isEmpty
+                ? ""
+                : ": " + log.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .components(separatedBy: "\n").suffix(3).joined(
+                        separator: " ")
+            throw NSError(
+                domain: "ProjectRootBuilder", code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                            "git clone exit \(exit)\(snippet)"])
         }
         // Move the cloned tree into the farm root. We can't just
         // `mv` over a non-empty dir, so we transfer item by item.
@@ -301,25 +324,51 @@ enum ProjectRootBuilder {
 
     // MARK: - internals
 
-    /// Run `git` with the given arguments synchronously, returning
-    /// true on exit 0. Used by the import paths; the app needs to
-    /// be allowed to spawn `Process()` for this to do anything
-    /// useful (non-App-Store builds).
+    /// Outcome of one `git` subprocess invocation. The three cases
+    /// drive different error messages: `spawnFailed` means we
+    /// couldn't even start the child (most likely the App Store
+    /// sandbox blocking `Process()`); `gitError` means git itself
+    /// ran but returned non-zero (bad URL, auth, conflict);
+    /// `success` carries whatever git wrote so the caller can
+    /// surface it for diagnostics.
+    enum GitOutcome {
+        case success(log: String)
+        case spawnFailed(message: String)
+        case gitError(exit: Int32, log: String)
+    }
+
+    /// Run `git` with the given arguments synchronously. Captures
+    /// stdout/stderr into one combined log so the caller can show
+    /// the user what went wrong without parsing both streams.
     @discardableResult
-    private static func run(git args: [String], cwd: URL) -> Bool {
+    static func run(git args: [String], cwd: URL) -> GitOutcome {
         let process = Process()
         process.launchPath = "/usr/bin/env"
         process.arguments = ["git"] + args
         process.currentDirectoryURL = cwd
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
         do {
             try process.run()
         } catch {
-            return false
+            return .spawnFailed(message: error.localizedDescription)
         }
         process.waitUntilExit()
-        return process.terminationStatus == 0
+        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(),
+                          encoding: .utf8) ?? ""
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                          encoding: .utf8) ?? ""
+        let combined: String = {
+            if out.isEmpty { return err }
+            if err.isEmpty { return out }
+            return out + "\n" + err
+        }()
+        if process.terminationStatus == 0 {
+            return .success(log: combined)
+        }
+        return .gitError(exit: process.terminationStatus, log: combined)
     }
 
     /// Canonical (post `resolvingSymlinksInPath`) form of every
