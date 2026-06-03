@@ -50,6 +50,16 @@ enum ProjectImportStrategy: Codable, Hashable {
     }
 }
 
+/// State of a per-project rebuild — used by the UI to render a
+/// spinner or banner while `.copy` is grinding through a large
+/// source tree or `.gitClone` is shelling out to `git`. Symlink
+/// rebuilds are fast enough that we don't bother surfacing them.
+enum ProjectRebuildStatus: Equatable {
+    case idle
+    case running
+    case failed(message: String)
+}
+
 /// A user-defined project: a name plus a list of source paths (files
 /// or directories). Indexing walks those paths and produces one
 /// `VectorizedDocument` per discovered text file, tagged with the
@@ -173,6 +183,13 @@ struct Project: Codable, Identifiable, Hashable {
 final class ProjectLibrary: ObservableObject {
     @Published private(set) var projects: [Project] = []
 
+    /// Per-project rebuild state. The UI binds to this so the
+    /// detail view can render a spinner while a `.copy` walks
+    /// through a large source tree or `.gitClone` is talking to
+    /// the network. Symlink rebuilds finish synchronously and never
+    /// land here — keeping the dict small.
+    @Published private(set) var rebuildStates: [UUID: ProjectRebuildStatus] = [:]
+
     /// Active security-scoped resource accessors, one vault per project
     /// id. Vault `acquire(bookmarks:)` is called whenever a project's
     /// bookmark blob changes (initial load, edit, re-add) so the macOS
@@ -197,14 +214,10 @@ final class ProjectLibrary: ObservableObject {
     func create(name: String,
                 strategy: ProjectImportStrategy = ProjectLibrary
                     .defaultImportStrategy) -> Project {
-        var p = Project(name: name, importStrategy: strategy)
-        if let result = try? ProjectRootBuilder.rebuild(p) {
-            p.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
-                ? nil
-                : result.externalSymlinkRoots
-        }
+        let p = Project(name: name, importStrategy: strategy)
         projects.insert(p, at: 0)
         saveIndex()
+        startRebuild(p.id)
         return p
     }
 
@@ -216,49 +229,138 @@ final class ProjectLibrary: ObservableObject {
     /// `.gitClone` it `git pull`s on top of the existing clone
     /// instead of doing a fresh shallow clone.
     func refresh(_ projectID: UUID) {
-        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        startRebuild(projectID)
+    }
+
+    /// Kick off whichever rebuild the project's strategy needs.
+    /// Symlink mode runs synchronously — it's just creating
+    /// directory entries, no point spinning up a Task. Copy / git
+    /// modes detach to a background priority Task because they can
+    /// take seconds (large repos, network), and we don't want the
+    /// main thread blocked while the user is staring at a frozen
+    /// sheet. The `rebuildStates` published dict drives the
+    /// spinner in `ProjectDetailView`.
+    private func startRebuild(_ projectID: UUID) {
+        guard let project = projects.first(where: { $0.id == projectID })
         else { return }
-        let project = projects[idx]
         switch project.effectiveImportStrategy {
-        case .gitClone:
-            ProjectRootBuilder.pullClone(project)
-        default:
-            if let result = try? ProjectRootBuilder.rebuild(project) {
-                projects[idx].pendingSymlinkRoots =
-                    result.externalSymlinkRoots.isEmpty
-                        ? nil
-                        : result.externalSymlinkRoots
+        case .symlinkFarm:
+            applySyncSymlinkRebuild(project)
+        case .copy, .gitClone:
+            // Coalesce reruns: a second click on "Re-import" while
+            // the first copy is still grinding would race the
+            // detached Task and produce a half-overwritten farm.
+            // Drop the request; the user can retry once the
+            // current Task finishes.
+            if rebuildStates[projectID] == .running { return }
+            rebuildStates[projectID] = .running
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let outcome: Result<ProjectRootBuilder.RebuildResult, Error>
+                do {
+                    if case .gitClone = project.effectiveImportStrategy,
+                       await self?.farmAlreadyCloned(for: projectID) == true
+                    {
+                        // Existing clone → "Pull" semantics, not a
+                        // fresh shallow clone over an already-populated
+                        // farm root.
+                        ProjectRootBuilder.pullClone(project)
+                        outcome = .success(.init(
+                            root: try PersistencePaths.projectRootDir(
+                                id: projectID),
+                            externalSymlinkRoots: []))
+                    } else {
+                        let result = try ProjectRootBuilder.rebuild(project)
+                        outcome = .success(result)
+                    }
+                } catch {
+                    outcome = .failure(error)
+                }
+                await self?.finishRebuild(projectID, outcome: outcome)
             }
         }
+    }
+
+    /// Fast-path sync rebuild for `.symlinkFarm`. Stays on the main
+    /// actor because creating symlinks is cheap and the call site
+    /// (`update`) already expects synchronous state mutation.
+    private func applySyncSymlinkRebuild(_ project: Project) {
+        guard let idx = projects.firstIndex(where: { $0.id == project.id })
+        else { return }
+        rebuildStates.removeValue(forKey: project.id)
+        if let result = try? ProjectRootBuilder.rebuild(project) {
+            projects[idx].pendingSymlinkRoots =
+                result.externalSymlinkRoots.isEmpty
+                    ? nil
+                    : result.externalSymlinkRoots
+        }
         saveIndex()
+    }
+
+    /// Apply the outcome of a copy / git rebuild back onto the
+    /// published state. Called from the detached Task via a hop
+    /// to the main actor.
+    private func finishRebuild(
+        _ projectID: UUID,
+        outcome: Result<ProjectRootBuilder.RebuildResult, Error>
+    ) {
+        guard let idx = projects.firstIndex(where: { $0.id == projectID })
+        else {
+            rebuildStates.removeValue(forKey: projectID)
+            return
+        }
+        switch outcome {
+        case .success(let result):
+            projects[idx].pendingSymlinkRoots =
+                result.externalSymlinkRoots.isEmpty
+                    ? nil
+                    : result.externalSymlinkRoots
+            rebuildStates.removeValue(forKey: projectID)
+            saveIndex()
+        case .failure(let error):
+            rebuildStates[projectID] = .failed(
+                message: error.localizedDescription)
+        }
+    }
+
+    /// True when the project's farm already contains a `.git`
+    /// directory — used by `startRebuild` to pick between a fresh
+    /// shallow clone and a `git pull` on the existing tree.
+    /// `nonisolated` so the detached rebuild Task can call it
+    /// without re-hopping to the main actor for every check; the
+    /// filesystem read it performs doesn't touch any actor-isolated
+    /// state.
+    private func farmAlreadyCloned(for projectID: UUID) -> Bool {
+        guard let root = try? PersistencePaths.projectRootDir(id: projectID)
+        else { return false }
+        let gitDir = root.appendingPathComponent(".git",
+                                                  isDirectory: true)
+        return FileManager.default.fileExists(atPath: gitDir.path)
     }
 
     func update(_ project: Project) {
         guard let idx = projects.firstIndex(where: { $0.id == project.id }) else { return }
         let prev = projects[idx]
-        var next = project
-        // Rebuild BEFORE the save so the discovery result lands in
-        // `next.pendingSymlinkRoots` before we persist — otherwise
-        // we'd write twice (once with stale discovery, once with
-        // fresh). Strategy changes also trigger a rebuild because
-        // the farm layout differs (symlinks vs bytes vs clone).
         let sourcesChanged = prev.sourcePaths != project.sourcePaths
         let strategyChanged = prev.effectiveImportStrategy
             != project.effectiveImportStrategy
-        if (sourcesChanged || strategyChanged),
-           let result = try? ProjectRootBuilder.rebuild(project)
-        {
-            next.pendingSymlinkRoots = result.externalSymlinkRoots.isEmpty
-                ? nil
-                : result.externalSymlinkRoots
-        }
-        projects[idx] = next
+        projects[idx] = project
         saveIndex()
         // Always refresh the vault when bookmarks change — even if the
         // path list is identical, the user may have re-picked a folder
-        // to recover sandbox access after a stale grant.
+        // to recover sandbox access after a stale grant. Done before
+        // the rebuild so a `.copy` reading source files sees the
+        // freshly-activated security-scoped resources.
         if prev.sourceBookmarks != project.sourceBookmarks {
             refreshAccess(for: project)
+        }
+        // Symlink rebuilds finish synchronously and update
+        // `pendingSymlinkRoots` in place; copy / git detach to a
+        // background Task and the result lands later via
+        // `finishRebuild`. The save above carries the new
+        // sourcePaths regardless, so even if the user closes the
+        // app mid-copy, the project metadata is persisted.
+        if sourcesChanged || strategyChanged {
+            startRebuild(project.id)
         }
     }
 
@@ -370,48 +472,37 @@ final class ProjectLibrary: ObservableObject {
     }
 
     /// Walk every loaded project; for any with `importStrategy == nil`
-    /// (i.e. persisted before the field existed), set the strategy to
-    /// `.copy` and rebuild so the legacy symlink farm gets replaced
-    /// with an in-container copy. We do this AFTER `refreshAccess`
-    /// has activated the security-scoped bookmarks — the copy reads
-    /// the source folders directly, which only works while the
-    /// bookmarks are live.
+    /// (i.e. persisted before the field existed), flip the strategy
+    /// to `.copy` and kick off a background rebuild so the legacy
+    /// symlink farm gets replaced with an in-container copy.
+    /// Called from `load()` after `refreshAccess` activates the
+    /// security-scoped bookmarks — the rebuild reads source folders
+    /// directly, which only works while the bookmarks are live.
     ///
-    /// Failure mode: if the rebuild can't read a source (stale
-    /// bookmark, removed folder), we silently keep the strategy at
-    /// nil so the next launch re-tries. The user can still open the
-    /// project and re-pick the sources from the detail view.
+    /// Async by design: a large project with a multi-GB source tree
+    /// would freeze app startup if we did the copy synchronously.
+    /// The metadata flip + save lands immediately; the actual file
+    /// I/O runs in a detached Task and the UI surfaces "Importing"
+    /// in the meantime.
+    ///
+    /// Failure mode: a failed rebuild leaves the strategy at `.copy`
+    /// but the farm empty, with `rebuildStates[id] = .failed`. The
+    /// detail view shows the error; the user can re-pick sources or
+    /// fall back to `.symlinkFarm` from a future affordance.
     private func migrateLegacyProjectsToCopy() {
-        var migrated = false
+        var migratedIDs: [UUID] = []
         for i in projects.indices {
             guard projects[i].importStrategy == nil,
                   !projects[i].sourcePaths.isEmpty
             else { continue }
-            var candidate = projects[i]
-            candidate.importStrategy = .copy
-            // Try the copy rebuild. If it throws or the farm ends up
-            // empty (every source unreadable), back off to the
-            // legacy symlinkFarm path so the user isn't left with a
-            // hollow project.
-            guard let result = try? ProjectRootBuilder.rebuild(candidate),
-                  farmIsNonEmpty(result.root)
-            else {
-                continue
-            }
-            projects[i] = candidate
-            migrated = true
+            projects[i].importStrategy = .copy
+            migratedIDs.append(projects[i].id)
         }
-        if migrated { saveIndex() }
-    }
-
-    /// Cheap "did the copy materialise anything?" check used by the
-    /// legacy migration. A folder counts as populated when it has
-    /// at least one entry. Avoids the deep-walk we'd need to
-    /// verify byte-equality with the source.
-    private func farmIsNonEmpty(_ root: URL) -> Bool {
-        let entries = (try? FileManager.default
-            .contentsOfDirectory(atPath: root.path)) ?? []
-        return !entries.isEmpty
+        guard !migratedIDs.isEmpty else { return }
+        saveIndex()
+        for id in migratedIDs {
+            startRebuild(id)
+        }
     }
 
     /// (Re)create the per-project access vault from the project's

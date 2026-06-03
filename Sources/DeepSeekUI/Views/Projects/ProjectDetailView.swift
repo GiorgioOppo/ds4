@@ -203,12 +203,13 @@ struct ProjectDetailView: View {
     // MARK: - import strategy (copy / symlink / git)
 
     /// One-glance summary of how this project's sources land in the
-    /// farm, with the matching "Refresh" / "Pull" affordance. Hidden
-    /// for projects with no sources and no clone URL — the section
-    /// would carry no useful action.
+    /// farm, with the matching "Refresh" / "Pull" affordance and a
+    /// live status row pulled from `library.rebuildStates` so the
+    /// user knows when a copy / clone is still running.
     @ViewBuilder
     private var importStrategySection: some View {
         let strategy = project.effectiveImportStrategy
+        let status = library.rebuildStates[project.id]
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Import strategy").font(.headline)
@@ -228,26 +229,58 @@ struct ProjectDetailView: View {
                     .truncationMode(.middle)
                     .foregroundStyle(.tertiary)
             }
-            HStack(spacing: 8) {
-                Spacer()
-                if case .gitClone = strategy {
-                    Button {
-                        library.refresh(project.id)
-                    } label: {
-                        Label("Pull", systemImage: "arrow.down.circle")
-                    }
+            statusRow(status: status, strategy: strategy)
+        }
+    }
+
+    /// Status + action row. Renders one of:
+    /// - spinner + "Importing…" while the detached rebuild Task is
+    ///   running (so the user knows the empty farm isn't broken,
+    ///   it's just not done yet),
+    /// - error label + retry button on `.failed`,
+    /// - the "Re-import" / "Pull" buttons otherwise.
+    @ViewBuilder
+    private func statusRow(status: ProjectRebuildStatus?,
+                            strategy: ProjectImportStrategy) -> some View {
+        HStack(spacing: 8) {
+            if case .running = status {
+                ProgressView()
                     .controlSize(.small)
-                } else if strategy == .copy && !project.sourcePaths.isEmpty {
-                    Button {
-                        library.refresh(project.id)
-                    } label: {
-                        Label("Re-import", systemImage: "arrow.clockwise")
-                    }
-                    .controlSize(.small)
-                    .help("Re-copy every source folder. Any edits the "
-                          + "agent made in the project will be replaced "
-                          + "by the upstream content.")
+                let label: String = {
+                    if case .gitClone = strategy { return "Cloning…" }
+                    return "Importing…"
+                }()
+                Text(label).font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if case .failed(let msg) = status {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            if case .gitClone = strategy {
+                Button {
+                    library.refresh(project.id)
+                } label: {
+                    Label("Pull", systemImage: "arrow.down.circle")
                 }
+                .controlSize(.small)
+                .disabled(status == .running)
+            } else if strategy == .copy && !project.sourcePaths.isEmpty {
+                Button {
+                    library.refresh(project.id)
+                } label: {
+                    Label("Re-import", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+                .disabled(status == .running)
+                .help("Re-copy every source folder. Any edits the "
+                      + "agent made in the project will be replaced "
+                      + "by the upstream content.")
             }
         }
     }
