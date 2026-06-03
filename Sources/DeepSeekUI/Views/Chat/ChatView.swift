@@ -146,7 +146,7 @@ struct ChatView: View {
         let userTurns = c.messages.filter { $0.role == .user }.count
         let alreadyCompacted = c.messages.contains {
             $0.role == .system
-            && $0.content.hasPrefix(chatCompactionMarker)
+            && $0.content.hasPrefix(ChatCompactionConstants.marker)
         }
         if isRemoteChat && isIdle
            && userTurns >= compactionUserTurnThreshold

@@ -2,15 +2,15 @@ import Foundation
 
 /// Stable marker prepended to the synthetic system message that
 /// `ChatStore.compactOlderTurns(of:keepLastN:)` writes in place of
-/// the compacted prefix. Lives at file scope (not on `ChatStore`)
-/// so call sites in `@MainActor`-adjacent contexts — the
-/// `Array.contains { … }` predicate in `ChatView`'s compaction
-/// banner, the future re-encoder that needs to recognise summary
-/// messages — can read it without arguing with Swift 6 about
-/// extension-inherited actor isolation. `ChatStore` exposes the
-/// same string via the back-compat alias just below so existing
-/// callers keep working.
-let chatCompactionMarker = "[compacted summary of older turns]"
+/// the compacted prefix. Wrapped in a nonisolated enum so the
+/// constant has no actor isolation to inherit — neither from a
+/// surrounding `@MainActor` class nor from Swift 6's implicit
+/// top-level-let inference — and stays readable from any
+/// generic-predicate closure in `ChatView`'s compaction banner
+/// or the future re-encoder that recognises summary messages.
+enum ChatCompactionConstants {
+    static let marker = "[compacted summary of older turns]"
+}
 
 /// Compaction reduces long chat history by replacing older turns
 /// with a model-generated summary. Works against the same
@@ -25,14 +25,16 @@ let chatCompactionMarker = "[compacted summary of older turns]"
 /// doesn't accidentally drop it.
 extension ChatStore {
 
-    /// Back-compat alias for the file-scope `chatCompactionMarker`.
-    /// New code should use the top-level constant directly; this
-    /// stays around so existing references via `ChatStore.compactionMarker`
-    /// keep resolving. Marked `nonisolated` for the same reason as
-    /// the file-scope constant: the value has no actor-dependent
+    /// Back-compat alias for `ChatCompactionConstants.marker`.
+    /// New code should reach the enum directly; this stays around
+    /// so existing references via `ChatStore.compactionMarker`
+    /// keep resolving. Marked `nonisolated` for the same reason
+    /// as the enum's static: the value has no actor-dependent
     /// state, and callers reach it from generic-predicate closures
     /// that don't inherit the surrounding `@MainActor`.
-    nonisolated static var compactionMarker: String { chatCompactionMarker }
+    nonisolated static var compactionMarker: String {
+        ChatCompactionConstants.marker
+    }
 
     /// Replace user-led turns older than the last `keepLastN` with
     /// a single `.system` message containing a model-generated
@@ -87,7 +89,7 @@ extension ChatStore {
 
         let summaryMessage = StoredMessage(
             role: .system,
-            content: chatCompactionMarker + "\n\n" + trimmed)
+            content: ChatCompactionConstants.marker + "\n\n" + trimmed)
         // Replace the prefix [0..<cutoff] with the single summary
         // message. The rest of the transcript — including any
         // .system messages that landed inside the compacted span
