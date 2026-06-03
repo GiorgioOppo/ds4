@@ -18,7 +18,14 @@ extension ChatStore {
     /// re-encoding code that needs to know "this is a summary of
     /// older turns, not original user input". Kept on its own
     /// line so the model continues from a clean delimiter.
-    static let compactionMarker = "[compacted summary of older turns]"
+    ///
+    /// `nonisolated` because Swift 6 propagates `ChatStore`'s
+    /// `@MainActor` isolation onto extension members, but this
+    /// pure constant has no state that needs the actor — and
+    /// callers read it from `Array.contains` predicates (which
+    /// the compiler treats as non-isolated even when invoked from
+    /// a `@MainActor` view body).
+    nonisolated static let compactionMarker = "[compacted summary of older turns]"
 
     /// Replace user-led turns older than the last `keepLastN` with
     /// a single `.system` message containing a model-generated

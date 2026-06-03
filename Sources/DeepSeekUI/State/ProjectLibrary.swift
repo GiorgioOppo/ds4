@@ -209,7 +209,14 @@ final class ProjectLibrary: ObservableObject {
     /// pay the bookmark-per-read tax. Legacy projects (decoded
     /// with `importStrategy == nil`) are upgraded by the
     /// `load()` path.
-    static let defaultImportStrategy: ProjectImportStrategy = .copy
+    ///
+    /// `nonisolated` so the value can serve as a default-parameter
+    /// expression on `create(name:strategy:)` without the call-site
+    /// caller (which may not be MainActor-isolated) tripping
+    /// Swift 6's actor-isolation check. The value itself is an
+    /// enum case with no associated state — no actual mutation
+    /// crosses the actor boundary here.
+    nonisolated static let defaultImportStrategy: ProjectImportStrategy = .copy
 
     func create(name: String,
                 strategy: ProjectImportStrategy = ProjectLibrary

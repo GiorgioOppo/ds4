@@ -71,28 +71,16 @@ public final class KVCacheLifecycle: @unchecked Sendable {
     /// Sempre forza il save (nessun throttle).
     public func triggerCold() async {
         await safeCall(.cold)
-        stateLock.lock()
-        lastContinuedSaveTokenCount = 0
-        lastContinuedSaveAt = Date()
-        stateLock.unlock()
+        recordContinuedSave(tokenCount: 0, at: Date())
     }
 
     /// Da chiamare durante decode quando il count cumulativo di
     /// token raggiunge un window boundary. Throttle applicato:
     /// non salva se sotto la soglia di token o tempo dal last save.
     public func triggerContinued(currentTokenCount: Int) async {
-        stateLock.lock()
-        let tokensDelta = currentTokenCount - lastContinuedSaveTokenCount
-        let timeDelta = Date().timeIntervalSince(lastContinuedSaveAt)
-        let shouldSave = tokensDelta >= continuedSaveTokenThreshold
-                          || timeDelta >= continuedSaveMinInterval
-        stateLock.unlock()
-        if !shouldSave { return }
+        if !shouldSaveContinued(currentTokenCount: currentTokenCount) { return }
         await safeCall(.continued)
-        stateLock.lock()
-        lastContinuedSaveTokenCount = currentTokenCount
-        lastContinuedSaveAt = Date()
-        stateLock.unlock()
+        recordContinuedSave(tokenCount: currentTokenCount, at: Date())
     }
 
     /// Da chiamare prima di un model swap o cambio conversation.
@@ -111,13 +99,34 @@ public final class KVCacheLifecycle: @unchecked Sendable {
     /// conversation così il prossimo `continued` non viene
     /// "antichizzato" dallo stato della conversation precedente.
     public func reset() {
-        stateLock.lock()
+        stateLock.lock(); defer { stateLock.unlock() }
         lastContinuedSaveTokenCount = 0
         lastContinuedSaveAt = Date.distantPast
-        stateLock.unlock()
     }
 
     // MARK: - Internal
+
+    /// Sync-only throttle check; the lock stays inside the method
+    /// body so Swift 6 strict concurrency doesn't see an NSLock
+    /// call from an async context. Caller (`triggerContinued`) is
+    /// async but only invokes this synchronously, then awaits the
+    /// save closure outside the lock.
+    private func shouldSaveContinued(currentTokenCount: Int) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        let tokensDelta = currentTokenCount - lastContinuedSaveTokenCount
+        let timeDelta = Date().timeIntervalSince(lastContinuedSaveAt)
+        return tokensDelta >= continuedSaveTokenThreshold
+            || timeDelta >= continuedSaveMinInterval
+    }
+
+    /// Sync-only commit of "we just saved" state. Same isolation
+    /// rationale as `shouldSaveContinued`: the lock is held only
+    /// for the assignments, never across an await.
+    private func recordContinuedSave(tokenCount: Int, at date: Date) {
+        stateLock.lock(); defer { stateLock.unlock() }
+        lastContinuedSaveTokenCount = tokenCount
+        lastContinuedSaveAt = date
+    }
 
     private func safeCall(_ trigger: SaveTrigger) async {
         guard let save = save else { return }
