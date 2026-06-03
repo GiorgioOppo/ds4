@@ -173,13 +173,44 @@ enum OpenRouterError: LocalizedError {
         case .invalidResponse:
             return "Unexpected response from OpenRouter"
         case .http(let code, let body):
-            if let body, !body.isEmpty { return "OpenRouter HTTP \(code): \(body)" }
+            if code == 402 {
+                // 402 bodies embed the key's dashboard URL (which
+                // includes the key id). The auto-retry path
+                // already tried lowering `max_tokens`; if we got
+                // here the retry didn't help — show a clean
+                // message and keep the raw URL out of the chat
+                // transcript so it doesn't end up in screenshots
+                // / model context / log files.
+                return "OpenRouter rejected the request (HTTP 402): the API "
+                    + "key's per-request budget is below the requested "
+                    + "max_tokens. Lower max_tokens in Settings → Generation, "
+                    + "or top up the key at openrouter.ai/keys."
+            }
+            if let body, !body.isEmpty {
+                return "OpenRouter HTTP \(code): \(Self.redact(body))"
+            }
             return "OpenRouter HTTP \(code)"
         case .unauthorized:
             return "OpenRouter rejected the API key. Check Settings."
         case .decodingFailed(let msg):
             return "OpenRouter response decode failed: \(msg)"
         }
+    }
+
+    /// Strip out the `openrouter.ai/workspaces/.../keys/<hex>` URLs
+    /// some error bodies embed. The hex segment is the key id —
+    /// useful to OpenRouter for support, but a credential leak
+    /// when echoed into the chat, screenshots, or model logs.
+    private static let keyURLRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"https?://openrouter\.ai/[^\s"']+keys/[A-Za-z0-9]+"#)
+
+    static func redact(_ body: String) -> String {
+        guard let regex = keyURLRegex else { return body }
+        let ns = body as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        return regex.stringByReplacingMatches(
+            in: body, range: range,
+            withTemplate: "<openrouter dashboard URL redacted>")
     }
 }
 
@@ -275,70 +306,104 @@ final class OpenRouterClient: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var req = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
-                    req.httpMethod = "POST"
-                    req.setValue("application/json",
-                                  forHTTPHeaderField: "Content-Type")
-                    req.setValue("text/event-stream",
-                                  forHTTPHeaderField: "Accept")
-                    req.setValue("Bearer \(apiKey)",
-                                  forHTTPHeaderField: "Authorization")
-                    Self.addStandardHeaders(&req)
                     var bodyToSend = body
                     bodyToSend["stream"] = true
-                    req.httpBody = try JSONSerialization.data(
-                        withJSONObject: bodyToSend, options: [])
+                    var triedBudgetRetry = false
 
-                    let (bytes, response) = try await session.bytes(for: req)
+                    // Single attempt loop. We re-enter at most once
+                    // on HTTP 402: OpenRouter rejects when the key's
+                    // per-request budget can't cover the requested
+                    // `max_tokens`, but the error body tells us how
+                    // many tokens the key CAN afford. We trim the
+                    // body and retry transparently so the user
+                    // doesn't see a flaky-looking failure when the
+                    // fix is mechanical.
+                    requestLoop:
+                    while true {
+                        var req = URLRequest(
+                            url: baseURL.appendingPathComponent(
+                                "chat/completions"))
+                        req.httpMethod = "POST"
+                        req.setValue("application/json",
+                                      forHTTPHeaderField: "Content-Type")
+                        req.setValue("text/event-stream",
+                                      forHTTPHeaderField: "Accept")
+                        req.setValue("Bearer \(apiKey)",
+                                      forHTTPHeaderField: "Authorization")
+                        Self.addStandardHeaders(&req)
+                        req.httpBody = try JSONSerialization.data(
+                            withJSONObject: bodyToSend, options: [])
 
-                    if let http = response as? HTTPURLResponse,
-                       http.statusCode != 200 {
-                        // Drain the body for a useful error message.
-                        var collected = Data()
-                        for try await b in bytes {
-                            collected.append(b)
-                            if collected.count > 4096 { break }
+                        let (bytes, response) = try await session.bytes(for: req)
+
+                        if let http = response as? HTTPURLResponse,
+                           http.statusCode != 200 {
+                            // Drain the body for a useful error message.
+                            var collected = Data()
+                            for try await b in bytes {
+                                collected.append(b)
+                                if collected.count > 4096 { break }
+                            }
+                            let body = String(data: collected, encoding: .utf8)
+                            if http.statusCode == 401 || http.statusCode == 403 {
+                                throw OpenRouterError.unauthorized
+                            }
+                            if http.statusCode == 402,
+                               !triedBudgetRetry,
+                               let affordable = Self.parseAffordableTokens(
+                                from: body),
+                               affordable >= 256
+                            {
+                                // Subtract a small safety margin so a
+                                // retry that lands on a SLIGHTLY
+                                // pricier provider doesn't 402 again.
+                                let target = max(256,
+                                                 Int(Double(affordable) * 0.95))
+                                bodyToSend["max_tokens"] = target
+                                triedBudgetRetry = true
+                                continue requestLoop
+                            }
+                            throw OpenRouterError.http(
+                                code: http.statusCode, body: body)
                         }
-                        let body = String(data: collected, encoding: .utf8)
-                        if http.statusCode == 401 || http.statusCode == 403 {
-                            throw OpenRouterError.unauthorized
+
+                        let decoder = JSONDecoder()
+                        for try await rawLine in bytes.lines {
+                            if Task.isCancelled {
+                                continuation.finish()
+                                return
+                            }
+                            // SSE: blank lines separate events; comments
+                            // start with ':'. We only care about
+                            // `data: …` payloads.
+                            if rawLine.isEmpty || rawLine.hasPrefix(":") {
+                                continue
+                            }
+                            guard rawLine.hasPrefix("data: ") else { continue }
+                            let payload = String(rawLine.dropFirst("data: ".count))
+                            if payload == "[DONE]" {
+                                continuation.finish()
+                                return
+                            }
+                            guard let data = payload.data(using: .utf8) else { continue }
+                            do {
+                                let chunk = try decoder.decode(
+                                    OpenAIStreamChunk.self, from: data)
+                                continuation.yield(chunk)
+                            } catch {
+                                // OpenRouter occasionally interleaves
+                                // provider-specific events (e.g. router
+                                // upstream switches) we don't model.
+                                // Skip rather than fail the whole stream.
+                                continue
+                            }
                         }
-                        throw OpenRouterError.http(
-                            code: http.statusCode, body: body)
+                        // Stream ended cleanly without an explicit
+                        // [DONE] terminator — finish the continuation
+                        // and exit the retry loop.
+                        continuation.finish()
+                        break requestLoop
                     }
-
-                    let decoder = JSONDecoder()
-                    for try await rawLine in bytes.lines {
-                        if Task.isCancelled {
-                            continuation.finish()
-                            return
-                        }
-                        // SSE: blank lines separate events; comments
-                        // start with ':'. We only care about
-                        // `data: …` payloads.
-                        if rawLine.isEmpty || rawLine.hasPrefix(":") {
-                            continue
-                        }
-                        guard rawLine.hasPrefix("data: ") else { continue }
-                        let payload = String(rawLine.dropFirst("data: ".count))
-                        if payload == "[DONE]" {
-                            continuation.finish()
-                            return
-                        }
-                        guard let data = payload.data(using: .utf8) else { continue }
-                        do {
-                            let chunk = try decoder.decode(
-                                OpenAIStreamChunk.self, from: data)
-                            continuation.yield(chunk)
-                        } catch {
-                            // OpenRouter occasionally interleaves
-                            // provider-specific events (e.g. router
-                            // upstream switches) we don't model.
-                            // Skip rather than fail the whole stream.
-                            continue
-                        }
-                    }
-                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -350,6 +415,56 @@ final class OpenRouterClient: @unchecked Sendable {
     }
 
     // MARK: - helpers
+
+    /// Pull the "you can only afford N tokens" hint out of an
+    /// OpenRouter 402 body. The error is structured like:
+    ///
+    /// ```json
+    /// { "error": {
+    ///     "code": 402,
+    ///     "message": "...can only afford 3630. To increase...",
+    ///     "metadata": { "previous_errors": [
+    ///         {"code":402,"message":"...afford 4967..."}, …
+    ///     ]}
+    /// }}
+    /// ```
+    ///
+    /// Multiple provider attempts can land in `previous_errors`
+    /// with different limits; the **top-level** message is the
+    /// last attempt and the one we should target on retry. Falls
+    /// back to a free-text scan when the JSON shape isn't what we
+    /// expect — OpenRouter occasionally returns slightly different
+    /// wrappers, and a regex over the body is still better than
+    /// throwing the whole error away.
+    ///
+    /// Visible for testing; not stable API.
+    static func parseAffordableTokens(from body: String?) -> Int? {
+        guard let body, !body.isEmpty else { return nil }
+        if let data = body.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any],
+           let err = obj["error"] as? [String: Any],
+           let message = err["message"] as? String,
+           let parsed = extractAffordFromText(message)
+        {
+            return parsed
+        }
+        return extractAffordFromText(body)
+    }
+
+    private static let affordRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"can only afford (\d+)"#)
+
+    private static func extractAffordFromText(_ text: String) -> Int? {
+        guard let regex = affordRegex else { return nil }
+        let ns = text as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        guard let match = regex.firstMatch(in: text, range: range)
+        else { return nil }
+        let group = match.range(at: 1)
+        guard group.location != NSNotFound else { return nil }
+        return Int(ns.substring(with: group))
+    }
 
     private static func addStandardHeaders(_ req: inout URLRequest) {
         req.setValue(attributionURL, forHTTPHeaderField: "HTTP-Referer")
