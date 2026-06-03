@@ -183,7 +183,7 @@ public enum UnixBinary {
             }
             body = combined
         }
-        let capped = capOutput(body, max: cap)
+        let capped = capOutput(body, max: outputCap)
         let status = process.terminationStatus
         return ToolOutput(
             output: "exit \(status)\n\(capped)",
