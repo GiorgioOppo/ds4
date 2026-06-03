@@ -1,6 +1,26 @@
 import Foundation
 import DeepSeekKit
 
+/// Format a `LoadPlan` into the multi-line stderr banner the
+/// `--list-tensors` / `--dump-row` diagnostic paths used to print
+/// via `plan.summary()` before that method got pulled out of
+/// `LegacyStubs.swift`. Kept here (not on `LoadPlan`) so the
+/// stub stays minimal — the surface that DeepSeekUI / the load
+/// pipeline care about doesn't need this representation.
+private func renderLoadPlanSummary(_ plan: LoadPlan) -> String {
+    let totalGB = Double(plan.totalBytes) / 1_073_741_824
+    let physGB = Double(plan.physicalRAM) / 1_073_741_824
+    return """
+    LoadPlan: \(plan.strategy.rawValue)
+      reason:     \(plan.reason)
+      shards:     \(plan.shards.count)
+      total:      \(String(format: "%.2f", totalGB)) GB
+      physRAM:    \(String(format: "%.1f", physGB)) GB
+      cores:      \(plan.cores)
+
+    """
+}
+
 // CLI: deepseek <model-dir> "<prompt>"
 //                   [--max-tokens N]
 //                   [--temperature T]
@@ -274,8 +294,8 @@ if listEnabled {
         let plan = try LoadPlan.decide(modelDir: modelDir,
                                         override: loadStrategy,
                                         forceLoad: forceLoad)
-        FileHandle.standardError.write(Data(plan.summary().utf8))
-        let loader = try WeightLoader(plan: plan)
+        FileHandle.standardError.write(Data(renderLoadPlanSummary(plan).utf8))
+        let loader = try WeightLoader(directory: modelDir)
         var names = loader.allKnownNames
         if let pfx = listPrefix {
             names = names.filter { $0.hasPrefix(pfx) }
@@ -317,8 +337,8 @@ if let spec = dumpSpec {
         let plan = try LoadPlan.decide(modelDir: modelDir,
                                         override: loadStrategy,
                                         forceLoad: forceLoad)
-        FileHandle.standardError.write(Data(plan.summary().utf8))
-        let loader = try WeightLoader(plan: plan)
+        FileHandle.standardError.write(Data(renderLoadPlanSummary(plan).utf8))
+        let loader = try WeightLoader(directory: modelDir)
         let r = try TensorDump.dumpRow(parsed.name,
                                         row: parsed.row,
                                         cols: parsed.cols,
