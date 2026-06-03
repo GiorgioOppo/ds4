@@ -57,6 +57,15 @@ private struct OpenRouterModelsResponse: Decodable {
 struct OpenAIMessage {
     var role: String                // "system" | "user" | "assistant" | "tool"
     var content: String?
+    /// Alternative to `content` when the message needs to carry
+    /// content blocks instead of a flat string. Used by the
+    /// `buildOpenAIMessages` cache-breakpoint path so a single
+    /// `text` block can be tagged with
+    /// `cache_control: {"type": "ephemeral"}` — OpenRouter routes
+    /// the marker through to Anthropic-family upstreams (10-25 %
+    /// of normal price on a cached prefix), other providers
+    /// ignore it. When non-nil this wins over `content`.
+    var contentBlocks: [[String: Any]]?
     var name: String?
     var toolCalls: [OpenAIToolCall]?
     var toolCallID: String?         // present when role == "tool"
@@ -65,7 +74,11 @@ struct OpenAIMessage {
     /// Serialise to the dict shape OpenRouter expects.
     func toJSON() -> [String: Any] {
         var obj: [String: Any] = ["role": role]
-        if let c = content { obj["content"] = c }
+        if let blocks = contentBlocks, !blocks.isEmpty {
+            obj["content"] = blocks
+        } else if let c = content {
+            obj["content"] = c
+        }
         if let n = name { obj["name"] = n }
         if let tc = toolCalls, !tc.isEmpty {
             obj["tool_calls"] = tc.map { $0.toJSON() }
@@ -73,6 +86,22 @@ struct OpenAIMessage {
         if let id = toolCallID { obj["tool_call_id"] = id }
         if let r = reasoningContent { obj["reasoning_content"] = r }
         return obj
+    }
+
+    /// Cache-marker helper used by `buildOpenAIMessages`. Replaces
+    /// the message's `content` string with a one-block content
+    /// list that carries the marker. No-op when there's nothing
+    /// to cache (empty content + no tool calls) or when the
+    /// message already uses `contentBlocks` for some other reason.
+    mutating func markCacheBreakpoint() {
+        guard contentBlocks == nil else { return }
+        guard let c = content, !c.isEmpty else { return }
+        content = nil
+        contentBlocks = [[
+            "type": "text",
+            "text": c,
+            "cache_control": ["type": "ephemeral"],
+        ]]
     }
 }
 

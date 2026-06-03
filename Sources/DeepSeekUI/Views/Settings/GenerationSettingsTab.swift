@@ -10,6 +10,8 @@ struct GenerationSettingsTab: View {
     @AppStorage("deepseek.repPenalty")  private var repPenalty: Double = 1.0
     @AppStorage("deepseek.maxTokens")   private var maxTokens: Int = 256
     @AppStorage("deepseek.mode")        private var modeRaw: String = "chat"
+    @AppStorage(AppSettingsKey.remoteHistoryTurnsCap)
+    private var remoteHistoryTurnsCap: Int = 0
 
     var body: some View {
         Form {
@@ -67,6 +69,31 @@ struct GenerationSettingsTab: View {
                             .font(.system(.body, design: .monospaced))
                     }
                 }
+            }
+            Section {
+                LabeledContent("Sliding window") {
+                    Stepper(value: $remoteHistoryTurnsCap,
+                             in: 0...100, step: 1) {
+                        Text(remoteHistoryTurnsCap == 0
+                              ? "Unlimited"
+                              : "\(remoteHistoryTurnsCap) turns")
+                            .font(.system(.body, design: .monospaced))
+                    }
+                }
+            } header: {
+                Text("Remote history")
+            } footer: {
+                Text("Cap how many user-led turns get re-sent to "
+                     + "OpenRouter / Anthropic on the next call. "
+                     + "0 = unlimited (full history every turn — "
+                     + "what every stateless chat API requires). "
+                     + "Set a positive value to bound per-request "
+                     + "token cost on long chats; older turns stay "
+                     + "visible in the transcript but aren't "
+                     + "re-sent. System messages and the agent "
+                     + "prompt are never dropped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Mode") {
                 Picker("Thinking mode", selection: $modeRaw) {

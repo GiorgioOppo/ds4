@@ -2266,7 +2266,7 @@ final class ChatStore: ObservableObject {
                            agent: AgentConfig?)? = await MainActor.run {
                 guard let idx = self.conversations.firstIndex(where: { $0.id == id })
                 else { return nil }
-                let history = self.conversations[idx].messages
+                let filtered = self.conversations[idx].messages
                     .dropLast()  // drop the in-progress placeholder
                     .filter { msg in
                         // Skip orphan assistant placeholders left
@@ -2286,9 +2286,12 @@ final class ChatStore: ObservableObject {
                         guard msg.role == .assistant else { return true }
                         return !msg.content.isEmpty || !msg.toolCalls.isEmpty
                     }
+                let windowed = ChatStore.applySlidingWindow(
+                    Array(filtered),
+                    keepLastNUserTurns: AppSettings.remoteHistoryTurnsCap)
                 let agent = self.conversations[idx].agentID
                     .flatMap { self.agents.agent(id: $0) }
-                return (Array(history), agent)
+                return (windowed, agent)
             }
             guard let snapshot else { return }
 
@@ -2832,6 +2835,44 @@ final class ChatStore: ObservableObject {
     /// each `toolOutput` becomes a follow-up `{role: "tool",
     /// tool_call_id, content}` message so the upstream model can
     /// thread the answer back to its original call.
+    /// Drop user-led turns older than the last `keepLastNUserTurns`
+    /// while keeping every `.system` message (those carry the
+    /// agent prompt + project inventory, not history that grows
+    /// unboundedly). A "turn" starts at a `.user` message and
+    /// runs until the next user message, so assistant + tool-
+    /// output messages stay paired with their kicking user
+    /// message instead of getting orphaned.
+    ///
+    /// `keepLastNUserTurns == 0` disables the cap (no slicing) —
+    /// callers wire it to `AppSettings.remoteHistoryTurnsCap` so
+    /// the user picks the trade-off between context fidelity and
+    /// per-request token cost. Visible for testing.
+    static func applySlidingWindow(_ messages: [StoredMessage],
+                                     keepLastNUserTurns: Int)
+        -> [StoredMessage]
+    {
+        guard keepLastNUserTurns > 0 else { return messages }
+        let userIndices = messages.enumerated()
+            .filter { $0.element.role == .user }
+            .map(\.offset)
+        guard userIndices.count > keepLastNUserTurns else { return messages }
+        let cutoff = userIndices[userIndices.count - keepLastNUserTurns]
+        var out: [StoredMessage] = []
+        out.reserveCapacity(messages.count - cutoff
+                              + userIndices.count - keepLastNUserTurns)
+        for (i, msg) in messages.enumerated() {
+            if i < cutoff {
+                // System messages stay so the agent's prompt and
+                // any sticky context (project inventory) aren't
+                // dropped along with the old turns they preceded.
+                if msg.role == .system { out.append(msg) }
+                continue
+            }
+            out.append(msg)
+        }
+        return out
+    }
+
     private func buildOpenAIMessages(history: [StoredMessage],
                                        agent: AgentConfig?,
                                        projectInventory: ProjectInventory? = nil)
@@ -2862,10 +2903,35 @@ final class ChatStore: ObservableObject {
                 : block + "\n" + systemContent
         }
         if !systemContent.isEmpty {
-            out.append(OpenAIMessage(role: "system", content: systemContent))
+            var sys = OpenAIMessage(role: "system", content: systemContent)
+            // Cache breakpoint #1: system prompt + project inventory
+            // + agent system. Static across every turn → biggest
+            // win on Anthropic-routed OpenRouter requests, ignored
+            // by upstreams that don't support `cache_control`.
+            sys.markCacheBreakpoint()
+            out.append(sys)
         }
 
-        for msg in history where msg.role != .system {
+        // Materialise non-system messages first so we can locate
+        // the LAST assistant block and tag it as a second cache
+        // breakpoint — that's the boundary "everything except the
+        // newest user message" which is constant across the next
+        // turn. Anthropic supports up to 4 breakpoints; using 2
+        // (system + last-assistant) covers the prompt-cache
+        // sweet spot without churn.
+        let nonSystem = history.filter { $0.role != .system }
+        let lastAssistantIdx: Int? = {
+            for idx in nonSystem.indices.reversed() {
+                let msg = nonSystem[idx]
+                guard msg.role == .assistant else { continue }
+                let hasContent = !msg.content.isEmpty
+                let hasCalls = !msg.toolCalls.isEmpty
+                if hasContent || hasCalls { return idx }
+            }
+            return nil
+        }()
+
+        for (idx, msg) in nonSystem.enumerated() {
             switch msg.role {
             case .user:
                 out.append(OpenAIMessage(role: "user", content: msg.content))
@@ -2882,6 +2948,9 @@ final class ChatStore: ObservableObject {
                             name: tc.name,
                             arguments: tc.args.isEmpty ? "{}" : tc.args)
                     }
+                }
+                if idx == lastAssistantIdx {
+                    m.markCacheBreakpoint()
                 }
                 out.append(m)
                 if let outputs = msg.toolOutputs {

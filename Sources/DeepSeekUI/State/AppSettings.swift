@@ -140,6 +140,13 @@ enum AppSettingsKey {
     /// can call them directly instead of falling through to the
     /// .dangerous `shell` tool. Default true. Unset (missing key)
     /// is read as true so a fresh install gets the full toolbox.
+    /// Cap on how many user-led turns a remote chat sends back to
+    /// the provider. 0 = unlimited (current behaviour). When > 0
+    /// the request keeps system messages + the last N user
+    /// turns and everything that follows each — older turns are
+    /// dropped from the request body, NOT from the on-screen
+    /// transcript.
+    static let remoteHistoryTurnsCap = "deepseek.remote.historyTurnsCap"
     static let enableUnixTools = "deepseek.tools.unix.enabled"
 
     /// Register the 30 Xcode / Apple-platform tools (xcodebuild_*,
@@ -156,6 +163,18 @@ enum AppSettingsKey {
 enum AppSettings {
     static var loadStrategy: String {
         UserDefaults.standard.string(forKey: AppSettingsKey.loadStrategy) ?? "auto"
+    }
+
+    /// Remote-chat sliding-window cap. 0 means "send the full
+    /// history", any positive value caps the request to system
+    /// messages + the last N user turns and everything that
+    /// follows each. The on-screen transcript stays untouched —
+    /// this only affects what's serialised into `messages` for
+    /// the next API call.
+    static var remoteHistoryTurnsCap: Int {
+        let raw = UserDefaults.standard.integer(
+            forKey: AppSettingsKey.remoteHistoryTurnsCap)
+        return max(0, raw)
     }
     static var forceLoad: Bool {
         UserDefaults.standard.bool(forKey: AppSettingsKey.forceLoad)
