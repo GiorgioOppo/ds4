@@ -103,6 +103,7 @@ struct ChatView: View {
                     .padding(.bottom, 6)
             }
             resumeBanner(c: c, phase: phase)
+            compactionBanner(c: c, phase: phase)
             thinkingPicker
             ComposerView(draft: $draft,
                           phase: phase,
@@ -111,6 +112,72 @@ struct ChatView: View {
                           onStop: { store.cancel(of: c.id) })
         }
         .navigationTitle(c.title)
+    }
+
+    /// Threshold (in user turns) above which the chat shows the
+    /// "Compact older turns" affordance. Picked to roughly match
+    /// the sliding-window cap: at this size every fresh turn pays
+    /// for ~24 turns of re-sent prefix, which is enough that even
+    /// a 25 % cache-hit makes compaction a clear win.
+    private var compactionUserTurnThreshold: Int { 12 }
+
+    /// Banner above the composer that offers to compact older
+    /// turns into a model-generated summary. Visible only when:
+    /// the chat is on a remote endpoint (compaction is wired for
+    /// OpenRouter / Anthropic, local is a TODO), the chat is
+    /// idle (no in-flight generation), and the user-turn count is
+    /// over the threshold.
+    @ViewBuilder
+    private func compactionBanner(c: Conversation,
+                                    phase: GenerationPhase) -> some View {
+        let endpoint = store.endpoint(of: c.id)
+        let isRemoteChat: Bool = {
+            switch endpoint {
+            case .openRouter, .anthropic: return true
+            case .localDirectory, .none: return false
+            }
+        }()
+        let isIdle: Bool = {
+            switch phase {
+            case .idle, .error: return true
+            default:           return false
+            }
+        }()
+        let userTurns = c.messages.filter { $0.role == .user }.count
+        let alreadyCompacted = c.messages.contains {
+            $0.role == .system
+            && $0.content.hasPrefix(ChatStore.compactionMarker)
+        }
+        if isRemoteChat && isIdle
+           && userTurns >= compactionUserTurnThreshold
+        {
+            HStack(spacing: 10) {
+                Image(systemName: "rectangle.compress.vertical")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(alreadyCompacted
+                          ? "Compact again"
+                          : "Compact older turns")
+                        .font(.callout.bold())
+                    Text("This chat has \(userTurns) user turns. Compaction "
+                         + "replaces all but the last 4 with a short "
+                         + "model-generated summary — reduces per-request "
+                         + "token cost; older transcript is dropped from "
+                         + "both screen and history.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button("Compact") {
+                    Task { await store.compactOlderTurns(of: c.id) }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.blue.opacity(0.08))
+        }
     }
 
     /// Rendered above the composer when a previous generation died
