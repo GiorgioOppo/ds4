@@ -1,5 +1,17 @@
 import Foundation
 
+/// Stable marker prepended to the synthetic system message that
+/// `ChatStore.compactOlderTurns(of:keepLastN:)` writes in place of
+/// the compacted prefix. Lives at file scope (not on `ChatStore`)
+/// so call sites in `@MainActor`-adjacent contexts — the
+/// `Array.contains { … }` predicate in `ChatView`'s compaction
+/// banner, the future re-encoder that needs to recognise summary
+/// messages — can read it without arguing with Swift 6 about
+/// extension-inherited actor isolation. `ChatStore` exposes the
+/// same string via the back-compat alias just below so existing
+/// callers keep working.
+let chatCompactionMarker = "[compacted summary of older turns]"
+
 /// Compaction reduces long chat history by replacing older turns
 /// with a model-generated summary. Works against the same
 /// `OpenRouterClient` / `AnthropicClient` that `runRemoteLoop`
@@ -8,24 +20,19 @@ import Foundation
 /// performs the work.
 ///
 /// The summary message gets a `.system` role and is tagged with
-/// `compactionMarker` at the start of its content so the UI can
-/// render it visually distinct and `applySlidingWindow` doesn't
-/// accidentally drop it.
+/// `chatCompactionMarker` at the start of its content so the UI
+/// can render it visually distinct and `applySlidingWindow`
+/// doesn't accidentally drop it.
 extension ChatStore {
 
-    /// Stable marker line we prepend to the summary content. Used
-    /// by the UI to recognise compaction artefacts and by
-    /// re-encoding code that needs to know "this is a summary of
-    /// older turns, not original user input". Kept on its own
-    /// line so the model continues from a clean delimiter.
-    ///
-    /// `nonisolated` because Swift 6 propagates `ChatStore`'s
-    /// `@MainActor` isolation onto extension members, but this
-    /// pure constant has no state that needs the actor — and
-    /// callers read it from `Array.contains` predicates (which
-    /// the compiler treats as non-isolated even when invoked from
-    /// a `@MainActor` view body).
-    nonisolated static let compactionMarker = "[compacted summary of older turns]"
+    /// Back-compat alias for the file-scope `chatCompactionMarker`.
+    /// New code should use the top-level constant directly; this
+    /// stays around so existing references via `ChatStore.compactionMarker`
+    /// keep resolving. Marked `nonisolated` for the same reason as
+    /// the file-scope constant: the value has no actor-dependent
+    /// state, and callers reach it from generic-predicate closures
+    /// that don't inherit the surrounding `@MainActor`.
+    nonisolated static var compactionMarker: String { chatCompactionMarker }
 
     /// Replace user-led turns older than the last `keepLastN` with
     /// a single `.system` message containing a model-generated
@@ -80,7 +87,7 @@ extension ChatStore {
 
         let summaryMessage = StoredMessage(
             role: .system,
-            content: Self.compactionMarker + "\n\n" + trimmed)
+            content: chatCompactionMarker + "\n\n" + trimmed)
         // Replace the prefix [0..<cutoff] with the single summary
         // message. The rest of the transcript — including any
         // .system messages that landed inside the compacted span
