@@ -73,18 +73,50 @@ public struct LayerWeights {
     public var sharedGate: GPUTensor, sharedUp: GPUTensor, sharedDown: GPUTensor  // Q8
     public var routerW: GPUTensor         // Q8 [nExperts x nEmbd]
     public var expGate: GPUTensor, expUp: GPUTensor, expDown: GPUTensor           // Q4_K experts
+    // --- Compression + sparse-indexer weights (only on compressed layers, il>=2).
+    // nil on ratio==0 layers (0,1). The `comp*` set is present for ratio 4 and 128;
+    // the `index*` set only for ratio 4. All compressor projections are F16; the
+    // norms are F32; indexerQB is F16 or Q8_0. See docs/COMPRESSED-ATTENTION-PORT.md.
+    public var comp: CompressorWeights?   // attn_compressor_* (ratio != 0)
+    public var index: IndexerWeights?     // indexer.* + indexer_compressor_* (ratio == 4)
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
                 attnOutA: GPUTensor, attnOut: GPUTensor, hcFfnFn: GPUTensor, ffnScale: GPUTensor, ffnBase: GPUTensor, ffnNorm: GPUTensor,
                 sharedGate: GPUTensor, sharedUp: GPUTensor, sharedDown: GPUTensor, routerW: GPUTensor,
-                expGate: GPUTensor, expUp: GPUTensor, expDown: GPUTensor) {
+                expGate: GPUTensor, expUp: GPUTensor, expDown: GPUTensor,
+                comp: CompressorWeights? = nil, index: IndexerWeights? = nil) {
         self.hcAttnFn = hcAttnFn; self.attnScale = attnScale; self.attnBase = attnBase; self.attnNorm = attnNorm
         self.qA = qA; self.qANorm = qANorm; self.qB = qB; self.kvW = kvW; self.kvNorm = kvNorm
         self.attnSinks = attnSinks
         self.attnOutA = attnOutA; self.attnOut = attnOut; self.hcFfnFn = hcFfnFn; self.ffnScale = ffnScale; self.ffnBase = ffnBase; self.ffnNorm = ffnNorm
         self.sharedGate = sharedGate; self.sharedUp = sharedUp; self.sharedDown = sharedDown; self.routerW = routerW
         self.expGate = expGate; self.expUp = expUp; self.expDown = expDown
+        self.comp = comp; self.index = index
+    }
+}
+
+/// Attention KV-compressor weights (present on every compressed layer, ratio!=0).
+/// Produces one pooled compressed KV row per `ratio` tokens. All F16 except norm.
+public struct CompressorWeights {
+    public var ape: GPUTensor    // F16 [compWidth, ratio]   — absolute-position bias (added to score)
+    public var kv: GPUTensor     // F16 [nEmbd, compWidth]   — compressed-KV projection
+    public var gate: GPUTensor   // F16 [nEmbd, compWidth]   — score/gate projection
+    public var norm: GPUTensor   // F32 [headDim]            — RMS-norm weight on the pooled row
+    public init(ape: GPUTensor, kv: GPUTensor, gate: GPUTensor, norm: GPUTensor) {
+        self.ape = ape; self.kv = kv; self.gate = gate; self.norm = norm
+    }
+}
+
+/// Sparse-indexer weights (only on ratio==4 layers). A parallel compressor lane
+/// (head_dim=128, QAT-quantized) plus the query/proj used to score + top-512 the
+/// visible compressed rows.
+public struct IndexerWeights {
+    public var qB: GPUTensor     // F16/Q8_0 [nLoraQ, nIndexerHead*nIndexerHeadDim] — indexer query up-proj (from qr_norm)
+    public var proj: GPUTensor   // F16 [nEmbd, nIndexerHead] — per-head score weights (from attn_norm)
+    public var comp: CompressorWeights  // indexer_compressor_* (head_dim=128, index_width)
+    public init(qB: GPUTensor, proj: GPUTensor, comp: CompressorWeights) {
+        self.qB = qB; self.proj = proj; self.comp = comp
     }
 }
 

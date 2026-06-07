@@ -69,7 +69,35 @@ public enum GGUFWeights {
             sharedDown: try T("ffn_down_shexp.weight"), routerW: try T("ffn_gate_inp.weight"),
             expGate: loadExperts ? try T("ffn_gate_exps.weight") : dummy,
             expUp: loadExperts ? try T("ffn_up_exps.weight") : dummy,
-            expDown: loadExperts ? try T("ffn_down_exps.weight") : dummy)
+            expDown: loadExperts ? try T("ffn_down_exps.weight") : dummy,
+            comp: try compressor(rt, model, il), index: try indexer(rt, model, il))
+    }
+
+    /// Load the attention KV-compressor weights for a compressed layer (ratio != 0),
+    /// or nil for the ratio==0 dense layers (0,1). Tensor names + F16/F32 types match
+    /// ds4.c load_layer (blk.<il>.attn_compressor_*).
+    static func compressor(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> CompressorWeights? {
+        guard DSV4Shape.compressRatio(layer: il) != 0 else { return nil }
+        let p = "blk.\(il)."
+        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
+        return CompressorWeights(ape: try T("attn_compressor_ape.weight"),
+                                 kv: try T("attn_compressor_kv.weight"),
+                                 gate: try T("attn_compressor_gate.weight"),
+                                 norm: try T("attn_compressor_norm.weight"))
+    }
+
+    /// Load the sparse-indexer weights for a ratio==4 layer, or nil otherwise.
+    /// Names: blk.<il>.indexer.{attn_q_b,proj}.weight + blk.<il>.indexer_compressor_*.
+    static func indexer(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> IndexerWeights? {
+        guard DSV4Shape.compressRatio(layer: il) == 4 else { return nil }
+        let p = "blk.\(il)."
+        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
+        let comp = CompressorWeights(ape: try T("indexer_compressor_ape.weight"),
+                                     kv: try T("indexer_compressor_kv.weight"),
+                                     gate: try T("indexer_compressor_gate.weight"),
+                                     norm: try T("indexer_compressor_norm.weight"))
+        return IndexerWeights(qB: try T("indexer.attn_q_b.weight"),
+                              proj: try T("indexer.proj.weight"), comp: comp)
     }
 
     /// Build a layer with its routed-expert tensors as NO-COPY mmap views over the
