@@ -62,6 +62,15 @@ struct ChatView: View {
     }
 
     private var composer: some View {
+        VStack(alignment: .leading, spacing: 4) {
+        if store.isGenerating && !store.status.isEmpty {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(store.status)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
         HStack(alignment: .bottom, spacing: 8) {
             TextField("Scrivi un messaggio…", text: $store.input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
@@ -77,6 +86,7 @@ struct ChatView: View {
                 }
                 .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+        }
         }
         .padding(.horizontal)
         .padding(.vertical, 10)

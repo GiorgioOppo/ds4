@@ -49,6 +49,7 @@ public struct ModelInfo: Sendable {
 public enum GenEvent: Sendable {
     case reasoning(String)
     case text(String)
+    case progress(String)   // prefill/decode status (e.g. "prefill 3/11" or "12 tok · 1.4 tok/s")
 }
 
 public actor InferenceService {
@@ -82,8 +83,10 @@ public actor InferenceService {
         // Mapped-experts streaming: experts are no-copy mmap views over the full
         // expert tensors (all 256/layer); the GPU reads only the selected rows and
         // the OS page cache caches them across tokens — no per-token re-gather.
-        self.decoder = try StreamingDecoder.fromGGUFMappedExperts(rt: rt, model: model, dims: dims, rope: rope,
-                                                                  nLayers: DSV4Shape.nLayer, maxKeys: contextSize)
+        // Fast 16GB path (C --ssd-streaming model): non-routed weights are no-copy mmap
+        // (resident via page cache, evictable), only the 6 selected experts gathered/token.
+        self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
+                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize)
     }
 
     public func modelInfo() -> ModelInfo {
@@ -119,13 +122,16 @@ public actor InferenceService {
         let prompt = tok.encodeChatPrompt(system: systemPrompt, prompt: userText, think: think.core)
         precondition(prompt.count < contextSize, "prompt exceeds context")
 
-        // Prefill: feed each prompt token, accumulating the KV cache.
+        // Prefill: feed each prompt token, accumulating the KV cache. Report progress
+        // per token (each forward is slow on a streamed model) like the CLI demo.
         var pos = 0
         var lastLogits: [Float] = []
-        for t in prompt {
+        continuation.yield(.progress("prefill 0/\(prompt.count)…"))
+        for (i, t) in prompt.enumerated() {
             try Task.checkCancellation()
             lastLogits = try decoder.forward(token: Int(t), pos: pos, nKeys: pos + 1)
             pos += 1
+            continuation.yield(.progress("prefill \(i + 1)/\(prompt.count)"))
         }
 
         var rng = sampling.seed
@@ -139,6 +145,7 @@ public actor InferenceService {
         }
 
         var produced = 0
+        let genStart = Date()
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
@@ -154,7 +161,11 @@ public actor InferenceService {
             produced += 1
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
             pos += 1
+            let elapsed = Date().timeIntervalSince(genStart)
+            continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
+                                                 elapsed > 0 ? Double(produced) / elapsed : 0)))
         }
         flush(inReasoning)
+        continuation.yield(.progress(""))   // clear status when done
     }
 }

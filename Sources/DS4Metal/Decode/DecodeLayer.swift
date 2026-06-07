@@ -73,50 +73,27 @@ public struct LayerWeights {
     public var sharedGate: GPUTensor, sharedUp: GPUTensor, sharedDown: GPUTensor  // Q8
     public var routerW: GPUTensor         // Q8 [nExperts x nEmbd]
     public var expGate: GPUTensor, expUp: GPUTensor, expDown: GPUTensor           // Q4_K experts
-    // --- Compression + sparse-indexer weights (only on compressed layers, il>=2).
-    // nil on ratio==0 layers (0,1). The `comp*` set is present for ratio 4 and 128;
-    // the `index*` set only for ratio 4. All compressor projections are F16; the
-    // norms are F32; indexerQB is F16 or Q8_0. See docs/COMPRESSED-ATTENTION-PORT.md.
-    public var comp: CompressorWeights?   // attn_compressor_* (ratio != 0)
-    public var index: IndexerWeights?     // indexer.* + indexer_compressor_* (ratio == 4)
+    // NSA attention compressor (present only on compressed layers, ratio!=0; nil on 0,1).
+    // F16 projections from attn_norm to coff*headDim (coff=2 for ratio-4, 1 for ratio-128).
+    public var compKv: GPUTensor?         // F16 attn_compressor_kv   [nEmbd x coff*headDim]
+    public var compGate: GPUTensor?       // F16 attn_compressor_gate [nEmbd x coff*headDim]
+    public var compApe: GPUTensor?        // attn_compressor_ape      [coff*headDim x ratio] (absolute pos emb)
+    public var compNorm: GPUTensor?       // F32 attn_compressor_norm [headDim]
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
                 attnOutA: GPUTensor, attnOut: GPUTensor, hcFfnFn: GPUTensor, ffnScale: GPUTensor, ffnBase: GPUTensor, ffnNorm: GPUTensor,
                 sharedGate: GPUTensor, sharedUp: GPUTensor, sharedDown: GPUTensor, routerW: GPUTensor,
                 expGate: GPUTensor, expUp: GPUTensor, expDown: GPUTensor,
-                comp: CompressorWeights? = nil, index: IndexerWeights? = nil) {
+                compKv: GPUTensor? = nil, compGate: GPUTensor? = nil,
+                compApe: GPUTensor? = nil, compNorm: GPUTensor? = nil) {
+        self.compKv = compKv; self.compGate = compGate; self.compApe = compApe; self.compNorm = compNorm
         self.hcAttnFn = hcAttnFn; self.attnScale = attnScale; self.attnBase = attnBase; self.attnNorm = attnNorm
         self.qA = qA; self.qANorm = qANorm; self.qB = qB; self.kvW = kvW; self.kvNorm = kvNorm
         self.attnSinks = attnSinks
         self.attnOutA = attnOutA; self.attnOut = attnOut; self.hcFfnFn = hcFfnFn; self.ffnScale = ffnScale; self.ffnBase = ffnBase; self.ffnNorm = ffnNorm
         self.sharedGate = sharedGate; self.sharedUp = sharedUp; self.sharedDown = sharedDown; self.routerW = routerW
         self.expGate = expGate; self.expUp = expUp; self.expDown = expDown
-        self.comp = comp; self.index = index
-    }
-}
-
-/// Attention KV-compressor weights (present on every compressed layer, ratio!=0).
-/// Produces one pooled compressed KV row per `ratio` tokens. All F16 except norm.
-public struct CompressorWeights {
-    public var ape: GPUTensor    // F16 [compWidth, ratio]   — absolute-position bias (added to score)
-    public var kv: GPUTensor     // F16 [nEmbd, compWidth]   — compressed-KV projection
-    public var gate: GPUTensor   // F16 [nEmbd, compWidth]   — score/gate projection
-    public var norm: GPUTensor   // F32 [headDim]            — RMS-norm weight on the pooled row
-    public init(ape: GPUTensor, kv: GPUTensor, gate: GPUTensor, norm: GPUTensor) {
-        self.ape = ape; self.kv = kv; self.gate = gate; self.norm = norm
-    }
-}
-
-/// Sparse-indexer weights (only on ratio==4 layers). A parallel compressor lane
-/// (head_dim=128, QAT-quantized) plus the query/proj used to score + top-512 the
-/// visible compressed rows.
-public struct IndexerWeights {
-    public var qB: GPUTensor     // F16/Q8_0 [nLoraQ, nIndexerHead*nIndexerHeadDim] — indexer query up-proj (from qr_norm)
-    public var proj: GPUTensor   // F16 [nEmbd, nIndexerHead] — per-head score weights (from attn_norm)
-    public var comp: CompressorWeights  // indexer_compressor_* (head_dim=128, index_width)
-    public init(qB: GPUTensor, proj: GPUTensor, comp: CompressorWeights) {
-        self.qB = qB; self.proj = proj; self.comp = comp
     }
 }
 
@@ -175,10 +152,9 @@ extension GraphContext {
     /// (nHC*nEmbd) in; result in `outHc`. rawCache holds nKeys latent rows.
     public func decodeLayer(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
-                            outHc: GPUTensor, rmsEps: Float, hcEps: Float,
-                            compState: CompressedLayerState? = nil) throws {
+                            outHc: GPUTensor, rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         try decodeRoute(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, compState: compState)
+                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp)
         try decodeExperts(w: w, s: s, d: d, gateExp: w.expGate, upExp: w.expUp, downExp: w.expDown,
                           ids: s.selected, outHc: outHc)
     }
@@ -191,10 +167,17 @@ extension GraphContext {
     /// the 6 experts, then runs decodeExperts).
     public func decodeRoute(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
-                            rmsEps: Float, hcEps: Float, compState: CompressedLayerState? = nil) throws {
-        // 1) HC-reduce pre-attn
+                            rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
+        // 1) HC-reduce pre-attn  (s.cur = attn_norm)
         try hcReduce(curHc: curHc, mixerFn: w.hcAttnFn, scale: w.attnScale, base: w.attnBase,
                      norm: w.attnNorm, s: s, d: d, eps: rmsEps)
+        // 1.5) NSA attention compressor (compressed layers only): update recurrent state
+        // from attn_norm and, every `ratio` tokens, emit a pooled compressed KV row.
+        var nComp = 0
+        if let comp = comp {
+            nComp = try runCompressor(attnNorm: s.cur, w: w, comp: comp, rope: rope,
+                                      pos: pos, rmsEps: rmsEps, nRot: d.nRot)
+        }
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
@@ -210,15 +193,10 @@ extension GraphContext {
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
         try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
-        // 4) attention -> heads. Compressed layers (ratio!=0) run the KV-compression +
-        //    sparse-indexer path; ratio==0 layers (0,1) the dense flash attention.
-        if let st = compState, w.comp != nil {
-            try decodeCompressedAttention(s: s, w: w, d: d, state: st, rawCache: rawCache,
-                                          nKeys: nKeys, pos: pos, rope: rope, rmsEps: rmsEps)
-        } else {
-            try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
-                              pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys, hasSinks: true)
-        }
+        // 4) attention over rawCache[0..nKeys] + comp.cache[0..nComp] -> heads
+        try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
+                          pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys, hasSinks: true,
+                          comp: comp?.cache, nComp: nComp)
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
         //    hcExpand4(blockOut, curHc, post=split[4:8], comb=split[8:24]) = afterAttn.

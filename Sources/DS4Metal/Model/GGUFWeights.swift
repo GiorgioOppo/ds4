@@ -55,6 +55,10 @@ public enum GGUFWeights {
     public static func layer(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int, loadExperts: Bool = true) throws -> LayerWeights {
         let p = "blk.\(il)."
         func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
+        // Optional: present only on compressed layers (ratio!=0). nil on 0,1.
+        func optT(_ s: String) throws -> GPUTensor? {
+            model.findTensor(p + s) == nil ? nil : try tensor(rt, model, p + s)
+        }
         let dummy = try GPUTensor.zerosBytes(rt, byteLength: 1)
         return LayerWeights(
             hcAttnFn: try T("hc_attn_fn.weight"), attnScale: try T("hc_attn_scale.weight"),
@@ -70,34 +74,8 @@ public enum GGUFWeights {
             expGate: loadExperts ? try T("ffn_gate_exps.weight") : dummy,
             expUp: loadExperts ? try T("ffn_up_exps.weight") : dummy,
             expDown: loadExperts ? try T("ffn_down_exps.weight") : dummy,
-            comp: try compressor(rt, model, il), index: try indexer(rt, model, il))
-    }
-
-    /// Load the attention KV-compressor weights for a compressed layer (ratio != 0),
-    /// or nil for the ratio==0 dense layers (0,1). Tensor names + F16/F32 types match
-    /// ds4.c load_layer (blk.<il>.attn_compressor_*).
-    static func compressor(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> CompressorWeights? {
-        guard DSV4Shape.compressRatio(layer: il) != 0 else { return nil }
-        let p = "blk.\(il)."
-        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
-        return CompressorWeights(ape: try T("attn_compressor_ape.weight"),
-                                 kv: try T("attn_compressor_kv.weight"),
-                                 gate: try T("attn_compressor_gate.weight"),
-                                 norm: try T("attn_compressor_norm.weight"))
-    }
-
-    /// Load the sparse-indexer weights for a ratio==4 layer, or nil otherwise.
-    /// Names: blk.<il>.indexer.{attn_q_b,proj}.weight + blk.<il>.indexer_compressor_*.
-    static func indexer(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> IndexerWeights? {
-        guard DSV4Shape.compressRatio(layer: il) == 4 else { return nil }
-        let p = "blk.\(il)."
-        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
-        let comp = CompressorWeights(ape: try T("indexer_compressor_ape.weight"),
-                                     kv: try T("indexer_compressor_kv.weight"),
-                                     gate: try T("indexer_compressor_gate.weight"),
-                                     norm: try T("indexer_compressor_norm.weight"))
-        return IndexerWeights(qB: try T("indexer.attn_q_b.weight"),
-                              proj: try T("indexer.proj.weight"), comp: comp)
+            compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
+            compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
     }
 
     /// Build a layer with its routed-expert tensors as NO-COPY mmap views over the
@@ -113,6 +91,49 @@ public enum GGUFWeights {
         w.expUp   = try mappedTensor(rt, model, p + "ffn_up_exps.weight")
         w.expDown = try mappedTensor(rt, model, p + "ffn_down_exps.weight")
         return w
+    }
+
+    /// Like `layer` but the BIG matmul-read weights are NO-COPY mmap views (resident
+    /// via the OS page cache, single copy, evictable) instead of copied into Metal
+    /// buffers. Only the small weights read by non-byteOffset-aware kernels (norms,
+    /// hc scale/base, sinks, compressor APE/norm) are copied. Experts are loaded
+    /// separately (gather). This is the C `--ssd-streaming` memory model: ~8GB of
+    /// non-routed weights resident as evictable file pages, NOT 8GB of dirty copies.
+    /// Requires model opened metalMapping:true and byteOffset-aware matmul encode-forms.
+    public static func layerMappedDense(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> LayerWeights {
+        let p = "blk.\(il)."
+        func M(_ s: String) throws -> GPUTensor { try mappedTensor(rt, model, p + s) }   // no-copy big weight
+        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }          // copy small weight
+        func optM(_ s: String) throws -> GPUTensor? { model.findTensor(p + s) == nil ? nil : try mappedTensor(rt, model, p + s) }
+        func optT(_ s: String) throws -> GPUTensor? { model.findTensor(p + s) == nil ? nil : try tensor(rt, model, p + s) }
+        let dummy = try GPUTensor.zerosBytes(rt, byteLength: 1)
+        return LayerWeights(
+            hcAttnFn: try M("hc_attn_fn.weight"), attnScale: try T("hc_attn_scale.weight"),
+            attnBase: try T("hc_attn_base.weight"), attnNorm: try T("attn_norm.weight"),
+            qA: try M("attn_q_a.weight"), qANorm: try T("attn_q_a_norm.weight"), qB: try M("attn_q_b.weight"),
+            kvW: try M("attn_kv.weight"), kvNorm: try T("attn_kv_a_norm.weight"),
+            attnSinks: try T("attn_sinks.weight"),
+            attnOutA: try M("attn_output_a.weight"), attnOut: try M("attn_output_b.weight"),
+            hcFfnFn: try M("hc_ffn_fn.weight"), ffnScale: try T("hc_ffn_scale.weight"),
+            ffnBase: try T("hc_ffn_base.weight"), ffnNorm: try T("ffn_norm.weight"),
+            sharedGate: try M("ffn_gate_shexp.weight"), sharedUp: try M("ffn_up_shexp.weight"),
+            sharedDown: try M("ffn_down_shexp.weight"), routerW: try M("ffn_gate_inp.weight"),
+            expGate: dummy, expUp: dummy, expDown: dummy,   // experts gathered separately
+            compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
+            compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
+    }
+
+    /// Output head + embedding with the big tensors (embed F16, output Q8, output_hc_fn
+    /// F16) as NO-COPY mmap views; the small norm/scale/base are copied.
+    public static func outputHeadMapped(_ rt: MetalRuntime, _ model: GGUFModel) throws -> (embed: GPUTensor, head: OutputHeadWeights) {
+        let embed = try mappedTensor(rt, model, "token_embd.weight")
+        let head = OutputHeadWeights(
+            hcFn: try mappedTensor(rt, model, "output_hc_fn.weight"),
+            hcScaleScalar: try scalarF32(model, "output_hc_scale.weight"),
+            hcBase: try tensor(rt, model, "output_hc_base.weight"),
+            norm: try tensor(rt, model, "output_norm.weight"),
+            head: try mappedTensor(rt, model, "output.weight"))
+        return (embed, head)
     }
 
     /// No-copy mmap GPUTensor over a whole GGUF tensor's bytes.

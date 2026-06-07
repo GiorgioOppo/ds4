@@ -20,6 +20,12 @@ public enum MoEQuant: Sendable {
     }
     /// N_R0_* — rows per threadgroup (q4_K=2; q2_K/iq2_xxs=4).
     public var nr0: Int { self == .q4_K ? 2 : 4 }
+    /// Threadgroup memory the kernel needs. iq2_xxs cooperatively loads the
+    /// codebook into shared memory: svalues = uint64 grid[256] (2048 B) + ssigns
+    /// = uint8[128] (128 B) = 2176 B. q2_K/q4_K only use the 256 B reduction
+    /// scratch. Allocating only 256 B for iq2_xxs causes out-of-bounds threadgroup
+    /// writes → garbage grid → wrong matvec on every gate/up expert.
+    public var threadgroupBytes: Int { self == .iq2_xxs ? (256 * 8 + 128) : 256 }
     public static func from(ggufType: UInt32) -> MoEQuant? {
         switch ggufType { case 12: return .q4_K; case 10: return .q2_K; case 16: return .iq2_xxs; default: return nil }
     }
@@ -77,31 +83,40 @@ extension GraphContext {
     /// tensor; sinks/pad/tmp are scratch sized per the C dispatch.
     public func flashAttnCore(q: GPUTensor, kvF32: GPUTensor, kvF16: GPUTensor,
                               mask: GPUTensor, sinks: GPUTensor, pad: GPUTensor, tmp: GPUTensor,
-                              heads: GPUTensor, nHead: Int, nKeys: Int, hasSinks: Bool = false) throws {
+                              heads: GPUTensor, nHead: Int, nKeys: Int, hasSinks: Bool = false,
+                              comp: GPUTensor? = nil, nComp: Int = 0) throws {
         let headDim = 512
         let ncpsg = 32, nwg = 32
-        let kvpad = (nKeys % ncpsg) != 0
+        // Two-span attention: raw SWA rows (nKeys) followed by compressed rows (nComp),
+        // contiguous in kvF16. The flash kernel then attends over the union.
+        let total = nKeys + nComp
+        let kvpad = (total % ncpsg) != 0
         var nsg = 1
-        while 2 * nwg * nsg * ncpsg < nKeys && nsg < 4 { nsg *= 2 }
+        while 2 * nwg * nsg * ncpsg < total && nsg < 4 { nsg *= 2 }
         let e = encoder
 
-        // 1) cpy F32 -> F16 (kvF32 -> kvF16), n = nKeys*512
-        let n = nKeys * headDim
-        let cpyArgs = MetalRuntime.cpyArgs(n: n, srcElem: 4, dstElem: 2)
+        // 1) cpy F32 -> F16: raw rows (kvF32 -> kvF16[0..]) then comp rows (comp -> kvF16[nKeys..]).
         let cpyPso = try rt.pipeline("kernel_cpy_f32_f16")
-        var cnth = 32; let cmaxT = cpyPso.maxTotalThreadsPerThreadgroup
-        while cnth < n && cnth < cmaxT { cnth *= 2 }
-        if cnth > cmaxT { cnth = cmaxT }; if cnth > n { cnth = n }; if cnth == 0 { cnth = 1 }
-        e.setComputePipelineState(cpyPso)
-        cpyArgs.withUnsafeBytes { e.setBytes($0.baseAddress!, length: cpyArgs.count, index: 0) }
-        e.setBuffer(kvF32.buffer, offset: 0, index: 1)
-        e.setBuffer(kvF16.buffer, offset: 0, index: 2)
-        e.dispatchThreadgroups(MTLSize(width: (n + cnth - 1) / cnth, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: cnth, height: 1, depth: 1))
+        func cpyF32toF16(_ src: GPUTensor, srcOff: Int, dstOff: Int, count: Int) {
+            let a = MetalRuntime.cpyArgs(n: count, srcElem: 4, dstElem: 2)
+            var cnth = 32; let cmaxT = cpyPso.maxTotalThreadsPerThreadgroup
+            while cnth < count && cnth < cmaxT { cnth *= 2 }
+            if cnth > cmaxT { cnth = cmaxT }; if cnth > count { cnth = count }; if cnth == 0 { cnth = 1 }
+            e.setComputePipelineState(cpyPso)
+            a.withUnsafeBytes { e.setBytes($0.baseAddress!, length: a.count, index: 0) }
+            e.setBuffer(src.buffer, offset: srcOff, index: 1)
+            e.setBuffer(kvF16.buffer, offset: dstOff, index: 2)
+            e.dispatchThreadgroups(MTLSize(width: (count + cnth - 1) / cnth, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: cnth, height: 1, depth: 1))
+        }
+        cpyF32toF16(kvF32, srcOff: 0, dstOff: 0, count: nKeys * headDim)
+        if let comp = comp, nComp > 0 {
+            cpyF32toF16(comp, srcOff: comp.byteOffset, dstOff: nKeys * headDim * 2, count: nComp * headDim)
+        }
 
-        // 1b) pad the partial last block when nKeys % 32 != 0 (K==V==kvF16, mask all-zero)
+        // 1b) pad the partial last block when total % 32 != 0 (K==V==kvF16, mask all-zero)
         if kvpad {
-            let pArgs = MetalRuntime.flashPadArgs(nKeys: nKeys, headDim: headDim)
+            let pArgs = MetalRuntime.flashPadArgs(nKeys: total, headDim: headDim)
             let padPso = try rt.flashPadPipeline(ncpsg: Int32(ncpsg))
             e.setComputePipelineState(padPso)
             pArgs.withUnsafeBytes { e.setBytes($0.baseAddress!, length: pArgs.count, index: 0) }
@@ -115,7 +130,7 @@ extension GraphContext {
 
         // 2) flash vec
         let scale = 1.0 / Float(headDim).squareRoot()
-        let vargs = MetalRuntime.flashVecArgs(nHead: nHead, nKeys: nKeys, headDim: headDim, scale: scale)
+        let vargs = MetalRuntime.flashVecArgs(nHead: nHead, nKeys: total, headDim: headDim, scale: scale)
         let vec = try rt.flashVecPipeline(nsg: Int32(nsg), nwg: Int32(nwg), hasSinks: hasSinks, hasKvpad: kvpad)
         let alignUp = { (v: Int, a: Int) in (v + a - 1) & ~(a - 1) }
         let sharedElems = (alignUp(headDim, 128) + 4 * ncpsg + 2 * alignUp(headDim, 128)) * nsg
@@ -325,7 +340,7 @@ extension GraphContext {
         e.setBuffer(activation.buffer, offset: 0, index: 2)
         e.setBuffer(out.buffer, offset: 0, index: 3)
         e.setBuffer(ids.buffer, offset: 0, index: 4)
-        e.setThreadgroupMemoryLength(256, index: 0)
+        e.setThreadgroupMemoryLength(quant.threadgroupBytes, index: 0)
         e.dispatchThreadgroups(MTLSize(width: (outDim + nsg * nr0 - 1) / (nsg * nr0), height: 1, depth: k),
                                threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
     }
@@ -396,7 +411,7 @@ extension GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(outputA.buffer, offset: 0, index: 1)
+        e.setBuffer(outputA.buffer, offset: outputA.byteOffset, index: 1)   // no-copy mmap weight
         e.setBuffer(heads.buffer, offset: 0, index: 2)
         e.setBuffer(low.buffer, offset: 0, index: 3)
         e.setThreadgroupMemoryLength(32 * 2 * 4, index: 0)
@@ -434,7 +449,7 @@ extension GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(table.buffer, offset: 0, index: 1)
+        e.setBuffer(table.buffer, offset: table.byteOffset, index: 1)   // no-copy mmap embed table
         e.setBytes(&idv, length: 4, index: 2)
         e.setBuffer(out.buffer, offset: 0, index: 3)
         e.dispatchThreadgroups(MTLSize(width: (nEmbd + nth - 1) / nth, height: 1, depth: 1),

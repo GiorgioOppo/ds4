@@ -68,7 +68,7 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(weight.buffer, offset: 0, index: 1)
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
         e.setBuffer(x.buffer, offset: 0, index: 2)
         e.setBuffer(out.buffer, offset: 0, index: 3)
         e.setThreadgroupMemoryLength(32 * 2 * 4, index: 0)
@@ -90,7 +90,7 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(weight.buffer, offset: 0, index: 1)
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
         e.setBuffer(x.buffer, offset: 0, index: 2)
         e.setBuffer(out.buffer, offset: 0, index: 3)
         e.setThreadgroupMemoryLength(smem, index: 0)
@@ -111,7 +111,7 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(weight.buffer, offset: 0, index: 1)
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
         e.setBuffer(x.buffer, offset: 0, index: 2)
         e.setBuffer(out.buffer, offset: 0, index: 3)
         e.setThreadgroupMemoryLength(32 * 2 * 4, index: 0)

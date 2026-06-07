@@ -32,10 +32,7 @@ public final class StreamingDecoder {
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
-    /// Per-layer persistent KV-compression + indexer state (nil on ratio==0 layers).
-    /// Carries the recurrent compressor state and emitted compressed caches across
-    /// tokens. See docs/COMPRESSED-ATTENTION-PORT.md.
-    let compStates: [CompressedLayerState?]
+    let compStates: [CompressorState?]   // NSA compressor state per compressed layer (nil on layers 0,1)
     let hcA, hcB, embd: GPUTensor
     let flat, pre, owts, otmp, oembd, onormed, logits: GPUTensor
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
@@ -49,10 +46,18 @@ public final class StreamingDecoder {
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         let hcDim = dims.nHC * dims.nEmbd
-        scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys)
+        // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
+        // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
+        // + up to maxKeys/4 compressed rows (ratio-4 is the densest).
+        let maxComp = maxKeys / 4 + 8
+        compStates = try (0..<nLayers).map { il -> CompressorState? in
+            let ratio = DSV4Shape.compressRatio(layer: il)
+            guard ratio != 0 else { return nil }
+            return try CompressorState(rt, ratio: ratio, headDim: dims.headDim, maxComp: maxKeys / ratio + 8)
+        }
+        scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         rawCaches = try (0..<nLayers).map { _ in try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim) }
-        compStates = try CompressedLayerState.perLayer(rt, nLayers: nLayers, ctxSize: maxKeys)
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
         embd = try .zeros(rt, floatCount: dims.nEmbd)
         flat = try .zeros(rt, floatCount: hcDim); pre = try .zeros(rt, floatCount: dims.nHC)
@@ -63,6 +68,8 @@ public final class StreamingDecoder {
 
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         let hcDim = d.nHC * d.nEmbd
+        // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
+        if pos == 0 { for c in compStates { try c?.reset(rt) } }
         // embedding (own command buffer)
         let ec = GraphContext(rt)
         try ec.begin()
@@ -78,7 +85,7 @@ public final class StreamingDecoder {
                 // Phase 1: route (own cb) -> read the 6 selected ids.
                 let c1 = GraphContext(rt); try c1.begin()
                 try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, compState: compStates[i])
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
                 c1.commit()
                 let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
                 let ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
@@ -91,8 +98,7 @@ public final class StreamingDecoder {
             } else {
                 let lc = GraphContext(rt); try lc.begin()
                 try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps,
-                                   compState: compStates[i])
+                                   nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
                 lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
             }
             swap(&cur, &other)
@@ -154,8 +160,34 @@ public final class StreamingDecoder {
             let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
             return (g, u, dn)
         }
+        // Memoize the non-routed (dense + NSA compressor) weights: loaded once,
+        // resident across tokens (the C --ssd-streaming model). Only the 6 selected
+        // experts are gathered per token (gatherExperts memcpy's just those rows from
+        // the mmap = ~6/256 of expert IO). This is the fast path: per token ~= a few
+        // expert slabs from SSD + GPU compute, instead of re-streaming the whole model.
+        let cache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
-                                    layerProvider: { try GGUFWeights.layer(rt, model, $0, loadExperts: false) },
+                                    layerProvider: { try cache.get($0) },
+                                    embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
+                                    expertGather: gather)
+    }
+
+    /// Fastest 16GB path (the C `--ssd-streaming` model): non-routed weights are
+    /// NO-COPY mmap views (resident via the OS page cache, single copy, evictable —
+    /// no per-token re-copy, no 8GB of dirty buffers that OOM), and only the 6 selected
+    /// experts are gathered per token. No memoization needed: the page cache serves
+    /// repeated weight reads across tokens. Requires model opened metalMapping:true.
+    public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
+                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+        let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
+        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
+            let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            let u = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_up_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+            return (g, u, dn)
+        }
+        return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
+                                    layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                     expertGather: gather)
     }
@@ -168,9 +200,27 @@ public final class StreamingDecoder {
     public static func fromGGUFMappedExperts(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                              nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
+        // Memoize per-layer weights: dense (incl. NSA compressor) are COPIED resident
+        // and reused across tokens; experts are no-copy mmap. Without this the ~8GB of
+        // non-routed weights were re-copied from the mmap EVERY token (minutes/token on
+        // 16GB). This is the C `--ssd-streaming` model: non-routed resident, experts paged.
+        let cache = CachedLayerProvider { try GGUFWeights.layerMappedExperts(rt, model, $0) }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
-                                    layerProvider: { try GGUFWeights.layerMappedExperts(rt, model, $0) },
+                                    layerProvider: { try cache.get($0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                     expertGather: nil)   // single-cb decodeLayer with real ids
+    }
+}
+
+/// Loads each layer's weights once and reuses them across tokens (weights are
+/// read-only during decode). Keeps non-routed weights resident instead of
+/// re-streaming them from the mmap every token.
+final class CachedLayerProvider {
+    private let make: (Int) throws -> LayerWeights
+    private var cache: [Int: LayerWeights] = [:]
+    init(_ make: @escaping (Int) throws -> LayerWeights) { self.make = make }
+    func get(_ il: Int) throws -> LayerWeights {
+        if let w = cache[il] { return w }
+        let w = try make(il); cache[il] = w; return w
     }
 }

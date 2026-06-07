@@ -148,6 +148,50 @@ extension MetalRuntime {
         return Array(UnsafeBufferPointer(start: p, count: k * outDim))
     }
 
+    /// Standalone IQ2_XXS routed matvec (real kernel_mul_mv_id_iq2_xxs_f32) for
+    /// validation. Mirrors moeMatvecQ2_K but with the 66-byte block_iq2_xxs.
+    public func moeMatvecIQ2XXS(experts: [UInt8], expertIds: [Int32], activation: [Float],
+                                nExperts: Int, inDim: Int, outDim: Int) throws -> [Float] {
+        precondition(inDim % 256 == 0, "IQ2_XXS in_dim must be a multiple of 256")
+        let rowBytes = (inDim / 256) * 66
+        let expertBytes = rowBytes * outDim
+        precondition(experts.count >= expertBytes * nExperts)
+        let k = expertIds.count
+        let nsg = 4, nr0 = 4
+
+        let args = Self.mulMVIdArgs(nei0: k, nei1: 1, nbi1: UInt64(k * 4),
+                                    ne00: inDim, ne01: outDim,
+                                    nb00: 66, nb01: UInt64(rowBytes), nb02: UInt64(expertBytes),
+                                    ne10: inDim, nb10: 4, nb11: UInt64(inDim * 4), nb12: UInt64(inDim * 4),
+                                    ne0: outDim, nb1: UInt64(outDim * 4), nr0: Int32(nr0))
+
+        guard let ebuf = device.makeBuffer(bytes: experts, length: expertBytes * nExperts, options: .storageModeShared),
+              let xbuf = device.makeBuffer(bytes: activation, length: inDim * 4, options: .storageModeShared),
+              let dbuf = device.makeBuffer(length: k * outDim * 4, options: .storageModeShared),
+              let idbuf = device.makeBuffer(bytes: expertIds, length: k * 4, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        let pso = try mulMVPipeline("kernel_mul_mv_id_iq2_xxs_f32", nsg: Int16(nsg))
+        guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+        enc.setComputePipelineState(pso)
+        args.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        enc.setBuffer(ebuf, offset: 0, index: 1)
+        enc.setBuffer(xbuf, offset: 0, index: 2)
+        enc.setBuffer(dbuf, offset: 0, index: 3)
+        enc.setBuffer(idbuf, offset: 0, index: 4)
+        enc.setThreadgroupMemoryLength(256 * 8 + 128, index: 0)
+        let groups = MTLSize(width: (outDim + nsg * nr0 - 1) / (nsg * nr0), height: 1, depth: k)
+        enc.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let p = dbuf.contents().bindMemory(to: Float.self, capacity: k * outDim)
+        return Array(UnsafeBufferPointer(start: p, count: k * outDim))
+    }
+
     /// 120-byte ds4_metal_args_mul_mv_id with explicit offsets.
     static func mulMVIdArgs(nei0: Int, nei1: Int, nbi1: UInt64, ne00: Int, ne01: Int,
                             nb00: UInt64, nb01: UInt64, nb02: UInt64,

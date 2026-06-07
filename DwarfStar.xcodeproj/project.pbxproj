@@ -14,6 +14,7 @@
 		0A8CB83E9E6A231039852450 /* DownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91E402FA8E03F338E4171FAF /* DownloadView.swift */; };
 		0AAF3A499169C93F6D0E0CDC /* DownloadRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01B6786D3EA54921AF2EF548 /* DownloadRunner.swift */; };
 		10777F701D6CA4ECD86FD9B2 /* MetalHyperConnections.swift in Sources */ = {isa = PBXBuildFile; fileRef = 457702D3FACF0B3B8ADD9DE0 /* MetalHyperConnections.swift */; };
+		14B47AE9D5E7E7C05362CF81 /* MetalCompressor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41257EEB0D80FA6B37E4518C /* MetalCompressor.swift */; };
 		1B111B8FD0B60EDAB2ED24FB /* MetalBin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0E59C82098F6F07ED5A1F76 /* MetalBin.swift */; };
 		1D7B90821767CB99FAC527F1 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC1A268CCF897B16962283D3 /* Diagnostics.swift */; };
 		1D8AF76D6EBAEFB797CC76D5 /* MetalSoftmax.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDADFE90A9EF121D8898A616 /* MetalSoftmax.swift */; };
@@ -35,6 +36,7 @@
 		54FFCFCEFA7E92506660456E /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 707B95F399566A2FD645B8FD /* ChatView.swift */; };
 		55E78D9E1BD5D2CFF7109A6E /* libDS4Metal.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */; };
 		57FFE0BE0E0FFC5397340EEA /* MetalKVCompress.swift in Sources */ = {isa = PBXBuildFile; fileRef = 214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */; };
+		62B5B4EB7A20DA93F14FFBF2 /* GraphCompressor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1768A7CE66C432C3B5FD1582 /* GraphCompressor.swift */; };
 		66828EA15AA63BF34C689008 /* GGUFWeights.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27C2252B9EF5EBC85445B6D0 /* GGUFWeights.swift */; };
 		69F4D04ACA0714532C075766 /* MetalArgsort.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC72C53F1000E3C34D7063B2 /* MetalArgsort.swift */; };
 		6A123829226B459DCA75BE16 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */; };
@@ -143,9 +145,10 @@
 /* Begin PBXFileReference section */
 		01B6786D3EA54921AF2EF548 /* DownloadRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadRunner.swift; sourceTree = "<group>"; };
 		0C32847407FE236FBFF6C962 /* MetalMoE.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoE.swift; sourceTree = "<group>"; };
+		1768A7CE66C432C3B5FD1582 /* GraphCompressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphCompressor.swift; sourceTree = "<group>"; };
 		183E178067339B3EEC399A6F /* MetalIndexerPool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPool.swift; sourceTree = "<group>"; };
 		19C4BBC9AE82CB74C39E2E49 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = text; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
 		1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Core.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalKVCompress.swift; sourceTree = "<group>"; };
 		238627F1B0C5B8FBB11B2F51 /* Sampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampler.swift; sourceTree = "<group>"; };
@@ -159,6 +162,7 @@
 		36C37C829EB6FC048045E80C /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
 		3791475277F6CBDF08A8EB97 /* InferenceService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceService.swift; sourceTree = "<group>"; };
 		3A9722BC07C1942FA4036046 /* ModelShape.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelShape.swift; sourceTree = "<group>"; };
+		41257EEB0D80FA6B37E4518C /* MetalCompressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCompressor.swift; sourceTree = "<group>"; };
 		457702D3FACF0B3B8ADD9DE0 /* MetalHyperConnections.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalHyperConnections.swift; sourceTree = "<group>"; };
 		5443B9093F7B88C9B0DAB7B1 /* MetalRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRouter.swift; sourceTree = "<group>"; };
 		56C7EEED3157C90E54511251 /* MetalMoEFused.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoEFused.swift; sourceTree = "<group>"; };
@@ -343,6 +347,7 @@
 				77809A5C256ACF8AE083AF59 /* DecodeLayer.swift */,
 				E063FFFA33C1612DAA33BAA1 /* DSV4Decoder.swift */,
 				8EF1E2F70560B504F96BD845 /* Graph.swift */,
+				1768A7CE66C432C3B5FD1582 /* GraphCompressor.swift */,
 				8C6177886F90F46E272B1975 /* GraphContext.swift */,
 				9DD0614BC9FDBCBFDD355BED /* StreamingDecoder.swift */,
 			);
@@ -456,6 +461,7 @@
 				BC72C53F1000E3C34D7063B2 /* MetalArgsort.swift */,
 				702A49FFFF6C2A66C93D9686 /* MetalAttnOutLow.swift */,
 				A0E59C82098F6F07ED5A1F76 /* MetalBin.swift */,
+				41257EEB0D80FA6B37E4518C /* MetalCompressor.swift */,
 				85B1C13B3E9BB7EE78644EBB /* MetalConcat.swift */,
 				B487BAABB41636A2E03AC5D3 /* MetalCopy.swift */,
 				629CABEDB39DE32E329634D7 /* MetalDense.swift */,
@@ -698,11 +704,13 @@
 				66828EA15AA63BF34C689008 /* GGUFWeights.swift in Sources */,
 				000EBEAAD22E5FD6A758B612 /* GPUTensor.swift in Sources */,
 				8BBF9E775F56B8C3204017D7 /* Graph.swift in Sources */,
+				62B5B4EB7A20DA93F14FFBF2 /* GraphCompressor.swift in Sources */,
 				BAC21DC46ADA1456ACE8BC97 /* GraphContext.swift in Sources */,
 				C03D6591694EDBB383989FF7 /* KernelSources.swift in Sources */,
 				69F4D04ACA0714532C075766 /* MetalArgsort.swift in Sources */,
 				363A1FD3DC66A7E7E7480F39 /* MetalAttnOutLow.swift in Sources */,
 				1B111B8FD0B60EDAB2ED24FB /* MetalBin.swift in Sources */,
+				14B47AE9D5E7E7C05362CF81 /* MetalCompressor.swift in Sources */,
 				FF02D53C9212273310CA7306 /* MetalConcat.swift in Sources */,
 				CDBA092A52C238217242E401 /* MetalCopy.swift in Sources */,
 				720A283BBD0CB84F513F252A /* MetalDense.swift in Sources */,
@@ -849,10 +857,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -875,10 +881,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

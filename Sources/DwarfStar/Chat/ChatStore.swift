@@ -50,6 +50,7 @@ final class ChatStore {
     var input = ""
     var think = false
     var isGenerating = false
+    var status = ""          // live prefill/decode progress (e.g. "prefill 3/11", "12 token · 1.4 tok/s")
 
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
@@ -138,6 +139,7 @@ final class ChatStore {
                     switch event {
                     case .reasoning(let r): self.messages[index].reasoning += r
                     case .text(let t): self.messages[index].text += t
+                    case .progress(let p): self.status = p
                     }
                 }
             } catch {
@@ -148,6 +150,7 @@ final class ChatStore {
                 }
             }
             self?.isGenerating = false
+            self?.status = ""
         }
     }
 
