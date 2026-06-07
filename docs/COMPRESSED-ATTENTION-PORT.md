@@ -203,3 +203,34 @@ indexer_compressor_norm.weight  F32 [128]
 5. **Verify on macOS** against the real model (golden vectors in `tests/test-vectors`
    of the C repo). None of stages 1–4 can be built/verified on Linux (no Swift
    toolchain, no Metal GPU, no full model in this environment).
+
+## Scaffold status (what is committed vs what needs the Mac)
+
+Committed (faithful to ds4.c, but UNBUILT/UNVERIFIED here):
+- Stage 1 — `DSV4Shape` constants, `LayerWeights` comp/index tensors, `GGUFWeights`
+  loading. ✓
+- Stage 2 — `CompressedState.swift`: per-layer `CompressedLayerState` (recurrent
+  state + compressed caches + indexer scratch), allocated per layer in
+  `StreamingDecoder`. ✓
+- Stage 3 — `MetalCompressedAttention.swift`: encode-form ops with the exact
+  dispatches captured from `ds4_metal.m` — `compressorStoreOne`, `softmaxPoolContiguous`,
+  `ratio4Shift`, `fp8QuantizeRow`, `indexerQAT`, `indexerScoreOneDirect`,
+  `indexedMixedAttentionDecode`, plus `compressorUpdate` + `decodeCompressedAttention`
+  orchestration. ✓ (with the gaps below)
+- Stage 4 — `decodeRoute`/`decodeLayer`/`StreamingDecoder` branch to the compressed
+  path for ratio!=0 layers (ratio==0 unchanged). ✓
+
+Remaining on-device tasks (search the code for `TODO(port)` / `TODO(verify)`):
+1. **SWA circular raw cache + `raw_start`** — compressed layers cap raw KV at
+   `nSWA=128` (circular). `StreamingDecoder.rawCaches` is still a full cache; the
+   attention currently double-counts recent tokens. This is the main numeric blocker.
+2. **Non-indexed raw+all-compressed attention** — ratio==128 (always) and ratio==4
+   pre-threshold need `attention_decode_heads` (ds4_metal.m:18240); the scaffold
+   falls back to raw-only flash attention there.
+3. **ratio==4 two-lane pool** — needs the concat-then-pool (ds4_metal.m:13801); the
+   scaffold pools lane 0 only as a placeholder.
+4. **Multi-pass top-512** — `indexerTopKSinglePass` covers only nComp ≤ one
+   threadgroup; wire the argsort merge (ds4_metal.m:11431) for long contexts.
+5. **Verify arg-struct byte offsets** (esp. the argsort `kargs` layout) and the
+   `index.qB` F16-vs-Q8_0 matmul against the real kernels, then check end-to-end
+   against the golden vectors.

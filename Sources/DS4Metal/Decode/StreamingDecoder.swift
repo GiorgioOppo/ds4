@@ -32,6 +32,10 @@ public final class StreamingDecoder {
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
+    /// Per-layer persistent KV-compression + indexer state (nil on ratio==0 layers).
+    /// Carries the recurrent compressor state and emitted compressed caches across
+    /// tokens. See docs/COMPRESSED-ATTENTION-PORT.md.
+    let compStates: [CompressedLayerState?]
     let hcA, hcB, embd: GPUTensor
     let flat, pre, owts, otmp, oembd, onormed, logits: GPUTensor
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
@@ -48,6 +52,7 @@ public final class StreamingDecoder {
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         rawCaches = try (0..<nLayers).map { _ in try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim) }
+        compStates = try CompressedLayerState.perLayer(rt, nLayers: nLayers, ctxSize: maxKeys)
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
         embd = try .zeros(rt, floatCount: dims.nEmbd)
         flat = try .zeros(rt, floatCount: hcDim); pre = try .zeros(rt, floatCount: dims.nHC)
@@ -73,7 +78,7 @@ public final class StreamingDecoder {
                 // Phase 1: route (own cb) -> read the 6 selected ids.
                 let c1 = GraphContext(rt); try c1.begin()
                 try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps)
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, compState: compStates[i])
                 c1.commit()
                 let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
                 let ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
@@ -86,7 +91,8 @@ public final class StreamingDecoder {
             } else {
                 let lc = GraphContext(rt); try lc.begin()
                 try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps)
+                                   nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps,
+                                   compState: compStates[i])
                 lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
             }
             swap(&cur, &other)

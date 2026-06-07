@@ -175,9 +175,10 @@ extension GraphContext {
     /// (nHC*nEmbd) in; result in `outHc`. rawCache holds nKeys latent rows.
     public func decodeLayer(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
-                            outHc: GPUTensor, rmsEps: Float, hcEps: Float) throws {
+                            outHc: GPUTensor, rmsEps: Float, hcEps: Float,
+                            compState: CompressedLayerState? = nil) throws {
         try decodeRoute(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps)
+                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, compState: compState)
         try decodeExperts(w: w, s: s, d: d, gateExp: w.expGate, upExp: w.expUp, downExp: w.expDown,
                           ids: s.selected, outHc: outHc)
     }
@@ -190,7 +191,7 @@ extension GraphContext {
     /// the 6 experts, then runs decodeExperts).
     public func decodeRoute(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
-                            rmsEps: Float, hcEps: Float) throws {
+                            rmsEps: Float, hcEps: Float, compState: CompressedLayerState? = nil) throws {
         // 1) HC-reduce pre-attn
         try hcReduce(curHc: curHc, mixerFn: w.hcAttnFn, scale: w.attnScale, base: w.attnBase,
                      norm: w.attnNorm, s: s, d: d, eps: rmsEps)
@@ -209,9 +210,15 @@ extension GraphContext {
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
         try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
-        // 4) attention (dense over rawCache[0..nKeys]) -> heads
-        try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
-                          pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys, hasSinks: true)
+        // 4) attention -> heads. Compressed layers (ratio!=0) run the KV-compression +
+        //    sparse-indexer path; ratio==0 layers (0,1) the dense flash attention.
+        if let st = compState, w.comp != nil {
+            try decodeCompressedAttention(s: s, w: w, d: d, state: st, rawCache: rawCache,
+                                          nKeys: nKeys, pos: pos, rope: rope, rmsEps: rmsEps)
+        } else {
+            try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
+                              pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys, hasSinks: true)
+        }
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
         //    hcExpand4(blockOut, curHc, post=split[4:8], comb=split[8:24]) = afterAttn.
