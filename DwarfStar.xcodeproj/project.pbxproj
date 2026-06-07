@@ -1,0 +1,1140 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		000EBEAAD22E5FD6A758B612 /* GPUTensor.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACC6DBD804497A2A001F2385 /* GPUTensor.swift */; };
+		002DC8D825867BD2A55948D1 /* ModelShape.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A9722BC07C1942FA4036046 /* ModelShape.swift */; };
+		054CBAACBE63FEE6D3AC50C3 /* KVCFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD85D41C4B63C72A2C4F691 /* KVCFile.swift */; };
+		091A1F8E5A6442531B374798 /* GGUF.swift in Sources */ = {isa = PBXBuildFile; fileRef = B83A939382FE58A5344FB194 /* GGUF.swift */; };
+		0A8CB83E9E6A231039852450 /* DownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91E402FA8E03F338E4171FAF /* DownloadView.swift */; };
+		0AAF3A499169C93F6D0E0CDC /* DownloadRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01B6786D3EA54921AF2EF548 /* DownloadRunner.swift */; };
+		10777F701D6CA4ECD86FD9B2 /* MetalHyperConnections.swift in Sources */ = {isa = PBXBuildFile; fileRef = 457702D3FACF0B3B8ADD9DE0 /* MetalHyperConnections.swift */; };
+		1B111B8FD0B60EDAB2ED24FB /* MetalBin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0E59C82098F6F07ED5A1F76 /* MetalBin.swift */; };
+		1D7B90821767CB99FAC527F1 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC1A268CCF897B16962283D3 /* Diagnostics.swift */; };
+		1D8AF76D6EBAEFB797CC76D5 /* MetalSoftmax.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDADFE90A9EF121D8898A616 /* MetalSoftmax.swift */; };
+		1F05165F0B67FF440D7A8BD3 /* MetalGetRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C7E38B67CE3ECA6D88F9A3D /* MetalGetRows.swift */; };
+		23C499EEF65FED94B591012E /* MetalNorm.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB82DAAD9E0A14AB5CC5D002 /* MetalNorm.swift */; };
+		2515ADC02C0DF358BBD75CD2 /* Sampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 238627F1B0C5B8FBB11B2F51 /* Sampler.swift */; };
+		2A1205D9A6F3C0C756D2E57E /* libDS4Metal.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */; };
+		2C20CB8F0C30A2E52969635B /* MetalHCSplit.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4EB6B4C9361D954796A67F0 /* MetalHCSplit.swift */; };
+		2D5DDFCA5D5821AE72D22A90 /* libDS4Engine.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AE55E668DADBC37930F51C9C /* libDS4Engine.a */; };
+		3025D1F97BC46ED47CCD2C25 /* MetalRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0ED452CEAE37525846B1A14 /* MetalRuntime.swift */; };
+		323BF1AD84D85111658CF923 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE556BF59729D2A83A806A2E /* RootView.swift */; };
+		33248385B5007159B778F4DE /* MetalSparseSelect.swift in Sources */ = {isa = PBXBuildFile; fileRef = F82BF19902894495819DBBB8 /* MetalSparseSelect.swift */; };
+		363A1FD3DC66A7E7E7480F39 /* MetalAttnOutLow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 702A49FFFF6C2A66C93D9686 /* MetalAttnOutLow.swift */; };
+		38A3557C5C53590B8A437472 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19C4BBC9AE82CB74C39E2E49 /* ContentView.swift */; };
+		3910E408B91A91870A85B053 /* AppEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36C37C829EB6FC048045E80C /* AppEnvironment.swift */; };
+		3D3B111F6A7FDD488BB12336 /* BenchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E3AF2E4CCB794369910FFFF /* BenchView.swift */; };
+		4494CFADD91733AD41BCCC65 /* InferenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3791475277F6CBDF08A8EB97 /* InferenceService.swift */; };
+		44EA43EBD5EA9FC300E03717 /* DwarfStarApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2ED669257A621E1FCE97A57 /* DwarfStarApp.swift */; };
+		54FFCFCEFA7E92506660456E /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 707B95F399566A2FD645B8FD /* ChatView.swift */; };
+		55E78D9E1BD5D2CFF7109A6E /* libDS4Metal.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */; };
+		57FFE0BE0E0FFC5397340EEA /* MetalKVCompress.swift in Sources */ = {isa = PBXBuildFile; fileRef = 214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */; };
+		66828EA15AA63BF34C689008 /* GGUFWeights.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27C2252B9EF5EBC85445B6D0 /* GGUFWeights.swift */; };
+		69F4D04ACA0714532C075766 /* MetalArgsort.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC72C53F1000E3C34D7063B2 /* MetalArgsort.swift */; };
+		6A123829226B459DCA75BE16 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */; };
+		720A283BBD0CB84F513F252A /* MetalDense.swift in Sources */ = {isa = PBXBuildFile; fileRef = 629CABEDB39DE32E329634D7 /* MetalDense.swift */; };
+		77272F1B5E9456F9C20524FD /* MetalGLU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C89BC62D6757D25356BBB1A4 /* MetalGLU.swift */; };
+		7B2B3E24CAA9E28BB3381B1D /* MetalSetRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA105CBD8D04BDE28112DF14 /* MetalSetRows.swift */; };
+		7E3AE9D47BAF8BEAE79E1596 /* MetalMatmulMM.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CD212AE6B90D910E3A86003 /* MetalMatmulMM.swift */; };
+		831805B636822C5D809E9128 /* MetalRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5443B9093F7B88C9B0DAB7B1 /* MetalRouter.swift */; };
+		842352337E1631E26D587430 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */; };
+		885FB5122EDD5DEFF651A182 /* StreamingDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DD0614BC9FDBCBFDD355BED /* StreamingDecoder.swift */; };
+		8BBF9E775F56B8C3204017D7 /* Graph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EF1E2F70560B504F96BD845 /* Graph.swift */; };
+		8EBB0B2F374F78D3B936AE5F /* MetalMoEFused.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56C7EEED3157C90E54511251 /* MetalMoEFused.swift */; };
+		8EEEED5D7374EEF118BE4CD4 /* DecodeLayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77809A5C256ACF8AE083AF59 /* DecodeLayer.swift */; };
+		93FDE6E30EA9C38912DD2E3E /* MetalMoE.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C32847407FE236FBFF6C962 /* MetalMoE.swift */; };
+		99B629E319D53B8F39358145 /* SSDCachePlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E372EE237F88941A0FA497 /* SSDCachePlan.swift */; };
+		9C261F90C77EED734810BF29 /* ChatStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEA6B355B4773391A1322A5D /* ChatStore.swift */; };
+		A01BF08EAF2AB25E1D41D2A6 /* DSV4Decoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = E063FFFA33C1612DAA33BAA1 /* DSV4Decoder.swift */; };
+		A332993EF2CE19A2246A8CFF /* libDS4Core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */; };
+		AD64668620B6C6456F1CF2B7 /* ProcessStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80F7CF152F58EE09CBB22DC5 /* ProcessStream.swift */; };
+		BAC21DC46ADA1456ACE8BC97 /* GraphContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C6177886F90F46E272B1975 /* GraphContext.swift */; };
+		C03D6591694EDBB383989FF7 /* KernelSources.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD6DE04B935B63859A8DDE53 /* KernelSources.swift */; };
+		C20145C001C130832BC7FB81 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */; };
+		C2B7BC09A70DCF7077F49D48 /* SimulatedMemoryLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA79BA361B243720FAB34744 /* SimulatedMemoryLock.swift */; };
+		C51D4A611EA1E31ED7617739 /* ServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 894E45A461C54907A4EFD483 /* ServerView.swift */; };
+		C7752C00226F260BA9E8D618 /* EngineLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A828BDCF1040481380777751 /* EngineLog.swift */; };
+		CDBA092A52C238217242E401 /* MetalCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B487BAABB41636A2E03AC5D3 /* MetalCopy.swift */; };
+		D3235B24DA61A34B9199A629 /* ServerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB2E6A33140969D21CEAFABC /* ServerController.swift */; };
+		D6F4F260558D32D2A2127564 /* libDS4Core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */; };
+		D75F16D1D315CE9E18F96C6B /* MetalUnary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E5D9C638E23AAEB68CB8C6B /* MetalUnary.swift */; };
+		DC1BBC5EB5F8CAFDA5E4B312 /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30330E7D53960E0C8259A4D7 /* DiagnosticsView.swift */; };
+		DF8D277B3D50C796DC317C68 /* ModelDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3D6B81125C2F72A8441BB0B /* ModelDownloader.swift */; };
+		E1027CB23EEA7BC80849301C /* MetalRepeat.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA131297356292236C084149 /* MetalRepeat.swift */; };
+		E45CB93C9FF95FA92895961C /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 368C01D45413AE767C6A7F00 /* ModelCatalog.swift */; };
+		E6C844C9753C91E537E069B4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35E3501F6C96B718DE1A5D33 /* main.swift */; };
+		E7A5703DB30C2A16FC11D792 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */; };
+		E7CF0F6536AF57CE9C822E37 /* MetalRoPE.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3093C9CF11A3876DEC0F2A36 /* MetalRoPE.swift */; };
+		E8B5652FF7E68FD0902200F6 /* MetalSumRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E600EC7D228CBEEE95DD1FD /* MetalSumRows.swift */; };
+		EAB1768B883D16CD64014E67 /* MetalFlashAttn.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73D7F826814FBF744D1684A3 /* MetalFlashAttn.swift */; };
+		EB8D68718761B19C64ED0277 /* Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E7D5BD7890708BA04142DD /* Tokenizer.swift */; };
+		EEF5139F71A62B28CC18988E /* DSV4Shape.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F02FB7FB64B6A5ABE55E27 /* DSV4Shape.swift */; };
+		EFE383A9CBCAF19F18F647A1 /* BenchController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7716F23603322B9FD836144 /* BenchController.swift */; };
+		FED741843ED14A1A8DC1657D /* DiagnosticsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D42D48508A34E2A4BA439C /* DiagnosticsController.swift */; };
+		FF02D53C9212273310CA7306 /* MetalConcat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85B1C13B3E9BB7EE78644EBB /* MetalConcat.swift */; };
+		FFDE581F6879F475E6D714C4 /* MetalIndexerPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 183E178067339B3EEC399A6F /* MetalIndexerPool.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0B794A524E00591FD42229F6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 74EC70CDF24D0CA461AFD58D;
+			remoteInfo = DS4Metal;
+		};
+		250947FC57787B5CFC01B421 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B48E6C3436AC27A6D2D0A92;
+			remoteInfo = DS4Core;
+		};
+		35647E896B52355C052FB381 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 74EC70CDF24D0CA461AFD58D;
+			remoteInfo = DS4Metal;
+		};
+		36013F1D550AA1CA6EFDDD77 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 74EC70CDF24D0CA461AFD58D;
+			remoteInfo = DS4Metal;
+		};
+		7BE5A3D73CAC40647B5CB3EB /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B48E6C3436AC27A6D2D0A92;
+			remoteInfo = DS4Core;
+		};
+		C245C59E68BA03DA5D2F363E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B48E6C3436AC27A6D2D0A92;
+			remoteInfo = DS4Core;
+		};
+		E85947993CEFFC0884C71D5B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4B48E6C3436AC27A6D2D0A92;
+			remoteInfo = DS4Core;
+		};
+		FD60C87E18FCBC770B4F5BDB /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9E84A795943A6EE55F257CDC;
+			remoteInfo = DS4Engine;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		01B6786D3EA54921AF2EF548 /* DownloadRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadRunner.swift; sourceTree = "<group>"; };
+		0C32847407FE236FBFF6C962 /* MetalMoE.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoE.swift; sourceTree = "<group>"; };
+		183E178067339B3EEC399A6F /* MetalIndexerPool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPool.swift; sourceTree = "<group>"; };
+		19C4BBC9AE82CB74C39E2E49 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = text; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Core.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalKVCompress.swift; sourceTree = "<group>"; };
+		238627F1B0C5B8FBB11B2F51 /* Sampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampler.swift; sourceTree = "<group>"; };
+		27C2252B9EF5EBC85445B6D0 /* GGUFWeights.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUFWeights.swift; sourceTree = "<group>"; };
+		2C7E38B67CE3ECA6D88F9A3D /* MetalGetRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGetRows.swift; sourceTree = "<group>"; };
+		30330E7D53960E0C8259A4D7 /* DiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsView.swift; sourceTree = "<group>"; };
+		3093C9CF11A3876DEC0F2A36 /* MetalRoPE.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRoPE.swift; sourceTree = "<group>"; };
+		35E3501F6C96B718DE1A5D33 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		368C01D45413AE767C6A7F00 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
+		36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		36C37C829EB6FC048045E80C /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
+		3791475277F6CBDF08A8EB97 /* InferenceService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceService.swift; sourceTree = "<group>"; };
+		3A9722BC07C1942FA4036046 /* ModelShape.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelShape.swift; sourceTree = "<group>"; };
+		457702D3FACF0B3B8ADD9DE0 /* MetalHyperConnections.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalHyperConnections.swift; sourceTree = "<group>"; };
+		5443B9093F7B88C9B0DAB7B1 /* MetalRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRouter.swift; sourceTree = "<group>"; };
+		56C7EEED3157C90E54511251 /* MetalMoEFused.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoEFused.swift; sourceTree = "<group>"; };
+		5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Metal.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		629CABEDB39DE32E329634D7 /* MetalDense.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDense.swift; sourceTree = "<group>"; };
+		702A49FFFF6C2A66C93D9686 /* MetalAttnOutLow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalAttnOutLow.swift; sourceTree = "<group>"; };
+		707B95F399566A2FD645B8FD /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		73D7F826814FBF744D1684A3 /* MetalFlashAttn.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalFlashAttn.swift; sourceTree = "<group>"; };
+		77809A5C256ACF8AE083AF59 /* DecodeLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecodeLayer.swift; sourceTree = "<group>"; };
+		7CD212AE6B90D910E3A86003 /* MetalMatmulMM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMatmulMM.swift; sourceTree = "<group>"; };
+		7E3AF2E4CCB794369910FFFF /* BenchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchView.swift; sourceTree = "<group>"; };
+		80F7CF152F58EE09CBB22DC5 /* ProcessStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessStream.swift; sourceTree = "<group>"; };
+		85B1C13B3E9BB7EE78644EBB /* MetalConcat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalConcat.swift; sourceTree = "<group>"; };
+		894E45A461C54907A4EFD483 /* ServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerView.swift; sourceTree = "<group>"; };
+		8C6177886F90F46E272B1975 /* GraphContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphContext.swift; sourceTree = "<group>"; };
+		8E5D9C638E23AAEB68CB8C6B /* MetalUnary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalUnary.swift; sourceTree = "<group>"; };
+		8EF1E2F70560B504F96BD845 /* Graph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Graph.swift; sourceTree = "<group>"; };
+		91E402FA8E03F338E4171FAF /* DownloadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadView.swift; sourceTree = "<group>"; };
+		9DD0614BC9FDBCBFDD355BED /* StreamingDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingDecoder.swift; sourceTree = "<group>"; };
+		9E600EC7D228CBEEE95DD1FD /* MetalSumRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSumRows.swift; sourceTree = "<group>"; };
+		A0E59C82098F6F07ED5A1F76 /* MetalBin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalBin.swift; sourceTree = "<group>"; };
+		A0ED452CEAE37525846B1A14 /* MetalRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRuntime.swift; sourceTree = "<group>"; };
+		A2ED669257A621E1FCE97A57 /* DwarfStarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DwarfStarApp.swift; sourceTree = "<group>"; };
+		A3D42D48508A34E2A4BA439C /* DiagnosticsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsController.swift; sourceTree = "<group>"; };
+		A828BDCF1040481380777751 /* EngineLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineLog.swift; sourceTree = "<group>"; };
+		AC1A268CCF897B16962283D3 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
+		ACC6DBD804497A2A001F2385 /* GPUTensor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPUTensor.swift; sourceTree = "<group>"; };
+		ACD85D41C4B63C72A2C4F691 /* KVCFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVCFile.swift; sourceTree = "<group>"; };
+		AE55E668DADBC37930F51C9C /* libDS4Engine.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Engine.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		B3F02FB7FB64B6A5ABE55E27 /* DSV4Shape.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSV4Shape.swift; sourceTree = "<group>"; };
+		B487BAABB41636A2E03AC5D3 /* MetalCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCopy.swift; sourceTree = "<group>"; };
+		B83A939382FE58A5344FB194 /* GGUF.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUF.swift; sourceTree = "<group>"; };
+		BB82DAAD9E0A14AB5CC5D002 /* MetalNorm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalNorm.swift; sourceTree = "<group>"; };
+		BC72C53F1000E3C34D7063B2 /* MetalArgsort.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalArgsort.swift; sourceTree = "<group>"; };
+		BEA6B355B4773391A1322A5D /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
+		C89BC62D6757D25356BBB1A4 /* MetalGLU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGLU.swift; sourceTree = "<group>"; };
+		CE556BF59729D2A83A806A2E /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		D4EB6B4C9361D954796A67F0 /* MetalHCSplit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalHCSplit.swift; sourceTree = "<group>"; };
+		D5E7D5BD7890708BA04142DD /* Tokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tokenizer.swift; sourceTree = "<group>"; };
+		DA105CBD8D04BDE28112DF14 /* MetalSetRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSetRows.swift; sourceTree = "<group>"; };
+		E063FFFA33C1612DAA33BAA1 /* DSV4Decoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSV4Decoder.swift; sourceTree = "<group>"; };
+		E3D6B81125C2F72A8441BB0B /* ModelDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloader.swift; sourceTree = "<group>"; };
+		EA131297356292236C084149 /* MetalRepeat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRepeat.swift; sourceTree = "<group>"; };
+		EDADFE90A9EF121D8898A616 /* MetalSoftmax.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSoftmax.swift; sourceTree = "<group>"; };
+		F1E372EE237F88941A0FA497 /* SSDCachePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSDCachePlan.swift; sourceTree = "<group>"; };
+		F7716F23603322B9FD836144 /* BenchController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchController.swift; sourceTree = "<group>"; };
+		F7DEE2615012BB37E34218F8 /* DwarfStar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DwarfStar.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F82BF19902894495819DBBB8 /* MetalSparseSelect.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSparseSelect.swift; sourceTree = "<group>"; };
+		FA79BA361B243720FAB34744 /* SimulatedMemoryLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimulatedMemoryLock.swift; sourceTree = "<group>"; };
+		FB2E6A33140969D21CEAFABC /* ServerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerController.swift; sourceTree = "<group>"; };
+		FD6DE04B935B63859A8DDE53 /* KernelSources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KernelSources.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		4B200A461AB890D8D145BEE5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D6F4F260558D32D2A2127564 /* libDS4Core.a in Frameworks */,
+				55E78D9E1BD5D2CFF7109A6E /* libDS4Metal.a in Frameworks */,
+				842352337E1631E26D587430 /* Metal.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4B524FA31957F279C32C7255 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2D5DDFCA5D5821AE72D22A90 /* libDS4Engine.a in Frameworks */,
+				A332993EF2CE19A2246A8CFF /* libDS4Core.a in Frameworks */,
+				2A1205D9A6F3C0C756D2E57E /* libDS4Metal.a in Frameworks */,
+				E7A5703DB30C2A16FC11D792 /* Metal.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		787A8E5225D1CE46336993C4 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6A123829226B459DCA75BE16 /* Metal.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F274A20E8486AB55631ED606 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C20145C001C130832BC7FB81 /* Metal.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		043F1656F0711D85AF8B49A0 /* Diagnostics */ = {
+			isa = PBXGroup;
+			children = (
+				A3D42D48508A34E2A4BA439C /* DiagnosticsController.swift */,
+				30330E7D53960E0C8259A4D7 /* DiagnosticsView.swift */,
+			);
+			path = Diagnostics;
+			sourceTree = "<group>";
+		};
+		0E2D5DB838E0D1C0178AE171 /* DS4Core */ = {
+			isa = PBXGroup;
+			children = (
+				0F5A82B3DB4D4D9DED933D92 /* Format */,
+				2285A95777CFFBC5B210C8DA /* Inference */,
+				AC17D2158B0FB8A847D84C04 /* Streaming */,
+			);
+			path = DS4Core;
+			sourceTree = "<group>";
+		};
+		0EA61B3630EA400F4E3442E5 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		0F5A82B3DB4D4D9DED933D92 /* Format */ = {
+			isa = PBXGroup;
+			children = (
+				B83A939382FE58A5344FB194 /* GGUF.swift */,
+				ACD85D41C4B63C72A2C4F691 /* KVCFile.swift */,
+			);
+			path = Format;
+			sourceTree = "<group>";
+		};
+		1E587491C950415A0E8EEAAF = {
+			isa = PBXGroup;
+			children = (
+				8C50E67A394E5FACDC7EC2C9 /* Sources */,
+				0EA61B3630EA400F4E3442E5 /* Frameworks */,
+				FE33167F8F619847DCE49CC7 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		2285A95777CFFBC5B210C8DA /* Inference */ = {
+			isa = PBXGroup;
+			children = (
+				3A9722BC07C1942FA4036046 /* ModelShape.swift */,
+				238627F1B0C5B8FBB11B2F51 /* Sampler.swift */,
+				D5E7D5BD7890708BA04142DD /* Tokenizer.swift */,
+			);
+			path = Inference;
+			sourceTree = "<group>";
+		};
+		298C0D7ECFE7CC1329D2BEB6 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				36C37C829EB6FC048045E80C /* AppEnvironment.swift */,
+				A2ED669257A621E1FCE97A57 /* DwarfStarApp.swift */,
+				CE556BF59729D2A83A806A2E /* RootView.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		34780C798F4B4C3951F19859 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				01B6786D3EA54921AF2EF548 /* DownloadRunner.swift */,
+				91E402FA8E03F338E4171FAF /* DownloadView.swift */,
+				368C01D45413AE767C6A7F00 /* ModelCatalog.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		35704BF857FDB55900D6ACD0 /* Server */ = {
+			isa = PBXGroup;
+			children = (
+				FB2E6A33140969D21CEAFABC /* ServerController.swift */,
+				894E45A461C54907A4EFD483 /* ServerView.swift */,
+			);
+			path = Server;
+			sourceTree = "<group>";
+		};
+		3BE88A5E48881705CA5A0C02 /* Decode */ = {
+			isa = PBXGroup;
+			children = (
+				77809A5C256ACF8AE083AF59 /* DecodeLayer.swift */,
+				E063FFFA33C1612DAA33BAA1 /* DSV4Decoder.swift */,
+				8EF1E2F70560B504F96BD845 /* Graph.swift */,
+				8C6177886F90F46E272B1975 /* GraphContext.swift */,
+				9DD0614BC9FDBCBFDD355BED /* StreamingDecoder.swift */,
+			);
+			path = Decode;
+			sourceTree = "<group>";
+		};
+		3D711B639C3CAA181DA5DD74 /* Chat */ = {
+			isa = PBXGroup;
+			children = (
+				BEA6B355B4773391A1322A5D /* ChatStore.swift */,
+				707B95F399566A2FD645B8FD /* ChatView.swift */,
+				19C4BBC9AE82CB74C39E2E49 /* ContentView.swift */,
+			);
+			path = Chat;
+			sourceTree = "<group>";
+		};
+		4B1C9EFB159AE91C0692738F /* DS4Metal */ = {
+			isa = PBXGroup;
+			children = (
+				3BE88A5E48881705CA5A0C02 /* Decode */,
+				D7EAD860ACBAE01CF2291F28 /* Kernels */,
+				61D1EED684316E08E792FF2F /* Model */,
+				F6A4346903BDA5A9B26E3A56 /* Runtime */,
+			);
+			path = DS4Metal;
+			sourceTree = "<group>";
+		};
+		60F3FE0E862980B186F638FF /* DS4Demo */ = {
+			isa = PBXGroup;
+			children = (
+				35E3501F6C96B718DE1A5D33 /* main.swift */,
+			);
+			path = DS4Demo;
+			sourceTree = "<group>";
+		};
+		61D1EED684316E08E792FF2F /* Model */ = {
+			isa = PBXGroup;
+			children = (
+				B3F02FB7FB64B6A5ABE55E27 /* DSV4Shape.swift */,
+				27C2252B9EF5EBC85445B6D0 /* GGUFWeights.swift */,
+			);
+			path = Model;
+			sourceTree = "<group>";
+		};
+		8C50E67A394E5FACDC7EC2C9 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				0E2D5DB838E0D1C0178AE171 /* DS4Core */,
+				60F3FE0E862980B186F638FF /* DS4Demo */,
+				C046EBFFC8968D1C26FB90D4 /* DS4Engine */,
+				4B1C9EFB159AE91C0692738F /* DS4Metal */,
+				D7CDBBBD42DA5BB20F98F3AB /* DwarfStar */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		AC17D2158B0FB8A847D84C04 /* Streaming */ = {
+			isa = PBXGroup;
+			children = (
+				FA79BA361B243720FAB34744 /* SimulatedMemoryLock.swift */,
+				F1E372EE237F88941A0FA497 /* SSDCachePlan.swift */,
+			);
+			path = Streaming;
+			sourceTree = "<group>";
+		};
+		C046EBFFC8968D1C26FB90D4 /* DS4Engine */ = {
+			isa = PBXGroup;
+			children = (
+				AC1A268CCF897B16962283D3 /* Diagnostics.swift */,
+				3791475277F6CBDF08A8EB97 /* InferenceService.swift */,
+				E3D6B81125C2F72A8441BB0B /* ModelDownloader.swift */,
+			);
+			path = DS4Engine;
+			sourceTree = "<group>";
+		};
+		C5FBAACB32423D6C0E821DF7 /* Bench */ = {
+			isa = PBXGroup;
+			children = (
+				F7716F23603322B9FD836144 /* BenchController.swift */,
+				7E3AF2E4CCB794369910FFFF /* BenchView.swift */,
+			);
+			path = Bench;
+			sourceTree = "<group>";
+		};
+		CB0D3DE6A0AD23AF5FB55A6F /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				A828BDCF1040481380777751 /* EngineLog.swift */,
+				80F7CF152F58EE09CBB22DC5 /* ProcessStream.swift */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+		D7CDBBBD42DA5BB20F98F3AB /* DwarfStar */ = {
+			isa = PBXGroup;
+			children = (
+				298C0D7ECFE7CC1329D2BEB6 /* App */,
+				C5FBAACB32423D6C0E821DF7 /* Bench */,
+				3D711B639C3CAA181DA5DD74 /* Chat */,
+				043F1656F0711D85AF8B49A0 /* Diagnostics */,
+				34780C798F4B4C3951F19859 /* Models */,
+				35704BF857FDB55900D6ACD0 /* Server */,
+				CB0D3DE6A0AD23AF5FB55A6F /* Support */,
+			);
+			path = DwarfStar;
+			sourceTree = "<group>";
+		};
+		D7EAD860ACBAE01CF2291F28 /* Kernels */ = {
+			isa = PBXGroup;
+			children = (
+				BC72C53F1000E3C34D7063B2 /* MetalArgsort.swift */,
+				702A49FFFF6C2A66C93D9686 /* MetalAttnOutLow.swift */,
+				A0E59C82098F6F07ED5A1F76 /* MetalBin.swift */,
+				85B1C13B3E9BB7EE78644EBB /* MetalConcat.swift */,
+				B487BAABB41636A2E03AC5D3 /* MetalCopy.swift */,
+				629CABEDB39DE32E329634D7 /* MetalDense.swift */,
+				73D7F826814FBF744D1684A3 /* MetalFlashAttn.swift */,
+				2C7E38B67CE3ECA6D88F9A3D /* MetalGetRows.swift */,
+				C89BC62D6757D25356BBB1A4 /* MetalGLU.swift */,
+				D4EB6B4C9361D954796A67F0 /* MetalHCSplit.swift */,
+				457702D3FACF0B3B8ADD9DE0 /* MetalHyperConnections.swift */,
+				183E178067339B3EEC399A6F /* MetalIndexerPool.swift */,
+				214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */,
+				7CD212AE6B90D910E3A86003 /* MetalMatmulMM.swift */,
+				0C32847407FE236FBFF6C962 /* MetalMoE.swift */,
+				56C7EEED3157C90E54511251 /* MetalMoEFused.swift */,
+				BB82DAAD9E0A14AB5CC5D002 /* MetalNorm.swift */,
+				EA131297356292236C084149 /* MetalRepeat.swift */,
+				3093C9CF11A3876DEC0F2A36 /* MetalRoPE.swift */,
+				5443B9093F7B88C9B0DAB7B1 /* MetalRouter.swift */,
+				DA105CBD8D04BDE28112DF14 /* MetalSetRows.swift */,
+				EDADFE90A9EF121D8898A616 /* MetalSoftmax.swift */,
+				F82BF19902894495819DBBB8 /* MetalSparseSelect.swift */,
+				9E600EC7D228CBEEE95DD1FD /* MetalSumRows.swift */,
+				8E5D9C638E23AAEB68CB8C6B /* MetalUnary.swift */,
+			);
+			path = Kernels;
+			sourceTree = "<group>";
+		};
+		F6A4346903BDA5A9B26E3A56 /* Runtime */ = {
+			isa = PBXGroup;
+			children = (
+				ACC6DBD804497A2A001F2385 /* GPUTensor.swift */,
+				FD6DE04B935B63859A8DDE53 /* KernelSources.swift */,
+				A0ED452CEAE37525846B1A14 /* MetalRuntime.swift */,
+			);
+			path = Runtime;
+			sourceTree = "<group>";
+		};
+		FE33167F8F619847DCE49CC7 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1D21A76A252CBFB07AB0537C /* DS4Demo */,
+				F7DEE2615012BB37E34218F8 /* DwarfStar.app */,
+				1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */,
+				AE55E668DADBC37930F51C9C /* libDS4Engine.a */,
+				5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		416C4C3510A58A0FED0E0CCE /* DS4Demo */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F960DE760B2D7634637C9268 /* Build configuration list for PBXNativeTarget "DS4Demo" */;
+			buildPhases = (
+				34DAD2701D4EE2430CFA6069 /* Sources */,
+				4B200A461AB890D8D145BEE5 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				11B33254FB0F77C46BC1F9D8 /* PBXTargetDependency */,
+				FF872892458C41991F40AEA9 /* PBXTargetDependency */,
+			);
+			name = DS4Demo;
+			packageProductDependencies = (
+			);
+			productName = DS4Demo;
+			productReference = 1D21A76A252CBFB07AB0537C /* DS4Demo */;
+			productType = "com.apple.product-type.tool";
+		};
+		4B48E6C3436AC27A6D2D0A92 /* DS4Core */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5918E8155822FAE4D27F27A3 /* Build configuration list for PBXNativeTarget "DS4Core" */;
+			buildPhases = (
+				156B756EB4C611F052105B72 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DS4Core;
+			packageProductDependencies = (
+			);
+			productName = DS4Core;
+			productReference = 1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */;
+			productType = "com.apple.product-type.library.static";
+		};
+		74EC70CDF24D0CA461AFD58D /* DS4Metal */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0E37289DF95CAEA1F6F3CD33 /* Build configuration list for PBXNativeTarget "DS4Metal" */;
+			buildPhases = (
+				8F65C833916E10BAD0043038 /* Sources */,
+				F274A20E8486AB55631ED606 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				3D37C3B8EFE0AF6547B6FC47 /* PBXTargetDependency */,
+			);
+			name = DS4Metal;
+			packageProductDependencies = (
+			);
+			productName = DS4Metal;
+			productReference = 5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */;
+			productType = "com.apple.product-type.library.static";
+		};
+		9E84A795943A6EE55F257CDC /* DS4Engine */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 41C52F829B7448B47791C215 /* Build configuration list for PBXNativeTarget "DS4Engine" */;
+			buildPhases = (
+				B5762D1F22067644047DF8C1 /* Sources */,
+				787A8E5225D1CE46336993C4 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				608D78A46298FB8BB5237D1E /* PBXTargetDependency */,
+				41E45D5338EF038D4BEA1275 /* PBXTargetDependency */,
+			);
+			name = DS4Engine;
+			packageProductDependencies = (
+			);
+			productName = DS4Engine;
+			productReference = AE55E668DADBC37930F51C9C /* libDS4Engine.a */;
+			productType = "com.apple.product-type.library.static";
+		};
+		EFFC265053211751C31DAD49 /* DwarfStar */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB751D327E6CD32C0AEC8096 /* Build configuration list for PBXNativeTarget "DwarfStar" */;
+			buildPhases = (
+				4A98F44DCB731DBEBFA30713 /* Sources */,
+				4B524FA31957F279C32C7255 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				55D8FC95B34D4A7FB74466C1 /* PBXTargetDependency */,
+				CCA15210FFBC09F8BEA7454B /* PBXTargetDependency */,
+				6812AC7CE65BCDC6CC8CA7B9 /* PBXTargetDependency */,
+			);
+			name = DwarfStar;
+			packageProductDependencies = (
+			);
+			productName = DwarfStar;
+			productReference = F7DEE2615012BB37E34218F8 /* DwarfStar.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		4BC3B843A602ED9BF92E6D8A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					EFFC265053211751C31DAD49 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 557B6D34801344E31F2D8021 /* Build configuration list for PBXProject "DwarfStar" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 1E587491C950415A0E8EEAAF;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = FE33167F8F619847DCE49CC7 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				4B48E6C3436AC27A6D2D0A92 /* DS4Core */,
+				416C4C3510A58A0FED0E0CCE /* DS4Demo */,
+				9E84A795943A6EE55F257CDC /* DS4Engine */,
+				74EC70CDF24D0CA461AFD58D /* DS4Metal */,
+				EFFC265053211751C31DAD49 /* DwarfStar */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		156B756EB4C611F052105B72 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				091A1F8E5A6442531B374798 /* GGUF.swift in Sources */,
+				054CBAACBE63FEE6D3AC50C3 /* KVCFile.swift in Sources */,
+				002DC8D825867BD2A55948D1 /* ModelShape.swift in Sources */,
+				99B629E319D53B8F39358145 /* SSDCachePlan.swift in Sources */,
+				2515ADC02C0DF358BBD75CD2 /* Sampler.swift in Sources */,
+				C2B7BC09A70DCF7077F49D48 /* SimulatedMemoryLock.swift in Sources */,
+				EB8D68718761B19C64ED0277 /* Tokenizer.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34DAD2701D4EE2430CFA6069 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E6C844C9753C91E537E069B4 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4A98F44DCB731DBEBFA30713 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3910E408B91A91870A85B053 /* AppEnvironment.swift in Sources */,
+				EFE383A9CBCAF19F18F647A1 /* BenchController.swift in Sources */,
+				3D3B111F6A7FDD488BB12336 /* BenchView.swift in Sources */,
+				9C261F90C77EED734810BF29 /* ChatStore.swift in Sources */,
+				54FFCFCEFA7E92506660456E /* ChatView.swift in Sources */,
+				38A3557C5C53590B8A437472 /* ContentView.swift in Sources */,
+				FED741843ED14A1A8DC1657D /* DiagnosticsController.swift in Sources */,
+				DC1BBC5EB5F8CAFDA5E4B312 /* DiagnosticsView.swift in Sources */,
+				0AAF3A499169C93F6D0E0CDC /* DownloadRunner.swift in Sources */,
+				0A8CB83E9E6A231039852450 /* DownloadView.swift in Sources */,
+				44EA43EBD5EA9FC300E03717 /* DwarfStarApp.swift in Sources */,
+				C7752C00226F260BA9E8D618 /* EngineLog.swift in Sources */,
+				E45CB93C9FF95FA92895961C /* ModelCatalog.swift in Sources */,
+				AD64668620B6C6456F1CF2B7 /* ProcessStream.swift in Sources */,
+				323BF1AD84D85111658CF923 /* RootView.swift in Sources */,
+				D3235B24DA61A34B9199A629 /* ServerController.swift in Sources */,
+				C51D4A611EA1E31ED7617739 /* ServerView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8F65C833916E10BAD0043038 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A01BF08EAF2AB25E1D41D2A6 /* DSV4Decoder.swift in Sources */,
+				EEF5139F71A62B28CC18988E /* DSV4Shape.swift in Sources */,
+				8EEEED5D7374EEF118BE4CD4 /* DecodeLayer.swift in Sources */,
+				66828EA15AA63BF34C689008 /* GGUFWeights.swift in Sources */,
+				000EBEAAD22E5FD6A758B612 /* GPUTensor.swift in Sources */,
+				8BBF9E775F56B8C3204017D7 /* Graph.swift in Sources */,
+				BAC21DC46ADA1456ACE8BC97 /* GraphContext.swift in Sources */,
+				C03D6591694EDBB383989FF7 /* KernelSources.swift in Sources */,
+				69F4D04ACA0714532C075766 /* MetalArgsort.swift in Sources */,
+				363A1FD3DC66A7E7E7480F39 /* MetalAttnOutLow.swift in Sources */,
+				1B111B8FD0B60EDAB2ED24FB /* MetalBin.swift in Sources */,
+				FF02D53C9212273310CA7306 /* MetalConcat.swift in Sources */,
+				CDBA092A52C238217242E401 /* MetalCopy.swift in Sources */,
+				720A283BBD0CB84F513F252A /* MetalDense.swift in Sources */,
+				EAB1768B883D16CD64014E67 /* MetalFlashAttn.swift in Sources */,
+				77272F1B5E9456F9C20524FD /* MetalGLU.swift in Sources */,
+				1F05165F0B67FF440D7A8BD3 /* MetalGetRows.swift in Sources */,
+				2C20CB8F0C30A2E52969635B /* MetalHCSplit.swift in Sources */,
+				10777F701D6CA4ECD86FD9B2 /* MetalHyperConnections.swift in Sources */,
+				FFDE581F6879F475E6D714C4 /* MetalIndexerPool.swift in Sources */,
+				57FFE0BE0E0FFC5397340EEA /* MetalKVCompress.swift in Sources */,
+				7E3AE9D47BAF8BEAE79E1596 /* MetalMatmulMM.swift in Sources */,
+				93FDE6E30EA9C38912DD2E3E /* MetalMoE.swift in Sources */,
+				8EBB0B2F374F78D3B936AE5F /* MetalMoEFused.swift in Sources */,
+				23C499EEF65FED94B591012E /* MetalNorm.swift in Sources */,
+				E1027CB23EEA7BC80849301C /* MetalRepeat.swift in Sources */,
+				E7CF0F6536AF57CE9C822E37 /* MetalRoPE.swift in Sources */,
+				831805B636822C5D809E9128 /* MetalRouter.swift in Sources */,
+				3025D1F97BC46ED47CCD2C25 /* MetalRuntime.swift in Sources */,
+				7B2B3E24CAA9E28BB3381B1D /* MetalSetRows.swift in Sources */,
+				1D8AF76D6EBAEFB797CC76D5 /* MetalSoftmax.swift in Sources */,
+				33248385B5007159B778F4DE /* MetalSparseSelect.swift in Sources */,
+				E8B5652FF7E68FD0902200F6 /* MetalSumRows.swift in Sources */,
+				D75F16D1D315CE9E18F96C6B /* MetalUnary.swift in Sources */,
+				885FB5122EDD5DEFF651A182 /* StreamingDecoder.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B5762D1F22067644047DF8C1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1D7B90821767CB99FAC527F1 /* Diagnostics.swift in Sources */,
+				4494CFADD91733AD41BCCC65 /* InferenceService.swift in Sources */,
+				DF8D277B3D50C796DC317C68 /* ModelDownloader.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		11B33254FB0F77C46BC1F9D8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B48E6C3436AC27A6D2D0A92 /* DS4Core */;
+			targetProxy = E85947993CEFFC0884C71D5B /* PBXContainerItemProxy */;
+		};
+		3D37C3B8EFE0AF6547B6FC47 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B48E6C3436AC27A6D2D0A92 /* DS4Core */;
+			targetProxy = C245C59E68BA03DA5D2F363E /* PBXContainerItemProxy */;
+		};
+		41E45D5338EF038D4BEA1275 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 74EC70CDF24D0CA461AFD58D /* DS4Metal */;
+			targetProxy = 0B794A524E00591FD42229F6 /* PBXContainerItemProxy */;
+		};
+		55D8FC95B34D4A7FB74466C1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9E84A795943A6EE55F257CDC /* DS4Engine */;
+			targetProxy = FD60C87E18FCBC770B4F5BDB /* PBXContainerItemProxy */;
+		};
+		608D78A46298FB8BB5237D1E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B48E6C3436AC27A6D2D0A92 /* DS4Core */;
+			targetProxy = 7BE5A3D73CAC40647B5CB3EB /* PBXContainerItemProxy */;
+		};
+		6812AC7CE65BCDC6CC8CA7B9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 74EC70CDF24D0CA461AFD58D /* DS4Metal */;
+			targetProxy = 35647E896B52355C052FB381 /* PBXContainerItemProxy */;
+		};
+		CCA15210FFBC09F8BEA7454B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4B48E6C3436AC27A6D2D0A92 /* DS4Core */;
+			targetProxy = 250947FC57787B5CFC01B421 /* PBXContainerItemProxy */;
+		};
+		FF872892458C41991F40AEA9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 74EC70CDF24D0CA461AFD58D /* DS4Metal */;
+			targetProxy = 36013F1D550AA1CA6EFDDD77 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		09659161EB1DA486C5264F8C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Metal;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		1A5BBA3ABD21A280827DB63E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Engine;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		2AEB8175D986D10CB681222B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Metal;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		3184AE13E81A2FD16B25B40F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Core;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		4EDFF857E892F890525F79E1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = U4V89TP978;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.app;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		63ACCE1320AF5B87AA30650B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = U4V89TP978;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.app;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		9D38450835D04D38AA1954BC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_INSTALL_OBJC_HEADER = NO;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A8C3D6C099EF491F3AC98777 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Demo;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		B23D42C3B7E7F92A2E5FE96D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Core;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		B7C8990DD191FFCE05822691 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Demo;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		BD077218B01ED7DC244C4E8C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_INSTALL_OBJC_HEADER = NO;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		D2669261729DDDBBA9F560ED /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.dwarfstar.DS4Engine;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0E37289DF95CAEA1F6F3CD33 /* Build configuration list for PBXNativeTarget "DS4Metal" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				09659161EB1DA486C5264F8C /* Debug */,
+				2AEB8175D986D10CB681222B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		41C52F829B7448B47791C215 /* Build configuration list for PBXNativeTarget "DS4Engine" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A5BBA3ABD21A280827DB63E /* Debug */,
+				D2669261729DDDBBA9F560ED /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		557B6D34801344E31F2D8021 /* Build configuration list for PBXProject "DwarfStar" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BD077218B01ED7DC244C4E8C /* Debug */,
+				9D38450835D04D38AA1954BC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		5918E8155822FAE4D27F27A3 /* Build configuration list for PBXNativeTarget "DS4Core" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3184AE13E81A2FD16B25B40F /* Debug */,
+				B23D42C3B7E7F92A2E5FE96D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		F960DE760B2D7634637C9268 /* Build configuration list for PBXNativeTarget "DS4Demo" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B7C8990DD191FFCE05822691 /* Debug */,
+				A8C3D6C099EF491F3AC98777 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FB751D327E6CD32C0AEC8096 /* Build configuration list for PBXNativeTarget "DwarfStar" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				63ACCE1320AF5B87AA30650B /* Debug */,
+				4EDFF857E892F890525F79E1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 4BC3B843A602ED9BF92E6D8A /* Project object */;
+}

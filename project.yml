@@ -1,160 +1,74 @@
-# XcodeGen project specification.
-#
-# Generates `DeepSeekV4Pro.xcodeproj` from this declarative spec so
-# the repo doesn't have to commit the fragile pbxproj format. The
-# generated .xcodeproj is gitignored; this file is the source of
-# truth.
-#
-# One-time setup:
-#     brew install xcodegen
-#
-# Each time this file or the source layout changes:
-#     xcodegen generate
-#     # or:
-#     ./Tools/generate-xcodeproj.sh
-#
-# After generation:
-#     open DeepSeekV4Pro.xcodeproj
-#     # → select scheme "DeepSeekUI" → ⌘R
-#
-# The SPM Package.swift still works as before — `swift run DeepSeekUI`
-# / `swift test` / `swift build` are unchanged. The Xcode project is
-# an alternative entry point that produces a proper .app bundle with
-# codesign, an Info.plist in Contents/, dock icon, and the usual Mac
-# app affordances.
-
-name: DeepSeekV4Pro
-
+name: DwarfStar
 options:
-  bundleIdPrefix: com.deepseek.v4pro
-  createIntermediateGroups: true
+  bundleIdPrefix: com.dwarfstar
   deploymentTarget:
     macOS: "14.0"
-  defaultConfig: Debug
-
-packages:
-  # The local Swift Package contains DeepSeekKit + the MetalLibPlugin
-  # build tool that compiles .metal kernels. The Xcode App target
-  # below depends only on the DeepSeekKit library product; the kernel
-  # build phase runs transparently when Xcode resolves the package.
-  DeepSeekKit:
-    path: .
-
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
 settings:
   base:
-    SWIFT_VERSION: "5.10"
+    SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    # Be explicit about platform so Xcode's destination resolver
-    # never falls back to "no eligible run destination".
-    SDKROOT: macosx
-    SUPPORTED_PLATFORMS: macosx
-    # Apple Silicon only. Intel Macs are explicitly unsupported
-    # (`Device.swift` fatal-errors with "requires Apple Silicon",
-    # README §0 documents the requirement). Beyond runtime, the
-    # source itself can't compile on x86_64: `Float16(_:Float)` and
-    # `Float(_:Float16)` initializers are gated out of the stdlib
-    # on macOS x86_64 (see `Layers/ActQuant.swift` roundToE4M3 and
-    # `Model+KVSnapshot.swift` F16 disk compression). Building with
-    # `ARCHS_STANDARD` would force the x86_64 slice and fail with
-    # "Argument passed to call that takes no arguments".
-    ARCHS: arm64
-    # Local dev: ad-hoc signing only. Gatekeeper on macOS 14+
-    # silently refuses to launch *unsigned* binaries; ad-hoc ("-")
-    # is the lightest signing identity that satisfies it. Hardened
-    # runtime stays OFF because it requires a real Developer ID
-    # team — incompatible with ad-hoc.
-    CODE_SIGN_STYLE: Automatic
-    CODE_SIGN_IDENTITY: "-"
-    DEVELOPMENT_TEAM: ""
-    ENABLE_HARDENED_RUNTIME: NO
-    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # Pure-Swift modules have no Obj-C interop, so no -Swift.h is generated;
+    # disable the "Copy Swift Obj-C Interface Header" install phase (it would
+    # otherwise fail looking for a missing header).
+    SWIFT_INSTALL_OBJC_HEADER: "NO"
 
+# Pure-Swift DeepSeek-V4 stack — NO external links (no C engine, no prebuilt
+# static lib). The SwiftUI app (DwarfStar) is now driven by the Swift engine
+# (DS4Engine -> DS4Core + DS4Metal), so the whole thing builds in this .xcodeproj.
 targets:
-  # NOTE: this target is named "DeepSeekApp" — *not* "DeepSeekUI" —
-  # to avoid a scheme-name collision with the SPM executable target
-  # (also named "DeepSeekUI") that the workspace exposes via
-  # Package.swift. With both visible in the workspace, Xcode would
-  # otherwise show two "DeepSeekUI" schemes: the SPM one (an
-  # executable, no "My Mac" destination, what triggered the user's
-  # "no destination" error) and this app one. Renaming this target
-  # disambiguates the scheme picker. PRODUCT_NAME below stays
-  # "DeepSeekUI" so the produced .app + binary still match the
-  # Info.plist.
-  DeepSeekApp:
+  DS4Core:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/DS4Core
+
+  DS4Metal:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/DS4Metal
+    dependencies:
+      - target: DS4Core
+      - sdk: Metal.framework
+
+  DS4Engine:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/DS4Engine
+    dependencies:
+      - target: DS4Core
+      - target: DS4Metal
+      - sdk: Metal.framework
+
+  DS4Demo:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/DS4Demo
+    dependencies:
+      - target: DS4Core
+      - target: DS4Metal
+      - sdk: Metal.framework
+
+  DwarfStar:
     type: application
     platform: macOS
-    deploymentTarget: "14.0"
     sources:
-      - path: Sources/DeepSeekUI
-        # The Info.plist is referenced via INFOPLIST_FILE below;
-        # exclude it from the Compile Sources phase so Xcode doesn't
-        # try to treat it as a Swift file or duplicate-copy it.
-        # DeepSeekUI.entitlements is consumed only by codesign at
-        # build time (via CODE_SIGN_ENTITLEMENTS below); excluding it
-        # keeps XcodeGen from also copying it as a runtime resource
-        # under .app/Contents/Resources/.
-        excludes:
-          - "Resources/Info.plist"
-          - "Resources/DeepSeekUI.entitlements"
+      - Sources/DwarfStar
     dependencies:
-      - package: DeepSeekKit
-        product: DeepSeekKit
-      # ConvertSheet.swift / ConvertViewModel.swift import this for
-      # `Converter.runQuantize` and the TargetDType enum. The SPM
-      # DeepSeekUI target already depends on it; the Xcode project
-      # has to declare it explicitly because XcodeGen doesn't mirror
-      # SPM target deps automatically.
-      - package: DeepSeekKit
-        product: DeepSeekConverter
-      # Fine-tuning scaffold (Spec + Progress + Runner + public entry
-      # point). FineTuneSheet.swift / FineTuneViewModel.swift import
-      # this for `FineTuner.run` and the FineTuneSpec / dtype enums.
-      - package: DeepSeekKit
-        product: DeepSeekTraining
-      # Native tool runtime (read/write/edit/grep/glob/shell/...).
-      # Same xcodegen-vs-SPM caveat — declare explicitly.
-      - package: DeepSeekKit
-        product: DeepSeekTools
-      - package: DeepSeekKit
-        product: DeepSeekIntegrations
-      # Vocab pruner: nuovo target (italiano-only checkpoint slimming).
-      # Stesso pattern di DeepSeekConverter — la sheet UI lo lancia
-      # in-process tramite la facade `VocabPruner.run(...)`.
-      - package: DeepSeekKit
-        product: DeepSeekVocabPruner
+      - target: DS4Engine
+      - target: DS4Core
+      - target: DS4Metal
+      - sdk: Metal.framework
     settings:
       base:
-        INFOPLIST_FILE: Sources/DeepSeekUI/Resources/Info.plist
-        # XcodeGen would otherwise auto-generate a stub Info.plist
-        # and conflict with the one we ship.
-        GENERATE_INFOPLIST_FILE: NO
-        PRODUCT_BUNDLE_IDENTIFIER: com.deepseek.v4pro.ui
-        # PRODUCT_NAME drives both the .app folder name and the
-        # binary inside Contents/MacOS/. We pin it to "DeepSeekUI"
-        # so it matches the Info.plist `CFBundleExecutable` and the
-        # SPM executable name — no Intents / Shortcuts registration
-        # mismatch. The user-facing display name lives in the
-        # Info.plist's CFBundleDisplayName = "DeepSeek-V4" which is
-        # independent of the binary name.
-        PRODUCT_NAME: DeepSeekUI
-        # App Sandbox is required for Mac App Store distribution
-        # (App Store Connect validator error 90296 rejects unsandboxed
-        # bundles at upload). The entitlements file below grants
-        # NSOpenPanel-selected filesystem access (read+write, with
-        # security-scoped bookmarks for persistence) plus outbound
-        # network for OpenRouter / web tools / HTTP MCP. Caveats:
-        # ShellTool, RepoCloneTool, and stdio-MCP transports rely on
-        # `Process()` to spawn /bin/zsh / git / node etc. — those
-        # APIs are denied under the sandbox and will fail at runtime
-        # in App Store builds. Direct-download (Developer ID outside
-        # the store) builds can keep using them by signing with a
-        # variant of this entitlements file that omits the app-sandbox
-        # key.
-        ENABLE_APP_SANDBOX: YES
-        CODE_SIGN_ENTITLEMENTS: Sources/DeepSeekUI/Resources/DeepSeekUI.entitlements
-        # Asset catalog. Resources/Assets.xcassets/AppIcon.appiconset
-        # ships PNGs at every macOS slot (16…1024 px); the catalog
-        # compiler turns them into Assets.car + a .icns fallback so
-        # the bundle satisfies App Store validator 90236 (which
-        # requires a 512pt @2x — i.e. 1024 px — icon).
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.dwarfstar.app
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
