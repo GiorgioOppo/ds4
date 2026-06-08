@@ -3,11 +3,9 @@ import Foundation
 // Faithful Swift port of ds4_ssd.c — SSD streaming cache planning and argument
 // parsing for routed-expert streaming. Pure logic, no engine dependencies.
 //
-// This is Phase 1 of the C -> Swift conversion. Behavior is matched 1:1 against
-// the C originals (see DS4CoreTests/SSDCachePlanTests, which cross-checks every
-// function against ds4_ssd.c through the CDS4 bridge). Where C relies on
-// unsigned wraparound we use Swift's &*/&+ to reproduce it exactly rather than
-// trap.
+// This is Phase 1 of the C -> Swift conversion. Behavior follows the C originals
+// 1:1 (see DS4CoreTests/SSDCachePlanTests). Where C relies on unsigned
+// wraparound we use Swift's &*/&+ to reproduce it exactly rather than trap.
 
 public enum SSDStreaming {
     /// 1 GiB, matching `DS4_GIB` in ds4_ssd.c.

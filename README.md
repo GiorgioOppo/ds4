@@ -1,69 +1,60 @@
 # DS4-gui
 
-Native Swift / SwiftUI front-end for the **ds4 (DwarfStar)** DeepSeek V4
-inference engine.
-
-This folder is self-contained and does **not** modify the upstream engine. The
-C / Objective-C / Metal engine in the parent directory is reused unchanged and
-driven in-process through its narrow public boundary, [`ds4.h`](../ds4.h).
+Native Swift / SwiftUI front-end for **DeepSeek V4 (DwarfStar)**, with a
+**pure-Swift inference engine** (a faithful port of the upstream `ds4.c` /
+`ds4_metal.m`). No C engine, no prebuilt static lib, no external links.
 
 > 📖 **Documentazione dettagliata (IT):** [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md)
-> — architettura, la demo CLI `DS4Demo`, l'app SwiftUI `DwarfStar` e il flusso
-> utente passo-passo.
+> (uso, demo e UI) · [`docs/ARCHITETTURA-MOTORE.md`](docs/ARCHITETTURA-MOTORE.md)
+> (interni del motore: encoder, decoder, MoE, NSA, streaming).
 
 ## Approach
 
 ```
-DwarfStarApp (SwiftUI)        ← GUI (chat, models, server/agent, bench) — later phases
+DwarfStarApp (SwiftUI)        ← GUI (chat, models, server/agent, bench)
         │
-   DS4Kit (Swift)             ← idiomatic bridge: engine, session, streaming
+   DS4Engine (Swift)          ← InferenceService: prompt → event stream
         │
-   CDS4 (C module)            ← exposes ds4.h + a small shim to Swift
+   DS4Core + DS4Metal (Swift) ← pure-Swift engine: GGUF, tokenizer, sampler,
+                                 Metal runtime + kernels, decode graph
         │
-   libDS4Engine.a             ← the upstream engine, compiled UNCHANGED
-   (ds4.c, ds4_metal.m, ds4_ssd.c, ds4_distributed.c)
+   metal/*.metal              ← kernels, embedded in the binary at build time
 ```
 
-The engine is compiled with the **exact upstream Metal flags** (see the
-`Makefile`), so in-process inference is byte-identical to the upstream `./ds4`
-binary. Correctness is the project's #1 rule; the GUI must not perturb the
-inference path.
+The engine is a faithful Swift reimplementation; correctness is the project's
+#1 rule, validated against the C originals in `Tests/DS4CoreTests/`.
 
-### Key integration facts (validated against the engine source)
+### Key facts
 
-- **Metal kernels are compiled at runtime** from the per-kernel files under
-  `metal/`, found relative to the working directory or via `DS4_METAL_*_SOURCE`
-  env overrides (`ds4_metal.m`, function `ds4_gpu_full_source`). The shim
-  `ds4gui_set_metal_source_dir()` points all 19 overrides at a chosen folder, so
-  a bundled `.app` can ship `metal/` in its Resources.
+- **Metal kernels are embedded in the binary** (`Sources/DS4Metal/Runtime/KernelSources.swift`,
+  generated from `metal/*.metal` by `make embed-kernels`). They are compiled at
+  runtime by `MetalRuntime`; no on-disk `metal/` folder is needed to run.
 - **One engine per process.** The Metal backend keeps global state (device,
-  queue, ~120 pipelines, expert cache), so the model is loaded once. The GUI
-  will not run the in-process engine and a `ds4-server` subprocess at the same
-  time (that would load the model twice → OOM on large quants).
+  queue, pipelines, expert cache), so the model is loaded once. The GUI will not
+  run the in-process engine and a `ds4-server` subprocess at the same time (that
+  would load the model twice → OOM on large quants).
 
 ## Layout
 
 ```
 DS4-gui/
-  Makefile                       build libDS4Engine.a (+ drive swift build / xcodegen)
+  Makefile                       drive swift build / test / xcodegen / packaging
   Package.swift                  SwiftPM package (open in Xcode or build via CLI)
   project.yml                    xcodegen spec for the standalone .xcodeproj
-  DwarfStar.xcodeproj            generated, clickable; builds the pure-Swift engine
-                                 (DS4Core+DS4Metal+DS4Demo) with NO external links
+  DwarfStar.xcodeproj            generated, clickable; builds the whole pure-Swift
+                                 stack with NO external links
   Sources/
     DS4Core/                     PURE-SWIFT engine core (GGUF, tokenizer, KV cache,
-                                 sampler, model shape) — no C, no external links
+                                 sampler, model shape)
     DS4Metal/                    PURE-SWIFT Metal runtime + kernels + graph:
                                  GPUTensor/GraphContext, decode layer, DSV4Decoder,
                                  StreamingDecoder, GGUF weight loader
+    DS4Engine/                   inference service backing the GUI (InferenceService,
+                                 downloader, diagnostics)
     DS4Demo/                     pure-Swift CLI demo (Metal self-test + GGUF stream)
-    CDS4/                        C module: ds4.h/ds4_ssd.h (symlinked) + shim
-    DS4Kit/                      Swift bridge over the C engine (GUI in-process path)
-    DwarfStar/                   SwiftUI chat app (ChatStore + views)
-    ds4gui-smoke/                smoke test executable
-  metal/                         vendored Metal kernel sources (copied in;
-                                 the engine compiles them at runtime)
-  enginelib/                     generated C engine static library (gitignored)
+    DwarfStar/                   SwiftUI app (ChatStore + chat/server/bench/diag views)
+  metal/                         Metal kernel sources (embedded into the binary
+                                 via make embed-kernels; the runtime compiles them)
 ```
 
 ## Pure-Swift engine (.xcodeproj, no external links)
@@ -86,18 +77,18 @@ no `metal/` folder needed at runtime), runs a GPU self-test, and — given a GGU
 streams tokens through `StreamingDecoder` (per-layer load/compute/evict, so the
 164GB model fits in 16GB).
 
-The kernel sources are embedded via `Sources/DS4Metal/KernelSources.swift`
+The kernel sources are embedded via `Sources/DS4Metal/Runtime/KernelSources.swift`
 (generated from `metal/*.metal` by `make embed-kernels`). `metal/` stays the
 source of truth; rerun that after editing any kernel.
 
-## Build & run (full SwiftUI GUI over the C engine)
+## Build & run (full SwiftUI GUI)
 
-The GUI app still drives the original C `./ds4` engine, so it needs the static lib:
+The GUI app is driven by the pure-Swift engine — no static lib, no C:
 
 ```sh
 cd DS4-gui
-make            # builds enginelib/libDS4Engine.a, then `swift build`
-make smoke      # build + run the smoke test
+make                  # swift build
+make test             # run the unit tests
 swift run DwarfStar   # launch the SwiftUI chat app
 ```
 
@@ -105,14 +96,6 @@ In the app: set the GGUF path, press **Carica modello**, then chat. The Metal
 kernels are **embedded in the binary** (no kernel folder to set). Toggle
 **Thinking** for chain-of-thought, **Stop** to cancel a generation. A complete
 model is required to load (see below).
-
-The smoke test validates the Swift → C bridge. With no model present it confirms
-the build/link wiring. To run a real greedy generation, point it at a complete
-ds4 GGUF:
-
-```sh
-swift run ds4gui-smoke ../ds4flash.gguf --prompt "Salutami in una frase."
-```
 
 > The parent project currently has only a partial download
 > (`gguf/*.gguf.part`). Finish a model download first, e.g.
@@ -127,10 +110,10 @@ open build/DwarfStar.app
 ```
 
 `packaging/make_app.sh` builds the release executable, assembles the bundle,
-copies the required `metal/` kernels into `Contents/Resources/metal` (the app
-points the engine at them via `AppEnvironment` / `ds4gui_set_metal_source_dir`),
-optionally bundles any built `ds4*` helper binaries under `Resources/bin`, and
-ad-hoc code-signs the result so it runs locally.
+copies the `metal/` kernel sources into `Contents/Resources/metal` (paths
+resolved via `AppEnvironment`), optionally bundles any built `ds4*` helper
+binaries under `Resources/bin`, and ad-hoc code-signs the result so it runs
+locally.
 
 For distribution, sign with a Developer ID identity and notarize:
 
@@ -145,12 +128,12 @@ Drop an `AppIcon.icns` into `packaging/` to give the app an icon.
 
 ## Status
 
-- **Phase 0 (scaffolding & build integration) — done.** Engine compiles into a
-  static library; the Swift package builds and links against it; the Metal
-  source directory is wired; the smoke executable runs.
-- **Phase 1 (DS4Kit async bridge) — done.** `InferenceService` actor serializes
-  engine access, streams reasoning/text as an `AsyncThrowingStream`, supports
-  sampling, multi-turn history with KV reuse, and cooperative cancellation.
+- **Phase 0 (scaffolding & build integration) — done.** Pure-Swift SwiftPM
+  package + standalone `.xcodeproj`; the Metal kernels are embedded in the binary.
+- **Phase 1 (async inference service) — done.** `InferenceService` actor (in
+  `DS4Engine`, over the pure-Swift `DS4Core`/`DS4Metal` engine) serializes engine
+  access, streams reasoning/text as an `AsyncThrowingStream`, supports sampling
+  and cooperative cancellation.
 - **Phase 2 (chat GUI) — initial app done.** `DwarfStar` SwiftUI app: model-load
   screen, streaming chat, collapsible reasoning, thinking toggle, stop/new chat.
 - **Phase 3 (model management) — done.** GGUF discovery in `../` and `../gguf`,

@@ -1,4 +1,6 @@
 .build/
+build/
+enginelib/
 .swiftpm/
 .DS_Store
 Package.resolved

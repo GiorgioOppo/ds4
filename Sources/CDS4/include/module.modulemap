@@ -1,7 +1,0 @@
-module CDS4 {
-    header "ds4.h"
-    header "ds4_ssd.h"
-    header "ds4_kvstore.h"
-    header "ds4gui_shim.h"
-    export *
-}

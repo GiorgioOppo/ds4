@@ -1,42 +1,41 @@
 import XCTest
-import CDS4
 @testable import DS4Core
 
-/// Cross-checks the KVC file-format port against the C ds4_kvstore_* functions.
+/// Swift-only checks of the disk KV-cache file format and policy bits in
+/// `KVCFile`: little-endian helpers, header fill/parse round-trips, SHA1 naming,
+/// reason/key-kind mapping, default options, and the eviction score. (The
+/// original bit-for-bit cross-check against ds4_kvstore.c was dropped with the
+/// C engine; expected values here are well-known constants or hand-derived.)
 final class KVCFileTests: XCTestCase {
 
-    func testLEHelpersMatchC() {
+    func testLEHelpersRoundTrip() {
         let values: [UInt32] = [0, 1, 255, 256, 0x1234_5678, 0xFFFF_FFFF, 0xDEAD_BEEF]
         for v in values {
-            var cbuf = [UInt8](repeating: 0, count: 4)
-            cbuf.withUnsafeMutableBufferPointer { ds4_kvstore_le_put32($0.baseAddress, v) }
-            var sbuf = [UInt8](repeating: 0, count: 4)
-            KVCFile.lePut32(&sbuf, 0, v)
-            XCTAssertEqual(sbuf, cbuf, "le_put32 \(v)")
-            let cget = cbuf.withUnsafeBufferPointer { ds4_kvstore_le_get32($0.baseAddress) }
-            XCTAssertEqual(KVCFile.leGet32(sbuf, 0), cget, "le_get32 \(v)")
+            var buf = [UInt8](repeating: 0, count: 4)
+            KVCFile.lePut32(&buf, 0, v)
+            // Little-endian byte order.
+            XCTAssertEqual(buf[0], UInt8(v & 0xff))
+            XCTAssertEqual(buf[3], UInt8((v >> 24) & 0xff))
+            XCTAssertEqual(KVCFile.leGet32(buf, 0), v, "round-trip \(v)")
         }
     }
 
-    func testFillHeaderMatchesC() {
+    func testFillHeaderRoundTrip() {
         let h = KVCFile.Header(quantBits: 4, reason: 1, extFlags: 0b101, modelId: 0,
                                tokens: 12345, hits: 7, ctxSize: 100000,
                                createdAt: 1_700_000_000, lastUsed: 1_700_009_999,
                                payloadBytes: 987_654_321)
-        var cbuf = [UInt8](repeating: 0, count: KVCFile.fixedHeader)
-        cbuf.withUnsafeMutableBufferPointer {
-            ds4_kvstore_fill_header($0.baseAddress, h.modelId, h.quantBits, h.reason, h.extFlags,
-                                    h.tokens, h.hits, h.ctxSize, h.createdAt, h.lastUsed, h.payloadBytes)
-        }
-        XCTAssertEqual(KVCFile.fillHeader(h), cbuf)
-
-        // Parse the C-produced bytes back; fields must round-trip.
-        let parsed = KVCFile.parseHeader(cbuf)
-        XCTAssertEqual(parsed, h)
+        let b = KVCFile.fillHeader(h)
+        XCTAssertEqual(b.count, KVCFile.fixedHeader)
+        // Magic "KVC", version, and payload ABI are at fixed offsets.
+        XCTAssertEqual(Array(b[0..<4]), [KVCFile.magic0, KVCFile.magic1, KVCFile.magic2, KVCFile.version])
+        XCTAssertEqual(b[20], KVCFile.payloadABI)
+        // Fields round-trip through parse.
+        XCTAssertEqual(KVCFile.parseHeader(b), h)
     }
 
     func testParseRejectsBadHeaders() {
-        var b = KVCFile.fillHeader(KVCFile.Header(quantBits: 4, reason: 1, extFlags: 0, modelId: 0,
+        let b = KVCFile.fillHeader(KVCFile.Header(quantBits: 4, reason: 1, extFlags: 0, modelId: 0,
                                                   tokens: 10, hits: 0, ctxSize: 1, createdAt: 0,
                                                   lastUsed: 0, payloadBytes: 0))
         var bad = b; bad[0] = 0x00
@@ -45,92 +44,85 @@ final class KVCFileTests: XCTestCase {
         XCTAssertNil(KVCFile.parseHeader(bad))         // wrong version
         bad = b; KVCFile.lePut32(&bad, 8, 0)
         XCTAssertNil(KVCFile.parseHeader(bad))         // tokens == 0
-        b[4] = 3
-        XCTAssertNil(KVCFile.parseHeader(b))           // quant not 2/4
+        bad = b; bad[4] = 3
+        XCTAssertNil(KVCFile.parseHeader(bad))         // quant not 2/4
     }
 
-    func testReasonCodeMatchesC() {
-        for r in ["cold", "continued", "evict", "shutdown", "agent-system", "agent-session", "bogus", ""] {
-            let c = r.withCString { ds4_kvstore_reason_code($0) }
-            XCTAssertEqual(KVCFile.reasonCode(r), c, "reason \(r)")
-        }
-        XCTAssertEqual(KVCFile.reasonCode(nil), ds4_kvstore_reason_code(nil))
+    func testReasonCode() {
+        XCTAssertEqual(KVCFile.reasonCode("cold"), 1)
+        XCTAssertEqual(KVCFile.reasonCode("continued"), 2)
+        XCTAssertEqual(KVCFile.reasonCode("evict"), 3)
+        XCTAssertEqual(KVCFile.reasonCode("shutdown"), 4)
+        XCTAssertEqual(KVCFile.reasonCode("agent-system"), 5)
+        XCTAssertEqual(KVCFile.reasonCode("agent-session"), 6)
+        XCTAssertEqual(KVCFile.reasonCode("bogus"), 0)
+        XCTAssertEqual(KVCFile.reasonCode(""), 0)
+        XCTAssertEqual(KVCFile.reasonCode(nil), 0)
     }
 
-    func testKeyKindMatchesC() {
-        for flags: UInt8 in [0, 1, 2, 4, 6, 7, 3] {
-            let c = String(cString: ds4_kvstore_key_kind(flags))
-            XCTAssertEqual(KVCFile.keyKind(extFlags: flags), c, "flags \(flags)")
-        }
+    func testKeyKind() {
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 0), "token-text")
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 1), "token-text")            // tool-map only
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 2), "responses-visible")    // responses bit
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 4), "thinking-visible")     // thinking bit
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 6), "responses-visible")    // both -> responses wins
+        XCTAssertEqual(KVCFile.keyKind(extFlags: 7), "responses-visible")
     }
 
-    func testSHA1MatchesC() {
-        let inputs: [[UInt8]] = [
-            [], Array("".utf8), Array("abc".utf8), Array("The quick brown fox".utf8),
-            Array(repeating: 0x41, count: 1000), Array(0..<UInt8(255)),
-        ]
-        for input in inputs {
-            var out = [CChar](repeating: 0, count: 41)
-            input.withUnsafeBytes { raw in
-                _ = out.withUnsafeMutableBufferPointer {
-                    ds4_kvstore_sha1_bytes_hex(raw.baseAddress, raw.count, $0.baseAddress)
-                }
-            }
-            let cHex = String(cString: out)
-            XCTAssertEqual(KVCFile.sha1Hex(input), cHex, "sha1 of \(input.count) bytes")
-        }
+    func testSHA1Known() {
+        // RFC 3174 / well-known SHA1 digests.
+        XCTAssertEqual(KVCFile.sha1Hex([]), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        XCTAssertEqual(KVCFile.sha1Hex(Array("abc".utf8)), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        // Any output is 40 lowercase hex chars.
+        let hex = KVCFile.sha1Hex(Array("The quick brown fox".utf8))
+        XCTAssertEqual(hex.count, 40)
+        XCTAssertTrue(hex.allSatisfy { $0.isHexDigit && (!$0.isLetter || $0.isLowercase) })
     }
 
-    func testShaHexNameMatchesC() {
-        let names = [
-            "0123456789abcdef0123456789abcdef01234567.kv",   // valid
-            "0123456789ABCDEF0123456789ABCDEF01234567.kv",   // valid, uppercase
-            "short.kv", "0123456789abcdef0123456789abcdef01234567.txt",
-            "0123456789abcdef0123456789abcdef0123456g.kv",   // non-hex
-            "0123456789abcdef0123456789abcdef012345678.kv",  // wrong length
-        ]
-        for name in names {
-            var csha = [CChar](repeating: 0, count: 41)
-            let cok = name.withCString { n in
-                csha.withUnsafeMutableBufferPointer { ds4_kvstore_sha_hex_name(n, $0.baseAddress) }
-            }
-            let swift = KVCFile.shaHexName(name)
-            if cok {
-                XCTAssertEqual(swift, String(cString: csha), "sha_hex_name \(name)")
-            } else {
-                XCTAssertNil(swift, "sha_hex_name should reject \(name)")
-            }
+    func testShaHexName() {
+        XCTAssertEqual(KVCFile.shaHexName("0123456789abcdef0123456789abcdef01234567.kv"),
+                       "0123456789abcdef0123456789abcdef01234567")
+        // Uppercase hex is accepted and lowercased.
+        XCTAssertEqual(KVCFile.shaHexName("0123456789ABCDEF0123456789ABCDEF01234567.kv"),
+                       "0123456789abcdef0123456789abcdef01234567")
+        // Rejected: too short, wrong extension, non-hex, wrong length.
+        for bad in ["short.kv", "0123456789abcdef0123456789abcdef01234567.txt",
+                    "0123456789abcdef0123456789abcdef0123456g.kv",
+                    "0123456789abcdef0123456789abcdef012345678.kv"] {
+            XCTAssertNil(KVCFile.shaHexName(bad), "should reject \(bad)")
         }
     }
 
-    func testDefaultOptionsMatchC() {
-        let c = ds4_kvstore_default_options()
-        let s = KVCFile.defaultOptions()
-        XCTAssertEqual(Int(c.min_tokens), s.minTokens)
-        XCTAssertEqual(Int(c.cold_max_tokens), s.coldMaxTokens)
-        XCTAssertEqual(Int(c.continued_interval_tokens), s.continuedIntervalTokens)
-        XCTAssertEqual(Int(c.boundary_trim_tokens), s.boundaryTrimTokens)
-        XCTAssertEqual(Int(c.boundary_align_tokens), s.boundaryAlignTokens)
+    func testDefaultOptions() {
+        let o = KVCFile.defaultOptions()
+        XCTAssertEqual(o.minTokens, 512)
+        XCTAssertEqual(o.coldMaxTokens, 30000)
+        XCTAssertEqual(o.continuedIntervalTokens, 10000)
+        XCTAssertEqual(o.boundaryTrimTokens, 32)
+        XCTAssertEqual(o.boundaryAlignTokens, 2048)
     }
 
-    func testEvictionScoreMatchesC() {
+    func testEvictionScore() {
         let now: UInt64 = 2_000_000_000
-        let entries: [KVCFile.Entry] = [
+        // fileSize 0 -> score 0.
+        XCTAssertEqual(KVCFile.evictionScore(
+            .init(hits: 5, tokens: 100, fileSize: 0, createdAt: now, lastUsed: now, reason: 1), now: now), 0.0)
+
+        // lastUsed == now -> no time decay; reason 2 (continued) is not an anchor.
+        // score = (hits + 1) * tokens / fileSize = 1 * 1000 / 1_000_000 = 0.001
+        XCTAssertEqual(KVCFile.evictionScore(
+            .init(hits: 0, tokens: 1000, fileSize: 1_000_000, createdAt: now, lastUsed: now, reason: 2),
+            now: now), 0.001, accuracy: 1e-12)
+
+        // reason 1 (cold) is an anchor -> score doubled: 0.001 * 2 = 0.002
+        XCTAssertEqual(KVCFile.evictionScore(
             .init(hits: 0, tokens: 1000, fileSize: 1_000_000, createdAt: now, lastUsed: now, reason: 1),
-            .init(hits: 5, tokens: 8000, fileSize: 5_000_000, createdAt: now - 3600, lastUsed: now - 3600, reason: 2),
-            .init(hits: 100, tokens: 30000, fileSize: 80_000_000, createdAt: now - 86400, lastUsed: now - 86400, reason: 3),
-            .init(hits: 3, tokens: 500, fileSize: 200_000, createdAt: now - 100000, lastUsed: 0, reason: 0),
-            .init(hits: 0, tokens: 1, fileSize: 0, createdAt: 0, lastUsed: 0, reason: 4),
-            .init(hits: 50, tokens: 12000, fileSize: 9_000_000, createdAt: now - 21600, lastUsed: now - 21600, reason: 1),
-        ]
-        for e in entries {
-            var ce = ds4_kvstore_entry()
-            ce.hits = e.hits; ce.tokens = e.tokens; ce.file_size = e.fileSize
-            ce.created_at = e.createdAt; ce.last_used = e.lastUsed; ce.reason = e.reason
-            let cscore = ds4_kvstore_entry_eviction_score(&ce, nil, now, nil)
-            let sscore = KVCFile.evictionScore(e, now: now)
-            XCTAssertEqual(sscore, cscore, accuracy: 1e-12, "eviction score hits=\(e.hits) reason=\(e.reason)")
-        }
+            now: now), 0.002, accuracy: 1e-12)
+
+        // usedAt == 0 -> effectiveHits forced to 0: (0+1)*2000/1000 = 2.0
+        XCTAssertEqual(KVCFile.evictionScore(
+            .init(hits: 9, tokens: 2000, fileSize: 1000, createdAt: 0, lastUsed: 0, reason: 2),
+            now: now), 2.0, accuracy: 1e-12)
     }
 
     func testDSV4HeaderRoundTrip() {
@@ -142,8 +134,7 @@ final class KVCFileTests: XCTestCase {
         XCTAssertEqual(bytes.count, DSV4PayloadHeader.u32Fields * 4)
         XCTAssertEqual(KVCFile.leGet32(bytes, 0), DSV4PayloadHeader.magic)
         XCTAssertEqual(KVCFile.leGet32(bytes, 4), DSV4PayloadHeader.version)
-        let parsed = DSV4PayloadHeader(bytes)
-        XCTAssertEqual(parsed, h)
+        XCTAssertEqual(DSV4PayloadHeader(bytes), h)
         // Reject wrong magic.
         var bad = bytes; bad[0] = 0
         XCTAssertNil(DSV4PayloadHeader(bad))

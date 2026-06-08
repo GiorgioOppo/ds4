@@ -1,11 +1,10 @@
 import XCTest
-import CDS4
 @testable import DS4Core
 
-/// Cross-checks the Swift sampler against the public C ds4_sample_logits over a
-/// grid of (temperature, top_k, top_p, min_p, seed). Uses distinct logits so
-/// the C qsort and the Swift sort agree on ordering. Asserts both the chosen
-/// token and the resulting RNG state match (so the RNG consumption is identical).
+/// Swift-only checks of the sampler: the RNG distribution, greedy argmax, and
+/// self-consistency invariants of the top-k / top-p / min-p path. (The original
+/// bit-for-bit cross-check against the C ds4_sample_logits was dropped when the
+/// C engine was removed from the project.)
 final class SamplerTests: XCTestCase {
 
     /// Distinct, scattered logits: a bijective permutation of evenly spaced values.
@@ -20,9 +19,7 @@ final class SamplerTests: XCTestCase {
         return out
     }
 
-    func testRNGMatchesC() {
-        // The RNG is the backbone; verify a long sequence matches indirectly via
-        // sampling-state equality below, and the f32 distribution here.
+    func testRNGF32Range() {
         var s: UInt64 = 12345
         for _ in 0..<1000 {
             let f = Sampler.rngF32(&s)
@@ -31,11 +28,34 @@ final class SamplerTests: XCTestCase {
         }
     }
 
-    func testSamplerMatchesC() {
+    /// The RNG must be deterministic for a given seed and advance its state.
+    func testRNGDeterministic() {
+        var a: UInt64 = 42, b: UInt64 = 42
+        for _ in 0..<100 { XCTAssertEqual(Sampler.rngNext(&a), Sampler.rngNext(&b)) }
+        var s: UInt64 = 7
+        let before = s
+        _ = Sampler.rngNext(&s)
+        XCTAssertNotEqual(s, before)
+    }
+
+    func testArgmax() {
+        // temperature 0 must select the global argmax with no RNG consumption.
+        let logits = makeLogits(2003)
+        var rng: UInt64 = 7
+        let tok = Sampler.sample(logits, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+        XCTAssertEqual(tok, Sampler.argmax(logits))
+        XCTAssertEqual(rng, 7) // unchanged
+    }
+
+    /// Self-consistency invariants across a grid of sampling parameters: the
+    /// sampler must always return a valid in-range index, and top_k==1 must
+    /// collapse to the argmax (the single most likely token).
+    func testSamplerInvariants() {
         let n = 2003
         let logits = makeLogits(n)
+        let argmax = Sampler.argmax(logits)
         let temps: [Float] = [0.0, 0.5, 0.7, 1.0, 1.5]
-        let topKs: [Int32] = [0, 1, 8, 40, 256, 1024, 5000]
+        let topKs: [Int] = [0, 1, 8, 40, 256, 1024, 5000]
         let topPs: [Float] = [0.5, 0.9, 0.95, 1.0]
         let minPs: [Float] = [0.0, 0.01, 0.05, 0.2]
         let seeds: [UInt64] = [1, 42, 0xDEAD_BEEF, 0x9E37_79B9_7F4A_7C15, 0]
@@ -46,16 +66,15 @@ final class SamplerTests: XCTestCase {
                 for topP in topPs {
                     for minP in minPs {
                         for seed in seeds {
-                            var rngC = seed
-                            let tokC = logits.withUnsafeBufferPointer {
-                                ds4_sample_logits($0.baseAddress, Int32(n), temp, topK, topP, minP, &rngC)
-                            }
-                            var rngS = seed
-                            let tokS = Sampler.sample(logits, temperature: temp,
-                                                      topK: Int(topK), topP: topP, minP: minP, rng: &rngS)
+                            var rng = seed
+                            let tok = Sampler.sample(logits, temperature: temp, topK: topK,
+                                                     topP: topP, minP: minP, rng: &rng)
                             let label = "temp=\(temp) topK=\(topK) topP=\(topP) minP=\(minP) seed=\(seed)"
-                            XCTAssertEqual(Int(tokC), tokS, "token mismatch: \(label)")
-                            XCTAssertEqual(rngC, rngS, "rng state mismatch: \(label)")
+                            XCTAssertGreaterThanOrEqual(tok, 0, "index < 0: \(label)")
+                            XCTAssertLessThan(tok, n, "index >= n: \(label)")
+                            if temp == 0 || topK == 1 {
+                                XCTAssertEqual(tok, argmax, "expected argmax: \(label)")
+                            }
                             cases += 1
                         }
                     }
@@ -63,14 +82,5 @@ final class SamplerTests: XCTestCase {
             }
         }
         XCTAssertGreaterThan(cases, 1000)
-    }
-
-    func testArgmaxMatchesC() {
-        // temperature 0 must select the global argmax with no RNG consumption.
-        let logits = makeLogits(2003)
-        var rng: UInt64 = 7
-        let tok = Sampler.sample(logits, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
-        XCTAssertEqual(tok, Sampler.argmax(logits))
-        XCTAssertEqual(rng, 7) // unchanged
     }
 }

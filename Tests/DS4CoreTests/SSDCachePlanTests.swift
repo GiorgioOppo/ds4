@@ -1,108 +1,96 @@
 import XCTest
-import CDS4
 @testable import DS4Core
 
-/// Cross-checks the Swift SSD planning port against the C originals in
-/// ds4_ssd.c for a wide range of inputs. If these pass, the Swift behavior is
-/// byte-for-byte faithful.
+/// Swift-only checks of the SSD streaming cache planning logic in
+/// `SSDStreaming`. Expected values are derived directly from the documented
+/// behavior (parse "<n>"/"<n>GB", 4/5 budget target, byte→expert conversion).
+/// The original bit-for-bit cross-check against ds4_ssd.c was dropped with the
+/// C engine.
 final class SSDCachePlanTests: XCTestCase {
+    private let gib = SSDStreaming.gib
 
-    // MARK: parseGiBArg vs ds4_parse_gib_arg
+    // MARK: parseGiBArg
 
-    func testParseGiBArgMatchesC() {
-        let inputs = ["", "0", "10", "10GB", "10gb", "10Gb", "10gB", "GB", "10G",
-                      "G", "B", "abc", "1.5GB", " 10", "10 ", "32GB", "1",
-                      "4096", "18446744073709551615", "999999999999GB",
-                      "18446744073709551616", "00010", "007"]
-        for s in inputs {
-            var cBytes: UInt64 = 0
-            let cOk = s.withCString { ds4_parse_gib_arg($0, &cBytes) }
-            let swift = SSDStreaming.parseGiBArg(s)
-            if cOk {
-                XCTAssertEqual(swift, cBytes, "parseGiBArg mismatch for \"\(s)\"")
-            } else {
-                XCTAssertNil(swift, "parseGiBArg should be nil for \"\(s)\" (C rejected)")
-            }
+    func testParseGiBArg() {
+        XCTAssertEqual(SSDStreaming.parseGiBArg("10"), 10 * gib)
+        XCTAssertEqual(SSDStreaming.parseGiBArg("10GB"), 10 * gib)
+        XCTAssertEqual(SSDStreaming.parseGiBArg("10gb"), 10 * gib)
+        XCTAssertEqual(SSDStreaming.parseGiBArg("10gB"), 10 * gib)
+        XCTAssertEqual(SSDStreaming.parseGiBArg("32GB"), 32 * gib)
+        XCTAssertEqual(SSDStreaming.parseGiBArg("007"), 7 * gib)
+
+        // Rejected: empty, suffix-only, zero, non-digits, decimals, overflow.
+        for bad in ["", "GB", "G", "B", "0", "abc", "1.5GB", " 10", "10 ",
+                    "999999999999GB", "18446744073709551616"] {
+            XCTAssertNil(SSDStreaming.parseGiBArg(bad), "should reject \"\(bad)\"")
         }
     }
 
-    // MARK: parseCacheExpertsArg vs ds4_parse_streaming_cache_experts_arg
+    // MARK: parseCacheExpertsArg
 
-    func testParseCacheExpertsArgMatchesC() {
-        let inputs = ["", "0", "32GB", "4854", "16GB", "100", "GB", "abc",
-                      "4294967295", "4294967296", "1gb", "2GB", "999",
-                      "18446744073709551615", "64gb"]
-        for s in inputs {
-            var cExperts: UInt32 = 0
-            var cBytes: UInt64 = 0
-            let cOk = s.withCString {
-                ds4_parse_streaming_cache_experts_arg($0, &cExperts, &cBytes)
-            }
-            let swift = SSDStreaming.parseCacheExpertsArg(s)
-            if cOk {
-                switch swift {
-                case .bytes(let b):
-                    XCTAssertEqual(cBytes, b, "bytes mismatch for \"\(s)\"")
-                    XCTAssertEqual(cExperts, 0, "C experts should be 0 for byte spec \"\(s)\"")
-                case .experts(let e):
-                    XCTAssertEqual(cExperts, e, "experts mismatch for \"\(s)\"")
-                    XCTAssertEqual(cBytes, 0, "C bytes should be 0 for expert spec \"\(s)\"")
-                case nil:
-                    XCTFail("Swift returned nil but C accepted \"\(s)\"")
-                }
-            } else {
-                XCTAssertNil(swift, "parseCacheExpertsArg should be nil for \"\(s)\"")
-            }
+    func testParseCacheExpertsArg() {
+        // A "…GB" suffix is a byte budget; a bare integer is an expert count.
+        XCTAssertEqual(SSDStreaming.parseCacheExpertsArg("32GB"), .bytes(32 * gib))
+        XCTAssertEqual(SSDStreaming.parseCacheExpertsArg("1gb"), .bytes(gib))
+        XCTAssertEqual(SSDStreaming.parseCacheExpertsArg("4854"), .experts(4854))
+        XCTAssertEqual(SSDStreaming.parseCacheExpertsArg("4294967295"), .experts(UInt32.max))
+
+        // Rejected: empty, zero, non-digits, > UInt32.max expert count.
+        for bad in ["", "0", "GB", "abc", "4294967296"] {
+            XCTAssertNil(SSDStreaming.parseCacheExpertsArg(bad), "should reject \"\(bad)\"")
         }
     }
 
-    // MARK: cacheExpertsForByteBudget vs C
+    // MARK: cacheExpertsForByteBudget
 
-    func testCacheExpertsForByteBudgetMatchesC() {
-        let cases: [(UInt64, UInt64)] = [
-            (0, 0), (0, 100), (100, 0),
-            (32 * SSDStreaming.gib, 13_500_000),
-            (2 * SSDStreaming.gib, 13_500_000),
-            (1, 1), (1000, 7), (UInt64.max, 1), (UInt64.max, UInt64.max),
-            (14_000_000, 13_500_000),
-        ]
-        for (bytes, per) in cases {
-            let c = ds4_ssd_cache_experts_for_byte_budget(bytes, per)
-            let swift = SSDStreaming.cacheExpertsForByteBudget(bytes: bytes, perExpertBytes: per)
-            XCTAssertEqual(c, swift, "cacheExperts mismatch for bytes=\(bytes) per=\(per)")
-        }
+    func testCacheExpertsForByteBudget() {
+        XCTAssertEqual(SSDStreaming.cacheExpertsForByteBudget(bytes: 0, perExpertBytes: 100), 0)
+        XCTAssertEqual(SSDStreaming.cacheExpertsForByteBudget(bytes: 100, perExpertBytes: 0), 0)
+        XCTAssertEqual(SSDStreaming.cacheExpertsForByteBudget(bytes: 1000, perExpertBytes: 7), 142) // floor(1000/7)
+        XCTAssertEqual(SSDStreaming.cacheExpertsForByteBudget(bytes: gib, perExpertBytes: gib), 1)
+        // Result that would exceed UInt32.max is clamped to 0 (rejected).
+        XCTAssertEqual(SSDStreaming.cacheExpertsForByteBudget(bytes: UInt64.max, perExpertBytes: 1), 0)
     }
 
-    // MARK: autoCachePlan vs ds4_ssd_auto_cache_plan
+    // MARK: autoCachePlan (targets 4/5 of the recommended budget)
 
-    func testAutoCachePlanMatchesC() {
-        let cases: [(UInt64, UInt64, UInt64, UInt64)] = [
-            (0, 0, 0, 0),
-            (64 * SSDStreaming.gib, 10 * SSDStreaming.gib, 13_500_000, 256_000),
-            (16 * SSDStreaming.gib, 8 * SSDStreaming.gib, 13_500_000, 0),
-            (128 * SSDStreaming.gib, 20 * SSDStreaming.gib, 6_750_000, 100_000),
-            (10 * SSDStreaming.gib, 20 * SSDStreaming.gib, 13_500_000, 256_000), // nonRouted > target
-            (100, 0, 13_500_000, 0),
-            (64 * SSDStreaming.gib, 0, 13_500_000, 4),
-            (UInt64.max, 1 * SSDStreaming.gib, 13_500_000, 0),
-        ]
-        for (rec, nonRouted, per, maxExp) in cases {
-            var cPlan = ds4_ssd_cache_plan()
-            let cOk = ds4_ssd_auto_cache_plan(rec, nonRouted, per, maxExp, &cPlan)
-            let swift = SSDStreaming.autoCachePlan(recommendedBytes: rec,
-                                                   nonRoutedBytes: nonRouted,
-                                                   perExpertBytes: per,
-                                                   maxModelExperts: maxExp)
-            let label = "rec=\(rec) nonRouted=\(nonRouted) per=\(per) max=\(maxExp)"
-            if cOk {
-                guard let s = swift else { XCTFail("Swift nil but C ok: \(label)"); continue }
-                XCTAssertEqual(cPlan.model_target_bytes, s.modelTargetBytes, "modelTarget \(label)")
-                XCTAssertEqual(cPlan.cache_bytes, s.cacheBytes, "cacheBytes \(label)")
-                XCTAssertEqual(cPlan.effective_cache_bytes, s.effectiveCacheBytes, "effective \(label)")
-                XCTAssertEqual(cPlan.cache_experts, s.cacheExperts, "experts \(label)")
-            } else {
-                XCTAssertNil(swift, "Swift should be nil when C rejects: \(label)")
-            }
+    func testAutoCachePlanCleanCase() {
+        // recommended 5 GiB -> modelTarget 4 GiB; nonRouted 1 GiB -> cache 3 GiB;
+        // per-expert 1 GiB -> 3 experts (no cap).
+        guard let p = SSDStreaming.autoCachePlan(recommendedBytes: 5 * gib, nonRoutedBytes: gib,
+                                                 perExpertBytes: gib, maxModelExperts: 0) else {
+            return XCTFail("plan should be non-nil")
         }
+        XCTAssertEqual(p.modelTargetBytes, 4 * gib)
+        XCTAssertEqual(p.cacheBytes, 3 * gib)
+        XCTAssertEqual(p.cacheExperts, 3)
+        XCTAssertEqual(p.effectiveCacheBytes, 3 * gib)
+    }
+
+    func testAutoCachePlanExpertCap() {
+        // Same target/cache (4 experts available) but capped to 2 by maxModelExperts.
+        guard let p = SSDStreaming.autoCachePlan(recommendedBytes: 5 * gib, nonRoutedBytes: 0,
+                                                 perExpertBytes: gib, maxModelExperts: 2) else {
+            return XCTFail("plan should be non-nil")
+        }
+        XCTAssertEqual(p.cacheExperts, 2)
+    }
+
+    func testAutoCachePlanFloorsToOneExpert() {
+        // nonRouted >= modelTarget -> cacheBytes 0 -> floored to 1 expert.
+        guard let p = SSDStreaming.autoCachePlan(recommendedBytes: 5 * gib, nonRoutedBytes: 10 * gib,
+                                                 perExpertBytes: gib, maxModelExperts: 0) else {
+            return XCTFail("plan should be non-nil")
+        }
+        XCTAssertEqual(p.cacheBytes, 0)
+        XCTAssertEqual(p.cacheExperts, 1)
+        XCTAssertEqual(p.effectiveCacheBytes, gib)
+    }
+
+    func testAutoCachePlanRejectsDegenerate() {
+        XCTAssertNil(SSDStreaming.autoCachePlan(recommendedBytes: 0, nonRoutedBytes: 0,
+                                                perExpertBytes: gib, maxModelExperts: 0))
+        XCTAssertNil(SSDStreaming.autoCachePlan(recommendedBytes: 5 * gib, nonRoutedBytes: 0,
+                                                perExpertBytes: 0, maxModelExperts: 0))
     }
 }

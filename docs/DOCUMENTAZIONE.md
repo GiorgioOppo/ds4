@@ -82,9 +82,8 @@ Punti importanti:
 - **I kernel Metal sono incorporati nel binario** tramite
   `Sources/DS4Metal/Runtime/KernelSources.swift`, generato da `metal/*.metal`
   con `make embed-kernels`. A runtime **non serve** la cartella `metal/`.
-- Esiste anche un percorso legacy (`DS4Kit` + `CDS4`) che fa da bridge al
-  motore C originale `ds4.h`; la GUI di default usa il motore Swift puro via
-  `DS4Engine`.
+- L'intero stack è **puro Swift**: la GUI usa il motore via `DS4Engine`. Non c'è
+  più alcun bridge verso il motore C originale (rimosso dal progetto).
 
 ### Mappa dei sorgenti
 
@@ -95,7 +94,6 @@ Punti importanti:
 | `Sources/DS4Engine/` | `InferenceService` (la facciata async usata dalla GUI), downloader, diagnostica. |
 | `Sources/DS4Demo/` | La demo CLI (`main.swift`). |
 | `Sources/DwarfStar/` | L'app SwiftUI (App, Chat, Server, Bench, Diagnostics, Models, Support). |
-| `Sources/DS4Kit/`, `Sources/CDS4/` | Bridge legacy verso il motore C. |
 | `metal/` | Sorgenti dei kernel Metal (fonte di verità, poi incorporati). |
 | `Tests/DS4CoreTests/` | Suite di test sui kernel, sul grafo, tokenizer, GGUF, sampler, ecc. |
 
