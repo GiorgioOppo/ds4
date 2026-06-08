@@ -7,6 +7,10 @@ This folder is self-contained and does **not** modify the upstream engine. The
 C / Objective-C / Metal engine in the parent directory is reused unchanged and
 driven in-process through its narrow public boundary, [`ds4.h`](../ds4.h).
 
+> 📖 **Documentazione dettagliata (IT):** [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md)
+> — architettura, la demo CLI `DS4Demo`, l'app SwiftUI `DwarfStar` e il flusso
+> utente passo-passo.
+
 ## Approach
 
 ```
