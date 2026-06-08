@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required by the App Store / TestFlight. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- Read/write files the user picks (model GGUF, chat attachments). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Re-open user-picked files across launches via security-scoped bookmarks. -->
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+    <!-- Downloading models over HTTPS. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

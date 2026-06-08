@@ -148,7 +148,7 @@
 		1768A7CE66C432C3B5FD1582 /* GraphCompressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphCompressor.swift; sourceTree = "<group>"; };
 		183E178067339B3EEC399A6F /* MetalIndexerPool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPool.swift; sourceTree = "<group>"; };
 		19C4BBC9AE82CB74C39E2E49 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
+		1D21A76A252CBFB07AB0537C /* DS4Demo */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = text; path = DS4Demo; sourceTree = BUILT_PRODUCTS_DIR; };
 		1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Core.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		214D96E9831A8BA4CE55A8BA /* MetalKVCompress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalKVCompress.swift; sourceTree = "<group>"; };
 		238627F1B0C5B8FBB11B2F51 /* Sampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampler.swift; sourceTree = "<group>"; };
@@ -856,9 +856,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = DS4;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -880,9 +882,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = DS4;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSMinimumSystemVersion = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
