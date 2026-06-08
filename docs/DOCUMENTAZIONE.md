@@ -8,6 +8,10 @@ dal lato sviluppatore (la demo CLI `DS4Demo`) sia dal lato utente finale
 (l'app SwiftUI `DwarfStar`). Per i dettagli di build e packaging fai
 riferimento anche al [`README.md`](../README.md) nella radice del progetto.
 
+> 🛠️ Per il funzionamento interno del motore (encoder/tokenizer, decoder,
+> attenzione MLA, MoE, compressore NSA, streaming dei pesi, sampler,
+> quantizzazione) vedi [`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md).
+
 ---
 
 ## Indice
