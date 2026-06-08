@@ -636,9 +636,11 @@ modello vede gli output e produce la risposta finale o altre chiamate.
 ### Registry e tool demo
 
 `ToolRegistry` (DS4Engine) espone i built-in auto-eseguibili — **`now`** (data/ora
-ISO-8601) e **`calculator`** (aritmetica sicura via `NSExpression` con input
-ristretto a cifre/operatori) — e `execute(_:)` che restituisce un `ToolOutput`
-oppure `nil` per i tool non integrati (risultato manuale dalla UI).
+ISO-8601), **`calculator`** (aritmetica sicura tramite un valutatore a discesa
+ricorsiva, niente `NSExpression`) e i tre tool a due operandi **`add` /
+`subtract` / `multiply`** (costruiti da `binaryTool`, accettano numeri o stringhe
+numeriche) — e `execute(_:)` che restituisce un `ToolOutput` oppure `nil` per i
+tool non integrati (risultato manuale dalla UI).
 
 I percorsi puri (renderer, parser, tool demo) sono coperti da test Swift-only:
 `ChatToolsTests`, `ToolRegistryTests`.

@@ -322,7 +322,12 @@ e scegli quali **tool integrati** esporre al modello. I built-in di demo sono:
 
 - **`now`** — data/ora corrente (ISO-8601), auto-eseguibile;
 - **`calculator`** — valuta un'espressione aritmetica (`+ - * / ( )`),
-  auto-eseguibile in modo sicuro (input ristretto a cifre/operatori).
+  auto-eseguibile in modo sicuro (input ristretto a cifre/operatori);
+- **`add` / `subtract` / `multiply`** — operano su due numeri `a` e `b`
+  (somma, sottrazione, moltiplicazione); accettano numeri JSON o stringhe
+  numeriche.
+
+Tutti i built-in sono abilitati di default e vengono eseguiti automaticamente.
 
 Flusso di una chiamata a tool:
 

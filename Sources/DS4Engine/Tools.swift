@@ -27,7 +27,7 @@ public struct ToolOutput: Sendable, Equatable {
 
 public enum ToolRegistry {
     /// The demo tools shipped with the app. All are pure and side-effect free.
-    public static let builtins: [BuiltinTool] = [clock, calculator]
+    public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -71,6 +71,51 @@ public enum ToolRegistry {
             return evaluateArithmetic(expr)
         })
 
+    // MARK: Two-operand arithmetic tools (a, b)
+
+    /// Sum of two numbers.
+    static let add = binaryTool(name: "add", verb: "Add", symbol: "+") { $0 + $1 }
+    /// Difference of two numbers (a − b).
+    static let subtract = binaryTool(name: "subtract", verb: "Subtract", symbol: "−") { $0 - $1 }
+    /// Product of two numbers.
+    static let multiply = binaryTool(name: "multiply", verb: "Multiply", symbol: "×") { $0 * $1 }
+
+    /// Build a tool taking two numeric arguments `a` and `b` and returning `op(a,b)`.
+    static func binaryTool(name: String, verb: String, symbol: String,
+                           _ op: @escaping @Sendable (Double, Double) -> Double) -> BuiltinTool {
+        let schema = #"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}"#
+        return BuiltinTool(
+            spec: ToolSpec(name: name, description: "\(verb) two numbers: a \(symbol) b.", parametersJSON: schema),
+            run: { argsJSON in
+                guard let (a, b) = parseTwoNumbers(argsJSON) else {
+                    return #"{"error":"expected numeric arguments 'a' and 'b'"}"#
+                }
+                return formatNumberResult(op(a, b))
+            })
+    }
+
+    /// Parse `a` and `b` from a JSON arguments object. Accepts JSON numbers or
+    /// numeric strings (some models quote their arguments).
+    static func parseTwoNumbers(_ argsJSON: String) -> (Double, Double)? {
+        guard let data = argsJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let a = number(obj["a"]), let b = number(obj["b"]) else { return nil }
+        return (a, b)
+    }
+
+    private static func number(_ any: Any?) -> Double? {
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s.trimmingCharacters(in: .whitespaces)) }
+        return nil
+    }
+
+    /// Render a numeric result as JSON, printing whole numbers without a ".0".
+    static func formatNumberResult(_ value: Double) -> String {
+        guard value.isFinite else { return #"{"error":"non-finite result"}"# }
+        let s = (value.rounded() == value && abs(value) < 1e15) ? String(Int64(value)) : String(value)
+        return #"{"result":\#(s)}"#
+    }
+
     /// Safe arithmetic evaluation via a small recursive-descent parser (no
     /// NSExpression, so a malformed input returns an error instead of throwing an
     /// uncatchable ObjC exception). Supports + - * / , unary minus, parentheses.
@@ -78,11 +123,7 @@ public enum ToolRegistry {
         guard let value = ArithmeticEvaluator.evaluate(expr) else {
             return #"{"error":"could not evaluate expression"}"#
         }
-        // Print integers without a trailing .0; keep finite results only.
-        guard value.isFinite else { return #"{"error":"non-finite result"}"# }
-        let s = (value.rounded() == value && abs(value) < 1e15)
-            ? String(Int64(value)) : String(value)
-        return #"{"result":\#(s)}"#
+        return formatNumberResult(value)
     }
 }
 

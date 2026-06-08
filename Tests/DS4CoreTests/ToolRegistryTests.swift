@@ -44,6 +44,33 @@ final class ToolRegistryTests: XCTestCase {
         XCTAssertNil(ToolRegistry.execute(ToolCall(id: "c3", name: "get_weather", argumentsJSON: "{}")))
     }
 
+    func testAddSubtractMultiply() {
+        func run(_ name: String, _ args: String) -> String? {
+            ToolRegistry.execute(ToolCall(id: "x", name: name, argumentsJSON: args))?.content
+        }
+        XCTAssertTrue(run("add", #"{"a":2,"b":3}"#)?.contains("5") ?? false)
+        XCTAssertTrue(run("subtract", #"{"a":10,"b":4}"#)?.contains("6") ?? false)
+        XCTAssertTrue(run("multiply", #"{"a":6,"b":7}"#)?.contains("42") ?? false)
+        // Negatives and decimals.
+        XCTAssertTrue(run("subtract", #"{"a":3,"b":8}"#)?.contains("-5") ?? false)
+        XCTAssertTrue(run("multiply", #"{"a":1.5,"b":2}"#)?.contains("3") ?? false)
+    }
+
+    func testBinaryToolAcceptsQuotedNumbers() {
+        let out = ToolRegistry.execute(ToolCall(id: "q", name: "add", argumentsJSON: #"{"a":"2","b":"40"}"#))
+        XCTAssertTrue(out?.content.contains("42") ?? false)
+    }
+
+    func testBinaryToolRejectsMissingArgs() {
+        let out = ToolRegistry.execute(ToolCall(id: "m", name: "add", argumentsJSON: #"{"a":2}"#))
+        XCTAssertTrue(out?.content.contains("error") ?? false)
+    }
+
+    func testNewToolsAreDeclared() {
+        let names = Set(ToolRegistry.builtins.map(\.spec.name))
+        XCTAssertTrue(names.isSuperset(of: ["add", "subtract", "multiply"]))
+    }
+
     func testSpecsForEnabledSubset() {
         let specs = ToolRegistry.specs(enabled: ["calculator"])
         XCTAssertEqual(specs.map(\.name), ["calculator"])
