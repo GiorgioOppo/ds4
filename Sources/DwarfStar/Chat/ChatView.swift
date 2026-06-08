@@ -1,8 +1,10 @@
 import SwiftUI
 import DS4Engine
+import DS4Core
 
 struct ChatView: View {
     @Bindable var store: ChatStore
+    @State private var showTools = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -11,6 +13,11 @@ struct ChatView: View {
             transcript
             Divider()
             composer
+        }
+        .sheet(isPresented: $showTools) { ToolPickerView(store: store) }
+        .sheet(isPresented: $store.awaitingManualResults) {
+            ManualToolResultsView(store: store)
+                .interactiveDismissDisabled()
         }
     }
 
@@ -26,6 +33,11 @@ struct ChatView: View {
                 }
             }
             Spacer()
+            Button {
+                showTools = true
+            } label: {
+                Label(toolButtonTitle, systemImage: "wrench.and.screwdriver")
+            }
             Toggle("Thinking", isOn: $store.think)
                 .toggleStyle(.switch)
             Button {
@@ -36,6 +48,11 @@ struct ChatView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
+    }
+
+    private var toolButtonTitle: String {
+        guard store.toolsEnabled else { return "Tool" }
+        return "Tool (\(store.enabledToolNames.count))"
     }
 
     private func kvSize(_ bytes: UInt64) -> String {
@@ -97,28 +114,70 @@ struct MessageRow: View {
     let message: UIMessage
 
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: 40) }
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
-                if !message.reasoning.isEmpty {
-                    ReasoningView(text: message.reasoning)
+        if message.role == .tool {
+            ToolResultRow(text: message.text)
+        } else {
+            HStack {
+                if message.role == .user { Spacer(minLength: 40) }
+                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
+                    if !message.reasoning.isEmpty {
+                        ReasoningView(text: message.reasoning)
+                    }
+                    if !message.text.isEmpty {
+                        Text(message.text)
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .background(bubbleColor)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else if message.role == .assistant && message.reasoning.isEmpty && message.toolCalls.isEmpty {
+                        ProgressView().controlSize(.small)
+                    }
+                    ForEach(message.toolCalls) { call in
+                        ToolCallView(call: call)
+                    }
                 }
-                if !message.text.isEmpty {
-                    Text(message.text)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .background(bubbleColor)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else if message.role == .assistant && message.reasoning.isEmpty {
-                    ProgressView().controlSize(.small)
-                }
+                if message.role == .assistant { Spacer(minLength: 40) }
             }
-            if message.role == .assistant { Spacer(minLength: 40) }
         }
     }
 
     private var bubbleColor: Color {
         message.role == .user ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12)
+    }
+}
+
+/// A tool the model decided to call.
+struct ToolCallView: View {
+    let call: ToolCall
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label("Chiamata tool: \(call.name)", systemImage: "wrench.and.screwdriver.fill")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+            Text(call.argumentsJSON)
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// The result of a tool, fed back to the model.
+struct ToolResultRow: View {
+    let text: String
+    var body: some View {
+        Label(text, systemImage: "arrow.uturn.left")
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.green.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -142,5 +201,81 @@ struct ReasoningView: View {
         .padding(8)
         .background(Color.secondary.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// Sheet to enable tools and choose which built-ins are exposed to the model.
+struct ToolPickerView: View {
+    @Bindable var store: ChatStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Tool").font(.title2).bold()
+            Toggle("Abilita i tool (function calling)", isOn: $store.toolsEnabled)
+                .onChange(of: store.toolsEnabled) { store.syncTools() }
+            Text("Quando abilitati, i tool selezionati vengono dichiarati al modello. I tool integrati vengono eseguiti automaticamente; per altri tool potrai inserire il risultato a mano.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            Divider()
+            Text("Tool integrati").font(.headline)
+            ForEach(store.availableTools) { tool in
+                Toggle(isOn: Binding(
+                    get: { store.enabledToolNames.contains(tool.name) },
+                    set: { on in
+                        if on { store.enabledToolNames.insert(tool.name) }
+                        else { store.enabledToolNames.remove(tool.name) }
+                        store.syncTools()
+                    })) {
+                    VStack(alignment: .leading) {
+                        Text(tool.name).font(.body.monospaced())
+                        Text(tool.description).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .disabled(!store.toolsEnabled)
+            }
+            Spacer()
+            HStack {
+                Spacer()
+                Button("Chiudi") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(minWidth: 460, minHeight: 360)
+    }
+}
+
+/// Sheet to enter results for tool calls that aren't built-in.
+struct ManualToolResultsView: View {
+    @Bindable var store: ChatStore
+    @State private var contents: [String: String] = [:]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Risultati dei tool").font(.title2).bold()
+            Text("Il modello ha chiamato dei tool non integrati. Inserisci il risultato (idealmente JSON) per ciascuno e invia per continuare.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            ForEach(store.pendingManualCalls) { call in
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("\(call.name)  \(call.argumentsJSON)", systemImage: "wrench.and.screwdriver.fill")
+                        .font(.caption.monospaced())
+                    TextEditor(text: Binding(get: { contents[call.id] ?? "" },
+                                             set: { contents[call.id] = $0 }))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(height: 70)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                }
+            }
+
+            HStack {
+                Button("Annulla") { store.cancelManualResults() }
+                Spacer()
+                Button("Invia risultati") { store.submitManualResults(contents) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(minWidth: 480, minHeight: 320)
     }
 }

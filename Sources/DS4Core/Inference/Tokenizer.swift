@@ -109,6 +109,10 @@ public final class Tokenizer {
 
     private let tokenToId: [[UInt8]: Int32]
     private let mergeRank: [[UInt8]: Int32]
+    /// Literal special tokens recognized when tokenizing already-rendered chat,
+    /// sorted longest-first so the longest token wins at any position. Built from
+    /// every CONTROL/USER_DEFINED vocab entry (so tool-call markup tokenizes as
+    /// single ids), falling back to the seven named specials.
     private let specials: [(bytes: [UInt8], id: Int32)]
 
     public enum TokError: Error { case missingTable(String), missingSpecial(String) }
@@ -144,16 +148,36 @@ public final class Tokenizer {
         self.thinkEndId = try lookup("</think>")
         self.dsmlId = try lookup("｜DSML｜")
 
-        self.specials = [
-            (Array("<｜begin▁of▁sentence｜>".utf8), bosId),
-            (Array("<｜end▁of▁sentence｜>".utf8), eosId),
-            (Array("<｜User｜>".utf8), userId),
-            (Array("<｜Assistant｜>".utf8), assistantId),
-            (Array("<think>".utf8), thinkStartId),
-            (Array("</think>".utf8), thinkEndId),
-            (Array("｜DSML｜".utf8), dsmlId),
-        ]
+        // Prefer the full set of CONTROL (type 3) tokens from
+        // tokenizer.ggml.token_type, so chat/tool markup (role markers, tool-call
+        // begin/end/sep, tool outputs) is recognized as atomic tokens — not just
+        // the seven named specials. Skip empty tokens.
+        var sp: [(bytes: [UInt8], id: Int32)] = []
+        if let types = model.intArray("tokenizer.ggml.token_type"), types.count == tokenBytes.count {
+            for (i, t) in types.enumerated() where t == 3 {
+                let b = tokenBytes[i]
+                if !b.isEmpty { sp.append((b, Int32(i))) }
+            }
+        }
+        if sp.isEmpty {
+            sp = [
+                (Array("<｜begin▁of▁sentence｜>".utf8), bosId),
+                (Array("<｜end▁of▁sentence｜>".utf8), eosId),
+                (Array("<｜User｜>".utf8), userId),
+                (Array("<｜Assistant｜>".utf8), assistantId),
+                (Array("<think>".utf8), thinkStartId),
+                (Array("</think>".utf8), thinkEndId),
+                (Array("｜DSML｜".utf8), dsmlId),
+            ]
+        }
+        // Longest-first: at each position the longest matching special wins.
+        sp.sort { $0.bytes.count > $1.bytes.count }
+        self.specials = sp
     }
+
+    /// Look up the id of an arbitrary special/normal token by its exact bytes
+    /// (used by chat/tool rendering to find model-specific markup tokens).
+    public func tokenId(_ s: String) -> Int32? { tokenToId[Array(s.utf8)] }
 
     // MARK: BPE
 

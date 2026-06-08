@@ -315,6 +315,41 @@ In fase `ready` appare la **`ChatView`**, divisa in tre parti:
 - **Nuova chat** — `newChat()` svuota i messaggi e resetta la conversazione nel
   servizio (mantenendo il system prompt configurato).
 
+#### Tool (function calling)
+
+Il pulsante **Tool** nell'header apre un foglio dove abiliti il function calling
+e scegli quali **tool integrati** esporre al modello. I built-in di demo sono:
+
+- **`now`** — data/ora corrente (ISO-8601), auto-eseguibile;
+- **`calculator`** — valuta un'espressione aritmetica (`+ - * / ( )`),
+  auto-eseguibile in modo sicuro (input ristretto a cifre/operatori).
+
+Flusso di una chiamata a tool:
+
+1. Con i tool abilitati, l'`InferenceService` **dichiara** i tool nel prompt e il
+   modello, invece di rispondere, può emettere una **tool-call** (markup
+   `｜DSML｜`/DeepSeek). Il decoder riconosce il token di inizio blocco e bufferizza
+   la chiamata invece di mostrarla come testo.
+2. La GUI mostra una bolla arancione **"Chiamata tool"** con nome e argomenti JSON.
+3. **Esecuzione**: i tool integrati vengono eseguiti **automaticamente**
+   (`ToolRegistry.execute`) e il risultato compare come bolla verde; per tool
+   non integrati si apre il foglio **"Risultati dei tool"** dove inserisci il
+   risultato a mano.
+4. Il risultato viene reimmesso nella conversazione (`provideToolResults`) e il
+   modello produce la risposta finale — o **altre** tool-call: il loop si ripete
+   finché non resta che testo.
+
+I token di markup dei tool sono **estratti dal modello**: `ToolMarkup.discover`
+tiene solo i token che il vocabolario del GGUF definisce davvero, con default
+della famiglia DeepSeek. Il `tokenizer.chat_template` grezzo del GGUF è
+ispezionabile via `InferenceService.chatTemplate()`. Vedi
+[`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md) §14 per i dettagli.
+
+> Nota: i tool richiedono il **multi-turno**, introdotto insieme a questa
+> feature — ogni generazione ri-renderizza l'intera conversazione (system, tool
+> dichiarati, turni utente/assistant, tool-call e risultati) e fa il prefill da
+> `pos 0` (nessun riuso di KV cache tra i turni).
+
 ---
 
 ## 7. Configurazione automatica e preset hardware

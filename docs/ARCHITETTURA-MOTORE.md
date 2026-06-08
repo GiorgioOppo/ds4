@@ -577,6 +577,74 @@ La testa di output (`OutputHeadWeights`): `token_embd` (embedding, F16),
 
 ---
 
+## 14. Tool calling (function calling)
+
+**File:** `Sources/DS4Core/Inference/ChatTools.swift` (rendering/parse, puro) ·
+`Sources/DS4Engine/Tools.swift` (registry + tool demo) ·
+`Sources/DS4Engine/InferenceService.swift` (stato multi-turno + loop).
+
+### Riconoscimento dei token speciali
+
+Per tokenizzare correttamente il markup dei tool, il `Tokenizer` non si limita
+più ai 7 special nominati: in `tokenizeRenderedChat` riconosce **tutti i token
+di tipo CONTROL** (`tokenizer.ggml.token_type == 3`) come token atomici, in
+match *longest-first*. Così i marcatori di ruolo e di tool-call/output
+(begin/sep/end) diventano singoli id. Se `token_type` è assente, fallback ai 7.
+`tokenizer.tokenId(_:)` risolve l'id di un token arbitrario per stringa.
+
+### Tipi e markup (estratti dal modello)
+
+`ToolSpec` (nome, descrizione, JSON-Schema dei parametri), `ToolCall` (id, nome,
+argomenti JSON) e `ChatTurn` (`system`/`user`/`assistant(text,toolCalls)`/
+`toolResult`) sono i tipi base. `ToolMarkup` contiene le stringhe dei token che
+incapsulano chiamate/output; **`ToolMarkup.discover(in:)`** tiene solo quelle che
+il vocabolario del GGUF definisce davvero (default famiglia DeepSeek). È la
+realizzazione della scelta "estrai dal GGUF" senza eseguire il Jinja del
+`chat_template`: il *wire format* usa i token reali del modello.
+
+> ⚠️ La fonte di verità autorevole resta `tokenizer.chat_template` (Jinja). Qui
+> non lo eseguiamo; il renderer segue la **struttura della famiglia DeepSeek**
+> usando i token estratti dal modello. Se una build DS4 diverge, `ToolMarkup` e
+> le due funzioni qui sotto sono l'**unico** punto da adattare. Va verificato
+> contro il template reale del modello su una macchina con il GGUF.
+
+### Rendering e parsing
+
+- **`ChatRenderer.render(turns:tools:think:markup:)`** produce la stringa di chat:
+  `BOS` + system (+ dichiarazione dei tool) + turni (user/assistant, con le
+  tool-call in markup, e i tool-output in markup) + turno assistant aperto
+  (`<think>`/`</think>`). La stringa va a `tokenizeRenderedChat`.
+- **`ToolCallParser.parse(_:markup:)`** estrae le `ToolCall` dall'output
+  dell'assistant (tollerante alle *fence* ```` ```json ````), restituendo anche
+  il testo visibile ripulito.
+
+### Loop nell'`InferenceService`
+
+Il servizio mantiene `turns` (conversazione) e `tools`. Ogni generazione:
+
+1. **render** dell'intera conversazione + tool → tokenizza → **prefill da pos 0**
+   (nessun riuso KV tra turni);
+2. **decode** con rilevamento del blocco tool: quando il token campionato è
+   l'inizio-chiamata (`tok.tokenId(markup.callsBegin)`), smette di emettere
+   `.text` e bufferizza i byte del blocco; a fine generazione fa il parse ed
+   emette **`GenEvent.toolCall([ToolCall])`**;
+3. registra il turno assistant (testo visibile + tool-call) nello storico.
+
+`provideToolResults(_:)` accoda i `toolResult` e rilancia la generazione: il
+modello vede gli output e produce la risposta finale o altre chiamate.
+
+### Registry e tool demo
+
+`ToolRegistry` (DS4Engine) espone i built-in auto-eseguibili — **`now`** (data/ora
+ISO-8601) e **`calculator`** (aritmetica sicura via `NSExpression` con input
+ristretto a cifre/operatori) — e `execute(_:)` che restituisce un `ToolOutput`
+oppure `nil` per i tool non integrati (risultato manuale dalla UI).
+
+I percorsi puri (renderer, parser, tool demo) sono coperti da test Swift-only:
+`ChatToolsTests`, `ToolRegistryTests`.
+
+---
+
 ## Riferimenti incrociati C → Swift
 
 Ogni file Swift cita la funzione C di origine. I principali punti d'aggancio:
