@@ -142,7 +142,7 @@ enum ArithmeticEvaluator {
         var i = 0
         init(_ c: [Character]) { self.c = c }
 
-        var atEnd: Bool { skipSpaces(); return i >= c.count }
+        var atEnd: Bool { mutating get { skipSpaces(); return i >= c.count } }
         mutating func skipSpaces() { while i < c.count, c[i] == " " || c[i] == "\t" { i += 1 } }
         mutating func peek() -> Character? { skipSpaces(); return i < c.count ? c[i] : nil }
 
