@@ -10,9 +10,14 @@ struct DiagnosticsView: View {
             Form {
                 Section("Tokenizzazione (nativa, DS4Core.Tokenizer)") {
                     TextField("Modello GGUF", text: $controller.modelPath)
+                    Button {
+                        if let path = ModelPicker.pickGGUF() { controller.modelPath = path }
+                    } label: {
+                        Label("Sfoglia…", systemImage: "folder")
+                    }
                     TextField("Testo", text: $controller.text, axis: .vertical)
                         .lineLimit(2...6)
-                    Text("Apre il GGUF solo per il tokenizer (puro Swift, niente subprocess).")
+                    Text("Apre il GGUF solo per il tokenizer (puro Swift, niente subprocess). Sotto sandbox seleziona il modello con Sfoglia…")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
@@ -23,6 +28,9 @@ struct DiagnosticsView: View {
                     } else {
                         Button { controller.dumpTokens() } label: {
                             Label("Tokenizza", systemImage: "text.magnifyingglass")
+                        }
+                        Button { controller.dumpChatTemplate() } label: {
+                            Label("Mostra chat template + formato tool", systemImage: "doc.text.magnifyingglass")
                         }
                     }
                 }

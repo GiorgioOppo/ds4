@@ -22,4 +22,39 @@ public enum Diagnostics {
         }
         return out
     }
+
+    /// Dump everything needed to implement the model's real tool format: the raw
+    /// `tokenizer.chat_template` (the authoritative wire format), whether each
+    /// guessed tool-markup token actually exists in the vocab, and the prompt we
+    /// currently render with tools (so the two can be compared).
+    public static func dumpChatTemplate(modelPath: String) throws -> String {
+        let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
+        let tok = try Tokenizer(model: model)
+
+        var out = "=== tokenizer.chat_template ===\n"
+        if let tpl = model.string("tokenizer.chat_template"), !tpl.isEmpty {
+            out += tpl + "\n"
+        } else {
+            out += "<assente nel GGUF>\n"
+        }
+
+        let markup = ToolMarkup.discover(in: tok)
+        out += "\n=== Token di markup tool (presenti nel vocab del modello?) ===\n"
+        let pairs: [(String, String)] = [
+            ("callsBegin", markup.callsBegin), ("callBegin", markup.callBegin),
+            ("sep", markup.sep), ("callEnd", markup.callEnd), ("callsEnd", markup.callsEnd),
+            ("outputsBegin", markup.outputsBegin), ("outputBegin", markup.outputBegin),
+            ("outputEnd", markup.outputEnd), ("outputsEnd", markup.outputsEnd),
+        ]
+        for (label, s) in pairs {
+            out += "\(label): \"\(s)\" -> \(tok.tokenId(s).map { "id \($0)" } ?? "ASSENTE")\n"
+        }
+        out += "｜DSML｜ -> \(tok.tokenId("｜DSML｜").map { "id \($0)" } ?? "ASSENTE")\n"
+
+        out += "\n=== Prompt che il GUI invia ORA con i tool abilitati ===\n"
+        let tools = ToolRegistry.specs(enabled: Set(ToolRegistry.builtins.map { $0.spec.name }))
+        out += ChatRenderer.render(turns: [.user("Ciao, come stai?")], tools: tools,
+                                   think: .none, markup: markup)
+        return out
+    }
 }

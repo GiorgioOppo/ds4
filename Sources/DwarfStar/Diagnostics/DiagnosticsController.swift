@@ -33,4 +33,24 @@ final class DiagnosticsController {
     }
 
     func cancel() { task?.cancel() }
+
+    /// Dump the model's chat_template + tool-markup report (to align the tool
+    /// format with what the model was actually trained on).
+    func dumpChatTemplate() {
+        guard !isRunning else { return }
+        output = ""
+        isRunning = true
+        let path = modelPath
+        task = Task {
+            do {
+                let dump = try await Task.detached { try Diagnostics.dumpChatTemplate(modelPath: path) }.value
+                output = dump
+            } catch is CancellationError {
+                output = "[annullato]\n"
+            } catch {
+                output = "Errore: \(error)\n"
+            }
+            isRunning = false
+        }
+    }
 }
