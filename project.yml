@@ -72,3 +72,8 @@ targets:
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
+        # Wire the manually-added AppIcon + entitlements so `make xcodeproj`
+        # regenerates losslessly. The Assets.xcassets catalog under
+        # Sources/DwarfStar is auto-detected by xcodegen.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: packaging/DwarfStar.entitlements
