@@ -70,6 +70,16 @@ final class ChatStore {
     var isReady: Bool { if case .ready = phase { return true } else { return false } }
     var availableTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
 
+    private var bookmarkRestored = false
+
+    /// Under the App Sandbox, re-open the last user-picked GGUF via its persisted
+    /// security-scoped bookmark (starts access). No-op if none / already restored.
+    func restoreModelBookmark() {
+        guard !bookmarkRestored else { return }
+        bookmarkRestored = true
+        if let path = ModelPicker.restoreBookmark() { modelPath = path }
+    }
+
     /// Scan the configured directories for GGUF files.
     func scanModels() {
         let gguf = (scriptDir as NSString).appendingPathComponent("gguf")

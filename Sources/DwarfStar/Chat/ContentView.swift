@@ -82,6 +82,13 @@ struct ModelLoadView: View {
 
             Section("Percorsi") {
                 TextField("Percorso GGUF", text: $store.modelPath)
+                Button {
+                    if let path = ModelPicker.pickGGUF() { store.modelPath = path }
+                } label: {
+                    Label("Sfoglia…", systemImage: "folder")
+                }
+                Text("Con l'App Sandbox attiva è necessario selezionare il file qui: il percorso scelto resta accessibile e viene ricordato al prossimo avvio.")
+                    .font(.caption).foregroundStyle(.secondary)
                 // Metal kernels are embedded in the app — no folder to set.
             }
 
@@ -141,7 +148,7 @@ struct ModelLoadView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .onAppear { store.scanModels() }
+        .onAppear { store.restoreModelBookmark(); store.scanModels() }
         .sheet(isPresented: $showDownload) {
             DownloadView(store: store)
         }

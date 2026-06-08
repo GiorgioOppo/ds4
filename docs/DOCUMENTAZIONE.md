@@ -257,7 +257,14 @@ All'avvio (fase `needsModel`) appare la **schermata di caricamento**
    scansione (↻) e aprire la sheet di **download** (`Scarica…`).
 2. **Configurazione automatica** — un pulsante *"Configura per la tua RAM (N GB)"*
    applica il preset consigliato (vedi §7) e mostra una nota esplicativa.
-3. **Percorsi** — campo di testo per il percorso GGUF (modificabile a mano).
+3. **Percorsi** — campo di testo per il percorso GGUF (modificabile a mano) e
+   pulsante **Sfoglia…**. Con l'**App Sandbox** attiva (build firmata/da Xcode) il
+   modello va selezionato dal pannello *Sfoglia…*: l'app ottiene l'accesso
+   *security-scoped* al file e ne salva un **bookmark**, così riapre lo stesso
+   GGUF ai lanci successivi senza richiederlo. Un percorso digitato a mano non
+   è leggibile sotto sandbox (la scansione automatica delle cartelle è anch'essa
+   limitata). Senza sandbox (`swift run DwarfStar`) funzionano anche i percorsi
+   digitati e la scansione.
 4. **SSD streaming** — toggle e opzioni per modelli più grandi della RAM
    (vedi §8).
 5. **Contesto e system prompt** — stepper per la dimensione del contesto
