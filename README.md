@@ -4,9 +4,41 @@ Native Swift / SwiftUI front-end for **DeepSeek V4 (DwarfStar)**, with a
 **pure-Swift inference engine** (a faithful port of the upstream `ds4.c` /
 `ds4_metal.m`). No C engine, no prebuilt static lib, no external links.
 
+> 🍴 **This project is a fork of [antirez/ds4](https://github.com/antirez/ds4)
+> (DwarfStar).** Upstream is the canonical C / Objective-C / CUDA / ROCm
+> inference engine for DeepSeek V4. This fork carries it to the **Apple
+> platforms natively**: a **pure-Swift port of the engine** (`DS4Core` +
+> `DS4Metal`, reusing upstream's Metal kernels verbatim) plus a full
+> **SwiftUI GUI** (`DwarfStar`). On top of that we added **tool calling**
+> (DeepSeek-V4 DSML function-calling, parsed/rendered in pure Swift, with a
+> built-in auto-executable tool registry in the app — see *Tool calling*
+> below).
+>
+> The Metal kernels under `metal/` are kept **byte-identical** to upstream so
+> they can be re-synced as the engine evolves. Backends not relevant to Apple
+> hardware (CUDA, ROCm, distributed inference) are intentionally out of scope.
+
 > 📖 **Documentazione dettagliata (IT):** [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md)
 > (uso, demo e UI) · [`docs/ARCHITETTURA-MOTORE.md`](docs/ARCHITETTURA-MOTORE.md)
 > (interni del motore: encoder, decoder, MoE, NSA, streaming).
+
+## Relationship to upstream
+
+| | **[antirez/ds4](https://github.com/antirez/ds4)** (upstream) | **DS4-gui** (this fork) |
+|---|---|---|
+| Nature | Self-contained inference engine | Native Apple GUI + Swift engine port |
+| Language | C / Objective-C / CUDA / ROCm | Swift / SwiftUI / Metal |
+| Interface | CLI + HTTP server | SwiftUI app (chat, models, server, bench, diag) |
+| Backends | Metal **+ CUDA/DGX Spark + ROCm/Strix Halo + distributed** | **Metal only** |
+| Metal kernels | source of truth (`metal/*.metal`) | **byte-identical**, embedded in the binary |
+| Tool calling | in the C agent | **DSML tool calling in pure Swift + GUI tool registry** |
+
+What this fork **adds**: the SwiftUI application, the pure-Swift engine
+(`DS4Core` + `DS4Metal`) validated against the C originals, and native
+**tool-calling** support. What it **drops** (out of scope for Apple hardware):
+the CUDA/ROCm backends and distributed inference. The server / agent / bench
+panels in the GUI can still drive upstream's `ds4*` binaries as subprocesses,
+so the two projects are designed to coexist.
 
 ## Approach
 
@@ -81,6 +113,30 @@ The kernel sources are embedded via `Sources/DS4Metal/Runtime/KernelSources.swif
 (generated from `metal/*.metal` by `make embed-kernels`). `metal/` stays the
 source of truth; rerun that after editing any kernel.
 
+## Tool calling
+
+This fork adds **native tool calling (function calling)** for the DeepSeek-V4
+chat protocol, implemented end to end in Swift:
+
+- **Wire format (`DS4Core/Inference/ChatTools.swift`)** — the authoritative
+  DeepSeek-V4 DSML scheme from the paper (Table 4), built on the single special
+  token `｜DSML｜`. Tool calls are emitted/parsed as
+  `<｜DSML｜tool_calls>` → `<｜DSML｜invoke name="…">` →
+  `<｜DSML｜parameter name="…" string="…">…`. String params use
+  `string="true"` and the raw value; everything else uses `string="false"` and a
+  JSON-encoded value. The module is pure and model-independent (unit-tested
+  without a GGUF); `ToolMarkup.discover` confirms the exact `｜DSML｜` spelling
+  against the model vocab.
+- **GUI tool registry (`DS4Engine/Tools.swift`)** — a set of built-in,
+  side-effect-free tools the app can auto-execute when the model calls them:
+  `now` (ISO-8601 datetime), `calculator` (arithmetic expression), and the
+  binary `add` / `subtract` / `multiply`. The `InferenceService` feeds tool
+  results back into the conversation; tools the registry doesn't know are left
+  to the UI to answer.
+
+Tests live in `Tests/DS4CoreTests/ChatToolsTests.swift` and
+`ToolRegistryTests.swift`.
+
 ## Build & run (full SwiftUI GUI)
 
 The GUI app is driven by the pure-Swift engine — no static lib, no C:
@@ -151,6 +207,10 @@ Drop an `AppIcon.icns` into `packaging/` to give the app an icon.
 - **Phase 6 (packaging) — done.** `make app` builds a release `DwarfStar.app`
   with `metal/` bundled in Resources, bundle-aware paths (`AppEnvironment`), an
   Info.plist, and ad-hoc code signing; verified valid with `codesign`.
+- **Tool calling — done.** DeepSeek-V4 DSML function-calling parsed/rendered in
+  pure Swift (`ChatTools.swift`), plus a built-in auto-executable tool registry
+  in the app (`now`, `calculator`, `add`, `subtract`, `multiply`); results are
+  fed back into the conversation by `InferenceService`. See *Tool calling*.
 
 > All six phases build, link, and package cleanly. What has **not** been run in
 > this environment: actual generation, the server subprocess, and the
