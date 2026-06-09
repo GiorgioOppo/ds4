@@ -167,16 +167,12 @@ public actor InferenceService {
             throw InferenceError.contextExceeded(prompt: prompt.count, context: contextSize)
         }
 
-        // Prefill: feed each prompt token, accumulating the KV cache.
-        var pos = 0
-        var lastLogits: [Float] = []
-        continuation.yield(.progress("prefill 0/\(prompt.count)…"))
-        for (i, t) in prompt.enumerated() {
-            try Task.checkCancellation()
-            lastLogits = try decoder.forward(token: Int(t), pos: pos, nKeys: pos + 1)
-            pos += 1
-            continuation.yield(.progress("prefill \(i + 1)/\(prompt.count)"))
-        }
+        // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
+        // prompt tokens at once (amortizes the dominant weight I/O). Returns the
+        // last token's logits; populates the KV cache for positions 0..N-1.
+        continuation.yield(.progress("prefill \(prompt.count) token…"))
+        var lastLogits = try decoder.prefill(tokens: prompt.map { Int($0) })
+        var pos = prompt.count
 
         var rng = sampling.seed
         var inReasoning = think == .high       // prompt ends with <think> when enabled

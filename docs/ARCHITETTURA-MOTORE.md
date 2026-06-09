@@ -469,6 +469,23 @@ Il `DSV4Decoder` tiene **tutti** i pesi residenti (≈164 GB): impossibile sotto
 64 GB. Lo `StreamingDecoder` risolve il problema caricando/evictando i pesi
 **per-layer**, con due meccanismi combinati.
 
+### Prefill layer-major (`prefill(tokens:chunk:)`)
+
+Il decode (`forward`) è **token-major**: per ogni token ricarica i pesi di tutti
+i layer. In streaming, dove il costo dominante è l'**I/O dei pesi** (vedi il
+profilo per-fase: gather esperti + fault non-routed ≈ 85–90% del tempo), il
+prefill del prompt è invece **layer-major**: per ogni layer i pesi si caricano
+**una volta** e si applicano a **tutti** i token del chunk → l'I/O dei pesi si
+ammortizza sull'intero prompt. È **numericamente identico** a chiamare `forward`
+per i token 0..N-1 in ordine (stesse op, stesso ordine per token, stessa
+evoluzione di KV cache e compressore NSA): solo il riordino dei loop (layer fuori,
+token dentro) tiene i pesi mmap *caldi* tra i token. Il prompt è diviso in
+**chunk** (default 512 token) per limitare la memoria delle attivazioni (≈ 2·chunk
+buffer HC); la KV cache e lo stato del compressore proseguono tra i chunk. La
+condivisione del corpo del layer tra decode e prefill è in `runLayer`; embed e
+testa di output in `embedToken`/`outputHead`. Restituisce i logit dell'**ultimo**
+token per avviare la generazione.
+
 ### Pattern "split command buffer"
 
 Ogni layer gira nel **proprio command buffer** (`commit + wait`, poi evict). I

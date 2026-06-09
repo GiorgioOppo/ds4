@@ -108,75 +108,138 @@ public final class StreamingDecoder {
     }
 
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
-        let hcDim = d.nHC * d.nEmbd
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
         if pos == 0 { for c in compStates { try c?.reset(rt) } }
-        // embedding (own command buffer)
-        var t = Date()
-        let ec = GraphContext(rt)
-        try ec.begin()
-        try ec.embedTokenHC(table: embedTable, token: token, embd: embd, hc: hcA,
-                            nEmbd: d.nEmbd, nVocab: d.vocab, nHC: d.nHC)
-        ec.commit()
-        profile.embedS += Date().timeIntervalSince(t)
-
+        try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
-            let w = try layerProvider(i)        // LOAD layer i (dense weights; experts on demand if cached)
-            let layerRope = DSV4Shape.ropeParams(layer: i)
-            if let gather = expertGather {
-                // Phase 1: route (own cb) -> read the 6 selected ids.
-                t = Date()
-                let c1 = GraphContext(rt); try c1.begin()
-                try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-                c1.commit()
-                profile.routeS += Date().timeIntervalSince(t)
-                // The router picked the top-d.k of 256. If activeExperts<d.k, keep the
-                // top-K of those by route weight (renormalized so they still sum to the
-                // original total) and gather ONLY those -> less expert I/O. Top-K of 256.
-                let K = max(1, min(d.activeExperts, d.k))
-                let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
-                var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
-                if K < d.k {
-                    let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
-                    let rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
-                    let keep = (0..<d.k).sorted { rw[$0] > rw[$1] }.prefix(K)
-                    let origSum = rw.reduce(0, +)
-                    let keptSum = keep.reduce(Float(0)) { $0 + rw[$1] }
-                    let scale = keptSum > 0 ? origSum / keptSum : 1
-                    var kept: [Int32] = []
-                    for (j, idx) in keep.enumerated() { wptr[j] = rw[idx] * scale; kept.append(ids[idx]) }
-                    ids = kept
-                    // Zero down6 rows K..d.k-1 so the fixed sum6 adds zeros for unused slots.
-                    let dptr = scratch.down6.buffer.contents().bindMemory(to: Float.self, capacity: d.k * d.nEmbd)
-                    for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
-                }
-                // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
-                t = Date()
-                let (g, u, dn) = try gather(i, ids)
-                profile.gatherS += Date().timeIntervalSince(t)
-                t = Date()
-                let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                     ids: idsPacked, outHc: other, activeK: K)
-                c2.commit()
-                profile.expertsS += Date().timeIntervalSince(t)
-            } else {
-                t = Date()
-                let lc = GraphContext(rt); try lc.begin()
-                try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-                lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
-                profile.layerOtherS += Date().timeIntervalSince(t)
-            }
-            profile.layers += 1
+            let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
+            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                         cur: cur, other: other, pos: pos, nKeys: nKeys)
             swap(&cur, &other)
             // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
         }
+        profile.forwards += 1
+        return try outputHead(cur)
+    }
 
-        // output head (own command buffer)
-        t = Date()
+    /// Layer-major prefill: process the prompt loading **each layer's weights
+    /// once** (per chunk) instead of once per token, so the dominant weight I/O is
+    /// amortized over all the chunk's tokens. Numerically **identical** to calling
+    /// `forward()` for tokens 0..N-1 in order — same ops, same per-token order,
+    /// same KV-cache and NSA-compressor evolution — just reordered (layer outer,
+    /// token inner) so the mmap'd weights stay hot across tokens. The prompt is
+    /// split into chunks of `chunk` tokens to bound activation memory (≈ 2·chunk
+    /// HC buffers); KV cache and the recurrent compressor carry across chunks.
+    /// Populates the KV cache for positions 0..N-1 and returns the LAST token's
+    /// logits to start generation.
+    public func prefill(tokens: [Int], chunk: Int = 512) throws -> [Float] {
+        precondition(!tokens.isEmpty)
+        for c in compStates { try c?.reset(rt) }   // fresh sequence (once, like pos==0)
+        var lastHC: GPUTensor?
+        var start = 0
+        let step = max(1, chunk)
+        while start < tokens.count {
+            let end = min(start + step, tokens.count)
+            lastHC = try prefillRange(tokens, start: start, end: end)
+            start = end
+        }
+        profile.forwards += tokens.count
+        return try outputHead(lastHC!)
+    }
+
+    /// Process one prompt chunk [start, end) layer-major. Weights for each layer
+    /// are loaded once and applied to all the chunk's tokens (in order), writing
+    /// KV[*][start..end-1]. Returns the chunk's last token's final HC state.
+    private func prefillRange(_ tokens: [Int], start: Int, end: Int) throws -> GPUTensor {
+        let n = end - start
+        let hcDim = d.nHC * d.nEmbd
+        var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
+        var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
+        for j in 0..<n { try embedToken(tokens[start + j], into: cur[j]) }
+        for i in 0..<nLayers {
+            try Task.checkCancellation()
+            let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
+            let layerRope = DSV4Shape.ropeParams(layer: i)
+            for j in 0..<n {
+                let pos = start + j                  // attends KV[0..pos] (incl. earlier chunks)
+                try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                             pos: pos, nKeys: pos + 1)
+            }
+            swap(&cur, &other)                       // w drops here -> EVICT
+        }
+        return cur[n - 1]
+    }
+
+    /// Embed one token into the HC state buffer `hc` (own command buffer).
+    private func embedToken(_ token: Int, into hc: GPUTensor) throws {
+        let t = Date()
+        let ec = GraphContext(rt)
+        try ec.begin()
+        try ec.embedTokenHC(table: embedTable, token: token, embd: embd, hc: hc,
+                            nEmbd: d.nEmbd, nVocab: d.vocab, nHC: d.nHC)
+        ec.commit()
+        profile.embedS += Date().timeIntervalSince(t)
+    }
+
+    /// One decode layer for one token: `cur` (HC in) -> `other` (HC out). Writes
+    /// KV[i][pos], updates compStates[i]. Shared by `forward` (decode) and the
+    /// layer-major `prefill` — identical numerics either way.
+    private func runLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
+                          cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int) throws {
+        if let gather = expertGather {
+            // Phase 1: route (own cb) -> read the selected ids.
+            var t = Date()
+            let c1 = GraphContext(rt); try c1.begin()
+            try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                               nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
+            c1.commit()
+            profile.routeS += Date().timeIntervalSince(t)
+            // The router picked the top-d.k of 256. If activeExperts<d.k, keep the
+            // top-K of those by route weight (renormalized to the original total) and
+            // gather ONLY those -> less expert I/O. Top-K of 256.
+            let K = max(1, min(d.activeExperts, d.k))
+            let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
+            var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
+            if K < d.k {
+                let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
+                let rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
+                let keep = (0..<d.k).sorted { rw[$0] > rw[$1] }.prefix(K)
+                let origSum = rw.reduce(0, +)
+                let keptSum = keep.reduce(Float(0)) { $0 + rw[$1] }
+                let scale = keptSum > 0 ? origSum / keptSum : 1
+                var kept: [Int32] = []
+                for (j, idx) in keep.enumerated() { wptr[j] = rw[idx] * scale; kept.append(ids[idx]) }
+                ids = kept
+                // Zero down6 rows K..d.k-1 so the fixed sum6 adds zeros for unused slots.
+                let dptr = scratch.down6.buffer.contents().bindMemory(to: Float.self, capacity: d.k * d.nEmbd)
+                for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
+            }
+            // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
+            t = Date()
+            let (g, u, dn) = try gather(i, ids)
+            profile.gatherS += Date().timeIntervalSince(t)
+            t = Date()
+            let c2 = GraphContext(rt); try c2.begin()
+            try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                 ids: idsPacked, outHc: other, activeK: K)
+            c2.commit()
+            profile.expertsS += Date().timeIntervalSince(t)
+        } else {
+            let t = Date()
+            let lc = GraphContext(rt); try lc.begin()
+            try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                               nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
+            lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
+            profile.layerOtherS += Date().timeIntervalSince(t)
+        }
+        profile.layers += 1
+    }
+
+    /// Output head for one token's final HC state -> logits[vocab].
+    private func outputHead(_ cur: GPUTensor) throws -> [Float] {
+        let hcDim = d.nHC * d.nEmbd
+        let t = Date()
         let oc = GraphContext(rt)
         try oc.begin()
         try oc.rmsNorm(cur, weight: nil, out: flat, rows: 1, n: hcDim, eps: rmsEps)
@@ -188,7 +251,6 @@ public final class StreamingDecoder {
         try oc.matmulQ8_0(weight: out.head, x: onormed, out: logits, inDim: d.nEmbd, outDim: d.vocab)
         oc.commit()
         profile.headS += Date().timeIntervalSince(t)
-        profile.forwards += 1
         return logits.floatArray(d.vocab)
     }
 

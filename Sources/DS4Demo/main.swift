@@ -86,14 +86,15 @@ do {
         let ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
         log("DS4Demo: prompt '\(prompt)' -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
         let stdout = FileHandle.standardOutput
-        // Prefill: process the prompt with per-token progress (each forward is slow).
-        var pos = 0
-        var last: [Float] = []
-        for (i, t) in ids.enumerated() {
-            let t0 = Date()
-            last = try dec.forward(token: t, pos: pos, nKeys: pos + 1); pos += 1
-            log(String(format: "  prefill %d/%d  %.1fs", i + 1, ids.count, Date().timeIntervalSince(t0)))
-        }
+        // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
+        // prompt tokens (amortizes the dominant weight I/O). Returns the last
+        // token's logits; KV cache is populated for positions 0..N-1.
+        let pf0 = Date()
+        var last = try dec.prefill(tokens: ids)
+        var pos = ids.count
+        log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.1fs/token)",
+                   ids.count, Date().timeIntervalSince(pf0),
+                   Date().timeIntervalSince(pf0) / Double(max(1, ids.count))))
         // Decode: stream each token's bytes to stdout AS it is produced (like ds4).
         dec.resetProfile()   // profila solo la fase di decode (non il prefill)
         stdout.write(Data("\nRisposta: ".utf8))
