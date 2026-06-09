@@ -115,9 +115,11 @@ public enum ChatRenderer {
         for t in tools {
             s += "- \(t.name)(\(paramNames(t.parametersJSON).joined(separator: ", ")))\n"
         }
-        // Single, prose-free format line (full open/close nesting once) so the model
-        // still emits parsable DSML. This is the irreducible floor for working calls.
-        s += "Call: <\(d)tool_calls><\(d)invoke name=\"NAME\">" +
+        // Directive (covers the no-thinking case) + single prose-free format line so
+        // the model emits parsable DSML even without a reasoning step.
+        s += "When a tool can answer the request you MUST call it (also without thinking), " +
+             "emitting directly after </think>:\n" +
+             "<\(d)tool_calls><\(d)invoke name=\"NAME\">" +
              "<\(d)parameter name=\"P\" string=\"true|false\">V</\(d)parameter>" +
              "</\(d)invoke></\(d)tool_calls>\n"
         return s
