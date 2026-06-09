@@ -32,6 +32,7 @@ Esempi:
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 import time
 
@@ -56,6 +57,25 @@ def dequant_flat(raw_bytes: np.ndarray, qtype, n_elements: int) -> np.ndarray:
 
 def ne_dims(t) -> list[int]:
     return [int(x) for x in t.shape]
+
+
+def parse_layers(spec: str, n_layers: int) -> list[int]:
+    """Accetta 'all', liste '0,2', range '0-42' e con passo '0-42:2'."""
+    spec = spec.strip().lower()
+    if spec in ("all", "*", "tutti"):
+        return list(range(n_layers))
+    out: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            rng, _, step = part.partition(":")
+            a, b = rng.split("-")
+            out.extend(range(int(a), int(b) + 1, int(step) if step else 1))
+        else:
+            out.append(int(part))
+    return out
 
 
 # ---------------------------------------------------------------- fattorizzazione
@@ -151,7 +171,8 @@ EXPERTS_PER_LAYER = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exp
 def main() -> int:
     ap = argparse.ArgumentParser(description="GGUF → grafo fattorizzato (pesi sugli archi).")
     ap.add_argument("gguf")
-    ap.add_argument("--layers", default="2", help="lista layer, es. 0,2 (default 2)")
+    ap.add_argument("--layers", default="2",
+                    help="layer: 'all', lista '0,2', range '0-42' o '0-42:2' (default 2)")
     ap.add_argument("--experts", action="store_true", help="fattorizza anche gli esperti (per esperto)")
     ap.add_argument("--energy", type=float, default=0.95, help="energia da conservare (default 0.95)")
     ap.add_argument("--rank", type=int, default=None, help="rank fisso (ignora --energy)")
@@ -161,16 +182,16 @@ def main() -> int:
     ap.add_argument("--json", help="scrivi il grafo (nodi/archi/summary) in JSON")
     ap.add_argument("--npz", help="salva le matrici fattore A,B in un .npz")
     args = ap.parse_args()
-
-    try:
-        layers = [int(x) for x in args.layers.split(",") if x.strip()]
-    except ValueError:
-        return ap.error("--layers vuole interi separati da virgola")
     save = args.npz is not None
 
     print(f"Apro {args.gguf} …")
     reader = GGUFReader(args.gguf)
     index = {t.name: t for t in reader.tensors}
+    arch_n = len({m.group(1) for n in index for m in [re.match(r"blk\.(\d+)\.", n)] if m})
+    try:
+        layers = parse_layers(args.layers, arch_n)
+    except ValueError:
+        return ap.error("--layers: usa 'all', '0,2', '0-42' o '0-42:2'")
     g = Graph()
 
     def factor_matrix(name, src, dst):
