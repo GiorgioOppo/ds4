@@ -132,16 +132,34 @@ public final class StreamingDecoder {
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
                 c1.commit()
                 profile.routeS += Date().timeIntervalSince(t)
+                // The router picked the top-d.k of 256. If activeExperts<d.k, keep the
+                // top-K of those by route weight (renormalized so they still sum to the
+                // original total) and gather ONLY those -> less expert I/O. Top-K of 256.
+                let K = max(1, min(d.activeExperts, d.k))
                 let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
-                let ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
-                // Gather ONLY the 6 selected experts (EXPERT I/O from the mmap), then phase 2.
+                var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
+                if K < d.k {
+                    let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
+                    let rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
+                    let keep = (0..<d.k).sorted { rw[$0] > rw[$1] }.prefix(K)
+                    let origSum = rw.reduce(0, +)
+                    let keptSum = keep.reduce(Float(0)) { $0 + rw[$1] }
+                    let scale = keptSum > 0 ? origSum / keptSum : 1
+                    var kept: [Int32] = []
+                    for (j, idx) in keep.enumerated() { wptr[j] = rw[idx] * scale; kept.append(ids[idx]) }
+                    ids = kept
+                    // Zero down6 rows K..d.k-1 so the fixed sum6 adds zeros for unused slots.
+                    let dptr = scratch.down6.buffer.contents().bindMemory(to: Float.self, capacity: d.k * d.nEmbd)
+                    for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
+                }
+                // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
                 t = Date()
                 let (g, u, dn) = try gather(i, ids)
                 profile.gatherS += Date().timeIntervalSince(t)
                 t = Date()
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                     ids: idsPacked, outHc: other)
+                                     ids: idsPacked, outHc: other, activeK: K)
                 c2.commit()
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {

@@ -448,6 +448,17 @@ Il quant di gate/up/down è **per-tensore** e configurato da `DSV4Dims`
 (`gateQuant`, `upQuant`, `downQuant`), così lo stesso codice serve sia il
 modello Q4_K sia quello a 2 bit (`IQ2_XXS` gate/up + `Q2_K` down).
 
+### Esperti attivi configurabili (`DSV4Dims.activeExperts`, env `DS4_ACTIVE_EXPERTS`)
+
+Il router sceglie sempre i **top-6 di 256**. Se `activeExperts < 6`, il path di
+streaming tiene in Swift i **top-K** di quei 6 (per peso di routing, **renormalizzati**
+allo stesso totale), fa il **gather di solo K** esperti dall'mmap e calcola con
+k=K (azzerando le righe `down6` inutilizzate, così la `moeSum6` cablata somma
+zeri). **Nessuna modifica ai kernel.** Meno esperti = **meno I/O di esperti per
+token** (la fase dominante su macchine con poca RAM), a scapito della qualità (il
+modello è addestrato per 6). Si imposta con `DS4_ACTIVE_EXPERTS=2..6` (CLI o
+scheme Xcode); onorato sia da `DS4Demo` sia da `InferenceService`.
+
 ---
 
 ## 10. StreamingDecoder e strategie di streaming

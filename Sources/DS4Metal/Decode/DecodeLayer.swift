@@ -26,6 +26,10 @@ public struct DSV4Dims {
     public var upQuant: MoEQuant = .q4_K
     public var downQuant: MoEQuant = .q4_K
     public var routerF16: Bool = false
+    /// Experts actually computed per token (≤ k). Lowering this below k=6 reduces
+    /// expert I/O (fewer experts gathered from the mmap) and compute, at a quality
+    /// cost — the model was trained with k=6. Honored by the streaming/gather path.
+    public var activeExperts: Int = 6
     /// Per-group slice of the attention heads (qDim / nOutGroup).
     public var attnGroupDim: Int { qDim / nOutGroup }
     /// Low-rank attention output dim (nOutGroup * nLoraO).
@@ -230,19 +234,23 @@ extension GraphContext {
     /// by `ids`) + residual HC expand -> outHc. Resident path: pass w.expGate/Up/
     /// Down + s.selected. Expert-cache path: pass the packed 6 experts + an ids
     /// 0..<6 buffer (after gathering only the selected experts from the GGUF).
+    /// `activeK` (≤ d.k) experts actually computed; defaults to d.k. With activeK<d.k
+    /// the caller must have packed activeK experts and zeroed `s.down6` rows
+    /// activeK..d.k-1 (so the fixed `moeSum6` adds zeros for the unused slots).
     public func decodeExperts(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                               gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
-                              ids: GPUTensor, outHc: GPUTensor) throws {
+                              ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1) throws {
+        let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
         // shared FFN: gate/up -> swiglu -> down
         try matmulQ8_0(weight: w.sharedGate, x: s.cur, out: s.sgate, inDim: d.nEmbd, outDim: d.sharedFfn)
         try matmulQ8_0(weight: w.sharedUp, x: s.cur, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
         try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
         // routed MoE over the provided experts (per-tensor quant: gate/up + down)
-        try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: s.cur, out: s.gate6, k: d.k, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-        try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: s.cur, out: s.up6, k: d.k, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-        try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: d.k, clampValue: d.swigluClamp)
-        try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: d.k, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+        try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: s.cur, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+        try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: s.cur, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+        try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
+        try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
         try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
         // HC expand post-FFN (post=split[4:8], comb=split[8:24]) -> outHc

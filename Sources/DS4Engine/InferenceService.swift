@@ -89,6 +89,11 @@ public actor InferenceService {
         let mq = GGUFWeights.detectMoEQuant(model)
         configuredDims.gateQuant = mq.gate; configuredDims.upQuant = mq.up
         configuredDims.downQuant = mq.down; configuredDims.routerF16 = mq.routerF16
+        // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
+        // per token = less expert I/O, lower quality. Honored by the streaming path.
+        if let s = ProcessInfo.processInfo.environment["DS4_ACTIVE_EXPERTS"], let kk = Int(s) {
+            configuredDims.activeExperts = max(1, min(kk, configuredDims.k))
+        }
         self.dims = configuredDims
         self.contextSize = contextSize
         self.modelName = (modelPath as NSString).lastPathComponent

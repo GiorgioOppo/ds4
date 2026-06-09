@@ -57,6 +57,12 @@ do {
     let mq = GGUFWeights.detectMoEQuant(model)
     dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
     log("DS4Demo: MoE quant gate=\(mq.gate) up=\(mq.up) down=\(mq.down) routerF16=\(mq.routerF16)")
+    // Optional: reduce active experts per token (DS4_ACTIVE_EXPERTS=2..6). Fewer
+    // experts = less expert I/O (faster on RAM-starved machines), lower quality.
+    if let s = ProcessInfo.processInfo.environment["DS4_ACTIVE_EXPERTS"], let kk = Int(s) {
+        dims.activeExperts = max(1, min(kk, dims.k))
+        log("DS4Demo: active experts (top-k) = \(dims.activeExperts) of \(dims.k)")
+    }
     let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
                           attnFactor: 1, betaFast: 32, betaSlow: 1)
     // Fast path: non-routed weights resident (memoized), only the 6 selected experts
