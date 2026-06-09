@@ -131,27 +131,30 @@ public final class StreamingDecoder {
     /// token inner) so the mmap'd weights stay hot across tokens. The prompt is
     /// split into chunks of `chunk` tokens to bound activation memory (≈ 2·chunk
     /// HC buffers); KV cache and the recurrent compressor carry across chunks.
-    /// Populates the KV cache for positions 0..N-1 and returns the LAST token's
-    /// logits to start generation.
-    public func prefill(tokens: [Int], chunk: Int = 512) throws -> [Float] {
+    /// Populates the KV cache for positions startPos..startPos+N-1 and returns the
+    /// LAST token's logits. With `startPos > 0` the call is **incremental**: it does
+    /// NOT reset the recurrent compressor and continues the KV cache from the given
+    /// position (the caller guarantees positions 0..startPos-1 are already valid) —
+    /// this is what enables KV reuse across turns (prefill only the new suffix).
+    public func prefill(tokens: [Int], startPos: Int = 0, chunk: Int = 512) throws -> [Float] {
         precondition(!tokens.isEmpty)
-        for c in compStates { try c?.reset(rt) }   // fresh sequence (once, like pos==0)
+        if startPos == 0 { for c in compStates { try c?.reset(rt) } }   // fresh sequence
         var lastHC: GPUTensor?
         var start = 0
         let step = max(1, chunk)
         while start < tokens.count {
             let end = min(start + step, tokens.count)
-            lastHC = try prefillRange(tokens, start: start, end: end)
+            lastHC = try prefillRange(tokens, start: start, end: end, posBase: startPos)
             start = end
         }
         profile.forwards += tokens.count
         return try outputHead(lastHC!)
     }
 
-    /// Process one prompt chunk [start, end) layer-major. Weights for each layer
-    /// are loaded once and applied to all the chunk's tokens (in order), writing
-    /// KV[*][start..end-1]. Returns the chunk's last token's final HC state.
-    private func prefillRange(_ tokens: [Int], start: Int, end: Int) throws -> GPUTensor {
+    /// Process one prompt chunk [start, end) layer-major at absolute positions
+    /// posBase+start … . Weights for each layer are loaded once and applied to all
+    /// the chunk's tokens (in order). Returns the chunk's last token's final HC state.
+    private func prefillRange(_ tokens: [Int], start: Int, end: Int, posBase: Int) throws -> GPUTensor {
         let n = end - start
         let hcDim = d.nHC * d.nEmbd
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
@@ -162,7 +165,7 @@ public final class StreamingDecoder {
             let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
             let layerRope = DSV4Shape.ropeParams(layer: i)
             for j in 0..<n {
-                let pos = start + j                  // attends KV[0..pos] (incl. earlier chunks)
+                let pos = posBase + start + j         // attends KV[0..pos] (incl. earlier chunks/turns)
                 try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
                              pos: pos, nKeys: pos + 1)
             }

@@ -133,8 +133,8 @@ public enum ChatRenderer {
 
     /// Build the system block: collected system prompts + (if tools) the tools
     /// declaration. `compact` selects the minimal name-list form. Mirrors the template.
-    static func systemBlock(turns: [ChatTurn], tools: [ToolSpec], markup m: ToolMarkup,
-                            compact: Bool) -> String {
+    public static func systemBlock(turns: [ChatTurn], tools: [ToolSpec], markup m: ToolMarkup,
+                                   compact: Bool) -> String {
         var system = ""
         var first = true
         for case let .system(s) in turns {

@@ -6,11 +6,13 @@ import DS4Metal
 // (DS4Core tokenizer/GGUF + DS4Metal StreamingDecoder).
 //
 // Generation uses StreamingDecoder (per-layer load/compute/evict) so the 164GB
-// model fits in 16GB. The service keeps a multi-turn conversation (`turns`) and
-// re-renders the whole transcript each generation (no cross-turn KV reuse yet),
-// which is what tool calling needs: a tool result is a new turn that continues
-// the same conversation. Tool calls are rendered/parsed via DS4Core.ChatRenderer
-// / ToolCallParser using the model's own markup tokens (ToolMarkup.discover).
+// model fits in 16GB. The conversation is APPEND-ONLY with KV-cache reuse: the
+// service tracks the exact token ids already in the KV (`committedIds`) and each
+// turn prefills ONLY the new suffix (the new user turn, or the tool result +
+// assistant open), reusing the KV of all prior turns. No full re-render — so the
+// generated reasoning/tool-call tokens stay verbatim in the KV and the next turn
+// is a clean token-level extension. Tool calls are parsed via DS4Core.ToolCallParser;
+// the tool/declaration format follows the model's chat_template (ChatRenderer).
 
 public enum ChatRole: Sendable { case system, user, assistant, tool }
 
@@ -73,8 +75,13 @@ public actor InferenceService {
     private let modelName: String
     private let markup: ToolMarkup
 
-    // Conversation state (rendered in full on each generation).
-    private var turns: [ChatTurn] = []
+    // Append-only conversation state: `committedIds` are the exact token ids already
+    // in the KV cache. Each turn prefills ONLY the new suffix and appends here, so
+    // the KV is reused across turns (no full re-prefill). `needsClose` is true when
+    // the committed KV ends with an open assistant turn (its <eos> not yet in the KV).
+    private var committedIds: [Int] = []
+    private var needsClose = false
+    private var systemPrompt: String?
     private var tools: [ToolSpec] = []
     // Compact tool declaration (just name(params)) to save prefill tokens on
     // local inference. Default from env DS4_TOOLS_COMPACT, overridable via setter.
@@ -101,7 +108,7 @@ public actor InferenceService {
         self.contextSize = contextSize
         self.modelName = (modelPath as NSString).lastPathComponent
         self.markup = ToolMarkup.discover(in: tok)
-        if let systemPrompt, !systemPrompt.isEmpty { self.turns = [.system(systemPrompt)] }
+        self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
         let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
                               attnFactor: 1, betaFast: 32, betaSlow: 1)
         // Fast 16GB path (C --ssd-streaming model): non-routed weights are no-copy mmap
@@ -125,37 +132,57 @@ public actor InferenceService {
     public func decodeProfileReport() -> String { decoder.profile.report() }
 
     public func resetConversation(systemPrompt: String?) {
-        if let systemPrompt, !systemPrompt.isEmpty { turns = [.system(systemPrompt)] }
-        else { turns = [] }
+        self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
+        committedIds = []
+        needsClose = false
     }
 
-    /// Declare the tools available to the model for subsequent turns.
+    /// Declare the tools available to the model. Tools are baked into the first
+    /// prompt of a conversation, so a change takes effect on the next new chat.
     public func setTools(_ tools: [ToolSpec]) { self.tools = tools }
 
     /// Use the compact (name-list) tool declaration to save prefill tokens.
     public func setCompactTools(_ on: Bool) { compactTools = on }
 
-    /// Append a user message and generate the assistant reply.
+    private func assistantOpen(_ think: DS4ThinkMode) -> String {
+        "<｜Assistant｜>" + (think == .high ? "<think>" : "</think>")
+    }
+
+    /// The prefix that opens a new user/tool turn: BOS + system (+ tools) the first
+    /// time, otherwise the <eos> that closes the previous (still-open) assistant turn.
+    private func openingPrefix() -> String {
+        if committedIds.isEmpty {
+            let sys = ChatRenderer.systemBlock(turns: systemPrompt.map { [.system($0)] } ?? [],
+                                               tools: tools, markup: markup, compact: compactTools)
+            return "<｜begin▁of▁sentence｜>" + sys
+        }
+        return needsClose ? "<｜end▁of▁sentence｜>" : ""
+    }
+
+    /// Append a user message and generate the assistant reply (prefills only the
+    /// new suffix, reusing the KV cache of the prior turns).
     public func send(userText: String, thinkMode: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
-        turns.append(.user(userText))
-        return run(think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+        let suffix = openingPrefix() + "<｜User｜>" + userText + assistantOpen(thinkMode)
+        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
-    /// Append tool results and continue the assistant turn (the model now sees the
-    /// outputs of the tools it called and produces its final answer — or more calls).
+    /// Append tool results (inside a user turn) and continue the assistant turn.
     public func provideToolResults(_ outputs: [ToolOutput], thinkMode: DS4ThinkMode,
                                    sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
-        for o in outputs { turns.append(.toolResult(callId: o.callId, name: o.name, content: o.content)) }
-        return run(think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+        var suffix = openingPrefix() + "<｜User｜>"
+        for o in outputs { suffix += "<tool_result>" + o.content + "</tool_result>" }
+        suffix += assistantOpen(thinkMode)
+        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
-    private func run(think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+    private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
+                     maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runGeneration(think: think, sampling: sampling, maxTokens: maxTokens,
-                                                 continuation: continuation)
+                    try await self.generate(suffix: suffix, think: think, sampling: sampling,
+                                            maxTokens: maxTokens, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -165,30 +192,28 @@ public actor InferenceService {
         }
     }
 
-    private func runGeneration(think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
-                               continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
-        let rendered = ChatRenderer.render(turns: turns, tools: tools, think: think.core,
-                                           markup: markup, compactTools: compactTools)
-        let prompt = tok.tokenizeRenderedChat(rendered)
-        guard prompt.count < contextSize else {
-            throw InferenceError.contextExceeded(prompt: prompt.count, context: contextSize)
+    private func generate(suffix: String, think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
+                          continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
+        let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        let startPos = committedIds.count
+        guard startPos + suffixIds.count < contextSize else {
+            throw InferenceError.contextExceeded(prompt: startPos + suffixIds.count, context: contextSize)
         }
+        guard !suffixIds.isEmpty else { continuation.yield(.progress("")); return }
 
-        // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
-        // prompt tokens at once (amortizes the dominant weight I/O). Returns the
-        // last token's logits; populates the KV cache for positions 0..N-1.
-        continuation.yield(.progress("prefill \(prompt.count) token…"))
-        var lastLogits = try decoder.prefill(tokens: prompt.map { Int($0) })
-        var pos = prompt.count
+        // Prefill ONLY the new suffix; positions 0..startPos-1 are reused from the KV.
+        continuation.yield(.progress(startPos == 0 ? "prefill \(suffixIds.count) token…"
+                                                   : "prefill +\(suffixIds.count) token (riuso KV)…"))
+        var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: startPos)
+        committedIds.append(contentsOf: suffixIds)
+        var pos = committedIds.count
 
         var rng = sampling.seed
-        var inReasoning = think == .high       // prompt ends with <think> when enabled
+        var inReasoning = think == .high       // suffix ends with <think> when enabled
         var inTool = false
         var pending: [UInt8] = []
-        var visible = ""                       // accumulated visible answer (for history)
-        var toolBytes: [UInt8] = []            // raw bytes of the DSML tool-call block
-        // The DSML tool-call block opens with the ｜DSML｜ token (a single vocab token),
-        // so we switch to tool-buffering when the model emits it.
+        var visible = ""
+        var toolBytes: [UInt8] = []
         let dsmlId = tok.dsmlId
 
         func flush(_ asReasoning: Bool) {
@@ -204,11 +229,11 @@ public actor InferenceService {
             try Task.checkCancellation()
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
                                       topP: sampling.topP, minP: sampling.minP, rng: &rng)
-            if Int32(next) == tok.eosId { break }
+            if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
-                flush(inReasoning)             // emit buffered text/reasoning, then enter the DSML block
+                flush(inReasoning)
                 inTool = true
-                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))   // start of block: ｜DSML｜
+                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inReasoning && Int32(next) == tok.thinkEndId {
@@ -220,30 +245,25 @@ public actor InferenceService {
             }
             produced += 1
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            committedIds.append(next)           // the generated token is now in the KV
             pos += 1
             let elapsed = Date().timeIntervalSince(genStart)
             continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
                                                  elapsed > 0 ? Double(produced) / elapsed : 0)))
         }
         flush(inReasoning)
+        needsClose = true                       // the assistant turn is open (its <eos> not yet committed)
 
-        // Finalize the assistant turn: extract any tool calls and record history.
-        // Recombine the (already-streamed) visible answer with the DSML block so the
-        // parser can split off the call block (its `<` lives at the end of `visible`).
+        // Extract any tool calls from the generated output.
         var calls: [ToolCall] = []
-        var finalVisible = visible
         if inTool {
             let combined = visible + (String(bytes: toolBytes, encoding: .utf8) ?? "")
-            let parsed = ToolCallParser.parse(combined, markup: markup)
-            calls = parsed.calls
-            finalVisible = parsed.visibleText
+            calls = ToolCallParser.parse(combined, markup: markup).calls
         } else {
-            // Fallback: the DSML block may have streamed as plain text — split it out.
-            let (c, v) = ToolCallParser.parse(visible, markup: markup)
-            if !c.isEmpty { calls = c; finalVisible = v }
+            let c = ToolCallParser.parse(visible, markup: markup).calls
+            if !c.isEmpty { calls = c }
         }
-        turns.append(.assistant(text: finalVisible, toolCalls: calls))
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
-        continuation.yield(.progress(""))   // clear status when done
+        continuation.yield(.progress(""))
     }
 }
