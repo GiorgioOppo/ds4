@@ -26,19 +26,13 @@ final class ChatStore {
     }
 
     // Configuration (editable before loading). Defaults adapt to dev vs bundle.
+    // NOTE: the pure-Swift engine always runs the SSD-streaming path (mmap no-copy
+    // + per-token expert gather); the old C-engine streaming/RAM-mode toggles were
+    // dead and have been removed.
     var modelPath = AppEnvironment.defaultModelPath
     var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
     var contextSize = 8192
     var systemPrompt = ""
-    var streamingEnabled = false
-    var streamingCacheSpec = ""     // e.g. "32GB"; empty = auto
-    /// Tier-A per-layer streaming: tells the engine not to pin or warm the
-    /// model so macOS pages out cold layers. Required on tight-RAM machines.
-    var minimumRAMMode = false
-    /// Tier-B per-layer streaming: drive decode one layer at a time and call
-    /// MADV_DONTNEED on each finished layer's weights. Costs latency per token
-    /// but caps the resident working-set to roughly one layer.
-    var perLayerStreaming = false
 
     // Discovered GGUF files on disk.
     var discoveredModels: [DiscoveredModel] = []
@@ -96,11 +90,7 @@ final class ChatStore {
     func applyRecommendedPreset() {
         scanModels()
         let preset = HardwarePresets.forRAM(MemoryInfo.physicalBytes)
-        streamingEnabled = preset.streaming
-        streamingCacheSpec = preset.cacheSpec
         contextSize = preset.contextSize
-        minimumRAMMode = preset.minimumRAMMode
-        perLayerStreaming = preset.perLayerStreaming
 
         var note = preset.summary
         if preset.prefersTwoBit {
@@ -120,20 +110,13 @@ final class ChatStore {
         phase = .loading
         let path = modelPath, ctx = contextSize
         let sys = systemPrompt
-        let streaming = StreamingOptions(enabled: streamingEnabled,
-                                         cacheSpec: streamingCacheSpec.isEmpty ? nil : streamingCacheSpec)
-        let minRAM = minimumRAMMode
-        let perLayer = perLayerStreaming
         let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
         let compact = compactTools
         Task.detached(priority: .userInitiated) {
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,
-                                               systemPrompt: sys.isEmpty ? nil : sys,
-                                               streaming: streaming,
-                                               minimumRAMMode: minRAM,
-                                               perLayerStreaming: perLayer)
+                                               systemPrompt: sys.isEmpty ? nil : sys)
                 await svc.setTools(tools)
                 await svc.setCompactTools(compact)
                 let info = await svc.modelInfo()
@@ -204,6 +187,9 @@ final class ChatStore {
 
     func newChat() {
         guard let service else { return }
+        generation?.cancel()              // stop any in-flight generation/tool loop
+        isGenerating = false
+        status = ""
         let sys = systemPrompt.isEmpty ? nil : systemPrompt
         messages.removeAll()
         pendingManualCalls = []
@@ -232,10 +218,19 @@ final class ChatStore {
                 switch event {
                 case .reasoning(let r): messages[index].reasoning += r
                 case .text(let t): messages[index].text += t
-                case .toolCall(let calls): messages[index].toolCalls = calls
+                case .toolCall(let calls):
+                    messages[index].toolCalls = calls
+                    // When the model spelled the DSML markup out as plain text (it
+                    // streamed into the bubble), strip the parsed block from view.
+                    if !messages[index].text.isEmpty {
+                        messages[index].text = ToolCallParser
+                            .parse(messages[index].text, markup: .dsv4).visibleText
+                    }
                 case .progress(let p): status = p
                 }
             }
+        } catch is CancellationError {
+            // User-initiated stop: keep the partial text, no error banner.
         } catch {
             let tail = EngineLog.shared.tail()
             if index < messages.count {

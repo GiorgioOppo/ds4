@@ -92,25 +92,9 @@ struct ModelLoadView: View {
                 // Metal kernels are embedded in the app — no folder to set.
             }
 
-            Section("SSD streaming (modelli più grandi della RAM)") {
-                Toggle("Abilita streaming degli expert", isOn: $store.streamingEnabled)
-                if store.streamingEnabled {
-                    TextField("Budget cache (es. 32GB, vuoto = auto)", text: $store.streamingCacheSpec)
-                }
-                Toggle("Modalità RAM minima (per-layer paging)", isOn: $store.minimumRAMMode)
-                if store.minimumRAMMode {
-                    Text("Disabilita residency set Metal e warmup del modello: macOS pagina via i layer freddi. Aiuta sotto i 24 GB.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Toggle("Decode per-layer + eviction (sperimentale)", isOn: $store.perLayerStreaming)
-                    .disabled(store.streamingEnabled)
-                if store.perLayerStreaming && !store.streamingEnabled {
-                    Text("Ogni token decodificato esegue un layer alla volta e chiama MADV_DONTNEED sui pesi del layer appena finito. Working-set ≈ 1 layer in RAM; decode più lento (overhead per-layer × n_layer). Funziona solo con modello completamente residente in RAM.")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else if store.streamingEnabled {
-                    Text("Non disponibile con SSD streaming: il motore fa già per-layer mapping nativamente durante il decode.")
-                        .font(.caption).foregroundStyle(.tertiary)
-                }
+            Section("Memoria") {
+                Text("Lo streaming da SSD è sempre attivo: i pesi non-routed sono mappati no-copy (page cache) e per ogni token vengono letti solo i 6 expert selezionati. Se il modello entra in RAM, la page cache lo tiene residente automaticamente.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Contesto e system prompt") {
@@ -120,8 +104,7 @@ struct ModelLoadView: View {
                     .lineLimit(2...6)
             }
 
-            if let warning = MemoryInfo.loadWarning(modelPath: store.modelPath,
-                                                    streaming: store.streamingEnabled) {
+            if let warning = MemoryInfo.loadWarning(modelPath: store.modelPath) {
                 Section {
                     Label(warning, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)

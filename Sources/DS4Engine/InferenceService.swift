@@ -42,12 +42,6 @@ public struct SamplingParams: Sendable {
     }
 }
 
-public struct StreamingOptions: Sendable {
-    public var enabled: Bool
-    public var cacheSpec: String?
-    public init(enabled: Bool = true, cacheSpec: String? = nil) { self.enabled = enabled; self.cacheSpec = cacheSpec }
-}
-
 public struct ModelInfo: Sendable {
     public let name: String
     public let layers: Int
@@ -86,10 +80,16 @@ public actor InferenceService {
     // Compact tool declaration (just name(params)) to save prefill tokens on
     // local inference. Default from env DS4_TOOLS_COMPACT, overridable via setter.
     private var compactTools = ProcessInfo.processInfo.environment["DS4_TOOLS_COMPACT"] != nil
+    /// Set when a generation was interrupted (cancel/error) mid-stream: the GPU
+    /// KV cache and the recurrent NSA-compressor state may then be inconsistent
+    /// with `committedIds`. The next generation rebuilds the KV from the exact
+    /// committed ids (slow once, but correct) before continuing.
+    private var kvDirty = false
 
-    public init(modelPath: String, metalSourceDir: String? = nil, contextSize: Int,
-                systemPrompt: String?, streaming: StreamingOptions,
-                minimumRAMMode: Bool, perLayerStreaming: Bool) throws {
+    /// The pure-Swift engine always runs the SSD-streaming path (no-copy mmap
+    /// non-routed weights + per-token expert gather); there are no resident/
+    /// per-layer variants to configure, hence no streaming options here.
+    public init(modelPath: String, contextSize: Int, systemPrompt: String?) throws {
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
@@ -135,6 +135,7 @@ public actor InferenceService {
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
         committedIds = []
         needsClose = false
+        kvDirty = false   // next generation starts at pos 0 and resets the compressor
     }
 
     /// Declare the tools available to the model. Tools are baked into the first
@@ -201,11 +202,26 @@ public actor InferenceService {
         }
         guard !suffixIds.isEmpty else { continuation.yield(.progress("")); return }
 
+        // Dirty-until-clean: any throw below (user cancel, error) leaves the GPU
+        // KV/compressor state possibly out of sync with committedIds; the flag makes
+        // the NEXT generation rebuild before continuing.
+        let needsRebuild = kvDirty
+        kvDirty = true
+        if needsRebuild && !committedIds.isEmpty {
+            // Recover from an interrupted generation: replay the exact committed ids
+            // from position 0 (resets the recurrent compressor) — slow once, correct.
+            continuation.yield(.progress("ripristino KV (\(committedIds.count) token)…"))
+            _ = try decoder.prefill(tokens: committedIds, startPos: 0)
+        }
+
         // Prefill ONLY the new suffix; positions 0..startPos-1 are reused from the KV.
         continuation.yield(.progress(startPos == 0 ? "prefill \(suffixIds.count) token…"
                                                    : "prefill +\(suffixIds.count) token (riuso KV)…"))
         var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: startPos)
         committedIds.append(contentsOf: suffixIds)
+        // The committed KV now ends with an open assistant turn; mark it immediately
+        // so a mid-decode interruption still closes the turn on the next suffix.
+        needsClose = true
         var pos = committedIds.count
 
         var rng = sampling.seed
@@ -236,8 +252,15 @@ public actor InferenceService {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
-            } else if inReasoning && Int32(next) == tok.thinkEndId {
-                flush(true)
+            } else if Int32(next) == tok.thinkStartId {
+                // The model opened a reasoning block on its own (even with think
+                // off): route it to the reasoning stream, don't show the tag.
+                flush(inReasoning)
+                inReasoning = true
+            } else if Int32(next) == tok.thinkEndId {
+                // Close reasoning (also when we weren't in it: suppress a stray
+                // literal "</think>" instead of showing it as text).
+                flush(inReasoning)
                 inReasoning = false
             } else {
                 pending.append(contentsOf: tok.tokenText(Int32(next)))
@@ -252,18 +275,23 @@ public actor InferenceService {
                                                  elapsed > 0 ? Double(produced) / elapsed : 0)))
         }
         flush(inReasoning)
-        needsClose = true                       // the assistant turn is open (its <eos> not yet committed)
 
         // Extract any tool calls from the generated output.
         var calls: [ToolCall] = []
         if inTool {
-            let combined = visible + (String(bytes: toolBytes, encoding: .utf8) ?? "")
-            calls = ToolCallParser.parse(combined, markup: markup).calls
+            let block = String(bytes: toolBytes, encoding: .utf8) ?? ""
+            calls = ToolCallParser.parse(visible + block, markup: markup).calls
+            if calls.isEmpty {
+                // The model opened a DSML block we could not parse: surface it
+                // instead of dropping it silently (the user can see what it tried).
+                continuation.yield(.text("\n[chiamata tool non interpretabile]\n" + block))
+            }
         } else {
             let c = ToolCallParser.parse(visible, markup: markup).calls
             if !c.isEmpty { calls = c }
         }
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
+        kvDirty = false                         // clean completion: KV matches committedIds
         continuation.yield(.progress(""))
     }
 }

@@ -49,10 +49,13 @@ public enum Diagnostics {
         }
         out += "\nDSML markup usato: \(markup.dsml)  (tag es. \(markup.callsOpen))\n"
 
-        out += "\n=== Prompt che il GUI invia ORA con i tool abilitati ===\n"
         let tools = ToolRegistry.specs(enabled: Set(ToolRegistry.builtins.map { $0.spec.name }))
+        out += "\n=== Prompt con tool — formato COMPLETO (template) ===\n"
         out += ChatRenderer.render(turns: [.user("Ciao, come stai?")], tools: tools,
-                                   think: .none, markup: markup)
+                                   think: .none, markup: markup, compactTools: false)
+        out += "\n\n=== Prompt con tool — formato COMPATTO (default GUI) ===\n"
+        out += ChatRenderer.render(turns: [.user("Ciao, come stai?")], tools: tools,
+                                   think: .none, markup: markup, compactTools: true)
         return out
     }
 }

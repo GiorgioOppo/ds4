@@ -265,8 +265,8 @@ All'avvio (fase `needsModel`) appare la **schermata di caricamento**
    è leggibile sotto sandbox (la scansione automatica delle cartelle è anch'essa
    limitata). Senza sandbox (`swift run DwarfStar`) funzionano anche i percorsi
    digitati e la scansione.
-4. **SSD streaming** — toggle e opzioni per modelli più grandi della RAM
-   (vedi §8).
+4. **Memoria** — nota informativa: lo streaming da SSD è sempre attivo, senza
+   opzioni da configurare (vedi §8).
 5. **Contesto e system prompt** — stepper per la dimensione del contesto
    (1024…1.000.000 token) e campo per un system prompt opzionale.
 6. **Avvisi di memoria** — se il modello rischia di non entrare in RAM, appare
@@ -380,12 +380,12 @@ alla RAM fisica rilevata. Quando il preset preferisce una quant a 2 bit,
 l'app seleziona automaticamente un modello 2-bit già su disco, oppure suggerisce
 come scaricarlo.
 
-| RAM rilevata | Streaming | Cache | Contesto | RAM minima | Note |
-|---|---|---|---|---|---|
-| **< 24 GB** | sì | 2 GB | 4096 | sì | Sotto il minimo del progetto (64 GB). Quant 2-bit, residency-off, prefill layer-major. Il motore mappa i layer on-demand. |
-| **24–80 GB** | sì | 16 GB | 8192 | no | Quant 2-bit con SSD streaming. |
-| **80–200 GB** | no | — | 32768 | no | Quant 2-bit residente in RAM. |
-| **> 200 GB** | no | — | 32768 | no | Anche la quant Q4 entra in RAM. |
+| RAM rilevata | Contesto | Quant consigliata | Note |
+|---|---|---|---|
+| **< 24 GB** | 4096 | 2-bit | Sotto il minimo del progetto (64 GB): pesi streamati da SSD (lento ma funziona). |
+| **24–80 GB** | 8192 | 2-bit | Gran parte dei pesi resta in page cache. |
+| **80–200 GB** | 32768 | 2-bit | Modello interamente in RAM. |
+| **> 200 GB** | 32768 | Q4 | Anche la quant Q4 entra in RAM. |
 
 `HardwarePresets.isTwoBit(...)` riconosce i nomi 2-bit (`iq2`, `q2k`, `-q2`,
 `q2-`). Il preset compila i campi della schermata di caricamento; l'utente può
@@ -393,23 +393,21 @@ sempre modificarli manualmente prima di premere **Carica modello**.
 
 ---
 
-## 8. Modalità di streaming e memoria
+## 8. Memoria e streaming
 
-La sezione **SSD streaming** della schermata di caricamento espone tre leve
-indipendenti, pensate per macchine con RAM limitata:
-
-| Opzione | Campo `ChatStore` | Effetto |
-|---|---|---|
-| **Abilita streaming degli expert** | `streamingEnabled` | Gli expert restano su SSD (mmap), solo i selezionati vengono letti per token. Mostra il campo **Budget cache** (es. `32GB`, vuoto = auto). |
-| **Modalità RAM minima** (Tier-A) | `minimumRAMMode` | Disabilita il residency set Metal e il warmup: macOS pagina via i layer freddi. Consigliata sotto i 24 GB. |
-| **Decode per-layer + eviction** (Tier-B, sperimentale) | `perLayerStreaming` | Esegue un layer alla volta e chiama `MADV_DONTNEED` sui pesi appena usati: working-set ≈ 1 layer, ma decode più lento. **Incompatibile** con lo streaming SSD (il motore fa già mapping per-layer nativamente). |
+Nel motore Swift **lo streaming da SSD è sempre attivo** e non richiede
+configurazione: i pesi non-routed sono viste `mmap` no-copy (residenti via page
+cache quando la RAM basta, evictabili quando non basta) e per ogni token vengono
+letti **solo i 6 expert selezionati**. Se il modello entra in RAM, la page cache
+lo tiene residente automaticamente — non esistono più i toggle del motore C
+(streaming on/off, RAM minima, per-layer eviction), che non avevano effetto.
 
 `MemoryInfo.loadWarning(...)` calcola un avviso preventivo:
 
-- **senza streaming**, se il modello è più grande della RAM → il prefill
-  fallirebbe: abilita lo streaming o usa una quant più piccola;
-- **con streaming**, se il modello supera ~4× la RAM → alto rischio OOM perché
-  le parti non-routed e la KV cache devono comunque stare in RAM.
+- modello **> RAM** → funziona, ma i pesi vengono riletti da SSD a ogni token
+  (decine di secondi/token);
+- modello **> 4× RAM** → alto rischio OOM, perché le parti non-routed e la KV
+  cache devono comunque stare in RAM.
 
 Dopo il caricamento, l'header della chat mostra una stima dell'impronta della
 **KV cache** (`nLayer × contesto × headDim × F32`).
@@ -516,7 +514,7 @@ non c'è alcun modello pre-incluso: l'utente ne seleziona uno.
 | Sintomo | Causa probabile | Rimedio |
 |---|---|---|
 | *"Nessun GGUF trovato…"* nella schermata di caricamento | nessun modello in `scriptDir` o `scriptDir/gguf` | premi **Scarica…** (es. target `q2-imatrix`) o copia un `.gguf` nella cartella, poi ↻. |
-| Warning arancione di memoria | modello più grande della RAM | abilita **SSD streaming**, riduci il **contesto**, o usa una quant 2-bit. |
+| Warning arancione di memoria | modello più grande della RAM | riduci il **contesto** o usa una quant 2-bit (lo streaming SSD è già attivo). |
 | Prefill fallisce / processo killed (OOM) | configurazione che non entra in RAM | applica il preset consigliato per la tua RAM; non eseguire chat e `ds4-server` insieme. |
 | Output spazzatura | schema di quantizzazione disallineato | verifica con `DS4_TYPES_ONLY=1 swift run DS4Demo <gguf>`; usa un GGUF coerente con l'engine. |
 | Errori Metal/kernel | compilazione kernel a runtime fallita | apri **Diagnostica → Console motore** per leggere lo stderr del motore. |

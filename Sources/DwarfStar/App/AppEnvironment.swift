@@ -64,17 +64,12 @@ enum AppEnvironment {
     }
 }
 
-/// A recommended starting configuration for a RAM tier.
+/// A recommended starting configuration for a RAM tier. The pure-Swift engine
+/// always runs the SSD-streaming path (mmap no-copy + per-token expert gather),
+/// so the preset only tunes what is actually configurable: context size + quant.
 struct HardwarePreset {
-    let streaming: Bool
-    let cacheSpec: String      // SSD streaming cache budget, "" = off/auto
     let contextSize: Int
     let prefersTwoBit: Bool    // recommend the 2-bit quant
-    /// Tier-A per-layer streaming: disable Metal residency set and model warmup.
-    let minimumRAMMode: Bool
-    /// Tier-B per-layer streaming: drive decode one layer at a time and call
-    /// MADV_DONTNEED between layers.
-    let perLayerStreaming: Bool
     let summary: String
 }
 
@@ -87,25 +82,16 @@ enum HardwarePresets {
         let gb = Double(ramBytes) / gib
         switch gb {
         case ..<24:
-            // Below the project's 64 GB floor: Stage A only. Stage B (Swift-
-            // driven per-layer decode) is incompatible with SSD streaming —
-            // the engine's native streaming decode loop already does per-layer
-            // mapping. Replicating it via eval_layer_slice misses the static
-            // map call and breaks. So minimumRAMMode=true, perLayerStreaming=off.
-            return HardwarePreset(streaming: true, cacheSpec: "2GB", contextSize: 4096,
-                prefersTwoBit: true, minimumRAMMode: true, perLayerStreaming: false,
-                summary: "≈\(Int(gb.rounded())) GB: sotto il minimo del progetto (64 GB). Quant 2-bit, SSD streaming cache 2 GB, contesto 4096, residency-off, layer-major prefill. Il motore mappa i layer on-demand durante il decode.")
+            return HardwarePreset(contextSize: 4096, prefersTwoBit: true,
+                summary: "≈\(Int(gb.rounded())) GB: sotto il minimo del progetto (64 GB). Quant 2-bit, contesto 4096; i pesi vengono streamati da SSD (lento ma funziona).")
         case ..<80:
-            return HardwarePreset(streaming: true, cacheSpec: "16GB", contextSize: 8192,
-                prefersTwoBit: true, minimumRAMMode: false, perLayerStreaming: false,
-                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit con SSD streaming, cache 16 GB, contesto 8192.")
+            return HardwarePreset(contextSize: 8192, prefersTwoBit: true,
+                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit, contesto 8192; gran parte dei pesi resta in page cache.")
         case ..<200:
-            return HardwarePreset(streaming: false, cacheSpec: "", contextSize: 32768,
-                prefersTwoBit: true, minimumRAMMode: false, perLayerStreaming: false,
-                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit residente in RAM, contesto 32768.")
+            return HardwarePreset(contextSize: 32768, prefersTwoBit: true,
+                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit interamente in RAM, contesto 32768.")
         default:
-            return HardwarePreset(streaming: false, cacheSpec: "", contextSize: 32768,
-                prefersTwoBit: false, minimumRAMMode: false, perLayerStreaming: false,
+            return HardwarePreset(contextSize: 32768, prefersTwoBit: false,
                 summary: "≈\(Int(gb.rounded())) GB: anche la quant Q4 entra in RAM, contesto 32768.")
         }
     }
@@ -135,15 +121,16 @@ enum MemoryInfo {
     }
 
     /// Returns a warning string when the model is unlikely to fit, else nil.
-    static func loadWarning(modelPath: String, streaming: Bool) -> String? {
+    /// (The engine always streams from SSD, so the only hard limit is that the
+    /// non-routed weights + KV cache must fit in RAM.)
+    static func loadWarning(modelPath: String) -> String? {
         let ram = physicalBytes
         guard let size = fileSize(modelPath), size > 0 else { return nil }
-        if !streaming {
-            if size > ram {
-                return "Il modello (\(gib(size))) è più grande della RAM (\(gib(ram))). Senza SSD streaming non può diventare residente e il prefill fallirà. Abilita lo streaming o usa una quant più piccola."
-            }
-        } else if size > ram * 4 {
-            return "Anche con SSD streaming, le parti non-routed e la KV cache devono stare in RAM. Con \(gib(ram)) di RAM e un modello da \(gib(size)), il rischio di esaurire la memoria (crash) è alto: usa una cache molto piccola e un contesto ridotto, o la quant a 2 bit."
+        if size > ram * 4 {
+            return "Le parti non-routed del modello e la KV cache devono stare in RAM. Con \(gib(ram)) di RAM e un modello da \(gib(size)), il rischio di esaurire la memoria (crash) è alto: usa un contesto ridotto o la quant a 2 bit."
+        }
+        if size > ram {
+            return "Il modello (\(gib(size))) è più grande della RAM (\(gib(ram))): i pesi verranno streamati da SSD a ogni token — funziona, ma molto lentamente (decine di secondi per token)."
         }
         return nil
     }
