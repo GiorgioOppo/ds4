@@ -106,6 +106,24 @@ final class ChatToolsTests: XCTestCase {
         XCTAssertEqual(calls[0].name, "now")
     }
 
+    /// Compact mode lists only name(params) + a one-line format hint, and is much
+    /// shorter than the full declaration.
+    func testCompactToolsDeclaration() {
+        let add = ToolSpec(name: "add", description: "Add a + b.",
+                           parametersJSON: #"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}"#)
+        let full = ChatRenderer.render(turns: [.user("hi")], tools: [add, weather], think: .none,
+                                       markup: markup, compactTools: false)
+        let compact = ChatRenderer.render(turns: [.user("hi")], tools: [add, weather], think: .none,
+                                          markup: markup, compactTools: true)
+        XCTAssertTrue(compact.contains("## Tools"))
+        XCTAssertTrue(compact.contains("- add(a, b)"))
+        XCTAssertTrue(compact.contains("- get_weather(city)"))
+        XCTAssertTrue(compact.contains(markup.callsOpen))           // keeps the format hint
+        XCTAssertFalse(compact.contains("### Available Tool Schemas"))
+        XCTAssertFalse(compact.contains("You MUST strictly follow"))
+        XCTAssertLessThan(compact.count, full.count / 2)            // much smaller
+    }
+
     /// The function schema uses sorted keys (≈ Jinja tojson) and nests parameters.
     func testFunctionSchema() {
         let s = ChatRenderer.functionJSON(weather)

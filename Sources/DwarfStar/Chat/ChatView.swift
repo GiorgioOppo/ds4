@@ -234,6 +234,14 @@ struct ToolPickerView: View {
                 }
                 .disabled(!store.toolsEnabled)
             }
+
+            Divider()
+            Toggle("Dichiarazione compatta (solo nome+parametri)", isOn: $store.compactTools)
+                .onChange(of: store.compactTools) { store.syncTools() }
+                .disabled(!store.toolsEnabled)
+            Text("Meno token di prefill: invece dello schema completo manda solo `nome(parametri)` + una riga di formato. Più economico ma si discosta dal testo di addestramento.")
+                .font(.caption).foregroundStyle(.secondary)
+
             Spacer()
             HStack {
                 Spacer()

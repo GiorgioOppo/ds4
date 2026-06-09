@@ -49,6 +49,9 @@ final class ChatStore {
     // Tools.
     var toolsEnabled = false
     var enabledToolNames: Set<String> = Set(ToolRegistry.builtins.map { $0.spec.name })
+    /// Compact tool declaration (just name(params)) — fewer prefill tokens. On by
+    /// default for local inference.
+    var compactTools = true
     /// Tool calls awaiting a manually-entered result (non-built-in tools).
     var pendingManualCalls: [ToolCall] = []
     /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
@@ -119,6 +122,7 @@ final class ChatStore {
         let minRAM = minimumRAMMode
         let perLayer = perLayerStreaming
         let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
+        let compact = compactTools
         Task.detached(priority: .userInitiated) {
             do {
                 let svc = try InferenceService(modelPath: path,
@@ -128,6 +132,7 @@ final class ChatStore {
                                                minimumRAMMode: minRAM,
                                                perLayerStreaming: perLayer)
                 await svc.setTools(tools)
+                await svc.setCompactTools(compact)
                 let info = await svc.modelInfo()
                 await MainActor.run {
                     self.service = svc
@@ -144,7 +149,8 @@ final class ChatStore {
     func syncTools() {
         guard let service else { return }
         let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
-        Task { await service.setTools(tools) }
+        let compact = compactTools
+        Task { await service.setTools(tools); await service.setCompactTools(compact) }
     }
 
     private var thinkMode: DS4ThinkMode { think ? .high : .none }

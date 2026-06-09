@@ -104,9 +104,33 @@ public enum ChatRenderer {
         """
     }
 
+    /// Compact tool declaration for local inference: just `name(params)` per tool
+    /// plus a one-line reminder of the call format. Far fewer prefill tokens than
+    /// the full block — at some risk to call reliability (it deviates from the
+    /// trained "## Tools" text). The format line is kept because without ANY
+    /// format hint the model won't emit the DSML markup we can parse.
+    static func compactToolsDeclaration(_ tools: [ToolSpec], markup m: ToolMarkup) -> String {
+        let d = m.dsml
+        var s = "## Tools\nAvailable tools — to call, emit a <\(d)tool_calls> block with " +
+                "<\(d)invoke name=\"NAME\"> and <\(d)parameter name=\"P\" string=\"true|false\">VALUE</\(d)parameter>:\n"
+        for t in tools {
+            s += "- \(t.name)(\(paramNames(t.parametersJSON).joined(separator: ", ")))\n"
+        }
+        return s
+    }
+
+    /// Parameter names from a JSON-Schema object's "properties".
+    static func paramNames(_ json: String) -> [String] {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let props = obj["properties"] as? [String: Any] else { return [] }
+        return props.keys.sorted()
+    }
+
     /// Build the system block: collected system prompts + (if tools) the tools
-    /// declaration appended with a blank-line separator. Mirrors the template.
-    static func systemBlock(turns: [ChatTurn], tools: [ToolSpec], markup m: ToolMarkup) -> String {
+    /// declaration. `compact` selects the minimal name-list form. Mirrors the template.
+    static func systemBlock(turns: [ChatTurn], tools: [ToolSpec], markup m: ToolMarkup,
+                            compact: Bool) -> String {
         var system = ""
         var first = true
         for case let .system(s) in turns {
@@ -114,22 +138,28 @@ public enum ChatRenderer {
             first = false
         }
         guard !tools.isEmpty else { return system }
-        var schemas = ""
-        for t in tools { schemas += functionJSON(t) + "\n" }
-        let toolsDecl = toolsHeader(m) + "\n\n" + schemas +
-            "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls."
+        let toolsDecl: String
+        if compact {
+            toolsDecl = compactToolsDeclaration(tools, markup: m)
+        } else {
+            var schemas = ""
+            for t in tools { schemas += functionJSON(t) + "\n" }
+            toolsDecl = toolsHeader(m) + "\n\n" + schemas +
+                "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls."
+        }
         return system.isEmpty ? toolsDecl : system + "\n\n" + toolsDecl
     }
 
     /// Render the whole conversation to the rendered-chat string the tokenizer
-    /// consumes. `think` controls the trailing reasoning marker on the open
-    /// assistant turn; `addGenerationPrompt` opens an assistant turn at the end.
+    /// consumes. `think` controls the trailing reasoning marker; `compactTools`
+    /// uses the minimal tool declaration; `addGenerationPrompt` opens an assistant turn.
     public static func render(turns: [ChatTurn], tools: [ToolSpec], think: ThinkMode,
-                              markup: ToolMarkup, addGenerationPrompt: Bool = true,
+                              markup: ToolMarkup, compactTools: Bool = false,
+                              addGenerationPrompt: Bool = true,
                               bos: String = "<｜begin▁of▁sentence｜>", eos: String = "<｜end▁of▁sentence｜>",
                               userTag: String = "<｜User｜>", assistantTag: String = "<｜Assistant｜>",
                               thinkOpen: String = "<think>", thinkClose: String = "</think>") -> String {
-        var out = bos + systemBlock(turns: turns, tools: tools, markup: markup)
+        var out = bos + systemBlock(turns: turns, tools: tools, markup: markup, compact: compactTools)
 
         var pendingAssistant = false
         var pendingToolResult = false

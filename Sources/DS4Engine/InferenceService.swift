@@ -76,6 +76,9 @@ public actor InferenceService {
     // Conversation state (rendered in full on each generation).
     private var turns: [ChatTurn] = []
     private var tools: [ToolSpec] = []
+    // Compact tool declaration (just name(params)) to save prefill tokens on
+    // local inference. Default from env DS4_TOOLS_COMPACT, overridable via setter.
+    private var compactTools = ProcessInfo.processInfo.environment["DS4_TOOLS_COMPACT"] != nil
 
     public init(modelPath: String, metalSourceDir: String? = nil, contextSize: Int,
                 systemPrompt: String?, streaming: StreamingOptions,
@@ -129,6 +132,9 @@ public actor InferenceService {
     /// Declare the tools available to the model for subsequent turns.
     public func setTools(_ tools: [ToolSpec]) { self.tools = tools }
 
+    /// Use the compact (name-list) tool declaration to save prefill tokens.
+    public func setCompactTools(_ on: Bool) { compactTools = on }
+
     /// Append a user message and generate the assistant reply.
     public func send(userText: String, thinkMode: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
@@ -161,7 +167,8 @@ public actor InferenceService {
 
     private func runGeneration(think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
                                continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
-        let rendered = ChatRenderer.render(turns: turns, tools: tools, think: think.core, markup: markup)
+        let rendered = ChatRenderer.render(turns: turns, tools: tools, think: think.core,
+                                           markup: markup, compactTools: compactTools)
         let prompt = tok.tokenizeRenderedChat(rendered)
         guard prompt.count < contextSize else {
             throw InferenceError.contextExceeded(prompt: prompt.count, context: contextSize)
