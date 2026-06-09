@@ -179,8 +179,10 @@ public actor InferenceService {
         var inTool = false
         var pending: [UInt8] = []
         var visible = ""                       // accumulated visible answer (for history)
-        var toolBytes: [UInt8] = []            // raw bytes of the tool-call block (after callsBegin)
-        let callsBeginId = tok.tokenId(markup.callsBegin)
+        var toolBytes: [UInt8] = []            // raw bytes of the DSML tool-call block
+        // The DSML tool-call block opens with the ｜DSML｜ token (a single vocab token),
+        // so we switch to tool-buffering when the model emits it.
+        let dsmlId = tok.dsmlId
 
         func flush(_ asReasoning: Bool) {
             guard !pending.isEmpty, let s = String(bytes: pending, encoding: .utf8) else { return }
@@ -196,9 +198,10 @@ public actor InferenceService {
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
                                       topP: sampling.topP, minP: sampling.minP, rng: &rng)
             if Int32(next) == tok.eosId { break }
-            if !inTool, let cb = callsBeginId, Int32(next) == cb {
-                flush(inReasoning)             // emit any buffered text/reasoning, then enter the tool block
+            if !inTool, Int32(next) == dsmlId {
+                flush(inReasoning)             // emit buffered text/reasoning, then enter the DSML block
                 inTool = true
+                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))   // start of block: ｜DSML｜
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inReasoning && Int32(next) == tok.thinkEndId {
@@ -218,14 +221,17 @@ public actor InferenceService {
         flush(inReasoning)
 
         // Finalize the assistant turn: extract any tool calls and record history.
+        // Recombine the (already-streamed) visible answer with the DSML block so the
+        // parser can split off the call block (its `<` lives at the end of `visible`).
         var calls: [ToolCall] = []
         var finalVisible = visible
         if inTool {
-            let block = markup.callsBegin + (String(bytes: toolBytes, encoding: .utf8) ?? "")
-            calls = ToolCallParser.parse(block, markup: markup).calls
+            let combined = visible + (String(bytes: toolBytes, encoding: .utf8) ?? "")
+            let parsed = ToolCallParser.parse(combined, markup: markup)
+            calls = parsed.calls
+            finalVisible = parsed.visibleText
         } else {
-            // Fallback: the markup may have streamed as plain text (model without a
-            // single-token markup). Split it back out of the visible answer.
+            // Fallback: the DSML block may have streamed as plain text — split it out.
             let (c, v) = ToolCallParser.parse(visible, markup: markup)
             if !c.isEmpty { calls = c; finalVisible = v }
         }

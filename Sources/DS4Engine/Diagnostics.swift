@@ -39,17 +39,15 @@ public enum Diagnostics {
         }
 
         let markup = ToolMarkup.discover(in: tok)
-        out += "\n=== Token di markup tool (presenti nel vocab del modello?) ===\n"
-        let pairs: [(String, String)] = [
-            ("callsBegin", markup.callsBegin), ("callBegin", markup.callBegin),
-            ("sep", markup.sep), ("callEnd", markup.callEnd), ("callsEnd", markup.callsEnd),
-            ("outputsBegin", markup.outputsBegin), ("outputBegin", markup.outputBegin),
-            ("outputEnd", markup.outputEnd), ("outputsEnd", markup.outputsEnd),
-        ]
-        for (label, s) in pairs {
-            out += "\(label): \"\(s)\" -> \(tok.tokenId(s).map { "id \($0)" } ?? "ASSENTE")\n"
+        out += "\n=== Token speciali del protocollo (presenti nel vocab?) ===\n"
+        let specials = ["｜DSML｜", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
+                        "<｜User｜>", "<｜Assistant｜>", "<think>", "</think>",
+                        "<｜action｜>", "<｜title｜>", "<｜query｜>", "<｜authority｜>",
+                        "<｜domain｜>", "<｜extracted_url｜>", "<｜read_url｜>"]
+        for s in specials {
+            out += "\(s) -> \(tok.tokenId(s).map { "id \($0)" } ?? "ASSENTE")\n"
         }
-        out += "｜DSML｜ -> \(tok.tokenId("｜DSML｜").map { "id \($0)" } ?? "ASSENTE")\n"
+        out += "\nDSML markup usato: \(markup.dsml)  (tag es. \(markup.callsOpen))\n"
 
         out += "\n=== Prompt che il GUI invia ORA con i tool abilitati ===\n"
         let tools = ToolRegistry.specs(enabled: Set(ToolRegistry.builtins.map { $0.spec.name }))

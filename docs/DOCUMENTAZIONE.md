@@ -338,10 +338,11 @@ Tutti i built-in sono abilitati di default e vengono eseguiti automaticamente.
 
 Flusso di una chiamata a tool:
 
-1. Con i tool abilitati, l'`InferenceService` **dichiara** i tool nel prompt e il
-   modello, invece di rispondere, può emettere una **tool-call** (markup
-   `｜DSML｜`/DeepSeek). Il decoder riconosce il token di inizio blocco e bufferizza
-   la chiamata invece di mostrarla come testo.
+1. Con i tool abilitati, l'`InferenceService` **dichiara** i tool nel prompt
+   (blocco "## Tools") e il modello, invece di rispondere, può emettere una
+   **tool-call** nel formato **DSML/XML** del paper (`<｜DSML｜tool_calls>…`). Il
+   decoder riconosce il token `｜DSML｜` e bufferizza la chiamata invece di
+   mostrarla come testo.
 2. La GUI mostra una bolla arancione **"Chiamata tool"** con nome e argomenti JSON.
 3. **Esecuzione**: i tool integrati vengono eseguiti **automaticamente**
    (`ToolRegistry.execute`) e il risultato compare come bolla verde; per tool
@@ -351,10 +352,10 @@ Flusso di una chiamata a tool:
    modello produce la risposta finale — o **altre** tool-call: il loop si ripete
    finché non resta che testo.
 
-I token di markup dei tool sono **estratti dal modello**: `ToolMarkup.discover`
-tiene solo i token che il vocabolario del GGUF definisce davvero, con default
-della famiglia DeepSeek. Il `tokenizer.chat_template` grezzo del GGUF è
-ispezionabile via `InferenceService.chatTemplate()`. Vedi
+Il formato è quello **autorevole del paper DeepSeek-V4** (Table 4): XML basato sul
+token `｜DSML｜`. Il `tokenizer.chat_template` grezzo del GGUF è ispezionabile dal
+pannello **Diagnostica** ("Mostra chat template + formato tool") o via
+`InferenceService.chatTemplate()`. Vedi
 [`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md) §14 per i dettagli.
 
 > Nota: i tool richiedono il **multi-turno**, introdotto insieme a questa

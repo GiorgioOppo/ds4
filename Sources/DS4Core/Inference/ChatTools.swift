@@ -2,22 +2,24 @@ import Foundation
 
 // Tool-calling (function calling) support for the DeepSeek-V4 chat protocol.
 //
-// Scope of this file (pure, model-independent logic — unit-tested without a GGUF):
-//   • value types for tools, tool calls, and conversation turns;
-//   • `ToolMarkup`: the model-specific special-token strings used to wrap tool
-//     calls / outputs, DISCOVERED from the model vocab at runtime (honoring the
-//     "extract from the GGUF" choice) with a documented DeepSeek-family default;
-//   • `ChatRenderer`: renders a multi-turn conversation (+ declared tools) to the
-//     rendered-chat string the tokenizer consumes (`tokenizeRenderedChat`);
-//   • `ToolCallParser`: extracts tool calls from generated assistant text.
+// Wire format is the AUTHORITATIVE one from the DeepSeek-V4 paper (Table 4): an
+// XML-style scheme built on the special "｜DSML｜" token. A tool call looks like:
 //
-// NOTE ON FIDELITY: the authoritative wire format lives in the GGUF's
-// `tokenizer.chat_template` (Jinja). We do not execute Jinja; instead we extract
-// the *actual* markup tokens the model defines (ToolMarkup.discover) and render
-// with the DeepSeek-family structure. If a given DS4 build diverges, the markup
-// strings and the two functions below are the single place to adjust. Verify the
-// rendered prompt against `model.string("tokenizer.chat_template")` on a machine
-// with the real model before relying on tool calls.
+//   <｜DSML｜tool_calls>
+//   <｜DSML｜invoke name="get_weather">
+//   <｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
+//   <｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>
+//   </｜DSML｜invoke>
+//   </｜DSML｜tool_calls>
+//
+// String parameters use string="true" and the raw value; all other types
+// (number/bool/array/object) use string="false" and a JSON-encoded value.
+//
+// This file is pure and model-independent (unit-tested without a GGUF). The only
+// model token involved is ｜DSML｜ (already in the vocab as Tokenizer.dsmlId);
+// ToolMarkup.discover confirms its exact spelling. NOTE: the paper specifies the
+// CALL format precisely; the tool-RESULT block (renderToolResult) is a documented
+// DSML-consistent extrapolation — verify it against the model's chat_template.
 
 // MARK: - Value types
 
@@ -33,11 +35,12 @@ public struct ToolSpec: Sendable, Equatable, Identifiable {
     }
 }
 
-/// A single tool invocation emitted by the model.
+/// A single tool invocation. `argumentsJSON` is the call arguments as a JSON
+/// object (parsed from the DSML parameters; used to execute the tool).
 public struct ToolCall: Sendable, Equatable, Identifiable {
     public var id: String
     public var name: String
-    public var argumentsJSON: String   // the raw JSON arguments object the model produced
+    public var argumentsJSON: String
     public init(id: String, name: String, argumentsJSON: String) {
         self.id = id; self.name = name; self.argumentsJSON = argumentsJSON
     }
@@ -51,100 +54,95 @@ public enum ChatTurn: Sendable, Equatable {
     case toolResult(callId: String, name: String, content: String)
 }
 
-// MARK: - Model-specific markup tokens
+// MARK: - DSML markup
 
-/// The special-token strings that wrap tool declarations, calls, and outputs.
-/// The defaults are the DeepSeek-family tokens; `discover` replaces any that the
-/// model's own vocab actually defines (so we use the real tokens, not guesses).
+/// The DeepSeek-V4 tool markup, built on the single special token `｜DSML｜`.
+/// All tags are derived from it, so only that one token is model-specific.
 public struct ToolMarkup: Sendable, Equatable {
-    public var callsBegin: String
-    public var callsEnd: String
-    public var callBegin: String
-    public var callEnd: String
-    public var sep: String
-    public var outputsBegin: String
-    public var outputsEnd: String
-    public var outputBegin: String
-    public var outputEnd: String
+    /// The DSML special token (vocab token, with fullwidth bars), e.g. "｜DSML｜".
+    public var dsml: String
+    public init(dsml: String) { self.dsml = dsml }
 
-    public static let deepSeekDefault = ToolMarkup(
-        callsBegin: "<｜tool▁calls▁begin｜>", callsEnd: "<｜tool▁calls▁end｜>",
-        callBegin: "<｜tool▁call▁begin｜>", callEnd: "<｜tool▁call▁end｜>",
-        sep: "<｜tool▁sep｜>",
-        outputsBegin: "<｜tool▁outputs▁begin｜>", outputsEnd: "<｜tool▁outputs▁end｜>",
-        outputBegin: "<｜tool▁output▁begin｜>", outputEnd: "<｜tool▁output▁end｜>")
+    /// DeepSeek-V4 default (the vocab token uses fullwidth U+FF5C bars; the paper
+    /// writes |DSML| in ASCII for readability).
+    public static let dsv4 = ToolMarkup(dsml: "｜DSML｜")
 
-    public init(callsBegin: String, callsEnd: String, callBegin: String, callEnd: String,
-                sep: String, outputsBegin: String, outputsEnd: String,
-                outputBegin: String, outputEnd: String) {
-        self.callsBegin = callsBegin; self.callsEnd = callsEnd
-        self.callBegin = callBegin; self.callEnd = callEnd; self.sep = sep
-        self.outputsBegin = outputsBegin; self.outputsEnd = outputsEnd
-        self.outputBegin = outputBegin; self.outputEnd = outputEnd
+    public var callsOpen: String  { "<\(dsml)tool_calls>" }
+    public var callsClose: String { "</\(dsml)tool_calls>" }
+    public func invokeOpen(_ name: String) -> String { "<\(dsml)invoke name=\"\(name)\">" }
+    public var invokeClose: String { "</\(dsml)invoke>" }
+    public func paramOpen(_ name: String, string: Bool) -> String {
+        "<\(dsml)parameter name=\"\(name)\" string=\"\(string)\">"
     }
+    public var paramClose: String { "</\(dsml)parameter>" }
 
-    /// Keep only the markup tokens the model's vocab actually defines; fall back
-    /// to the default string for any that are absent. This is the "extract from
-    /// the GGUF" step: the wire tokens come from the model, not a hardcoded guess.
+    /// Confirm the DSML token's exact spelling against the model vocab.
     public static func discover(in tokenizer: Tokenizer) -> ToolMarkup {
-        var m = deepSeekDefault
-        // Try a few known alternative spellings for each role; use whichever the
-        // vocab defines. (All DeepSeek variants seen use the ▁-joined names.)
-        func first(_ candidates: [String], _ fallback: String) -> String {
-            for c in candidates where tokenizer.tokenId(c) != nil { return c }
-            return fallback
-        }
-        m.callsBegin = first(["<｜tool▁calls▁begin｜>", "<｜tool_calls_begin｜>"], m.callsBegin)
-        m.callsEnd   = first(["<｜tool▁calls▁end｜>", "<｜tool_calls_end｜>"], m.callsEnd)
-        m.callBegin  = first(["<｜tool▁call▁begin｜>", "<｜tool_call_begin｜>"], m.callBegin)
-        m.callEnd    = first(["<｜tool▁call▁end｜>", "<｜tool_call_end｜>"], m.callEnd)
-        m.sep        = first(["<｜tool▁sep｜>", "<｜tool_sep｜>"], m.sep)
-        m.outputsBegin = first(["<｜tool▁outputs▁begin｜>", "<｜tool_outputs_begin｜>"], m.outputsBegin)
-        m.outputsEnd   = first(["<｜tool▁outputs▁end｜>", "<｜tool_outputs_end｜>"], m.outputsEnd)
-        m.outputBegin  = first(["<｜tool▁output▁begin｜>", "<｜tool_output_begin｜>"], m.outputBegin)
-        m.outputEnd    = first(["<｜tool▁output▁end｜>", "<｜tool_output_end｜>"], m.outputEnd)
-        return m
+        for c in ["｜DSML｜", "|DSML|"] where tokenizer.tokenId(c) != nil { return ToolMarkup(dsml: c) }
+        return dsv4
     }
 }
 
 // MARK: - Rendering
 
-/// Renders a conversation (+ optional tools) to the rendered-chat string the
-/// tokenizer consumes. Mirrors the DeepSeek chat structure: a single system
-/// section (with the tool declarations appended when tools are present), then
-/// alternating user / assistant turns, with tool calls and tool outputs wrapped
-/// in the model markup. Ends with the assistant marker (+ <think>/</think>).
 public enum ChatRenderer {
-    /// Build the tool-declaration block appended to the system message.
-    public static func toolDeclarations(_ tools: [ToolSpec]) -> String {
+    /// The "## Tools" declaration block (DeepSeek-V4 paper, Table 4), appended to
+    /// the system section when tools are present.
+    public static func toolDeclarations(_ tools: [ToolSpec], markup m: ToolMarkup) -> String {
         guard !tools.isEmpty else { return "" }
-        var s = "\n\n## Tools\nYou have access to the following tools. " +
-                "When you decide to call a tool, emit the tool-call markup; otherwise answer normally.\n"
+        var s = """
+
+        ## Tools
+
+        You have access to a set of tools to help answer the user's question. You can \
+        invoke tools by writing a "\(m.callsOpen)" block like the following:
+
+        \(m.callsOpen)
+        \(m.invokeOpen("$TOOL_NAME"))
+        <\(m.dsml)parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</\(m.dsml)parameter>
+        ...
+        \(m.invokeClose)
+        ...
+        \(m.callsClose)
+
+        String parameters should be specified as is and set `string="true"`. For all \
+        other types (numbers, booleans, arrays, objects), pass the value in JSON format \
+        and set `string="false"`.
+
+        If thinking_mode is enabled (triggered by <think>), you MUST output your complete \
+        reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+        Otherwise, output directly after </think> with tool calls or final response.
+
+        ### Available Tool Schemas
+
+
+        """
         for t in tools {
-            s += "\n### \(t.name)\n\(t.description)\nParameters (JSON Schema): \(t.parametersJSON)\n"
+            s += "{\"name\": \"\(t.name)\", \"description\": \(jsonString(t.description)), " +
+                 "\"parameters\": \(t.parametersJSON)}\n"
         }
+        s += "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n"
         return s
     }
 
-    /// Render the whole conversation to a string. `think` controls the trailing
-    /// reasoning marker on the open assistant turn; `markup` carries the model's
-    /// tool tokens. The returned string is fed to `tokenizeRenderedChat`.
+    /// Render the whole conversation to the rendered-chat string the tokenizer
+    /// consumes. `think` controls the trailing reasoning marker on the open
+    /// assistant turn. The first system turn (+ tool declarations) is emitted up
+    /// front, then alternating user/assistant turns and tool results.
     public static func render(turns: [ChatTurn], tools: [ToolSpec], think: ThinkMode,
                               markup: ToolMarkup, bos: String = "<｜begin▁of▁sentence｜>",
                               eos: String = "<｜end▁of▁sentence｜>",
                               userTag: String = "<｜User｜>", assistantTag: String = "<｜Assistant｜>") -> String {
         var out = bos
-
-        // Collect the system text (only the first system turn is used, like the
-        // C template) and append tool declarations once, up front.
         let systemText = turns.compactMap { if case let .system(s) = $0 { return s } else { return nil } }.first ?? ""
-        let decls = toolDeclarations(tools)
+        let decls = toolDeclarations(tools, markup: markup)
         if !systemText.isEmpty || !decls.isEmpty { out += systemText + decls }
 
         for turn in turns {
             switch turn {
             case .system:
-                continue   // already emitted above
+                continue
             case .user(let text):
                 out += userTag + text
             case .assistant(let text, let calls):
@@ -152,80 +150,133 @@ public enum ChatRenderer {
                 if !calls.isEmpty { out += renderToolCalls(calls, markup: markup) }
                 out += eos
             case .toolResult(_, let name, let content):
-                out += markup.outputsBegin + markup.outputBegin + name + "\n" + content + markup.outputEnd + markup.outputsEnd
+                out += renderToolResult(name: name, content: content, markup: markup)
             }
         }
 
-        // Open the assistant turn for generation.
         out += assistantTag
         out += think.enabled ? "<think>" : "</think>"
         return out
     }
 
-    static func renderToolCalls(_ calls: [ToolCall], markup: ToolMarkup) -> String {
-        var s = markup.callsBegin
+    /// Render assistant-emitted tool calls back into the DSML block (for history).
+    static func renderToolCalls(_ calls: [ToolCall], markup m: ToolMarkup) -> String {
+        var s = "\n" + m.callsOpen + "\n"
         for c in calls {
-            s += markup.callBegin + "function" + markup.sep + c.name + "\n```json\n" + c.argumentsJSON + "\n```" + markup.callEnd
+            s += m.invokeOpen(c.name) + "\n"
+            for p in jsonToParams(c.argumentsJSON) {
+                s += m.paramOpen(p.name, string: p.isString) + p.value + m.paramClose + "\n"
+            }
+            s += m.invokeClose + "\n"
         }
-        s += markup.callsEnd
+        s += m.callsClose
         return s
     }
+
+    /// Tool result block. NOTE: extrapolated (DSML-consistent) — the paper's
+    /// Table 4 specifies the call format but not the result format; verify against
+    /// the model's chat_template.
+    static func renderToolResult(name: String, content: String, markup m: ToolMarkup) -> String {
+        "\n<\(m.dsml)tool_outputs>\n<\(m.dsml)output name=\"\(name)\">\(content)</\(m.dsml)output>\n</\(m.dsml)tool_outputs>"
+    }
+
+    /// Decompose a JSON arguments object into DSML parameters (name, string-flag,
+    /// rendered value). String values are emitted raw with string="true"; other
+    /// types are JSON-encoded with string="false". Keys sorted for determinism.
+    static func jsonToParams(_ json: String) -> [(name: String, isString: Bool, value: String)] {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        var out: [(name: String, isString: Bool, value: String)] = []
+        for key in obj.keys.sorted() {
+            let v = obj[key]!
+            if let str = v as? String {
+                out.append((key, true, str))
+            } else {
+                let d = (try? JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed])) ?? Data("null".utf8)
+                out.append((key, false, String(data: d, encoding: .utf8) ?? "null"))
+            }
+        }
+        return out
+    }
+}
+
+/// JSON-encode a string (with quotes/escapes), for the tool-schema block.
+func jsonString(_ s: String) -> String {
+    if let d = try? JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed]),
+       let str = String(data: d, encoding: .utf8) { return str }
+    return "\"\(s)\""
 }
 
 // MARK: - Parsing tool calls from generated text
 
 public enum ToolCallParser {
-    /// Extract tool calls from a completed assistant message. Returns the calls
-    /// and the visible text with the tool-call block stripped. Tolerant of the
-    /// optional ```json fences DeepSeek emits around the arguments.
-    public static func parse(_ text: String, markup: ToolMarkup) -> (calls: [ToolCall], visibleText: String) {
-        guard let blockStart = text.range(of: markup.callsBegin) else { return ([], text) }
-        let visible = String(text[text.startIndex..<blockStart.lowerBound])
-        // The block runs to callsEnd if present, else to the end of the string.
-        let afterBegin = blockStart.upperBound
-        let blockEnd = text.range(of: markup.callsEnd, range: afterBegin..<text.endIndex)?.lowerBound ?? text.endIndex
-        let block = String(text[afterBegin..<blockEnd])
+    /// Extract tool calls from a completed assistant message and return the visible
+    /// text (the DSML tool-call block stripped). Parses the DSML XML scheme.
+    public static func parse(_ text: String, markup m: ToolMarkup) -> (calls: [ToolCall], visibleText: String) {
+        guard let start = text.range(of: m.callsOpen) else { return ([], text) }
+        let visible = String(text[text.startIndex..<start.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let afterOpen = start.upperBound
+        let end = text.range(of: m.callsClose, range: afterOpen..<text.endIndex)?.lowerBound ?? text.endIndex
+        let block = String(text[afterOpen..<end])
 
         var calls: [ToolCall] = []
         var idx = 0
         var search = block.startIndex
-        while let cb = block.range(of: markup.callBegin, range: search..<block.endIndex) {
-            let ce = block.range(of: markup.callEnd, range: cb.upperBound..<block.endIndex)?.lowerBound ?? block.endIndex
-            let body = String(block[cb.upperBound..<ce])
-            if let call = parseOneCall(body, markup: markup, index: idx) { calls.append(call); idx += 1 }
-            search = (ce < block.endIndex) ? block.index(after: ce) : block.endIndex
+        let invokePrefix = "<\(m.dsml)invoke"
+        while let io = block.range(of: invokePrefix, range: search..<block.endIndex) {
+            let close = block.range(of: m.invokeClose, range: io.upperBound..<block.endIndex)?.lowerBound ?? block.endIndex
+            let body = String(block[io.lowerBound..<close])
+            if let call = parseInvoke(body, markup: m, index: idx) { calls.append(call); idx += 1 }
+            search = close < block.endIndex ? block.index(after: close) : block.endIndex
             if search >= block.endIndex { break }
         }
-        return (calls, visible.trimmingCharacters(in: .whitespacesAndNewlines))
+        return (calls, visible)
     }
 
-    /// One call body looks like: `function<sep>name\n```json\n{…}\n```` (the
-    /// leading "function" type and the fences are optional / tolerated).
-    static func parseOneCall(_ body: String, markup: ToolMarkup, index: Int) -> ToolCall? {
-        var rest = body
-        if let sep = rest.range(of: markup.sep) { rest = String(rest[sep.upperBound...]) }
-        rest = rest.trimmingCharacters(in: .whitespacesAndNewlines)
-        // name = up to the first newline (or the start of a ``` fence / { ).
-        let nameEnd = rest.firstIndex(where: { $0 == "\n" || $0 == "{" }) ?? rest.endIndex
-        let name = String(rest[rest.startIndex..<nameEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty { return nil }
-        var args = String(rest[nameEnd...])
-        args = stripJSONFence(args)
-        if args.isEmpty { args = "{}" }
-        return ToolCall(id: "call_\(index)", name: name, argumentsJSON: args)
-    }
-
-    /// Strip an optional ```json … ``` fence (or plain ``` …  ```), returning the
-    /// inner JSON, else the trimmed input.
-    static func stripJSONFence(_ s: String) -> String {
-        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let open = t.range(of: "```") {
-            // drop everything up to and including the opening fence line
-            var inner = String(t[open.upperBound...])
-            if let nl = inner.firstIndex(of: "\n") { inner = String(inner[inner.index(after: nl)...]) }
-            if let close = inner.range(of: "```") { inner = String(inner[inner.startIndex..<close.lowerBound]) }
-            t = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Parse one `<DSML|invoke name="…"> …params… ` body into a ToolCall.
+    static func parseInvoke(_ body: String, markup m: ToolMarkup, index: Int) -> ToolCall? {
+        guard let name = attributeValue("name", in: body) else { return nil }
+        var params: [(name: String, isString: Bool, value: String)] = []
+        var search = body.startIndex
+        let paramPrefix = "<\(m.dsml)parameter"
+        while let po = body.range(of: paramPrefix, range: search..<body.endIndex) {
+            guard let tagEnd = body.range(of: ">", range: po.upperBound..<body.endIndex) else { break }
+            let tag = String(body[po.lowerBound..<tagEnd.upperBound])
+            let pname = attributeValue("name", in: tag) ?? ""
+            let isString = (attributeValue("string", in: tag) ?? "true") == "true"
+            let valStart = tagEnd.upperBound
+            let pclose = body.range(of: m.paramClose, range: valStart..<body.endIndex)?.lowerBound ?? body.endIndex
+            let value = String(body[valStart..<pclose]).trimmingCharacters(in: .whitespacesAndNewlines)
+            params.append((pname, isString, value))
+            search = pclose < body.endIndex ? body.index(after: pclose) : body.endIndex
+            if search >= body.endIndex { break }
         }
-        return t
+        return ToolCall(id: "call_\(index)", name: name, argumentsJSON: paramsToJSON(params))
+    }
+
+    /// Build a JSON arguments object from parsed DSML parameters.
+    static func paramsToJSON(_ params: [(name: String, isString: Bool, value: String)]) -> String {
+        var parts: [String] = []
+        for p in params {
+            let key = jsonString(p.name)
+            let val: String
+            if p.isString {
+                val = jsonString(p.value)
+            } else if let d = p.value.data(using: .utf8),
+                      (try? JSONSerialization.jsonObject(with: d, options: [.fragmentsAllowed])) != nil {
+                val = p.value                    // already valid JSON
+            } else {
+                val = jsonString(p.value)        // fallback: treat as a string
+            }
+            parts.append("\(key):\(val)")
+        }
+        return "{" + parts.joined(separator: ",") + "}"
+    }
+
+    /// Extract `attr="value"` from an XML-ish tag/body.
+    static func attributeValue(_ attr: String, in s: String) -> String? {
+        guard let r = s.range(of: "\(attr)=\"") else { return nil }
+        guard let close = s.range(of: "\"", range: r.upperBound..<s.endIndex) else { return nil }
+        return String(s[r.upperBound..<close.lowerBound])
     }
 }

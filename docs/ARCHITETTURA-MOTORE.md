@@ -620,31 +620,43 @@ match *longest-first*. Così i marcatori di ruolo e di tool-call/output
 (begin/sep/end) diventano singoli id. Se `token_type` è assente, fallback ai 7.
 `tokenizer.tokenId(_:)` risolve l'id di un token arbitrario per stringa.
 
-### Tipi e markup (estratti dal modello)
+### Tipi e formato DSML (DeepSeek-V4 paper, Table 4)
 
 `ToolSpec` (nome, descrizione, JSON-Schema dei parametri), `ToolCall` (id, nome,
 argomenti JSON) e `ChatTurn` (`system`/`user`/`assistant(text,toolCalls)`/
-`toolResult`) sono i tipi base. `ToolMarkup` contiene le stringhe dei token che
-incapsulano chiamate/output; **`ToolMarkup.discover(in:)`** tiene solo quelle che
-il vocabolario del GGUF definisce davvero (default famiglia DeepSeek). È la
-realizzazione della scelta "estrai dal GGUF" senza eseguire il Jinja del
-`chat_template`: il *wire format* usa i token reali del modello.
+`toolResult`) sono i tipi base. Il *wire format* è quello **autorevole del paper**:
+una sintassi **XML basata sul token `｜DSML｜`** (non il markup
+`<｜tool▁calls▁begin｜>` di DeepSeek-V3):
 
-> ⚠️ La fonte di verità autorevole resta `tokenizer.chat_template` (Jinja). Qui
-> non lo eseguiamo; il renderer segue la **struttura della famiglia DeepSeek**
-> usando i token estratti dal modello. Se una build DS4 diverge, `ToolMarkup` e
-> le due funzioni qui sotto sono l'**unico** punto da adattare. Va verificato
-> contro il template reale del modello su una macchina con il GGUF.
+```
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_weather">
+<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
+<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+```
+
+I parametri **stringa** usano `string="true"` e il valore grezzo; gli **altri tipi**
+(numeri, booleani, array, oggetti) usano `string="false"` e il valore in JSON.
+`ToolMarkup` deriva tutti i tag dal singolo token `｜DSML｜`; `discover(in:)` ne
+conferma l'ortografia esatta nel vocab.
+
+> ⚠️ Il paper specifica con precisione il formato della **chiamata** (e la
+> dichiarazione "## Tools"); il formato del **risultato** tool
+> (`renderToolResult`) è un'estrapolazione DSML-coerente da verificare contro il
+> `tokenizer.chat_template` del modello.
 
 ### Rendering e parsing
 
 - **`ChatRenderer.render(turns:tools:think:markup:)`** produce la stringa di chat:
-  `BOS` + system (+ dichiarazione dei tool) + turni (user/assistant, con le
-  tool-call in markup, e i tool-output in markup) + turno assistant aperto
-  (`<think>`/`</think>`). La stringa va a `tokenizeRenderedChat`.
-- **`ToolCallParser.parse(_:markup:)`** estrae le `ToolCall` dall'output
-  dell'assistant (tollerante alle *fence* ```` ```json ````), restituendo anche
-  il testo visibile ripulito.
+  `BOS` + system (+ blocco dichiarazione "## Tools") + turni (user/assistant con
+  le tool-call in DSML, e i risultati tool) + turno assistant aperto
+  (`<think>`/`</think>`). I parametri si convertono da `argumentsJSON` ai tag
+  DSML (e viceversa nel parse).
+- **`ToolCallParser.parse(_:markup:)`** estrae le `ToolCall` dal blocco DSML
+  dell'output (gestisce `invoke`/`parameter`, ricostruisce `argumentsJSON`),
+  restituendo anche il testo visibile ripulito.
 
 ### Loop nell'`InferenceService`
 
@@ -653,9 +665,9 @@ Il servizio mantiene `turns` (conversazione) e `tools`. Ogni generazione:
 1. **render** dell'intera conversazione + tool → tokenizza → **prefill da pos 0**
    (nessun riuso KV tra turni);
 2. **decode** con rilevamento del blocco tool: quando il token campionato è
-   l'inizio-chiamata (`tok.tokenId(markup.callsBegin)`), smette di emettere
-   `.text` e bufferizza i byte del blocco; a fine generazione fa il parse ed
-   emette **`GenEvent.toolCall([ToolCall])`**;
+   **`｜DSML｜`** (`tok.dsmlId`, token singolo), smette di emettere `.text` e
+   bufferizza i byte del blocco; a fine generazione ricompone testo+blocco, fa il
+   parse ed emette **`GenEvent.toolCall([ToolCall])`**;
 3. registra il turno assistant (testo visibile + tool-call) nello storico.
 
 `provideToolResults(_:)` accoda i `toolResult` e rilancia la generazione: il
