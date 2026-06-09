@@ -620,32 +620,31 @@ match *longest-first*. Così i marcatori di ruolo e di tool-call/output
 (begin/sep/end) diventano singoli id. Se `token_type` è assente, fallback ai 7.
 `tokenizer.tokenId(_:)` risolve l'id di un token arbitrario per stringa.
 
-### Tipi e formato DSML (DeepSeek-V4 paper, Table 4)
+### Formato DSML (allineato al `tokenizer.chat_template` reale)
 
-`ToolSpec` (nome, descrizione, JSON-Schema dei parametri), `ToolCall` (id, nome,
-argomenti JSON) e `ChatTurn` (`system`/`user`/`assistant(text,toolCalls)`/
-`toolResult`) sono i tipi base. Il *wire format* è quello **autorevole del paper**:
-una sintassi **XML basata sul token `｜DSML｜`** (non il markup
-`<｜tool▁calls▁begin｜>` di DeepSeek-V3):
+`ToolSpec`, `ToolCall`, `ChatTurn` sono i tipi base. Il `ChatRenderer` **rispecchia
+il template Jinja del modello** (verificato sul GGUF). Punti salienti:
 
-```
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="get_weather">
-<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
-<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜tool_calls>
-```
+- **Dichiarazione** dei tool in un blocco system `## Tools` (testo verbatim del
+  template) + schemi delle funzioni in JSON (chiavi ordinate, ≈ `tojson`);
+- **Chiamata** in XML sul token `｜DSML｜`:
+  ```
+  <｜DSML｜tool_calls>
+  <｜DSML｜invoke name="get_weather">
+  <｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
+  <｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>
+  </｜DSML｜invoke>
+  </｜DSML｜tool_calls>
+  ```
+  stringhe → `string="true"` valore grezzo; altri tipi → `string="false"` valore JSON;
+- **Risultato** tool dentro un turno utente: `<｜User｜><tool_result>…</tool_result>`
+  (risultati consecutivi non ripetono `<｜User｜>`);
+- ogni turno assistant apre `<｜Assistant｜>` poi `</think>` (o `<think>…` per un
+  turno con ragionamento) e chiude con `<｜end▁of▁sentence｜>`;
+- niente newline spuria dopo il `BOS` (system attaccato al BOS).
 
-I parametri **stringa** usano `string="true"` e il valore grezzo; gli **altri tipi**
-(numeri, booleani, array, oggetti) usano `string="false"` e il valore in JSON.
-`ToolMarkup` deriva tutti i tag dal singolo token `｜DSML｜`; `discover(in:)` ne
-conferma l'ortografia esatta nel vocab.
-
-> ⚠️ Il paper specifica con precisione il formato della **chiamata** (e la
-> dichiarazione "## Tools"); il formato del **risultato** tool
-> (`renderToolResult`) è un'estrapolazione DSML-coerente da verificare contro il
-> `tokenizer.chat_template` del modello.
+> Allineato 1:1 al template del modello (no Jinja a runtime). Se il modello cambia
+> template, `ChatRenderer` è l'unico punto da adeguare.
 
 ### Rendering e parsing
 
