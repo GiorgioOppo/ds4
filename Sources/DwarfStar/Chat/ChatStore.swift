@@ -57,6 +57,9 @@ final class ChatStore {
     /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
     var awaitingManualResults = false
     private var partialAutoOutputs: [ToolOutput] = []
+    /// Guard against a tool loop (model re-calling instead of answering).
+    private var toolRounds = 0
+    private let maxToolRounds = 6
 
     // Live state.
     var phase: Phase = .needsModel
@@ -163,14 +166,15 @@ final class ChatStore {
         messages.append(UIMessage(role: .user, text: text))
         let index = appendAssistant()
         isGenerating = true
+        toolRounds = 0                     // fresh user turn resets the tool-loop guard
 
         let mode = thinkMode
         generation = Task { [weak self] in
             let stream = await service.send(userText: text, thinkMode: mode,
                                             sampling: SamplingParams(), maxTokens: 4096)
             await self?.consume(stream, into: index)
-            await self?.handleToolCalls(assistantIndex: index)
-            await MainActor.run { self?.finishIfIdle() }
+            let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
+            if !continued { await MainActor.run { self?.finishIfIdle() } }
         }
     }
 
@@ -205,6 +209,7 @@ final class ChatStore {
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false
+        toolRounds = 0
         Task { await service.resetConversation(systemPrompt: sys) }
     }
 
@@ -241,11 +246,19 @@ final class ChatStore {
     }
 
     /// Execute the tool calls the assistant emitted: auto-run built-ins, collect
-    /// manual ones, and continue the conversation when all results are ready.
-    private func handleToolCalls(assistantIndex index: Int) async {
-        guard let service, index < messages.count else { return }
+    /// manual ones, and continue the conversation. Returns true if generation
+    /// continues (a continuation was spawned or we're awaiting manual input) — in
+    /// which case the caller must NOT mark generation finished.
+    private func handleToolCalls(assistantIndex index: Int) async -> Bool {
+        guard let service, index < messages.count else { return false }
         let calls = messages[index].toolCalls
-        guard !calls.isEmpty else { return }
+        guard !calls.isEmpty else { return false }
+
+        toolRounds += 1
+        if toolRounds > maxToolRounds {
+            messages.append(UIMessage(role: .tool, text: "⚠️ troppi round di tool (\(maxToolRounds)) — interrotto."))
+            return false
+        }
 
         var outputs: [ToolOutput] = []
         var manual: [ToolCall] = []
@@ -259,17 +272,17 @@ final class ChatStore {
         }
 
         if !manual.isEmpty {
-            // Pause for manual entry; the auto results so far are kept.
             partialAutoOutputs = outputs
             pendingManualCalls = manual
             awaitingManualResults = true
-            return
+            return true
         }
         continueWithToolOutputs(outputs, service: service)
+        return true
     }
 
     /// Feed tool outputs back and stream the model's continuation (which may emit
-    /// further tool calls — the loop repeats).
+    /// further tool calls — the loop repeats, bounded by maxToolRounds).
     private func continueWithToolOutputs(_ outputs: [ToolOutput], service: InferenceService) {
         let index = appendAssistant()
         isGenerating = true
@@ -278,8 +291,8 @@ final class ChatStore {
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
                                                           sampling: SamplingParams(), maxTokens: 4096)
             await self?.consume(stream, into: index)
-            await self?.handleToolCalls(assistantIndex: index)
-            await MainActor.run { self?.finishIfIdle() }
+            let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
+            if !continued { await MainActor.run { self?.finishIfIdle() } }
         }
     }
 }
