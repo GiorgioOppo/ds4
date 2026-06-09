@@ -28,6 +28,8 @@ public struct DecodeProfile: Sendable {
     public var headS = 0.0        // output head
     public var forwards = 0       // number of forward() calls (= tokens)
     public var layers = 0         // total per-layer iterations
+    public var expertHits = 0     // expert slot-cache hits (persistent experts)
+    public var expertMisses = 0   // expert slot-cache misses (changed experts)
 
     public init() {}
 
@@ -38,6 +40,11 @@ public struct DecodeProfile: Sendable {
         func ms(_ s: Double) -> String { String(format: "%6.1f", s / f * 1000) }
         func pct(_ s: Double) -> String { String(format: "%2.0f%%", total > 0 ? s / total * 100 : 0) }
         let tps = total > 0 ? f / total : 0
+        var cacheLine = ""
+        if expertHits + expertMisses > 0 {
+            let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
+            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
+        }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
@@ -45,7 +52,7 @@ public struct DecodeProfile: Sendable {
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
           experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
-          output head  \(ms(headS)) ms/token  (\(pct(headS)))
+          output head  \(ms(headS)) ms/token  (\(pct(headS)))\(cacheLine)
           ----------------------------------------
           totale       \(ms(total)) ms/token  (~\(String(format: "%.2f", tps)) tok/s)
         """
@@ -70,6 +77,10 @@ public final class StreamingDecoder {
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
     /// the router and loads 6/256 experts on demand instead of the full set.
     let expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))?
+    /// Optional LRU slot-cache ("persistent + changing experts"): when set, the
+    /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
+    /// only the misses; the matvec runs on the pool with slot-index ids.
+    let slotCache: ExpertSlotCache?
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
@@ -82,10 +93,12 @@ public final class StreamingDecoder {
                 layerProvider: @escaping (Int) throws -> LayerWeights,
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
                 rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
-                expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil) throws {
+                expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
+                slotCache: ExpertSlotCache? = nil) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
+        self.slotCache = slotCache
         let hcDim = dims.nHC * dims.nEmbd
         // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
         // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
@@ -337,16 +350,36 @@ public final class StreamingDecoder {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
-            t = Date()
-            let (g, u, dn) = try gather(i, ids)
-            profile.gatherS += Date().timeIntervalSince(t)
-            t = Date()
-            let c2 = GraphContext(rt); try c2.begin()
-            try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                 ids: idsPacked, outHc: other, activeK: K)
-            c2.commit()
-            profile.expertsS += Date().timeIntervalSince(t)
+            if let cache = slotCache {
+                // Persistent + changing experts: hits are already resident in the
+                // layer's GPU pool (zero copies); only misses are filled from the
+                // mmap. The matvec indexes the pool with slot ids.
+                t = Date()
+                let (pool, slots) = try cache.acquire(layer: i, ids: ids)
+                profile.gatherS += Date().timeIntervalSince(t)
+                profile.expertHits = cache.hits
+                profile.expertMisses = cache.misses
+                let slotsBuf = try GPUTensor.bytes(rt, slots.withUnsafeBytes { Array($0) },
+                                                   elementCount: K)
+                t = Date()
+                let c2 = GraphContext(rt); try c2.begin()
+                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
+                                     upExp: pool.up, downExp: pool.down,
+                                     ids: slotsBuf, outHc: other, activeK: K)
+                c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
+            } else {
+                // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
+                t = Date()
+                let (g, u, dn) = try gather(i, ids)
+                profile.gatherS += Date().timeIntervalSince(t)
+                t = Date()
+                let c2 = GraphContext(rt); try c2.begin()
+                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                     ids: idsPacked, outHc: other, activeK: K)
+                c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
+            }
         } else {
             let t = Date()
             let lc = GraphContext(rt); try lc.begin()
@@ -443,10 +476,35 @@ public final class StreamingDecoder {
             let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
             return (g, u, dn)
         }
+        // Persistent + changing experts (DS4_EXPERT_CACHE_SLOTS=N, default off):
+        // per layer, an N-slot LRU pool keeps hot experts resident in GPU buffers;
+        // only misses are memcpy'd from the mmap. The pool is WIRED memory
+        // (~6.9 MB/slot on the 2-bit model × nLayers): on tight-RAM machines start
+        // small (4-8) and watch the hit rate in the decode profile.
+        var cache: ExpertSlotCache? = nil
+        if let s = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"],
+           let nSlots = Int(s), nSlots > 0 {
+            let S = max(8, nSlots)
+            let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
+            let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
+            let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+            cache = ExpertSlotCache(slotsPerLayer: S, makePool: {
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: S * gateBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: S * upBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: S * downBytes))
+            }, fill: { il, id, pool, slot in
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
+                                           expertBytes: gateBytes, into: pool.gate, slot: slot)
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_up_exps.weight", id: id,
+                                           expertBytes: upBytes, into: pool.up, slot: slot)
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
+                                           expertBytes: downBytes, into: pool.down, slot: slot)
+            })
+        }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather)
+                                    expertGather: gather, slotCache: cache)
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

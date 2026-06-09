@@ -515,6 +515,21 @@ gli altri token nello stesso layer); l'I/O scende da `6·token` a
 in meno nella fase dominante. L'unione per gruppo è limitata da
 `DS4_PREFILL_UNION` (default 64 expert ≈ 450 MB transitori sul modello 2-bit).
 
+### Cache expert a slot — "persistenti + che cambiano" (`ExpertSlotCache`)
+
+Nel **decode**, opzionalmente (`DS4_EXPERT_CACHE_SLOTS=N`, default off), ogni layer
+ha un **pool LRU di N slot** in buffer GPU condivisi (gate/up/down packed per
+slot). Gli expert *caldi* restano **residenti** nel pool tra i token (hit = zero
+copie); un *miss* evicta lo slot meno usato e copia **solo quell'expert**
+dall'mmap. Il matvec gira sul pool usando gli **indici di slot come id**, quindi
+funzionano sia i kernel validati sia i **fusi** — nessun kernel nuovo. Statistiche
+hit/miss nel profilo decode (`cache expert X hit / Y miss`).
+
+⚠️ Il pool è memoria **wired** (≈6,9 MB/slot sul modello 2-bit × 43 layer: N=8 ≈
+2,4 GB) e compete con la page cache: su macchine con poca RAM parti basso (4–8)
+e guarda l'hit-rate; con routing molto uniforme (load balancing) la cache può non
+ripagare. Sul prefill resta la dedup a unione (più adatta al batch).
+
 ### Pattern "split command buffer"
 
 Ogni layer gira nel **proprio command buffer** (`commit + wait`, poi evict). I

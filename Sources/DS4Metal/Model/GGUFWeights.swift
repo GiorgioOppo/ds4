@@ -166,6 +166,16 @@ public enum GGUFWeights {
         return try GPUTensor.bytes(rt, packed, elementCount: ids.count * expertBytes)
     }
 
+    /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
+    /// (the ExpertSlotCache fill primitive; dst is a shared-storage pool tensor).
+    public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
+                                  expertBytes: Int, into dst: GPUTensor, slot: Int) throws {
+        guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
+        let src = model.mapBase + Int(t.absOffset) + Int(id) * expertBytes
+        memcpy(dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes),
+               src, expertBytes)
+    }
+
     /// Assemble the output-head weights + embedding table.
     public static func outputHead(_ rt: MetalRuntime, _ model: GGUFModel) throws -> (embed: GPUTensor, head: OutputHeadWeights) {
         let embed = try tensor(rt, model, "token_embd.weight")
