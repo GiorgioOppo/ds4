@@ -77,9 +77,10 @@ public actor InferenceService {
     private var needsClose = false
     private var systemPrompt: String?
     private var tools: [ToolSpec] = []
-    // Compact tool declaration (just name(params)) to save prefill tokens on
-    // local inference. Default from env DS4_TOOLS_COMPACT, overridable via setter.
-    private var compactTools = ProcessInfo.processInfo.environment["DS4_TOOLS_COMPACT"] != nil
+    // Compact tool declaration (just name(params)) to save prefill tokens.
+    // Defaults to true (local inference); the GUI toggle is the single source of
+    // truth and pushes its value via setCompactTools (no env override).
+    private var compactTools = true
     /// Set when a generation was interrupted (cancel/error) mid-stream: the GPU
     /// KV cache and the recurrent NSA-compressor state may then be inconsistent
     /// with `committedIds`. The next generation rebuilds the KV from the exact

@@ -176,7 +176,15 @@ final class ChatStore {
         continueWithToolOutputs(outputs, service: service)
     }
 
+    /// Abandon the pending manual tool calls without answering them. The calls
+    /// stay in the committed KV (the model emitted them), so the next user turn
+    /// follows an unanswered call — the model generally copes, but we surface the
+    /// abandonment in the transcript so the state is visible.
     func cancelManualResults() {
+        if !pendingManualCalls.isEmpty {
+            let names = pendingManualCalls.map(\.name).joined(separator: ", ")
+            messages.append(UIMessage(role: .tool, text: "✗ risultati non forniti per: \(names)"))
+        }
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false

@@ -106,6 +106,14 @@ final class ChatToolsTests: XCTestCase {
         XCTAssertEqual(calls[0].name, "now")
     }
 
+    /// Backslash-escaped quotes inside attribute values are unescaped, not truncated.
+    func testAttributeValueEscapedQuotes() {
+        XCTAssertEqual(ToolCallParser.attributeValue("name", in: #"name="plain""#), "plain")
+        XCTAssertEqual(ToolCallParser.attributeValue("name", in: #"name="say_\"hi\"_now""#), #"say_"hi"_now"#)
+        XCTAssertNil(ToolCallParser.attributeValue("name", in: #"name="unterminated"#))
+        XCTAssertNil(ToolCallParser.attributeValue("name", in: "other=\"x\""))
+    }
+
     /// Compact mode lists only name(params) + a one-line format hint, and is much
     /// shorter than the full declaration.
     func testCompactToolsDeclaration() {

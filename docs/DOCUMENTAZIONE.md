@@ -338,8 +338,8 @@ Nel foglio **Tool** c'è anche il toggle **"Dichiarazione compatta"** (attivo di
 default): invece dello schema completo dei tool manda solo `nome(parametri)` + una
 riga di formato → **meno token di prefill** (utile sull'inferenza locale, dove ogni
 token pesa), al piccolo costo di discostarsi dal testo di addestramento. Disattivalo
-per il formato pieno se la qualità delle chiamate ne risente. Da CLI/ambiente:
-`DS4_TOOLS_COMPACT=1`.
+per il formato pieno se la qualità delle chiamate ne risente (il toggle è l'unica
+fonte di verità: non esiste più una variabile d'ambiente).
 
 Tutti i built-in sono abilitati di default e vengono eseguiti automaticamente.
 

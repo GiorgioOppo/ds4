@@ -224,6 +224,9 @@ public enum ChatRenderer {
     /// Decompose a JSON arguments object into DSML parameters (name, string-flag,
     /// rendered value). String values are raw with string="true"; other types are
     /// JSON-encoded with string="false". Keys sorted for determinism.
+    /// NOTE: invalid/non-object JSON yields [] (the invoke renders with no
+    /// parameters). Cold path: used only when re-rendering history (diagnostics,
+    /// tests) — the live engine keeps the model's own tokens in the KV instead.
     static func jsonToParams(_ json: String) -> [(name: String, isString: Bool, value: String)] {
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
@@ -314,10 +317,25 @@ public enum ToolCallParser {
         return "{" + parts.joined(separator: ",") + "}"
     }
 
-    /// Extract `attr="value"` from an XML-ish tag/body.
+    /// Extract `attr="value"` from an XML-ish tag/body. Backslash-escaped quotes
+    /// inside the value (\" ) are honored and unescaped, so a name like
+    /// `say_\"hi\"` doesn't truncate the value at the first quote.
     static func attributeValue(_ attr: String, in s: String) -> String? {
         guard let r = s.range(of: "\(attr)=\"") else { return nil }
-        guard let close = s.range(of: "\"", range: r.upperBound..<s.endIndex) else { return nil }
-        return String(s[r.upperBound..<close.lowerBound])
+        var value = ""
+        var i = r.upperBound
+        while i < s.endIndex {
+            let c = s[i]
+            if c == "\\", s.index(after: i) < s.endIndex, s[s.index(after: i)] == "\"" {
+                value.append("\"")
+                i = s.index(i, offsetBy: 2)
+            } else if c == "\"" {
+                return value
+            } else {
+                value.append(c)
+                i = s.index(after: i)
+            }
+        }
+        return nil   // unterminated attribute
     }
 }
