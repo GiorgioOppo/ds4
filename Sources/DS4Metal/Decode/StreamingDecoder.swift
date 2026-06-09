@@ -15,6 +15,43 @@ import DS4Core
 // weights (real path: GGUFWeights.layer(rt, model, i)); the returned LayerWeights
 // is dropped after the layer commits, freeing its Metal buffers (eviction).
 
+/// Per-phase wall-clock accumulator for the decode forward pass. Each phase is
+/// timed around a committed (and waited) command buffer / a CPU gather, so the
+/// numbers reflect real elapsed time and answer "I/O vs compute". Times are
+/// totals over all forward() calls; `report()` averages per token.
+public struct DecodeProfile: Sendable {
+    public var embedS = 0.0       // token embedding
+    public var routeS = 0.0       // attention + router (compute)
+    public var gatherS = 0.0      // gather the 6 selected experts from the mmap (EXPERT I/O)
+    public var expertsS = 0.0     // shared FFN + routed MoE matvec (compute)
+    public var layerOtherS = 0.0  // non-split decode path (resident experts)
+    public var headS = 0.0        // output head
+    public var forwards = 0       // number of forward() calls (= tokens)
+    public var layers = 0         // total per-layer iterations
+
+    public init() {}
+
+    public func report() -> String {
+        guard forwards > 0 else { return "Profilo decode: nessun forward registrato." }
+        let f = Double(forwards)
+        let total = embedS + routeS + gatherS + expertsS + layerOtherS + headS
+        func ms(_ s: Double) -> String { String(format: "%6.1f", s / f * 1000) }
+        func pct(_ s: Double) -> String { String(format: "%2.0f%%", total > 0 ? s / total * 100 : 0) }
+        let tps = total > 0 ? f / total : 0
+        return """
+        Profilo decode — \(forwards) token, \(layers) iterazioni-layer
+          embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
+          route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute
+          gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
+          experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
+          layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
+          output head  \(ms(headS)) ms/token  (\(pct(headS)))
+          ----------------------------------------
+          totale       \(ms(total)) ms/token  (~\(String(format: "%.2f", tps)) tok/s)
+        """
+    }
+}
+
 public final class StreamingDecoder {
     let rt: MetalRuntime
     let d: DSV4Dims
@@ -24,6 +61,10 @@ public final class StreamingDecoder {
     let embedTable: GPUTensor
     let out: OutputHeadWeights
     let rmsEps: Float, hcEps: Float
+
+    /// Per-phase decode timing (opt-in: read after a run, reset between runs).
+    public var profile = DecodeProfile()
+    public func resetProfile() { profile = DecodeProfile() }
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -71,11 +112,13 @@ public final class StreamingDecoder {
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
         if pos == 0 { for c in compStates { try c?.reset(rt) } }
         // embedding (own command buffer)
+        var t = Date()
         let ec = GraphContext(rt)
         try ec.begin()
         try ec.embedTokenHC(table: embedTable, token: token, embd: embd, hc: hcA,
                             nEmbd: d.nEmbd, nVocab: d.vocab, nHC: d.nHC)
         ec.commit()
+        profile.embedS += Date().timeIntervalSince(t)
 
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
@@ -83,29 +126,39 @@ public final class StreamingDecoder {
             let layerRope = DSV4Shape.ropeParams(layer: i)
             if let gather = expertGather {
                 // Phase 1: route (own cb) -> read the 6 selected ids.
+                t = Date()
                 let c1 = GraphContext(rt); try c1.begin()
                 try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
                 c1.commit()
+                profile.routeS += Date().timeIntervalSince(t)
                 let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
                 let ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
-                // Gather ONLY the 6 selected experts, then phase 2 (own cb).
+                // Gather ONLY the 6 selected experts (EXPERT I/O from the mmap), then phase 2.
+                t = Date()
                 let (g, u, dn) = try gather(i, ids)
+                profile.gatherS += Date().timeIntervalSince(t)
+                t = Date()
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
                                      ids: idsPacked, outHc: other)
                 c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
             } else {
+                t = Date()
                 let lc = GraphContext(rt); try lc.begin()
                 try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
                 lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
+                profile.layerOtherS += Date().timeIntervalSince(t)
             }
+            profile.layers += 1
             swap(&cur, &other)
             // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
         }
 
         // output head (own command buffer)
+        t = Date()
         let oc = GraphContext(rt)
         try oc.begin()
         try oc.rmsNorm(cur, weight: nil, out: flat, rows: 1, n: hcDim, eps: rmsEps)
@@ -116,6 +169,8 @@ public final class StreamingDecoder {
         try oc.rmsNorm(oembd, weight: out.norm, out: onormed, rows: 1, n: d.nEmbd, eps: rmsEps)
         try oc.matmulQ8_0(weight: out.head, x: onormed, out: logits, inDim: d.nEmbd, outDim: d.vocab)
         oc.commit()
+        profile.headS += Date().timeIntervalSince(t)
+        profile.forwards += 1
         return logits.floatArray(d.vocab)
     }
 

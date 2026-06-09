@@ -89,6 +89,7 @@ do {
             log(String(format: "  prefill %d/%d  %.1fs", i + 1, ids.count, Date().timeIntervalSince(t0)))
         }
         // Decode: stream each token's bytes to stdout AS it is produced (like ds4).
+        dec.resetProfile()   // profila solo la fase di decode (non il prefill)
         stdout.write(Data("\nRisposta: ".utf8))
         var rng: UInt64 = 1
         var genTokens = 0
@@ -107,6 +108,8 @@ do {
         let total = Date().timeIntervalSince(genStart)
         log(String(format: "DS4Demo: %d tokens in %.1fs (%.2f tok/s)", genTokens, total,
                    total > 0 ? Double(genTokens) / total : 0))
+        log("")
+        log(dec.profile.report())
     }
     exit(0)
 } catch {

@@ -112,6 +112,10 @@ public actor InferenceService {
     /// The raw Jinja chat template embedded in the GGUF (for inspection), if any.
     public func chatTemplate() -> String? { model.string("tokenizer.chat_template") }
 
+    /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
+    public func resetDecodeProfile() { decoder.resetProfile() }
+    public func decodeProfileReport() -> String { decoder.profile.report() }
+
     public func resetConversation(systemPrompt: String?) {
         if let systemPrompt, !systemPrompt.isEmpty { turns = [.system(systemPrompt)] }
         else { turns = [] }
