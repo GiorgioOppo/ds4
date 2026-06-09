@@ -448,6 +448,22 @@ Il quant di gate/up/down è **per-tensore** e configurato da `DSV4Dims`
 (`gateQuant`, `upQuant`, `downQuant`), così lo stesso codice serve sia il
 modello Q4_K sia quello a 2 bit (`IQ2_XXS` gate/up + `Q2_K` down).
 
+### Kernel MoE fusi (decode)
+
+Il percorso routed del decode usa, quando lo schema quant lo permette, i **kernel
+fusi del percorso release del motore C** — 2 dispatch invece di 5:
+
+- **`kernel_mul_mv_id_<q>_pair_swiglu_f32`** (`iq2_xxs`/`q4_K`): gate+up matvec +
+  SwiGLU·peso di routing in un solo dispatch (`mid` scritto direttamente, niente
+  re-lettura degli intermedi gate/up);
+- **`kernel_mul_mv_id_<q>_sum6_f32`** (`q2_K`/`q4_K`): down-projection + somma dei
+  **6** expert in un solo dispatch (scrive direttamente la riga routed). Il kernel
+  ha i 6 slot cablati, quindi è usato solo a k pieno (`activeExperts == 6`).
+
+Combinazioni senza kernel fuso (o `DS4_FUSED_MOE=0` per il confronto A/B) usano il
+percorso validato a 5 dispatch. L'equivalenza numerica dei due percorsi è coperta
+da `MetalMoEFusedDecodeTests`.
+
 ### Esperti attivi configurabili (`DSV4Dims.activeExperts`, env `DS4_ACTIVE_EXPERTS`)
 
 Il router sceglie sempre i **top-6 di 256**. Se `activeExperts < 6`, il path di

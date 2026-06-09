@@ -352,6 +352,78 @@ extension GraphContext {
                         k: k, inDim: inDim, outDim: outDim, perExpertAct: perExpertAct)
     }
 
+    /// FUSED routed gate+up matvec + SwiGLU·route-weight (1 dispatch instead of 3):
+    /// mid[e] = silu(clamp(gate_e·x)) · clamp(up_e·x) · w[e] for each selected expert.
+    /// Mirrors the C engine's release path (kernel_mul_mv_id_<q>_pair_swiglu_f32).
+    /// `gateScratch`/`upScratch` receive diagnostic raw projections (row collisions
+    /// are harmless — nothing reads them in release). Only iq2_xxs/q4_K exist.
+    public func moePairSwiGLU(_ quant: MoEQuant, gateExp: GPUTensor, upExp: GPUTensor,
+                              ids: GPUTensor, activation: GPUTensor, weights: GPUTensor,
+                              gateScratch: GPUTensor, upScratch: GPUTensor, mid: GPUTensor,
+                              k: Int, inDim: Int, outDim: Int, clamp: Float) throws {
+        let kernel: String
+        switch quant {
+        case .iq2_xxs: kernel = "kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32"
+        case .q4_K:    kernel = "kernel_mul_mv_id_q4_K_pair_swiglu_f32"
+        case .q2_K:    throw MetalError.missingKernel("no q2_K pair_swiglu kernel")
+        }
+        let nsg = 4, nr0 = quant.nr0
+        let rowBytes = (inDim / 256) * quant.blockBytes
+        let args = Self.mulMVIdArgsFull(nei0: k, nei1: 1, nbi1: UInt64(k * 4), ne00: inDim, ne01: outDim,
+                                        nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
+                                        nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 1,
+                                        nb10: 4, nb11: UInt64(inDim * 4), nb12: UInt64(inDim * 4),
+                                        ne0: outDim, nb1: UInt64(outDim * 4), nr0: Int32(nr0))
+        let act = MetalRuntime.moeSwiGLUWeightArgs(width: outDim, rows: k, clampValue: clamp, midF16: false)
+        let pso = try rt.mulMVPipeline(kernel, nsg: Int16(nsg))
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        act.withUnsafeBytes { e.setBytes($0.baseAddress!, length: act.count, index: 1) }
+        e.setBuffer(gateExp.buffer, offset: gateExp.byteOffset, index: 2)
+        e.setBuffer(upExp.buffer, offset: upExp.byteOffset, index: 3)
+        e.setBuffer(activation.buffer, offset: 0, index: 4)
+        e.setBuffer(gateScratch.buffer, offset: 0, index: 5)
+        e.setBuffer(upScratch.buffer, offset: 0, index: 6)
+        e.setBuffer(mid.buffer, offset: 0, index: 7)
+        e.setBuffer(ids.buffer, offset: 0, index: 8)
+        e.setBuffer(weights.buffer, offset: 0, index: 9)
+        e.setThreadgroupMemoryLength(quant.threadgroupBytes, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (outDim + nsg * nr0 - 1) / (nsg * nr0), height: 1, depth: k),
+                               threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
+    }
+
+    /// FUSED routed down-projection + sum over the 6 selected experts (1 dispatch
+    /// instead of 2): out[outDim] = Σ_e down_e · mid[e]. The kernel hardcodes 6
+    /// expert slots, so it requires k == 6. Only q2_K/q4_K exist.
+    public func moeDownSum6(_ quant: MoEQuant, experts: GPUTensor, ids: GPUTensor,
+                            mid: GPUTensor, out: GPUTensor, inDim: Int, outDim: Int) throws {
+        let kernel: String
+        switch quant {
+        case .q2_K:    kernel = "kernel_mul_mv_id_q2_K_sum6_f32"
+        case .q4_K:    kernel = "kernel_mul_mv_id_q4_K_sum6_f32"
+        case .iq2_xxs: throw MetalError.missingKernel("no iq2_xxs down_sum6 kernel")
+        }
+        let nsg = 4, nr0 = quant.nr0
+        let rowBytes = (inDim / 256) * quant.blockBytes
+        let args = Self.mulMVIdArgsFull(nei0: 6, nei1: 1, nbi1: 6 * 4, ne00: inDim, ne01: outDim,
+                                        nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
+                                        nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 6,
+                                        nb10: 4, nb11: UInt64(inDim * 4), nb12: UInt64(6 * inDim * 4),
+                                        ne0: outDim, nb1: UInt64(outDim * 4), nr0: Int32(nr0))
+        let pso = try rt.mulMVPipeline(kernel, nsg: Int16(nsg))
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(experts.buffer, offset: experts.byteOffset, index: 1)
+        e.setBuffer(mid.buffer, offset: 0, index: 2)
+        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(ids.buffer, offset: 0, index: 4)
+        e.setThreadgroupMemoryLength(quant.threadgroupBytes, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (outDim + nsg * nr0 - 1) / (nsg * nr0), height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
+    }
+
     /// Encode-form per-expert SwiGLU+route-weight: mid[e]=silu(gate[e])*up[e]*w[e].
     public func moeSwiGLUWeight(gate: GPUTensor, up: GPUTensor, weights: GPUTensor, mid: GPUTensor,
                                 width: Int, rows: Int, clampValue: Float = 0) throws {

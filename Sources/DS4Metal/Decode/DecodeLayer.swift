@@ -30,6 +30,10 @@ public struct DSV4Dims {
     /// expert I/O (fewer experts gathered from the mmap) and compute, at a quality
     /// cost — the model was trained with k=6. Honored by the streaming/gather path.
     public var activeExperts: Int = 6
+    /// Use the fused MoE kernels (pair_swiglu + down_sum6, the C engine's release
+    /// path: 2 dispatches instead of 5) when the quant scheme supports them.
+    /// DS4_FUSED_MOE=0 disables for A/B comparison.
+    public var fusedMoE: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_MOE"] != "0"
     /// Per-group slice of the attention heads (qDim / nOutGroup).
     public var attnGroupDim: Int { qDim / nOutGroup }
     /// Low-rank attention output dim (nOutGroup * nLoraO).
@@ -253,12 +257,31 @@ extension GraphContext {
         try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
         try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
-        // routed MoE over the provided experts (per-tensor quant: gate/up + down)
-        try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-        try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-        try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
-        try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
-        try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
+        // routed MoE over the provided experts (per-tensor quant: gate/up + down).
+        // Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when the
+        // quant scheme has the kernels; otherwise the validated 5-dispatch path.
+        let pairFused = d.fusedMoE && d.gateQuant == d.upQuant
+            && (d.gateQuant == .iq2_xxs || d.gateQuant == .q4_K)
+        if pairFused {
+            try moePairSwiGLU(d.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
+                              activation: x, weights: s.rw, gateScratch: s.gate6,
+                              upScratch: s.up6, mid: s.mid6,
+                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
+        } else {
+            try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
+        }
+        // down_sum6 hardcodes 6 expert slots: usable only at full k.
+        let sumFused = d.fusedMoE && kk == 6
+            && (d.downQuant == .q2_K || d.downQuant == .q4_K)
+        if sumFused {
+            try moeDownSum6(d.downQuant, experts: downExp, ids: ids, mid: s.mid6,
+                            out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd)
+        } else {
+            try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+            try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
+        }
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
         // HC expand post-FFN (post=split[4:8], comb=split[8:24]) -> outHc
         try hcExpand4(blockOut: s.ffnOut, residual: resid, post: sp, comb: sp,
