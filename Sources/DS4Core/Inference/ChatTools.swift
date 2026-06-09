@@ -111,11 +111,15 @@ public enum ChatRenderer {
     /// format hint the model won't emit the DSML markup we can parse.
     static func compactToolsDeclaration(_ tools: [ToolSpec], markup m: ToolMarkup) -> String {
         let d = m.dsml
-        var s = "## Tools\nAvailable tools — to call, emit a <\(d)tool_calls> block with " +
-                "<\(d)invoke name=\"NAME\"> and <\(d)parameter name=\"P\" string=\"true|false\">VALUE</\(d)parameter>:\n"
+        var s = "## Tools\n"
         for t in tools {
             s += "- \(t.name)(\(paramNames(t.parametersJSON).joined(separator: ", ")))\n"
         }
+        // Single, prose-free format line (full open/close nesting once) so the model
+        // still emits parsable DSML. This is the irreducible floor for working calls.
+        s += "Call: <\(d)tool_calls><\(d)invoke name=\"NAME\">" +
+             "<\(d)parameter name=\"P\" string=\"true|false\">V</\(d)parameter>" +
+             "</\(d)invoke></\(d)tool_calls>\n"
         return s
     }
 
