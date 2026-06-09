@@ -153,7 +153,9 @@ public final class StreamingDecoder {
 
     /// Process one prompt chunk [start, end) layer-major at absolute positions
     /// posBase+start … . Weights for each layer are loaded once and applied to all
-    /// the chunk's tokens (in order). Returns the chunk's last token's final HC state.
+    /// the chunk's tokens (in order). On the expert-gather path the routed-FFN
+    /// phase is BATCHED: each unique expert is gathered once per group instead of
+    /// 6 per token. Returns the chunk's last token's final HC state.
     private func prefillRange(_ tokens: [Int], start: Int, end: Int, posBase: Int) throws -> GPUTensor {
         let n = end - start
         let hcDim = d.nHC * d.nEmbd
@@ -164,14 +166,105 @@ public final class StreamingDecoder {
             try Task.checkCancellation()
             let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
             let layerRope = DSV4Shape.ropeParams(layer: i)
-            for j in 0..<n {
-                let pos = posBase + start + j         // attends KV[0..pos] (incl. earlier chunks/turns)
-                try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
-                             pos: pos, nKeys: pos + 1)
+            if let gather = expertGather, n > 1 {
+                try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
+                                       n: n, posBase: posBase + start, gather: gather)
+            } else {
+                for j in 0..<n {
+                    let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
+                    try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                                 pos: pos, nKeys: pos + 1)
+                }
             }
             swap(&cur, &other)                       // w drops here -> EVICT
         }
         return cur[n - 1]
+    }
+
+    /// Max experts gathered per group in the batched prefill (bounds the packed
+    /// union tensors' transient memory: ~7 MB/expert on the 2-bit model). Env
+    /// override: DS4_PREFILL_UNION. Never below d.k.
+    private var maxUnionExperts: Int {
+        let v = ProcessInfo.processInfo.environment["DS4_PREFILL_UNION"].flatMap(Int.init) ?? 64
+        return max(d.k, v)
+    }
+
+    /// One prefill layer over all chunk tokens with BATCHED expert I/O.
+    /// Phase A — routes run sequentially per token (attention is causal: token j
+    /// attends KV written by tokens 0..j in this same layer), saving each token's
+    /// FFN inputs (attn-normed cur, residual, HC split) and its expert selection.
+    /// Phase B — tokens are grouped; each group's UNION of selected experts is
+    /// gathered ONCE and every token's FFN runs over it with remapped ids.
+    /// Numerically identical to the per-token path (a token's FFN does not feed
+    /// other tokens within the layer); only the expert I/O is deduplicated:
+    /// ≤ min(6·tokens, 256) expert reads per layer instead of 6·tokens.
+    private func batchedExpertLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
+                                    cur: [GPUTensor], other: [GPUTensor], n: Int, posBase: Int,
+                                    gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor)) throws {
+        // Phase A: sequential routes; save per-token FFN inputs + selection.
+        var curT: [GPUTensor] = [], attnT: [GPUTensor] = [], splitT: [GPUTensor] = []
+        var idsT: [[Int32]] = [], rwT: [[Float]] = []
+        curT.reserveCapacity(n); attnT.reserveCapacity(n); splitT.reserveCapacity(n)
+        for j in 0..<n {
+            try Task.checkCancellation()
+            let pos = posBase + j
+            var t = Date()
+            let c1 = GraphContext(rt); try c1.begin()
+            try c1.decodeRoute(curHc: cur[j], w: w, s: scratch, d: d, rope: layerRope,
+                               rawCache: rawCaches[i], nKeys: pos + 1, pos: pos,
+                               rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
+            c1.commit()
+            profile.routeS += Date().timeIntervalSince(t)
+            let (ids, rw) = readRouteSelection()
+            idsT.append(ids); rwT.append(rw)
+            let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
+            let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
+            let sT = try GPUTensor.zeros(rt, floatCount: 24)
+            copyFloats(from: scratch.cur, to: cT, count: d.nEmbd)
+            copyFloats(from: scratch.afterAttn, to: aT, count: d.nHC * d.nEmbd)
+            copyFloats(from: scratch.split, to: sT, count: 24)
+            curT.append(cT); attnT.append(aT); splitT.append(sT)
+            profile.layers += 1
+        }
+
+        // Phase B: group consecutive tokens while the union stays under the cap,
+        // gather each group's union once, run every token's FFN with remapped ids.
+        let cap = maxUnionExperts
+        var j0 = 0
+        while j0 < n {
+            var union: [Int32] = []
+            var seen = Set<Int32>()
+            var j1 = j0
+            while j1 < n {
+                let fresh = idsT[j1].filter { !seen.contains($0) }
+                if !union.isEmpty && union.count + fresh.count > cap { break }
+                for id in fresh { union.append(id); seen.insert(id) }
+                j1 += 1
+            }
+            var t = Date()
+            let (g, u, dn) = try gather(i, union)        // each unique expert ONCE
+            profile.gatherS += Date().timeIntervalSince(t)
+            var posOf: [Int32: Int32] = [:]
+            for (p, id) in union.enumerated() { posOf[id] = Int32(p) }
+            for j in j0..<j1 {
+                try Task.checkCancellation()
+                let K = idsT[j].count
+                let remapped = idsT[j].map { posOf[$0]! }
+                let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
+                                                 elementCount: K)
+                writeFloats(rwT[j], into: scratch.rw)
+                zeroDown6(from: K)
+                t = Date()
+                let c2 = GraphContext(rt); try c2.begin()
+                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                     ids: idsBuf, outHc: other[j], activeK: K,
+                                     cur: curT[j], afterAttn: attnT[j], split: splitT[j])
+                c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
+            }
+            j0 = j1
+            // g/u/dn drop here -> the group's packed union tensors are freed
+        }
     }
 
     /// Embed one token into the HC state buffer `hc` (own command buffer).
@@ -185,38 +278,64 @@ public final class StreamingDecoder {
         profile.embedS += Date().timeIntervalSince(t)
     }
 
+    /// Read back the router's selection after a committed decodeRoute, applying
+    /// the activeExperts top-K reduction (route weights renormalized to the
+    /// original total). Returns the final (ids, weights), both of count K ≤ d.k.
+    private func readRouteSelection() -> (ids: [Int32], rw: [Float]) {
+        let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
+        var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
+        let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
+        var rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
+        let K = max(1, min(d.activeExperts, d.k))
+        if K < d.k {
+            let keep = (0..<d.k).sorted { rw[$0] > rw[$1] }.prefix(K)
+            let origSum = rw.reduce(0, +)
+            let keptSum = keep.reduce(Float(0)) { $0 + rw[$1] }
+            let scale = keptSum > 0 ? origSum / keptSum : 1
+            ids = keep.map { ids[$0] }
+            rw = keep.map { rw[$0] * scale }
+        }
+        return (ids, rw)
+    }
+
+    /// CPU-write `a` into the head of a shared GPU buffer (safe between commits).
+    private func writeFloats(_ a: [Float], into t: GPUTensor) {
+        a.withUnsafeBytes {
+            memcpy(t.buffer.contents().advanced(by: t.byteOffset), $0.baseAddress!, $0.count)
+        }
+    }
+
+    /// CPU-copy `count` floats between shared GPU buffers (after a commit).
+    private func copyFloats(from src: GPUTensor, to dst: GPUTensor, count: Int) {
+        memcpy(dst.buffer.contents().advanced(by: dst.byteOffset),
+               src.buffer.contents().advanced(by: src.byteOffset), count * 4)
+    }
+
+    /// Zero s.down6 rows K..d.k-1 so the fixed moeSum6 adds zeros for unused slots.
+    private func zeroDown6(from K: Int) {
+        guard K < d.k else { return }
+        let dptr = scratch.down6.buffer.contents().bindMemory(to: Float.self, capacity: d.k * d.nEmbd)
+        for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
+    }
+
     /// One decode layer for one token: `cur` (HC in) -> `other` (HC out). Writes
     /// KV[i][pos], updates compStates[i]. Shared by `forward` (decode) and the
     /// layer-major `prefill` — identical numerics either way.
     private func runLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                           cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int) throws {
         if let gather = expertGather {
-            // Phase 1: route (own cb) -> read the selected ids.
+            // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
             let c1 = GraphContext(rt); try c1.begin()
             try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
             c1.commit()
             profile.routeS += Date().timeIntervalSince(t)
-            // The router picked the top-d.k of 256. If activeExperts<d.k, keep the
-            // top-K of those by route weight (renormalized to the original total) and
-            // gather ONLY those -> less expert I/O. Top-K of 256.
-            let K = max(1, min(d.activeExperts, d.k))
-            let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
-            var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
+            let (ids, rw) = readRouteSelection()
+            let K = ids.count
             if K < d.k {
-                let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
-                let rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
-                let keep = (0..<d.k).sorted { rw[$0] > rw[$1] }.prefix(K)
-                let origSum = rw.reduce(0, +)
-                let keptSum = keep.reduce(Float(0)) { $0 + rw[$1] }
-                let scale = keptSum > 0 ? origSum / keptSum : 1
-                var kept: [Int32] = []
-                for (j, idx) in keep.enumerated() { wptr[j] = rw[idx] * scale; kept.append(ids[idx]) }
-                ids = kept
-                // Zero down6 rows K..d.k-1 so the fixed sum6 adds zeros for unused slots.
-                let dptr = scratch.down6.buffer.contents().bindMemory(to: Float.self, capacity: d.k * d.nEmbd)
-                for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
+                writeFloats(rw, into: scratch.rw)
+                zeroDown6(from: K)
             }
             // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
             t = Date()

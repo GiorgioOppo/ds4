@@ -486,6 +486,19 @@ condivisione del corpo del layer tra decode e prefill è in `runLayer`; embed e
 testa di output in `embedToken`/`outputHead`. Restituisce i logit dell'**ultimo**
 token per avviare la generazione.
 
+**Expert I/O batched (`batchedExpertLayer`).** Sul percorso expert-gather il
+prefill deduplica anche l'I/O degli **expert**: dentro ogni layer, la fase A
+esegue le **route in sequenza** per token (l'attenzione è causale: il token j
+legge le KV scritte dai token 0..j nello stesso layer) salvando per token gli
+input della FFN (cur normato, residuo, split HC) e la selezione del router; la
+fase B raggruppa i token e fa il **gather dell'unione** degli expert selezionati
+del gruppo **una volta sola**, eseguendo poi la FFN di ogni token con gli id
+rimappati sull'unione. Numericamente identico (la FFN di un token non alimenta
+gli altri token nello stesso layer); l'I/O scende da `6·token` a
+`min(6·token, 256)` letture-expert per layer — su prompt lunghi fino a **~12×**
+in meno nella fase dominante. L'unione per gruppo è limitata da
+`DS4_PREFILL_UNION` (default 64 expert ≈ 450 MB transitori sul modello 2-bit).
+
 ### Pattern "split command buffer"
 
 Ogni layer gira nel **proprio command buffer** (`commit + wait`, poi evict). I
