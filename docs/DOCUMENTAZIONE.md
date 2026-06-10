@@ -200,7 +200,8 @@ sezioni (`RootView` + `AppSection`):
 | Sezione | Icona | Scopo |
 |---|---|---|
 | **Chat** | fumetti | Caricamento modello + conversazione in streaming. |
-| **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso"). Il fine-tuning dei pesi non è possibile on-device. |
+| **Agenti** | persone | Ruoli: visualizza/modifica i prompt di definizione e i tool di ogni agente, creane di nuovi, scegli l'attivo. |
+| **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso") per-agente. Il fine-tuning dei pesi non è possibile on-device. |
 | **Server** | rack | Avvio del server HTTP `ds4-server` e launcher dell'agent. |
 | **Benchmark** | tachimetro | Esecuzione di `ds4-bench` e grafico del throughput. |
 | **Diagnostica** | stetoscopio | Tokenizzazione di un testo + console del motore. |

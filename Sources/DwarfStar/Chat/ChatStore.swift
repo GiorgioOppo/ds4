@@ -44,11 +44,48 @@ final class ChatStore {
 
     // Agents (roles). Selecting one starts a fresh chat with its role and swaps
     // the per-agent expert-usage profile (the cache re-warms with ITS experts).
-    let agents: [AgentProfile] = AgentProfile.defaults
+    // Editable + persisted; edits apply on the next new chat / agent switch.
+    var agents: [AgentProfile] = ChatStore.loadAgents()
     var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgent") ?? "generale" {
         didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgent") }
     }
     var selectedAgent: AgentProfile { agents.first { $0.id == selectedAgentId } ?? agents[0] }
+
+    static func loadAgents() -> [AgentProfile] {
+        if let data = UserDefaults.standard.data(forKey: "DS4Agents"),
+           let arr = try? JSONDecoder().decode([AgentProfile].self, from: data), !arr.isEmpty {
+            return arr
+        }
+        return AgentProfile.defaults
+    }
+
+    func saveAgents() {
+        if let data = try? JSONEncoder().encode(agents) {
+            UserDefaults.standard.set(data, forKey: "DS4Agents")
+        }
+    }
+
+    func isDefaultAgent(_ id: String) -> Bool { AgentProfile.defaults.contains { $0.id == id } }
+
+    func addAgent() {
+        let id = "custom-\(UUID().uuidString.prefix(8))"
+        agents.append(AgentProfile(id: id, name: "Nuovo agente", icon: "person.fill.questionmark",
+                                   systemPrompt: "", toolNames: []))
+        saveAgents()
+    }
+
+    func deleteAgent(_ id: String) {
+        guard !isDefaultAgent(id), agents.count > 1 else { return }
+        agents.removeAll { $0.id == id }
+        if selectedAgentId == id { selectAgent(agents[0].id) }
+        saveAgents()
+    }
+
+    func restoreDefaultAgents() {
+        agents = AgentProfile.defaults
+        if !agents.contains(where: { $0.id == selectedAgentId }) { selectAgent(agents[0].id) }
+        saveAgents()
+    }
 
     /// The agent with the user's extra system prompt appended (if any).
     private func resolvedAgent() -> AgentProfile {

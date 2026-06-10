@@ -97,10 +97,27 @@ struct ModelLoadView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Agente (ruolo)") {
+                Picker("Agente", selection: Binding(get: { store.selectedAgentId },
+                                                    set: { store.selectAgent($0) })) {
+                    ForEach(store.agents) { agent in
+                        Label(agent.name, systemImage: agent.icon).tag(agent.id)
+                    }
+                }
+                if !store.selectedAgent.systemPrompt.isEmpty {
+                    Text(store.selectedAgent.systemPrompt)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+                Text("Definisce ruolo e tool della chat. Visualizza e modifica i prompt nella scheda “Agenti”.")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+
             Section("Contesto e system prompt") {
                 Stepper("Contesto: \(store.contextSize) token",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
-                TextField("System prompt (opzionale)", text: $store.systemPrompt, axis: .vertical)
+                TextField("System prompt aggiuntivo (si somma al ruolo dell'agente)",
+                          text: $store.systemPrompt, axis: .vertical)
                     .lineLimit(2...6)
             }
 
