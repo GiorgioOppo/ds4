@@ -63,6 +63,16 @@ enum ProjectLibrary {
         if activeId == id { activeId = nil }
     }
 
+    /// Resolve, load into the ProjectCache and mark active. Returns the project
+    /// info, or nil when the folder is no longer resolvable.
+    @discardableResult
+    static func activate(_ project: SavedProject) -> ProjectCache.Info? {
+        guard let url = resolveURL(project) else { return nil }
+        let info = ProjectCache.shared.load(root: url)
+        activeId = project.id
+        return info
+    }
+
     /// Resolve a saved project's folder and start security-scoped access.
     static func resolveURL(_ p: SavedProject) -> URL? {
         var stale = false
@@ -191,12 +201,10 @@ struct ProjectView: View {
 
     private func activate(_ project: ProjectLibrary.SavedProject) {
         message = ""
-        guard let url = ProjectLibrary.resolveURL(project) else {
+        guard let i = ProjectLibrary.activate(project) else {
             message = "Cartella non più accessibile (spostata o eliminata?). Rimuovila e re-importala."
             return
         }
-        let i = ProjectCache.shared.load(root: url)
-        ProjectLibrary.activeId = project.id
         info = i
         preview = ProjectCache.shared.sampleFiles(50)
         projects = ProjectLibrary.all()

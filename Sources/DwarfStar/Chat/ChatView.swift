@@ -5,6 +5,8 @@ import DS4Core
 struct ChatView: View {
     @Bindable var store: ChatStore
     @State private var showTools = false
+    @State private var projects: [ProjectLibrary.SavedProject] = []
+    @State private var activeProjectName: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,6 +35,7 @@ struct ChatView: View {
                 }
             }
             Spacer()
+            projectMenu
             Picker("Agente", selection: Binding(get: { store.selectedAgentId },
                                                 set: { store.selectAgent($0) })) {
                 ForEach(store.agents) { agent in
@@ -62,6 +65,46 @@ struct ChatView: View {
     private var toolButtonTitle: String {
         guard store.toolsEnabled else { return "Tool" }
         return "Tool (\(store.enabledToolNames.count))"
+    }
+
+    /// Import/switch the active project right from the chat: the agent's
+    /// project_* tools read the active one; the chat memory is untouched.
+    private var projectMenu: some View {
+        Menu {
+            if projects.isEmpty {
+                Text("Nessun progetto salvato")
+            }
+            ForEach(projects) { p in
+                Button {
+                    if ProjectLibrary.activate(p) != nil { refreshProject() }
+                } label: {
+                    if p.id == ProjectLibrary.activeId {
+                        Label(p.name, systemImage: "checkmark")
+                    } else {
+                        Text(p.name)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                if let p = ProjectLibrary.pickAndAdd() {
+                    ProjectLibrary.activate(p)
+                    refreshProject()
+                }
+            } label: {
+                Label("Importa cartella…", systemImage: "folder.badge.plus")
+            }
+        } label: {
+            Label(activeProjectName ?? "Progetto", systemImage: "folder")
+        }
+        .fixedSize()
+        .help("Progetto attivo per i tool project_* dell'agente. L'import non tocca la memoria della chat.")
+        .onAppear { refreshProject() }
+    }
+
+    private func refreshProject() {
+        projects = ProjectLibrary.all()
+        activeProjectName = ProjectCache.shared.info()?.name
     }
 
     private func kvSize(_ bytes: UInt64) -> String {
