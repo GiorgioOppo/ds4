@@ -27,7 +27,8 @@ public struct ToolOutput: Sendable, Equatable {
 
 public enum ToolRegistry {
     /// The demo tools shipped with the app. All are pure and side-effect free.
-    public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply]
+    public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
+                                                 projectList, projectRead, projectSearch]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -70,6 +71,52 @@ public enum ToolRegistry {
             }
             return evaluateArithmetic(expr)
         })
+
+    // MARK: Project-exploration tools (read-only over the imported ProjectCache;
+    // results enter the chat ONLY when the model calls them, so the project
+    // import never alters the conversation memory).
+
+    static let projectList = BuiltinTool(
+        spec: ToolSpec(name: "project_list",
+                       description: "List files/folders of the imported project. Optional 'path' (relative) lists a subfolder; omit it for the root.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"}}}"#),
+        run: { argsJSON in
+            let path = stringArg(argsJSON, "path") ?? ""
+            return ProjectCache.shared.listTool(path: path)
+        })
+
+    static let projectRead = BuiltinTool(
+        spec: ToolSpec(name: "project_read",
+                       description: "Read a project file (about 120 lines per call, with line numbers). 'path' relative; optional 'from_line' to continue.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"},"from_line":{"type":"number"}},"required":["path"]}"#),
+        run: { argsJSON in
+            guard let path = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            let from = intArg(argsJSON, "from_line") ?? 1
+            return ProjectCache.shared.readTool(path: path, fromLine: from)
+        })
+
+    static let projectSearch = BuiltinTool(
+        spec: ToolSpec(name: "project_search",
+                       description: "Search a text (case-insensitive) across the imported project; returns file:line matches.",
+                       parametersJSON: #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
+        run: { argsJSON in
+            guard let q = stringArg(argsJSON, "query") else { return "Argomento 'query' mancante." }
+            return ProjectCache.shared.searchTool(query: q)
+        })
+
+    static func stringArg(_ json: String, _ key: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj[key] as? String
+    }
+
+    static func intArg(_ json: String, _ key: String) -> Int? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let n = obj[key] as? NSNumber { return n.intValue }
+        if let s = obj[key] as? String { return Int(s) }
+        return nil
+    }
 
     // MARK: Two-operand arithmetic tools (a, b)
 

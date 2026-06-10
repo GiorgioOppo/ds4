@@ -3,6 +3,7 @@ import SwiftUI
 enum AppSection: String, CaseIterable, Identifiable {
     case chat = "Chat"
     case agents = "Agenti"
+    case project = "Progetto"
     case tuning = "Tuning"
     case server = "Server"
     case benchmark = "Benchmark"
@@ -13,6 +14,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
         case .agents: return "person.2"
+        case .project: return "folder"
         case .tuning: return "slider.horizontal.3"
         case .server: return "server.rack"
         case .benchmark: return "gauge.with.dots.needle.67percent"
@@ -43,6 +45,8 @@ struct RootView: View {
                 ContentView(store: store)
             case .agents:
                 AgentsView(store: store)
+            case .project:
+                ProjectView(store: store)
             case .tuning:
                 TuningView(store: store)
             case .server:
