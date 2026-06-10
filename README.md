@@ -11,13 +11,12 @@ Native Swift / SwiftUI front-end for **DeepSeek V4 (DwarfStar)**, with a
 ## Approach
 
 ```
-DwarfStarApp (SwiftUI)        ← GUI (chat, models, server/agent, bench)
-        │
+DwarfStarApp (SwiftUI)        ← GUI: chat, agents, projects, tuning,
+        │                            models, server, bench, diagnostics
    DS4Engine (Swift)          ← InferenceService: prompt → event stream
-        │
+        │                       (+ agents/roles, tool registry, project cache)
    DS4Core + DS4Metal (Swift) ← pure-Swift engine: GGUF, tokenizer, sampler,
-                                 Metal runtime + kernels, decode graph
-        │
+        │                         Metal runtime + kernels, decode graph
    metal/*.metal              ← kernels, embedded in the binary at build time
 ```
 
@@ -50,11 +49,17 @@ DS4-gui/
                                  GPUTensor/GraphContext, decode layer, DSV4Decoder,
                                  StreamingDecoder, GGUF weight loader
     DS4Engine/                   inference service backing the GUI (InferenceService,
+                                 agents/roles, tool registry, project cache,
                                  downloader, diagnostics)
     DS4Demo/                     pure-Swift CLI demo (Metal self-test + GGUF stream)
-    DwarfStar/                   SwiftUI app (ChatStore + chat/server/bench/diag views)
+    DwarfStar/                   SwiftUI app (ChatStore + chat/agents/project/tuning/
+                                 server/bench/diagnostics views)
   metal/                         Metal kernel sources (embedded into the binary
                                  via make embed-kernels; the runtime compiles them)
+  templates/                     DeepSeek-V4 chat_template.jinja (tool calling) — the
+                                 spec the Swift ChatRenderer mirrors 1:1
+  docs/                          DOCUMENTAZIONE.md (uso/UI) + ARCHITETTURA-MOTORE.md
+                                 (interni del motore)
 ```
 
 ## Pure-Swift engine (.xcodeproj, no external links)
@@ -151,8 +156,27 @@ Drop an `AppIcon.icns` into `packaging/` to give the app an icon.
 - **Phase 6 (packaging) — done.** `make app` builds a release `DwarfStar.app`
   with `metal/` bundled in Resources, bundle-aware paths (`AppEnvironment`), an
   Info.plist, and ad-hoc code signing; verified valid with `codesign`.
+- **Phase 7 (agents, tools, projects & tuning) — done.** Four new capabilities,
+  each with its own sidebar tab:
+  - **Agenti** — an agent is a *role*: a system prompt, the tools it may call,
+    an icon, and its **own expert-usage profile**. Editable in-app, with custom
+    agents, restore-defaults, and JSON export/import. Switching agent starts a
+    fresh chat in that role.
+  - **Tool calling** — `DS4Engine` ships a built-in tool registry (clock,
+    calculator/arithmetic, and the `project_*` explorers) that the model invokes
+    via the DeepSeek-V4 tool-call format. `templates/chat_template.jinja` is the
+    reference spec the Swift `ChatRenderer` mirrors byte-for-byte.
+  - **Progetto** — a saved library of projects (sandbox-safe security-scoped
+    bookmarks); one is active at a time. Importing a folder builds a separate
+    memory container (`ProjectCache`) that the agent explores through
+    `project_list` / `project_read` / `project_search` — so only the bits it
+    actually reads enter the conversation KV. Projects can also be imported and
+    switched straight from the chat.
+  - **Tuning** — runtime tuning (not weight fine-tuning, which is impossible
+    on-device): an LRU expert **slot-cache** (persistent + rotating experts) and
+    the **usage "imatrix"** that pre-warms it per agent, with a live hit-rate.
 
-> All six phases build, link, and package cleanly. What has **not** been run in
+> All seven phases build, link, and package cleanly. What has **not** been run in
 > this environment: actual generation, the server subprocess, and the
 > benchmark/diagnostics runners — only a partial GGUF is present, so verify those
 > on a machine with a complete model. The server/bench/diagnostics panels also
