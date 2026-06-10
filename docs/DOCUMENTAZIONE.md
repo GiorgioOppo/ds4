@@ -201,7 +201,7 @@ sezioni (`RootView` + `AppSection`):
 |---|---|---|
 | **Chat** | fumetti | Caricamento modello + conversazione in streaming. |
 | **Agenti** | persone | Ruoli: visualizza/modifica i prompt di definizione e i tool di ogni agente, creane di nuovi, scegli l'attivo. |
-| **Progetto** | cartella | Contenitore di memoria separato dalla chat: importa una cartella di progetto che l'agente esplora con i tool `project_*` (solo le parti lette entrano in conversazione). |
+| **Progetto** | cartella | Libreria di progetti salvati (memoria separata dalla chat): importa più cartelle, attivane una; l'agente la esplora con i tool `project_*` (solo le parti lette entrano in conversazione). |
 | **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso") per-agente. Il fine-tuning dei pesi non è possibile on-device. |
 | **Server** | rack | Avvio del server HTTP `ds4-server` e launcher dell'agent. |
 | **Benchmark** | tachimetro | Esecuzione di `ds4-bench` e grafico del throughput. |
