@@ -1,11 +1,26 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 import DS4Engine
 
-/// Agent (role) management: view and EDIT each agent's defining prompt and the
-/// tools it exposes; create custom agents, restore the defaults, and switch the
-/// active one. Edits apply on the next new chat / agent switch.
+/// Curated SF Symbols selectable as agent icons.
+enum AgentIcons {
+    static let all = [
+        "person", "person.fill", "person.2", "brain",
+        "chevron.left.forwardslash.chevron.right", "terminal", "function", "pencil",
+        "book", "graduationcap", "magnifyingglass", "globe",
+        "lightbulb", "hammer", "wrench.and.screwdriver", "chart.bar",
+        "briefcase", "stethoscope", "music.note", "gamecontroller",
+    ]
+}
+
+/// Agent (role) management: view and EDIT each agent's defining prompt, icon and
+/// the tools it exposes; create custom agents, restore the defaults, switch the
+/// active one, and export/import the whole set as JSON. Edits apply on the next
+/// new chat / agent switch.
 struct AgentsView: View {
     @Bindable var store: ChatStore
+    @State private var ioMessage = ""
 
     var body: some View {
         Form {
@@ -31,6 +46,23 @@ struct AgentsView: View {
                     }
 
                     TextField("Nome", text: $agent.name)
+
+                    DisclosureGroup("Icona") {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 36))], spacing: 8) {
+                            ForEach(AgentIcons.all, id: \.self) { symbol in
+                                Button { agent.icon = symbol } label: {
+                                    Image(systemName: symbol)
+                                        .frame(width: 30, height: 30)
+                                        .background(agent.icon == symbol
+                                                    ? Color.accentColor.opacity(0.25) : .clear)
+                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                }
+                                .buttonStyle(.plain)
+                                .help(symbol)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("System prompt (definizione del ruolo)")
@@ -76,6 +108,17 @@ struct AgentsView: View {
                 Button { store.restoreDefaultAgents() } label: {
                     Label("Ripristina predefiniti", systemImage: "arrow.counterclockwise")
                 }
+                HStack {
+                    Button { exportAgents() } label: {
+                        Label("Esporta…", systemImage: "square.and.arrow.up")
+                    }
+                    Button { importAgents() } label: {
+                        Label("Importa…", systemImage: "square.and.arrow.down")
+                    }
+                }
+                if !ioMessage.isEmpty {
+                    Text(ioMessage).font(.caption).foregroundStyle(.secondary)
+                }
                 if !store.isReady {
                     Text("Nessun modello caricato: la selezione viene ricordata e applicata al caricamento.")
                         .font(.caption).foregroundStyle(.tertiary)
@@ -84,5 +127,33 @@ struct AgentsView: View {
         }
         .formStyle(.grouped)
         .onChange(of: store.agents) { store.saveAgents() }
+    }
+
+    /// Save the whole agent set as JSON (user-picked location, sandbox-safe).
+    private func exportAgents() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "agenti-dwarfstar.json"
+        panel.allowedContentTypes = [.json]
+        panel.title = "Esporta agenti"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = store.exportAgentsData() else { return }
+        do {
+            try data.write(to: url)
+            ioMessage = "Esportati \(store.agents.count) agenti in \(url.lastPathComponent)."
+        } catch {
+            ioMessage = "Esportazione fallita: \(error.localizedDescription)"
+        }
+    }
+
+    /// Merge agents from a JSON file (matching ids updated, new ones appended).
+    private func importAgents() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.title = "Importa agenti"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+        let n = store.importAgents(from: data)
+        ioMessage = n > 0 ? "Importati/aggiornati \(n) agenti." : "File non valido: nessun agente importato."
     }
 }

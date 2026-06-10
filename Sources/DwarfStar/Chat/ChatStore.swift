@@ -87,6 +87,27 @@ final class ChatStore {
         saveAgents()
     }
 
+    /// Agents as pretty JSON (for export/sharing between machines).
+    func exportAgentsData() -> Data? {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? enc.encode(agents)
+    }
+
+    /// Merge agents from JSON: matching ids are updated, new ones appended.
+    /// Returns how many agents were imported (0 = invalid file).
+    @discardableResult
+    func importAgents(from data: Data) -> Int {
+        guard let imported = try? JSONDecoder().decode([AgentProfile].self, from: data),
+              !imported.isEmpty else { return 0 }
+        for a in imported {
+            if let i = agents.firstIndex(where: { $0.id == a.id }) { agents[i] = a }
+            else { agents.append(a) }
+        }
+        saveAgents()
+        return imported.count
+    }
+
     /// The agent with the user's extra system prompt appended (if any).
     private func resolvedAgent() -> AgentProfile {
         var agent = selectedAgent
