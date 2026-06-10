@@ -60,15 +60,16 @@ struct ProjectView: View {
             }
 
             Section("Progetto importato") {
-                if let info {
-                    LabeledContent("Nome", value: info.name)
-                    LabeledContent("File indicizzati", value: "\(info.fileCount)")
+                if let p = info {
+                    LabeledContent("Nome", value: p.name)
+                    LabeledContent("File indicizzati", value: "\(p.fileCount)")
                     LabeledContent("Dimensione testo", value: ByteCountFormatter.string(
-                        fromByteCount: Int64(info.totalBytes), countStyle: .file))
+                        fromByteCount: Int64(p.totalBytes), countStyle: .file))
                     Button(role: .destructive) {
                         ProjectCache.shared.clear()
                         ProjectPicker.clearBookmark()
-                        info = nil; preview = []
+                        info = nil
+                        preview = []
                     } label: {
                         Label("Rimuovi progetto", systemImage: "trash")
                     }
