@@ -123,7 +123,7 @@ public actor InferenceService {
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.
-        if let data = try? Data(contentsOf: usageURL()) {
+        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
             decoder.usage?.load(data)
         }
     }
@@ -140,7 +140,7 @@ public actor InferenceService {
     public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
         saveExpertUsage()
         agentId = agent.id
-        decoder.usage?.replace(with: try? Data(contentsOf: usageURL()))
+        decoder.usage?.replace(with: try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: agentId)))
         decoder.slotCache?.invalidate()
         self.tools = tools
         resetConversation(systemPrompt: agent.systemPrompt.isEmpty ? nil : agent.systemPrompt)
@@ -148,7 +148,9 @@ public actor InferenceService {
 
     // MARK: - Expert usage ("usage imatrix") persistence + tuning info
 
-    private func usageURL() -> URL {
+    /// Per-(model, agent) usage-profile file. Nonisolated so the actor's init
+    /// can resolve it before isolation is established.
+    nonisolated static func usageURL(modelName: String, agentId: String) -> URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DwarfStar", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -159,12 +161,12 @@ public actor InferenceService {
     /// generation; cheap — at most nLayer×nExpert small ints).
     public func saveExpertUsage() {
         guard let data = decoder.usage?.serialize() else { return }
-        try? data.write(to: usageURL())
+        try? data.write(to: Self.usageURL(modelName: modelName, agentId: agentId))
     }
 
     public func resetExpertUsage() {
         decoder.usage?.reset()
-        try? FileManager.default.removeItem(at: usageURL())
+        try? FileManager.default.removeItem(at: Self.usageURL(modelName: modelName, agentId: agentId))
     }
 
     public struct TuningInfo: Sendable {
