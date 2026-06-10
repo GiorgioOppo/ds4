@@ -45,6 +45,15 @@ public final class ExpertSlotCache {
         self.warm = warm
     }
 
+    /// Drop all pools (frees the wired buffers) and reset the hit/miss counters.
+    /// Pools rebuild lazily and re-warm from the CURRENT usage profile on next
+    /// use — called on agent switch, when the warm prior changes.
+    public func invalidate() {
+        pools.removeAll()
+        hits = 0
+        misses = 0
+    }
+
     /// Ensure all `ids` are resident in layer `layer`'s pool; returns the pool and
     /// each id's slot index (same order — route weights stay aligned). Misses
     /// evict LRU slots, never a slot already touched by this call.

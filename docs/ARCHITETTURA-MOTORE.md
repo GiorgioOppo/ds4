@@ -541,6 +541,17 @@ fretta). `concentration(layer:n:)` misura quanto il routing è concentrato
 (~n/256 = uniforme → cache inutile): è il segnale onesto esposto nella tab
 **Tuning** della GUI, insieme a hit/miss live e alla configurazione slot.
 
+**Agenti (ruoli) e profili per-agente (`AgentProfile`).** Un agente = system
+prompt (ruolo) + tool esposti + **profilo d'uso expert separato**
+(`expert-usage-<modello>-<agente>.json`): ruoli diversi instradano verso expert
+diversi, quindi il prior di warm è molto più mirato di un profilo globale.
+`InferenceService.setAgent` persiste il profilo dell'agente uscente, carica
+quello del nuovo, **invalida i pool** della cache (`ExpertSlotCache.invalidate`,
+re-warm lazy col nuovo profilo) e apre una conversazione fresca col ruolo. Nella
+GUI: picker agente nell'header della chat (Generale / Coding / Matematica — con
+i tool aritmetici — / Scrittura); il system prompt utente si concatena a quello
+del ruolo.
+
 ### Pattern "split command buffer"
 
 Ogni layer gira nel **proprio command buffer** (`commit + wait`, poi evict). I

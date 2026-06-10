@@ -33,6 +33,15 @@ struct ChatView: View {
                 }
             }
             Spacer()
+            Picker("Agente", selection: Binding(get: { store.selectedAgentId },
+                                                set: { store.selectAgent($0) })) {
+                ForEach(store.agents) { agent in
+                    Label(agent.name, systemImage: agent.icon).tag(agent.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+            .help("Cambia ruolo: nuova chat con il system prompt e i tool dell'agente; la cache esperti si ri-scalda col SUO profilo d'uso.")
             Button {
                 showTools = true
             } label: {

@@ -42,6 +42,52 @@ final class ChatStore {
     // Tuning tab state.
     var tuningInfo: InferenceService.TuningInfo?
 
+    // Agents (roles). Selecting one starts a fresh chat with its role and swaps
+    // the per-agent expert-usage profile (the cache re-warms with ITS experts).
+    let agents: [AgentProfile] = AgentProfile.defaults
+    var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgent") ?? "generale" {
+        didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgent") }
+    }
+    var selectedAgent: AgentProfile { agents.first { $0.id == selectedAgentId } ?? agents[0] }
+
+    /// The agent with the user's extra system prompt appended (if any).
+    private func resolvedAgent() -> AgentProfile {
+        var agent = selectedAgent
+        let extra = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !extra.isEmpty {
+            agent.systemPrompt = agent.systemPrompt.isEmpty ? extra : agent.systemPrompt + "\n\n" + extra
+        }
+        return agent
+    }
+
+    /// Apply the agent to the running service: fresh chat with its role + tools,
+    /// per-agent usage profile swapped in, slot-cache re-warmed.
+    private func applyAgent() {
+        guard let service else { return }
+        let agent = resolvedAgent()
+        toolsEnabled = !agent.toolNames.isEmpty
+        enabledToolNames = Set(agent.toolNames)
+        let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
+        Task {
+            await service.setAgent(agent, tools: tools)
+            await service.setCompactTools(compactTools)
+            refreshTuningInfo()
+        }
+    }
+
+    func selectAgent(_ id: String) {
+        selectedAgentId = id
+        generation?.cancel()
+        isGenerating = false
+        status = ""
+        messages.removeAll()
+        pendingManualCalls = []
+        partialAutoOutputs = []
+        awaitingManualResults = false
+        toolRounds = 0
+        applyAgent()
+    }
+
     // Discovered GGUF files on disk.
     var discoveredModels: [DiscoveredModel] = []
 
@@ -117,23 +163,19 @@ final class ChatStore {
         guard phase != .loading else { return }
         phase = .loading
         let path = modelPath, ctx = contextSize
-        let sys = systemPrompt
-        let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
-        let compact = compactTools
         let cacheSlots = expertCacheSlots
         Task.detached(priority: .userInitiated) {
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,
-                                               systemPrompt: sys.isEmpty ? nil : sys,
+                                               systemPrompt: nil,   // set by applyAgent below
                                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
-                await svc.setTools(tools)
-                await svc.setCompactTools(compact)
                 let info = await svc.modelInfo()
                 await MainActor.run {
                     self.service = svc
                     self.info = info
                     self.phase = .ready
+                    self.applyAgent()   // role + tools + per-agent usage profile
                 }
             } catch {
                 await MainActor.run { self.phase = .failed("\(error)") }
@@ -225,7 +267,8 @@ final class ChatStore {
         generation?.cancel()              // stop any in-flight generation/tool loop
         isGenerating = false
         status = ""
-        let sys = systemPrompt.isEmpty ? nil : systemPrompt
+        let agentSys = resolvedAgent().systemPrompt
+        let sys = agentSys.isEmpty ? nil : agentSys
         messages.removeAll()
         pendingManualCalls = []
         partialAutoOutputs = []

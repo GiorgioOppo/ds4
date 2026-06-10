@@ -60,4 +60,10 @@ public final class ExpertUsageStats {
         for i in counts.indices { counts[i] = [:] }
         totalRoutes = 0
     }
+
+    /// Swap in another profile (agent switch): clear and load `data` if present.
+    public func replace(with data: Data?) {
+        reset()
+        if let data { load(data) }
+    }
 }

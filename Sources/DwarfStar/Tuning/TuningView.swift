@@ -34,10 +34,11 @@ struct TuningView: View {
                 }
 
                 Section("Profilo d'uso esperti (\"imatrix d'uso\")") {
+                    LabeledContent("Agente attivo", value: store.selectedAgent.name)
                     if let info = store.tuningInfo {
                         LabeledContent("Routing registrati", value: "\(info.totalRoutes)")
                     }
-                    Text("Conta quanto spesso il router sceglie ogni esperto nel TUO uso reale. Persistito tra le sessioni e usato per pre-caricare la cache con gli esperti storicamente più caldi al prossimo avvio.")
+                    Text("Conta quanto spesso il router sceglie ogni esperto nel TUO uso reale. Il profilo è PER-AGENTE (ruoli diversi instradano verso esperti diversi): cambiando agente la cache si ri-scalda con il suo profilo. Persistito tra le sessioni.")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack {
                         Button { store.refreshTuningInfo() } label: {

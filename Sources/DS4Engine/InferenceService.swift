@@ -121,34 +121,54 @@ public actor InferenceService {
                                                                        nLayers: DSV4Shape.nLayer, maxKeys: contextSize,
                                                                        cacheSlots: expertCacheSlots)
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
-        // so the slot-cache warms with the historically hottest experts.
-        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName)) {
+        // so the slot-cache warms with the historically hottest experts. The
+        // profile is PER-AGENT: different roles route to different experts.
+        if let data = try? Data(contentsOf: usageURL()) {
             decoder.usage?.load(data)
         }
     }
 
+    // MARK: - Agents (roles) + per-agent expert usage
+
+    /// The active agent's id — keys the persisted usage profile.
+    private var agentId = "generale"
+
+    /// Switch the conversation to `agent`: persists the outgoing agent's usage
+    /// profile, swaps in the new agent's one, drops the slot-cache pools (they
+    /// re-warm lazily with the NEW profile), declares the agent's tools and
+    /// starts a fresh conversation with its role (system prompt).
+    public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
+        saveExpertUsage()
+        agentId = agent.id
+        decoder.usage?.replace(with: try? Data(contentsOf: usageURL()))
+        decoder.slotCache?.invalidate()
+        self.tools = tools
+        resetConversation(systemPrompt: agent.systemPrompt.isEmpty ? nil : agent.systemPrompt)
+    }
+
     // MARK: - Expert usage ("usage imatrix") persistence + tuning info
 
-    static func usageURL(modelName: String) -> URL {
+    private func usageURL() -> URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DwarfStar", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("expert-usage-\(modelName).json")
+        return dir.appendingPathComponent("expert-usage-\(modelName)-\(agentId).json")
     }
 
     /// Persist the routing-frequency stats (called automatically after each
     /// generation; cheap — at most nLayer×nExpert small ints).
     public func saveExpertUsage() {
         guard let data = decoder.usage?.serialize() else { return }
-        try? data.write(to: Self.usageURL(modelName: modelName))
+        try? data.write(to: usageURL())
     }
 
     public func resetExpertUsage() {
         decoder.usage?.reset()
-        try? FileManager.default.removeItem(at: Self.usageURL(modelName: modelName))
+        try? FileManager.default.removeItem(at: usageURL())
     }
 
     public struct TuningInfo: Sendable {
+        public let agentId: String          // whose usage profile is active
         public let cacheSlots: Int          // 0 = cache off
         public let cacheHits: Int
         public let cacheMisses: Int
@@ -168,7 +188,8 @@ public actor InferenceService {
                 summaries.append(String(format: "L%-3d top8 = %2.0f%%  ·  expert %@", il, conc * 100, top))
             }
         }
-        return TuningInfo(cacheSlots: decoder.slotCache?.slotsPerLayer ?? 0,
+        return TuningInfo(agentId: agentId,
+                          cacheSlots: decoder.slotCache?.slotsPerLayer ?? 0,
                           cacheHits: decoder.slotCache?.hits ?? 0,
                           cacheMisses: decoder.slotCache?.misses ?? 0,
                           totalRoutes: usage?.totalRoutes ?? 0,
