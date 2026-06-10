@@ -80,7 +80,10 @@ public final class StreamingDecoder {
     /// Optional LRU slot-cache ("persistent + changing experts"): when set, the
     /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
     /// only the misses; the matvec runs on the pool with slot-index ids.
-    let slotCache: ExpertSlotCache?
+    public let slotCache: ExpertSlotCache?
+    /// Routing-frequency statistics (the "usage imatrix"): fed by every route,
+    /// persisted by the service, and used to pre-warm the slot cache.
+    public let usage: ExpertUsageStats?
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
@@ -94,11 +97,13 @@ public final class StreamingDecoder {
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
                 rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                 expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
-                slotCache: ExpertSlotCache? = nil) throws {
+                slotCache: ExpertSlotCache? = nil,
+                usage: ExpertUsageStats? = nil) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         self.slotCache = slotCache
+        self.usage = usage
         let hcDim = dims.nHC * dims.nEmbd
         // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
         // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
@@ -228,7 +233,7 @@ public final class StreamingDecoder {
                                rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
             c1.commit()
             profile.routeS += Date().timeIntervalSince(t)
-            let (ids, rw) = readRouteSelection()
+            let (ids, rw) = readRouteSelection(layer: i)
             idsT.append(ids); rwT.append(rw)
             let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
             let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
@@ -294,7 +299,8 @@ public final class StreamingDecoder {
     /// Read back the router's selection after a committed decodeRoute, applying
     /// the activeExperts top-K reduction (route weights renormalized to the
     /// original total). Returns the final (ids, weights), both of count K ≤ d.k.
-    private func readRouteSelection() -> (ids: [Int32], rw: [Float]) {
+    /// Also feeds the usage statistics ("usage imatrix") for `layer`.
+    private func readRouteSelection(layer: Int) -> (ids: [Int32], rw: [Float]) {
         let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
         var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
         let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
@@ -308,6 +314,7 @@ public final class StreamingDecoder {
             ids = keep.map { ids[$0] }
             rw = keep.map { rw[$0] * scale }
         }
+        usage?.record(layer: layer, ids: ids)
         return (ids, rw)
     }
 
@@ -344,7 +351,7 @@ public final class StreamingDecoder {
                                nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
             c1.commit()
             profile.routeS += Date().timeIntervalSince(t)
-            let (ids, rw) = readRouteSelection()
+            let (ids, rw) = readRouteSelection(layer: i)
             let K = ids.count
             if K < d.k {
                 writeFloats(rw, into: scratch.rw)
@@ -468,7 +475,8 @@ public final class StreamingDecoder {
     /// experts are gathered per token. No memoization needed: the page cache serves
     /// repeated weight reads across tokens. Requires model opened metalMapping:true.
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
+                                                  cacheSlots: Int? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
@@ -476,14 +484,19 @@ public final class StreamingDecoder {
             let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
             return (g, u, dn)
         }
-        // Persistent + changing experts (DS4_EXPERT_CACHE_SLOTS=N, default off):
-        // per layer, an N-slot LRU pool keeps hot experts resident in GPU buffers;
-        // only misses are memcpy'd from the mmap. The pool is WIRED memory
-        // (~6.9 MB/slot on the 2-bit model × nLayers): on tight-RAM machines start
-        // small (4-8) and watch the hit rate in the decode profile.
+        // Routing-frequency stats ("usage imatrix"): always collected (cheap);
+        // the service persists them across sessions and they pre-warm the cache.
+        let usage = ExpertUsageStats(nLayers: nLayers)
+        // Persistent + changing experts (cacheSlots param, else env
+        // DS4_EXPERT_CACHE_SLOTS; default off): per layer, an N-slot LRU pool
+        // keeps hot experts resident in GPU buffers; only misses are memcpy'd
+        // from the mmap. The pool is WIRED memory (~6.9 MB/slot on the 2-bit
+        // model × nLayers): on tight-RAM machines start small (8) and watch the
+        // hit rate in the decode profile / Tuning tab.
+        let envSlots = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"].flatMap(Int.init)
+        let nSlots = cacheSlots ?? envSlots ?? 0
         var cache: ExpertSlotCache? = nil
-        if let s = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"],
-           let nSlots = Int(s), nSlots > 0 {
+        if nSlots > 0 {
             let S = max(8, nSlots)
             let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
             let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
@@ -499,12 +512,12 @@ public final class StreamingDecoder {
                                            expertBytes: upBytes, into: pool.up, slot: slot)
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
                                            expertBytes: downBytes, into: pool.down, slot: slot)
-            })
+            }, warm: { il in usage.top(layer: il, n: S) })
         }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather, slotCache: cache)
+                                    expertGather: gather, slotCache: cache, usage: usage)
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

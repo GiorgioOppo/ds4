@@ -33,6 +33,14 @@ final class ChatStore {
     var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
     var contextSize = 8192
     var systemPrompt = ""
+    /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
+    /// 43 layer on the 2-bit model. Applied on the NEXT model load.
+    var expertCacheSlots: Int = UserDefaults.standard.integer(forKey: "DS4ExpertCacheSlots") {
+        didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
+    }
+
+    // Tuning tab state.
+    var tuningInfo: InferenceService.TuningInfo?
 
     // Discovered GGUF files on disk.
     var discoveredModels: [DiscoveredModel] = []
@@ -112,11 +120,13 @@ final class ChatStore {
         let sys = systemPrompt
         let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
         let compact = compactTools
+        let cacheSlots = expertCacheSlots
         Task.detached(priority: .userInitiated) {
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,
-                                               systemPrompt: sys.isEmpty ? nil : sys)
+                                               systemPrompt: sys.isEmpty ? nil : sys,
+                                               expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
                 await svc.setTools(tools)
                 await svc.setCompactTools(compact)
                 let info = await svc.modelInfo()
@@ -192,6 +202,23 @@ final class ChatStore {
     }
 
     func stop() { generation?.cancel() }
+
+    // MARK: - Tuning tab
+
+    func refreshTuningInfo() {
+        guard let service else { tuningInfo = nil; return }
+        Task { tuningInfo = await service.tuningInfo() }
+    }
+
+    func saveExpertUsage() {
+        guard let service else { return }
+        Task { await service.saveExpertUsage(); refreshTuningInfo() }
+    }
+
+    func resetExpertUsage() {
+        guard let service else { return }
+        Task { await service.resetExpertUsage(); refreshTuningInfo() }
+    }
 
     func newChat() {
         guard let service else { return }

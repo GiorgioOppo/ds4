@@ -2,6 +2,7 @@ import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
     case chat = "Chat"
+    case tuning = "Tuning"
     case server = "Server"
     case benchmark = "Benchmark"
     case diagnostics = "Diagnostica"
@@ -10,6 +11,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
+        case .tuning: return "slider.horizontal.3"
         case .server: return "server.rack"
         case .benchmark: return "gauge.with.dots.needle.67percent"
         case .diagnostics: return "stethoscope"
@@ -37,6 +39,8 @@ struct RootView: View {
             switch selection ?? .chat {
             case .chat:
                 ContentView(store: store)
+            case .tuning:
+                TuningView(store: store)
             case .server:
                 ServerView(controller: server, modelLoadedInProcess: store.isReady)
             case .benchmark:

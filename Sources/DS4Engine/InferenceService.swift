@@ -90,7 +90,10 @@ public actor InferenceService {
     /// The pure-Swift engine always runs the SSD-streaming path (no-copy mmap
     /// non-routed weights + per-token expert gather); there are no resident/
     /// per-layer variants to configure, hence no streaming options here.
-    public init(modelPath: String, contextSize: Int, systemPrompt: String?) throws {
+    /// `expertCacheSlots` enables the per-layer expert slot-cache (0/nil = off);
+    /// the persisted usage stats pre-warm it with the hottest experts.
+    public init(modelPath: String, contextSize: Int, systemPrompt: String?,
+                expertCacheSlots: Int? = nil) throws {
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
@@ -115,7 +118,61 @@ public actor InferenceService {
         // Fast 16GB path (C --ssd-streaming model): non-routed weights are no-copy mmap
         // (resident via page cache, evictable), only the 6 selected experts gathered/token.
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
-                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize)
+                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize,
+                                                                       cacheSlots: expertCacheSlots)
+        // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
+        // so the slot-cache warms with the historically hottest experts.
+        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName)) {
+            decoder.usage?.load(data)
+        }
+    }
+
+    // MARK: - Expert usage ("usage imatrix") persistence + tuning info
+
+    static func usageURL(modelName: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("expert-usage-\(modelName).json")
+    }
+
+    /// Persist the routing-frequency stats (called automatically after each
+    /// generation; cheap — at most nLayer×nExpert small ints).
+    public func saveExpertUsage() {
+        guard let data = decoder.usage?.serialize() else { return }
+        try? data.write(to: Self.usageURL(modelName: modelName))
+    }
+
+    public func resetExpertUsage() {
+        decoder.usage?.reset()
+        try? FileManager.default.removeItem(at: Self.usageURL(modelName: modelName))
+    }
+
+    public struct TuningInfo: Sendable {
+        public let cacheSlots: Int          // 0 = cache off
+        public let cacheHits: Int
+        public let cacheMisses: Int
+        public let totalRoutes: Int
+        /// Per-layer summary: "L7 · top8 = 43% · expert 17,4,99,…".
+        public let layerSummaries: [String]
+    }
+
+    public func tuningInfo() -> TuningInfo {
+        let usage = decoder.usage
+        var summaries: [String] = []
+        if let usage, usage.totalRoutes > 0 {
+            for il in 0..<DSV4Shape.nLayer {
+                let conc = usage.concentration(layer: il, n: 8)
+                let top = usage.top(layer: il, n: 8).map(String.init).joined(separator: ",")
+                guard conc > 0 else { continue }
+                summaries.append(String(format: "L%-3d top8 = %2.0f%%  ·  expert %@", il, conc * 100, top))
+            }
+        }
+        return TuningInfo(cacheSlots: decoder.slotCache?.slotsPerLayer ?? 0,
+                          cacheHits: decoder.slotCache?.hits ?? 0,
+                          cacheMisses: decoder.slotCache?.misses ?? 0,
+                          totalRoutes: usage?.totalRoutes ?? 0,
+                          layerSummaries: summaries)
     }
 
     public func modelInfo() -> ModelInfo {
@@ -293,6 +350,7 @@ public actor InferenceService {
         }
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
         kvDirty = false                         // clean completion: KV matches committedIds
+        saveExpertUsage()                       // persist the usage imatrix (cheap)
         continuation.yield(.progress(""))
     }
 }

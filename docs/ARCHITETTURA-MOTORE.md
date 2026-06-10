@@ -530,6 +530,17 @@ hit/miss nel profilo decode (`cache expert X hit / Y miss`).
 e guarda l'hit-rate; con routing molto uniforme (load balancing) la cache può non
 ripagare. Sul prefill resta la dedup a unione (più adatta al batch).
 
+**"Imatrix d'uso" (`ExpertUsageStats`).** Il router alimenta statistiche di
+frequenza per (layer, expert) — l'equivalente runtime di una importance matrix
+per gli expert (nota: la *vera* imatrix di quantizzazione non è nel GGUF e serve
+solo offline). Il servizio le **persiste** in Application Support
+(`expert-usage-<modello>.json`, salvataggio automatico a fine generazione) e al
+caricamento successivo **pre-scalda** il pool con gli expert storicamente più
+caldi (entrano come voci "più vecchie": un prior sbagliato viene evictato in
+fretta). `concentration(layer:n:)` misura quanto il routing è concentrato
+(~n/256 = uniforme → cache inutile): è il segnale onesto esposto nella tab
+**Tuning** della GUI, insieme a hit/miss live e alla configurazione slot.
+
 ### Pattern "split command buffer"
 
 Ogni layer gira nel **proprio command buffer** (`commit + wait`, poi evict). I

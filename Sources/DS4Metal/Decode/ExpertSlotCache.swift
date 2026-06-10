@@ -31,13 +31,18 @@ public final class ExpertSlotCache {
     private let makePool: () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
     /// Copy expert `id` of layer `layer` into pool slot `slot` (all 3 matrices).
     private let fill: (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void
+    /// Optional warm-set provider: historically hottest experts of a layer (from
+    /// the persisted usage stats); pre-filled into the pool on first use.
+    private let warm: ((_ layer: Int) -> [Int32])?
 
     public init(slotsPerLayer: Int,
                 makePool: @escaping () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
-                fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void) {
+                fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void,
+                warm: ((_ layer: Int) -> [Int32])? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)   // ≥ k+2 so this tick's ids never starve eviction
         self.makePool = makePool
         self.fill = fill
+        self.warm = warm
     }
 
     /// Ensure all `ids` are resident in layer `layer`'s pool; returns the pool and
@@ -46,10 +51,20 @@ public final class ExpertSlotCache {
     public func acquire(layer: Int, ids: [Int32]) throws -> (pool: LayerPool, slots: [Int32]) {
         if pools[layer] == nil {
             let p = try makePool()
-            pools[layer] = LayerPool(gate: p.gate, up: p.up, down: p.down,
-                                     owner: Array(repeating: -1, count: slotsPerLayer),
-                                     lastUse: Array(repeating: 0, count: slotsPerLayer),
-                                     slotOf: [:])
+            var fresh = LayerPool(gate: p.gate, up: p.up, down: p.down,
+                                  owner: Array(repeating: -1, count: slotsPerLayer),
+                                  lastUse: Array(repeating: 0, count: slotsPerLayer),
+                                  slotOf: [:])
+            // Pre-warm with the historically hottest experts (usage-stats prior):
+            // they start as the oldest entries, so a wrong prior is evicted fast.
+            if let warm {
+                for (s, id) in warm(layer).prefix(slotsPerLayer).enumerated() {
+                    try fill(layer, id, fresh, s)
+                    fresh.owner[s] = id
+                    fresh.slotOf[id] = s
+                }
+            }
+            pools[layer] = fresh
         }
         tick += 1
         var pool = pools[layer]!
@@ -66,10 +81,13 @@ public final class ExpertSlotCache {
         }
         for j in missIdx {
             let id = ids[j]
+            // Victim: a FREE slot if any, else the least-recently-used one —
+            // never a slot already touched by this call.
             var victim = -1
             var best = UInt64.max
-            for s in 0..<slotsPerLayer where pool.lastUse[s] != tick && pool.lastUse[s] < best {
-                best = pool.lastUse[s]; victim = s
+            for s in 0..<slotsPerLayer where pool.lastUse[s] != tick {
+                if pool.owner[s] < 0 { victim = s; break }
+                if pool.lastUse[s] < best { best = pool.lastUse[s]; victim = s }
             }
             precondition(victim >= 0, "expert cache: no evictable slot (S too small)")
             if pool.owner[victim] >= 0 { pool.slotOf.removeValue(forKey: pool.owner[victim]) }
