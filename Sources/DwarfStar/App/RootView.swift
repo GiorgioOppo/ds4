@@ -6,6 +6,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case project = "Progetto"
     case tuning = "Tuning"
     case server = "Server"
+    case distributed = "Distribuito"
     case benchmark = "Benchmark"
     case diagnostics = "Diagnostica"
 
@@ -17,6 +18,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .project: return "folder"
         case .tuning: return "slider.horizontal.3"
         case .server: return "server.rack"
+        case .distributed: return "rectangle.3.group"
         case .benchmark: return "gauge.with.dots.needle.67percent"
         case .diagnostics: return "stethoscope"
         }
@@ -28,6 +30,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 struct RootView: View {
     @Bindable var store: ChatStore
     @State private var server = ServerController()
+    @State private var distributed = DistributedController()
     @State private var bench = BenchController()
     @State private var diagnostics = DiagnosticsController()
     @State private var selection: AppSection? = .chat
@@ -51,6 +54,8 @@ struct RootView: View {
                 TuningView(store: store)
             case .server:
                 ServerView(controller: server, modelLoadedInProcess: store.isReady)
+            case .distributed:
+                DistributedView(controller: distributed)
             case .benchmark:
                 BenchView(controller: bench)
             case .diagnostics:
