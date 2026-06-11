@@ -312,12 +312,23 @@ public actor InferenceService {
         var visible = ""
         var toolBytes: [UInt8] = []
         let dsmlId = tok.dsmlId
+        let lt = UInt8(ascii: "<")
 
         func flush(_ asReasoning: Bool) {
             guard !pending.isEmpty, let s = String(bytes: pending, encoding: .utf8) else { return }
             pending.removeAll(keepingCapacity: true)
             if asReasoning { continuation.yield(.reasoning(s)) }
             else { visible += s; continuation.yield(.text(s)) }
+        }
+
+        // Flush pending text but keep a trailing '<' buffered: it may begin the
+        // tool-call opener "<｜DSML｜…" (the '<' and ｜DSML｜ are separate tokens) and
+        // must not be streamed as a stray bubble before we know what follows.
+        func flushHoldingOpener(_ asReasoning: Bool) {
+            guard pending.last == lt else { flush(asReasoning); return }
+            pending.removeLast()
+            flush(asReasoning)        // emit everything before the '<'
+            pending.append(lt)        // re-buffer the '<' for the next round
         }
 
         var produced = 0
@@ -328,7 +339,11 @@ public actor InferenceService {
                                       topP: sampling.topP, minP: sampling.minP, rng: &rng)
             if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
-                flush(inReasoning)
+                // A held opener '<' belongs to the tool block, not the visible text:
+                // move it into toolBytes (so the parser sees "<｜DSML｜…") without ever
+                // streaming it as a stray bubble.
+                if pending.last == lt { pending.removeLast(); toolBytes.append(lt) }
+                flush(inReasoning)                               // flush any remaining real text
                 inTool = true
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inTool {
@@ -345,7 +360,7 @@ public actor InferenceService {
                 inReasoning = false
             } else {
                 pending.append(contentsOf: tok.tokenText(Int32(next)))
-                flush(inReasoning)
+                flushHoldingOpener(inReasoning)
             }
             produced += 1
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
