@@ -1,4 +1,5 @@
 import Foundation
+import DS4Core
 
 /// Wire protocol for DwarfStar distributed inference (pipeline parallelism by
 /// contiguous layer ranges), modelled on ds4_distributed.c but Swift-native:
@@ -208,7 +209,7 @@ public enum ActivationCodec {
         switch bits {
         case 16:
             var d = Data(capacity: v.count * 2)
-            for x in v { d.appendLE(Float16(x).bitPattern) }
+            for x in v { d.appendLE(Half.bits(x)) }
             return d
         case 8:
             let absmax = v.reduce(Float(0)) { max($0, abs($1)) }
@@ -234,7 +235,7 @@ public enum ActivationCodec {
         case 16:
             for _ in 0..<count {
                 guard o + 2 <= d.endIndex else { break }
-                out.append(Float(Float16(bitPattern: d.readLE(&o) as UInt16)))
+                out.append(Half.float(d.readLE(&o) as UInt16))
             }
         case 8:
             guard o + 4 <= d.endIndex else { return out }

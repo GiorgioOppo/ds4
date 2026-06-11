@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import DS4Core
 
 // Phase 9 / Stage A3: decode FlashAttention (the MLA dk=dv=512 path). Faithful
 // port of the ds4_gpu_attention_decode_heads vec+reduce dispatch using the real
@@ -86,7 +87,7 @@ extension MetalRuntime {
 
         // K/V as F16 (same values the cpy kernel would produce).
         var kvF16 = [UInt16](repeating: 0, count: nKeys * headDim)
-        for i in 0..<kvF16.count { kvF16[i] = Float16(kv[i]).bitPattern }
+        for i in 0..<kvF16.count { kvF16[i] = Half.bits(kv[i]) }   // portable f32→f16 (arch-safe)
 
         let rowBytes = headDim * 4
         let rowBytesF16 = headDim * 2
