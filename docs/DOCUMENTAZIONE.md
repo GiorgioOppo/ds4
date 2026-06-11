@@ -44,7 +44,7 @@ Il progetto offre due punti d'ingresso:
 | Punto d'ingresso | Tipo | A chi serve | Cosa fa |
 |---|---|---|---|
 | **`DS4Demo`** | CLI | sviluppatori / verifica | Avvia il runtime Metal, esegue un self-test GPU e — dato un GGUF — genera token in streaming dal modello reale. |
-| **`DwarfStar`** | App SwiftUI | utente finale | Chat grafica con caricamento modello, ragionamento collassabile, gestione modelli, server HTTP, benchmark e diagnostica. |
+| **`DwarfStar`** | App SwiftUI | utente finale | Chat grafica con tool/agenti/progetti, ragionamento collassabile, tuning della cache esperti, server HTTP nativo (OpenAI+Anthropic), inferenza distribuita su più Mac, diagnostica. |
 
 Entrambi condividono lo stesso motore Swift (`DS4Core` + `DS4Metal`), quindi
 ciò che la demo dimostra a riga di comando è esattamente ciò che l'app esegue
@@ -56,11 +56,13 @@ sotto il cofano.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  DwarfStarApp (SwiftUI)   ← GUI: chat, modelli, server, bench  │
-│        │                                                       │
+│  DwarfStarApp (SwiftUI)   ← GUI: chat, agenti, progetti,       │
+│        │                    tuning, server, distribuito, diag  │
 │  DS4Engine (Swift)        ← InferenceService (actor):          │
 │        │                    prompt → stream di eventi          │
-│        │                    (reasoning / text / progress)      │
+│        │                    (reasoning/text/toolStream/toolCall)│
+│        │                    + ToolRegistry, agenti, progetti,  │
+│        │                    LocalServer (in DwarfStar), Dist*  │
 │  ┌─────┴───────────────────────────────────────────────┐      │
 │  │ DS4Core (Swift puro)   DS4Metal (Swift puro)         │      │
 │  │  • GGUF parser          • MetalRuntime (kernel)      │      │
@@ -194,18 +196,19 @@ Argomenti:
 
 ## 5. L'app SwiftUI: `DwarfStar`
 
-L'app (`Sources/DwarfStar/`) è una finestra macOS con una **sidebar** a quattro
-sezioni (`RootView` + `AppSection`):
+L'app (`Sources/DwarfStar/`) è una finestra macOS con una **sidebar**
+(`RootView` + `AppSection`):
 
 | Sezione | Icona | Scopo |
 |---|---|---|
-| **Chat** | fumetti | Caricamento modello + conversazione in streaming. |
-| **Agenti** | persone | Ruoli: visualizza/modifica i prompt di definizione e i tool di ogni agente, creane di nuovi, scegli l'attivo. |
+| **Chat** | fumetti | Caricamento modello + conversazione in streaming (tool, agenti, progetto, riuso KV). |
+| **Agenti** | persone | Ruoli: visualizza/modifica i prompt di definizione e i tool di ogni agente, creane di nuovi, scegli l'attivo, export/import JSON. |
 | **Progetto** | cartella | Libreria di progetti salvati (memoria separata dalla chat): importa più cartelle, attivane una; l'agente la esplora con i tool `project_*` (solo le parti lette entrano in conversazione). |
 | **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso") per-agente. Il fine-tuning dei pesi non è possibile on-device. |
-| **Server** | rack | Avvio del server HTTP `ds4-server` e launcher dell'agent. |
-| **Benchmark** | tachimetro | Esecuzione di `ds4-bench` e grafico del throughput. |
-| **Diagnostica** | stetoscopio | Tokenizzazione di un testo + console del motore. |
+| **Server** | rack | Server HTTP **nativo in-process**, compatibile OpenAI + Anthropic (§9). |
+| **Distribuito** | gruppi | Inferenza distribuita su più Mac: pipeline a range di layer (§9). |
+| **Benchmark** | tachimetro | ⚠️ legacy: pilota il binario C `ds4-bench` rimosso — da riscrivere nativo. |
+| **Diagnostica** | stetoscopio | Tokenizzazione di un testo, chat template + token speciali (tipo/atomicità), console del motore. |
 
 Il punto d'ingresso è `DwarfStarApp` (`@main`): crea lo `ChatStore`
 condiviso, installa la cattura dello stderr del motore (`EngineLog`) e apre la
@@ -310,7 +313,9 @@ In fase `ready` appare la **`ChatView`**, divisa in tre parti:
 3. Si apre lo stream con `thinkMode` (`.high` se Thinking è attivo, altrimenti
    `.none`), `SamplingParams()` di default e `maxTokens: 4096`.
 4. Gli eventi affluiscono: il ragionamento riempie il blocco collassabile, il
-   testo riempie la bolla, il progress aggiorna la barra di stato.
+   testo riempie la bolla, un'eventuale tool-call scorre live come markup
+   grezzo (`.toolStream`) finché non diventa card, il progress aggiorna la
+   barra di stato.
 5. In caso d'errore, viene appeso il messaggio d'errore e — se presente — la
    coda del log del motore (`EngineLog.shared.tail()`).
 6. Alla fine `isGenerating = false` e la barra di stato si svuota.
@@ -335,7 +340,10 @@ e scegli quali **tool integrati** esporre al modello. I built-in di demo sono:
   auto-eseguibile in modo sicuro (input ristretto a cifre/operatori);
 - **`add` / `subtract` / `multiply`** — operano su due numeri `a` e `b`
   (somma, sottrazione, moltiplicazione); accettano numeri JSON o stringhe
-  numeriche.
+  numeriche;
+- **`project_list` / `project_read` / `project_search`** — esplorano il
+  **progetto attivo** (tab Progetto): elenco file, lettura paginata con numeri
+  di riga, ricerca testuale. Sono i tool dell'agente *coding*.
 
 Nel foglio **Tool** c'è anche il toggle **"Dichiarazione compatta"** (attivo di
 default): invece dello schema completo dei tool manda solo `nome(parametri)` + una
@@ -353,7 +361,10 @@ Flusso di una chiamata a tool:
    **tool-call** nel formato **DSML/XML** del paper (`<｜DSML｜tool_calls>…`). Il
    decoder riconosce il token `｜DSML｜` e bufferizza la chiamata invece di
    mostrarla come testo.
-2. La GUI mostra una bolla arancione **"Chiamata tool"** con nome e argomenti JSON.
+2. Mentre la chiamata viene generata, la GUI mostra il **markup grezzo in
+   streaming** in un riquadro tratteggiato ("Generazione chiamata tool…"); alla
+   chiusura del blocco il riquadro è sostituito dalla card arancione
+   **"Chiamata tool"** con nome e argomenti JSON.
 3. **Esecuzione**: i tool integrati vengono eseguiti **automaticamente**
    (`ToolRegistry.execute`) e il risultato compare come bolla verde; per tool
    non integrati si apre il foglio **"Risultati dei tool"** dove inserisci il
@@ -368,10 +379,13 @@ pannello **Diagnostica** ("Mostra chat template + formato tool") o via
 `InferenceService.chatTemplate()`. Vedi
 [`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md) §14 per i dettagli.
 
-> Nota: i tool richiedono il **multi-turno**, introdotto insieme a questa
-> feature — ogni generazione ri-renderizza l'intera conversazione (system, tool
-> dichiarati, turni utente/assistant, tool-call e risultati) e fa il prefill da
-> `pos 0` (nessun riuso di KV cache tra i turni).
+> Nota: il multi-turno **riusa la KV cache** (design append-only). Il servizio
+> tiene gli id esatti già nella KV (`committedIds`) e a ogni turno fa il prefill
+> **solo del suffisso nuovo** (chiusura `<eos>` del turno precedente + nuovo
+> turno utente/tool-result + apertura assistant). Reasoning e tool-call restano
+> verbatim nella KV. Se una generazione viene interrotta (Stop/errore), la KV
+> viene marcata *dirty* e il turno successivo la **ricostruisce** dagli id
+> committati (il compressore NSA è ricorrente e non può tornare indietro).
 
 ---
 
@@ -419,36 +433,69 @@ Dopo il caricamento, l'header della chat mostra una stima dell'impronta della
 
 ## 9. Pannelli avanzati
 
-> Questi pannelli pilotano i binari `ds4*` del progetto upstream come
-> **subprocess** e/o aprono il GGUF solo per il tokenizer. Richiedono i binari
-> compilati (`make` nel progetto padre) e, per la generazione vera, un GGUF
-> completo. Ricorda il vincolo **un solo modello in RAM**: il pannello Server
-> avvisa se un modello è già caricato in-process per la chat.
+### Server (`ServerView` + `LocalServer`) — HTTP nativo in-process
 
-### Server (`ServerView` + `ServerController`)
+Server HTTP **nativo** (Network.framework): espone il modello su un endpoint
+compatibile **OpenAI e Anthropic**, senza alcun sottoprocesso. Carica un
+**proprio** `InferenceService` in-process: i pesi GGUF sono viste mmap no-copy,
+quindi la page cache del SO li **condivide** col motore della chat — niente
+seconda copia dei pesi in RAM (solo KV cache e scratch sono separati).
 
-Pannello di controllo per il server HTTP compatibile OpenAI/Anthropic
-`ds4-server`:
+- configurazione: GGUF (con **Sfoglia**, sandbox), host/porta, contesto,
+  max token per risposta, toggle **CORS**;
+- **Avvia / Ferma** con stato "In ascolto", esempio `curl` pronto, log live;
+- richieste **serializzate** (modello singolo): una generazione alla volta
+  (`RequestGate`); ogni richiesta è **stateless** (la lista messaggi completa
+  viene ri-renderizzata, semantica OpenAI — `InferenceService.complete`).
 
-- campi: binario, GGUF, host/porta, contesto, toggle **CORS**;
-- **Disk KV cache** opzionale (cartella + spazio in MB);
-- **SSD streaming** opzionale (toggle + budget cache);
-- **Avvia / Ferma server** con stato "In ascolto su host:porta" e **log live**;
-- avviso arancione se un modello è già caricato in-process;
-- **Apri agent nel Terminale** — lancia l'`ds4-agent` interattivo in una
-  finestra di Terminale (`AgentLauncher.openInTerminal`).
+Endpoint:
 
-### Benchmark (`BenchView` + `BenchController`)
+| Metodo | Path | API |
+|---|---|---|
+| GET | `/v1/models`, `/v1/models/{id}` | OpenAI |
+| POST | `/v1/chat/completions` | OpenAI chat (SSE `chat.completion.chunk` con `stream:true`) |
+| POST | `/v1/responses` | OpenAI Responses (lifecycle eventi `response.*` completo) |
+| POST | `/v1/completions` | OpenAI completamento legacy |
+| POST | `/v1/messages` | Anthropic Messages (`message_start` → `content_block_*` → `message_stop`) |
 
-Esegue `ds4-bench`, ne fa il parsing del CSV in streaming e disegna il
-throughput con **Swift Charts**:
+Il parsing delle richieste (`ChatRequestParser`) mappa i JSON delle tre API nei
+tipi del motore (`ChatTurn`/`ToolSpec`/`SamplingParams`); `reasoning_effort` /
+`thinking` / `reasoning.effort` abilitano il thinking. Il sandbox richiede
+l'entitlement `com.apple.security.network.server` (già nel progetto).
 
-- configurazione: binario, GGUF, prompt file;
-- **frontiere di contesto**: start, max, passo, token generati;
-- **Avvia / Ferma**; finché non ci sono dati mostra un placeholder
-  (`ContentUnavailableView`);
-- il grafico traccia due serie — **Prefill** e **Generazione** — in token/secondo
-  sull'asse dei token di contesto.
+### Distribuito (`DistributedView` + `DS4Engine/Distributed/*`)
+
+Inferenza **distribuita su più Mac** (pipeline parallelism a range di layer,
+modellata su `ds4_distributed.c`):
+
+- ogni **worker** possiede uno slice contiguo di layer (`primo…ultimo`) con i
+  **suoi soli** pesi caldi e il **suo solo** shard di KV/compressore (allocati
+  esclusivamente per lo slice);
+- il **coordinatore** possiede embedding, sampling e prompt; valida che la
+  *route* copra tutti i 61 layer in modo contiguo, poi per token fa scorrere lo
+  **stato HC** (`nHC×nEmbd` float) attraverso i worker in ordine di layer;
+- lo streaming da SSD resta attivo su ogni nodo: il vantaggio è che ogni worker
+  tocca solo ~1/N degli esperti → working set caldo più piccolo → meno
+  page-fault;
+- **prefill a chunk** (default 32 token/frame, configurabile): il round-trip di
+  rete si paga per chunk, non per token;
+- **inoltro worker→worker** opzionale: lo stato HC passa direttamente tra i
+  worker e il terminale risponde al listener di ritorno del coordinatore
+  (serve l'IP LAN del coordinatore) — metà degli hop;
+- **bit attivazioni** 32/16/8 per ridurre la banda (parti da 32 per la
+  correttezza).
+
+Uso: su ogni Mac-worker scegli ruolo **Worker**, porta e range di layer e
+avvia; sul coordinatore elenca i worker (`host:porta`, uno per riga, in ordine
+di layer), scrivi il prompt e premi **Genera**. Il GGUF deve essere presente su
+ogni Mac (selezionato con Sfoglia per il sandbox).
+
+### Benchmark (`BenchView` + `BenchController`) — ⚠️ legacy
+
+Pilota ancora il binario C `ds4-bench` del progetto upstream, che **non esiste
+più** in questo repo (il motore è Swift puro): il pannello al momento non è
+funzionante e va riscritto in nativo (stessa sorte del vecchio pannello Server,
+già sostituito).
 
 ### Diagnostica (`DiagnosticsView` + `DiagnosticsController`)
 
