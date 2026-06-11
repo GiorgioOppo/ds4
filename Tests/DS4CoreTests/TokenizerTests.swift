@@ -92,4 +92,32 @@ final class TokenizerTests: XCTestCase {
             XCTAssertEqual(bytes, Array(prompt.utf8), "round-trip failed for \(prompt.debugDescription)")
         }
     }
+
+    /// The protocol control tokens (｜DSML｜, role markers, think tags) MUST tokenize
+    /// to a single atomic id — otherwise the rendered tool example in the prompt
+    /// (e.g. "<｜DSML｜tool_calls>") BPE-splits into pieces like "DS"+"ML" and the
+    /// model learns to emit those text fragments instead of the control token.
+    /// Independent of the C reference binary (only needs the real GGUF).
+    func testControlTokensTokenizeAtomically() throws {
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.modelPath), "real GGUF not present")
+        let model = try GGUFModel(path: Self.modelPath, metalMapping: false)
+        let tok = try Tokenizer(model: model)
+
+        let names = ["｜DSML｜", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
+                     "<｜User｜>", "<｜Assistant｜>", "<think>", "</think>"]
+        for name in names {
+            guard let id = tok.tokenId(name) else {
+                XCTFail("control token \(name.debugDescription) missing from vocab"); continue
+            }
+            XCTAssertEqual(tok.tokenizeRenderedChat(name), [id],
+                           "\(name.debugDescription) did not tokenize to its atomic id \(id)")
+        }
+
+        // The exact tool-call opener the renderer emits must keep ｜DSML｜ atomic:
+        // "<" + ｜DSML｜ + "tool_calls>" — three pieces, not a split bar token.
+        let dsml = tok.tokenId("｜DSML｜")!
+        let ids = tok.tokenizeRenderedChat("<｜DSML｜tool_calls>")
+        XCTAssertTrue(ids.contains(dsml),
+                      "opener tokenization \(ids) lost the atomic ｜DSML｜ id \(dsml)")
+    }
 }
