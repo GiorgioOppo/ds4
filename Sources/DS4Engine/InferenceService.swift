@@ -266,7 +266,7 @@ public actor InferenceService {
                          sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         resetConversation(systemPrompt: nil)
         self.tools = tools
-        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode,
+        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
                                          markup: markup, compactTools: compactTools)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
