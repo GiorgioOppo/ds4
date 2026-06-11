@@ -9,6 +9,13 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Apple Silicon ONLY. The engine requires unified-memory Metal and uses
+    # Float16 (unavailable on macOS x86_64): building the Intel slice fails
+    # with misleading errors ("Float16 has no member bitPattern"). Pin arm64
+    # so "Any Mac" destinations and Archive never try x86_64.
+    ARCHS: arm64
+    EXCLUDED_ARCHS: x86_64
+    ONLY_ACTIVE_ARCH: YES
     # Pure-Swift modules have no Obj-C interop, so no -Swift.h is generated;
     # disable the "Copy Swift Obj-C Interface Header" install phase (it would
     # otherwise fail looking for a missing header).
