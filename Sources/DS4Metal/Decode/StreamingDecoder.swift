@@ -141,7 +141,54 @@ public final class StreamingDecoder {
         return try outputHead(cur)
     }
 
-    /// Layer-major prefill: process the prompt loading **each layer's weights
+    // MARK: - Distributed slice execution (pipeline parallelism)
+    //
+    // These let a node run only PART of the model: the coordinator owns the
+    // embedding + output head, each worker owns a contiguous layer range and runs
+    // it over an incoming HC state. The HC state (nHC*nEmbd floats) is what crosses
+    // the wire between nodes. They reuse embedToken/runLayer/outputHead, so a slice
+    // [start,end] is numerically identical to the same layers inside forward().
+
+    /// HC state width that crosses the wire (nHC * nEmbd floats).
+    public var hcStateCount: Int { d.nHC * d.nEmbd }
+
+    /// Coordinator: embed `token` into the HC state (the start of the pipeline).
+    public func embed(token: Int, pos: Int) throws -> [Float] {
+        try embedToken(token, into: hcA)
+        return readHC(hcA)
+    }
+
+    /// Worker: run layers `start...end` over an incoming HC state at absolute `pos`,
+    /// returning the produced HC state to forward to the next slice. Resets only this
+    /// slice's recurrent compressor state on a fresh sequence (pos == 0).
+    public func forwardSlice(hc hcIn: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
+        precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
+        if pos == 0 { for i in start...end { try compStates[i]?.reset(rt) } }
+        writeFloats(hcIn, into: hcA)
+        var cur = hcA, other = hcB
+        for i in start...end {
+            let w = try layerProvider(i)
+            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                         cur: cur, other: other, pos: pos, nKeys: nKeys)
+            swap(&cur, &other)
+        }
+        profile.forwards += 1
+        return readHC(cur)
+    }
+
+    /// Coordinator/last node: run the output head over the final HC state → logits.
+    public func head(hc hcIn: [Float]) throws -> [Float] {
+        writeFloats(hcIn, into: hcA)
+        return try outputHead(hcA)
+    }
+
+    /// Read the HC state (nHC*nEmbd floats) out of a GPU buffer.
+    private func readHC(_ t: GPUTensor) -> [Float] {
+        let n = d.nHC * d.nEmbd
+        let p = t.buffer.contents().advanced(by: t.byteOffset).bindMemory(to: Float.self, capacity: n)
+        return Array(UnsafeBufferPointer(start: p, count: n))
+    }
+
     /// once** (per chunk) instead of once per token, so the dominant weight I/O is
     /// amortized over all the chunk's tokens. Numerically **identical** to calling
     /// `forward()` for tokens 0..N-1 in order — same ops, same per-token order,
