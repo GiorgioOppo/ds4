@@ -122,7 +122,7 @@ struct ChatView: View {
                 }
                 .padding()
             }
-            .onChange(of: store.messages.last?.text) {
+            .onChange(of: store.messages.last.map { $0.reasoning.count + $0.text.count + $0.toolStreamText.count }) {
                 if let last = store.messages.last {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
@@ -181,8 +181,12 @@ struct MessageRow: View {
                             .padding(10)
                             .background(bubbleColor)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
-                    } else if message.role == .assistant && message.reasoning.isEmpty && message.toolCalls.isEmpty {
+                    } else if message.role == .assistant && message.reasoning.isEmpty
+                                && message.toolCalls.isEmpty && message.toolStreamText.isEmpty {
                         ProgressView().controlSize(.small)
+                    }
+                    if !message.toolStreamText.isEmpty {
+                        ToolStreamView(text: message.toolStreamText)
                     }
                     ForEach(message.toolCalls) { call in
                         ToolCallView(call: call)
@@ -195,6 +199,30 @@ struct MessageRow: View {
 
     private var bubbleColor: Color {
         message.role == .user ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12)
+    }
+}
+
+/// The raw tool-call markup as it streams, shown live during generation. Once the
+/// block closes it is replaced by the formatted ToolCallView card.
+struct ToolStreamView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label("Generazione chiamata tool…", systemImage: "wrench.and.screwdriver")
+                .font(.caption.bold())
+                .foregroundStyle(.orange.opacity(0.7))
+            Text(text)
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.05))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.orange.opacity(0.25),
+                                                                 style: StrokeStyle(lineWidth: 1, dash: [4])))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 

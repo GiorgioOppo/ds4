@@ -10,6 +10,7 @@ struct UIMessage: Identifiable {
     let role: ChatRole
     var reasoning: String = ""
     var text: String
+    var toolStreamText: String = ""   // raw tool markup shown live while it generates
     var toolCalls: [ToolCall] = []
 }
 
@@ -354,8 +355,12 @@ final class ChatStore {
                 switch event {
                 case .reasoning(let r): messages[index].reasoning += r
                 case .text(let t): messages[index].text += t
+                case .toolStream(let s): messages[index].toolStreamText += s
                 case .toolCall(let calls):
                     messages[index].toolCalls = calls
+                    // The block closed: drop the raw live markup; the formatted card
+                    // (ToolCallView) takes over.
+                    messages[index].toolStreamText = ""
                     // When the model spelled the DSML markup out as plain text (it
                     // streamed into the bubble), strip the parsed block + any leaked
                     // malformed markup from view.
@@ -366,10 +371,12 @@ final class ChatStore {
                 case .progress(let p): status = p
                 }
             }
-            // Defensive: scrub any malformed tool markup the model emitted as text
-            // (degraded 2-bit output, e.g. a second botched tool call) so the final
-            // bubble shows clean prose. The real tool result has its own bubble.
+            // The stream ended: the raw live markup was ephemeral feedback — drop it
+            // (a parsed call shows as a card; an unparsable block is surfaced as text).
+            // Also scrub any malformed tool markup the model emitted as text (degraded
+            // 2-bit output) so the final bubble shows clean prose.
             if index < messages.count {
+                messages[index].toolStreamText = ""
                 messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
             }
         } catch is CancellationError {

@@ -55,6 +55,7 @@ public struct ModelInfo: Sendable {
 public enum GenEvent: Sendable {
     case reasoning(String)
     case text(String)
+    case toolStream(String)     // raw tool-call markup, streamed live during generation
     case toolCall([ToolCall])   // the model requested one or more tools; generation paused
     case progress(String)       // prefill/decode status (e.g. "prefill 3/11" or "12 tok · 1.4 tok/s")
 }
@@ -311,6 +312,7 @@ public actor InferenceService {
         var pending: [UInt8] = []
         var visible = ""
         var toolBytes: [UInt8] = []
+        var toolEmitted = 0
         let dsmlId = tok.dsmlId
         let lt = UInt8(ascii: "<")
 
@@ -319,6 +321,15 @@ public actor InferenceService {
             pending.removeAll(keepingCapacity: true)
             if asReasoning { continuation.yield(.reasoning(s)) }
             else { visible += s; continuation.yield(.text(s)) }
+        }
+
+        // Stream the not-yet-emitted suffix of the tool block as raw markup, so the
+        // user watches the tool call being generated. Holds back partial UTF-8.
+        func streamTool() {
+            guard toolEmitted < toolBytes.count,
+                  let s = String(bytes: toolBytes[toolEmitted...], encoding: .utf8) else { return }
+            toolEmitted = toolBytes.count
+            continuation.yield(.toolStream(s))
         }
 
         // Flush pending text but keep a trailing '<' buffered: it may begin the
@@ -346,8 +357,10 @@ public actor InferenceService {
                 flush(inReasoning)                               // flush any remaining real text
                 inTool = true
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()                                     // begin streaming the raw markup
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()
             } else if Int32(next) == tok.thinkStartId {
                 // The model opened a reasoning block on its own (even with think
                 // off): route it to the reasoning stream, don't show the tag.
