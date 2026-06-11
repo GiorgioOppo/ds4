@@ -357,13 +357,20 @@ final class ChatStore {
                 case .toolCall(let calls):
                     messages[index].toolCalls = calls
                     // When the model spelled the DSML markup out as plain text (it
-                    // streamed into the bubble), strip the parsed block from view.
+                    // streamed into the bubble), strip the parsed block + any leaked
+                    // malformed markup from view.
                     if !messages[index].text.isEmpty {
-                        messages[index].text = ToolCallParser
-                            .parse(messages[index].text, markup: .dsv4).visibleText
+                        let visible = ToolCallParser.parse(messages[index].text, markup: .dsv4).visibleText
+                        messages[index].text = ToolCallParser.stripLeakedMarkup(visible, markup: .dsv4)
                     }
                 case .progress(let p): status = p
                 }
+            }
+            // Defensive: scrub any malformed tool markup the model emitted as text
+            // (degraded 2-bit output, e.g. a second botched tool call) so the final
+            // bubble shows clean prose. The real tool result has its own bubble.
+            if index < messages.count {
+                messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
             }
         } catch is CancellationError {
             // User-initiated stop: keep the partial text, no error banner.
