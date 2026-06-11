@@ -14,5 +14,8 @@
     <!-- Downloading models over HTTPS. -->
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- Listening socket for the native in-process HTTP server (OpenAI-compatible API). -->
+    <key>com.apple.security.network.server</key>
+    <true/>
 </dict>
 </plist>

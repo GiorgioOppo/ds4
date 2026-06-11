@@ -1,83 +1,86 @@
 import Foundation
+import DS4Engine
 
-/// Launches and monitors the `ds4-server` binary as a subprocess.
-///
-/// The server holds its own copy of the model, so it must not run at the same
-/// time as the in-process chat engine on a machine where the model fits only
-/// once (that would load the weights twice). The UI surfaces that warning.
+/// Owns a native, in-process HTTP server (`LocalServer`) that exposes the model
+/// over an OpenAI-compatible API. Unlike the old C `ds4-server` subprocess, this
+/// loads its OWN `InferenceService` in-process: the GGUF weights are no-copy mmap
+/// views, so the OS page cache shares them with the chat engine (no second copy
+/// of the weights in RAM). Only the KV cache + Metal scratch are independent.
 @MainActor
 @Observable
 final class ServerController {
-    // Configuration.
-    var binaryPath = AppEnvironment.binary("ds4-server")
-    var workingDir = AppEnvironment.resourceDir   // resolves metal/ and relative paths
+    // Configuration (editable before Start).
     var modelPath = AppEnvironment.defaultModelPath
     var host = "127.0.0.1"
     var port = 8000
-    var contextSize = 100_000
+    var contextSize = 8192
+    var maxTokens = 1024
     var cors = false
-    var kvDiskDir = ""
-    var kvDiskSpaceMB = 8192
-    var streamingEnabled = false
-    var streamingCacheSpec = ""
 
     // Live state.
     var log = ""
     var isRunning = false
+    var isLoading = false
 
-    private let proc = ProcessStream()
+    private var engine: InferenceService?
+    private var server: LocalServer?
+    private var logTask: Task<Void, Never>?
 
     var endpoint: String { "http://\(host):\(port)/v1" }
 
     func start() {
-        guard !isRunning else { return }
+        guard !isRunning, !isLoading else { return }
+        isLoading = true
+        log = "Caricamento modello in-process…\n"
 
-        var args = ["-m", ProcessStream.absolutePath(modelPath),
-                    "--ctx", String(contextSize),
-                    "--host", host,
-                    "--port", String(port)]
-        if cors { args.append("--cors") }
-        if !kvDiskDir.isEmpty {
-            args += ["--kv-disk-dir", kvDiskDir, "--kv-disk-space-mb", String(kvDiskSpaceMB)]
+        let path = ProcessStream.absolutePath(modelPath)
+        let name = (path as NSString).lastPathComponent
+        let ctx = contextSize
+        let cfg = LocalServer.Config(host: host, port: UInt16(clamping: port),
+                                     cors: cors, maxTokens: maxTokens)
+
+        // Sendable log channel: the server (any thread) yields lines; we drain them
+        // on the main actor. Avoids capturing this @MainActor object in a @Sendable
+        // closure (Swift 6 concurrency-safe).
+        let (logStream, logCont) = AsyncStream<String>.makeStream()
+        logTask?.cancel()
+        logTask = Task { [weak self] in
+            for await line in logStream { self?.log += line }
         }
-        if streamingEnabled {
-            args.append("--ssd-streaming")
-            if !streamingCacheSpec.isEmpty {
-                args += ["--ssd-streaming-cache-experts", streamingCacheSpec]
+        let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
+
+        // Load the model OFF the main thread (mmap + Metal setup is heavy). The
+        // detached task captures only Sendable values (no self), then we hop back
+        // to the main actor to publish state.
+        let loadTask = Task.detached { () -> (InferenceService, LocalServer) in
+            let eng = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
+            let srv = LocalServer(engine: eng, modelName: name, config: cfg, onLog: onLog)
+            try srv.start()
+            return (eng, srv)
+        }
+        Task {
+            do {
+                let (eng, srv) = try await loadTask.value
+                self.engine = eng
+                self.server = srv
+                self.isLoading = false
+                self.isRunning = true
+            } catch {
+                logCont.yield("avvio fallito: \(error)\n")
+                self.isLoading = false
+                self.isRunning = false
             }
-        }
-
-        log = "$ ds4-server " + args.joined(separator: " ") + "\n"
-        isRunning = true
-        let error = proc.start(executable: binaryPath,
-                               arguments: args,
-                               workingDir: workingDir,
-                               onOutput: { [weak self] text in self?.log += text },
-                               onExit: { [weak self] status in
-                                   self?.log += "\n[server terminato, exit \(status)]\n"
-                                   self?.isRunning = false
-                               })
-        if let error {
-            log += "ds4-server: \(error)\nCompila con `make` nella cartella del progetto.\n"
-            isRunning = false
         }
     }
 
-    /// Cooperative stop (SIGINT): lets the server drain and persist KV state.
-    func stop() { proc.interrupt() }
-}
-
-/// Opens Terminal and runs the interactive `ds4-agent` in the project directory.
-/// The agent is a terminal program (REPL + TUI), so it is launched in a real
-/// terminal rather than embedded.
-enum AgentLauncher {
-    static func openInTerminal(projectDir: String) {
-        let dir = ProcessStream.absolutePath(projectDir)
-        let escaped = dir.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = "tell application \"Terminal\" to do script \"cd \(escaped) && ./ds4-agent\""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        try? proc.run()
+    func stop() {
+        server?.stop()
+        server = nil
+        engine = nil                  // release the model (KV + scratch)
+        logTask?.cancel()
+        logTask = nil
+        isRunning = false
+        isLoading = false
+        log += "[server fermato]\n"
     }
 }

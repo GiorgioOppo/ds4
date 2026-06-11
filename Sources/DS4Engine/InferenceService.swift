@@ -259,6 +259,18 @@ public actor InferenceService {
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
+    /// Stateless completion for the local HTTP server: reset the KV and render the
+    /// FULL message list as a fresh prompt, then generate. Mirrors OpenAI semantics
+    /// where each request carries the whole conversation (no server-side history).
+    public func complete(turns: [ChatTurn], tools: [ToolSpec], thinkMode: DS4ThinkMode,
+                         sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+        resetConversation(systemPrompt: nil)
+        self.tools = tools
+        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode,
+                                         markup: markup, compactTools: compactTools)
+        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+    }
+
     private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
