@@ -126,6 +126,80 @@ enum ChatRequestParser {
                       stream: (obj["stream"] as? Bool) ?? false, model: obj["model"] as? String)
     }
 
+    // MARK: OpenAI /v1/responses
+
+    static func parseResponses(_ obj: [String: Any], defaultTokens: Int) -> Parsed {
+        var turns: [ChatTurn] = []
+        if let s = obj["instructions"] as? String, !s.isEmpty { turns.append(.system(s)) }
+
+        if let s = obj["input"] as? String {
+            if !s.isEmpty { turns.append(.user(s)) }
+        } else if let items = obj["input"] as? [[String: Any]] {
+            for (i, it) in items.enumerated() {
+                switch it["type"] as? String ?? "message" {
+                case "message", "":
+                    let role = it["role"] as? String ?? "user"
+                    let text = responsesContent(it["content"])
+                    if role == "assistant" { turns.append(.assistant(text: text, toolCalls: [])) }
+                    else if role == "system" || role == "developer" { turns.append(.system(text)) }
+                    else { turns.append(.user(text)) }
+                case "function_call":
+                    let id = (it["call_id"] as? String) ?? (it["id"] as? String) ?? "call_\(i)"
+                    let name = it["name"] as? String ?? ""
+                    let args = it["arguments"] as? String ?? "{}"
+                    if !name.isEmpty {
+                        turns.append(.assistant(text: "", toolCalls: [ToolCall(id: id, name: name, argumentsJSON: args)]))
+                    }
+                case "function_call_output":
+                    let id = it["call_id"] as? String ?? ""
+                    let out = (it["output"] as? String) ?? responsesContent(it["output"])
+                    turns.append(.toolResult(callId: id, name: "", content: out))
+                default: break
+                }
+            }
+        }
+
+        var tools: [ToolSpec] = []
+        for t in obj["tools"] as? [[String: Any]] ?? [] {
+            guard let name = t["name"] as? String, !name.isEmpty else { continue }
+            let desc = t["description"] as? String ?? ""
+            let pj = jsonStringOf(t["parameters"]) ?? #"{"type":"object","properties":{}}"#
+            tools.append(ToolSpec(name: name, description: desc, parametersJSON: pj))
+        }
+
+        var sampling = SamplingParams()
+        if let t = number(obj["temperature"]) { sampling.temperature = Float(t) }
+        if let p = number(obj["top_p"]) { sampling.topP = Float(p) }
+        if let k = obj["top_k"] as? Int { sampling.topK = k }
+
+        var think: DS4ThinkMode = .none
+        if let r = obj["reasoning"] as? [String: Any],
+           let e = (r["effort"] as? String)?.lowercased(), ["high", "xhigh", "medium"].contains(e) {
+            think = .high
+        }
+
+        let maxTokens = (obj["max_output_tokens"] as? Int) ?? (obj["max_tokens"] as? Int) ?? defaultTokens
+        return Parsed(turns: turns, tools: tools, sampling: sampling, think: think,
+                      maxTokens: max(1, maxTokens), stream: (obj["stream"] as? Bool) ?? false,
+                      model: obj["model"] as? String)
+    }
+
+    /// Responses `content` may be a string or an array of input_text/output_text/text parts.
+    private static func responsesContent(_ value: Any?) -> String {
+        if let s = value as? String { return s }
+        if let parts = value as? [[String: Any]] {
+            var out = ""
+            for p in parts {
+                switch p["type"] as? String {
+                case "input_text", "output_text", "text", .none: out += p["text"] as? String ?? ""
+                default: break
+                }
+            }
+            return out
+        }
+        return ""
+    }
+
     /// Anthropic `system`/`content` may be a string or an array of text blocks.
     private static func anthropicText(_ value: Any?) -> String {
         if let s = value as? String { return s }

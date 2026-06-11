@@ -79,6 +79,7 @@ struct ServerView: View {
                 Section("Endpoint supportati") {
                     endpointRow("GET", "/v1/models", "elenco modelli")
                     endpointRow("POST", "/v1/chat/completions", "OpenAI chat (stream + non)")
+                    endpointRow("POST", "/v1/responses", "OpenAI Responses (stream + non)")
                     endpointRow("POST", "/v1/messages", "Anthropic Messages (stream + non)")
                     endpointRow("POST", "/v1/completions", "OpenAI completamento legacy")
                 }
