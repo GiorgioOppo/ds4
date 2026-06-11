@@ -7,3 +7,8 @@ Package.resolved
 weights/
 *.safetensors
 *.gguf
+
+# Xcode per-user state and stray duplicate projects (Xcode creates
+# "DwarfStar 2.xcodeproj" copies if the project is open during xcodegen).
+xcuserdata/
+DwarfStar *.xcodeproj/
