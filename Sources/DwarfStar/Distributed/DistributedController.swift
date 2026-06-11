@@ -30,6 +30,10 @@ final class DistributedController {
     var peersText = "127.0.0.1:9100"  // one host:port per line, in layer order
     var prompt = ""
     var maxTokens = 256
+    var prefillChunk = 32             // tokens per WORK frame during prefill
+    var forwardEnabled = false        // worker→worker forwarding (needs returnHost)
+    var returnHost = ""               // this Mac's LAN address, as the workers see it
+    var returnPort = 9099
     var output = ""
 
     // Live state.
@@ -94,8 +98,17 @@ final class DistributedController {
         guard !peers.isEmpty else { log += "nessun worker indicato\n"; return }
         isLoading = true; output = ""; log = "Caricamento modello (coordinatore)…\n"
 
+        if forwardEnabled && returnHost.trimmingCharacters(in: .whitespaces).isEmpty {
+            log += "inoltro worker→worker: indica l'host di ritorno (l'indirizzo LAN di questo Mac)\n"
+            isLoading = false
+            return
+        }
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
-                                         contextSize: contextSize, peers: peers, activationBits: activationBits)
+                                         contextSize: contextSize, peers: peers,
+                                         activationBits: activationBits, prefillChunk: prefillChunk,
+                                         forward: forwardEnabled,
+                                         returnHost: returnHost.trimmingCharacters(in: .whitespaces),
+                                         returnPort: UInt16(clamping: returnPort))
         let (logStream, logCont) = AsyncStream<String>.makeStream(); drainLog(logStream)
         let (tokStream, tokCont) = AsyncStream<String>.makeStream(); drainTokens(tokStream)
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }

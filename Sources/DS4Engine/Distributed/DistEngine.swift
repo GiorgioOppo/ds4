@@ -20,7 +20,11 @@ public final class DistEngine: @unchecked Sendable {
     private let tok: Tokenizer
     private let decoder: StreamingDecoder
 
-    public init(modelPath: String, contextSize: Int, expertCacheSlots: Int? = nil) throws {
+    /// `kvLayers` restricts KV/compressor allocation to a layer range (a worker
+    /// allocates only its slice's caches; a pure coordinator can pass 0..<0).
+    /// nil = full model.
+    public init(modelPath: String, contextSize: Int, expertCacheSlots: Int? = nil,
+                kvLayers: Range<Int>? = nil) throws {
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         self.tok = try Tokenizer(model: model)
@@ -34,7 +38,7 @@ public final class DistEngine: @unchecked Sendable {
                               attnFactor: 1, betaFast: 32, betaSlow: 1)
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(
             rt: rt, model: model, dims: dims, rope: rope, nLayers: DSV4Shape.nLayer,
-            maxKeys: contextSize, cacheSlots: expertCacheSlots)
+            maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers)
     }
 
     /// HC state width crossing the wire (nHC * nEmbd floats).
@@ -48,6 +52,11 @@ public final class DistEngine: @unchecked Sendable {
 
     public func forwardSlice(hc: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
         try decoder.forwardSlice(hc: hc, pos: pos, nKeys: nKeys, start: start, end: end)
+    }
+
+    /// Chunked prefill: run the slice over `hcs.count` consecutive tokens from `posBase`.
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
+        try decoder.forwardSliceBatch(hcs: hcs, posBase: posBase, start: start, end: end)
     }
 
     public func head(hc: [Float]) throws -> [Float] {

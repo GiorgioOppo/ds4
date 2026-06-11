@@ -98,25 +98,34 @@ public final class StreamingDecoder {
                 rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                 expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
                 slotCache: ExpertSlotCache? = nil,
-                usage: ExpertUsageStats? = nil) throws {
+                usage: ExpertUsageStats? = nil,
+                kvLayers: Range<Int>? = nil) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         self.slotCache = slotCache
         self.usage = usage
         let hcDim = dims.nHC * dims.nEmbd
+        // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
+        // (a worker never runs the other layers — dummy 1-float buffers there).
+        // nil = full model (the single-machine default).
+        let kvRange = kvLayers ?? 0..<nLayers
         // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
         // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
         // + up to maxKeys/4 compressed rows (ratio-4 is the densest).
         let maxComp = maxKeys / 4 + 8
         compStates = try (0..<nLayers).map { il -> CompressorState? in
+            guard kvRange.contains(il) else { return nil }
             let ratio = DSV4Shape.compressRatio(layer: il)
             guard ratio != 0 else { return nil }
             return try CompressorState(rt, ratio: ratio, headDim: dims.headDim, maxComp: maxKeys / ratio + 8)
         }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
-        rawCaches = try (0..<nLayers).map { _ in try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim) }
+        rawCaches = try (0..<nLayers).map { il in
+            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim)
+                                 : try GPUTensor.zeros(rt, floatCount: 1)
+        }
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
         embd = try .zeros(rt, floatCount: dims.nEmbd)
         flat = try .zeros(rt, floatCount: hcDim); pre = try .zeros(rt, floatCount: dims.nHC)
@@ -174,6 +183,20 @@ public final class StreamingDecoder {
         }
         profile.forwards += 1
         return readHC(cur)
+    }
+
+    /// Worker, chunked prefill: run layers `start...end` over `hcs.count` consecutive
+    /// tokens' HC states starting at absolute `posBase`. Token-outer (numerically
+    /// identical to consecutive forwardSlice calls); amortizes the NETWORK round
+    /// trip over the chunk — one WORK/RESULT per chunk instead of per token.
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
+        var out: [[Float]] = []
+        out.reserveCapacity(hcs.count)
+        for (i, hc) in hcs.enumerated() {
+            let pos = posBase + i
+            out.append(try forwardSlice(hc: hc, pos: pos, nKeys: pos + 1, start: start, end: end))
+        }
+        return out
     }
 
     /// Coordinator/last node: run the output head over the final HC state → logits.
@@ -523,7 +546,7 @@ public final class StreamingDecoder {
     /// repeated weight reads across tokens. Requires model opened metalMapping:true.
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
-                                                  cacheSlots: Int? = nil) throws -> StreamingDecoder {
+                                                  cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
@@ -564,7 +587,7 @@ public final class StreamingDecoder {
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather, slotCache: cache, usage: usage)
+                                    expertGather: gather, slotCache: cache, usage: usage, kvLayers: kvLayers)
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

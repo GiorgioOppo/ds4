@@ -99,32 +99,44 @@ public struct DistHello: Sendable {
     }
 }
 
-/// WORK payload: a hidden (HC) state (or a token for the first slice) to evaluate
-/// through `[layerStart, layerEnd]` at absolute position `pos`.
+/// WORK payload: `nTokens` consecutive tokens' HC states (concatenated) to
+/// evaluate through `[layerStart, layerEnd]` starting at absolute position `pos`.
+/// When `route` is non-empty the workers forward the result downstream
+/// (worker→worker) and the terminal worker replies to `returnHost:returnPort`;
+/// when empty, each worker replies on the same connection (coordinator relay).
 public struct DistWork: Sendable {
-    public var pos: Int
-    public var nKeys: Int
+    public var pos: Int               // absolute position of the FIRST token
+    public var nTokens: Int           // tokens in this chunk (hc holds nTokens states)
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
     public var flags: Dist.WorkFlags
-    public var token: Int             // used when `hc` is empty (coordinator embeds remotely — unused here)
     public var hcBits: Int            // 32/16/8
-    public var hc: [Float]            // the HC state (nHC*nEmbd); empty if sending a raw token
+    public var route: [DistRouteEntry]
+    public var routeIndex: Int        // which route entry THIS work is for
+    public var returnHost: String
+    public var returnPort: UInt16
+    public var hc: [Float]            // nTokens * (nHC*nEmbd) floats
 
-    public init(pos: Int, nKeys: Int, layerStart: Int, layerEnd: Int, flags: Dist.WorkFlags,
-                token: Int, hcBits: Int, hc: [Float]) {
-        self.pos = pos; self.nKeys = nKeys; self.layerStart = layerStart; self.layerEnd = layerEnd
-        self.flags = flags; self.token = token; self.hcBits = hcBits; self.hc = hc
+    public init(pos: Int, nTokens: Int, layerStart: Int, layerEnd: Int, flags: Dist.WorkFlags,
+                hcBits: Int, route: [DistRouteEntry] = [], routeIndex: Int = 0,
+                returnHost: String = "", returnPort: UInt16 = 0, hc: [Float]) {
+        self.pos = pos; self.nTokens = nTokens; self.layerStart = layerStart; self.layerEnd = layerEnd
+        self.flags = flags; self.hcBits = hcBits; self.route = route; self.routeIndex = routeIndex
+        self.returnHost = returnHost; self.returnPort = returnPort; self.hc = hc
     }
 
     public func encoded() -> Data {
         var d = Data()
         d.appendLE(UInt32(bitPattern: Int32(pos)))
-        d.appendLE(UInt32(nKeys))
+        d.appendLE(UInt32(nTokens))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(flags.rawValue)
-        d.appendLE(UInt32(bitPattern: Int32(token)))
         d.appendLE(UInt32(hcBits))
+        d.appendLE(UInt32(route.count)); d.appendLE(UInt32(routeIndex))
+        for e in route { e.encode(into: &d) }
+        let rh = Data(returnHost.utf8)
+        d.appendLE(UInt32(rh.count)); d.append(rh)
+        d.appendLE(UInt32(returnPort))
         d.appendLE(UInt32(hc.count))
         d.append(ActivationCodec.pack(hc, bits: hcBits))
         return d
@@ -134,16 +146,27 @@ public struct DistWork: Sendable {
         var o = d.startIndex
         guard d.count >= 32 else { return nil }
         let pos = Int(Int32(bitPattern: d.readLE(&o)))
-        let nKeys = Int(d.readLE(&o) as UInt32)
+        let nTokens = Int(d.readLE(&o) as UInt32)
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let flags = Dist.WorkFlags(rawValue: d.readLE(&o))
-        let token = Int(Int32(bitPattern: d.readLE(&o)))
         let bits = Int(d.readLE(&o) as UInt32)
+        let routeCount = Int(d.readLE(&o) as UInt32)
+        let routeIndex = Int(d.readLE(&o) as UInt32)
+        var route: [DistRouteEntry] = []
+        for _ in 0..<routeCount {
+            guard let e = DistRouteEntry.decode(d, &o) else { return nil }
+            route.append(e)
+        }
+        guard o + 4 <= d.endIndex else { return nil }
+        let rhLen = Int(d.readLE(&o) as UInt32)
+        guard o + rhLen + 8 <= d.endIndex else { return nil }
+        let returnHost = String(decoding: d[o..<o+rhLen], as: UTF8.self); o += rhLen
+        let returnPort = UInt16(clamping: d.readLE(&o) as UInt32)
         let count = Int(d.readLE(&o) as UInt32)
-        let packed = d[o..<d.endIndex]
-        let hc = count == 0 ? [] : ActivationCodec.unpack(Data(packed), count: count, bits: bits)
-        return DistWork(pos: pos, nKeys: nKeys, layerStart: ls, layerEnd: le, flags: flags,
-                        token: token, hcBits: bits, hc: hc)
+        let hc = count == 0 ? [] : ActivationCodec.unpack(Data(d[o..<d.endIndex]), count: count, bits: bits)
+        return DistWork(pos: pos, nTokens: nTokens, layerStart: ls, layerEnd: le, flags: flags,
+                        hcBits: bits, route: route, routeIndex: routeIndex,
+                        returnHost: returnHost, returnPort: returnPort, hc: hc)
     }
 }
 

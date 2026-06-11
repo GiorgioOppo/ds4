@@ -57,6 +57,21 @@ struct DistributedView: View {
                             .lineLimit(2...5)
                         Stepper("Max token: \(controller.maxTokens)",
                                 value: $controller.maxTokens, in: 16...4096, step: 16)
+                        Stepper("Chunk prefill: \(controller.prefillChunk) token",
+                                value: $controller.prefillChunk, in: 1...256, step: 8)
+                            .disabled(controller.isRunning)
+                    }
+                    Section("Inoltro worker→worker (opzionale)") {
+                        Toggle("Inoltra lo stato HC direttamente tra i worker", isOn: $controller.forwardEnabled)
+                            .disabled(controller.isRunning)
+                        if controller.forwardEnabled {
+                            TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
+                                .disabled(controller.isRunning)
+                            TextField("Porta di ritorno", value: $controller.returnPort,
+                                      format: .number.grouping(.never))
+                                .frame(width: 100)
+                                .disabled(controller.isRunning)
+                        }
                     }
                 }
 

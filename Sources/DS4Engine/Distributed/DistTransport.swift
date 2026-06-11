@@ -77,4 +77,62 @@ public struct DistRouteEntry: Sendable {
         self.host = host; self.port = port; self.layerStart = layerStart
         self.layerEnd = layerEnd; self.hasOutput = hasOutput
     }
+
+    func encode(into d: inout Data) {
+        let h = Data(host.utf8)
+        d.appendLE(UInt32(h.count)); d.append(h)
+        d.appendLE(UInt32(port))
+        d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
+        d.appendLE(UInt32(hasOutput ? 1 : 0))
+    }
+
+    static func decode(_ d: Data, _ o: inout Data.Index) -> DistRouteEntry? {
+        guard o + 4 <= d.endIndex else { return nil }
+        let hLen = Int(d.readLE(&o) as UInt32)
+        guard o + hLen + 16 <= d.endIndex else { return nil }
+        let host = String(decoding: d[o..<o+hLen], as: UTF8.self); o += hLen
+        let port = UInt16(clamping: d.readLE(&o) as UInt32)
+        let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
+        let hasOut = (d.readLE(&o) as UInt32) != 0
+        return DistRouteEntry(host: host, port: port, layerStart: ls, layerEnd: le, hasOutput: hasOut)
+    }
+}
+
+/// Coordinator-side listener for worker→worker forwarding: the TERMINAL worker
+/// connects back here and delivers RESULT frames. Results are surfaced as an
+/// AsyncStream the generation loop awaits (one in-flight chunk at a time).
+public final class DistReturnListener: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "ds4.dist.return")
+    private var listener: NWListener?
+    public let results: AsyncStream<DistResult>
+    private let cont: AsyncStream<DistResult>.Continuation
+
+    public init() {
+        (results, cont) = AsyncStream<DistResult>.makeStream()
+    }
+
+    public func start(port: UInt16) throws {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        guard let p = NWEndpoint.Port(rawValue: port) else { throw DistError.badPort }
+        let l = try NWListener(using: params, on: p)
+        l.newConnectionHandler = { [weak self] c in
+            guard let self else { return }
+            c.start(queue: self.queue)
+            let conn = DistConnection(c)
+            Task {
+                while let (type, payload) = try? await conn.readFrame() {
+                    if type == .result, let r = DistResult.decode(payload) { self.cont.yield(r) }
+                }
+                conn.cancel()
+            }
+        }
+        l.start(queue: queue)
+        listener = l
+    }
+
+    public func stop() {
+        listener?.cancel(); listener = nil
+        cont.finish()
+    }
 }

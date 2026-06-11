@@ -30,7 +30,10 @@ public final class DistWorker: @unchecked Sendable {
     public init(config: Config, onLog: @escaping @Sendable (String) -> Void) throws {
         self.config = config
         self.onLog = onLog
-        self.engine = try DistEngine(modelPath: config.modelPath, contextSize: config.contextSize)
+        // KV/compressor allocated ONLY for this worker's slice (the rest of the
+        // model's layers are never run here).
+        self.engine = try DistEngine(modelPath: config.modelPath, contextSize: config.contextSize,
+                                     kvLayers: config.layerStart..<(config.layerEnd + 1))
     }
 
     public func start() throws {
@@ -59,7 +62,22 @@ public final class DistWorker: @unchecked Sendable {
     }
 
     private func serve(_ conn: DistConnection) async {
-        onLog("coordinatore connesso\n")
+        onLog("connessione in ingresso\n")
+        // Outbound connections (next-hop worker / coordinator return), per session.
+        var downstream: [String: DistConnection] = [:]
+        defer { for c in downstream.values { c.cancel() } }
+
+        // `expectHello`: next-hop workers greet new connections with a HELLO frame
+        // (consume it once); the coordinator's return listener does not.
+        func outbound(_ host: String, _ port: UInt16, expectHello: Bool) async throws -> DistConnection {
+            let key = "\(host):\(port)"
+            if let c = downstream[key] { return c }
+            let c = try DistConnection.connect(host: host, port: port, queue: queue)
+            if expectHello { _ = try await c.readFrame() }
+            downstream[key] = c
+            return c
+        }
+
         do {
             let hello = DistHello(modelName: engine.modelName, layerStart: config.layerStart,
                                   layerEnd: config.layerEnd, hasOutput: config.hasOutput,
@@ -69,16 +87,51 @@ public final class DistWorker: @unchecked Sendable {
             while true {
                 let (type, payload) = try await conn.readFrame()
                 guard type == .work, let work = DistWork.decode(payload) else { continue }
-                // Serialize compute: one generation step at a time against the shard.
-                let result: DistResult = try await gate.run {
-                    let outHC = try self.engine.forwardSlice(hc: work.hc, pos: work.pos, nKeys: work.nKeys,
+
+                // Serialize compute: one chunk at a time against the shard.
+                // The chunk's hc holds nTokens states; split, run, re-concat.
+                let stateLen = engine.hcStateCount
+                let n = max(1, work.nTokens)
+                let outStates: [[Float]] = try await gate.run {
+                    var hcs: [[Float]] = []
+                    hcs.reserveCapacity(n)
+                    for i in 0..<n { hcs.append(Array(work.hc[i*stateLen..<(i+1)*stateLen])) }
+                    return try self.engine.forwardSliceBatch(hcs: hcs, posBase: work.pos,
                                                              start: work.layerStart, end: work.layerEnd)
-                    if work.flags.contains(.outputLogits) {
-                        return DistResult(kind: .logits, bits: 32, values: try self.engine.head(hc: outHC))
-                    }
-                    return DistResult(kind: .hidden, bits: work.hcBits, values: outHC)
                 }
-                try await conn.sendFrame(.result, result.encoded())
+
+                let isTerminal = work.route.isEmpty || work.routeIndex >= work.route.count - 1
+                if isTerminal {
+                    // Terminal hop: produce logits for the chunk's LAST token if asked,
+                    // else hidden states (relay) / a bare ack (forwarding flow control).
+                    let result: DistResult
+                    if work.flags.contains(.outputLogits) {
+                        result = DistResult(kind: .logits, bits: 32, values: try engine.head(hc: outStates[n-1]))
+                    } else if work.route.isEmpty {
+                        result = DistResult(kind: .hidden, bits: work.hcBits,
+                                            values: outStates.flatMap { $0 })
+                    } else {
+                        result = DistResult(kind: .ack, bits: 32, values: [])
+                    }
+                    if work.route.isEmpty {
+                        try await conn.sendFrame(.result, result.encoded())     // relay: reply upstream
+                    } else {
+                        let back = try await outbound(work.returnHost, work.returnPort, expectHello: false)
+                        try await back.sendFrame(.result, result.encoded())     // forwarding: reply to coordinator
+                    }
+                } else {
+                    // Forward the chunk to the next hop in the route.
+                    let nextIdx = work.routeIndex + 1
+                    let next = work.route[nextIdx]
+                    let fwd = DistWork(pos: work.pos, nTokens: n,
+                                       layerStart: next.layerStart, layerEnd: next.layerEnd,
+                                       flags: work.flags, hcBits: work.hcBits,
+                                       route: work.route, routeIndex: nextIdx,
+                                       returnHost: work.returnHost, returnPort: work.returnPort,
+                                       hc: outStates.flatMap { $0 })
+                    let c = try await outbound(next.host, next.port, expectHello: true)
+                    try await c.sendFrame(.work, fwd.encoded())
+                }
             }
         } catch {
             onLog("sessione chiusa: \(error)\n")
