@@ -153,6 +153,13 @@ final class ChatStore {
     // Last applied preset explanation, shown in the load screen.
     var presetNote: String?
 
+    // Sampling. Temperature is user-tunable (lower = more focused, less drift —
+    // helps on aggressively-quantized models). Persisted across launches.
+    var temperature: Double = UserDefaults.standard.object(forKey: "DS4Temperature") as? Double ?? 0.6 {
+        didSet { UserDefaults.standard.set(temperature, forKey: "DS4Temperature") }
+    }
+    private var sampling: SamplingParams { SamplingParams(temperature: Float(temperature)) }
+
     // Tools.
     var toolsEnabled = false
     var enabledToolNames: Set<String> = Set(ToolRegistry.builtins.map { $0.spec.name })
@@ -265,7 +272,7 @@ final class ChatStore {
         let mode = thinkMode
         generation = Task { [weak self] in
             let stream = await service.send(userText: text, thinkMode: mode,
-                                            sampling: SamplingParams(), maxTokens: 4096)
+                                            sampling: sampling, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
@@ -434,7 +441,7 @@ final class ChatStore {
         let mode = thinkMode
         generation = Task { [weak self] in
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
-                                                          sampling: SamplingParams(), maxTokens: 4096)
+                                                          sampling: sampling, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }

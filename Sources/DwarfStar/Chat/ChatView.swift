@@ -50,6 +50,7 @@ struct ChatView: View {
             } label: {
                 Label(toolButtonTitle, systemImage: "wrench.and.screwdriver")
             }
+            temperatureMenu
             Toggle("Thinking", isOn: $store.think)
                 .toggleStyle(.switch)
             Button {
@@ -60,6 +61,33 @@ struct ChatView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
+    }
+
+    /// Temperature control: lower = più focalizzato e meno deriva (utile sui
+    /// modelli molto quantizzati); più alto = più creativo/variabile.
+    private var temperatureMenu: some View {
+        Menu {
+            VStack(alignment: .leading) {
+                Text("Temperatura: \(store.temperature, format: .number.precision(.fractionLength(2)))")
+                    .font(.caption).foregroundStyle(.secondary)
+                Slider(value: $store.temperature, in: 0...1.5, step: 0.05)
+                    .frame(width: 220)
+                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                HStack {
+                    Button("Preciso (0.3)") { store.temperature = 0.3 }
+                    Button("Default (0.6)") { store.temperature = 0.6 }
+                }
+                .buttonStyle(.borderless).font(.caption)
+            }
+            .padding(8)
+        } label: {
+            Label(store.temperature.formatted(.number.precision(.fractionLength(1))),
+                  systemImage: "thermometer.medium")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Temperatura di campionamento: abbassala (0.3–0.4) se il modello sbanda o ripete.")
     }
 
     private var toolButtonTitle: String {
