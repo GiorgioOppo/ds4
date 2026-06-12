@@ -96,6 +96,10 @@ public actor InferenceService {
     /// with `committedIds`. The next generation rebuilds the KV from the exact
     /// committed ids (slow once, but correct) before continuing.
     private var kvDirty = false
+    /// Disk KV cache (ds4_kvstore model): nil = off. Checkpoints completed
+    /// generations and restores matching prefixes on cold starts.
+    private var diskKV: DiskKVStore?
+    private var lastDiskStoreCount = 0
 
     /// The pure-Swift engine always runs the SSD-streaming path (no-copy mmap
     /// non-routed weights + per-token expert gather); there are no resident/
@@ -227,6 +231,16 @@ public actor InferenceService {
         committedIds = []
         needsClose = false
         kvDirty = false   // next generation starts at pos 0 and resets the compressor
+        lastDiskStoreCount = 0
+    }
+
+    /// Enable/disable the disk KV cache. `dir` nil turns it off. Takes effect on
+    /// the next generation; existing checkpoints in `dir` become restorable.
+    public func setDiskKV(directory: URL?, budgetMB: Int) {
+        guard let directory else { diskKV = nil; return }
+        let bits: UInt8 = dims.gateQuant == .iq2_xxs ? 2 : 4
+        diskKV = try? DiskKVStore(directory: directory, budgetMB: budgetMB,
+                                  quantBits: bits, contextSize: contextSize)
     }
 
     /// Declare the tools available to the model. Tools are baked into the first
@@ -298,7 +312,25 @@ public actor InferenceService {
 
     private func generate(suffix: String, think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
                           continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
-        let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        var suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+
+        // Disk KV (ds4_kvstore model): on a COLD start, restore the longest stored
+        // checkpoint that is an exact token prefix of this prompt and prefill only
+        // the remainder. Covers both a fresh chat (system/agent prefix) and the
+        // stateless HTTP server (each request re-sends the whole transcript).
+        if committedIds.isEmpty, !kvDirty, let store = diskKV,
+           let hit = store.findLongestPrefix(of: suffixIds, modelName: modelName) {
+            continuation.yield(.progress("ripristino KV da disco (\(hit.tokens.count) token)…"))
+            do {
+                try decoder.importKV(hit.snapshot)
+                committedIds = hit.tokens
+                suffixIds.removeFirst(hit.tokens.count)
+                lastDiskStoreCount = hit.tokens.count
+            } catch {
+                committedIds = []          // fall back to a cold prefill
+            }
+        }
+
         let startPos = committedIds.count
         guard startPos + suffixIds.count < contextSize else {
             throw InferenceError.contextExceeded(prompt: startPos + suffixIds.count, context: contextSize)
@@ -427,6 +459,14 @@ public actor InferenceService {
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
         kvDirty = false                         // clean completion: KV matches committedIds
         saveExpertUsage()                       // persist the usage imatrix (cheap)
+        // Disk KV checkpoint (interval-gated: each entry is tens of MB).
+        if let store = diskKV,
+           committedIds.count - lastDiskStoreCount >= store.options.storeIntervalTokens {
+            continuation.yield(.progress("salvataggio KV su disco…"))
+            store.store(tokens: committedIds, modelName: modelName,
+                        snapshot: decoder.exportKV(nKeys: committedIds.count))
+            lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
+        }
         continuation.yield(.progress(""))
     }
 }

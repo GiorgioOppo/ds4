@@ -95,6 +95,13 @@ struct ModelLoadView: View {
             Section("Memoria") {
                 Text("Lo streaming da SSD è sempre attivo: i pesi non-routed sono mappati no-copy (page cache) e per ogni token vengono letti solo i 6 expert selezionati. Se il modello entra in RAM, la page cache lo tiene residente automaticamente.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("KV su disco (riusa i prefissi tra sessioni)", isOn: $store.diskKVEnabled)
+                if store.diskKVEnabled {
+                    Stepper("Budget: \(store.diskKVBudgetMB) MB",
+                            value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                    Text("A fine risposta lo stato KV viene salvato su disco; una nuova conversazione (o una richiesta al server) che inizia con un prefisso già visto lo ripristina invece di rifare il prefill. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
             }
 
             Section("Agente (ruolo)") {

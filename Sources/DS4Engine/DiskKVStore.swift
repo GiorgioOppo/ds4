@@ -1,0 +1,256 @@
+import Foundation
+import DS4Core
+import DS4Metal
+
+/// Disk-backed KV cache, modelled on ds4_kvstore.c: completed-generation
+/// checkpoints are written to a directory keyed by their exact token prefix;
+/// a later conversation (or a stateless HTTP request re-sending the transcript)
+/// that starts with a stored prefix RESTORES it and prefills only the rest.
+///
+/// File layout (Swift-defined body behind the ported KVC/DSV4 headers):
+///   [48B KVC header]  (KVCFile: magic, quant, tokens, ctx, hits, timestamps)
+///   [u32 nameLen][model name utf8]
+///   [u32 nTokens][nTokens × u32 token ids]
+///   [52B DSV4PayloadHeader]
+///   per layer: [u32 rawStart][u32 rawFloats][raw f32…]
+///              [u8 hasComp]( [u32 count][u32 stateLen][stateKv f32…]
+///                            [stateScore f32…][u32 cacheFloats][cache f32…] )
+/// Eviction uses the ported `KVCFile.evictionScore` under a byte budget;
+/// hits/lastUsed are bumped in-place on every restore (the 48B header only).
+public final class DiskKVStore: @unchecked Sendable {
+    public struct Options: Sendable {
+        /// Don't checkpoint tiny prefixes (C default is 512; local chats have
+        /// shorter useful prefixes, so we default lower).
+        public var minTokens = 128
+        /// Re-checkpoint only after this many NEW tokens since the last store.
+        public var storeIntervalTokens = 256
+        public init() {}
+    }
+
+    public let directory: URL
+    public let options: Options
+    private let budgetBytes: UInt64
+    private let quantBits: UInt8
+    private let contextSize: Int
+
+    public init(directory: URL, budgetMB: Int, quantBits: UInt8, contextSize: Int,
+                options: Options = Options()) throws {
+        self.directory = directory
+        self.budgetBytes = UInt64(max(64, budgetMB)) * 1_048_576
+        self.quantBits = quantBits == 2 ? 2 : 4    // header validity wants {2,4}
+        self.contextSize = contextSize
+        self.options = options
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    // MARK: Lookup
+
+    public struct Hit {
+        public let tokens: [Int]
+        public let snapshot: KVSnapshot
+    }
+
+    /// Find the stored entry with the LONGEST token prefix of `ids` (strictly
+    /// shorter than `ids`, ≥ minTokens, same model, fits this context), load its
+    /// snapshot and bump its hit counters.
+    public func findLongestPrefix(of ids: [Int], modelName: String) -> Hit? {
+        var bestURL: URL?
+        var bestTokens: [Int] = []
+        for url in entryURLs() {
+            guard let scan = scanEntry(url) else { continue }
+            guard scan.model == modelName,
+                  scan.tokens.count >= options.minTokens,
+                  scan.tokens.count < ids.count,
+                  scan.tokens.count < contextSize,
+                  scan.tokens.count > bestTokens.count,
+                  ids.starts(with: scan.tokens) else { continue }
+            bestURL = url
+            bestTokens = scan.tokens
+        }
+        guard let url = bestURL, let snapshot = loadSnapshot(url) else { return nil }
+        bumpHit(url)
+        return Hit(tokens: bestTokens, snapshot: snapshot)
+    }
+
+    // MARK: Store
+
+    /// Checkpoint `tokens`+`snapshot` (dedup by content name), then evict down to
+    /// the budget. Returns true if a new file was written.
+    @discardableResult
+    public func store(tokens: [Int], modelName: String, snapshot: KVSnapshot) -> Bool {
+        guard tokens.count >= options.minTokens, snapshot.nKeys == tokens.count else { return false }
+        let url = directory.appendingPathComponent(entryName(tokens: tokens, modelName: modelName))
+        guard !FileManager.default.fileExists(atPath: url.path) else { return false }
+
+        var body = Data()
+        appendU32(&body, UInt32(Data(modelName.utf8).count)); body.append(Data(modelName.utf8))
+        appendU32(&body, UInt32(tokens.count))
+        for t in tokens { appendU32(&body, UInt32(truncatingIfNeeded: t)) }
+        let ph = DSV4PayloadHeader(
+            savedContextSize: UInt32(contextSize), prefillChunk: 512,
+            rawKVCapacity: UInt32(contextSize), rawSlidingWindow: 128,
+            compressedKVCapacity: 0, checkpointTokenCount: UInt32(tokens.count),
+            layerCount: UInt32(snapshot.layers.count), rawHeadKVDim: UInt32(snapshot.headDim),
+            indexerHeadDim: 128, vocabSize: 0,
+            liveRawRows: UInt32(snapshot.layers.first.map { snapshot.nKeys - $0.rawStart } ?? 0))
+        body.append(contentsOf: ph.serialize())
+        for layer in snapshot.layers {
+            appendU32(&body, UInt32(layer.rawStart))
+            appendU32(&body, UInt32(layer.raw.count)); appendFloats(&body, layer.raw)
+            if let c = layer.comp {
+                body.append(1)
+                appendU32(&body, UInt32(c.count))
+                appendU32(&body, UInt32(c.stateKv.count))
+                appendFloats(&body, c.stateKv); appendFloats(&body, c.stateScore)
+                appendU32(&body, UInt32(c.cacheRows.count)); appendFloats(&body, c.cacheRows)
+            } else {
+                body.append(0)
+            }
+        }
+
+        let now = UInt64(Date().timeIntervalSince1970)
+        let header = KVCFile.fillHeader(KVCFile.Header(
+            quantBits: quantBits, reason: KVCFile.Reason.continued.rawValue, extFlags: 0, modelId: 0,
+            tokens: UInt32(tokens.count), hits: 0, ctxSize: UInt32(contextSize),
+            createdAt: now, lastUsed: now, payloadBytes: UInt64(body.count)))
+        var file = Data(header); file.append(body)
+        do { try file.write(to: url, options: .atomic) } catch { return false }
+        evictToBudget(keeping: url)
+        return true
+    }
+
+    /// Evict lowest-score entries (ported `KVCFile.evictionScore`) until the
+    /// directory fits the byte budget. Never evicts `keeping` (just written).
+    func evictToBudget(keeping: URL?) {
+        var entries: [(url: URL, size: UInt64, entry: KVCFile.Entry)] = []
+        var total: UInt64 = 0
+        for url in entryURLs() {
+            guard let h = readHeader(url) else { continue }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let sz = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+            total += sz
+            entries.append((url, sz, KVCFile.Entry(hits: h.hits, tokens: h.tokens, fileSize: sz,
+                                                   createdAt: h.createdAt, lastUsed: h.lastUsed,
+                                                   reason: h.reason)))
+        }
+        guard total > budgetBytes else { return }
+        let now = UInt64(Date().timeIntervalSince1970)
+        let order = entries.sorted { KVCFile.evictionScore($0.entry, now: now)
+                                   < KVCFile.evictionScore($1.entry, now: now) }
+        for e in order where total > budgetBytes {
+            if let keeping, e.url == keeping { continue }
+            try? FileManager.default.removeItem(at: e.url)
+            total -= e.size
+        }
+    }
+
+    // MARK: File scanning / parsing
+
+    private func entryURLs() -> [URL] {
+        let all = (try? FileManager.default.contentsOfDirectory(at: directory,
+                                                                includingPropertiesForKeys: nil)) ?? []
+        return all.filter { KVCFile.shaHexName($0.lastPathComponent) != nil }
+    }
+
+    private func entryName(tokens: [Int], modelName: String) -> String {
+        var bytes = Array(modelName.utf8)
+        for t in tokens {
+            let v = UInt32(truncatingIfNeeded: t)
+            bytes.append(contentsOf: [UInt8(v & 0xff), UInt8((v >> 8) & 0xff),
+                                      UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)])
+        }
+        return KVCFile.sha1Hex(bytes) + ".kv"
+    }
+
+    /// Cheap scan: header + model name + token list (no tensor body).
+    private func scanEntry(_ url: URL) -> (model: String, tokens: [Int])? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        func read(_ n: Int) -> [UInt8]? {
+            guard n >= 0, let d = try? fh.read(upToCount: n), d.count == n else { return nil }
+            return [UInt8](d)
+        }
+        guard let head = read(KVCFile.fixedHeader), KVCFile.parseHeader(head) != nil,
+              let nameLenB = read(4) else { return nil }
+        let nameLen = Int(KVCFile.leGet32(nameLenB, 0))
+        guard nameLen < 4096, let nameB = read(nameLen),
+              let countB = read(4) else { return nil }
+        let count = Int(KVCFile.leGet32(countB, 0))
+        guard count > 0, count < 1_000_000, let tokB = read(count * 4) else { return nil }
+        var tokens = [Int](); tokens.reserveCapacity(count)
+        for i in 0..<count { tokens.append(Int(KVCFile.leGet32(tokB, i * 4))) }
+        return (String(decoding: nameB, as: UTF8.self), tokens)
+    }
+
+    private func readHeader(_ url: URL) -> KVCFile.Header? {
+        guard let fh = try? FileHandle(forReadingFrom: url),
+              let d = try? fh.read(upToCount: KVCFile.fixedHeader) else { return nil }
+        try? fh.close()
+        return KVCFile.parseHeader([UInt8](d))
+    }
+
+    /// Bump hits + lastUsed in the 48-byte header, in place.
+    private func bumpHit(_ url: URL) {
+        guard var h = readHeader(url) else { return }
+        h.hits &+= 1
+        h.lastUsed = UInt64(Date().timeIntervalSince1970)
+        guard let fh = try? FileHandle(forWritingTo: url) else { return }
+        try? fh.write(contentsOf: Data(KVCFile.fillHeader(h)))
+        try? fh.close()
+    }
+
+    /// Full parse of one entry's tensor body into a KVSnapshot.
+    func loadSnapshot(_ url: URL) -> KVSnapshot? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let b = [UInt8](data)
+        var o = KVCFile.fixedHeader
+        func u32() -> Int? {
+            guard o + 4 <= b.count else { return nil }
+            defer { o += 4 }
+            return Int(KVCFile.leGet32(b, o))
+        }
+        func floats(_ n: Int) -> [Float]? {
+            guard n >= 0, o + n * 4 <= b.count else { return nil }
+            var out = [Float](repeating: 0, count: n)
+            b.withUnsafeBytes { raw in
+                _ = out.withUnsafeMutableBytes { dst in
+                    memcpy(dst.baseAddress!, raw.baseAddress!.advanced(by: o), n * 4)
+                }
+            }
+            o += n * 4
+            return out
+        }
+        guard let nameLen = u32() else { return nil }
+        o += nameLen
+        guard let count = u32() else { return nil }
+        o += count * 4
+        guard o + DSV4PayloadHeader.u32Fields * 4 <= b.count,
+              let ph = DSV4PayloadHeader(Array(b[o..<(o + DSV4PayloadHeader.u32Fields * 4)])) else { return nil }
+        o += DSV4PayloadHeader.u32Fields * 4
+        var layers: [KVLayerSnapshot] = []
+        for _ in 0..<Int(ph.layerCount) {
+            guard let rawStart = u32(), let rawCount = u32(), let raw = floats(rawCount),
+                  o < b.count else { return nil }
+            let hasComp = b[o]; o += 1
+            var comp: CompSnapshot? = nil
+            if hasComp == 1 {
+                guard let cCount = u32(), let stateLen = u32(),
+                      let kv = floats(stateLen), let score = floats(stateLen),
+                      let cacheLen = u32(), let cache = floats(cacheLen) else { return nil }
+                comp = CompSnapshot(count: cCount, stateKv: kv, stateScore: score, cacheRows: cache)
+            }
+            layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp))
+        }
+        return KVSnapshot(nKeys: count, headDim: Int(ph.rawHeadKVDim), layers: layers)
+    }
+
+    // MARK: little-endian append helpers
+
+    private func appendU32(_ d: inout Data, _ v: UInt32) {
+        d.append(contentsOf: [UInt8(v & 0xff), UInt8((v >> 8) & 0xff),
+                              UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)])
+    }
+    private func appendFloats(_ d: inout Data, _ a: [Float]) {
+        a.withUnsafeBufferPointer { d.append(Data(buffer: $0)) }   // little-endian host (arm64)
+    }
+}

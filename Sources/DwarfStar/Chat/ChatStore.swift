@@ -40,6 +40,20 @@ final class ChatStore {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
 
+    // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
+    // restores matching prefixes on cold starts. Applied on the NEXT model load.
+    var diskKVEnabled: Bool = UserDefaults.standard.bool(forKey: "DS4DiskKV") {
+        didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
+    }
+    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 4096 {
+        didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
+    }
+    /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
+    static var diskKVDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("DwarfStar/kv-cache", isDirectory: true)
+    }
+
     // Tuning tab state.
     var tuningInfo: InferenceService.TuningInfo?
 
@@ -237,12 +251,15 @@ final class ChatStore {
         phase = .loading
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
+        let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
+        let kvBudget = diskKVBudgetMB
         Task.detached(priority: .userInitiated) {
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,
                                                systemPrompt: nil,   // set by applyAgent below
                                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
+                await svc.setDiskKV(directory: kvDir, budgetMB: kvBudget)
                 let info = await svc.modelInfo()
                 await MainActor.run {
                     self.service = svc

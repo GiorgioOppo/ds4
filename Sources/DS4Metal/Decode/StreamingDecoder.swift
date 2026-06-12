@@ -88,6 +88,10 @@ public final class StreamingDecoder {
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
     let compStates: [CompressorState?]   // NSA compressor state per compressed layer (nil on layers 0,1)
+    /// Layers with real KV allocation (full model: 0..<nLayers; distributed slice: its range).
+    let kvRange: Range<Int>
+    /// KV capacity in tokens (raw rows per layer).
+    let maxKeys: Int
     let hcA, hcB, embd: GPUTensor
     let flat, pre, owts, otmp, oembd, onormed, logits: GPUTensor
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
@@ -110,6 +114,8 @@ public final class StreamingDecoder {
         // (a worker never runs the other layers — dummy 1-float buffers there).
         // nil = full model (the single-machine default).
         let kvRange = kvLayers ?? 0..<nLayers
+        self.kvRange = kvRange
+        self.maxKeys = maxKeys
         // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
         // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
         // + up to maxKeys/4 compressed rows (ratio-4 is the densest).

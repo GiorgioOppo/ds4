@@ -52,8 +52,13 @@ final class ServerController {
         // Load the model OFF the main thread (mmap + Metal setup is heavy). The
         // detached task captures only Sendable values (no self), then we hop back
         // to the main actor to publish state.
+        // Disk KV (shared setting with the chat): the stateless API re-sends the
+        // whole transcript each request, so prefix restore is its biggest win.
+        let kvDir = UserDefaults.standard.bool(forKey: "DS4DiskKV") ? ChatStore.diskKVDirectory : nil
+        let kvBudget = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 4096
         let loadTask = Task.detached { () -> (InferenceService, LocalServer) in
             let eng = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
+            await eng.setDiskKV(directory: kvDir, budgetMB: kvBudget)
             let srv = LocalServer(engine: eng, modelName: name, config: cfg, onLog: onLog)
             try srv.start()
             return (eng, srv)
