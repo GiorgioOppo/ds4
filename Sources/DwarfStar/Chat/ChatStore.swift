@@ -277,9 +277,10 @@ final class ChatStore {
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
 
         let mode = thinkMode
+        let params = sampling             // capture: `self` is weak inside the Task
         generation = Task { [weak self] in
             let stream = await service.send(userText: text, thinkMode: mode,
-                                            sampling: sampling, maxTokens: 4096)
+                                            sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
@@ -446,9 +447,10 @@ final class ChatStore {
         let index = appendAssistant()
         isGenerating = true
         let mode = thinkMode
+        let params = sampling             // capture: `self` is weak inside the Task
         generation = Task { [weak self] in
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
-                                                          sampling: sampling, maxTokens: 4096)
+                                                          sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
