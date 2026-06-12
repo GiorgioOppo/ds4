@@ -15,15 +15,10 @@ struct WorkerView: View {
                           systemImage: "rectangle.3.group")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Modello") {
-                    HStack {
-                        TextField("Modello GGUF", text: $controller.modelPath)
-                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
-                    }
-                    Stepper("Contesto: \(controller.contextSize) token",
-                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
+                Section("Modello (da Impostazioni)") {
+                    LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
+                    LabeledContent("Contesto", value: "\(controller.contextSize) token")
                 }
-                .disabled(controller.workerRunning || controller.workerLoading)
 
                 Section("Worker — modello da \(controller.modelLayers) layer (0…\(controller.modelLayers - 1))") {
                     TextField("Porta", value: $controller.port, format: .number.grouping(.never))
@@ -73,6 +68,10 @@ struct CoordinatorChatView: View {
     @State private var projects: [ProjectLibrary.SavedProject] = []
     @State private var activeProjectName: String?
 
+    /// The route setup lives in Impostazioni; this view is the chat itself.
+    /// `openSettings` lets the not-connected placeholder jump there.
+    var openSettings: () -> Void = {}
+
     var body: some View {
         if controller.connected {
             VStack(spacing: 0) {
@@ -83,7 +82,13 @@ struct CoordinatorChatView: View {
                 composer
             }
         } else {
-            setup
+            ContentUnavailableView {
+                Label("Cluster non connesso", systemImage: "rectangle.3.group")
+            } description: {
+                Text("Configura modello, worker e route nella scheda Impostazioni, poi premi Connetti.")
+            } actions: {
+                Button("Apri Impostazioni") { openSettings() }
+            }
         }
     }
 
@@ -211,63 +216,6 @@ struct CoordinatorChatView: View {
         .padding(10)
     }
 
-    // MARK: Not connected — full-screen setup (mirrors the local load screen)
-
-    private var setup: some View {
-        VStack(spacing: 0) {
-            Form {
-                Section {
-                    Label("Questo Mac come COORDINATORE: connette i worker e chatta sul cluster. Avvia prima i worker (scheda Worker, su questo o altri Mac).",
-                          systemImage: "rectangle.3.group")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                Section("Modello") {
-                    HStack {
-                        TextField("Modello GGUF", text: $controller.modelPath)
-                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
-                    }
-                    Stepper("Contesto: \(controller.contextSize) token",
-                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
-                    Picker("Bit attivazioni (transport)", selection: $controller.activationBits) {
-                        Text("32").tag(32); Text("16").tag(16); Text("8").tag(8)
-                    }
-                }
-                Section("Worker (uno per riga, host:porta, in ordine di layer)") {
-                    TextEditor(text: $controller.peersText)
-                        .font(.system(.callout, design: .monospaced))
-                        .frame(height: 64)
-                }
-                Section("Trasporto") {
-                    Stepper("Chunk prefill: \(controller.prefillChunk) token",
-                            value: $controller.prefillChunk, in: 1...256, step: 8)
-                    Stepper("Max token per risposta: \(controller.maxTokens)",
-                            value: $controller.maxTokens, in: 16...4096, step: 16)
-                    Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
-                    if controller.forwardEnabled {
-                        TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
-                        TextField("Porta di ritorno", value: $controller.returnPort, format: .number.grouping(.never))
-                            .frame(width: 100)
-                    }
-                }
-                Section {
-                    HStack(spacing: 12) {
-                        if controller.coordLoading {
-                            ProgressView().controlSize(.small)
-                            Text("Connessione…").font(.callout).foregroundStyle(.secondary)
-                        } else {
-                            Button { controller.connectCoordinator() } label: {
-                                Label("Connetti", systemImage: "link")
-                            }
-                        }
-                    }
-                }
-            }
-            .formStyle(.grouped)
-            .disabled(controller.coordLoading)
-
-            DistLogView(text: controller.coordLog, height: 140)
-        }
-    }
 }
 
 /// Shared monospaced log strip (hidden when empty).

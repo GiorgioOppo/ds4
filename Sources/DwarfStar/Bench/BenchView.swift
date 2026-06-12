@@ -14,15 +14,9 @@ struct BenchView: View {
                           systemImage: "gauge.with.dots.needle.67percent")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Modello") {
-                    HStack {
-                        TextField("Modello GGUF", text: $controller.modelPath)
-                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
-                    }
-                    .disabled(controller.isRunning)
-                    Stepper("Contesto max caricato: \(controller.contextSize) token",
-                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
-                        .disabled(controller.isRunning)
+                Section("Modello (da Impostazioni)") {
+                    LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
+                    LabeledContent("Contesto", value: "\(controller.contextSize) token")
                 }
                 Section("Frontiere di contesto") {
                     Stepper("Start: \(controller.ctxStart)", value: $controller.ctxStart, in: 64...200_000, step: 256)

@@ -10,7 +10,10 @@ import DS4Engine
 @Observable
 final class ServerController {
     // Configuration (editable before Start).
-    var modelPath = AppEnvironment.defaultModelPath
+    let settings: AppSettings
+    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+
+    init(settings: AppSettings) { self.settings = settings }
     var host = "127.0.0.1"
     var port = 8000
     var contextSize = 8192

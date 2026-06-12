@@ -20,15 +20,8 @@ struct ServerView: View {
                     }
                 }
 
-                Section("Modello") {
-                    HStack {
-                        TextField("Modello GGUF", text: $controller.modelPath)
-                            .disabled(controller.isRunning)
-                        Button("Sfoglia") {
-                            if let p = ModelPicker.pickGGUF() { controller.modelPath = p }
-                        }
-                        .disabled(controller.isRunning)
-                    }
+                Section("Modello (da Impostazioni)") {
+                    LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
                     Stepper("Contesto: \(controller.contextSize) token",
                             value: $controller.contextSize, in: 1024...200_000, step: 1024)
                         .disabled(controller.isRunning)

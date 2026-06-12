@@ -1,34 +1,46 @@
 import SwiftUI
 
-/// The Chat tab. A segmented switch chooses how the chat runs:
-///   • Locale       — the in-process engine on this Mac (ContentView).
-///   • Distribuito  — this Mac coordinates the worker cluster (CoordinatorChatView).
-/// Each mode shows its own config then chat; the WORKER role lives in the
-/// separate "Worker" sidebar tab.
+/// The Chat tab. The engine (local or distributed) is chosen ONCE in the
+/// Impostazioni tab; this view just renders the right chat for it:
+///   • Locale       — the in-process engine (ChatView once loaded).
+///   • Distribuito  — the coordinator chat across the worker cluster.
+/// When the engine isn't ready, a placeholder points to Impostazioni.
 struct ChatTabView: View {
     @Bindable var store: ChatStore
     @Bindable var dist: DistributedController
-    @State private var mode: Mode = .local
-
-    enum Mode: String, CaseIterable, Identifiable {
-        case local = "Locale"
-        case distributed = "Distribuito"
-        var id: String { rawValue }
-    }
+    let settings: AppSettings
+    var openSettings: () -> Void = {}
 
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("Modo", selection: $mode) {
-                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+        switch settings.mode {
+        case .local:
+            switch store.phase {
+            case .ready:
+                ChatView(store: store)
+            case .loading:
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("Caricamento del modello…").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .needsModel, .failed:
+                ContentUnavailableView {
+                    Label("Nessun modello caricato", systemImage: "shippingbox")
+                } description: {
+                    Text(placeholderText)
+                } actions: {
+                    Button("Apri Impostazioni") { openSettings() }
+                }
             }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .padding(.horizontal).padding(.vertical, 8)
-            Divider()
-            switch mode {
-            case .local:       ContentView(store: store)
-            case .distributed: CoordinatorChatView(controller: dist)
-            }
+        case .distributed:
+            CoordinatorChatView(controller: dist, openSettings: openSettings)
         }
+    }
+
+    private var placeholderText: String {
+        if case .failed(let message) = store.phase {
+            return "Caricamento fallito: \(message)\nConfigura il modello nella scheda Impostazioni."
+        }
+        return "Scegli il modello GGUF e caricalo nella scheda Impostazioni."
     }
 }

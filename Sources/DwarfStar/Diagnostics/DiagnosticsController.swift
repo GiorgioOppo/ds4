@@ -7,7 +7,10 @@ import DS4Engine
 @MainActor
 @Observable
 final class DiagnosticsController {
-    var modelPath = AppEnvironment.defaultModelPath
+    let settings: AppSettings
+    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+
+    init(settings: AppSettings) { self.settings = settings }
     var text = "Ciao, come stai?"
     var output = ""
     var isRunning = false

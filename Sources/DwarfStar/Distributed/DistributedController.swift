@@ -9,10 +9,20 @@ import DS4Core
 @MainActor
 @Observable
 final class DistributedController {
-    // Shared model config (each role loads its own engine; mmap weights shared).
-    var modelPath = AppEnvironment.defaultModelPath
-    var contextSize = 8192
+    // Model path/context come from the shared settings (each role still loads
+    // its own engine; the mmap weights are shared).
+    let settings: AppSettings
+    var modelPath: String {
+        get { settings.modelPath }
+        set { settings.modelPath = newValue }
+    }
+    var contextSize: Int {
+        get { settings.contextSize }
+        set { settings.contextSize = newValue }
+    }
     var activationBits = 32
+
+    init(settings: AppSettings) { self.settings = settings }
 
     // Worker (Distribuito sidebar tab).
     var port = 9100

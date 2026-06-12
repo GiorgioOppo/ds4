@@ -2,6 +2,7 @@ import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
     case chat = "Chat"
+    case settings = "Impostazioni"
     case agents = "Agenti"
     case project = "Progetto"
     case tuning = "Tuning"
@@ -14,6 +15,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
+        case .settings: return "gearshape"
         case .agents: return "person.2"
         case .project: return "folder"
         case .tuning: return "slider.horizontal.3"
@@ -25,15 +27,25 @@ enum AppSection: String, CaseIterable, Identifiable {
     }
 }
 
-/// App shell: a sidebar selects between chat, server/agent, benchmark and
-/// diagnostics panels.
+/// App shell: a sidebar selects the panel. The model + engine mode are set once
+/// in Impostazioni (AppSettings) and inherited by every panel's controller.
 struct RootView: View {
     @Bindable var store: ChatStore
-    @State private var server = ServerController()
-    @State private var distributed = DistributedController()
-    @State private var bench = BenchController()
-    @State private var diagnostics = DiagnosticsController()
+    let settings: AppSettings
+    @State private var distributed: DistributedController
+    @State private var server: ServerController
+    @State private var bench: BenchController
+    @State private var diagnostics: DiagnosticsController
     @State private var selection: AppSection? = .chat
+
+    init(store: ChatStore, settings: AppSettings) {
+        self.store = store
+        self.settings = settings
+        _distributed = State(initialValue: DistributedController(settings: settings))
+        _server = State(initialValue: ServerController(settings: settings))
+        _bench = State(initialValue: BenchController(settings: settings))
+        _diagnostics = State(initialValue: DiagnosticsController(settings: settings))
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -45,7 +57,10 @@ struct RootView: View {
         } detail: {
             switch selection ?? .chat {
             case .chat:
-                ChatTabView(store: store, dist: distributed)
+                ChatTabView(store: store, dist: distributed, settings: settings,
+                            openSettings: { selection = .settings })
+            case .settings:
+                SettingsView(settings: settings, store: store, dist: distributed)
             case .agents:
                 AgentsView(store: store)
             case .project:

@@ -30,9 +30,20 @@ final class ChatStore {
     // NOTE: the pure-Swift engine always runs the SSD-streaming path (mmap no-copy
     // + per-token expert gather); the old C-engine streaming/RAM-mode toggles were
     // dead and have been removed.
-    var modelPath = AppEnvironment.defaultModelPath
+    /// Shared app settings: model path / context / mode are owned by the
+    /// Impostazioni screen; this store (like every other controller) proxies them.
+    let settings: AppSettings
+    var modelPath: String {
+        get { settings.modelPath }
+        set { settings.modelPath = newValue }
+    }
+    var contextSize: Int {
+        get { settings.contextSize }
+        set { settings.contextSize = newValue }
+    }
     var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
-    var contextSize = 8192
+
+    init(settings: AppSettings) { self.settings = settings }
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.

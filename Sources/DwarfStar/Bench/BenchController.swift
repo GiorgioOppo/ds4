@@ -16,8 +16,11 @@ struct BenchRow: Identifiable {
 @MainActor
 @Observable
 final class BenchController {
-    var modelPath = AppEnvironment.defaultModelPath
-    var contextSize = 8192
+    let settings: AppSettings
+    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+    var contextSize: Int { settings.contextSize }
+
+    init(settings: AppSettings) { self.settings = settings }
     var ctxStart = 512
     var ctxMax = 4096
     var stepIncr = 512
