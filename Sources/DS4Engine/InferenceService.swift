@@ -37,8 +37,15 @@ public struct SamplingParams: Sendable {
     public var topP: Float
     public var minP: Float
     public var seed: UInt64
-    public init(temperature: Float = 0.6, topK: Int = 0, topP: Float = 0.95, minP: Float = 0.05, seed: UInt64 = 0xD54) {
-        self.temperature = temperature; self.topK = topK; self.topP = topP; self.minP = minP; self.seed = seed
+    /// Repetition penalty (llama.cpp `penalty_repeat`): >1 discourages re-emitting
+    /// the last `repeatLastN` tokens — breaks the repeat-loop collapse on
+    /// quantized models. 1.0 = off.
+    public var repetitionPenalty: Float
+    public var repeatLastN: Int
+    public init(temperature: Float = 0.6, topK: Int = 0, topP: Float = 0.95, minP: Float = 0.05,
+                seed: UInt64 = 0xD54, repetitionPenalty: Float = 1.1, repeatLastN: Int = 64) {
+        self.temperature = temperature; self.topK = topK; self.topP = topP; self.minP = minP
+        self.seed = seed; self.repetitionPenalty = repetitionPenalty; self.repeatLastN = repeatLastN
     }
 }
 
@@ -358,8 +365,12 @@ public actor InferenceService {
         let genStart = Date()
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
+            // Penalize the recently produced tokens to break repeat-loop collapse.
+            let lo = max(0, committedIds.count - sampling.repeatLastN)
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
-                                      topP: sampling.topP, minP: sampling.minP, rng: &rng)
+                                      topP: sampling.topP, minP: sampling.minP,
+                                      repetitionPenalty: sampling.repetitionPenalty,
+                                      recent: committedIds[lo...], rng: &rng)
             if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
                 // A held opener '<' belongs to the tool block, not the visible text:

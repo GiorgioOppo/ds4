@@ -81,9 +81,11 @@ public final class DistEngine: @unchecked Sendable {
 
     public var eosId: Int { Int(tok.eosId) }
 
-    /// Sample the next token id from a logits vector.
-    public func sample(_ logits: [Float], params: SamplingParams, rng: inout UInt64) -> Int {
+    /// Sample the next token id from a logits vector, penalizing `recent` tokens.
+    public func sample(_ logits: [Float], params: SamplingParams, recent: ArraySlice<Int> = ArraySlice<Int>(),
+                       rng: inout UInt64) -> Int {
         Sampler.sample(logits, temperature: params.temperature, topK: params.topK,
-                       topP: params.topP, minP: params.minP, rng: &rng)
+                       topP: params.topP, minP: params.minP,
+                       repetitionPenalty: params.repetitionPenalty, recent: recent, rng: &rng)
     }
 }

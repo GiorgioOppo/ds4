@@ -158,7 +158,14 @@ final class ChatStore {
     var temperature: Double = UserDefaults.standard.object(forKey: "DS4Temperature") as? Double ?? 0.6 {
         didSet { UserDefaults.standard.set(temperature, forKey: "DS4Temperature") }
     }
-    private var sampling: SamplingParams { SamplingParams(temperature: Float(temperature)) }
+    /// Repetition penalty (>1 discourages repeats; breaks the repeat-loop collapse
+    /// on quantized models). 1.0 = off. Persisted.
+    var repetitionPenalty: Double = UserDefaults.standard.object(forKey: "DS4RepPenalty") as? Double ?? 1.1 {
+        didSet { UserDefaults.standard.set(repetitionPenalty, forKey: "DS4RepPenalty") }
+    }
+    private var sampling: SamplingParams {
+        SamplingParams(temperature: Float(temperature), repetitionPenalty: Float(repetitionPenalty))
+    }
 
     // Tools.
     var toolsEnabled = false

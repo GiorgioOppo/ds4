@@ -47,6 +47,38 @@ final class SamplerTests: XCTestCase {
         XCTAssertEqual(rng, 7) // unchanged
     }
 
+    func testRepetitionPenaltyMovesArgmax() {
+        // With a clear winner at index 5, penalizing it should change the argmax
+        // (it stops being the top token) — this is what breaks a repeat loop.
+        var logits = [Float](repeating: 0, count: 100)
+        logits[5] = 10; logits[9] = 8
+        XCTAssertEqual(Sampler.applyRepetitionPenalty(logits, recent: [], penalty: 1.5).count, 100)
+        let penalized = Sampler.applyRepetitionPenalty(logits, recent: [5][...], penalty: 2.0)
+        XCTAssertEqual(penalized[5], 5, accuracy: 1e-5)   // 10/2
+        XCTAssertEqual(Sampler.argmax(penalized), 9)      // 8 now wins over 5
+
+        // penalty 1.0 or empty window leaves logits untouched.
+        XCTAssertEqual(Sampler.applyRepetitionPenalty(logits, recent: [5][...], penalty: 1.0), logits)
+        XCTAssertEqual(Sampler.applyRepetitionPenalty(logits, recent: [], penalty: 2.0), logits)
+
+        // Negative logits are multiplied (pushed further down), not divided.
+        var neg = [Float](repeating: 0, count: 4); neg[2] = -4
+        XCTAssertEqual(Sampler.applyRepetitionPenalty(neg, recent: [2][...], penalty: 2.0)[2], -8, accuracy: 1e-5)
+    }
+
+    func testRepetitionPenaltyBreaksGreedyLoop() {
+        // Greedy (temp 0) keeps picking the winner; once it's in `recent`, the
+        // penalty lets a different token win.
+        var logits = [Float](repeating: 0, count: 50)
+        logits[7] = 5; logits[3] = 4
+        var rng: UInt64 = 1
+        let plain = Sampler.sample(logits, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+        XCTAssertEqual(plain, 7)
+        let penalized = Sampler.sample(logits, temperature: 0, topK: 0, topP: 1, minP: 0,
+                                       repetitionPenalty: 2.0, recent: [7, 7][...], rng: &rng)
+        XCTAssertEqual(penalized, 3)
+    }
+
     /// Self-consistency invariants across a grid of sampling parameters: the
     /// sampler must always return a valid in-range index, and top_k==1 must
     /// collapse to the argmax (the single most likely token).

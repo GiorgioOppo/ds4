@@ -79,6 +79,14 @@ struct ChatView: View {
                     Button("Default (0.6)") { store.temperature = 0.6 }
                 }
                 .buttonStyle(.borderless).font(.caption)
+
+                Divider()
+                Text("Penalità ripetizione: \(store.repetitionPenalty, format: .number.precision(.fractionLength(2)))")
+                    .font(.caption).foregroundStyle(.secondary)
+                Slider(value: $store.repetitionPenalty, in: 1.0...1.5, step: 0.05)
+                    .frame(width: 220)
+                Text("Alza (1.15–1.3) se il modello entra in loop di ripetizione dopo molti token.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             .padding(8)
         } label: {
