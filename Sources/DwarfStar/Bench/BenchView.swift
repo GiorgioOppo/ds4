@@ -1,25 +1,37 @@
 import SwiftUI
 import Charts
 
-/// Benchmark panel: configure and run ds4-bench, then chart prefill and
-/// generation throughput across context frontiers.
+/// Native benchmark panel: run prefill + generation on the in-process engine
+/// across context frontiers and chart the throughput (no subprocess).
 struct BenchView: View {
     @Bindable var controller: BenchController
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("ds4-bench") {
-                    TextField("Binario", text: $controller.binaryPath)
-                    TextField("Modello GGUF", text: $controller.modelPath)
-                    TextField("Prompt file", text: $controller.promptFile)
+                Section {
+                    Label("Benchmark nativo: misura prefill e generazione (token/s) del motore in-process a contesti crescenti. Carica una propria copia del modello (pesi mmap condivisi).",
+                          systemImage: "gauge.with.dots.needle.67percent")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Section("Modello") {
+                    HStack {
+                        TextField("Modello GGUF", text: $controller.modelPath)
+                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
+                    }
+                    .disabled(controller.isRunning)
+                    Stepper("Contesto max caricato: \(controller.contextSize) token",
+                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
+                        .disabled(controller.isRunning)
                 }
                 Section("Frontiere di contesto") {
-                    Stepper("Start: \(controller.ctxStart)", value: $controller.ctxStart, in: 256...1_000_000, step: 1024)
-                    Stepper("Max: \(controller.ctxMax)", value: $controller.ctxMax, in: 1024...1_000_000, step: 1024)
-                    Stepper("Passo: \(controller.stepIncr)", value: $controller.stepIncr, in: 256...262_144, step: 1024)
-                    Stepper("Token generati: \(controller.genTokens)", value: $controller.genTokens, in: 0...4096, step: 32)
+                    Stepper("Start: \(controller.ctxStart)", value: $controller.ctxStart, in: 64...200_000, step: 256)
+                    Stepper("Max: \(controller.ctxMax)", value: $controller.ctxMax, in: 256...200_000, step: 256)
+                    Stepper("Passo: \(controller.stepIncr)", value: $controller.stepIncr, in: 64...32_768, step: 256)
+                    Stepper("Token generati per punto: \(controller.genTokens)",
+                            value: $controller.genTokens, in: 1...512, step: 8)
                 }
+                .disabled(controller.isRunning)
                 Section {
                     if controller.isRunning {
                         Button(role: .destructive) { controller.stop() } label: {
@@ -27,7 +39,7 @@ struct BenchView: View {
                         }
                     } else {
                         Button { controller.run() } label: {
-                            Label("Avvia benchmark", systemImage: "gauge.with.dots.needle.67percent")
+                            Label("Avvia benchmark", systemImage: "play.fill")
                         }
                     }
                 }
@@ -39,11 +51,23 @@ struct BenchView: View {
 
             if controller.rows.isEmpty {
                 ContentUnavailableView("Nessun dato", systemImage: "chart.xyaxis.line",
-                                       description: Text(controller.isRunning ? "Benchmark in corso…" : "Avvia un benchmark per vedere il throughput."))
+                                       description: Text(controller.isRunning ? "Benchmark in corso…"
+                                                                              : "Avvia un benchmark per vedere il throughput."))
                     .frame(maxHeight: .infinity)
             } else {
-                throughputChart
-                    .padding()
+                throughputChart.padding()
+            }
+
+            if !controller.log.isEmpty {
+                Divider()
+                ScrollView {
+                    Text(controller.log)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled).padding(8)
+                }
+                .frame(height: 110)
+                .background(Color.black.opacity(0.05))
             }
         }
     }

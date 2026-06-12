@@ -207,7 +207,7 @@ L'app (`Sources/DwarfStar/`) è una finestra macOS con una **sidebar**
 | **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso") per-agente. Il fine-tuning dei pesi non è possibile on-device. |
 | **Server** | rack | Server HTTP **nativo in-process**, compatibile OpenAI + Anthropic (§9). |
 | **Distribuito** | gruppi | Inferenza distribuita su più Mac: pipeline a range di layer (§9). |
-| **Benchmark** | tachimetro | ⚠️ legacy: pilota il binario C `ds4-bench` rimosso — da riscrivere nativo. |
+| **Benchmark** | tachimetro | Nativo: prefill + generazione (token/s) del motore in-process a contesti crescenti, con grafico. |
 | **Diagnostica** | stetoscopio | Tokenizzazione di un testo, chat template + token speciali (tipo/atomicità), console del motore. |
 
 Il punto d'ingresso è `DwarfStarApp` (`@main`): crea lo `ChatStore`
@@ -490,12 +490,17 @@ avvia; sul coordinatore elenca i worker (`host:porta`, uno per riga, in ordine
 di layer), scrivi il prompt e premi **Genera**. Il GGUF deve essere presente su
 ogni Mac (selezionato con Sfoglia per il sandbox).
 
-### Benchmark (`BenchView` + `BenchController`) — ⚠️ legacy
+### Benchmark (`BenchView` + `BenchController`) — nativo
 
-Pilota ancora il binario C `ds4-bench` del progetto upstream, che **non esiste
-più** in questo repo (il motore è Swift puro): il pannello al momento non è
-funzionante e va riscritto in nativo (stessa sorte del vecchio pannello Server,
-già sostituito).
+Benchmark **in-process** (niente sottoprocesso): carica una propria copia del
+modello (pesi mmap condivisi) e misura, a contesti crescenti, il throughput di
+**prefill** e **generazione** (`InferenceService.benchmark(contextTokens:
+genTokens:)`: prefilla un prompt sintetico di N token e decodifica `genTokens`,
+cronometrando le due fasi). Configurazione: modello (+Sfoglia), contesto max
+caricato, frontiere (start/max/passo) e token generati per punto. Il grafico
+(Swift Charts) traccia le due serie token/s sull'asse dei token di contesto; un
+log mostra l'avanzamento. Caricamento ed esecuzione off-main, risultati in
+streaming via `AsyncStream`; **Ferma** annulla tra una frontiera e l'altra.
 
 ### Diagnostica (`DiagnosticsView` + `DiagnosticsController`)
 

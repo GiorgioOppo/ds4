@@ -60,7 +60,7 @@ The engine is a faithful Swift reimplementation; correctness is the project's
 | **Tuning** | slot della cache esperti, hit-rate, concentrazione del routing per layer (la "usage imatrix") |
 | **Server** | server HTTP **nativo in-process** OpenAI/Anthropic-compatible (vedi sotto) |
 | **Distribuito** | inferenza distribuita su più Mac (pipeline a range di layer, vedi sotto) |
-| **Benchmark** | ⚠️ legacy: pilota il binario C `ds4-bench`, rimosso — da riscrivere nativo |
+| **Benchmark** | nativo: prefill + generazione (token/s) del motore in-process a contesti crescenti, con grafico (Swift Charts) |
 | **Diagnostica** | dump dei token e del chat template (tokenizer nativo, niente sottoprocessi) |
 
 ### Quick start
@@ -163,7 +163,7 @@ native HTTP server (OpenAI `chat/completions` verified end-to-end, Anthropic
 inference (protocol + worker/coordinator + UI are in place; numerical parity
 and multi-Mac runs not yet verified).
 
-**Known gaps**: the Benchmark tab still drives the removed C `ds4-bench`
-binary (to be reimplemented natively); decode on a 16 GB machine is
-I/O-bound (~57% expert gather) — that is the physics of streaming 284B from
-SSD, and the distributed mode is the intended mitigation.
+**Known gaps**: decode on a 16 GB machine is I/O-bound (~57% expert gather) —
+that is the physics of streaming 284B from SSD, and the distributed mode is the
+intended mitigation. No subprocess-driven panels remain: server, distributed
+and benchmark are all native in-process.
