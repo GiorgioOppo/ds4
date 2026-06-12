@@ -119,7 +119,7 @@ public final class DiskKVStore: @unchecked Sendable {
         guard UInt64(file.count) <= budgetBytes else { return false }   // can never fit
         evictToBudget(incomingBytes: UInt64(file.count),
                       incomingTokens: tokens, incomingModel: modelName)
-        do { try file.write(to: url, options: .atomic) } catch { return false }
+        do { try file.write(to: url, options: Data.WritingOptions.atomic) } catch { return false }
         return true
     }
 

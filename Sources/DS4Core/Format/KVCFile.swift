@@ -96,6 +96,14 @@ public enum KVCFile {
         public var createdAt: UInt64
         public var lastUsed: UInt64
         public var payloadBytes: UInt64
+        public init(quantBits: UInt8, reason: UInt8, extFlags: UInt8, modelId: UInt8,
+                    tokens: UInt32, hits: UInt32, ctxSize: UInt32,
+                    createdAt: UInt64, lastUsed: UInt64, payloadBytes: UInt64) {
+            self.quantBits = quantBits; self.reason = reason; self.extFlags = extFlags
+            self.modelId = modelId; self.tokens = tokens; self.hits = hits
+            self.ctxSize = ctxSize; self.createdAt = createdAt; self.lastUsed = lastUsed
+            self.payloadBytes = payloadBytes
+        }
     }
 
     public static func fillHeader(_ h: Header) -> [UInt8] {
