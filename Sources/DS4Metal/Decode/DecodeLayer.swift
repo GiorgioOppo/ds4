@@ -39,6 +39,12 @@ public struct DSV4Dims {
     /// through the NSA-compressed rows — matching the trained NSA semantics (the C
     /// kv_cache_push_raw literally slides its raw buffer at this cap).
     public var nSWA: Int = 128
+    /// NSA indexer (DSA): on ratio-4 layers, when the compressed rows exceed
+    /// `indexerTopK` the attention sees only the top-K most relevant ones for the
+    /// current query (C: DS4_N_INDEXER_TOP_K=512 on Flash, 64 heads × 128 dim).
+    public var nIndexerHead: Int = 64
+    public var nIndexerHeadDim: Int = 128
+    public var indexerTopK: Int = 512
     /// Per-group slice of the attention heads (qDim / nOutGroup).
     public var attnGroupDim: Int { qDim / nOutGroup }
     /// Low-rank attention output dim (nOutGroup * nLoraO).
@@ -92,6 +98,15 @@ public struct LayerWeights {
     public var compGate: GPUTensor?       // F16 attn_compressor_gate [nEmbd x coff*headDim]
     public var compApe: GPUTensor?        // attn_compressor_ape      [coff*headDim x ratio] (absolute pos emb)
     public var compNorm: GPUTensor?       // F32 attn_compressor_norm [headDim]
+    // NSA indexer (DSA, ratio-4 layers only): its own compressor (head_dim=128)
+    // plus the per-token scoring projections. All optional (nil elsewhere).
+    public var idxQB: GPUTensor?          // indexer.attn_q_b  [qRank x 64*128] (F16 or Q8)
+    public var idxQBF16 = true            // idxQB precision (the C accepts both)
+    public var idxProj: GPUTensor?        // F16 indexer.proj  [nEmbd x 64]
+    public var idxKv: GPUTensor?          // F16 indexer_compressor_kv   [nEmbd x coff*128]
+    public var idxGate: GPUTensor?        // F16 indexer_compressor_gate [nEmbd x coff*128]
+    public var idxApe: GPUTensor?         // F16 indexer_compressor_ape  [coff*128 x ratio]
+    public var idxNorm: GPUTensor?        // F32 indexer_compressor_norm [128]
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -120,6 +135,7 @@ public final class DecodeScratch {
     let logits, sp, probs, selected, rw: GPUTensor
     let gate6, up6, mid6, down6, routed: GPUTensor
     let sgate, sup, smid, sdown, sharedOut, ffnOut: GPUTensor
+    let idxQ, idxW, idxScores: GPUTensor   // NSA indexer: q [64×128], weights [64], scores [maxComp]
 
     public init(_ rt: MetalRuntime, _ d: DSV4Dims, maxKeys: Int) throws {
         let hcDim = d.nHC * d.nEmbd
@@ -144,6 +160,9 @@ public final class DecodeScratch {
         sgate = try .zeros(rt, floatCount: d.sharedFfn); sup = try .zeros(rt, floatCount: d.sharedFfn)
         smid = try .zeros(rt, floatCount: d.sharedFfn); sdown = try .zeros(rt, floatCount: d.nEmbd)
         sharedOut = try .zeros(rt, floatCount: d.nEmbd); ffnOut = try .zeros(rt, floatCount: d.nEmbd)
+        idxQ = try .zeros(rt, floatCount: d.nIndexerHead * d.nIndexerHeadDim)
+        idxW = try .zeros(rt, floatCount: d.nIndexerHead)
+        idxScores = try .zeros(rt, floatCount: maxKeys)   // ≥ maxComp rows, generous
     }
 }
 
@@ -181,6 +200,22 @@ extension GraphContext {
     public func decodeRoute(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
                             rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
+        let nComp = try decodeRoutePre(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
+                                       pos: pos, rmsEps: rmsEps, comp: comp, idx: nil, indexerScoring: false)
+        try decodeRouteAttn(w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
+                            rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
+    }
+
+    /// Phase 1a (pre-attention): HC-reduce, attention+indexer compressor updates,
+    /// Q/KV paths, fp8 raw store, and — when `indexerScoring` — the indexer
+    /// relevance scores for this token (s.idxScores[0..nIdxComp)). Split from the
+    /// attention so the caller can commit, run the CPU top-K and write the
+    /// compressed-row mask before encoding the attention (C: indexer_allowed_
+    /// decode_one + the dense top-k mask path). Returns n_comp visible to this token.
+    public func decodeRoutePre(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                               rope: RopeParams, rawCache: GPUTensor, pos: Int,
+                               rmsEps: Float, comp: CompressorState?, idx: CompressorState?,
+                               indexerScoring: Bool) throws -> Int {
         // 1) HC-reduce pre-attn  (s.cur = attn_norm)
         try hcReduce(curHc: curHc, mixerFn: w.hcAttnFn, scale: w.attnScale, base: w.attnBase,
                      norm: w.attnNorm, s: s, d: d, eps: rmsEps)
@@ -191,6 +226,15 @@ extension GraphContext {
             nComp = try runCompressor(attnNorm: s.cur, w: w, comp: comp, rope: rope,
                                       pos: pos, rmsEps: rmsEps, nRot: d.nRot)
         }
+        // 1.6) NSA INDEXER compressor (ratio-4 layers): same recurrence on its own
+        // weights (head_dim 128), finalized with Hadamard+FP4 instead of fp8.
+        var nIdxComp = 0
+        if let idx = idx, let ikv = w.idxKv, let igate = w.idxGate,
+           let iape = w.idxApe, let inorm = w.idxNorm {
+            nIdxComp = try runCompressor(x: s.cur, kv: ikv, gate: igate, ape: iape, normW: inorm,
+                                         comp: idx, rope: rope, pos: pos, rmsEps: rmsEps,
+                                         nRot: d.nRot, finalize: .indexerQat)
+        }
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
@@ -199,13 +243,35 @@ extension GraphContext {
         try ropeTail(x: s.q, nTok: 1, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
-        // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
-        try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
-        try rmsNorm(s.kvRaw, weight: w.kvNorm, out: s.kv, rows: 1, n: d.headDim, eps: rmsEps)
-        try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
-                     freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
-                     attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
-        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
+        // 2.5) Indexer scoring (only when the comp rows exceed the top-K): the
+        // indexer query comes from qr_norm via indexer.attn_q_b (+rope+Hadamard),
+        // the head weights from attn_norm via indexer.proj. C: indexer_allowed_decode_one.
+        if indexerScoring, let idx = idx, nIdxComp > 0,
+           let iqb = w.idxQB, let iproj = w.idxProj {
+            let ih = d.nIndexerHeadDim, inH = d.nIndexerHead
+            if w.idxQBF16 {
+                try matmulF16(weight: iqb, x: s.qrNorm, out: s.idxQ, inDim: d.qRank, outDim: inH * ih)
+            } else {
+                try matmulQ8_0(weight: iqb, x: s.qrNorm, out: s.idxQ, inDim: d.qRank, outDim: inH * ih)
+            }
+            try ropeTail(x: s.idxQ, nTok: 1, nHead: inH, headDim: ih, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
+                         freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
+                         attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow,
+                         pos0: pos, posStep: 1)
+            try indexerHadamardFp4Enc(s.idxQ, rows: inH, rowStrideBytes: ih * 4)
+            try matmulF16(weight: iproj, x: s.cur, out: s.idxW, inDim: d.nEmbd, outDim: inH)
+            let scale = 1.0 / Float(ih * inH).squareRoot()
+            try indexerScoresEnc(q: s.idxQ, weights: s.idxW, indexComp: idx.cache,
+                                 scores: s.idxScores, nComp: nIdxComp, nHead: inH, headDim: ih, scale: scale)
+        }
+        return nComp
+    }
+
+    /// Phase 1b: attention (raw SWA window + compressed rows, with s.mask possibly
+    /// carrying the indexer top-K selection) -> attn out -> pre-FFN HC -> router.
+    public func decodeRouteAttn(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                                rmsEps: Float, hcEps: Float, nComp: Int, comp: CompressorState?) throws {
         // 4) attention over the raw SWA WINDOW + comp.cache[0..nComp] -> heads.
         //    Only the last nSWA raw rows are visible (C slides its raw cache at
         //    that cap); attending ALL raw rows would be out-of-distribution for

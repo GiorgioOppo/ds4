@@ -25,7 +25,12 @@ final class DiskKVStoreTests: XCTestCase {
                 count: 2,
                 stateKv: (0..<16).map { Float($0) }, stateScore: (0..<16).map { Float(-$0) },
                 cacheRows: (0..<2 * headDim).map { Float(il) + Float($0) * 0.5 })
-            ls.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp))
+            // NSA indexer state on one layer (round-trips alongside the attention comp).
+            let idx = il == 2 ? CompSnapshot(
+                count: 1,
+                stateKv: (0..<8).map { Float($0) * 2 }, stateScore: (0..<8).map { Float($0) - 4 },
+                cacheRows: (0..<headDim).map { Float($0) * 0.25 }) : nil
+            ls.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp, idx: idx))
         }
         return KVSnapshot(nKeys: nKeys, headDim: headDim, layers: ls)
     }

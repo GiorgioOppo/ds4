@@ -106,15 +106,8 @@ public final class DiskKVStore: @unchecked Sendable {
         for layer in snapshot.layers {
             appendU32(&body, UInt32(layer.rawStart))
             appendU32(&body, UInt32(layer.raw.count)); appendFloats(&body, layer.raw)
-            if let c = layer.comp {
-                body.append(1)
-                appendU32(&body, UInt32(c.count))
-                appendU32(&body, UInt32(c.stateKv.count))
-                appendFloats(&body, c.stateKv); appendFloats(&body, c.stateScore)
-                appendU32(&body, UInt32(c.cacheRows.count)); appendFloats(&body, c.cacheRows)
-            } else {
-                body.append(0)
-            }
+            appendComp(&body, layer.comp)
+            appendComp(&body, layer.idx)     // NSA indexer compressor (ratio-4 layers)
         }
 
         let now = UInt64(Date().timeIntervalSince1970)
@@ -254,24 +247,34 @@ public final class DiskKVStore: @unchecked Sendable {
         guard o + DSV4PayloadHeader.u32Fields * 4 <= b.count,
               let ph = DSV4PayloadHeader(Array(b[o..<(o + DSV4PayloadHeader.u32Fields * 4)])) else { return nil }
         o += DSV4PayloadHeader.u32Fields * 4
+        func readComp() -> CompSnapshot?? {       // nil = parse error; .some(nil) = absent
+            guard o < b.count else { return nil }
+            let has = b[o]; o += 1
+            if has != 1 { return .some(nil) }
+            guard let cCount = u32(), let stateLen = u32(),
+                  let kv = floats(stateLen), let score = floats(stateLen),
+                  let cacheLen = u32(), let cache = floats(cacheLen) else { return nil }
+            return CompSnapshot(count: cCount, stateKv: kv, stateScore: score, cacheRows: cache)
+        }
         var layers: [KVLayerSnapshot] = []
         for _ in 0..<Int(ph.layerCount) {
             guard let rawStart = u32(), let rawCount = u32(), let raw = floats(rawCount),
-                  o < b.count else { return nil }
-            let hasComp = b[o]; o += 1
-            var comp: CompSnapshot? = nil
-            if hasComp == 1 {
-                guard let cCount = u32(), let stateLen = u32(),
-                      let kv = floats(stateLen), let score = floats(stateLen),
-                      let cacheLen = u32(), let cache = floats(cacheLen) else { return nil }
-                comp = CompSnapshot(count: cCount, stateKv: kv, stateScore: score, cacheRows: cache)
-            }
-            layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp))
+                  let comp = readComp(), let idx = readComp() else { return nil }
+            layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp, idx: idx))
         }
         return KVSnapshot(nKeys: count, headDim: Int(ph.rawHeadKVDim), layers: layers)
     }
 
     // MARK: little-endian append helpers
+
+    private func appendComp(_ d: inout Data, _ c: CompSnapshot?) {
+        guard let c else { d.append(0); return }
+        d.append(1)
+        appendU32(&d, UInt32(c.count))
+        appendU32(&d, UInt32(c.stateKv.count))
+        appendFloats(&d, c.stateKv); appendFloats(&d, c.stateScore)
+        appendU32(&d, UInt32(c.cacheRows.count)); appendFloats(&d, c.cacheRows)
+    }
 
     private func appendU32(_ d: inout Data, _ v: UInt32) {
         d.append(contentsOf: [UInt8(v & 0xff), UInt8((v >> 8) & 0xff),

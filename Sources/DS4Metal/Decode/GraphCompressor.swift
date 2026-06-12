@@ -176,6 +176,12 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     }
 
+    /// How an emitted compressed row is finalized (after pool+norm+rope): the
+    /// ATTENTION compressor fp8-rounds the non-rope part; the INDEXER compressor
+    /// applies the 128-wide Hadamard + FP4 activation simulation (C:
+    /// dsv4_indexer_qat_row_inplace).
+    enum CompressorFinalize { case fp8, indexerQat }
+
     /// Run the compressor for one token on a compressed layer. `attnNorm` is the
     /// rms-normed pre-attention input (s.cur). Updates comp.state + on emit appends one
     /// row to comp.cache and bumps comp.count. Returns n_comp visible to THIS token's
@@ -185,23 +191,37 @@ extension GraphContext {
         guard let compKv = w.compKv, let compGate = w.compGate, let ape = w.compApe, let normW = w.compNorm else {
             return comp.count
         }
+        return try runCompressor(x: attnNorm, kv: compKv, gate: compGate, ape: ape, normW: normW,
+                                 comp: comp, rope: rope, pos: pos, rmsEps: rmsEps, nRot: nRot,
+                                 finalize: .fp8)
+    }
+
+    /// Generalized compressor step (shared by the attention and INDEXER
+    /// compressors — same recurrence in the C `compressor_decode_one`, different
+    /// weights/width/finalize).
+    func runCompressor(x: GPUTensor, kv: GPUTensor, gate: GPUTensor, ape: GPUTensor, normW: GPUTensor,
+                       comp: CompressorState, rope: RopeParams, pos: Int, rmsEps: Float, nRot: Int,
+                       finalize: CompressorFinalize) throws -> Int {
         let h = comp.headDim, ratio = comp.ratio, width = comp.width
-        // 1) project attn_norm -> kv_cur / sc_cur (F16 matvec).
-        try matmulF16(weight: compKv, x: attnNorm, out: comp.kvCur, inDim: attnNorm.count, outDim: width)
-        try matmulF16(weight: compGate, x: attnNorm, out: comp.scCur, inDim: attnNorm.count, outDim: width)
+        // 1) project x -> kv_cur / sc_cur (F16 matvec).
+        try matmulF16(weight: kv, x: x, out: comp.kvCur, inDim: x.count, outDim: width)
+        try matmulF16(weight: gate, x: x, out: comp.scCur, inDim: x.count, outDim: width)
         // 2) store into recurrent state (+ APE, F16 -> ape_type 1).
         try compressorStoreOneEnc(kvCur: comp.kvCur, scCur: comp.scCur, ape: ape, apeType: 1,
                                   stateKv: comp.stateKv, stateScore: comp.stateScore, width: width, ratio: ratio, pos: pos)
         let emit = ((pos + 1) % ratio) == 0
         if !emit { return comp.count }
-        // 3) emit: pool -> rmsNorm(compNorm) -> rope(comp_pos) -> fp8 -> write cache[count].
+        // 3) emit: pool -> rmsNorm -> rope(comp_pos) -> finalize -> write cache[count].
         try compressorPoolEnc(comp, out: comp.rowScratch)
         try rmsNorm(comp.rowScratch, weight: normW, out: comp.rowScratch, rows: 1, n: h, eps: rmsEps)
         let compPos = pos + 1 - ratio
         try ropeTail(x: comp.rowScratch, nTok: 1, nHead: 1, headDim: h, nRot: nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: compPos, posStep: 1)
-        try fp8QuantizeRowEnc(comp.rowScratch, headDim: h, nRot: nRot)
+        switch finalize {
+        case .fp8:        try fp8QuantizeRowEnc(comp.rowScratch, headDim: h, nRot: nRot)
+        case .indexerQat: try indexerHadamardFp4Enc(comp.rowScratch, rows: 1, rowStrideBytes: h * 4)
+        }
         // copy rowScratch -> cache[count]
         let dstRow = comp.cache.rowView(row: comp.count, cols: h)
         try gatherRowsEnc(src: comp.rowScratch, srcByteOffset: comp.rowScratch.byteOffset, srcRowStride: h,
@@ -209,5 +229,56 @@ extension GraphContext {
         if ratio == 4 { try ratio4ShiftEnc(stateKv: comp.stateKv, stateScore: comp.stateScore, width: width) }
         comp.count += 1
         return comp.count
+    }
+
+    /// 128-wide Hadamard rotation + FP4 activation simulation, in place on `rows`
+    /// rows (kernel_dsv4_indexer_hadamard_fp4_f32; C dsv4_indexer_qat_rows_inplace).
+    func indexerHadamardFp4Enc(_ x: GPUTensor, rows: Int, rowStrideBytes: Int) throws {
+        var args = [UInt8](repeating: 0, count: 16)
+        args.withUnsafeMutableBytes { p in
+            p.storeBytes(of: UInt32(rows), toByteOffset: 0, as: UInt32.self)
+            p.storeBytes(of: UInt32(128), toByteOffset: 4, as: UInt32.self)
+            p.storeBytes(of: UInt64(rowStrideBytes), toByteOffset: 8, as: UInt64.self)
+        }
+        let pso = try rt.pipeline("kernel_dsv4_indexer_hadamard_fp4_f32")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 1)
+        e.setThreadgroupMemoryLength(256 * 4, index: 0)    // vals[128] + absbuf[128]
+        e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
+    /// Indexer relevance scores for the current token over `nComp` indexer rows
+    /// (kernel_dsv4_indexer_score_one_direct): scores[c] = scale·Σ_h max(q_h·k_c,0)·w_h.
+    func indexerScoresEnc(q: GPUTensor, weights: GPUTensor, indexComp: GPUTensor,
+                          scores: GPUTensor, nComp: Int, nHead: Int, headDim: Int, scale: Float) throws {
+        var args = [UInt8](repeating: 0, count: 72)
+        args.withUnsafeMutableBytes { p in
+            p.storeBytes(of: UInt32(nComp), toByteOffset: 0, as: UInt32.self)    // n_comp
+            p.storeBytes(of: UInt32(1), toByteOffset: 4, as: UInt32.self)        // n_tokens
+            p.storeBytes(of: UInt32(nHead), toByteOffset: 8, as: UInt32.self)
+            p.storeBytes(of: UInt32(headDim), toByteOffset: 12, as: UInt32.self)
+            p.storeBytes(of: UInt32(0), toByteOffset: 16, as: UInt32.self)       // pos0 (unused)
+            p.storeBytes(of: UInt32(4), toByteOffset: 20, as: UInt32.self)       // ratio (unused)
+            p.storeBytes(of: UInt64(nHead * headDim * 4), toByteOffset: 24, as: UInt64.self) // q_token_stride
+            p.storeBytes(of: UInt64(headDim * 4), toByteOffset: 32, as: UInt64.self)         // q_head_stride
+            p.storeBytes(of: UInt64(nHead * 4), toByteOffset: 40, as: UInt64.self)           // weights_token_stride
+            p.storeBytes(of: UInt64(headDim * 4), toByteOffset: 48, as: UInt64.self)         // index_row_stride
+            p.storeBytes(of: UInt64(nComp * 4), toByteOffset: 56, as: UInt64.self)           // score_token_stride
+            p.storeBytes(of: scale, toByteOffset: 64, as: Float.self)
+        }
+        let pso = try rt.pipeline("kernel_dsv4_indexer_score_one_direct")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(q.buffer, offset: q.byteOffset, index: 1)
+        e.setBuffer(weights.buffer, offset: weights.byteOffset, index: 2)
+        e.setBuffer(indexComp.buffer, offset: indexComp.byteOffset, index: 3)
+        e.setBuffer(scores.buffer, offset: scores.byteOffset, index: 4)
+        e.setThreadgroupMemoryLength((128 + 4) * 4, index: 0)   // ktg[128] + psum[4]
+        e.dispatchThreadgroups(MTLSize(width: nComp, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 }

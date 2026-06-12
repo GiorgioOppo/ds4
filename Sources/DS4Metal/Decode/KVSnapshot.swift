@@ -21,8 +21,9 @@ public struct KVLayerSnapshot: Sendable, Equatable {
     public var rawStart: Int         // absolute position of the first stored raw row
     public var raw: [Float]          // SWA window rows [(nKeys-rawStart) × headDim]
     public var comp: CompSnapshot?   // nil on non-compressed layers
-    public init(rawStart: Int, raw: [Float], comp: CompSnapshot?) {
-        self.rawStart = rawStart; self.raw = raw; self.comp = comp
+    public var idx: CompSnapshot?    // NSA indexer compressor (ratio-4 layers only)
+    public init(rawStart: Int, raw: [Float], comp: CompSnapshot?, idx: CompSnapshot? = nil) {
+        self.rawStart = rawStart; self.raw = raw; self.comp = comp; self.idx = idx
     }
 }
 
@@ -49,16 +50,9 @@ extension StreamingDecoder {
             let rawStart = max(0, nKeys - d.nSWA)
             let rows = nKeys - rawStart
             let raw = readFloats(rawCaches[i], from: rawStart * d.headDim, count: rows * d.headDim)
-            var comp: CompSnapshot? = nil
-            if let c = compStates[i] {
-                let coff = c.ratio == 4 ? 2 : 1
-                let stateLen = coff * c.ratio * c.width
-                comp = CompSnapshot(count: c.count,
-                                    stateKv: readFloats(c.stateKv, from: 0, count: stateLen),
-                                    stateScore: readFloats(c.stateScore, from: 0, count: stateLen),
-                                    cacheRows: readFloats(c.cache, from: 0, count: c.count * d.headDim))
-            }
-            layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw, comp: comp))
+            layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw,
+                                          comp: snapshotComp(compStates[i]),
+                                          idx: snapshotComp(indexStates[i])))
         }
         return KVSnapshot(nKeys: nKeys, headDim: d.headDim, layers: layers)
     }
@@ -75,18 +69,33 @@ extension StreamingDecoder {
             guard kvRange.contains(i) else { continue }
             let layer = s.layers[i]
             writeFloatsArray(layer.raw, into: rawCaches[i], at: layer.rawStart * d.headDim)
-            if let c = compStates[i] {
-                try c.reset(rt)
-                guard let comp = layer.comp, comp.count * d.headDim == comp.cacheRows.count else {
-                    if layer.comp != nil { throw KVSnapshotError.shapeMismatch }
-                    continue
-                }
-                writeFloatsArray(comp.stateKv, into: c.stateKv, at: 0)
-                writeFloatsArray(comp.stateScore, into: c.stateScore, at: 0)
-                writeFloatsArray(comp.cacheRows, into: c.cache, at: 0)
-                c.count = comp.count
-            }
+            try restoreComp(compStates[i], from: layer.comp, rowDim: d.headDim)
+            try restoreComp(indexStates[i], from: layer.idx, rowDim: d.nIndexerHeadDim)
         }
+    }
+
+    /// Read one compressor's full state (recurrent accumulators + emitted rows).
+    private func snapshotComp(_ c: CompressorState?) -> CompSnapshot? {
+        guard let c else { return nil }
+        let coff = c.ratio == 4 ? 2 : 1
+        let stateLen = coff * c.ratio * c.width
+        return CompSnapshot(count: c.count,
+                            stateKv: readFloats(c.stateKv, from: 0, count: stateLen),
+                            stateScore: readFloats(c.stateScore, from: 0, count: stateLen),
+                            cacheRows: readFloats(c.cache, from: 0, count: c.count * c.headDim))
+    }
+
+    private func restoreComp(_ c: CompressorState?, from snap: CompSnapshot?, rowDim: Int) throws {
+        guard let c else { return }
+        try c.reset(rt)
+        guard let snap, snap.count * rowDim == snap.cacheRows.count else {
+            if snap != nil { throw KVSnapshotError.shapeMismatch }
+            return
+        }
+        writeFloatsArray(snap.stateKv, into: c.stateKv, at: 0)
+        writeFloatsArray(snap.stateScore, into: c.stateScore, at: 0)
+        writeFloatsArray(snap.cacheRows, into: c.cache, at: 0)
+        c.count = snap.count
     }
 
     private func readFloats(_ t: GPUTensor, from offset: Int, count: Int) -> [Float] {

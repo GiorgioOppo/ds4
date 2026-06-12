@@ -88,6 +88,12 @@ public final class StreamingDecoder {
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
     let compStates: [CompressorState?]   // NSA compressor state per compressed layer (nil on layers 0,1)
+    /// NSA indexer compressor state (DSA): ratio-4 layers only. Beyond
+    /// `d.indexerTopK` compressed rows, attention is restricted to the top-K
+    /// most relevant for the current query (C: indexer_allowed_decode_one).
+    let indexStates: [CompressorState?]
+    /// Halves of s.mask dirtied by the last indexer selection (0 = clean).
+    private var maskDirtyCount = 0
     /// Layers with real KV allocation (full model: 0..<nLayers; distributed slice: its range).
     let kvRange: Range<Int>
     /// KV capacity in tokens (raw rows per layer).
@@ -126,6 +132,11 @@ public final class StreamingDecoder {
             guard ratio != 0 else { return nil }
             return try CompressorState(rt, ratio: ratio, headDim: dims.headDim, maxComp: maxKeys / ratio + 8)
         }
+        // NSA indexer compressor (DSA): ratio-4 layers only (head_dim 128).
+        indexStates = try (0..<nLayers).map { il -> CompressorState? in
+            guard kvRange.contains(il), DSV4Shape.compressRatio(layer: il) == 4 else { return nil }
+            return try CompressorState(rt, ratio: 4, headDim: dims.nIndexerHeadDim, maxComp: maxKeys / 4 + 8)
+        }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         rawCaches = try (0..<nLayers).map { il in
@@ -142,7 +153,7 @@ public final class StreamingDecoder {
 
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
-        if pos == 0 { for c in compStates { try c?.reset(rt) } }
+        if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
@@ -178,7 +189,7 @@ public final class StreamingDecoder {
     /// slice's recurrent compressor state on a fresh sequence (pos == 0).
     public func forwardSlice(hc hcIn: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
         precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
-        if pos == 0 { for i in start...end { try compStates[i]?.reset(rt) } }
+        if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
         writeFloats(hcIn, into: hcA)
         var cur = hcA, other = hcB
         for i in start...end {
@@ -232,7 +243,7 @@ public final class StreamingDecoder {
     /// this is what enables KV reuse across turns (prefill only the new suffix).
     public func prefill(tokens: [Int], startPos: Int = 0, chunk: Int = 512) throws -> [Float] {
         precondition(!tokens.isEmpty)
-        if startPos == 0 { for c in compStates { try c?.reset(rt) } }   // fresh sequence
+        if startPos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }   // fresh sequence
         var lastHC: GPUTensor?
         var start = 0
         let step = max(1, chunk)
@@ -303,11 +314,7 @@ public final class StreamingDecoder {
             try Task.checkCancellation()
             let pos = posBase + j
             var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeRoute(curHc: cur[j], w: w, s: scratch, d: d, rope: layerRope,
-                               rawCache: rawCaches[i], nKeys: pos + 1, pos: pos,
-                               rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-            c1.commit()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
             idsT.append(ids); rwT.append(rw)
@@ -422,10 +429,7 @@ public final class StreamingDecoder {
         if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                               nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-            c1.commit()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
             let K = ids.count
@@ -465,13 +469,91 @@ public final class StreamingDecoder {
             }
         } else {
             let t = Date()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
             let lc = GraphContext(rt); try lc.begin()
-            try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                               nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
+            try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
+                                 downExp: w.expDown, ids: scratch.selected, outHc: other)
             lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
             profile.layerOtherS += Date().timeIntervalSince(t)
         }
         profile.layers += 1
+    }
+
+    /// Encode (and COMMIT) the route for one token on layer `i`. When the NSA
+    /// indexer is active (ratio-4 layer with more compressed rows than the top-K),
+    /// the command buffer is split at the indexer scores: commit phase 1a, run the
+    /// CPU top-K to write the compressed-row mask, then encode the attention —
+    /// the C "dense top-k mask" path (indexer_allowed_decode_one). Otherwise a
+    /// single command buffer, numerically identical to the pre-indexer code.
+    private func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
+                             curHc: GPUTensor, pos: Int, nKeys: Int) throws {
+        let idx = indexStates[i]
+        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
+        let active = hasIdxWeights && indexerActive(i, pos: pos)
+        if active, let idx {
+            let c1 = GraphContext(rt); try c1.begin()
+            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              indexerScoring: true)
+            c1.commit()
+            applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
+            let c2 = GraphContext(rt); try c2.begin()
+            try c2.decodeRouteAttn(w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nComp: nComp, comp: compStates[i])
+            c2.commit()
+        } else {
+            clearMaskIfDirty()
+            let c1 = GraphContext(rt); try c1.begin()
+            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              indexerScoring: false)
+            try c1.decodeRouteAttn(w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nComp: nComp, comp: compStates[i])
+            c1.commit()
+        }
+    }
+
+    /// Will the indexer restrict this token's compressed rows on layer `i`?
+    /// (prospective count: the compressor may emit one more row for this token.)
+    private func indexerActive(_ i: Int, pos: Int) -> Bool {
+        guard let idx = indexStates[i] else { return false }
+        let prospective = idx.count + (((pos + 1) % idx.ratio) == 0 ? 1 : 0)
+        return prospective > d.indexerTopK
+    }
+
+    /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:
+    /// raw window rows stay 0; compressed row c gets 0 if selected, -inf if not.
+    /// Ties keep the LOWEST row index (the C argmax scan picks the first best).
+    private func applyIndexerMask(nKeys: Int, nComp: Int, nIdxComp: Int) {
+        let nRaw = nKeys - max(0, nKeys - d.nSWA)
+        let scores = scratch.idxScores.buffer.contents()
+            .advanced(by: scratch.idxScores.byteOffset).bindMemory(to: Float.self, capacity: nIdxComp)
+        var order = Array(0..<nIdxComp)
+        order.sort { scores[$0] != scores[$1] ? scores[$0] > scores[$1] : $0 < $1 }
+        var allowed = [Bool](repeating: false, count: nIdxComp)
+        for k in 0..<min(d.indexerTopK, nIdxComp) { allowed[order[k]] = true }
+
+        let total = nRaw + nComp
+        let mask = scratch.mask.buffer.contents().bindMemory(to: UInt16.self, capacity: total)
+        let negInf = Half.bits(-Float.infinity)
+        for j in 0..<nRaw { mask[j] = 0 }
+        for c in 0..<nComp {
+            let ok = c < nIdxComp ? allowed[c] : true
+            mask[nRaw + c] = ok ? 0 : negInf
+        }
+        maskDirtyCount = max(maskDirtyCount, total)
+    }
+
+    /// Zero the mask region a previous indexer selection dirtied (offsets shift
+    /// every token, so a stale -inf would mask the wrong key).
+    private func clearMaskIfDirty() {
+        guard maskDirtyCount > 0 else { return }
+        memset(scratch.mask.buffer.contents(), 0, maskDirtyCount * 2)
+        maskDirtyCount = 0
     }
 
     /// Output head for one token's final HC state -> logits[vocab].

@@ -432,6 +432,21 @@ raccoglie due "corsie" in un buffer packed `8 × headDim` prima del pool, per
 
 ---
 
+### L'indexer NSA (DSA, top-512)
+
+Sui layer **ratio-4** un secondo compressore (stessa ricorrenza, pesi
+`indexer_compressor_*`, head_dim 128, finalizzato con **Hadamard+FP4** invece
+di fp8) mantiene la cache dell'indexer. Quando le righe compresse superano
+`indexerTopK` (512 su Flash), per ogni token si calcolano gli score di
+rilevanza (`q` da qr_norm via `indexer.attn_q_b` + rope + Hadamard; pesi-testa
+da attn_norm via `indexer.proj`; kernel `indexer_score_one_direct`), si fa il
+**top-K su CPU** (split del command buffer al confine degli score) e si scrive
+una **maschera f16 0/-inf** sulle righe compresse che il flash-attention
+consuma — il "dense top-k mask path" del C (`indexer_allowed_decode_one`).
+Sotto i 2048 token (≤512 righe) il percorso resta quello denso, identico.
+Lo stato dell'indexer fa parte dello snapshot KV su disco. Il decoder legacy
+non-streaming (`DSV4Decoder`, demo) resta denso.
+
 ## 9. Il MoE: router ed expert
 
 Il **router** (fase 1, passo 7) produce `nExpert` logit con un matvec (Q8_0 nel
