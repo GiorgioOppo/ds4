@@ -167,22 +167,22 @@ final class DistributedController {
         let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.specs(enabled: Set(agent.toolNames))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
-        enum Ev: Sendable { case log(String), reasoning(String), token(String) }
+        enum Ev: Sendable { case log(String), progress(String), reasoning(String), token(String) }
         let (stream, cont) = AsyncStream<Ev>.makeStream()
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             for await e in stream {
                 guard let self, index < self.messages.count else { continue }
                 switch e {
-                case .log(let s):
-                    self.coordLog += s
-                    self.status = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                case .log(let s): self.coordLog += s
+                case .progress(let s): self.status = s     // live "N token · X tok/s"
                 case .reasoning(let s): self.messages[index].reasoning += s
                 case .token(let s): self.messages[index].text += s
                 }
             }
         }
         let onLog: @Sendable (String) -> Void = { cont.yield(.log($0)) }
+        let onProgress: @Sendable (String) -> Void = { cont.yield(.progress($0)) }
         let onReasoning: @Sendable (String) -> Void = { cont.yield(.reasoning($0)) }
         let onToken: @Sendable (String) -> Void = { cont.yield(.token($0)) }
 
@@ -190,11 +190,12 @@ final class DistributedController {
             // Explicit capture list: only Sendable copies cross into the detached
             // task (no main-actor state in the closure's region).
             let work = Task.detached { [coord, sendTurns, tools, wantThink, maxT, samp,
-                                        onLog, onReasoning, onToken] () -> Result<[ToolCall], Error> in
+                                        onLog, onProgress, onReasoning, onToken] () -> Result<[ToolCall], Error> in
                 do {
                     let calls = try await coord.send(turns: sendTurns, tools: tools, think: wantThink,
                                                      maxTokens: maxT, sampling: samp,
-                                                     onLog: onLog, onReasoning: onReasoning, onToken: onToken)
+                                                     onLog: onLog, onProgress: onProgress,
+                                                     onReasoning: onReasoning, onToken: onToken)
                     return .success(calls)
                 } catch { return .failure(error) }
             }

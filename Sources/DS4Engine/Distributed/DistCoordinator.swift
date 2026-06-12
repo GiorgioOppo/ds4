@@ -111,6 +111,7 @@ public final class DistCoordinator: @unchecked Sendable {
     public func send(turns: [ChatTurn], tools: [ToolSpec] = [], think: Bool, maxTokens: Int,
                      sampling: SamplingParams,
                      onLog: @Sendable (String) -> Void,
+                     onProgress: @Sendable (String) -> Void = { _ in },
                      onReasoning: @Sendable (String) -> Void,
                      onToken: @Sendable (String) -> Void) async throws -> [ToolCall] {
         guard !entries.isEmpty else { throw DistError.closed }
@@ -138,6 +139,7 @@ public final class DistCoordinator: @unchecked Sendable {
             }
             pos += end - start
             start = end
+            onProgress("prefill \(pos)/\(ids.count) token…")
         }
         guard !lastLogits.isEmpty else { throw DistError.badFrame }
         // Diagnose where the pipeline breaks: a sane top token here = prefill OK,
@@ -194,6 +196,9 @@ public final class DistCoordinator: @unchecked Sendable {
             }
             lastLogits = logits
             pos += 1; produced += 1
+            let elapsed = Date().timeIntervalSince(t0)
+            onProgress(String(format: "%d token · %.2f tok/s", produced,
+                              elapsed > 0 ? Double(produced) / elapsed : 0))
         }
         if pendingLT, !inTool { emit("<") }
         let dt = Date().timeIntervalSince(t0)
