@@ -7,7 +7,8 @@ The 2-bit GGUF runs on a 16 GB MacBook by streaming weights from SSD.
 
 > 📖 **Documentazione dettagliata (IT):** [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md)
 > (uso, GUI, tool, agenti, server, distribuito) · [`docs/ARCHITETTURA-MOTORE.md`](docs/ARCHITETTURA-MOTORE.md)
-> (interni del motore: tokenizer, decoder, MoE, NSA, streaming, cache esperti).
+> (interni del motore: tokenizer, decoder, MoE, NSA, streaming, cache esperti) ·
+> [`docs/CRITTOGRAFIA.md`](docs/CRITTOGRAFIA.md) (crittografia ed export compliance App Store).
 
 ## Architecture
 
