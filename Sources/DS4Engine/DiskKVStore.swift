@@ -67,17 +67,26 @@ public final class DiskKVStore: @unchecked Sendable {
             bestURL = url
             bestTokens = scan.tokens
         }
-        guard let url = bestURL, let snapshot = loadSnapshot(url) else { return nil }
+        guard let url = bestURL else { return nil }
+        guard let snapshot = loadSnapshot(url) else {
+            // Corrupt/truncated entry: discard it like the C does on load failure.
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
         bumpHit(url)
         return Hit(tokens: bestTokens, snapshot: snapshot)
     }
 
     // MARK: Store
 
-    /// Checkpoint `tokens`+`snapshot` (dedup by content name), then evict down to
-    /// the budget. Returns true if a new file was written.
+    /// Checkpoint `tokens`+`snapshot` (dedup by content name). Mirrors the C
+    /// store_live_prefix order: refuse an entry that alone exceeds the budget,
+    /// EVICT FIRST to make room for the incoming bytes (with the supersede-
+    /// continued scoring), then write atomically. `reason` "cold" marks the
+    /// first checkpoint of a conversation (anchor, 2× protected in eviction).
     @discardableResult
-    public func store(tokens: [Int], modelName: String, snapshot: KVSnapshot) -> Bool {
+    public func store(tokens: [Int], modelName: String, snapshot: KVSnapshot,
+                      reason: KVCFile.Reason = .continued) -> Bool {
         guard tokens.count >= options.minTokens, snapshot.nKeys == tokens.count else { return false }
         let url = directory.appendingPathComponent(entryName(tokens: tokens, modelName: modelName))
         guard !FileManager.default.fileExists(atPath: url.path) else { return false }
@@ -110,37 +119,55 @@ public final class DiskKVStore: @unchecked Sendable {
 
         let now = UInt64(Date().timeIntervalSince1970)
         let header = KVCFile.fillHeader(KVCFile.Header(
-            quantBits: quantBits, reason: KVCFile.Reason.continued.rawValue, extFlags: 0, modelId: 0,
+            quantBits: quantBits, reason: reason.rawValue, extFlags: 0, modelId: 0,
             tokens: UInt32(tokens.count), hits: 0, ctxSize: UInt32(contextSize),
             createdAt: now, lastUsed: now, payloadBytes: UInt64(body.count)))
         var file = Data(header); file.append(body)
+        guard UInt64(file.count) <= budgetBytes else { return false }   // can never fit
+        evictToBudget(incomingBytes: UInt64(file.count),
+                      incomingTokens: tokens, incomingModel: modelName)
         do { try file.write(to: url, options: .atomic) } catch { return false }
-        evictToBudget(keeping: url)
         return true
     }
 
-    /// Evict lowest-score entries (ported `KVCFile.evictionScore`) until the
-    /// directory fits the byte budget. Never evicts `keeping` (just written).
-    func evictToBudget(keeping: URL?) {
-        var entries: [(url: URL, size: UInt64, entry: KVCFile.Entry)] = []
+    /// Evict lowest-score entries until the directory fits `budget − incomingBytes`.
+    /// Score = ported `KVCFile.evictionScore` ×(0.05 + 0.45·h/(h+1)) when the entry
+    /// is a CONTINUED strict token-prefix of the incoming checkpoint (the C
+    /// supersede-continued rule: the longer checkpoint of the same conversation
+    /// replaces the shorter one under pressure). Ties evict the older lastUsed.
+    func evictToBudget(incomingBytes: UInt64, incomingTokens: [Int], incomingModel: String) {
+        struct Victim { let url: URL; let size: UInt64; let lastUsed: UInt64; let score: Double }
+        var victims: [Victim] = []
         var total: UInt64 = 0
+        let now = UInt64(Date().timeIntervalSince1970)
         for url in entryURLs() {
             guard let h = readHeader(url) else { continue }
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
             let sz = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
             total += sz
-            entries.append((url, sz, KVCFile.Entry(hits: h.hits, tokens: h.tokens, fileSize: sz,
-                                                   createdAt: h.createdAt, lastUsed: h.lastUsed,
-                                                   reason: h.reason)))
+            var score = KVCFile.evictionScore(
+                KVCFile.Entry(hits: h.hits, tokens: h.tokens, fileSize: sz,
+                              createdAt: h.createdAt, lastUsed: h.lastUsed, reason: h.reason),
+                now: now)
+            if h.reason == KVCFile.Reason.continued.rawValue,
+               Int(h.tokens) < incomingTokens.count,
+               let scan = scanEntry(url), scan.model == incomingModel,
+               incomingTokens.starts(with: scan.tokens) {
+                let hits = Double(h.hits)
+                let hFrac = hits > 0 ? hits / (hits + 1.0) : 0.0
+                score *= 0.05 + 0.45 * hFrac
+            }
+            victims.append(Victim(url: url, size: sz, lastUsed: h.lastUsed, score: score))
         }
-        guard total > budgetBytes else { return }
-        let now = UInt64(Date().timeIntervalSince1970)
-        let order = entries.sorted { KVCFile.evictionScore($0.entry, now: now)
-                                   < KVCFile.evictionScore($1.entry, now: now) }
-        for e in order where total > budgetBytes {
-            if let keeping, e.url == keeping { continue }
-            try? FileManager.default.removeItem(at: e.url)
-            total -= e.size
+        guard incomingBytes <= budgetBytes else { return }
+        let target = budgetBytes - incomingBytes
+        guard total > target else { return }
+        let order = victims.sorted {
+            $0.score != $1.score ? $0.score < $1.score : $0.lastUsed < $1.lastUsed
+        }
+        for v in order where total > target {
+            try? FileManager.default.removeItem(at: v.url)
+            total -= min(total, v.size)
         }
     }
 

@@ -463,8 +463,12 @@ public actor InferenceService {
         if let store = diskKV,
            committedIds.count - lastDiskStoreCount >= store.options.storeIntervalTokens {
             continuation.yield(.progress("salvataggio KV su disco…"))
+            // First checkpoint of a conversation = "cold" (anchor: the shared
+            // system/agent prefix, 2× protected in eviction); later = "continued"
+            // (superseded under pressure by longer checkpoints of the same chat).
+            let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
             store.store(tokens: committedIds, modelName: modelName,
-                        snapshot: decoder.exportKV(nKeys: committedIds.count))
+                        snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))
