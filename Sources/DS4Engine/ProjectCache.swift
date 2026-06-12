@@ -89,6 +89,9 @@ public final class ProjectCache: @unchecked Sendable {
 
     public func info() -> Info? { lock.lock(); defer { lock.unlock() }; return infoValue }
 
+    /// The active project root (the git tool runs there). nil = no project.
+    public func rootURL() -> URL? { lock.lock(); defer { lock.unlock() }; return root }
+
     /// First `n` indexed paths (GUI preview).
     public func sampleFiles(_ n: Int) -> [String] {
         lock.lock(); defer { lock.unlock() }

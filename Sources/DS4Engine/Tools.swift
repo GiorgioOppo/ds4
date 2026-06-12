@@ -30,7 +30,7 @@ public enum ToolRegistry {
     /// modify files INSIDE the active project root only); everything else is pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
-                                                 projectWrite, projectEdit]
+                                                 projectWrite, projectEdit, git]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -125,6 +125,15 @@ public enum ToolRegistry {
             guard let f = stringArg(argsJSON, "find") else { return "Argomento 'find' mancante." }
             let r = stringArg(argsJSON, "replace") ?? ""
             return ProjectCache.shared.editTool(path: p, find: f, replace: r)
+        })
+
+    static let git = BuiltinTool(
+        spec: ToolSpec(name: "git",
+                       description: "Run a LOCAL git subcommand in the imported project. Allowed: status, diff, log, show, branch, blame, grep, add, commit, stash, tag, rev-parse, ls-files. No push/pull/network. Example: {\"args\":\"diff --stat\"} or {\"args\":\"commit -am \\\"fix: ...\\\"\"}.",
+                       parametersJSON: #"{"type":"object","properties":{"args":{"type":"string","description":"git subcommand and arguments"}},"required":["args"]}"#),
+        run: { argsJSON in
+            guard let a = stringArg(argsJSON, "args") else { return "Argomento 'args' mancante." }
+            return GitTool.run(argsLine: a)
         })
 
     static func stringArg(_ json: String, _ key: String) -> String? {

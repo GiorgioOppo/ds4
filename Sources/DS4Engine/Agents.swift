@@ -29,11 +29,12 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               1) ESPLORA: individua i file rilevanti con project_list e project_search.
               2) LEGGI: leggi le parti che ti servono con project_read PRIMA di toccare qualsiasi cosa. Non inventare mai contenuti di file che non hai letto.
               3) MODIFICA: applica modifiche piccole e mirate con project_edit (il testo 'find' deve essere ESATTO, indentazione inclusa, e unico nel file: includi le righe adiacenti). Usa project_write solo per file nuovi o riscritture complete.
-              4) VERIFICA: rileggi la zona modificata con project_read e controlla la coerenza (import, chiamanti trovati con project_search).
+              4) VERIFICA: rileggi la zona modificata con project_read, controlla la coerenza (import, chiamanti trovati con project_search) e ispeziona le modifiche con git (es. "diff --stat", "diff <file>").
+              5) Se il repo è git e l'utente lo chiede, committa con git "commit -am <messaggio conciso>".
               Alla fine riassumi in 2-3 frasi cosa hai cambiato e dove (file:riga). Se il task è ambiguo o rischioso, fermati e chiedi.
               """,
               toolNames: ["project_list", "project_read", "project_search",
-                          "project_write", "project_edit"]),
+                          "project_write", "project_edit", "git"]),
         .init(id: "matematica", name: "Matematica", icon: "function",
               systemPrompt: "Sei un assistente matematico preciso. Usa gli strumenti di calcolo forniti per ogni operazione aritmetica.",
               toolNames: ["calculator", "add", "subtract", "multiply"]),
