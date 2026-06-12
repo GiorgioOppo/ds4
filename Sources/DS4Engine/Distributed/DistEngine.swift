@@ -23,6 +23,7 @@ public final class DistEngine: @unchecked Sendable {
     private let model: GGUFModel
     private let tok: Tokenizer
     private let decoder: StreamingDecoder
+    private let markup: ToolMarkup
 
     /// `kvLayers` restricts KV/compressor allocation to a layer range (a worker
     /// allocates only its slice's caches; a pure coordinator can pass 0..<0).
@@ -40,9 +41,21 @@ public final class DistEngine: @unchecked Sendable {
         self.modelName = (modelPath as NSString).lastPathComponent
         let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
                               attnFactor: 1, betaFast: 32, betaSlow: 1)
+        self.markup = ToolMarkup.discover(in: tok)
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(
             rt: rt, model: model, dims: dims, rope: rope, nLayers: DSV4Shape.nLayer,
             maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers)
+    }
+
+    public var thinkStartId: Int { Int(tok.thinkStartId) }
+    public var thinkEndId: Int { Int(tok.thinkEndId) }
+
+    /// Render a FULL conversation to token ids (BOS + system + turns + assistant
+    /// open) — the coordinator re-renders the whole chat each turn (stateless).
+    public func chatPromptIds(turns: [ChatTurn], think: Bool) -> [Int] {
+        let s = ChatRenderer.render(turns: turns, tools: [], think: think ? .high : .none,
+                                    markup: markup, compactTools: true)
+        return tok.tokenizeRenderedChat(s).map { Int($0) }
     }
 
     /// HC state width crossing the wire (nHC * nEmbd floats).
@@ -72,11 +85,6 @@ public final class DistEngine: @unchecked Sendable {
     /// Tokenize a rendered chat / prompt string into token ids.
     public func tokenize(_ text: String) -> [Int] {
         tok.tokenizeRenderedChat(text).map { Int($0) }
-    }
-
-    /// Build the token ids for a single-turn chat prompt (BOS + system + user + assistant open).
-    public func chatPromptIds(system: String?, prompt: String) -> [Int] {
-        tok.encodeChatPrompt(system: system, prompt: prompt, think: .none).map { Int($0) }
     }
 
     public func tokenText(_ id: Int) -> String {
