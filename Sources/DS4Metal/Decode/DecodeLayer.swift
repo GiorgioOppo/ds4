@@ -243,7 +243,14 @@ extension GraphContext {
         try ropeTail(x: s.q, nTok: 1, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
-        // 2.5) Indexer scoring (only when the comp rows exceed the top-K): the
+        // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
+        try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
+        try rmsNorm(s.kvRaw, weight: w.kvNorm, out: s.kv, rows: 1, n: d.headDim, eps: rmsEps)
+        try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
+                     freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
+                     attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
+        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
+        // 3.5) Indexer scoring (only when the comp rows exceed the top-K): the
         // indexer query comes from qr_norm via indexer.attn_q_b (+rope+Hadamard),
         // the head weights from attn_norm via indexer.proj. C: indexer_allowed_decode_one.
         if indexerScoring, let idx = idx, nIdxComp > 0,
