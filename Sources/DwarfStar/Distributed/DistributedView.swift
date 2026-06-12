@@ -1,54 +1,97 @@
 import SwiftUI
 
-/// Control panel for distributed inference: pick a role (worker or coordinator),
-/// configure the slice / route, and — as coordinator — chat across the cluster.
-struct DistributedView: View {
+/// This Mac as a distributed WORKER: owns a layer slice and listens for the
+/// coordinator (the Distribuito sidebar tab). The coordinator lives in the Chat
+/// tab → Distribuito mode.
+struct WorkerView: View {
+    @Bindable var controller: DistributedController
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    Label("Questo Mac come WORKER: possiede uno slice di layer e resta in ascolto del coordinatore. Avvia i worker, poi connetti il coordinatore (scheda Chat → Distribuito).",
+                          systemImage: "rectangle.3.group")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Section("Modello") {
+                    HStack {
+                        TextField("Modello GGUF", text: $controller.modelPath)
+                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
+                    }
+                    Stepper("Contesto: \(controller.contextSize) token",
+                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
+                }
+                .disabled(controller.workerRunning || controller.workerLoading)
+
+                Section("Worker — modello da \(controller.modelLayers) layer (0…\(controller.modelLayers - 1))") {
+                    TextField("Porta", value: $controller.port, format: .number.grouping(.never))
+                    Stepper("Primo layer: \(controller.layerStart)", value: $controller.layerStart,
+                            in: 0...(controller.modelLayers - 1))
+                    Stepper("Ultimo layer: \(controller.layerEnd)", value: $controller.layerEnd,
+                            in: controller.layerStart...(controller.modelLayers - 1))
+                    Toggle("Possiede l'output head (ultimo slice)", isOn: $controller.hasOutput)
+                    Text("La route dei worker deve coprire tutti i \(controller.modelLayers) layer in modo contiguo. Su un solo Mac: un worker 0…\(controller.modelLayers - 1) con output head.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(controller.workerRunning)
+
+                Section {
+                    HStack(spacing: 12) {
+                        if controller.workerRunning {
+                            Button(role: .destructive) { controller.stopWorker() } label: {
+                                Label("Ferma worker", systemImage: "stop.fill")
+                            }
+                            Label(controller.workerSummary, systemImage: "dot.radiowaves.left.and.right")
+                                .foregroundStyle(.green).font(.callout)
+                        } else if controller.workerLoading {
+                            ProgressView().controlSize(.small)
+                            Text("Caricamento…").font(.callout).foregroundStyle(.secondary)
+                        } else {
+                            Button { controller.startWorker() } label: {
+                                Label("Avvia worker", systemImage: "play.fill")
+                            }
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+
+            DistLogView(text: controller.workerLog, height: 140)
+        }
+    }
+}
+
+/// The coordinator: a chat that runs across the worker cluster. Shown inside the
+/// Chat tab when "Distribuito" is selected. Before connecting it shows the route
+/// config; once connected, the chat transcript + composer.
+struct CoordinatorChatView: View {
     @Bindable var controller: DistributedController
 
     var body: some View {
         VStack(spacing: 0) {
             config
                 .formStyle(.grouped)
-                .frame(maxHeight: chatActive ? 230 : .infinity)
+                .frame(maxHeight: controller.connected ? 230 : .infinity)
 
-            if chatActive {
+            if controller.connected {
                 Divider()
                 transcript
                 Divider()
                 composer
             }
 
-            if !controller.log.isEmpty {
-                Divider()
-                ScrollView {
-                    Text(controller.log)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled).padding(8)
-                }
-                .frame(height: chatActive ? 80 : 140)
-                .background(Color.black.opacity(0.05))
-            }
+            DistLogView(text: controller.coordLog, height: controller.connected ? 80 : 140)
         }
     }
-
-    private var chatActive: Bool { controller.role == .coordinator && controller.connected }
-
-    // MARK: Config form
 
     private var config: some View {
         Form {
             Section {
-                Label("Inferenza distribuita: spezza i layer del modello (Flash 43, Pro 61) su piu' Mac (pipeline). Avvia prima i worker, poi connetti il coordinatore.",
+                Label("Questo Mac come COORDINATORE: connette i worker e chatta sul cluster. Avvia prima i worker (su questo o altri Mac).",
                       systemImage: "rectangle.3.group")
                     .font(.callout).foregroundStyle(.secondary)
-                Picker("Ruolo", selection: $controller.role) {
-                    ForEach(DistributedController.Role.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .disabled(controller.isRunning || controller.isLoading)
             }
-
             Section("Modello") {
                 HStack {
                     TextField("Modello GGUF", text: $controller.modelPath)
@@ -60,102 +103,54 @@ struct DistributedView: View {
                     Text("32").tag(32); Text("16").tag(16); Text("8").tag(8)
                 }
             }
-            .disabled(controller.isRunning || controller.isLoading)
+            .disabled(controller.connected || controller.coordLoading)
 
-            if controller.role == .worker {
-                workerSection
-                actionSection
-            } else {
-                coordinatorSection
-            }
-        }
-    }
-
-    private var workerSection: some View {
-        Group {
-            Section("Worker — modello da \(controller.modelLayers) layer (0…\(controller.modelLayers - 1))") {
-                TextField("Porta", value: $controller.port, format: .number.grouping(.never))
-                Stepper("Primo layer: \(controller.layerStart)", value: $controller.layerStart,
-                        in: 0...(controller.modelLayers - 1))
-                Stepper("Ultimo layer: \(controller.layerEnd)", value: $controller.layerEnd,
-                        in: controller.layerStart...(controller.modelLayers - 1))
-                Toggle("Possiede l'output head (ultimo slice)", isOn: $controller.hasOutput)
-                Text("La route deve coprire tutti i \(controller.modelLayers) layer in modo contiguo. Su un solo Mac: un worker 0…\(controller.modelLayers - 1) con output head.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .disabled(controller.isRunning)
-        }
-    }
-
-    private var actionSection: some View {
-        Section {
-            HStack(spacing: 12) {
-                if controller.isRunning {
-                    Button(role: .destructive) { controller.stopWorker() } label: {
-                        Label("Ferma worker", systemImage: "stop.fill")
-                    }
-                    Label(controller.endpointSummary, systemImage: "dot.radiowaves.left.and.right")
-                        .foregroundStyle(.green).font(.callout)
-                } else if controller.isLoading {
-                    ProgressView().controlSize(.small)
-                    Text("Caricamento…").font(.callout).foregroundStyle(.secondary)
-                } else {
-                    Button { controller.startWorker() } label: {
-                        Label("Avvia worker", systemImage: "play.fill")
+            if !controller.connected {
+                Section("Worker (uno per riga, host:porta, in ordine di layer)") {
+                    TextEditor(text: $controller.peersText)
+                        .font(.system(.callout, design: .monospaced))
+                        .frame(height: 64)
+                }
+                .disabled(controller.coordLoading)
+                Section("Trasporto") {
+                    Stepper("Chunk prefill: \(controller.prefillChunk) token",
+                            value: $controller.prefillChunk, in: 1...256, step: 8)
+                    Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
+                    if controller.forwardEnabled {
+                        TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
+                        TextField("Porta di ritorno", value: $controller.returnPort, format: .number.grouping(.never))
+                            .frame(width: 100)
                     }
                 }
-            }
-        }
-    }
-
-    @ViewBuilder private var coordinatorSection: some View {
-        if !controller.connected {
-            Section("Worker (uno per riga, host:porta, in ordine di layer)") {
-                TextEditor(text: $controller.peersText)
-                    .font(.system(.callout, design: .monospaced))
-                    .frame(height: 64)
-            }
-            .disabled(controller.isLoading)
-            Section("Trasporto") {
-                Stepper("Chunk prefill: \(controller.prefillChunk) token",
-                        value: $controller.prefillChunk, in: 1...256, step: 8)
-                Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
-                if controller.forwardEnabled {
-                    TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
-                    TextField("Porta di ritorno", value: $controller.returnPort, format: .number.grouping(.never))
-                        .frame(width: 100)
-                }
-            }
-            .disabled(controller.isLoading)
-            Section {
-                HStack(spacing: 12) {
-                    if controller.isLoading {
-                        ProgressView().controlSize(.small)
-                        Text("Connessione…").font(.callout).foregroundStyle(.secondary)
-                    } else {
-                        Button { controller.connectCoordinator() } label: {
-                            Label("Connetti", systemImage: "link")
+                .disabled(controller.coordLoading)
+                Section {
+                    HStack(spacing: 12) {
+                        if controller.coordLoading {
+                            ProgressView().controlSize(.small)
+                            Text("Connessione…").font(.callout).foregroundStyle(.secondary)
+                        } else {
+                            Button { controller.connectCoordinator() } label: {
+                                Label("Connetti", systemImage: "link")
+                            }
                         }
                     }
                 }
-            }
-        } else {
-            Section {
-                HStack {
-                    Label("Connesso · \(controller.parsePeers().count) worker", systemImage: "link")
-                        .foregroundStyle(.green).font(.callout)
-                    Spacer()
-                    Button(role: .destructive) { controller.disconnectCoordinator() } label: {
-                        Label("Disconnetti", systemImage: "xmark.circle")
+            } else {
+                Section {
+                    HStack {
+                        Label("Connesso · \(controller.parsePeers().count) worker", systemImage: "link")
+                            .foregroundStyle(.green).font(.callout)
+                        Spacer()
+                        Button(role: .destructive) { controller.disconnectCoordinator() } label: {
+                            Label("Disconnetti", systemImage: "xmark.circle")
+                        }
                     }
+                    Toggle("Thinking", isOn: $controller.think)
+                    Stepper("Max token: \(controller.maxTokens)", value: $controller.maxTokens, in: 16...4096, step: 16)
                 }
-                Toggle("Thinking", isOn: $controller.think)
-                Stepper("Max token: \(controller.maxTokens)", value: $controller.maxTokens, in: 16...4096, step: 16)
             }
         }
     }
-
-    // MARK: Chat (coordinator, connected)
 
     private var transcript: some View {
         ScrollViewReader { proxy in
@@ -179,9 +174,7 @@ struct DistributedView: View {
                 .onSubmit { controller.sendChat() }
                 .disabled(controller.isGenerating)
             if controller.isGenerating {
-                Button(role: .destructive) { controller.stopGeneration() } label: {
-                    Image(systemName: "stop.fill")
-                }
+                Button(role: .destructive) { controller.stopGeneration() } label: { Image(systemName: "stop.fill") }
             } else {
                 Button { controller.sendChat() } label: { Image(systemName: "paperplane.fill") }
                     .disabled(controller.chatInput.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -190,5 +183,24 @@ struct DistributedView: View {
                 .help("Nuova chat")
         }
         .padding(8)
+    }
+}
+
+/// Shared monospaced log strip (hidden when empty).
+struct DistLogView: View {
+    let text: String
+    var height: CGFloat = 140
+    var body: some View {
+        if !text.isEmpty {
+            Divider()
+            ScrollView {
+                Text(text)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled).padding(8)
+            }
+            .frame(height: height)
+            .background(Color.black.opacity(0.05))
+        }
     }
 }

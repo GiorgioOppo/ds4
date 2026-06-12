@@ -201,12 +201,12 @@ L'app (`Sources/DwarfStar/`) è una finestra macOS con una **sidebar**
 
 | Sezione | Icona | Scopo |
 |---|---|---|
-| **Chat** | fumetti | Caricamento modello + conversazione in streaming (tool, agenti, progetto, riuso KV). |
+| **Chat** | fumetti | Conversazione in streaming (tool, agenti, progetto, riuso KV). Picker **Locale** (motore in-process) / **Distribuito** (coordina il cluster di worker). |
 | **Agenti** | persone | Ruoli: visualizza/modifica i prompt di definizione e i tool di ogni agente, creane di nuovi, scegli l'attivo, export/import JSON. |
 | **Progetto** | cartella | Libreria di progetti salvati (memoria separata dalla chat): importa più cartelle, attivane una; l'agente la esplora con i tool `project_*` (solo le parti lette entrano in conversazione). |
 | **Tuning** | slider | Cache esperti (persistenti+dinamici) e profilo d'uso ("imatrix d'uso") per-agente. Il fine-tuning dei pesi non è possibile on-device. |
 | **Server** | rack | Server HTTP **nativo in-process**, compatibile OpenAI + Anthropic (§9). |
-| **Distribuito** | gruppi | Inferenza distribuita su più Mac: pipeline a range di layer (§9). |
+| **Worker** | cpu | Questo Mac come worker del cluster distribuito (slice di layer); il coordinatore è in Chat → Distribuito (§9). |
 | **Benchmark** | tachimetro | Nativo: prefill + generazione (token/s) del motore in-process a contesti crescenti, con grafico. |
 | **Diagnostica** | stetoscopio | Tokenizzazione di un testo, chat template + token speciali (tipo/atomicità), console del motore. |
 

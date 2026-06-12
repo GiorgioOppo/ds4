@@ -55,12 +55,12 @@ The engine is a faithful Swift reimplementation; correctness is the project's
 
 | Tab | What it does |
 |---|---|
-| **Chat** | streaming chat: reasoning collassabile, tool-call live (markup grezzo → card), risultati tool, riuso KV multi-turno, import progetto |
+| **Chat** | streaming chat (markdown), reasoning collassabile, tool-call live, riuso KV multi-turno, import progetto · modo **Locale** (in-process) o **Distribuito** (coordina il cluster di worker) |
 | **Agenti** | ruoli con prompt/icone/tool per agente, editor completo, export/import JSON, profilo di uso esperti per agente |
 | **Progetto** | libreria di progetti (cartelle indicizzate, bookmark sandbox); i tool `project_list/read/search` li esplorano senza toccare la memoria chat |
 | **Tuning** | slot della cache esperti, hit-rate, concentrazione del routing per layer (la "usage imatrix") |
 | **Server** | server HTTP **nativo in-process** OpenAI/Anthropic-compatible (vedi sotto) |
-| **Distribuito** | inferenza distribuita su più Mac (pipeline a range di layer, vedi sotto) |
+| **Worker** | questo Mac come worker del cluster distribuito (possiede uno slice di layer; il coordinatore sta in Chat → Distribuito) |
 | **Benchmark** | nativo: prefill + generazione (token/s) del motore in-process a contesti crescenti, con grafico (Swift Charts) |
 | **Diagnostica** | dump dei token e del chat template (tokenizer nativo, niente sottoprocessi) |
 

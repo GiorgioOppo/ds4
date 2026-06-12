@@ -9,26 +9,22 @@ import DS4Core
 @MainActor
 @Observable
 final class DistributedController {
-    enum Role: String, CaseIterable, Identifiable {
-        case worker = "Worker"
-        case coordinator = "Coordinatore"
-        var id: String { rawValue }
-    }
-
-    // Shared.
-    var role: Role = .worker
+    // Shared model config (each role loads its own engine; mmap weights shared).
     var modelPath = AppEnvironment.defaultModelPath
     var contextSize = 8192
     var activationBits = 32
 
-    // Worker.
+    // Worker (Distribuito sidebar tab).
     var port = 9100
     var layerStart = 0
     var layerEnd = DistEngine.modelLayers - 1
     var hasOutput = true
     var modelLayers: Int { DistEngine.modelLayers }
+    var workerRunning = false
+    var workerLoading = false
+    var workerLog = ""
 
-    // Coordinator.
+    // Coordinator (Chat tab → Distribuito).
     var peersText = "127.0.0.1:9100"
     var prefillChunk = 32
     var forwardEnabled = false
@@ -36,39 +32,35 @@ final class DistributedController {
     var returnPort = 9099
     var think = false
     var maxTokens = 512
+    var connected = false        // route established
+    var coordLoading = false
+    var coordLog = ""
 
     // Coordinator chat.
     var messages: [UIMessage] = []
     var chatInput = ""
-    var connected = false        // route established
     var isGenerating = false
-
-    // Live state.
-    var log = ""
-    var isRunning = false        // worker listening OR coordinator connected
-    var isLoading = false
 
     private var worker: DistWorker?
     private var coordinator: DistCoordinator?
     private var coordTask: Task<Void, Never>?      // connect / generation task
-    private var logTask: Task<Void, Never>?
+    private var workerLogTask: Task<Void, Never>?
+    private var coordLogTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
 
-    var endpointSummary: String {
-        role == .worker ? "worker :\(port) · layer \(layerStart)…\(layerEnd)\(hasOutput ? " +output" : "")"
-                        : "coordinatore · \(parsePeers().count) worker"
-    }
+    var workerSummary: String { "worker :\(port) · layer \(layerStart)…\(layerEnd)\(hasOutput ? " +output" : "")" }
 
     // MARK: Worker
 
     func startWorker() {
-        guard !isRunning, !isLoading else { return }
-        isLoading = true; log = "Caricamento modello (worker)…\n"
+        guard !workerRunning, !workerLoading else { return }
+        workerLoading = true; workerLog = "Caricamento modello (worker)…\n"
         let cfg = DistWorker.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                     port: UInt16(clamping: port), layerStart: layerStart,
                                     layerEnd: layerEnd, hasOutput: hasOutput, contextSize: contextSize)
         let (logStream, logCont) = AsyncStream<String>.makeStream()
-        drainLog(logStream)
+        workerLogTask?.cancel()
+        workerLogTask = Task { [weak self] in for await s in logStream { self?.workerLog += s } }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
         let loadTask = Task.detached { () -> DistWorker in
             let w = try DistWorker(config: cfg, onLog: onLog)
@@ -76,34 +68,36 @@ final class DistributedController {
             return w
         }
         Task {
-            do { self.worker = try await loadTask.value; self.isLoading = false; self.isRunning = true }
-            catch { logCont.yield("avvio worker fallito: \(error)\n"); self.isLoading = false; self.isRunning = false }
+            do { self.worker = try await loadTask.value; self.workerLoading = false; self.workerRunning = true }
+            catch { logCont.yield("avvio worker fallito: \(error)\n"); self.workerLoading = false; self.workerRunning = false }
         }
     }
 
     func stopWorker() {
         worker?.stop(); worker = nil
-        isRunning = false; isLoading = false
-        log += "[worker fermato]\n"
+        workerRunning = false; workerLoading = false
+        workerLog += "[worker fermato]\n"
     }
 
     // MARK: Coordinator — connect / chat
 
     func connectCoordinator() {
-        guard !connected, !isLoading else { return }
+        guard !connected, !coordLoading else { return }
         let peers = parsePeers()
-        guard !peers.isEmpty else { log += "nessun worker indicato\n"; return }
+        guard !peers.isEmpty else { coordLog += "nessun worker indicato\n"; return }
         if forwardEnabled, returnHost.trimmingCharacters(in: .whitespaces).isEmpty {
-            log += "inoltro: indica l'host di ritorno (IP LAN di questo Mac)\n"; return
+            coordLog += "inoltro: indica l'host di ritorno (IP LAN di questo Mac)\n"; return
         }
-        isLoading = true; log = "Caricamento modello (coordinatore)…\n"
+        coordLoading = true; coordLog = "Caricamento modello (coordinatore)…\n"
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
                                          forward: forwardEnabled,
                                          returnHost: returnHost.trimmingCharacters(in: .whitespaces),
                                          returnPort: UInt16(clamping: returnPort))
-        let (logStream, logCont) = AsyncStream<String>.makeStream(); drainLog(logStream)
+        let (logStream, logCont) = AsyncStream<String>.makeStream()
+        coordLogTask?.cancel()
+        coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
 
         coordTask = Task {
@@ -111,10 +105,10 @@ final class DistributedController {
                 let coord = try await Task.detached { try DistCoordinator(config: cfg) }.value
                 try await coord.connect(onLog: onLog)
                 self.coordinator = coord
-                self.isLoading = false; self.connected = true; self.isRunning = true
+                self.coordLoading = false; self.connected = true
             } catch {
                 logCont.yield("connessione fallita: \(error)\n")
-                self.isLoading = false; self.connected = false
+                self.coordLoading = false; self.connected = false
             }
         }
     }
@@ -124,8 +118,8 @@ final class DistributedController {
         let coord = coordinator
         Task.detached { coord?.disconnect() }
         coordinator = nil
-        connected = false; isRunning = false; isGenerating = false
-        log += "[disconnesso]\n"
+        connected = false; isGenerating = false
+        coordLog += "[disconnesso]\n"
     }
 
     /// Send the current input as a chat turn and stream the reply.
@@ -151,7 +145,7 @@ final class DistributedController {
             for await e in stream {
                 guard let self, index < self.messages.count else { continue }
                 switch e {
-                case .log(let s): self.log += s
+                case .log(let s): self.coordLog += s
                 case .reasoning(let s): self.messages[index].reasoning += s
                 case .token(let s): self.messages[index].text += s
                 }
@@ -179,17 +173,12 @@ final class DistributedController {
     func stopGeneration() {
         coordTask?.cancel()
         isGenerating = false
-        log += "[interrotto] (la prossima domanda riparte da capo)\n"
+        coordLog += "[interrotto] (la prossima domanda riparte da capo)\n"
     }
 
     func newChat() { messages.removeAll() }
 
     // MARK: Helpers
-
-    private func drainLog(_ stream: AsyncStream<String>) {
-        logTask?.cancel()
-        logTask = Task { [weak self] in for await line in stream { self?.log += line } }
-    }
 
     func parsePeers() -> [DistCoordinator.Peer] {
         peersText.split(whereSeparator: \.isNewline).compactMap { line in
