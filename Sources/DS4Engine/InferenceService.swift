@@ -39,11 +39,13 @@ public struct SamplingParams: Sendable {
     public var seed: UInt64
     /// Repetition penalty (llama.cpp `penalty_repeat`): >1 discourages re-emitting
     /// the last `repeatLastN` tokens — breaks the repeat-loop collapse on
-    /// quantized models. 1.0 = off.
+    /// quantized models. 1.0 = off — the DEFAULT: the C original (ds4.c
+    /// sample_top_p_min_p) has no penalty, so engine/server/demo stay faithful
+    /// to it; the chat GUI opts in explicitly with its own user-set value.
     public var repetitionPenalty: Float
     public var repeatLastN: Int
     public init(temperature: Float = 0.6, topK: Int = 0, topP: Float = 0.95, minP: Float = 0.05,
-                seed: UInt64 = 0xD54, repetitionPenalty: Float = 1.1, repeatLastN: Int = 64) {
+                seed: UInt64 = 0xD54, repetitionPenalty: Float = 1.0, repeatLastN: Int = 64) {
         self.temperature = temperature; self.topK = topK; self.topP = topP; self.minP = minP
         self.seed = seed; self.repetitionPenalty = repetitionPenalty; self.repeatLastN = repeatLastN
     }
