@@ -485,10 +485,17 @@ modellata su `ds4_distributed.c`):
 - **bit attivazioni** 32/16/8 per ridurre la banda (parti da 32 per la
   correttezza).
 
-Uso: su ogni Mac-worker scegli ruolo **Worker**, porta e range di layer e
-avvia; sul coordinatore elenca i worker (`host:porta`, uno per riga, in ordine
-di layer), scrivi il prompt e premi **Genera**. Il GGUF deve essere presente su
-ogni Mac (selezionato con Sfoglia per il sandbox).
+Uso: su ogni Mac-worker apri la scheda **Worker**, imposta porta e range di
+layer e avvia; sul coordinatore (Chat → **Distribuito**) elenca i worker
+(`host:porta`, uno per riga, in ordine di layer), **Connetti** e chatta. Il GGUF
+deve essere presente su ogni Mac (selezionato con Sfoglia per il sandbox).
+
+> **Permesso rete locale (macOS 15+)**: al primo uso il sistema mostra il
+> prompt "DwarfStar vuole accedere alla rete locale" (testo da
+> `NSLocalNetworkUsageDescription`, impostato in `project.yml`). Va concesso su
+> OGNI Mac del cluster — coordinatore e worker — altrimenti le connessioni LAN
+> vengono negate silenziosamente (timeout in Connetti). Verificabile in
+> Impostazioni di Sistema → Privacy e Sicurezza → Rete locale.
 
 ### Benchmark (`BenchView` + `BenchController`) — nativo
 
