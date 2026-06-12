@@ -74,7 +74,10 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.dwarfstar.app
+        INFOPLIST_KEY_CFBundleDisplayName: DwarfStar
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         MARKETING_VERSION: "1.0"
+        # Build number: `make xcodeproj` increments this in-place before xcodegen.
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
         CODE_SIGN_STYLE: Automatic

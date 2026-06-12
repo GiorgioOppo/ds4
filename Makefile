@@ -24,7 +24,12 @@ embed-kernels:
 
 # (Re)generate the standalone DwarfStar.xcodeproj (DS4Core + DS4Metal + DS4Engine
 # + DwarfStar + DS4Demo) — NO external links — via xcodegen (project.yml).
+# Bumps CURRENT_PROJECT_VERSION (the build number) in project.yml in-place first,
+# so every regeneration yields a higher build. Display name (DwarfStar) and the
+# Utilities app category come from project.yml.
 xcodeproj:
+	@perl -i -pe 's/(CURRENT_PROJECT_VERSION: ")(\d+)(")/"$$1".($$2+1)."$$3"/e' project.yml
+	@echo "build $$(perl -ne 'print $$1 if /CURRENT_PROJECT_VERSION: \"(\d+)\"/' project.yml)"
 	xcodegen generate
 
 # Generate + open the project in Xcode (clickable .xcodeproj, no external links).
