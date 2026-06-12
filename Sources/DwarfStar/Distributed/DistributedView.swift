@@ -62,94 +62,61 @@ struct WorkerView: View {
     }
 }
 
-/// The coordinator: a chat that runs across the worker cluster. Shown inside the
-/// Chat tab when "Distribuito" is selected. Before connecting it shows the route
-/// config; once connected, the chat transcript + composer.
+/// The coordinator: a chat that runs across the worker cluster, shown inside the
+/// Chat tab when "Distribuito" is selected. Before connecting: a full-screen
+/// setup form (like the local model-load screen). Once connected: the SAME
+/// layout as the local chat — header (model name + route info, Thinking, Nuova
+/// chat, Disconnetti), full-screen transcript, composer with live status.
 struct CoordinatorChatView: View {
     @Bindable var controller: DistributedController
 
     var body: some View {
-        VStack(spacing: 0) {
-            config
-                .formStyle(.grouped)
-                .frame(maxHeight: controller.connected ? 230 : .infinity)
-
-            if controller.connected {
+        if controller.connected {
+            VStack(spacing: 0) {
+                header
                 Divider()
                 transcript
                 Divider()
                 composer
             }
-
-            DistLogView(text: controller.coordLog, height: controller.connected ? 80 : 140)
+        } else {
+            setup
         }
     }
 
-    private var config: some View {
-        Form {
-            Section {
-                Label("Questo Mac come COORDINATORE: connette i worker e chatta sul cluster. Avvia prima i worker (su questo o altri Mac).",
-                      systemImage: "rectangle.3.group")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            Section("Modello") {
-                HStack {
-                    TextField("Modello GGUF", text: $controller.modelPath)
-                    Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
-                }
-                Stepper("Contesto: \(controller.contextSize) token",
-                        value: $controller.contextSize, in: 1024...200_000, step: 1024)
-                Picker("Bit attivazioni (transport)", selection: $controller.activationBits) {
-                    Text("32").tag(32); Text("16").tag(16); Text("8").tag(8)
-                }
-            }
-            .disabled(controller.connected || controller.coordLoading)
+    // MARK: Connected — local-chat look
 
-            if !controller.connected {
-                Section("Worker (uno per riga, host:porta, in ordine di layer)") {
-                    TextEditor(text: $controller.peersText)
-                        .font(.system(.callout, design: .monospaced))
-                        .frame(height: 64)
-                }
-                .disabled(controller.coordLoading)
-                Section("Trasporto") {
-                    Stepper("Chunk prefill: \(controller.prefillChunk) token",
-                            value: $controller.prefillChunk, in: 1...256, step: 8)
-                    Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
-                    if controller.forwardEnabled {
-                        TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
-                        TextField("Porta di ritorno", value: $controller.returnPort, format: .number.grouping(.never))
-                            .frame(width: 100)
-                    }
-                }
-                .disabled(controller.coordLoading)
-                Section {
-                    HStack(spacing: 12) {
-                        if controller.coordLoading {
-                            ProgressView().controlSize(.small)
-                            Text("Connessione…").font(.callout).foregroundStyle(.secondary)
-                        } else {
-                            Button { controller.connectCoordinator() } label: {
-                                Label("Connetti", systemImage: "link")
-                            }
-                        }
-                    }
-                }
-            } else {
-                Section {
-                    HStack {
-                        Label("Connesso · \(controller.parsePeers().count) worker", systemImage: "link")
-                            .foregroundStyle(.green).font(.callout)
-                        Spacer()
-                        Button(role: .destructive) { controller.disconnectCoordinator() } label: {
-                            Label("Disconnetti", systemImage: "xmark.circle")
-                        }
-                    }
-                    Toggle("Thinking", isOn: $controller.think)
-                    Stepper("Max token: \(controller.maxTokens)", value: $controller.maxTokens, in: 16...4096, step: 16)
-                }
+    private var modelName: String { (controller.modelPath as NSString).lastPathComponent }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(modelName)
+                    .font(.headline)
+                Text("distribuito · \(controller.modelLayers) layer su \(controller.parsePeers().count) worker · ctx \(controller.contextSize) · \(controller.forwardEnabled ? "inoltro" : "relay")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Stepper("Max token: \(controller.maxTokens)",
+                    value: $controller.maxTokens, in: 16...4096, step: 16)
+                .fixedSize()
+                .font(.callout)
+            Toggle("Thinking", isOn: $controller.think)
+                .toggleStyle(.switch)
+            Button {
+                controller.newChat()
+            } label: {
+                Label("Nuova chat", systemImage: "square.and.pencil")
+            }
+            Button(role: .destructive) {
+                controller.disconnectCoordinator()
+            } label: {
+                Label("Disconnetti", systemImage: "xmark.circle")
             }
         }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
     }
 
     private var transcript: some View {
@@ -167,22 +134,89 @@ struct CoordinatorChatView: View {
     }
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            TextField("Messaggio…", text: $controller.chatInput, axis: .vertical)
-                .lineLimit(1...4)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { controller.sendChat() }
-                .disabled(controller.isGenerating)
-            if controller.isGenerating {
-                Button(role: .destructive) { controller.stopGeneration() } label: { Image(systemName: "stop.fill") }
-            } else {
-                Button { controller.sendChat() } label: { Image(systemName: "paperplane.fill") }
-                    .disabled(controller.chatInput.trimmingCharacters(in: .whitespaces).isEmpty)
+        VStack(alignment: .leading, spacing: 4) {
+            if controller.isGenerating && !controller.status.isEmpty {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(controller.status)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
-            Button { controller.newChat() } label: { Image(systemName: "square.and.pencil") }
-                .help("Nuova chat")
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Scrivi un messaggio…", text: $controller.chatInput, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...6)
+                    .onSubmit { controller.sendChat() }
+                if controller.isGenerating {
+                    Button(role: .destructive) { controller.stopGeneration() } label: {
+                        Image(systemName: "stop.fill")
+                    }
+                } else {
+                    Button { controller.sendChat() } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                    }
+                    .disabled(controller.chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
         }
-        .padding(8)
+        .padding(10)
+    }
+
+    // MARK: Not connected — full-screen setup (mirrors the local load screen)
+
+    private var setup: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    Label("Questo Mac come COORDINATORE: connette i worker e chatta sul cluster. Avvia prima i worker (scheda Worker, su questo o altri Mac).",
+                          systemImage: "rectangle.3.group")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Section("Modello") {
+                    HStack {
+                        TextField("Modello GGUF", text: $controller.modelPath)
+                        Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { controller.modelPath = p } }
+                    }
+                    Stepper("Contesto: \(controller.contextSize) token",
+                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
+                    Picker("Bit attivazioni (transport)", selection: $controller.activationBits) {
+                        Text("32").tag(32); Text("16").tag(16); Text("8").tag(8)
+                    }
+                }
+                Section("Worker (uno per riga, host:porta, in ordine di layer)") {
+                    TextEditor(text: $controller.peersText)
+                        .font(.system(.callout, design: .monospaced))
+                        .frame(height: 64)
+                }
+                Section("Trasporto") {
+                    Stepper("Chunk prefill: \(controller.prefillChunk) token",
+                            value: $controller.prefillChunk, in: 1...256, step: 8)
+                    Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
+                    if controller.forwardEnabled {
+                        TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)
+                        TextField("Porta di ritorno", value: $controller.returnPort, format: .number.grouping(.never))
+                            .frame(width: 100)
+                    }
+                }
+                Section {
+                    HStack(spacing: 12) {
+                        if controller.coordLoading {
+                            ProgressView().controlSize(.small)
+                            Text("Connessione…").font(.callout).foregroundStyle(.secondary)
+                        } else {
+                            Button { controller.connectCoordinator() } label: {
+                                Label("Connetti", systemImage: "link")
+                            }
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .disabled(controller.coordLoading)
+
+            DistLogView(text: controller.coordLog, height: 140)
+        }
     }
 }
 

@@ -40,6 +40,7 @@ final class DistributedController {
     var messages: [UIMessage] = []
     var chatInput = ""
     var isGenerating = false
+    var status = ""              // live prefill/decode progress (last log line)
 
     private var worker: DistWorker?
     private var coordinator: DistCoordinator?
@@ -145,7 +146,9 @@ final class DistributedController {
             for await e in stream {
                 guard let self, index < self.messages.count else { continue }
                 switch e {
-                case .log(let s): self.coordLog += s
+                case .log(let s):
+                    self.coordLog += s
+                    self.status = s.trimmingCharacters(in: .whitespacesAndNewlines)
                 case .reasoning(let s): self.messages[index].reasoning += s
                 case .token(let s): self.messages[index].text += s
                 }
@@ -167,6 +170,7 @@ final class DistributedController {
             if let err = await work.value { cont.yield(.log("errore: \(err)\n")) }
             cont.finish()
             self.isGenerating = false
+            self.status = ""
         }
     }
 
