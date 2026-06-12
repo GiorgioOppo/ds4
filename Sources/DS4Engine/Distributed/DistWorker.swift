@@ -99,6 +99,12 @@ public final class DistWorker: @unchecked Sendable {
                     return try self.engine.forwardSliceBatch(hcs: hcs, posBase: work.pos,
                                                              start: work.layerStart, end: work.layerEnd)
                 }
+                if work.pos == 0, let inHC = (n > 0 ? Array(work.hc[0..<stateLen]) : nil),
+                   let outHC = outStates.first {
+                    func nrm(_ a: [Float]) -> Float { (a.reduce(0) { $0 + $1 * $1 }).squareRoot() }
+                    onLog(String(format: "diag: layer %d…%d  |in|=%.2f  |out|=%.2f\n",
+                                 work.layerStart, work.layerEnd, nrm(inHC), nrm(outHC)))
+                }
 
                 let isTerminal = work.route.isEmpty || work.routeIndex >= work.route.count - 1
                 if isTerminal {

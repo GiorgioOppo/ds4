@@ -125,6 +125,10 @@ public final class DistCoordinator: @unchecked Sendable {
             for (i, id) in ids[start..<end].enumerated() {
                 hcs.append(try engine.embed(token: id, pos: pos + i))
             }
+            if pos == 0, let h0 = hcs.first {
+                let n = (h0.reduce(0) { $0 + $1 * $1 }).squareRoot()
+                onLog(String(format: "diag: |embed| = %.2f (hc=%d float)\n", n, h0.count))
+            }
             if let logits = try await runChunk(hcs: hcs, posBase: pos, wantLogits: end == ids.count) {
                 lastLogits = logits
             }
@@ -132,6 +136,13 @@ public final class DistCoordinator: @unchecked Sendable {
             start = end
         }
         guard !lastLogits.isEmpty else { throw DistError.badFrame }
+        // Diagnose where the pipeline breaks: a sane top token here = prefill OK,
+        // problem in decode; garbage here = problem in embed/slice/head/wire.
+        if let mx = lastLogits.indices.max(by: { lastLogits[$0] < lastLogits[$1] }) {
+            let finite = lastLogits.filter { $0.isFinite }.count
+            onLog(String(format: "diag: prefill top=%d (%@) logit=%.2f · %d/%d finiti\n",
+                         mx, engine.tokenText(mx), lastLogits[mx], finite, lastLogits.count))
+        }
 
         // DECODE token-by-token, splitting reasoning (<think>…</think>) from text.
         var rng = sampling.seed
