@@ -41,6 +41,23 @@ final class DistributedController {
     var chatInput = ""
     var isGenerating = false
     var status = ""              // live prefill/decode progress (last log line)
+    /// Authoritative conversation as engine turns (incl. tool calls/results):
+    /// re-rendered in full on every send (stateless coordinator).
+    private var turns: [ChatTurn] = []
+    private var toolRounds = 0
+    private let maxToolRounds = 4
+
+    // Agent (role): same library as the local chat, own selection. Tools run
+    // LOCALLY on this (coordinator) Mac — incl. project_* against the active project.
+    var agents: [AgentProfile] = ChatStore.loadAgents()
+    var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgentDist") ?? "generale" {
+        didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgentDist") }
+    }
+    var selectedAgent: AgentProfile { agents.first { $0.id == selectedAgentId } ?? agents[0] }
+    func selectAgent(_ id: String) {
+        selectedAgentId = id
+        newChat()                 // fresh conversation with the new role (like local)
+    }
 
     private var worker: DistWorker?
     private var coordinator: DistCoordinator?
@@ -123,20 +140,30 @@ final class DistributedController {
         coordLog += "[disconnesso]\n"
     }
 
-    /// Send the current input as a chat turn and stream the reply.
+    /// Send the current input as a chat turn and stream the reply, running the
+    /// tool loop: DSML calls are executed LOCALLY (ToolRegistry, incl. project_*)
+    /// and fed back as .toolResult turns until the model answers with text.
     func sendChat() {
         let text = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard connected, !isGenerating, !text.isEmpty, let coord = coordinator else { return }
+        guard connected, !isGenerating, !text.isEmpty, coordinator != nil else { return }
         chatInput = ""
         messages.append(UIMessage(role: .user, text: text))
+        turns.append(.user(text))
+        toolRounds = 0
+        isGenerating = true
+        generateTurn()
+    }
+
+    /// One generation round (assistant reply or tool call) + tool continuation.
+    private func generateTurn() {
+        guard let coord = coordinator else { isGenerating = false; return }
         let index = messages.count
         messages.append(UIMessage(role: .assistant, text: ""))
-        isGenerating = true
 
-        // Snapshot the conversation as engine turns.
-        let turns: [ChatTurn] = messages.dropLast().map { m in
-            m.role == .user ? .user(m.text) : .assistant(text: m.text, toolCalls: [])
-        }
+        let agent = selectedAgent
+        var sendTurns = turns
+        if !agent.systemPrompt.isEmpty { sendTurns.insert(.system(agent.systemPrompt), at: 0) }
+        let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.specs(enabled: Set(agent.toolNames))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
         enum Ev: Sendable { case log(String), reasoning(String), token(String) }
@@ -159,19 +186,49 @@ final class DistributedController {
         let onToken: @Sendable (String) -> Void = { cont.yield(.token($0)) }
 
         coordTask = Task {
-            let work = Task.detached { () -> String? in
+            let work = Task.detached { () -> Result<[ToolCall], Error> in
                 do {
-                    try await coord.send(turns: turns, think: wantThink, maxTokens: maxT, sampling: samp,
-                                         onLog: onLog, onReasoning: onReasoning, onToken: onToken)
-                    return nil
-                } catch is CancellationError { return nil }
-                catch { return "\(error)" }
+                    let calls = try await coord.send(turns: sendTurns, tools: tools, think: wantThink,
+                                                     maxTokens: maxT, sampling: samp,
+                                                     onLog: onLog, onReasoning: onReasoning, onToken: onToken)
+                    return .success(calls)
+                } catch { return .failure(error) }
             }
-            if let err = await work.value { cont.yield(.log("errore: \(err)\n")) }
+            let result = await work.value
             cont.finish()
-            self.isGenerating = false
-            self.status = ""
+            switch result {
+            case .failure(let error):
+                if !(error is CancellationError) { self.coordLog += "errore: \(error)\n" }
+                self.isGenerating = false; self.status = ""
+            case .success(let calls):
+                self.finishTurn(index: index, calls: calls)
+            }
         }
+    }
+
+    /// Record the assistant turn; execute tool calls locally and continue, or stop.
+    private func finishTurn(index: Int, calls: [ToolCall]) {
+        guard index < messages.count else { isGenerating = false; status = ""; return }
+        let visible = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
+        messages[index].text = visible
+        messages[index].toolCalls = calls
+        turns.append(.assistant(text: visible, toolCalls: calls))
+
+        guard !calls.isEmpty else { isGenerating = false; status = ""; return }
+        toolRounds += 1
+        guard toolRounds <= maxToolRounds else {
+            messages.append(UIMessage(role: .tool, text: "⚠️ troppi round di tool (\(maxToolRounds)) — interrotto."))
+            isGenerating = false; status = ""
+            return
+        }
+        for c in calls {
+            let out = ToolRegistry.execute(c)
+                ?? ToolOutput(callId: c.id, name: c.name,
+                              content: #"{"error":"tool non integrato: non supportato in distribuito"}"#)
+            messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
+            turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
+        }
+        generateTurn()      // continue with the tool results
     }
 
     func stopGeneration() {
@@ -180,7 +237,12 @@ final class DistributedController {
         coordLog += "[interrotto] (la prossima domanda riparte da capo)\n"
     }
 
-    func newChat() { messages.removeAll() }
+    func newChat() {
+        messages.removeAll()
+        turns.removeAll()
+        toolRounds = 0
+        agents = ChatStore.loadAgents()   // pick up edits from the Agenti tab
+    }
 
     // MARK: Helpers
 

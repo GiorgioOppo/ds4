@@ -102,15 +102,19 @@ public final class DistCoordinator: @unchecked Sendable {
 
     // MARK: One chat turn
 
-    /// Render the whole conversation, run it across the cluster (fresh KV), and
-    /// stream the assistant reply: reasoning tokens via `onReasoning`, visible
-    /// text via `onToken`.
-    public func send(turns: [ChatTurn], think: Bool, maxTokens: Int, sampling: SamplingParams,
+    /// Render the whole conversation (with the agent's tools declared), run it
+    /// across the cluster (fresh KV), and stream the assistant reply: reasoning
+    /// via `onReasoning`, visible text via `onToken`. Returns the parsed DSML
+    /// tool calls (empty when the model answered directly) — the caller executes
+    /// them locally and continues with `.toolResult` turns.
+    @discardableResult
+    public func send(turns: [ChatTurn], tools: [ToolSpec] = [], think: Bool, maxTokens: Int,
+                     sampling: SamplingParams,
                      onLog: @Sendable (String) -> Void,
                      onReasoning: @Sendable (String) -> Void,
-                     onToken: @Sendable (String) -> Void) async throws {
+                     onToken: @Sendable (String) -> Void) async throws -> [ToolCall] {
         guard !entries.isEmpty else { throw DistError.closed }
-        let ids = engine.chatPromptIds(turns: turns, think: think)
+        let ids = engine.chatPromptIds(turns: turns, tools: tools, think: think)
         guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt oltre il contesto") }
         onLog("prefill \(ids.count) token (chunk \(config.prefillChunk))…\n")
 
@@ -144,21 +148,43 @@ public final class DistCoordinator: @unchecked Sendable {
                          mx, engine.tokenText(mx), lastLogits[mx], finite, lastLogits.count))
         }
 
-        // DECODE token-by-token, splitting reasoning (<think>…</think>) from text.
+        // DECODE token-by-token, splitting reasoning (<think>…</think>) from text
+        // and buffering DSML tool-call markup (never shown; parsed at the end —
+        // same scheme as the local InferenceService, incl. the held '<' opener).
         var rng = sampling.seed
         var produced = 0
         var inReasoning = think
+        var inTool = false
+        var pendingLT = false                    // a held trailing '<' (may open <｜DSML｜…)
+        var visible = ""
+        var toolText = ""
         var recentIds = Array(ids.suffix(sampling.repeatLastN))
         let t0 = Date()
+        func emit(_ s: String) {
+            if inReasoning { onReasoning(s) } else { visible += s; onToken(s) }
+        }
         while produced < maxTokens {
             try Task.checkCancellation()
             let next = engine.sample(lastLogits, params: sampling, recent: recentIds[...], rng: &rng)
             if next == engine.eosId { break }
-            if next == engine.thinkEndId { inReasoning = false }
+            if !inTool, next == engine.dsmlId {
+                if pendingLT { pendingLT = false; toolText += "<" }   // the '<' belonged to the opener
+                inTool = true
+                toolText += engine.tokenText(next)
+            } else if inTool {
+                toolText += engine.tokenText(next)
+            } else if next == engine.thinkEndId { inReasoning = false }
             else if next == engine.thinkStartId { inReasoning = true }
             else {
+                if pendingLT { pendingLT = false; emit("<") }         // plain '<' after all
                 let s = engine.tokenText(next)
-                if inReasoning { onReasoning(s) } else { onToken(s) }
+                if s.hasSuffix("<") {
+                    let head = String(s.dropLast())
+                    if !head.isEmpty { emit(head) }
+                    pendingLT = true
+                } else {
+                    emit(s)
+                }
             }
             recentIds.append(next)
             if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
@@ -169,8 +195,11 @@ public final class DistCoordinator: @unchecked Sendable {
             lastLogits = logits
             pos += 1; produced += 1
         }
+        if pendingLT, !inTool { emit("<") }
         let dt = Date().timeIntervalSince(t0)
         onLog("[\(produced) token · \(String(format: "%.2f", dt > 0 ? Double(produced) / dt : 0)) tok/s]\n")
+        guard inTool else { return engine.parseToolCalls(visible).calls }
+        return engine.parseToolCalls(visible + toolText).calls
     }
 
     /// One chunk through the pipeline; returns the last token's logits if `wantLogits`.

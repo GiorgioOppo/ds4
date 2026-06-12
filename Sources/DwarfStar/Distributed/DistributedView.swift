@@ -1,4 +1,5 @@
 import SwiftUI
+import DS4Engine
 
 /// This Mac as a distributed WORKER: owns a layer slice and listens for the
 /// coordinator (the Distribuito sidebar tab). The coordinator lives in the Chat
@@ -69,6 +70,8 @@ struct WorkerView: View {
 /// chat, Disconnetti), full-screen transcript, composer with live status.
 struct CoordinatorChatView: View {
     @Bindable var controller: DistributedController
+    @State private var projects: [ProjectLibrary.SavedProject] = []
+    @State private var activeProjectName: String?
 
     var body: some View {
         if controller.connected {
@@ -98,10 +101,16 @@ struct CoordinatorChatView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Stepper("Max token: \(controller.maxTokens)",
-                    value: $controller.maxTokens, in: 16...4096, step: 16)
-                .fixedSize()
-                .font(.callout)
+            projectMenu
+            Picker("Agente", selection: Binding(get: { controller.selectedAgentId },
+                                                set: { controller.selectAgent($0) })) {
+                ForEach(controller.agents) { agent in
+                    Label(agent.name, systemImage: agent.icon).tag(agent.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+            .help("Ruolo della chat distribuita: nuova chat con il system prompt e i tool dell'agente. I tool girano su QUESTO Mac (coordinatore).")
             Toggle("Thinking", isOn: $controller.think)
                 .toggleStyle(.switch)
             Button {
@@ -117,6 +126,45 @@ struct CoordinatorChatView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
+    }
+
+    /// Same project menu as the local chat: the active project feeds the
+    /// project_* tools, which run on this (coordinator) Mac.
+    private var projectMenu: some View {
+        Menu {
+            if projects.isEmpty {
+                Text("Nessun progetto salvato")
+            } else {
+                ForEach(projects) { p in
+                    Button {
+                        ProjectLibrary.activate(p)
+                        refreshProject()
+                    } label: {
+                        if p.name == activeProjectName { Label(p.name, systemImage: "checkmark") }
+                        else { Text(p.name) }
+                    }
+                }
+            }
+            Divider()
+            Button {
+                if let p = ProjectLibrary.pickAndAdd() {
+                    ProjectLibrary.activate(p)
+                    refreshProject()
+                }
+            } label: {
+                Label("Importa cartella…", systemImage: "folder.badge.plus")
+            }
+        } label: {
+            Label(activeProjectName ?? "Progetto", systemImage: "folder")
+        }
+        .fixedSize()
+        .help("Progetto attivo per i tool project_* dell'agente (eseguiti sul coordinatore).")
+        .onAppear { refreshProject() }
+    }
+
+    private func refreshProject() {
+        projects = ProjectLibrary.all()
+        activeProjectName = ProjectCache.shared.info()?.name
     }
 
     private var transcript: some View {
@@ -192,6 +240,8 @@ struct CoordinatorChatView: View {
                 Section("Trasporto") {
                     Stepper("Chunk prefill: \(controller.prefillChunk) token",
                             value: $controller.prefillChunk, in: 1...256, step: 8)
+                    Stepper("Max token per risposta: \(controller.maxTokens)",
+                            value: $controller.maxTokens, in: 16...4096, step: 16)
                     Toggle("Inoltro worker→worker", isOn: $controller.forwardEnabled)
                     if controller.forwardEnabled {
                         TextField("Host di ritorno (IP LAN di questo Mac)", text: $controller.returnHost)

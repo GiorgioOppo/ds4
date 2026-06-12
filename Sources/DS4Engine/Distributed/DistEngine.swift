@@ -49,13 +49,21 @@ public final class DistEngine: @unchecked Sendable {
 
     public var thinkStartId: Int { Int(tok.thinkStartId) }
     public var thinkEndId: Int { Int(tok.thinkEndId) }
+    public var dsmlId: Int { Int(tok.dsmlId) }
 
-    /// Render a FULL conversation to token ids (BOS + system + turns + assistant
-    /// open) — the coordinator re-renders the whole chat each turn (stateless).
-    public func chatPromptIds(turns: [ChatTurn], think: Bool) -> [Int] {
-        let s = ChatRenderer.render(turns: turns, tools: [], think: think ? .high : .none,
+    /// Render a FULL conversation to token ids (BOS + system + tools + turns +
+    /// assistant open) — the coordinator re-renders the whole chat each turn
+    /// (stateless). Tools use the compact declaration like the local chat.
+    public func chatPromptIds(turns: [ChatTurn], tools: [ToolSpec] = [], think: Bool) -> [Int] {
+        let s = ChatRenderer.render(turns: turns, tools: tools, think: think ? .high : .none,
                                     markup: markup, compactTools: true)
         return tok.tokenizeRenderedChat(s).map { Int($0) }
+    }
+
+    /// Parse DSML tool calls out of generated text (coordinator-side tool loop).
+    public func parseToolCalls(_ text: String) -> (calls: [ToolCall], visible: String) {
+        let r = ToolCallParser.parse(text, markup: markup)
+        return (r.calls, r.visibleText)
     }
 
     /// HC state width crossing the wire (nHC * nEmbd floats).
