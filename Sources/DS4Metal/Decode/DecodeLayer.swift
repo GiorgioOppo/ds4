@@ -202,7 +202,7 @@ extension GraphContext {
                             rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         let nComp = try decodeRoutePre(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
                                        pos: pos, rmsEps: rmsEps, comp: comp, idx: nil, indexerScoring: false)
-        try decodeRouteAttn(w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
+        try decodeRouteAttn(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
                             rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
     }
 
@@ -275,8 +275,9 @@ extension GraphContext {
     }
 
     /// Phase 1b: attention (raw SWA window + compressed rows, with s.mask possibly
-    /// carrying the indexer top-K selection) -> attn out -> pre-FFN HC -> router.
-    public func decodeRouteAttn(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+    /// carrying the indexer top-K selection) -> attn out (residual: curHc) ->
+    /// pre-FFN HC -> router.
+    public func decodeRouteAttn(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                 rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
                                 rmsEps: Float, hcEps: Float, nComp: Int, comp: CompressorState?) throws {
         // 4) attention over the raw SWA WINDOW + comp.cache[0..nComp] -> heads.

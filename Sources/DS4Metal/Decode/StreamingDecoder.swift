@@ -499,7 +499,7 @@ public final class StreamingDecoder {
             c1.commit()
             applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
             let c2 = GraphContext(rt); try c2.begin()
-            try c2.decodeRouteAttn(w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+            try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
             c2.commit()
@@ -510,7 +510,7 @@ public final class StreamingDecoder {
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: false)
-            try c1.decodeRouteAttn(w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+            try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
             c1.commit()
