@@ -34,6 +34,11 @@ public struct DSV4Dims {
     /// path: 2 dispatches instead of 5) when the quant scheme supports them.
     /// DS4_FUSED_MOE=0 disables for A/B comparison.
     public var fusedMoE: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_MOE"] != "0"
+    /// Raw-KV sliding window (C: DS4_N_SWA, GGUF `attention.sliding_window` = 128).
+    /// Attention sees only the LAST nSWA raw rows; older context is visible only
+    /// through the NSA-compressed rows — matching the trained NSA semantics (the C
+    /// kv_cache_push_raw literally slides its raw buffer at this cap).
+    public var nSWA: Int = 128
     /// Per-group slice of the attention heads (qDim / nOutGroup).
     public var attnGroupDim: Int { qDim / nOutGroup }
     /// Low-rank attention output dim (nOutGroup * nLoraO).
@@ -201,9 +206,15 @@ extension GraphContext {
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
         try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
-        // 4) attention over rawCache[0..nKeys] + comp.cache[0..nComp] -> heads
+        // 4) attention over the raw SWA WINDOW + comp.cache[0..nComp] -> heads.
+        //    Only the last nSWA raw rows are visible (C slides its raw cache at
+        //    that cap); attending ALL raw rows would be out-of-distribution for
+        //    the model and degrades long generations. Rows carry their absolute
+        //    RoPE position, so dropping the oldest is exactly the C semantics.
+        let rawLo = max(0, nKeys - d.nSWA)
         try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
-                          pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys, hasSinks: true,
+                          pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys - rawLo,
+                          rawStartRow: rawLo, hasSinks: true,
                           comp: comp?.cache, nComp: nComp)
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);

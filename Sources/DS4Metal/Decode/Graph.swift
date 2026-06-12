@@ -83,7 +83,8 @@ extension GraphContext {
     /// tensor; sinks/pad/tmp are scratch sized per the C dispatch.
     public func flashAttnCore(q: GPUTensor, kvF32: GPUTensor, kvF16: GPUTensor,
                               mask: GPUTensor, sinks: GPUTensor, pad: GPUTensor, tmp: GPUTensor,
-                              heads: GPUTensor, nHead: Int, nKeys: Int, hasSinks: Bool = false,
+                              heads: GPUTensor, nHead: Int, nKeys: Int, rawStartRow: Int = 0,
+                              hasSinks: Bool = false,
                               comp: GPUTensor? = nil, nComp: Int = 0) throws {
         let headDim = 512
         let ncpsg = 32, nwg = 32
@@ -109,7 +110,9 @@ extension GraphContext {
             e.dispatchThreadgroups(MTLSize(width: (count + cnth - 1) / cnth, height: 1, depth: 1),
                                    threadsPerThreadgroup: MTLSize(width: cnth, height: 1, depth: 1))
         }
-        cpyF32toF16(kvF32, srcOff: 0, dstOff: 0, count: nKeys * headDim)
+        // Raw span: only the SWA window starting at `rawStartRow` (rows hold their
+        // absolute-RoPE'd values, so a shifted span is exactly the C slid cache).
+        cpyF32toF16(kvF32, srcOff: rawStartRow * headDim * 4, dstOff: 0, count: nKeys * headDim)
         if let comp = comp, nComp > 0 {
             cpyF32toF16(comp, srcOff: comp.byteOffset, dstOff: nKeys * headDim * 2, count: nComp * headDim)
         }
