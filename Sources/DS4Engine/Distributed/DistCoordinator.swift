@@ -163,12 +163,16 @@ public final class DistCoordinator: @unchecked Sendable {
         // DECODE token-by-token.
         var rng = sampling.seed
         var produced = 0
+        // Tail of the token stream (prompt + generated) for the repetition penalty.
+        var recentIds = Array(ids.suffix(sampling.repeatLastN))
         let t0 = Date()
         while produced < maxTokens {
             try Task.checkCancellation()
-            let next = engine.sample(lastLogits, params: sampling, rng: &rng)
+            let next = engine.sample(lastLogits, params: sampling, recent: recentIds[...], rng: &rng)
             if next == engine.eosId { break }
             onToken(engine.tokenText(next))
+            recentIds.append(next)
+            if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
             let hc = try engine.embed(token: next, pos: pos)
             guard let logits = try await runChunk(hcs: [hc], posBase: pos, wantLogits: true) else {
                 throw DistError.badFrame
