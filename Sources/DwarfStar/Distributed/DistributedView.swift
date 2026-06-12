@@ -9,7 +9,7 @@ struct DistributedView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Inferenza distribuita: spezza i 61 layer del modello su piu' Mac (pipeline). Avvia prima i worker, poi il coordinatore.",
+                    Label("Inferenza distribuita: spezza i layer del modello (Flash 43, Pro 61) su piu' Mac (pipeline). Avvia prima i worker, poi il coordinatore.",
                           systemImage: "rectangle.3.group")
                         .font(.callout).foregroundStyle(.secondary)
                     Picker("Ruolo", selection: $controller.role) {
@@ -35,15 +35,17 @@ struct DistributedView: View {
                 }
 
                 if controller.role == .worker {
-                    Section("Worker") {
+                    Section("Worker — modello da \(controller.modelLayers) layer (0…\(controller.modelLayers - 1))") {
                         TextField("Porta", value: $controller.port, format: .number.grouping(.never))
                             .disabled(controller.isRunning)
-                        Stepper("Primo layer: \(controller.layerStart)",
-                                value: $controller.layerStart, in: 0...60).disabled(controller.isRunning)
-                        Stepper("Ultimo layer: \(controller.layerEnd)",
-                                value: $controller.layerEnd, in: 0...60).disabled(controller.isRunning)
+                        Stepper("Primo layer: \(controller.layerStart)", value: $controller.layerStart,
+                                in: 0...(controller.modelLayers - 1)).disabled(controller.isRunning)
+                        Stepper("Ultimo layer: \(controller.layerEnd)", value: $controller.layerEnd,
+                                in: controller.layerStart...(controller.modelLayers - 1)).disabled(controller.isRunning)
                         Toggle("Possiede l'output head (ultimo slice)", isOn: $controller.hasOutput)
                             .disabled(controller.isRunning)
+                        Text("La route deve coprire tutti i \(controller.modelLayers) layer in modo contiguo. Su un solo Mac: un worker 0…\(controller.modelLayers - 1) con output head.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 } else {
                     Section("Coordinatore — worker (uno per riga, host:porta, in ordine di layer)") {

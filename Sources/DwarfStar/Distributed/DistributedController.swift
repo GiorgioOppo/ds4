@@ -23,8 +23,11 @@ final class DistributedController {
     // Worker.
     var port = 9100
     var layerStart = 0
-    var layerEnd = 20
-    var hasOutput = false
+    var layerEnd = DistEngine.modelLayers - 1   // default: one worker covers ALL layers
+    var hasOutput = true
+
+    /// The compiled model's layer count (Flash 43 / Pro 61) — for UI bounds.
+    var modelLayers: Int { DistEngine.modelLayers }
 
     // Coordinator.
     var peersText = "127.0.0.1:9100"  // one host:port per line, in layer order

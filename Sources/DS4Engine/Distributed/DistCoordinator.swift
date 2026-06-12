@@ -83,7 +83,7 @@ public final class DistCoordinator: @unchecked Sendable {
             expected = e.layerEnd + 1
         }
         guard expected == engine.nLayers else {
-            throw DistError.sliceGap("copertura \(expected)/\(engine.nLayers) layer — route incompleta")
+            throw DistError.sliceGap("copertura \(expected)/\(engine.nLayers) layer — la route deve coprire 0…\(engine.nLayers - 1) in modo contiguo (manca da \(expected) in poi)")
         }
         onLog("route completa: \(engine.nLayers) layer su \(entries.count) worker"
               + (config.forward ? " · inoltro worker→worker" : " · relay") + "\n")

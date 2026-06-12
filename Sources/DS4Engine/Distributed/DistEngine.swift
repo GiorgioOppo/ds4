@@ -12,6 +12,10 @@ import DS4Metal
 /// worker that only calls `forwardSlice` over its range never faults in the other
 /// layers' weights — that is where the per-node memory saving comes from.
 public final class DistEngine: @unchecked Sendable {
+    /// Layer count of the compiled model shape (Flash = 43, Pro = 61). The UI
+    /// uses it to bound the worker slice and validate full coverage.
+    public static let modelLayers = DSV4Shape.nLayer
+
     public let modelName: String
     public let nLayers: Int
     public let contextSize: Int

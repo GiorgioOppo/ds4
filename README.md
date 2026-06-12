@@ -103,7 +103,7 @@ each **worker** owns a layer slice (weights *and* KV shard — allocated only fo
 its slice), the **coordinator** owns embedding, sampling and the prompt. The HC
 hidden state (`nHC×nEmbd` floats, transported at 32/16/8 bit) flows through the
 workers per token. Start the workers first, then the coordinator; the route must
-cover all 61 layers contiguously (validated).
+cover all the model's layers contiguously (Flash 43, Pro 61; validated).
 
 Per-node win: each worker streams only ~1/N of the experts, so its hot working
 set is N× more likely to fit in RAM → fewer SSD page faults. Prefill runs in

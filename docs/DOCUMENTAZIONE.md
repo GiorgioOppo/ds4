@@ -472,7 +472,7 @@ modellata su `ds4_distributed.c`):
   **suoi soli** pesi caldi e il **suo solo** shard di KV/compressore (allocati
   esclusivamente per lo slice);
 - il **coordinatore** possiede embedding, sampling e prompt; valida che la
-  *route* copra tutti i 61 layer in modo contiguo, poi per token fa scorrere lo
+  *route* copra tutti i layer del modello (Flash 43, Pro 61) in modo contiguo, poi per token fa scorrere lo
   **stato HC** (`nHC×nEmbd` float) attraverso i worker in ordine di layer;
 - lo streaming da SSD resta attivo su ogni nodo: il vantaggio è che ogni worker
   tocca solo ~1/N degli esperti → working set caldo più piccolo → meno
