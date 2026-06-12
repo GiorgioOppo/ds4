@@ -186,4 +186,87 @@ public final class ProjectCache: @unchecked Sendable {
         lock.unlock()
         return text
     }
+
+    // MARK: - Write surface (the agentic "code mode" tools)
+
+    /// Validate a relative path for writing: inside the root, no traversal,
+    /// textual extension only (this is a code assistant, not a binary editor).
+    private func writableURL(_ relPath: String) -> (URL, String)? {
+        guard let root else { return nil }
+        guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
+        let url = root.appendingPathComponent(relPath).standardizedFileURL
+        guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
+        guard Self.textExtensions.contains(url.pathExtension.lowercased()) else { return nil }
+        return (url, relPath)
+    }
+
+    /// Create or overwrite `relPath` with `content` (creates intermediate dirs).
+    /// The index and cache are updated so the next read/search sees the change.
+    public func writeTool(path relPath: String, content: String) -> String {
+        guard info() != nil else { return "Nessun progetto importato." }
+        guard let (url, rel) = writableURL(relPath) else {
+            return "Percorso non valido o estensione non testuale: '\(relPath)'."
+        }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        let existed = FileManager.default.fileExists(atPath: url.path)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            return "Scrittura fallita: \(error.localizedDescription)"
+        }
+        upsertIndex(rel, content: content)
+        let lines = content.components(separatedBy: "\n").count
+        return "\(existed ? "Sovrascritto" : "Creato") '\(rel)' (\(lines) righe)."
+    }
+
+    /// Replace ONE exact occurrence of `find` with `replace` in `relPath`.
+    /// Refuses 0 matches (wrong/old text) and >1 matches (ambiguous — the model
+    /// must include more surrounding context), like an agentic editor should.
+    public func editTool(path relPath: String, find: String, replace: String) -> String {
+        guard info() != nil else { return "Nessun progetto importato." }
+        guard let (url, rel) = writableURL(relPath) else {
+            return "Percorso non valido o estensione non testuale: '\(relPath)'."
+        }
+        guard !find.isEmpty else { return "'find' vuoto." }
+        guard let text = fileContents(rel) else {
+            return "File non trovato nell'indice: '\(rel)'. Usa project_list / project_read prima di modificare."
+        }
+        let occurrences = text.components(separatedBy: find).count - 1
+        guard occurrences != 0 else {
+            return "Testo da sostituire NON trovato in '\(rel)'. Rileggi il file (project_read) e usa il testo esatto, inclusa l'indentazione."
+        }
+        guard occurrences == 1 else {
+            return "Testo ambiguo: \(occurrences) occorrenze in '\(rel)'. Includi più contesto (righe adiacenti) per renderlo unico."
+        }
+        guard let range = text.range(of: find) else { return "Testo non trovato." }
+        let updated = text.replacingCharacters(in: range, with: replace)
+        do {
+            try updated.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            return "Scrittura fallita: \(error.localizedDescription)"
+        }
+        upsertIndex(rel, content: updated)
+        let line = text[text.startIndex..<range.lowerBound].components(separatedBy: "\n").count
+        return "Modificato '\(rel)' alla riga ~\(line) (1 sostituzione)."
+    }
+
+    /// Insert/update a file in the index and content cache after a write.
+    private func upsertIndex(_ rel: String, content: String) {
+        lock.lock()
+        if let i = files.firstIndex(where: { $0 >= rel }) {
+            if files[i] != rel { files.insert(rel, at: i) }
+        } else {
+            files.append(rel)
+        }
+        contents[rel] = content
+        cachedBytes += content.utf8.count
+        if let inf = infoValue {
+            infoValue = Info(name: inf.name, fileCount: files.count, totalBytes: inf.totalBytes)
+        }
+        lock.unlock()
+    }
 }

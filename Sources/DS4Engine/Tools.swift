@@ -26,9 +26,11 @@ public struct ToolOutput: Sendable, Equatable {
 }
 
 public enum ToolRegistry {
-    /// The demo tools shipped with the app. All are pure and side-effect free.
+    /// The built-in tools. project_write/project_edit have side effects (they
+    /// modify files INSIDE the active project root only); everything else is pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
-                                                 projectList, projectRead, projectSearch]
+                                                 projectList, projectRead, projectSearch,
+                                                 projectWrite, projectEdit]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -102,6 +104,27 @@ public enum ToolRegistry {
         run: { argsJSON in
             guard let q = stringArg(argsJSON, "query") else { return "Argomento 'query' mancante." }
             return ProjectCache.shared.searchTool(query: q)
+        })
+
+    static let projectWrite = BuiltinTool(
+        spec: ToolSpec(name: "project_write",
+                       description: "Create or overwrite a TEXT file inside the imported project. Use project_edit for small changes to existing files.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"relative path"},"content":{"type":"string","description":"full file content"}},"required":["path","content"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
+            return ProjectCache.shared.writeTool(path: p, content: c)
+        })
+
+    static let projectEdit = BuiltinTool(
+        spec: ToolSpec(name: "project_edit",
+                       description: "Replace ONE exact occurrence of 'find' with 'replace' in a project file. 'find' must match exactly (incl. indentation) and be unique in the file — include surrounding lines to disambiguate.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let f = stringArg(argsJSON, "find") else { return "Argomento 'find' mancante." }
+            let r = stringArg(argsJSON, "replace") ?? ""
+            return ProjectCache.shared.editTool(path: p, find: f, replace: r)
         })
 
     static func stringArg(_ json: String, _ key: String) -> String? {

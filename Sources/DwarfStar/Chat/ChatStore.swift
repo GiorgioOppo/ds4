@@ -68,7 +68,12 @@ final class ChatStore {
 
     static func loadAgents() -> [AgentProfile] {
         if let data = UserDefaults.standard.data(forKey: "DS4Agents"),
-           let arr = try? JSONDecoder().decode([AgentProfile].self, from: data), !arr.isEmpty {
+           var arr = try? JSONDecoder().decode([AgentProfile].self, from: data), !arr.isEmpty {
+            // New DEFAULT agents (e.g. "code") must appear even for users with a
+            // persisted list: append the missing ones without touching edits.
+            for d in AgentProfile.defaults where !arr.contains(where: { $0.id == d.id }) {
+                arr.append(d)
+            }
             return arr
         }
         return AgentProfile.defaults
@@ -193,8 +198,12 @@ final class ChatStore {
     var awaitingManualResults = false
     private var partialAutoOutputs: [ToolOutput] = []
     /// Guard against a tool loop (model re-calling instead of answering).
+    /// Agentic roles (write tools) get a larger budget: a code task legitimately
+    /// chains many explore/read/edit/verify rounds.
     private var toolRounds = 0
-    private let maxToolRounds = 6
+    private var maxToolRounds: Int {
+        selectedAgent.toolNames.contains("project_write") ? 16 : 6
+    }
 
     // Live state.
     var phase: Phase = .needsModel
