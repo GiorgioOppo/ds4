@@ -161,8 +161,9 @@ final class DistributedController {
         messages.append(UIMessage(role: .assistant, text: ""))
 
         let agent = selectedAgent
-        var sendTurns = turns
-        if !agent.systemPrompt.isEmpty { sendTurns.insert(.system(agent.systemPrompt), at: 0) }
+        // Immutable snapshot for the detached closure (capturing a mutable local
+        // trips Swift 6 region analysis: "sending parameter risks data races").
+        let sendTurns: [ChatTurn] = (agent.systemPrompt.isEmpty ? [] : [.system(agent.systemPrompt)]) + turns
         let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.specs(enabled: Set(agent.toolNames))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
@@ -186,7 +187,10 @@ final class DistributedController {
         let onToken: @Sendable (String) -> Void = { cont.yield(.token($0)) }
 
         coordTask = Task {
-            let work = Task.detached { () -> Result<[ToolCall], Error> in
+            // Explicit capture list: only Sendable copies cross into the detached
+            // task (no main-actor state in the closure's region).
+            let work = Task.detached { [coord, sendTurns, tools, wantThink, maxT, samp,
+                                        onLog, onReasoning, onToken] () -> Result<[ToolCall], Error> in
                 do {
                     let calls = try await coord.send(turns: sendTurns, tools: tools, think: wantThink,
                                                      maxTokens: maxT, sampling: samp,
