@@ -1,0 +1,39 @@
+# Workflow GitHub Actions per la scansione con Semgrep CE (Community Edition).
+# Posiziona questo file in: .github/workflows/semgrep.yml
+name: Semgrep CE scan
+
+on:
+  # Scansiona le Pull Request:
+  pull_request: {}
+  # Permette l'avvio manuale dall'interfaccia di GitHub Actions:
+  workflow_dispatch: {}
+  # Scansiona i push sui branch principali:
+  push:
+    branches: ["master", "main"]
+  # Scansione programmata (sintassi cron):
+  schedule:
+    # Ogni giorno alle 17:20 UTC. Consigliato scegliere un orario "casuale"
+    # per evitare picchi di carico sui runner.
+    - cron: '20 17 * * *'
+
+# Permessi minimi necessari: sola lettura del codice.
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: semgrep-oss/scan
+    # Se usi runner self-hosted, modifica questo valore.
+    runs-on: ubuntu-latest
+    container:
+      # Immagine Docker con Semgrep già installato.
+      image: semgrep/semgrep
+    # Salta le PR create da dependabot per evitare problemi di permessi.
+    if: (github.actor != 'dependabot[bot]')
+    steps:
+      # Scarica il codice sorgente del progetto.
+      - uses: actions/checkout@v4
+
+      # Esegue la scansione con il set di regole automatico.
+      # --config auto seleziona regole in base ai linguaggi rilevati.
+      - run: semgrep scan --config auto
