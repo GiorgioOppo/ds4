@@ -46,6 +46,7 @@ struct BenchView: View {
                 .disabled(controller.isRunning)
                 Section {
                     if controller.isRunning {
+                        runningBadge
                         Button(role: .destructive) { controller.stop() } label: {
                             Label("Ferma", systemImage: "stop.fill")
                         }
@@ -64,11 +65,15 @@ struct BenchView: View {
 
             if controller.rows.isEmpty {
                 ContentUnavailableView("Nessun dato", systemImage: "chart.xyaxis.line",
-                                       description: Text(controller.isRunning ? "Benchmark in corso…"
-                                                                              : "Avvia un benchmark per vedere il throughput."))
+                                       description: Text(controller.isRunning
+                                                         ? "Benchmark in corso — \(controller.runningLabel ?? "")"
+                                                         : "Avvia un benchmark per vedere il throughput."))
                     .frame(maxHeight: .infinity)
             } else {
-                throughputChart.padding()
+                VStack(spacing: 0) {
+                    if controller.isRunning { runningBadge.padding(.horizontal).padding(.top, 8) }
+                    throughputChart.padding()
+                }
             }
 
             if !controller.log.isEmpty {
@@ -82,6 +87,20 @@ struct BenchView: View {
                 .frame(height: 110)
                 .background(Color.black.opacity(0.05))
             }
+        }
+    }
+
+    /// Live "running on X" indicator: spinner + colored engine chip. Local is
+    /// green/memorychip, distributed is blue/network so the two are unmistakable.
+    private var runningBadge: some View {
+        let distributed = controller.runningMode == .distributed
+        return HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Label("In esecuzione: \(controller.runningLabel ?? "")",
+                  systemImage: distributed ? "network" : "memorychip")
+                .foregroundStyle(distributed ? Color.blue : Color.green)
+                .font(.callout)
+            Spacer(minLength: 0)
         }
     }
 

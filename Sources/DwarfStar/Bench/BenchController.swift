@@ -44,10 +44,23 @@ final class BenchController {
     var rows: [BenchRow] = []
     var log = ""
     var isRunning = false
+    /// Which engine the in-flight run is actually using (nil when idle). Drives the
+    /// "running on Local / Distributed" indicator; authoritative even though the
+    /// mode picker is locked during a run.
+    var runningMode: BenchMode?
 
     /// Whether a distributed benchmark is possible right now (route connected, idle).
     var distConnected: Bool { dist.connectedCoordinator != nil }
     var distRoute: String { dist.connectedCoordinator?.routeSummary ?? "non connesso" }
+
+    /// Human label for the engine currently running (nil when idle).
+    var runningLabel: String? {
+        switch runningMode {
+        case .local:       return "Locale (motore in-process)"
+        case .distributed: return "Distribuito · \(distRoute)"
+        case nil:          return nil
+        }
+    }
 
     private var benchWork: Task<String?, Never>?
     private var work: Task<Void, Never>?
@@ -56,7 +69,7 @@ final class BenchController {
 
     func run() {
         guard !isRunning else { return }
-        rows = []; log = ""; isRunning = true
+        rows = []; log = ""; isRunning = true; runningMode = mode
         let gen = genTokens
         let frontiers = stride(from: ctxStart, through: max(ctxStart, ctxMax),
                                by: max(1, stepIncr)).map { $0 }
@@ -100,12 +113,12 @@ final class BenchController {
     private func runDistributed(frontiers: [Int], gen: Int) {
         guard let coord = dist.connectedCoordinator else {
             log = "Nessun coordinatore connesso. Apri Chat → Distribuito e premi «Connetti» prima del benchmark distribuito.\n"
-            isRunning = false
+            isRunning = false; runningMode = nil
             return
         }
         guard !dist.isGenerating else {
             log = "Il coordinatore sta generando una risposta: attendi o ferma la chat distribuita prima del benchmark.\n"
-            isRunning = false
+            isRunning = false; runningMode = nil
             return
         }
         dist.benchmarkActive = true          // lock out chat turns on the shared route
@@ -153,7 +166,7 @@ final class BenchController {
             if let err = await benchWork.value { logCont.yield("errore: \(err)\n") }
             logCont.finish(); rowCont.finish()
             onComplete()
-            self.isRunning = false
+            self.isRunning = false; self.runningMode = nil
         }
     }
 
