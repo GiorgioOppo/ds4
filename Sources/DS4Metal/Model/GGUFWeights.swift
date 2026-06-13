@@ -60,7 +60,7 @@ public enum GGUFWeights {
             model.findTensor(p + s) == nil ? nil : try tensor(rt, model, p + s)
         }
         let dummy = try GPUTensor.zerosBytes(rt, byteLength: 1)
-        return LayerWeights(
+        var w = LayerWeights(
             hcAttnFn: try T("hc_attn_fn.weight"), attnScale: try T("hc_attn_scale.weight"),
             attnBase: try T("hc_attn_base.weight"), attnNorm: try T("attn_norm.weight"),
             qA: try T("attn_q_a.weight"), qANorm: try T("attn_q_a_norm.weight"), qB: try T("attn_q_b.weight"),
@@ -76,6 +76,23 @@ public enum GGUFWeights {
             expDown: loadExperts ? try T("ffn_down_exps.weight") : dummy,
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
+        try loadIndexer(&w, model, il, big: optT, small: optT)
+        return w
+    }
+
+    /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
+    /// `big` loads the two large projections + compressor kv/gate (mmap no-copy on
+    /// the streaming path, copy otherwise); `small` the tiny APE/norm.
+    static func loadIndexer(_ w: inout LayerWeights, _ model: GGUFModel, _ il: Int,
+                            big: (String) throws -> GPUTensor?,
+                            small: (String) throws -> GPUTensor?) rethrows {
+        w.idxQB = try big("indexer.attn_q_b.weight")
+        w.idxProj = try big("indexer.proj.weight")
+        w.idxKv = try big("indexer_compressor_kv.weight")
+        w.idxGate = try big("indexer_compressor_gate.weight")
+        w.idxApe = try small("indexer_compressor_ape.weight")
+        w.idxNorm = try small("indexer_compressor_norm.weight")
+        w.idxQBF16 = model.findTensor("blk.\(il).indexer.attn_q_b.weight")?.type == 1   // 1 = f16
     }
 
     /// Build a layer with its routed-expert tensors as NO-COPY mmap views over the
@@ -107,7 +124,7 @@ public enum GGUFWeights {
         func optM(_ s: String) throws -> GPUTensor? { model.findTensor(p + s) == nil ? nil : try mappedTensor(rt, model, p + s) }
         func optT(_ s: String) throws -> GPUTensor? { model.findTensor(p + s) == nil ? nil : try tensor(rt, model, p + s) }
         let dummy = try GPUTensor.zerosBytes(rt, byteLength: 1)
-        return LayerWeights(
+        var w = LayerWeights(
             hcAttnFn: try M("hc_attn_fn.weight"), attnScale: try T("hc_attn_scale.weight"),
             attnBase: try T("hc_attn_base.weight"), attnNorm: try T("attn_norm.weight"),
             qA: try M("attn_q_a.weight"), qANorm: try T("attn_q_a_norm.weight"), qB: try M("attn_q_b.weight"),
@@ -121,6 +138,8 @@ public enum GGUFWeights {
             expGate: dummy, expUp: dummy, expDown: dummy,   // experts gathered separately
             compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
+        try loadIndexer(&w, model, il, big: optM, small: optT)
+        return w
     }
 
     /// Output head + embedding with the big tensors (embed F16, output Q8, output_hc_fn
@@ -164,6 +183,16 @@ public enum GGUFWeights {
             }
         }
         return try GPUTensor.bytes(rt, packed, elementCount: ids.count * expertBytes)
+    }
+
+    /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
+    /// (the ExpertSlotCache fill primitive; dst is a shared-storage pool tensor).
+    public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
+                                  expertBytes: Int, into dst: GPUTensor, slot: Int) throws {
+        guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
+        let src = model.mapBase + Int(t.absOffset) + Int(id) * expertBytes
+        memcpy(dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes),
+               src, expertBytes)
     }
 
     /// Assemble the output-head weights + embedding table.

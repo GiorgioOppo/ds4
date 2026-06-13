@@ -110,10 +110,29 @@ public enum Sampler {
         return cand[filtered - 1].id
     }
 
-    /// Port of sample_top_p_min_p / ds4_sample_logits.
+    /// Apply a repetition penalty to a copy of the logits for the recently produced
+    /// tokens (llama.cpp `penalty_repeat`): logit /= penalty if positive, else
+    /// logit *= penalty. Returns the logits unchanged when disabled.
+    static func applyRepetitionPenalty(_ logits: [Float], recent: ArraySlice<Int>, penalty: Float) -> [Float] {
+        guard penalty > 1.0, !recent.isEmpty else { return logits }
+        var out = logits
+        let n = out.count
+        for id in Set(recent) where id >= 0 && id < n {
+            out[id] = out[id] > 0 ? out[id] / penalty : out[id] * penalty
+        }
+        return out
+    }
+
+    /// Port of sample_top_p_min_p / ds4_sample_logits, plus an optional repetition
+    /// penalty over the recently produced tokens (llama.cpp style): without it a
+    /// quantized model that emits one low-confidence token can lock into a repeat
+    /// loop ("è è è ( ( (") and never recover. `recent` is the tail of the token
+    /// stream to penalize; `repetitionPenalty` > 1 divides those tokens' logits.
     public static func sample(_ logits: [Float], temperature: Float,
                               topK: Int, topP: Float, minP: Float,
+                              repetitionPenalty: Float = 1.0, recent: ArraySlice<Int> = ArraySlice<Int>(),
                               rng: inout UInt64) -> Int {
+        let logits = applyRepetitionPenalty(logits, recent: recent, penalty: repetitionPenalty)
         let nVocab = logits.count
         if temperature <= 0.0 { return argmax(logits) }
         var topP = topP

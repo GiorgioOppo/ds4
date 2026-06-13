@@ -32,6 +32,8 @@ n.1 è la **correttezza numerica** bit-per-bit sulla stessa piattaforma.
 11. [Decoder — dai logit al token (`Sampler`)](#11-decoder--dai-logit-al-token-sampler)
 12. [Quantizzazione](#12-quantizzazione)
 13. [Riepilogo dei tensori per-layer](#13-riepilogo-dei-tensori-per-layer)
+14. [Tool calling (function calling)](#14-tool-calling-function-calling)
+15. [Inferenza distribuita](#15-inferenza-distribuita)
 
 ---
 
@@ -430,6 +432,21 @@ raccoglie due "corsie" in un buffer packed `8 × headDim` prima del pool, per
 
 ---
 
+### L'indexer NSA (DSA, top-512)
+
+Sui layer **ratio-4** un secondo compressore (stessa ricorrenza, pesi
+`indexer_compressor_*`, head_dim 128, finalizzato con **Hadamard+FP4** invece
+di fp8) mantiene la cache dell'indexer. Quando le righe compresse superano
+`indexerTopK` (512 su Flash), per ogni token si calcolano gli score di
+rilevanza (`q` da qr_norm via `indexer.attn_q_b` + rope + Hadamard; pesi-testa
+da attn_norm via `indexer.proj`; kernel `indexer_score_one_direct`), si fa il
+**top-K su CPU** (split del command buffer al confine degli score) e si scrive
+una **maschera f16 0/-inf** sulle righe compresse che il flash-attention
+consuma — il "dense top-k mask path" del C (`indexer_allowed_decode_one`).
+Sotto i 2048 token (≤512 righe) il percorso resta quello denso, identico.
+Lo stato dell'indexer fa parte dello snapshot KV su disco. Il decoder legacy
+non-streaming (`DSV4Decoder`, demo) resta denso.
+
 ## 9. Il MoE: router ed expert
 
 Il **router** (fase 1, passo 7) produce `nExpert` logit con un matvec (Q8_0 nel
@@ -514,6 +531,43 @@ gli altri token nello stesso layer); l'I/O scende da `6·token` a
 `min(6·token, 256)` letture-expert per layer — su prompt lunghi fino a **~12×**
 in meno nella fase dominante. L'unione per gruppo è limitata da
 `DS4_PREFILL_UNION` (default 64 expert ≈ 450 MB transitori sul modello 2-bit).
+
+### Cache expert a slot — "persistenti + che cambiano" (`ExpertSlotCache`)
+
+Nel **decode**, opzionalmente (`DS4_EXPERT_CACHE_SLOTS=N`, default off), ogni layer
+ha un **pool LRU di N slot** in buffer GPU condivisi (gate/up/down packed per
+slot). Gli expert *caldi* restano **residenti** nel pool tra i token (hit = zero
+copie); un *miss* evicta lo slot meno usato e copia **solo quell'expert**
+dall'mmap. Il matvec gira sul pool usando gli **indici di slot come id**, quindi
+funzionano sia i kernel validati sia i **fusi** — nessun kernel nuovo. Statistiche
+hit/miss nel profilo decode (`cache expert X hit / Y miss`).
+
+⚠️ Il pool è memoria **wired** (≈6,9 MB/slot sul modello 2-bit × 43 layer: N=8 ≈
+2,4 GB) e compete con la page cache: su macchine con poca RAM parti basso (4–8)
+e guarda l'hit-rate; con routing molto uniforme (load balancing) la cache può non
+ripagare. Sul prefill resta la dedup a unione (più adatta al batch).
+
+**"Imatrix d'uso" (`ExpertUsageStats`).** Il router alimenta statistiche di
+frequenza per (layer, expert) — l'equivalente runtime di una importance matrix
+per gli expert (nota: la *vera* imatrix di quantizzazione non è nel GGUF e serve
+solo offline). Il servizio le **persiste** in Application Support
+(`expert-usage-<modello>.json`, salvataggio automatico a fine generazione) e al
+caricamento successivo **pre-scalda** il pool con gli expert storicamente più
+caldi (entrano come voci "più vecchie": un prior sbagliato viene evictato in
+fretta). `concentration(layer:n:)` misura quanto il routing è concentrato
+(~n/256 = uniforme → cache inutile): è il segnale onesto esposto nella tab
+**Tuning** della GUI, insieme a hit/miss live e alla configurazione slot.
+
+**Agenti (ruoli) e profili per-agente (`AgentProfile`).** Un agente = system
+prompt (ruolo) + tool esposti + **profilo d'uso expert separato**
+(`expert-usage-<modello>-<agente>.json`): ruoli diversi instradano verso expert
+diversi, quindi il prior di warm è molto più mirato di un profilo globale.
+`InferenceService.setAgent` persiste il profilo dell'agente uscente, carica
+quello del nuovo, **invalida i pool** della cache (`ExpertSlotCache.invalidate`,
+re-warm lazy col nuovo profilo) e apre una conversazione fresca col ruolo. Nella
+GUI: picker agente nell'header della chat (Generale / Coding / Matematica — con
+i tool aritmetici — / Scrittura); il system prompt utente si concatena a quello
+del ruolo.
 
 ### Pattern "split command buffer"
 
@@ -642,11 +696,16 @@ La testa di output (`OutputHeadWeights`): `token_embd` (embedding, F16),
 
 ### Riconoscimento dei token speciali
 
-Per tokenizzare correttamente il markup dei tool, il `Tokenizer` non si limita
-più ai 7 special nominati: in `tokenizeRenderedChat` riconosce **tutti i token
-di tipo CONTROL** (`tokenizer.ggml.token_type == 3`) come token atomici, in
-match *longest-first*. Così i marcatori di ruolo e di tool-call/output
-(begin/sep/end) diventano singoli id. Se `token_type` è assente, fallback ai 7.
+Per tokenizzare correttamente il markup dei tool, in `tokenizeRenderedChat` il
+`Tokenizer` riconosce **tutti i token di tipo CONTROL**
+(`tokenizer.ggml.token_type == 3`) come atomici, in match *longest-first*, e vi
+**unisce sempre i 7 special nominati** (BOS/EOS, ruoli, think, `｜DSML｜` —
+dedup per id). L'unione non è un fallback: alcuni GGUF taggano `｜DSML｜` come
+USER_DEFINED (tipo 4) invece di CONTROL, e senza unione l'esempio
+`<｜DSML｜tool_calls>` nel prompt verrebbe **spezzato dal BPE in `DS`+`ML`** —
+il modello, vedendo l'esempio rotto, impara a emettere quei frammenti di testo
+invece del token di controllo (bug osservato e corretto). Il pannello
+Diagnostica mostra per ogni special il tipo e se tokenizza atomico.
 `tokenizer.tokenId(_:)` risolve l'id di un token arbitrario per stringa.
 
 ### Formato DSML (allineato al `tokenizer.chat_template` reale)
@@ -715,6 +774,62 @@ I percorsi puri (renderer, parser, tool demo) sono coperti da test Swift-only:
 
 ---
 
+## 15. Inferenza distribuita
+
+**File:** `Sources/DS4Engine/Distributed/` (`DistProtocol`, `DistTransport`,
+`DistEngine`, `DistWorker`, `DistCoordinator`) ·
+`Sources/DS4Metal/Decode/StreamingDecoder.swift` (API slice).
+Modellata su `ds4_distributed.c` (pipeline parallelism), con protocollo
+Swift-nativo (tutti i nodi eseguono DwarfStar: nessuna byte-compat col C).
+
+### API slice del decoder
+
+Tra un layer e il successivo scorre lo **stato HC** (`nHC×nEmbd` float): è
+l'unico dato che deve attraversare la rete. Lo `StreamingDecoder` espone tre
+operazioni additive che riusano `embedToken`/`runLayer`/`outputHead` — uno
+slice `[a,b]` è numericamente identico agli stessi layer dentro `forward()`:
+
+```swift
+embed(token:pos:) -> [Float]                       // coordinatore: inizio pipeline
+forwardSlice(hc:pos:nKeys:start:end:) -> [Float]   // worker: i suoi layer
+forwardSliceBatch(hcs:posBase:start:end:)          // prefill a chunk (token-outer)
+head(hc:) -> [Float]                               // nodo terminale: logits
+```
+
+Con `kvLayers:` il decoder alloca KV-cache e stato compressore **solo per il
+range** (dummy altrove): il worker non paga la cache dei layer altrui, il
+coordinatore puro (`0..<0`) non alloca nulla. I pesi sono mmap **lazy**: un
+worker che esegue solo il suo slice non fa mai page-fault sugli altri layer —
+da qui il risparmio di RAM per nodo (e meno thrashing della page cache: ogni
+nodo stream-a ~1/N degli esperti).
+
+### Protocollo e topologia
+
+Frame TCP `magic DS4D + type + length` (`DistConnection`, Network.framework,
+wrapper async). Messaggi:
+
+- **HELLO** (worker → coordinatore alla connessione): nome modello, slice
+  `[start,end]`, `hasOutput`, nLayers, contesto;
+- **WORK**: `nTokens` stati HC concatenati + posizione base + range layer +
+  flag (`resetSession` a pos 0, `outputLogits` per l'hop terminale) + bit di
+  trasporto + (per l'inoltro) route completa e indirizzo di ritorno;
+- **RESULT**: stati HC (relay), logits (terminale) o ack (flow control inoltro).
+
+Le attivazioni viaggiano a **32/16/8 bit** (`ActivationCodec`: float16, o int8
+con scala absmax per-vettore).
+
+Il **coordinatore** valida che la route copra tutti i layer in modo contiguo,
+fa il **prefill a chunk** (default 32 token/frame: il round-trip di rete si
+ammortizza sul chunk) e il decode token-per-token. Due trasporti:
+
+- **relay** (default): coordinatore → worker → coordinatore per ogni hop;
+  nessuna connettività in ingresso richiesta sul coordinatore;
+- **inoltro worker→worker**: il WORK trasporta la route; ogni worker inoltra lo
+  stato HC al prossimo hop e il terminale risponde al `DistReturnListener` del
+  coordinatore (serve il suo IP LAN) — metà degli hop per token.
+
+---
+
 ## Riferimenti incrociati C → Swift
 
 Ogni file Swift cita la funzione C di origine. I principali punti d'aggancio:
@@ -730,6 +845,8 @@ Ogni file Swift cita la funzione C di origine. I principali punti d'aggancio:
 | `StreamingDecoder` | il modello `--ssd-streaming` (split command buffer) |
 | `Sampler.sample` | `ds4_sample_logits` → `sample_top_p_min_p` → `sample_full_vocab` |
 | `MetalRuntime` | `ds4_gpu_full_source` (compilazione kernel a runtime) |
+| `DistWorker` / `DistCoordinator` | `ds4_dist_run`, `ds4_dist_session_eval` (`ds4_distributed.c`) |
+| `LocalServer` (DwarfStar) | `ds4_server.c` (route + wire format OpenAI/Anthropic/Responses) |
 
 La validazione numerica end-to-end richiede il modello reale (≥64 GB); i singoli
 kernel e sotto-operazioni sono validati contro CPU/`./ds4` nella suite

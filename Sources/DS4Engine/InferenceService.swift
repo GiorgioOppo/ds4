@@ -37,8 +37,17 @@ public struct SamplingParams: Sendable {
     public var topP: Float
     public var minP: Float
     public var seed: UInt64
-    public init(temperature: Float = 0.6, topK: Int = 0, topP: Float = 0.95, minP: Float = 0.05, seed: UInt64 = 0xD54) {
-        self.temperature = temperature; self.topK = topK; self.topP = topP; self.minP = minP; self.seed = seed
+    /// Repetition penalty (llama.cpp `penalty_repeat`): >1 discourages re-emitting
+    /// the last `repeatLastN` tokens — breaks the repeat-loop collapse on
+    /// quantized models. 1.0 = off — the DEFAULT: the C original (ds4.c
+    /// sample_top_p_min_p) has no penalty, so engine/server/demo stay faithful
+    /// to it; the chat GUI opts in explicitly with its own user-set value.
+    public var repetitionPenalty: Float
+    public var repeatLastN: Int
+    public init(temperature: Float = 0.6, topK: Int = 0, topP: Float = 0.95, minP: Float = 0.05,
+                seed: UInt64 = 0xD54, repetitionPenalty: Float = 1.0, repeatLastN: Int = 64) {
+        self.temperature = temperature; self.topK = topK; self.topP = topP; self.minP = minP
+        self.seed = seed; self.repetitionPenalty = repetitionPenalty; self.repeatLastN = repeatLastN
     }
 }
 
@@ -55,6 +64,7 @@ public struct ModelInfo: Sendable {
 public enum GenEvent: Sendable {
     case reasoning(String)
     case text(String)
+    case toolStream(String)     // raw tool-call markup, streamed live during generation
     case toolCall([ToolCall])   // the model requested one or more tools; generation paused
     case progress(String)       // prefill/decode status (e.g. "prefill 3/11" or "12 tok · 1.4 tok/s")
 }
@@ -86,11 +96,18 @@ public actor InferenceService {
     /// with `committedIds`. The next generation rebuilds the KV from the exact
     /// committed ids (slow once, but correct) before continuing.
     private var kvDirty = false
+    /// Disk KV cache (ds4_kvstore model): nil = off. Checkpoints completed
+    /// generations and restores matching prefixes on cold starts.
+    private var diskKV: DiskKVStore?
+    private var lastDiskStoreCount = 0
 
     /// The pure-Swift engine always runs the SSD-streaming path (no-copy mmap
     /// non-routed weights + per-token expert gather); there are no resident/
     /// per-layer variants to configure, hence no streaming options here.
-    public init(modelPath: String, contextSize: Int, systemPrompt: String?) throws {
+    /// `expertCacheSlots` enables the per-layer expert slot-cache (0/nil = off);
+    /// the persisted usage stats pre-warm it with the hottest experts.
+    public init(modelPath: String, contextSize: Int, systemPrompt: String?,
+                expertCacheSlots: Int? = nil) throws {
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
@@ -115,7 +132,84 @@ public actor InferenceService {
         // Fast 16GB path (C --ssd-streaming model): non-routed weights are no-copy mmap
         // (resident via page cache, evictable), only the 6 selected experts gathered/token.
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
-                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize)
+                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize,
+                                                                       cacheSlots: expertCacheSlots)
+        // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
+        // so the slot-cache warms with the historically hottest experts. The
+        // profile is PER-AGENT: different roles route to different experts.
+        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
+            decoder.usage?.load(data)
+        }
+    }
+
+    // MARK: - Agents (roles) + per-agent expert usage
+
+    /// The active agent's id — keys the persisted usage profile.
+    private var agentId = "generale"
+
+    /// Switch the conversation to `agent`: persists the outgoing agent's usage
+    /// profile, swaps in the new agent's one, drops the slot-cache pools (they
+    /// re-warm lazily with the NEW profile), declares the agent's tools and
+    /// starts a fresh conversation with its role (system prompt).
+    public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
+        saveExpertUsage()
+        agentId = agent.id
+        decoder.usage?.replace(with: try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: agentId)))
+        decoder.slotCache?.invalidate()
+        self.tools = tools
+        resetConversation(systemPrompt: agent.systemPrompt.isEmpty ? nil : agent.systemPrompt)
+    }
+
+    // MARK: - Expert usage ("usage imatrix") persistence + tuning info
+
+    /// Per-(model, agent) usage-profile file. Nonisolated so the actor's init
+    /// can resolve it before isolation is established.
+    nonisolated static func usageURL(modelName: String, agentId: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("expert-usage-\(modelName)-\(agentId).json")
+    }
+
+    /// Persist the routing-frequency stats (called automatically after each
+    /// generation; cheap — at most nLayer×nExpert small ints).
+    public func saveExpertUsage() {
+        guard let data = decoder.usage?.serialize() else { return }
+        try? data.write(to: Self.usageURL(modelName: modelName, agentId: agentId))
+    }
+
+    public func resetExpertUsage() {
+        decoder.usage?.reset()
+        try? FileManager.default.removeItem(at: Self.usageURL(modelName: modelName, agentId: agentId))
+    }
+
+    public struct TuningInfo: Sendable {
+        public let agentId: String          // whose usage profile is active
+        public let cacheSlots: Int          // 0 = cache off
+        public let cacheHits: Int
+        public let cacheMisses: Int
+        public let totalRoutes: Int
+        /// Per-layer summary: "L7 · top8 = 43% · expert 17,4,99,…".
+        public let layerSummaries: [String]
+    }
+
+    public func tuningInfo() -> TuningInfo {
+        let usage = decoder.usage
+        var summaries: [String] = []
+        if let usage, usage.totalRoutes > 0 {
+            for il in 0..<DSV4Shape.nLayer {
+                let conc = usage.concentration(layer: il, n: 8)
+                let top = usage.top(layer: il, n: 8).map(String.init).joined(separator: ",")
+                guard conc > 0 else { continue }
+                summaries.append(String(format: "L%-3d top8 = %2.0f%%  ·  expert %@", il, conc * 100, top))
+            }
+        }
+        return TuningInfo(agentId: agentId,
+                          cacheSlots: decoder.slotCache?.slotsPerLayer ?? 0,
+                          cacheHits: decoder.slotCache?.hits ?? 0,
+                          cacheMisses: decoder.slotCache?.misses ?? 0,
+                          totalRoutes: usage?.totalRoutes ?? 0,
+                          layerSummaries: summaries)
     }
 
     public func modelInfo() -> ModelInfo {
@@ -128,6 +222,56 @@ public actor InferenceService {
     /// The raw Jinja chat template embedded in the GGUF (for inspection), if any.
     public func chatTemplate() -> String? { model.string("tokenizer.chat_template") }
 
+    public struct BenchPoint: Sendable {
+        public let contextTokens: Int
+        public let prefillTps: Double
+        public let genTps: Double
+        public let kvBytes: UInt64
+        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64) {
+            self.contextTokens = contextTokens; self.prefillTps = prefillTps
+            self.genTps = genTps; self.kvBytes = kvBytes
+        }
+    }
+
+    /// Native benchmark (replaces the removed `ds4-bench` binary): prefill a
+    /// synthetic prompt of `contextTokens` tokens and decode `genTokens` from it,
+    /// returning prefill/generation throughput at that context frontier. Resets
+    /// the conversation; `contextTokens` is clamped to fit the loaded context.
+    public func benchmark(contextTokens: Int, genTokens: Int) throws -> BenchPoint {
+        resetConversation(systemPrompt: nil)
+        let ctx = max(8, min(contextTokens, contextSize - genTokens - 4))
+        // Synthetic prompt: BOS + a tiled filler tokenization (output quality is
+        // irrelevant for timing; the work — attention, MoE gather — is the same).
+        var ids: [Int] = [Int(tok.bosId)]
+        let filler = tok.tokenizeRenderedChat("The quick brown fox jumps over the lazy dog. ").map { Int($0) }
+        let pad = filler.isEmpty ? [Int(tok.eosId)] : filler
+        var i = 0
+        while ids.count < ctx { ids.append(pad[i % pad.count]); i += 1 }
+        ids = Array(ids.prefix(ctx))
+
+        let t0 = Date()
+        var lastLogits = try decoder.prefill(tokens: ids, startPos: 0)
+        let prefillDt = Date().timeIntervalSince(t0)
+
+        var pos = ids.count
+        var rng: UInt64 = 0xD54
+        var produced = 0
+        let g0 = Date()
+        while produced < genTokens {
+            try Task.checkCancellation()
+            let next = Sampler.sample(lastLogits, temperature: 0.6, topK: 0, topP: 0.95, minP: 0.05, rng: &rng)
+            lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            pos += 1; produced += 1
+        }
+        let genDt = Date().timeIntervalSince(g0)
+        kvDirty = true   // synthetic KV state — force a rebuild on the next real turn
+        let kv = UInt64(DSV4Shape.nLayer) * UInt64(ctx) * UInt64(dims.headDim) * 4
+        return BenchPoint(contextTokens: ctx,
+                          prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
+                          genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
+                          kvBytes: kv)
+    }
+
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
     public func resetDecodeProfile() { decoder.resetProfile() }
     public func decodeProfileReport() -> String { decoder.profile.report() }
@@ -137,6 +281,16 @@ public actor InferenceService {
         committedIds = []
         needsClose = false
         kvDirty = false   // next generation starts at pos 0 and resets the compressor
+        lastDiskStoreCount = 0
+    }
+
+    /// Enable/disable the disk KV cache. `dir` nil turns it off. Takes effect on
+    /// the next generation; existing checkpoints in `dir` become restorable.
+    public func setDiskKV(directory: URL?, budgetMB: Int) {
+        guard let directory else { diskKV = nil; return }
+        let bits: UInt8 = dims.gateQuant == .iq2_xxs ? 2 : 4
+        diskKV = try? DiskKVStore(directory: directory, budgetMB: budgetMB,
+                                  quantBits: bits, contextSize: contextSize)
     }
 
     /// Declare the tools available to the model. Tools are baked into the first
@@ -178,6 +332,18 @@ public actor InferenceService {
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
+    /// Stateless completion for the local HTTP server: reset the KV and render the
+    /// FULL message list as a fresh prompt, then generate. Mirrors OpenAI semantics
+    /// where each request carries the whole conversation (no server-side history).
+    public func complete(turns: [ChatTurn], tools: [ToolSpec], thinkMode: DS4ThinkMode,
+                         sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+        resetConversation(systemPrompt: nil)
+        self.tools = tools
+        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
+                                         markup: markup, compactTools: compactTools)
+        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+    }
+
     private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -196,7 +362,25 @@ public actor InferenceService {
 
     private func generate(suffix: String, think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
                           continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
-        let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        var suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+
+        // Disk KV (ds4_kvstore model): on a COLD start, restore the longest stored
+        // checkpoint that is an exact token prefix of this prompt and prefill only
+        // the remainder. Covers both a fresh chat (system/agent prefix) and the
+        // stateless HTTP server (each request re-sends the whole transcript).
+        if committedIds.isEmpty, !kvDirty, let store = diskKV,
+           let hit = store.findLongestPrefix(of: suffixIds, modelName: modelName) {
+            continuation.yield(.progress("ripristino KV da disco (\(hit.tokens.count) token)…"))
+            do {
+                try decoder.importKV(hit.snapshot)
+                committedIds = hit.tokens
+                suffixIds.removeFirst(hit.tokens.count)
+                lastDiskStoreCount = hit.tokens.count
+            } catch {
+                committedIds = []          // fall back to a cold prefill
+            }
+        }
+
         let startPos = committedIds.count
         guard startPos + suffixIds.count < contextSize else {
             throw InferenceError.contextExceeded(prompt: startPos + suffixIds.count, context: contextSize)
@@ -231,7 +415,9 @@ public actor InferenceService {
         var pending: [UInt8] = []
         var visible = ""
         var toolBytes: [UInt8] = []
+        var toolEmitted = 0
         let dsmlId = tok.dsmlId
+        let lt = UInt8(ascii: "<")
 
         func flush(_ asReasoning: Bool) {
             guard !pending.isEmpty, let s = String(bytes: pending, encoding: .utf8) else { return }
@@ -240,19 +426,48 @@ public actor InferenceService {
             else { visible += s; continuation.yield(.text(s)) }
         }
 
+        // Stream the not-yet-emitted suffix of the tool block as raw markup, so the
+        // user watches the tool call being generated. Holds back partial UTF-8.
+        func streamTool() {
+            guard toolEmitted < toolBytes.count,
+                  let s = String(bytes: toolBytes[toolEmitted...], encoding: .utf8) else { return }
+            toolEmitted = toolBytes.count
+            continuation.yield(.toolStream(s))
+        }
+
+        // Flush pending text but keep a trailing '<' buffered: it may begin the
+        // tool-call opener "<｜DSML｜…" (the '<' and ｜DSML｜ are separate tokens) and
+        // must not be streamed as a stray bubble before we know what follows.
+        func flushHoldingOpener(_ asReasoning: Bool) {
+            guard pending.last == lt else { flush(asReasoning); return }
+            pending.removeLast()
+            flush(asReasoning)        // emit everything before the '<'
+            pending.append(lt)        // re-buffer the '<' for the next round
+        }
+
         var produced = 0
         let genStart = Date()
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
+            // Penalize the recently produced tokens to break repeat-loop collapse.
+            let lo = max(0, committedIds.count - sampling.repeatLastN)
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
-                                      topP: sampling.topP, minP: sampling.minP, rng: &rng)
+                                      topP: sampling.topP, minP: sampling.minP,
+                                      repetitionPenalty: sampling.repetitionPenalty,
+                                      recent: committedIds[lo...], rng: &rng)
             if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
-                flush(inReasoning)
+                // A held opener '<' belongs to the tool block, not the visible text:
+                // move it into toolBytes (so the parser sees "<｜DSML｜…") without ever
+                // streaming it as a stray bubble.
+                if pending.last == lt { pending.removeLast(); toolBytes.append(lt) }
+                flush(inReasoning)                               // flush any remaining real text
                 inTool = true
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()                                     // begin streaming the raw markup
             } else if inTool {
                 toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+                streamTool()
             } else if Int32(next) == tok.thinkStartId {
                 // The model opened a reasoning block on its own (even with think
                 // off): route it to the reasoning stream, don't show the tag.
@@ -265,7 +480,7 @@ public actor InferenceService {
                 inReasoning = false
             } else {
                 pending.append(contentsOf: tok.tokenText(Int32(next)))
-                flush(inReasoning)
+                flushHoldingOpener(inReasoning)
             }
             produced += 1
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
@@ -293,6 +508,19 @@ public actor InferenceService {
         }
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
         kvDirty = false                         // clean completion: KV matches committedIds
+        saveExpertUsage()                       // persist the usage imatrix (cheap)
+        // Disk KV checkpoint (interval-gated: each entry is tens of MB).
+        if let store = diskKV,
+           committedIds.count - lastDiskStoreCount >= store.options.storeIntervalTokens {
+            continuation.yield(.progress("salvataggio KV su disco…"))
+            // First checkpoint of a conversation = "cold" (anchor: the shared
+            // system/agent prefix, 2× protected in eviction); later = "continued"
+            // (superseded under pressure by longer checkpoints of the same chat).
+            let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
+            store.store(tokens: committedIds, modelName: modelName,
+                        snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
+            lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
+        }
         continuation.yield(.progress(""))
     }
 }

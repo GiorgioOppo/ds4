@@ -106,6 +106,23 @@ final class ChatToolsTests: XCTestCase {
         XCTAssertEqual(calls[0].name, "now")
     }
 
+    /// Defensive cleanup of malformed tool markup the 2-bit model spells as text.
+    func testStripLeakedMarkup() {
+        // The exact degraded second-turn output from the bug report.
+        let garbage = #"<tool_c: {"a": "multiply">? result: 13964257860</tool_c:>"#
+        XCTAssertEqual(ToolCallParser.stripLeakedMarkup(garbage, markup: markup), "")
+        // Leading prose is kept; the broken markup tail is cut.
+        let mixed = "Il risultato è 42. " + garbage
+        XCTAssertEqual(ToolCallParser.stripLeakedMarkup(mixed, markup: markup), "Il risultato è 42.")
+        // A leaked ｜DSML｜ fragment is cut from the marker.
+        XCTAssertEqual(ToolCallParser.stripLeakedMarkup("Ecco: " + markup.dsml + "invoke", markup: markup), "Ecco:")
+        // Ordinary text with < and > (math, code) is left untouched.
+        XCTAssertEqual(ToolCallParser.stripLeakedMarkup("if a < b && b > c { return }", markup: markup),
+                       "if a < b && b > c { return }")
+        XCTAssertEqual(ToolCallParser.stripLeakedMarkup("Plain answer, no tools.", markup: markup),
+                       "Plain answer, no tools.")
+    }
+
     /// Backslash-escaped quotes inside attribute values are unescaped, not truncated.
     func testAttributeValueEscapedQuotes() {
         XCTAssertEqual(ToolCallParser.attributeValue("name", in: #"name="plain""#), "plain")

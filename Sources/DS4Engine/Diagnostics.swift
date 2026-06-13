@@ -39,13 +39,20 @@ public enum Diagnostics {
         }
 
         let markup = ToolMarkup.discover(in: tok)
-        out += "\n=== Token speciali del protocollo (presenti nel vocab?) ===\n"
+        out += "\n=== Token speciali del protocollo (vocab, tipo, atomico?) ===\n"
+        out += "Legenda tipo: 1=NORMAL 2=UNKNOWN 3=CONTROL 4=USER_DEFINED 6=BYTE.\n"
+        out += "'atomico' = la stringa tokenizza in un solo id (necessario per i tag DSML).\n"
+        let types = model.intArray("tokenizer.ggml.token_type")
         let specials = ["｜DSML｜", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
                         "<｜User｜>", "<｜Assistant｜>", "<think>", "</think>",
                         "<｜action｜>", "<｜title｜>", "<｜query｜>", "<｜authority｜>",
                         "<｜domain｜>", "<｜extracted_url｜>", "<｜read_url｜>"]
         for s in specials {
-            out += "\(s) -> \(tok.tokenId(s).map { "id \($0)" } ?? "ASSENTE")\n"
+            guard let id = tok.tokenId(s) else { out += "\(s) -> ASSENTE\n"; continue }
+            let type = types.flatMap { Int(id) < $0.count ? $0[Int(id)] : nil }
+            let typeStr = type.map { "tipo \($0)" } ?? "tipo ?"
+            let atomic = tok.tokenizeRenderedChat(s) == [id]
+            out += "\(s) -> id \(id), \(typeStr), \(atomic ? "atomico ✓" : "SPEZZATO ✗")\n"
         }
         out += "\nDSML markup usato: \(markup.dsml)  (tag es. \(markup.callsOpen))\n"
 

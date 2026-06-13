@@ -148,10 +148,9 @@ public final class Tokenizer {
         self.thinkEndId = try lookup("</think>")
         self.dsmlId = try lookup("｜DSML｜")
 
-        // Prefer the full set of CONTROL (type 3) tokens from
+        // Collect the full set of CONTROL (type 3) tokens from
         // tokenizer.ggml.token_type, so chat/tool markup (role markers, tool-call
-        // begin/end/sep, tool outputs) is recognized as atomic tokens — not just
-        // the seven named specials. Skip empty tokens.
+        // begin/end/sep, tool outputs) is recognized as atomic tokens. Skip empty.
         var sp: [(bytes: [UInt8], id: Int32)] = []
         if let types = model.intArray("tokenizer.ggml.token_type"), types.count == tokenBytes.count {
             for (i, t) in types.enumerated() where t == 3 {
@@ -159,17 +158,22 @@ public final class Tokenizer {
                 if !b.isEmpty { sp.append((b, Int32(i))) }
             }
         }
-        if sp.isEmpty {
-            sp = [
-                (Array("<｜begin▁of▁sentence｜>".utf8), bosId),
-                (Array("<｜end▁of▁sentence｜>".utf8), eosId),
-                (Array("<｜User｜>".utf8), userId),
-                (Array("<｜Assistant｜>".utf8), assistantId),
-                (Array("<think>".utf8), thinkStartId),
-                (Array("</think>".utf8), thinkEndId),
-                (Array("｜DSML｜".utf8), dsmlId),
-            ]
-        }
+        // ALWAYS add the seven named control tokens (union, dedup by id) — not just
+        // as a fallback. A GGUF may tag these USER_DEFINED (type 4) instead of
+        // CONTROL (type 3); if ｜DSML｜ were missing here, the rendered tool example
+        // "<｜DSML｜tool_calls>" in the prompt would BPE-split into "DS"+"ML" and the
+        // model would learn to emit those two text pieces instead of the atomic id.
+        let named: [(bytes: [UInt8], id: Int32)] = [
+            (Array("<｜begin▁of▁sentence｜>".utf8), bosId),
+            (Array("<｜end▁of▁sentence｜>".utf8), eosId),
+            (Array("<｜User｜>".utf8), userId),
+            (Array("<｜Assistant｜>".utf8), assistantId),
+            (Array("<think>".utf8), thinkStartId),
+            (Array("</think>".utf8), thinkEndId),
+            (Array("｜DSML｜".utf8), dsmlId),
+        ]
+        var seen = Set(sp.map { $0.id })
+        for n in named where !seen.contains(n.id) { sp.append(n); seen.insert(n.id) }
         // Longest-first: at each position the longest matching special wins.
         sp.sort { $0.bytes.count > $1.bytes.count }
         self.specials = sp

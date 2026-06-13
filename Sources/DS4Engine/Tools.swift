@@ -26,8 +26,11 @@ public struct ToolOutput: Sendable, Equatable {
 }
 
 public enum ToolRegistry {
-    /// The demo tools shipped with the app. All are pure and side-effect free.
-    public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply]
+    /// The built-in tools. project_write/project_edit have side effects (they
+    /// modify files INSIDE the active project root only); everything else is pure.
+    public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
+                                                 projectList, projectRead, projectSearch,
+                                                 projectWrite, projectEdit, git]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -70,6 +73,82 @@ public enum ToolRegistry {
             }
             return evaluateArithmetic(expr)
         })
+
+    // MARK: Project-exploration tools (read-only over the imported ProjectCache;
+    // results enter the chat ONLY when the model calls them, so the project
+    // import never alters the conversation memory).
+
+    static let projectList = BuiltinTool(
+        spec: ToolSpec(name: "project_list",
+                       description: "List files/folders of the imported project. Optional 'path' (relative) lists a subfolder; omit it for the root.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"}}}"#),
+        run: { argsJSON in
+            let path = stringArg(argsJSON, "path") ?? ""
+            return ProjectCache.shared.listTool(path: path)
+        })
+
+    static let projectRead = BuiltinTool(
+        spec: ToolSpec(name: "project_read",
+                       description: "Read a project file (about 120 lines per call, with line numbers). 'path' relative; optional 'from_line' to continue.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"},"from_line":{"type":"number"}},"required":["path"]}"#),
+        run: { argsJSON in
+            guard let path = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            let from = intArg(argsJSON, "from_line") ?? 1
+            return ProjectCache.shared.readTool(path: path, fromLine: from)
+        })
+
+    static let projectSearch = BuiltinTool(
+        spec: ToolSpec(name: "project_search",
+                       description: "Search a text (case-insensitive) across the imported project; returns file:line matches.",
+                       parametersJSON: #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
+        run: { argsJSON in
+            guard let q = stringArg(argsJSON, "query") else { return "Argomento 'query' mancante." }
+            return ProjectCache.shared.searchTool(query: q)
+        })
+
+    static let projectWrite = BuiltinTool(
+        spec: ToolSpec(name: "project_write",
+                       description: "Create or overwrite a TEXT file inside the imported project. Use project_edit for small changes to existing files.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"relative path"},"content":{"type":"string","description":"full file content"}},"required":["path","content"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
+            return ProjectCache.shared.writeTool(path: p, content: c)
+        })
+
+    static let projectEdit = BuiltinTool(
+        spec: ToolSpec(name: "project_edit",
+                       description: "Replace ONE exact occurrence of 'find' with 'replace' in a project file. 'find' must match exactly (incl. indentation) and be unique in the file — include surrounding lines to disambiguate.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let f = stringArg(argsJSON, "find") else { return "Argomento 'find' mancante." }
+            let r = stringArg(argsJSON, "replace") ?? ""
+            return ProjectCache.shared.editTool(path: p, find: f, replace: r)
+        })
+
+    static let git = BuiltinTool(
+        spec: ToolSpec(name: "git",
+                       description: "Run a LOCAL git subcommand in the imported project. Allowed: status, diff, log, show, branch, blame, grep, add, commit, stash, tag, rev-parse, ls-files. No push/pull/network. Example: {\"args\":\"diff --stat\"} or {\"args\":\"commit -am \\\"fix: ...\\\"\"}.",
+                       parametersJSON: #"{"type":"object","properties":{"args":{"type":"string","description":"git subcommand and arguments"}},"required":["args"]}"#),
+        run: { argsJSON in
+            guard let a = stringArg(argsJSON, "args") else { return "Argomento 'args' mancante." }
+            return GitTool.run(argsLine: a)
+        })
+
+    static func stringArg(_ json: String, _ key: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj[key] as? String
+    }
+
+    static func intArg(_ json: String, _ key: String) -> Int? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let n = obj[key] as? NSNumber { return n.intValue }
+        if let s = obj[key] as? String { return Int(s) }
+        return nil
+    }
 
     // MARK: Two-operand arithmetic tools (a, b)
 

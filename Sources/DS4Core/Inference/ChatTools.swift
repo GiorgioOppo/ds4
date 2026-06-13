@@ -122,7 +122,7 @@ public enum ChatRenderer {
              "<\(d)tool_calls><\(d)invoke name=\"NAME\">" +
              "<\(d)parameter name=\"P\" string=\"true|false\">V</\(d)parameter>" +
              "</\(d)invoke></\(d)tool_calls>\n" +
-             "After you receive the tool result, reply to the user with the final answer.\n"
+             "After a tool result, do NOT call any tool again: reply to the user in plain language with the final answer.\n"
         return s
     }
 
@@ -152,7 +152,8 @@ public enum ChatRenderer {
             var schemas = ""
             for t in tools { schemas += functionJSON(t) + "\n" }
             toolsDecl = toolsHeader(m) + "\n\n" + schemas +
-                "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls."
+                "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls." +
+                "\nAfter a tool result, do NOT call any tool again: reply to the user in plain language with the final answer."
         }
         return system.isEmpty ? toolsDecl : system + "\n\n" + toolsDecl
     }
@@ -275,6 +276,23 @@ public enum ToolCallParser {
             if search >= block.endIndex { break }
         }
         return (calls, visible)
+    }
+
+    /// Defensive display cleanup: remove (possibly malformed) tool-call markup the
+    /// model spelled out as plain text — a leaked ｜DSML｜ fragment or a degraded
+    /// "<tool_c:…>" that did NOT parse into a real call. Cuts from the first such
+    /// marker to the end of the message: once the model starts emitting broken
+    /// markup the tail is junk, and the actual tool result is shown in its own
+    /// bubble. The markers are tool-specific (fullwidth bars never occur in prose
+    /// or code), so ordinary text — including math like "5 < 3" — is untouched.
+    public static func stripLeakedMarkup(_ text: String, markup m: ToolMarkup) -> String {
+        let markers = [m.dsml, "<tool_call", "</tool_call", "<tool_c:", "</tool_c"]
+        var cut = text.endIndex
+        for marker in markers {
+            if let r = text.range(of: marker), r.lowerBound < cut { cut = r.lowerBound }
+        }
+        guard cut < text.endIndex else { return text }
+        return String(text[text.startIndex..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Parse one `<DSML|invoke name="…"> …params…` body into a ToolCall.

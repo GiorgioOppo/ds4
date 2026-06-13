@@ -28,6 +28,8 @@ public struct DecodeProfile: Sendable {
     public var headS = 0.0        // output head
     public var forwards = 0       // number of forward() calls (= tokens)
     public var layers = 0         // total per-layer iterations
+    public var expertHits = 0     // expert slot-cache hits (persistent experts)
+    public var expertMisses = 0   // expert slot-cache misses (changed experts)
 
     public init() {}
 
@@ -38,6 +40,11 @@ public struct DecodeProfile: Sendable {
         func ms(_ s: Double) -> String { String(format: "%6.1f", s / f * 1000) }
         func pct(_ s: Double) -> String { String(format: "%2.0f%%", total > 0 ? s / total * 100 : 0) }
         let tps = total > 0 ? f / total : 0
+        var cacheLine = ""
+        if expertHits + expertMisses > 0 {
+            let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
+            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
+        }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
@@ -45,7 +52,7 @@ public struct DecodeProfile: Sendable {
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
           experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
-          output head  \(ms(headS)) ms/token  (\(pct(headS)))
+          output head  \(ms(headS)) ms/token  (\(pct(headS)))\(cacheLine)
           ----------------------------------------
           totale       \(ms(total)) ms/token  (~\(String(format: "%.2f", tps)) tok/s)
         """
@@ -70,10 +77,27 @@ public final class StreamingDecoder {
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
     /// the router and loads 6/256 experts on demand instead of the full set.
     let expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))?
+    /// Optional LRU slot-cache ("persistent + changing experts"): when set, the
+    /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
+    /// only the misses; the matvec runs on the pool with slot-index ids.
+    public let slotCache: ExpertSlotCache?
+    /// Routing-frequency statistics (the "usage imatrix"): fed by every route,
+    /// persisted by the service, and used to pre-warm the slot cache.
+    public let usage: ExpertUsageStats?
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
     let compStates: [CompressorState?]   // NSA compressor state per compressed layer (nil on layers 0,1)
+    /// NSA indexer compressor state (DSA): ratio-4 layers only. Beyond
+    /// `d.indexerTopK` compressed rows, attention is restricted to the top-K
+    /// most relevant for the current query (C: indexer_allowed_decode_one).
+    let indexStates: [CompressorState?]
+    /// Halves of s.mask dirtied by the last indexer selection (0 = clean).
+    private var maskDirtyCount = 0
+    /// Layers with real KV allocation (full model: 0..<nLayers; distributed slice: its range).
+    let kvRange: Range<Int>
+    /// KV capacity in tokens (raw rows per layer).
+    let maxKeys: Int
     let hcA, hcB, embd: GPUTensor
     let flat, pre, owts, otmp, oembd, onormed, logits: GPUTensor
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
@@ -82,23 +106,43 @@ public final class StreamingDecoder {
                 layerProvider: @escaping (Int) throws -> LayerWeights,
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
                 rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
-                expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil) throws {
+                expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
+                slotCache: ExpertSlotCache? = nil,
+                usage: ExpertUsageStats? = nil,
+                kvLayers: Range<Int>? = nil) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
+        self.slotCache = slotCache
+        self.usage = usage
         let hcDim = dims.nHC * dims.nEmbd
+        // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
+        // (a worker never runs the other layers — dummy 1-float buffers there).
+        // nil = full model (the single-machine default).
+        let kvRange = kvLayers ?? 0..<nLayers
+        self.kvRange = kvRange
+        self.maxKeys = maxKeys
         // NSA compressor state per compressed layer (ratio!=0); comp rows accumulate
         // ~1 per `ratio` tokens, so the attention KV scratch must hold maxKeys raw rows
         // + up to maxKeys/4 compressed rows (ratio-4 is the densest).
         let maxComp = maxKeys / 4 + 8
         compStates = try (0..<nLayers).map { il -> CompressorState? in
+            guard kvRange.contains(il) else { return nil }
             let ratio = DSV4Shape.compressRatio(layer: il)
             guard ratio != 0 else { return nil }
             return try CompressorState(rt, ratio: ratio, headDim: dims.headDim, maxComp: maxKeys / ratio + 8)
         }
+        // NSA indexer compressor (DSA): ratio-4 layers only (head_dim 128).
+        indexStates = try (0..<nLayers).map { il -> CompressorState? in
+            guard kvRange.contains(il), DSV4Shape.compressRatio(layer: il) == 4 else { return nil }
+            return try CompressorState(rt, ratio: 4, headDim: dims.nIndexerHeadDim, maxComp: maxKeys / 4 + 8)
+        }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
-        rawCaches = try (0..<nLayers).map { _ in try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim) }
+        rawCaches = try (0..<nLayers).map { il in
+            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim)
+                                 : try GPUTensor.zeros(rt, floatCount: 1)
+        }
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
         embd = try .zeros(rt, floatCount: dims.nEmbd)
         flat = try .zeros(rt, floatCount: hcDim); pre = try .zeros(rt, floatCount: dims.nHC)
@@ -109,7 +153,7 @@ public final class StreamingDecoder {
 
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
-        if pos == 0 { for c in compStates { try c?.reset(rt) } }
+        if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
@@ -123,7 +167,68 @@ public final class StreamingDecoder {
         return try outputHead(cur)
     }
 
-    /// Layer-major prefill: process the prompt loading **each layer's weights
+    // MARK: - Distributed slice execution (pipeline parallelism)
+    //
+    // These let a node run only PART of the model: the coordinator owns the
+    // embedding + output head, each worker owns a contiguous layer range and runs
+    // it over an incoming HC state. The HC state (nHC*nEmbd floats) is what crosses
+    // the wire between nodes. They reuse embedToken/runLayer/outputHead, so a slice
+    // [start,end] is numerically identical to the same layers inside forward().
+
+    /// HC state width that crosses the wire (nHC * nEmbd floats).
+    public var hcStateCount: Int { d.nHC * d.nEmbd }
+
+    /// Coordinator: embed `token` into the HC state (the start of the pipeline).
+    public func embed(token: Int, pos: Int) throws -> [Float] {
+        try embedToken(token, into: hcA)
+        return readHC(hcA)
+    }
+
+    /// Worker: run layers `start...end` over an incoming HC state at absolute `pos`,
+    /// returning the produced HC state to forward to the next slice. Resets only this
+    /// slice's recurrent compressor state on a fresh sequence (pos == 0).
+    public func forwardSlice(hc hcIn: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
+        precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
+        if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
+        writeFloats(hcIn, into: hcA)
+        var cur = hcA, other = hcB
+        for i in start...end {
+            let w = try layerProvider(i)
+            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                         cur: cur, other: other, pos: pos, nKeys: nKeys)
+            swap(&cur, &other)
+        }
+        profile.forwards += 1
+        return readHC(cur)
+    }
+
+    /// Worker, chunked prefill: run layers `start...end` over `hcs.count` consecutive
+    /// tokens' HC states starting at absolute `posBase`. Token-outer (numerically
+    /// identical to consecutive forwardSlice calls); amortizes the NETWORK round
+    /// trip over the chunk — one WORK/RESULT per chunk instead of per token.
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
+        var out: [[Float]] = []
+        out.reserveCapacity(hcs.count)
+        for (i, hc) in hcs.enumerated() {
+            let pos = posBase + i
+            out.append(try forwardSlice(hc: hc, pos: pos, nKeys: pos + 1, start: start, end: end))
+        }
+        return out
+    }
+
+    /// Coordinator/last node: run the output head over the final HC state → logits.
+    public func head(hc hcIn: [Float]) throws -> [Float] {
+        writeFloats(hcIn, into: hcA)
+        return try outputHead(hcA)
+    }
+
+    /// Read the HC state (nHC*nEmbd floats) out of a GPU buffer.
+    private func readHC(_ t: GPUTensor) -> [Float] {
+        let n = d.nHC * d.nEmbd
+        let p = t.buffer.contents().advanced(by: t.byteOffset).bindMemory(to: Float.self, capacity: n)
+        return Array(UnsafeBufferPointer(start: p, count: n))
+    }
+
     /// once** (per chunk) instead of once per token, so the dominant weight I/O is
     /// amortized over all the chunk's tokens. Numerically **identical** to calling
     /// `forward()` for tokens 0..N-1 in order — same ops, same per-token order,
@@ -138,7 +243,7 @@ public final class StreamingDecoder {
     /// this is what enables KV reuse across turns (prefill only the new suffix).
     public func prefill(tokens: [Int], startPos: Int = 0, chunk: Int = 512) throws -> [Float] {
         precondition(!tokens.isEmpty)
-        if startPos == 0 { for c in compStates { try c?.reset(rt) } }   // fresh sequence
+        if startPos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }   // fresh sequence
         var lastHC: GPUTensor?
         var start = 0
         let step = max(1, chunk)
@@ -209,13 +314,9 @@ public final class StreamingDecoder {
             try Task.checkCancellation()
             let pos = posBase + j
             var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeRoute(curHc: cur[j], w: w, s: scratch, d: d, rope: layerRope,
-                               rawCache: rawCaches[i], nKeys: pos + 1, pos: pos,
-                               rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-            c1.commit()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
             profile.routeS += Date().timeIntervalSince(t)
-            let (ids, rw) = readRouteSelection()
+            let (ids, rw) = readRouteSelection(layer: i)
             idsT.append(ids); rwT.append(rw)
             let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
             let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
@@ -281,7 +382,8 @@ public final class StreamingDecoder {
     /// Read back the router's selection after a committed decodeRoute, applying
     /// the activeExperts top-K reduction (route weights renormalized to the
     /// original total). Returns the final (ids, weights), both of count K ≤ d.k.
-    private func readRouteSelection() -> (ids: [Int32], rw: [Float]) {
+    /// Also feeds the usage statistics ("usage imatrix") for `layer`.
+    private func readRouteSelection(layer: Int) -> (ids: [Int32], rw: [Float]) {
         let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
         var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
         let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
@@ -295,6 +397,7 @@ public final class StreamingDecoder {
             ids = keep.map { ids[$0] }
             rw = keep.map { rw[$0] * scale }
         }
+        usage?.record(layer: layer, ids: ids)
         return (ids, rw)
     }
 
@@ -326,36 +429,131 @@ public final class StreamingDecoder {
         if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeRoute(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                               nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
-            c1.commit()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
             profile.routeS += Date().timeIntervalSince(t)
-            let (ids, rw) = readRouteSelection()
+            let (ids, rw) = readRouteSelection(layer: i)
             let K = ids.count
             if K < d.k {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
-            t = Date()
-            let (g, u, dn) = try gather(i, ids)
-            profile.gatherS += Date().timeIntervalSince(t)
-            t = Date()
-            let c2 = GraphContext(rt); try c2.begin()
-            try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                 ids: idsPacked, outHc: other, activeK: K)
-            c2.commit()
-            profile.expertsS += Date().timeIntervalSince(t)
+            if let cache = slotCache {
+                // Persistent + changing experts: hits are already resident in the
+                // layer's GPU pool (zero copies); only misses are filled from the
+                // mmap. The matvec indexes the pool with slot ids.
+                t = Date()
+                let (pool, slots) = try cache.acquire(layer: i, ids: ids)
+                profile.gatherS += Date().timeIntervalSince(t)
+                profile.expertHits = cache.hits
+                profile.expertMisses = cache.misses
+                let slotsBuf = try GPUTensor.bytes(rt, slots.withUnsafeBytes { Array($0) },
+                                                   elementCount: K)
+                t = Date()
+                let c2 = GraphContext(rt); try c2.begin()
+                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
+                                     upExp: pool.up, downExp: pool.down,
+                                     ids: slotsBuf, outHc: other, activeK: K)
+                c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
+            } else {
+                // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
+                t = Date()
+                let (g, u, dn) = try gather(i, ids)
+                profile.gatherS += Date().timeIntervalSince(t)
+                t = Date()
+                let c2 = GraphContext(rt); try c2.begin()
+                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                     ids: idsPacked, outHc: other, activeK: K)
+                c2.commit()
+                profile.expertsS += Date().timeIntervalSince(t)
+            }
         } else {
             let t = Date()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
             let lc = GraphContext(rt); try lc.begin()
-            try lc.decodeLayer(curHc: cur, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                               nKeys: nKeys, pos: pos, outHc: other, rmsEps: rmsEps, hcEps: hcEps, comp: compStates[i])
+            try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
+                                 downExp: w.expDown, ids: scratch.selected, outHc: other)
             lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
             profile.layerOtherS += Date().timeIntervalSince(t)
         }
         profile.layers += 1
+    }
+
+    /// Encode (and COMMIT) the route for one token on layer `i`. When the NSA
+    /// indexer is active (ratio-4 layer with more compressed rows than the top-K),
+    /// the command buffer is split at the indexer scores: commit phase 1a, run the
+    /// CPU top-K to write the compressed-row mask, then encode the attention —
+    /// the C "dense top-k mask" path (indexer_allowed_decode_one). Otherwise a
+    /// single command buffer, numerically identical to the pre-indexer code.
+    private func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
+                             curHc: GPUTensor, pos: Int, nKeys: Int) throws {
+        let idx = indexStates[i]
+        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
+        let active = hasIdxWeights && indexerActive(i, pos: pos)
+        if active, let idx {
+            let c1 = GraphContext(rt); try c1.begin()
+            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              indexerScoring: true)
+            c1.commit()
+            applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
+            let c2 = GraphContext(rt); try c2.begin()
+            try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nComp: nComp, comp: compStates[i])
+            c2.commit()
+        } else {
+            clearMaskIfDirty()
+            let c1 = GraphContext(rt); try c1.begin()
+            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              indexerScoring: false)
+            try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nComp: nComp, comp: compStates[i])
+            c1.commit()
+        }
+    }
+
+    /// Will the indexer restrict this token's compressed rows on layer `i`?
+    /// (prospective count: the compressor may emit one more row for this token.)
+    private func indexerActive(_ i: Int, pos: Int) -> Bool {
+        guard let idx = indexStates[i] else { return false }
+        let prospective = idx.count + (((pos + 1) % idx.ratio) == 0 ? 1 : 0)
+        return prospective > d.indexerTopK
+    }
+
+    /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:
+    /// raw window rows stay 0; compressed row c gets 0 if selected, -inf if not.
+    /// Ties keep the LOWEST row index (the C argmax scan picks the first best).
+    private func applyIndexerMask(nKeys: Int, nComp: Int, nIdxComp: Int) {
+        let nRaw = nKeys - max(0, nKeys - d.nSWA)
+        let scores = scratch.idxScores.buffer.contents()
+            .advanced(by: scratch.idxScores.byteOffset).bindMemory(to: Float.self, capacity: nIdxComp)
+        var order = Array(0..<nIdxComp)
+        order.sort { scores[$0] != scores[$1] ? scores[$0] > scores[$1] : $0 < $1 }
+        var allowed = [Bool](repeating: false, count: nIdxComp)
+        for k in 0..<min(d.indexerTopK, nIdxComp) { allowed[order[k]] = true }
+
+        let total = nRaw + nComp
+        let mask = scratch.mask.buffer.contents().bindMemory(to: UInt16.self, capacity: total)
+        let negInf = Half.bits(-Float.infinity)
+        for j in 0..<nRaw { mask[j] = 0 }
+        for c in 0..<nComp {
+            let ok = c < nIdxComp ? allowed[c] : true
+            mask[nRaw + c] = ok ? 0 : negInf
+        }
+        maskDirtyCount = max(maskDirtyCount, total)
+    }
+
+    /// Zero the mask region a previous indexer selection dirtied (offsets shift
+    /// every token, so a stale -inf would mask the wrong key).
+    private func clearMaskIfDirty() {
+        guard maskDirtyCount > 0 else { return }
+        memset(scratch.mask.buffer.contents(), 0, maskDirtyCount * 2)
+        maskDirtyCount = 0
     }
 
     /// Output head for one token's final HC state -> logits[vocab].
@@ -435,7 +633,8 @@ public final class StreamingDecoder {
     /// experts are gathered per token. No memoization needed: the page cache serves
     /// repeated weight reads across tokens. Requires model opened metalMapping:true.
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
+                                                  cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
@@ -443,10 +642,40 @@ public final class StreamingDecoder {
             let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
             return (g, u, dn)
         }
+        // Routing-frequency stats ("usage imatrix"): always collected (cheap);
+        // the service persists them across sessions and they pre-warm the cache.
+        let usage = ExpertUsageStats(nLayers: nLayers)
+        // Persistent + changing experts (cacheSlots param, else env
+        // DS4_EXPERT_CACHE_SLOTS; default off): per layer, an N-slot LRU pool
+        // keeps hot experts resident in GPU buffers; only misses are memcpy'd
+        // from the mmap. The pool is WIRED memory (~6.9 MB/slot on the 2-bit
+        // model × nLayers): on tight-RAM machines start small (8) and watch the
+        // hit rate in the decode profile / Tuning tab.
+        let envSlots = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"].flatMap(Int.init)
+        let nSlots = cacheSlots ?? envSlots ?? 0
+        var cache: ExpertSlotCache? = nil
+        if nSlots > 0 {
+            let S = max(8, nSlots)
+            let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
+            let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
+            let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+            cache = ExpertSlotCache(slotsPerLayer: S, makePool: {
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: S * gateBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: S * upBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: S * downBytes))
+            }, fill: { il, id, pool, slot in
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
+                                           expertBytes: gateBytes, into: pool.gate, slot: slot)
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_up_exps.weight", id: id,
+                                           expertBytes: upBytes, into: pool.up, slot: slot)
+                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
+                                           expertBytes: downBytes, into: pool.down, slot: slot)
+            }, warm: { il in usage.top(layer: il, n: S) })
+        }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather)
+                                    expertGather: gather, slotCache: cache, usage: usage, kvLayers: kvLayers)
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

@@ -95,12 +95,36 @@ struct ModelLoadView: View {
             Section("Memoria") {
                 Text("Lo streaming da SSD è sempre attivo: i pesi non-routed sono mappati no-copy (page cache) e per ogni token vengono letti solo i 6 expert selezionati. Se il modello entra in RAM, la page cache lo tiene residente automaticamente.")
                     .font(.caption).foregroundStyle(.secondary)
+                Toggle("KV su disco (riusa i prefissi tra sessioni)", isOn: $store.diskKVEnabled)
+                if store.diskKVEnabled {
+                    Stepper("Budget: \(store.diskKVBudgetMB) MB",
+                            value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                    Text("A fine risposta lo stato KV viene salvato su disco; una nuova conversazione (o una richiesta al server) che inizia con un prefisso già visto lo ripristina invece di rifare il prefill. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+
+            Section("Agente (ruolo)") {
+                Picker("Agente", selection: Binding(get: { store.selectedAgentId },
+                                                    set: { store.selectAgent($0) })) {
+                    ForEach(store.agents) { agent in
+                        Label(agent.name, systemImage: agent.icon).tag(agent.id)
+                    }
+                }
+                if !store.selectedAgent.systemPrompt.isEmpty {
+                    Text(store.selectedAgent.systemPrompt)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+                Text("Definisce ruolo e tool della chat. Visualizza e modifica i prompt nella scheda “Agenti”.")
+                    .font(.caption).foregroundStyle(.tertiary)
             }
 
             Section("Contesto e system prompt") {
                 Stepper("Contesto: \(store.contextSize) token",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
-                TextField("System prompt (opzionale)", text: $store.systemPrompt, axis: .vertical)
+                TextField("System prompt aggiuntivo (si somma al ruolo dell'agente)",
+                          text: $store.systemPrompt, axis: .vertical)
                     .lineLimit(2...6)
             }
 

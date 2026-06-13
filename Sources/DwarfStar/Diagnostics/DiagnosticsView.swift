@@ -9,15 +9,11 @@ struct DiagnosticsView: View {
         VStack(spacing: 0) {
             Form {
                 Section("Tokenizzazione (nativa, DS4Core.Tokenizer)") {
-                    TextField("Modello GGUF", text: $controller.modelPath)
-                    Button {
-                        if let path = ModelPicker.pickGGUF() { controller.modelPath = path }
-                    } label: {
-                        Label("Sfoglia…", systemImage: "folder")
-                    }
+                    LabeledContent("Modello (da Impostazioni)",
+                                   value: (controller.modelPath as NSString).lastPathComponent)
                     TextField("Testo", text: $controller.text, axis: .vertical)
                         .lineLimit(2...6)
-                    Text("Apre il GGUF solo per il tokenizer (puro Swift, niente subprocess). Sotto sandbox seleziona il modello con Sfoglia…")
+                    Text("Apre il GGUF solo per il tokenizer (puro Swift, niente subprocess). Il modello si sceglie nella scheda Impostazioni.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
