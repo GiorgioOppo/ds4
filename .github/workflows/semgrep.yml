@@ -1,39 +1,47 @@
-# Workflow GitHub Actions per la scansione con Semgrep CE (Community Edition).
-# Posiziona questo file in: .github/workflows/semgrep.yml
-name: Semgrep CE scan
+# Name of this GitHub Actions workflow.
+name: Semgrep
 
 on:
-  # Scansiona le Pull Request:
+  # Scan changed files in PRs (diff-aware scanning):
   pull_request: {}
-  # Permette l'avvio manuale dall'interfaccia di GitHub Actions:
+  # Scan on-demand through GitHub Actions interface:
   workflow_dispatch: {}
-  # Scansiona i push sui branch principali:
+  # Scan mainline branches if there are changes to .github/workflows/semgrep.yml:
   push:
-    branches: ["master", "main"]
-  # Scansione programmata (sintassi cron):
+    branches:
+      - main
+      - master
+    paths:
+      - .github/workflows/semgrep.yml
+  # Schedule the CI job (this method uses cron syntax):
   schedule:
-    # Ogni giorno alle 17:20 UTC. Consigliato scegliere un orario "casuale"
-    # per evitare picchi di carico sui runner.
-    - cron: '20 17 * * *'
+    - cron: '20 17 * * *' # Sets Semgrep to scan every day at 17:20 UTC.
+    # It is recommended to change the schedule to a random time.
 
-# Permessi minimi necessari: sola lettura del codice.
 permissions:
   contents: read
 
 jobs:
   semgrep:
-    name: semgrep-oss/scan
-    # Se usi runner self-hosted, modifica questo valore.
+    # User definable name of this GitHub Actions job.
+    name: semgrep/ci
+    # If you are self-hosting, change the following `runs-on` value:
     runs-on: ubuntu-latest
-    container:
-      # Immagine Docker con Semgrep già installato.
-      image: semgrep/semgrep
-    # Salta le PR create da dependabot per evitare problemi di permessi.
-    if: (github.actor != 'dependabot[bot]')
-    steps:
-      # Scarica il codice sorgente del progetto.
-      - uses: actions/checkout@v4
 
-      # Esegue la scansione con il set di regole automatico.
-      # --config auto seleziona regole in base ai linguaggi rilevati.
-      - run: semgrep scan --config auto
+    container:
+      # A Docker image with Semgrep installed. Do not change this.
+      image: semgrep/semgrep
+
+    # Skip any PR created by dependabot to avoid permission issues:
+    if: (github.actor != 'dependabot[bot]')
+
+    steps:
+      # Fetch project source with GitHub Actions Checkout. Use either v3 or v4.
+      - uses: actions/checkout@v6
+      # Run the "semgrep ci" command on the command line of the docker image.
+      - run: semgrep ci
+        env:
+          # Connect to Semgrep AppSec Platform through your SEMGREP_APP_TOKEN.
+          # Generate a token from Semgrep AppSec Platform > Settings
+          # and add it to your GitHub secrets.
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
