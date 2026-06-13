@@ -77,8 +77,9 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: DwarfStar
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         # Export compliance: the app uses only EXEMPT encryption (HTTPS/TLS via
-        # the OS for downloads) + SHA-1 hashing (not encryption). No proprietary
-        # crypto. See docs/CRITTOGRAFIA.md. NO = no annual self-classification report.
+        # the OS for downloads) + hashing (SHA-1 for KV-cache filenames, SHA-256
+        # for downloaded-model integrity — not encryption). No proprietary crypto.
+        # See docs/CRITTOGRAFIA.md. NO = no annual self-classification report.
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         # Local-network privacy (macOS 15+): without this usage description the
         # system can silently deny LAN traffic — distributed inference (worker/
