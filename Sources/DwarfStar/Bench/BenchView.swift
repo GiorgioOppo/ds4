@@ -1,8 +1,9 @@
 import SwiftUI
 import Charts
 
-/// Native benchmark panel: run prefill + generation on the in-process engine
-/// across context frontiers and chart the throughput (no subprocess).
+/// Native benchmark panel: run prefill + generation across context frontiers and
+/// chart the throughput (no subprocess). The engine is either the local in-process
+/// one or the already-connected distributed cluster (segmented control).
 struct BenchView: View {
     @Bindable var controller: BenchController
 
@@ -10,10 +11,27 @@ struct BenchView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Benchmark nativo: misura prefill e generazione (token/s) del motore in-process a contesti crescenti. Carica una propria copia del modello (pesi mmap condivisi).",
+                    Label(controller.mode == .local
+                          ? "Benchmark nativo: misura prefill e generazione (token/s) del motore in-process a contesti crescenti. Carica una propria copia del modello (pesi mmap condivisi)."
+                          : "Benchmark distribuito: misura prefill e generazione (token/s) sul cluster, riusando il coordinatore già connesso in Chat → Distribuito (nessuna seconda connessione).",
                           systemImage: "gauge.with.dots.needle.67percent")
                         .font(.callout).foregroundStyle(.secondary)
                 }
+                Section("Motore") {
+                    Picker("Motore", selection: $controller.mode) {
+                        ForEach(BenchMode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    if controller.mode == .distributed {
+                        LabeledContent("Route", value: controller.distRoute)
+                        if !controller.distConnected {
+                            Label("Coordinatore non connesso: aprilo in Chat → Distribuito e premi «Connetti».",
+                                  systemImage: "exclamationmark.triangle")
+                                .font(.callout).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                .disabled(controller.isRunning)
                 Section("Modello (da Impostazioni)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
                     LabeledContent("Contesto", value: "\(controller.contextSize) token")
@@ -35,6 +53,7 @@ struct BenchView: View {
                         Button { controller.run() } label: {
                             Label("Avvia benchmark", systemImage: "play.fill")
                         }
+                        .disabled(controller.mode == .distributed && !controller.distConnected)
                     }
                 }
             }

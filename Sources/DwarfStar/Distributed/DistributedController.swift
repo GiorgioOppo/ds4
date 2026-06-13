@@ -82,6 +82,15 @@ final class DistributedController {
 
     var workerSummary: String { "worker :\(port) · layer \(layerStart)…\(layerEnd)\(hasOutput ? " +output" : "")" }
 
+    /// The connected coordinator, exposed so the Benchmark panel can reuse the live
+    /// route instead of opening a second connection (nil unless connected). The
+    /// benchmark resets the cluster KV, so it must not overlap a chat generation.
+    var connectedCoordinator: DistCoordinator? { connected ? coordinator : nil }
+
+    /// Set by the Benchmark panel while it drives the shared coordinator, so a chat
+    /// turn can't interleave frames on the same connections (mutual exclusion).
+    var benchmarkActive = false
+
     // MARK: Worker
 
     func startWorker() {
@@ -159,7 +168,10 @@ final class DistributedController {
     /// and fed back as .toolResult turns until the model answers with text.
     func sendChat() {
         let text = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard connected, !isGenerating, !text.isEmpty, coordinator != nil else { return }
+        guard connected, !isGenerating, !benchmarkActive, !text.isEmpty, coordinator != nil else {
+            if benchmarkActive { coordLog += "benchmark in corso: attendi la fine prima di chattare.\n" }
+            return
+        }
         chatInput = ""
         messages.append(UIMessage(role: .user, text: text))
         turns.append(.user(text))

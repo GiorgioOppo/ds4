@@ -100,6 +100,10 @@ public final class DistEngine: @unchecked Sendable {
     }
 
     public var eosId: Int { Int(tok.eosId) }
+    public var bosId: Int { Int(tok.bosId) }
+
+    /// KV per-head dimension of the compiled shape (for benchmark KV-size reporting).
+    public var headDim: Int { DSV4Shape.nHeadDim }
 
     /// Sample the next token id from a logits vector, penalizing `recent` tokens.
     public func sample(_ logits: [Float], params: SamplingParams, recent: ArraySlice<Int> = ArraySlice<Int>(),

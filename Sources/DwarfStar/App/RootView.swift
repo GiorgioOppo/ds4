@@ -41,9 +41,10 @@ struct RootView: View {
     init(store: ChatStore, settings: AppSettings) {
         self.store = store
         self.settings = settings
-        _distributed = State(initialValue: DistributedController(settings: settings))
+        let distributed = DistributedController(settings: settings)
+        _distributed = State(initialValue: distributed)
         _server = State(initialValue: ServerController(settings: settings))
-        _bench = State(initialValue: BenchController(settings: settings))
+        _bench = State(initialValue: BenchController(settings: settings, dist: distributed))
         _diagnostics = State(initialValue: DiagnosticsController(settings: settings))
     }
 

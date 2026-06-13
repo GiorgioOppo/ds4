@@ -227,6 +227,10 @@ public actor InferenceService {
         public let prefillTps: Double
         public let genTps: Double
         public let kvBytes: UInt64
+        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64) {
+            self.contextTokens = contextTokens; self.prefillTps = prefillTps
+            self.genTps = genTps; self.kvBytes = kvBytes
+        }
     }
 
     /// Native benchmark (replaces the removed `ds4-bench` binary): prefill a
