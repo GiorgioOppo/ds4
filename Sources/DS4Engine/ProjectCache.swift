@@ -98,6 +98,16 @@ public final class ProjectCache: @unchecked Sendable {
         return Array(files.prefix(n))
     }
 
+    /// All indexed relative paths (sub-agent target search / project map).
+    public func fileList() -> [String] { lock.lock(); defer { lock.unlock() }; return files }
+
+    /// The entire indexed text of `relPath` (to seed a sub-agent's KV context);
+    /// nil if not in the index. Capped by the same per-file limit as the index.
+    public func fullText(of relPath: String) -> String? {
+        guard !relPath.contains("..") else { return nil }
+        return fileContents(relPath)
+    }
+
     static func looksTextual(_ url: URL) -> Bool {
         if textExtensions.contains(url.pathExtension.lowercased()) { return true }
         guard let fh = try? FileHandle(forReadingFrom: url),

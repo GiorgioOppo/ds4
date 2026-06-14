@@ -17,6 +17,9 @@ struct UIMessage: Identifiable {
     /// Names of text files imported with this (user) message — shown as badges; the
     /// full content was folded into the turn actually sent to the model.
     var attachments: [String] = []
+    /// Set on a `.tool` message that reports an isolated sub-agent run (question,
+    /// answer, and a collapsible trace of its internal steps).
+    var subAgent: InferenceService.SubAgentRun?
 }
 
 /// A text file staged in the composer: its full content is folded into the next
@@ -480,6 +483,13 @@ final class ChatStore {
 
     // MARK: - Internals
 
+    /// Parse the (target, question) arguments of a `subagent_run` tool call.
+    private static func subAgentArgs(_ json: String) -> (target: String, question: String) {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ("", "") }
+        return ((obj["target"] as? String) ?? "", (obj["question"] as? String) ?? "")
+    }
+
     private func appendAssistant() -> Int {
         messages.append(UIMessage(role: .assistant, text: ""))
         return messages.count - 1
@@ -550,6 +560,25 @@ final class ChatStore {
         var outputs: [ToolOutput] = []
         var manual: [ToolCall] = []
         for c in calls {
+            // subagent_run runs ON the engine (it drives the decoder in an isolated
+            // context): the main KV only commits this call + the returned answer.
+            if c.name == "subagent_run" {
+                let (target, question) = Self.subAgentArgs(c.argumentsJSON)
+                status = "sub-agent su \(target)…"
+                let run: InferenceService.SubAgentRun
+                do {
+                    run = try await service.runSubAgent(target: target, question: question)
+                } catch is CancellationError {
+                    run = InferenceService.SubAgentRun(target: target, question: question,
+                                                       answer: "(sub-agent interrotto)", steps: [])
+                } catch {
+                    run = InferenceService.SubAgentRun(target: target, question: question,
+                                                       answer: "Errore sub-agent: \(error)", steps: [])
+                }
+                messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
+                continue
+            }
             if let out = ToolRegistry.execute(c) {
                 outputs.append(out)
                 messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))

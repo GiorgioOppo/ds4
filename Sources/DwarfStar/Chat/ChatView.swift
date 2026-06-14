@@ -274,7 +274,11 @@ struct MessageRow: View {
 
     var body: some View {
         if message.role == .tool {
-            ToolResultRow(text: message.text)
+            if let run = message.subAgent {
+                SubAgentView(run: run)
+            } else {
+                ToolResultRow(text: message.text)
+            }
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 40) }
@@ -499,6 +503,45 @@ struct ToolCallView: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// A completed isolated sub-agent run: target + answer, with a collapsible trace
+/// of the internal steps (which never entered the main conversation's context).
+struct SubAgentView: View {
+    let run: InferenceService.SubAgentRun
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Sub-agent · \(run.target)", systemImage: "person.3.sequence")
+                .font(.caption.bold()).foregroundStyle(.purple)
+            if !run.question.isEmpty {
+                Text(run.question).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Text(run.answer).font(.callout).textSelection(.enabled)
+            if !run.steps.isEmpty {
+                DisclosureGroup(isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(run.steps.enumerated()), id: \.offset) { _, step in
+                            Text(step)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                } label: {
+                    Label("Passi interni (\(run.steps.count))", systemImage: "list.bullet.indent")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.purple.opacity(0.07))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.purple.opacity(0.25)))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }

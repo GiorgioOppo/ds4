@@ -30,7 +30,8 @@ public enum ToolRegistry {
     /// modify files INSIDE the active project root only); everything else is pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
-                                                 projectWrite, projectEdit, git]
+                                                 projectWrite, projectEdit, git,
+                                                 subagentSearch, subagentRun]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -135,6 +136,28 @@ public enum ToolRegistry {
             guard let a = stringArg(argsJSON, "args") else { return "Argomento 'args' mancante." }
             return GitTool.run(argsLine: a)
         })
+
+    // MARK: Sub-agent tools (delegate a focused task to an isolated context)
+
+    /// Find loadable sub-agent targets: project files whose name/content match.
+    static let subagentSearch = BuiltinTool(
+        spec: ToolSpec(name: "subagent_search",
+                       description: "Cerca i target caricabili come sub-agent: file del progetto che corrispondono (per contenuto). Restituisce 'file:riga' da cui ricavare il percorso da passare a subagent_run.",
+                       parametersJSON: #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
+        run: { argsJSON in
+            guard let q = stringArg(argsJSON, "query") else { return "Argomento 'query' mancante." }
+            return ProjectCache.shared.searchTool(query: q)
+        })
+
+    /// Delegate a focused task to an isolated sub-agent. EXECUTED BY THE ENGINE
+    /// (InferenceService.runSubAgent), which intercepts this call so the sub-agent
+    /// runs in a separate context; this sentinel only applies if a non-engine path
+    /// (HTTP server / distributed) emits the call, where sub-agents are unsupported.
+    static let subagentRun = BuiltinTool(
+        spec: ToolSpec(name: "subagent_run",
+                       description: "Esegui un sub-agent ISOLATO su un TARGET (percorso file del progetto, oppure \"project\" per l'intero progetto) con una DOMANDA. Il sub-agent ha il contenuto già in contesto e può leggere/modificare i file; restituisce SOLO la risposta. Usalo per delegare compiti focalizzati senza riempire il tuo contesto.",
+                       parametersJSON: #"{"type":"object","properties":{"target":{"type":"string","description":"percorso file relativo, oppure \"project\""},"question":{"type":"string","description":"compito o domanda per il sub-agent"}},"required":["target","question"]}"#),
+        run: { _ in #"{"note":"subagent_run è gestito dall'engine (non disponibile in questo contesto)"}"# })
 
     static func stringArg(_ json: String, _ key: String) -> String? {
         guard let data = json.data(using: .utf8),

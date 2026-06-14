@@ -77,6 +77,20 @@ public final class DiskKVStore: @unchecked Sendable {
         return Hit(tokens: bestTokens, snapshot: snapshot)
     }
 
+    /// Load the entry stored under the EXACT `tokens` (a content-keyed cache: the
+    /// key is the file/project content prefix, not a conversation prefix), bumping
+    /// its hit counters. nil if absent; a corrupt entry is discarded. Used by the
+    /// per-file / per-project sub-agent KV caches.
+    public func snapshot(forTokens tokens: [Int], modelName: String) -> KVSnapshot? {
+        let url = directory.appendingPathComponent(entryName(tokens: tokens, modelName: modelName))
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let snap = loadSnapshot(url) else {
+            try? FileManager.default.removeItem(at: url); return nil
+        }
+        bumpHit(url)
+        return snap
+    }
+
     // MARK: Store
 
     /// Checkpoint `tokens`+`snapshot` (dedup by content name). Mirrors the C

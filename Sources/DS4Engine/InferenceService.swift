@@ -100,6 +100,9 @@ public actor InferenceService {
     /// generations and restores matching prefixes on cold starts.
     private var diskKV: DiskKVStore?
     private var lastDiskStoreCount = 0
+    /// Content-keyed KV cache for sub-agents: one entry per file/project context
+    /// (key = the content prefix tokens), built lazily on first use and reused.
+    private var subKV: DiskKVStore?
 
     /// The pure-Swift engine always runs the SSD-streaming path (no-copy mmap
     /// non-routed weights + per-token expert gather); there are no resident/
@@ -140,6 +143,18 @@ public actor InferenceService {
         if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
             decoder.usage?.load(data)
         }
+        // Sub-agent KV cache (separate directory from the chat disk-KV; content-keyed).
+        let subBits: UInt8 = configuredDims.gateQuant == .iq2_xxs ? 2 : 4
+        self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: modelName),
+                                      budgetMB: 8192, quantBits: subBits, contextSize: contextSize)
+    }
+
+    /// Directory holding the per-file / per-project sub-agent KV caches.
+    nonisolated static func subAgentKVDir(modelName: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar/subagent-kv", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     // MARK: - Agents (roles) + per-agent expert usage
@@ -270,6 +285,162 @@ public actor InferenceService {
                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
                           kvBytes: kv)
+    }
+
+    // MARK: - Sub-agents (isolated context, returns only the answer)
+
+    /// The outcome of a sub-agent run. `answer` is fed back to the main agent as a
+    /// tool result (so the main KV commits only the question + this answer); `steps`
+    /// is a display-only trace of the sub-agent's internal tool rounds.
+    public struct SubAgentRun: Sendable {
+        public let target: String
+        public let question: String
+        public let answer: String
+        public let steps: [String]
+        public init(target: String, question: String, answer: String, steps: [String]) {
+            self.target = target; self.question = question; self.answer = answer; self.steps = steps
+        }
+    }
+
+    private struct SubContext { let system: String; let content: String; let tools: [ToolSpec]; let label: String }
+
+    /// Resolve a sub-agent target ("project"/"" or a project file path) into its
+    /// system prompt, the content block that seeds the KV, and the tools it may call.
+    private func subContext(for target: String) -> SubContext? {
+        let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        let names = ["project_list", "project_read", "project_search", "project_edit", "project_write"]
+        let specs = ToolRegistry.specs(enabled: Set(names))
+        if t.isEmpty || t.lowercased() == "project" || t == "." {
+            guard let info = ProjectCache.shared.info() else { return nil }
+            let map = ProjectCache.shared.fileList().prefix(200).joined(separator: "\n")
+            let content = "Progetto «\(info.name)» — \(info.fileCount) file.\nMappa (parziale):\n\(map)\n\n"
+            let sys = "Sei un sub-agent autonomo che lavora SOLO sul progetto importato. Esplora con project_list/project_search, leggi con project_read, modifica con project_edit/project_write (find esatto e unico). Concludi con una risposta sintetica: cosa hai trovato/fatto, con file:riga."
+            return SubContext(system: sys, content: content, tools: specs, label: "progetto:\(info.name)")
+        }
+        guard let text = ProjectCache.shared.fullText(of: t) else { return nil }
+        let content = "Contenuto del file «\(t)» (già in contesto):\n```\n\(text)\n```\n\n"
+        let sys = "Sei un sub-agent focalizzato sul file «\(t)». Rispondi alla domanda usando il contenuto già in contesto; se serve modifica SOLO questo file con project_edit/project_write (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
+        return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)")
+    }
+
+    /// Run an isolated sub-agent on `target` with `question`. The MAIN conversation
+    /// KV is snapshotted and restored around the run, so the caller's context only
+    /// ever sees the question (the tool call) and this answer (the tool result) —
+    /// the sub-agent's internal tool rounds happen in a separate, discarded context.
+    /// The target's content prefix is cached (content-keyed) and reused next time.
+    public func runSubAgent(target: String, question: String,
+                            maxTokens: Int = 1024, maxRounds: Int = 6) async throws -> SubAgentRun {
+        guard let ctx = subContext(for: target) else {
+            return SubAgentRun(target: target, question: question,
+                               answer: "Nessun progetto importato o target non valido: «\(target)».", steps: [])
+        }
+        // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
+        if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
+
+        // Snapshot the MAIN context and restore it however the sub-agent ends.
+        let savedIds = committedIds, savedClose = needsClose, savedDirty = kvDirty, savedDisk = lastDiskStoreCount
+        let mainSnap: KVSnapshot? = savedIds.isEmpty ? nil : decoder.exportKV(nKeys: savedIds.count)
+        defer {
+            committedIds = savedIds; needsClose = savedClose; lastDiskStoreCount = savedDisk
+            if let mainSnap {
+                do { try decoder.importKV(mainSnap); kvDirty = savedDirty }
+                catch { kvDirty = true }   // next main turn rebuilds from committedIds
+            } else { kvDirty = true }
+        }
+
+        var steps: [String] = []
+        let sampling = SamplingParams()
+
+        // 1. Build or restore the content-keyed KV prefix (lazy cache).
+        let prefixText = "<｜begin▁of▁sentence｜>"
+            + ChatRenderer.systemBlock(turns: [.system(ctx.system)], tools: ctx.tools, markup: markup, compact: true)
+            + "<｜User｜>" + ctx.content
+        let prefixIds = tok.tokenizeRenderedChat(prefixText).map { Int($0) }
+        guard prefixIds.count < contextSize - 32 else {
+            return SubAgentRun(target: ctx.label, question: question,
+                               answer: "Il contenuto di «\(ctx.label)» eccede il contesto del sub-agent.", steps: steps)
+        }
+        var pos = 0
+        if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
+            try decoder.importKV(snap); pos = prefixIds.count
+            steps.append("KV «\(ctx.label)» riusata (\(pos) token)")
+        } else {
+            _ = try decoder.prefill(tokens: prefixIds, startPos: 0); pos = prefixIds.count
+            subKV?.store(tokens: prefixIds, modelName: modelName,
+                         snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
+            steps.append("KV «\(ctx.label)» creata (\(pos) token)")
+        }
+
+        // 2. Sub-agent tool loop: question → answer/tool-calls → results → … (bounded).
+        var recent: [Int] = []
+        var suffix = question + assistantOpen(.none)
+        var answer = ""
+        var round = 0
+        while true {
+            let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+            guard pos + suffixIds.count < contextSize else { steps.append("contesto sub-agent esaurito"); break }
+            var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: pos)
+            pos += suffixIds.count
+            let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
+                                         sampling: sampling, maxTokens: maxTokens)
+            answer = turn.visible
+            guard !turn.calls.isEmpty, round < maxRounds else { break }
+            round += 1
+            var results = ""
+            for c in turn.calls {
+                let out = ToolRegistry.execute(c)
+                    ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool non disponibile nel sub-agent"}"#)
+                steps.append("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
+                results += "<tool_result>" + out.content + "</tool_result>"
+            }
+            suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
+        }
+        let final = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        steps.append("risposta: \(final.count) caratteri")
+        return SubAgentRun(target: ctx.label, question: question,
+                           answer: final.isEmpty ? "(nessuna risposta)" : final, steps: steps)
+    }
+
+    /// Decode one assistant turn in the sub-agent context: returns the visible
+    /// answer text and any tool calls. Reasoning (<think>…</think>) is discarded —
+    /// only the answer and tool calls matter for the sub-agent.
+    private func decodeSubTurn(lastLogits: inout [Float], pos: inout Int, recent: inout [Int],
+                               sampling: SamplingParams, maxTokens: Int) throws
+        -> (visible: String, calls: [ToolCall]) {
+        var rng = sampling.seed &+ UInt64(pos)
+        var inTool = false, inReasoning = false
+        var visibleBytes: [UInt8] = []
+        var toolBytes: [UInt8] = []
+        let dsmlId = tok.dsmlId
+        var produced = 0
+        while produced < maxTokens && pos < contextSize {
+            try Task.checkCancellation()
+            let lo = max(0, recent.count - sampling.repeatLastN)
+            let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
+                                      topP: sampling.topP, minP: sampling.minP,
+                                      repetitionPenalty: sampling.repetitionPenalty,
+                                      recent: recent[lo...], rng: &rng)
+            if Int32(next) == tok.eosId { break }
+            if !inTool, Int32(next) == dsmlId {
+                inTool = true; toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+            } else if inTool {
+                toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
+            } else if Int32(next) == tok.thinkStartId {
+                inReasoning = true
+            } else if Int32(next) == tok.thinkEndId {
+                inReasoning = false
+            } else if !inReasoning {
+                visibleBytes.append(contentsOf: tok.tokenText(Int32(next)))
+            }
+            produced += 1
+            recent.append(next)
+            lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            pos += 1
+        }
+        let visibleRaw = String(bytes: visibleBytes, encoding: .utf8) ?? ""
+        let toolText = String(bytes: toolBytes, encoding: .utf8) ?? ""
+        let parsed = ToolCallParser.parse(inTool ? visibleRaw + toolText : visibleRaw, markup: markup)
+        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls)
     }
 
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
