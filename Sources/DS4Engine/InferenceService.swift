@@ -305,41 +305,52 @@ public actor InferenceService {
     private struct SubContext { let system: String; let content: String; let tools: [ToolSpec]; let label: String; let toolNames: [String] }
 
     /// Resolve a sub-agent target ("project"/"" or a project file path), an optional
-    /// ROLE to assume (`agentId`, from the agent roster), and the MINIMAL tool set
-    /// into the sub-agent's system prompt, the content block that seeds the KV, and
-    /// the declared tools. Granted tools = explicit `requested` (∩ grantable), else
-    /// the role's tools (∩ grantable), else a read-only default. When a role is
-    /// given its system prompt leads (persona/approach) and the sub-agent framing
-    /// follows (task constraints).
-    private func subContext(for target: String, agent agentId: String, toolNames requested: [String]) -> SubContext? {
+    /// ROLE to assume (`agentId`), and the MINIMAL tool set into the sub-agent's
+    /// system prompt, the content block that seeds the KV, and the declared tools.
+    /// Granted tools = explicit `requested` (∩ grantable), else the role's tools,
+    /// else a read-only default. Works WITHOUT an imported project: that is not an
+    /// error — the sub-agent then runs on the task alone (no project content/tools).
+    private func subContext(for target: String, agent agentId: String, toolNames requested: [String]) -> SubContext {
         let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let isProject = t.isEmpty || t.lowercased() == "project" || t == "."
         let role = agentId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil
             : AgentRegistry.shared.all().first { $0.id == agentId.trimmingCharacters(in: .whitespacesAndNewlines) }
-        // Granted = explicit ∩ grantable, else role's tools ∩ grantable, else read-only.
+        let projectInfo = ProjectCache.shared.info()
+        let fileText = (projectInfo != nil && !isProject) ? ProjectCache.shared.fullText(of: t) : nil
+
+        // Granted = explicit ∩ grantable, else role's tools ∩ grantable, else default.
         var granted = requested.filter { ToolRegistry.subAgentGrantable.contains($0) }
         if granted.isEmpty, let role { granted = role.toolNames.filter { ToolRegistry.subAgentGrantable.contains($0) } }
         if granted.isEmpty {
-            granted = isProject ? ["project_list", "project_read", "project_search"]
-                                : ["project_read", "project_search"]
+            granted = projectInfo == nil ? []
+                : (isProject ? ["project_list", "project_read", "project_search"]
+                             : ["project_read", "project_search"])
         }
+        // Without an imported project, project/git tools can't do anything → drop them.
+        if projectInfo == nil { granted = granted.filter { !$0.hasPrefix("project_") && $0 != "git" } }
         var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
         let specs = ToolRegistry.specs(enabled: Set(granted))
-        let toolLine = "Tool a disposizione (usa SOLO questi): " + granted.joined(separator: ", ") + "."
+        let toolLine = granted.isEmpty ? "Non hai tool: rispondi con le tue conoscenze."
+                                       : "Tool a disposizione (usa SOLO questi): " + granted.joined(separator: ", ") + "."
         let rolePrefix = (role.map { $0.systemPrompt.isEmpty ? "" : $0.systemPrompt + "\n\n" }) ?? ""
         let roleLabel = role.map { " · \($0.name)" } ?? ""
 
-        if isProject {
-            guard let info = ProjectCache.shared.info() else { return nil }
+        if let info = projectInfo, isProject {
             let map = ProjectCache.shared.fileList().prefix(200).joined(separator: "\n")
             let content = "Progetto «\(info.name)» — \(info.fileCount) file.\nMappa (parziale):\n\(map)\n\n"
             let sys = rolePrefix + "Sei un sub-agent autonomo che lavora SOLO sul progetto importato. \(toolLine) Concludi con una risposta sintetica: cosa hai trovato/fatto, con file:riga."
             return SubContext(system: sys, content: content, tools: specs, label: "progetto:\(info.name)\(roleLabel)", toolNames: granted)
         }
-        guard let text = ProjectCache.shared.fullText(of: t) else { return nil }
-        let content = "Contenuto del file «\(t)» (già in contesto):\n```\n\(text)\n```\n\n"
-        let sys = rolePrefix + "Sei un sub-agent focalizzato sul file «\(t)», già in contesto. \(toolLine) Se modifichi, agisci SOLO su questo file (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
-        return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)\(roleLabel)", toolNames: granted)
+        if let text = fileText {
+            let content = "Contenuto del file «\(t)» (già in contesto):\n```\n\(text)\n```\n\n"
+            let sys = rolePrefix + "Sei un sub-agent focalizzato sul file «\(t)», già in contesto. \(toolLine) Se modifichi, agisci SOLO su questo file (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
+            return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)\(roleLabel)", toolNames: granted)
+        }
+        // No project imported (or the file isn't in it): a plain sub-agent that
+        // answers the task directly — NOT an error (a chat may have no project).
+        let note = projectInfo == nil ? "" : "Nota: «\(t)» non è nel progetto importato. "
+        let sys = rolePrefix + "Sei un sub-agent. \(note)\(toolLine) Esegui il compito e concludi con una risposta sintetica."
+        return SubContext(system: sys, content: "", tools: specs, label: "task\(roleLabel)", toolNames: granted)
     }
 
     /// Run an isolated sub-agent on `target` with `question`. The MAIN conversation
@@ -349,10 +360,7 @@ public actor InferenceService {
     /// The target's content prefix is cached (content-keyed) and reused next time.
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
                             maxTokens: Int = 1024, maxRounds: Int = 6) async throws -> SubAgentRun {
-        guard let ctx = subContext(for: target, agent: agent, toolNames: tools) else {
-            return SubAgentRun(target: target, question: question,
-                               answer: "Nessun progetto importato o target non valido: «\(target)».", steps: [])
-        }
+        let ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
 
