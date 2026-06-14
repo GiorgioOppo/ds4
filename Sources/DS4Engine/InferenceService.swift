@@ -302,25 +302,37 @@ public actor InferenceService {
         }
     }
 
-    private struct SubContext { let system: String; let content: String; let tools: [ToolSpec]; let label: String }
+    private struct SubContext { let system: String; let content: String; let tools: [ToolSpec]; let label: String; let toolNames: [String] }
 
-    /// Resolve a sub-agent target ("project"/"" or a project file path) into its
-    /// system prompt, the content block that seeds the KV, and the tools it may call.
-    private func subContext(for target: String) -> SubContext? {
+    /// Resolve a sub-agent target ("project"/"" or a project file path) and the
+    /// MINIMAL tool set the caller granted into the sub-agent's system prompt, the
+    /// content block that seeds the KV, and the declared tools. Requested tools are
+    /// filtered to the grantable built-ins; if none are valid the sub-agent is
+    /// read-only (edit/write are available only when explicitly granted).
+    private func subContext(for target: String, toolNames requested: [String]) -> SubContext? {
         let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        let names = ["project_list", "project_read", "project_search", "project_edit", "project_write"]
-        let specs = ToolRegistry.specs(enabled: Set(names))
-        if t.isEmpty || t.lowercased() == "project" || t == "." {
+        let isProject = t.isEmpty || t.lowercased() == "project" || t == "."
+        // Granted = requested ∩ grantable; fall back to a read-only default.
+        var granted = requested.filter { ToolRegistry.subAgentGrantable.contains($0) }
+        if granted.isEmpty {
+            granted = isProject ? ["project_list", "project_read", "project_search"]
+                                : ["project_read", "project_search"]
+        }
+        var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
+        let specs = ToolRegistry.specs(enabled: Set(granted))
+        let toolLine = "Tool a disposizione (usa SOLO questi): " + granted.joined(separator: ", ") + "."
+
+        if isProject {
             guard let info = ProjectCache.shared.info() else { return nil }
             let map = ProjectCache.shared.fileList().prefix(200).joined(separator: "\n")
             let content = "Progetto «\(info.name)» — \(info.fileCount) file.\nMappa (parziale):\n\(map)\n\n"
-            let sys = "Sei un sub-agent autonomo che lavora SOLO sul progetto importato. Esplora con project_list/project_search, leggi con project_read, modifica con project_edit/project_write (find esatto e unico). Concludi con una risposta sintetica: cosa hai trovato/fatto, con file:riga."
-            return SubContext(system: sys, content: content, tools: specs, label: "progetto:\(info.name)")
+            let sys = "Sei un sub-agent autonomo che lavora SOLO sul progetto importato. \(toolLine) Concludi con una risposta sintetica: cosa hai trovato/fatto, con file:riga."
+            return SubContext(system: sys, content: content, tools: specs, label: "progetto:\(info.name)", toolNames: granted)
         }
         guard let text = ProjectCache.shared.fullText(of: t) else { return nil }
         let content = "Contenuto del file «\(t)» (già in contesto):\n```\n\(text)\n```\n\n"
-        let sys = "Sei un sub-agent focalizzato sul file «\(t)». Rispondi alla domanda usando il contenuto già in contesto; se serve modifica SOLO questo file con project_edit/project_write (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
-        return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)")
+        let sys = "Sei un sub-agent focalizzato sul file «\(t)», già in contesto. \(toolLine) Se modifichi, agisci SOLO su questo file (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
+        return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)", toolNames: granted)
     }
 
     /// Run an isolated sub-agent on `target` with `question`. The MAIN conversation
@@ -328,9 +340,9 @@ public actor InferenceService {
     /// ever sees the question (the tool call) and this answer (the tool result) —
     /// the sub-agent's internal tool rounds happen in a separate, discarded context.
     /// The target's content prefix is cached (content-keyed) and reused next time.
-    public func runSubAgent(target: String, question: String,
+    public func runSubAgent(target: String, question: String, tools: [String] = [],
                             maxTokens: Int = 1024, maxRounds: Int = 6) async throws -> SubAgentRun {
-        guard let ctx = subContext(for: target) else {
+        guard let ctx = subContext(for: target, toolNames: tools) else {
             return SubAgentRun(target: target, question: question,
                                answer: "Nessun progetto importato o target non valido: «\(target)».", steps: [])
         }
@@ -370,6 +382,7 @@ public actor InferenceService {
                          snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
             steps.append("KV «\(ctx.label)» creata (\(pos) token)")
         }
+        steps.append("tool: " + ctx.toolNames.joined(separator: ", "))
 
         // 2. Sub-agent tool loop: question → answer/tool-calls → results → … (bounded).
         var recent: [Int] = []

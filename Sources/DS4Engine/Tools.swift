@@ -42,6 +42,13 @@ public enum ToolRegistry {
         builtins.filter { names.contains($0.spec.name) }.map(\.spec)
     }
 
+    /// Tools a sub-agent may be granted: every built-in EXCEPT the sub-agent tools
+    /// themselves (no nested sub-agents). The main agent passes a minimal subset of
+    /// these to `subagent_run`; names outside this set are ignored.
+    public static var subAgentGrantable: Set<String> {
+        Set(builtins.map(\.spec.name)).subtracting(["subagent_run", "subagent_search"])
+    }
+
     /// Run a model-emitted call against the built-ins; nil if it's not a built-in
     /// (the UI must then supply the result manually).
     public static func execute(_ call: ToolCall) -> ToolOutput? {
@@ -155,8 +162,8 @@ public enum ToolRegistry {
     /// (HTTP server / distributed) emits the call, where sub-agents are unsupported.
     static let subagentRun = BuiltinTool(
         spec: ToolSpec(name: "subagent_run",
-                       description: "Esegui un sub-agent ISOLATO su un TARGET (percorso file del progetto, oppure \"project\" per l'intero progetto) con una DOMANDA. Il sub-agent ha il contenuto già in contesto e può leggere/modificare i file; restituisce SOLO la risposta. Usalo per delegare compiti focalizzati senza riempire il tuo contesto.",
-                       parametersJSON: #"{"type":"object","properties":{"target":{"type":"string","description":"percorso file relativo, oppure \"project\""},"question":{"type":"string","description":"compito o domanda per il sub-agent"}},"required":["target","question"]}"#),
+                       description: "Esegui un sub-agent ISOLATO su un TARGET (percorso file del progetto, oppure \"project\" per l'intero progetto) con una DOMANDA. Il sub-agent ha il contenuto già in contesto e restituisce SOLO la risposta. Passa in 'tools' l'insieme MINIMO di tool necessari al compito (es. solo project_read/project_search per sola lettura; aggiungi project_edit/project_write SOLO se il sub-agent deve modificare). Tool disponibili: project_list, project_read, project_search, project_edit, project_write, git.",
+                       parametersJSON: #"{"type":"object","properties":{"target":{"type":"string","description":"percorso file relativo, oppure \"project\""},"question":{"type":"string","description":"compito o domanda per il sub-agent"},"tools":{"type":"array","items":{"type":"string"},"description":"insieme MINIMO di tool concessi al sub-agent, scelto in base al compito; ometti quelli non necessari. Se assente, il sub-agent è in sola lettura."}},"required":["target","question"]}"#),
         run: { _ in #"{"note":"subagent_run è gestito dall'engine (non disponibile in questo contesto)"}"# })
 
     static func stringArg(_ json: String, _ key: String) -> String? {
