@@ -31,7 +31,7 @@ public enum ToolRegistry {
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
                                                  projectWrite, projectEdit, git,
-                                                 subagentSearch, subagentRun]
+                                                 agentsList, subagentSearch, subagentRun]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -42,11 +42,12 @@ public enum ToolRegistry {
         builtins.filter { names.contains($0.spec.name) }.map(\.spec)
     }
 
-    /// Tools a sub-agent may be granted: every built-in EXCEPT the sub-agent tools
-    /// themselves (no nested sub-agents). The main agent passes a minimal subset of
-    /// these to `subagent_run`; names outside this set are ignored.
+    /// Tools a sub-agent may be granted: every built-in EXCEPT the orchestration
+    /// tools (no nested sub-agents; `agents_list` is for the orchestrator, not for
+    /// doing work). The main agent passes a minimal subset of these to
+    /// `subagent_run`; names outside this set are ignored.
     public static var subAgentGrantable: Set<String> {
-        Set(builtins.map(\.spec.name)).subtracting(["subagent_run", "subagent_search"])
+        Set(builtins.map(\.spec.name)).subtracting(["subagent_run", "subagent_search", "agents_list"])
     }
 
     /// Run a model-emitted call against the built-ins; nil if it's not a built-in
@@ -145,6 +146,14 @@ public enum ToolRegistry {
         })
 
     // MARK: Sub-agent tools (delegate a focused task to an isolated context)
+
+    /// List the available agents (roles) and the tools each one has — so the
+    /// orchestrator can pick the right minimal tool set to grant a sub-agent.
+    static let agentsList = BuiltinTool(
+        spec: ToolSpec(name: "agents_list",
+                       description: "Elenca gli agenti (ruoli) disponibili e i tool che ciascuno ha a disposizione (id · nome · tool). Usalo per scegliere quali tool concedere a un sub-agent (parametro 'tools' di subagent_run) in base al ruolo adatto al compito.",
+                       parametersJSON: #"{"type":"object","properties":{}}"#),
+        run: { _ in AgentRegistry.shared.describe() })
 
     /// Find loadable sub-agent targets: project files whose name/content match.
     static let subagentSearch = BuiltinTool(

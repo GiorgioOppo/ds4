@@ -36,8 +36,8 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               toolNames: ["project_list", "project_read", "project_search",
                           "project_write", "project_edit", "git"]),
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
-              systemPrompt: "Delega i compiti su file/progetto a sub-agent: subagent_search per trovare i file, poi subagent_run(target, domanda focalizzata, tools minimi — sola lettura di default, edit/write solo se serve). Integra le risposte.",
-              toolNames: ["subagent_search", "subagent_run", "project_list", "project_search"]),
+              systemPrompt: "Vedi ruoli e relativi tool con agents_list. Delega i compiti su file/progetto a sub-agent: subagent_search per trovare i file, poi subagent_run(target, domanda focalizzata, tools minimi — sola lettura di default, edit/write solo se serve). Integra le risposte.",
+              toolNames: ["agents_list", "subagent_search", "subagent_run", "project_list", "project_search"]),
         .init(id: "matematica", name: "Matematica", icon: "function",
               systemPrompt: "Sei un assistente matematico preciso. Usa gli strumenti di calcolo forniti per ogni operazione aritmetica.",
               toolNames: ["calculator", "add", "subtract", "multiply"]),
@@ -45,4 +45,33 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               systemPrompt: "Sei un editor e scrittore in italiano: tono naturale, frasi chiare, niente giri di parole.",
               toolNames: []),
     ]
+}
+
+/// Process-wide registry of the CURRENT agents, so engine-side tools (the
+/// orchestrator's `agents_list`) can see the actual roster — including the user's
+/// edits — which otherwise lives only in the app's UserDefaults. The app keeps it
+/// in sync; until it does, it reports the built-in defaults.
+public final class AgentRegistry: @unchecked Sendable {
+    public static let shared = AgentRegistry()
+    private let lock = NSLock()
+    private var agents: [AgentProfile] = AgentProfile.defaults
+
+    /// Replace the roster (the app calls this whenever its agent list changes).
+    public func set(_ agents: [AgentProfile]) {
+        lock.lock(); self.agents = agents.isEmpty ? AgentProfile.defaults : agents; lock.unlock()
+    }
+
+    public func all() -> [AgentProfile] { lock.lock(); defer { lock.unlock() }; return agents }
+
+    /// Compact listing for the `agents_list` tool: one "id · nome · tool" per line.
+    public func describe() -> String {
+        let list = all()
+        guard !list.isEmpty else { return "Nessun agente disponibile." }
+        var out = "Agenti disponibili (id · nome · tool):"
+        for a in list {
+            let tools = a.toolNames.isEmpty ? "(nessun tool)" : a.toolNames.joined(separator: ", ")
+            out += "\n- \(a.id) · \(a.name) · \(tools)"
+        }
+        return out
+    }
 }

@@ -60,7 +60,10 @@ final class ChatStore {
     }
     var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
 
-    init(settings: AppSettings) { self.settings = settings }
+    init(settings: AppSettings) {
+        self.settings = settings
+        AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+    }
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
@@ -88,7 +91,9 @@ final class ChatStore {
     // Agents (roles). Selecting one starts a fresh chat with its role and swaps
     // the per-agent expert-usage profile (the cache re-warms with ITS experts).
     // Editable + persisted; edits apply on the next new chat / agent switch.
-    var agents: [AgentProfile] = ChatStore.loadAgents()
+    var agents: [AgentProfile] = ChatStore.loadAgents() {
+        didSet { AgentRegistry.shared.set(agents) }   // keep the engine-side agents_list tool in sync
+    }
     var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgent") ?? "generale" {
         didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgent") }
     }
