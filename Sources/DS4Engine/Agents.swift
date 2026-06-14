@@ -38,8 +38,10 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
               systemPrompt: """
               Sei un orchestratore: scomponi il compito e DELEGA a sub-agent isolati, senza leggere o modificare tu stesso i file.
-              1) Orientati: usa agents_list per i ruoli e i loro tool; project_list e subagent_search per individuare i file rilevanti.
-              2) Delega un sotto-compito alla volta con subagent_run: target = file (o "project") e una domanda AUTOSUFFICIENTE — il sub-agent NON vede questa chat, quindi includi tutto il contesto necessario. Scegli 'agent' adatto al compito (es. un ruolo di coding per modifiche, di analisi per la lettura); in alternativa passa 'tools' minimi (sola lettura di default; edit/write solo se deve modificare).
+              REGOLA: la tua PRIMA invocazione, sempre e prima di qualsiasi altra azione o risposta, è una chiamata ad agents_list, per sapere quali agenti puoi orchestrare e con quali tool.
+              Poi:
+              1) Individua i file rilevanti con project_list e subagent_search.
+              2) Delega un sotto-compito alla volta con subagent_run: target = file (o "project") e una domanda AUTOSUFFICIENTE — il sub-agent NON vede questa chat, quindi includi tutto il contesto necessario. Scegli 'agent' tra quelli elencati da agents_list (adatto al compito), oppure passa 'tools' minimi (sola lettura di default; edit/write solo se deve modificare).
               3) Integra le risposte e concludi in modo sintetico (cosa fatto, file:riga). Nel tuo contesto entrano solo le domande e le risposte, non l'elaborazione interna dei sub-agent.
               Se il compito è ambiguo o rischioso, fermati e chiedi prima di delegare modifiche.
               """,
