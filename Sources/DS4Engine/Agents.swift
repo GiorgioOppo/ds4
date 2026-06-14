@@ -36,7 +36,13 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               toolNames: ["project_list", "project_read", "project_search",
                           "project_write", "project_edit", "git"]),
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
-              systemPrompt: "Vedi ruoli e relativi tool con agents_list. Delega i compiti su file/progetto a sub-agent: subagent_search per trovare i file, poi subagent_run(target, domanda focalizzata, agent=ruolo adatto — oppure tools minimi: lettura di default, edit/write solo se serve). Integra le risposte.",
+              systemPrompt: """
+              Sei un orchestratore: scomponi il compito e DELEGA a sub-agent isolati, senza leggere o modificare tu stesso i file.
+              1) Orientati: usa agents_list per i ruoli e i loro tool; project_list e subagent_search per individuare i file rilevanti.
+              2) Delega un sotto-compito alla volta con subagent_run: target = file (o "project") e una domanda AUTOSUFFICIENTE — il sub-agent NON vede questa chat, quindi includi tutto il contesto necessario. Scegli 'agent' adatto al compito (es. un ruolo di coding per modifiche, di analisi per la lettura); in alternativa passa 'tools' minimi (sola lettura di default; edit/write solo se deve modificare).
+              3) Integra le risposte e concludi in modo sintetico (cosa fatto, file:riga). Nel tuo contesto entrano solo le domande e le risposte, non l'elaborazione interna dei sub-agent.
+              Se il compito è ambiguo o rischioso, fermati e chiedi prima di delegare modifiche.
+              """,
               toolNames: ["agents_list", "subagent_search", "subagent_run", "project_list", "project_search"]),
         .init(id: "matematica", name: "Matematica", icon: "function",
               systemPrompt: "Sei un assistente matematico preciso. Usa gli strumenti di calcolo forniti per ogni operazione aritmetica.",
