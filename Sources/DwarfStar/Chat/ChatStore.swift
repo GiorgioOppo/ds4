@@ -488,18 +488,19 @@ final class ChatStore {
 
     // MARK: - Internals
 
-    /// Parse the (target, question, tools) arguments of a `subagent_run` tool call.
-    /// `tools` accepts a JSON array or a comma/space-separated string (some models
-    /// quote list arguments).
-    private static func subAgentArgs(_ json: String) -> (target: String, question: String, tools: [String]) {
+    /// Parse the (target, question, agent, tools) arguments of a `subagent_run`
+    /// call. `tools` accepts a JSON array or a comma/space-separated string (some
+    /// models quote list arguments).
+    private static func subAgentArgs(_ json: String) -> (target: String, question: String, agent: String, tools: [String]) {
         guard let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ("", "", []) }
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ("", "", "", []) }
         var tools: [String] = []
         if let arr = obj["tools"] as? [Any] { tools = arr.compactMap { $0 as? String } }
         else if let s = obj["tools"] as? String {
             tools = s.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init)
         }
-        return ((obj["target"] as? String) ?? "", (obj["question"] as? String) ?? "", tools)
+        return ((obj["target"] as? String) ?? "", (obj["question"] as? String) ?? "",
+                (obj["agent"] as? String) ?? "", tools)
     }
 
     private func appendAssistant() -> Int {
@@ -575,11 +576,11 @@ final class ChatStore {
             // subagent_run runs ON the engine (it drives the decoder in an isolated
             // context): the main KV only commits this call + the returned answer.
             if c.name == "subagent_run" {
-                let (target, question, tools) = Self.subAgentArgs(c.argumentsJSON)
+                let (target, question, agent, tools) = Self.subAgentArgs(c.argumentsJSON)
                 status = "sub-agent su \(target)…"
                 let run: InferenceService.SubAgentRun
                 do {
-                    run = try await service.runSubAgent(target: target, question: question, tools: tools)
+                    run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
                 } catch is CancellationError {
                     run = InferenceService.SubAgentRun(target: target, question: question,
                                                        answer: "(sub-agent interrotto)", steps: [])
