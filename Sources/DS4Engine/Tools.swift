@@ -143,25 +143,30 @@ public enum ToolRegistry {
             return ProjectCache.shared.editTool(path: p, find: f, replace: r)
         })
 
-    /// Read any file inside the project root (raw, not limited to the index).
+    /// Read any file inside the project root (raw, not limited to the index),
+    /// optionally a line range [from_line, to_line].
     static let fileRead = BuiltinTool(
         spec: ToolSpec(name: "file_read",
-                       description: "Leggi un file QUALSIASI dentro la radice del progetto importato (anche non indicizzato), restituito come testo. Per letture paginate dei file indicizzati usa project_read.",
-                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice del progetto"}},"required":["path"]}"#),
+                       description: "Leggi un file QUALSIASI dentro la radice del progetto importato (anche non indicizzato). Senza from_line/to_line restituisce l'intero file (cap 96 KB); con from_line/to_line (1-based, inclusi) restituisce SOLO quelle righe, numerate.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"from_line":{"type":"number","description":"prima riga, 1-based (opzionale)"},"to_line":{"type":"number","description":"ultima riga inclusa, 1-based (opzionale)"}},"required":["path"]}"#),
         run: { argsJSON in
             guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
-            return ProjectCache.shared.readFileTool(path: p)
+            return ProjectCache.shared.readFileTool(path: p,
+                                                    fromLine: intArg(argsJSON, "from_line"),
+                                                    toLine: intArg(argsJSON, "to_line"))
         })
 
-    /// Create/overwrite any file inside the project root (any extension).
+    /// Create/overwrite any file inside the project root, or splice a line range.
     static let fileWrite = BuiltinTool(
         spec: ToolSpec(name: "file_write",
-                       description: "Crea o sovrascrivi un file QUALSIASI dentro la radice del progetto importato (qualunque estensione); crea le cartelle intermedie. Per piccole modifiche a file esistenti preferisci project_edit.",
-                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"contenuto completo del file"}},"required":["path","content"]}"#),
+                       description: "Scrivi un file QUALSIASI dentro la radice del progetto importato (qualunque estensione; crea le cartelle). Senza from_line/to_line crea o sovrascrive l'INTERO file. Con from_line/to_line (1-based, incluse) SOSTITUISCE quelle righe di un file esistente con 'content' (content vuoto = cancella le righe; to_line omesso = una sola riga). Per sostituzioni puntuali su testo esatto preferisci project_edit.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"contenuto (intero file, oppure le righe sostitutive)"},"from_line":{"type":"number","description":"prima riga da sostituire, 1-based (opzionale)"},"to_line":{"type":"number","description":"ultima riga da sostituire inclusa, 1-based (opzionale)"}},"required":["path","content"]}"#),
         run: { argsJSON in
             guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
             guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
-            return ProjectCache.shared.writeFileTool(path: p, content: c)
+            return ProjectCache.shared.writeFileTool(path: p, content: c,
+                                                     fromLine: intArg(argsJSON, "from_line"),
+                                                     toLine: intArg(argsJSON, "to_line"))
         })
 
     static let git = BuiltinTool(
