@@ -52,6 +52,13 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
         .init(id: "scrittura", name: "Scrittura", icon: "pencil",
               systemPrompt: "Sei un editor e scrittore in italiano: tono naturale, frasi chiare, niente giri di parole.",
               toolNames: []),
+        .init(id: "latex", name: "LaTeX", icon: "doc.richtext",
+              systemPrompt: """
+              Sei un esperto di LaTeX: produci documenti .tex corretti e COMPILABILI. Includi un preamble minimo ma adeguato (\\documentclass + solo i package necessari), struttura chiara e modalità matematica usata correttamente. Esegui l'escape dei caratteri speciali nel testo (# $ % & _ { } ~ ^ \\). Verifica che gli ambienti siano bilanciati (\\begin/\\end accoppiati, parentesi math chiuse).
+              Se è importato un progetto, salva i documenti con file_write (es. doc.tex) e fai piccole modifiche con project_edit; leggi riferimenti e file esistenti con project_read/project_search. Senza progetto, restituisci il LaTeX completo nella risposta.
+              """,
+              toolNames: ["project_list", "project_read", "project_search",
+                          "project_edit", "file_read", "file_write"]),
     ]
 }
 

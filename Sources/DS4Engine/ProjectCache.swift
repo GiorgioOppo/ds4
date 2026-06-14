@@ -41,6 +41,7 @@ public final class ProjectCache: @unchecked Sendable {
         "yml", "yaml", "toml", "ini", "cfg", "sh", "bash", "zsh",
         "html", "css", "xml", "plist", "entitlements", "modulemap",
         "java", "kt", "rs", "go", "rb", "sql", "gradle", "cmake", "make",
+        "tex", "bib", "cls", "sty", "latex",
     ]
 
     // MARK: - Import / clear (GUI side)
