@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 import DS4Engine
 import DS4Core
 
@@ -12,6 +14,18 @@ struct UIMessage: Identifiable {
     var text: String
     var toolStreamText: String = ""   // raw tool markup shown live while it generates
     var toolCalls: [ToolCall] = []
+    /// Names of text files imported with this (user) message — shown as badges; the
+    /// full content was folded into the turn actually sent to the model.
+    var attachments: [String] = []
+}
+
+/// A text file staged in the composer: its full content is folded into the next
+/// user turn sent to the model; the transcript shows only the filename + size.
+struct ChatAttachment: Identifiable, Equatable {
+    let id = UUID()
+    let name: String
+    let content: String
+    var bytes: Int { content.utf8.count }
 }
 
 /// Main-thread view model. Owns the `InferenceService` actor and mirrors its
@@ -221,6 +235,16 @@ final class ChatStore {
     var info: ModelInfo?
     var messages: [UIMessage] = []
     var input = ""
+    /// Text files staged for the next message (folded into the user turn on send).
+    var attachments: [ChatAttachment] = []
+    /// Transient composer note (e.g. a file that couldn't be decoded as text).
+    var attachmentNote: String?
+    /// Rough token estimate of the staged attachments (≈4 chars/token); nil if none.
+    /// Used to warn before they overflow the context window.
+    var attachmentTokenEstimate: Int? {
+        guard !attachments.isEmpty else { return nil }
+        return attachments.reduce(0) { $0 + $1.content.count } / 4
+    }
     var think = false
     var isGenerating = false
     var status = ""          // live prefill/decode progress
@@ -303,12 +327,18 @@ final class ChatStore {
 
     private var thinkMode: DS4ThinkMode { think ? .high : .none }
 
-    /// Send the current input and stream the reply, running the tool loop.
+    /// Send the current input (+ any imported text files) and stream the reply,
+    /// running the tool loop. Attachments are folded into the turn sent to the
+    /// model; the transcript shows just the typed text and the filenames.
     func send() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let service, !text.isEmpty, !isGenerating else { return }
+        let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let service, !isGenerating, !(typed.isEmpty && attachments.isEmpty) else { return }
+        let atts = attachments
+        let text = Self.composeUserText(typed: typed, attachments: atts)
         input = ""
-        messages.append(UIMessage(role: .user, text: text))
+        attachments = []
+        attachmentNote = nil
+        messages.append(UIMessage(role: .user, text: typed, attachments: atts.map(\.name)))
         let index = appendAssistant()
         isGenerating = true
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
@@ -356,6 +386,64 @@ final class ChatStore {
 
     func stop() { generation?.cancel() }
 
+    // MARK: - Text-file attachments
+
+    /// Present an open panel for one or more text files and stage their contents.
+    /// Honors the App Sandbox: each pick grants security-scoped access for the
+    /// one-shot read (entitlement: files.user-selected.read-write).
+    func pickAndAttachFiles() {
+        attachmentNote = nil
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.title = "Importa file di testo"
+        panel.prompt = "Importa"
+        // Prefer text types; allow any file (.data) so odd extensions can still be
+        // picked — non-text content simply fails to decode and is reported.
+        panel.allowedContentTypes = [.text, .plainText, .sourceCode, .json, .xml,
+                                     .commaSeparatedText, .log, .data]
+        guard panel.runModal() == .OK else { return }
+        importFiles(panel.urls)
+    }
+
+    /// Read each URL as text (UTF-8, then Latin-1) and stage it; collect failures.
+    func importFiles(_ urls: [URL]) {
+        var failed: [String] = []
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let text = Self.readText(url) else { failed.append(url.lastPathComponent); continue }
+            let name = url.lastPathComponent
+            // Re-importing the identical file is a no-op (avoid duplicate context).
+            if !attachments.contains(where: { $0.name == name && $0.content == text }) {
+                attachments.append(ChatAttachment(name: name, content: text))
+            }
+        }
+        if !failed.isEmpty {
+            attachmentNote = "Non leggibili come testo: \(failed.joined(separator: ", "))"
+        }
+    }
+
+    func removeAttachment(_ id: UUID) { attachments.removeAll { $0.id == id } }
+
+    /// Decode a file as text: UTF-8 first, then Latin-1 (covers most legacy files).
+    static func readText(_ url: URL) -> String? {
+        if let s = try? String(contentsOf: url, encoding: .utf8) { return s }
+        return try? String(contentsOf: url, encoding: .isoLatin1)
+    }
+
+    /// Fold staged attachments + the typed message into the text sent to the model.
+    /// Each file is delimited so the model can tell content apart from the prompt.
+    static func composeUserText(typed: String, attachments: [ChatAttachment]) -> String {
+        guard !attachments.isEmpty else { return typed }
+        var parts: [String] = attachments.map {
+            "--- File allegato: \($0.name) ---\n\($0.content)\n--- fine: \($0.name) ---"
+        }
+        if !typed.isEmpty { parts.append(typed) }
+        return parts.joined(separator: "\n\n")
+    }
+
     // MARK: - Tuning tab
 
     func refreshTuningInfo() {
@@ -381,6 +469,8 @@ final class ChatStore {
         let agentSys = resolvedAgent().systemPrompt
         let sys = agentSys.isEmpty ? nil : agentSys
         messages.removeAll()
+        attachments = []
+        attachmentNote = nil
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false

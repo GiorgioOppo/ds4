@@ -167,7 +167,7 @@ struct ChatView: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
         if store.isGenerating && !store.status.isEmpty {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
@@ -176,7 +176,33 @@ struct ChatView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        if !store.attachments.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(store.attachments) { att in
+                        AttachmentChip(name: att.name, bytes: att.bytes) {
+                            store.removeAttachment(att.id)
+                        }
+                    }
+                }
+            }
+        }
+        if let note = store.attachmentNote {
+            Label(note, systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.orange)
+        }
+        if let est = store.attachmentTokenEstimate, est > store.contextSize - 256 {
+            Label("Allegati ~\(est) token: rischiano di superare il contesto (\(store.contextSize)). Riduci i file o aumenta il contesto in Impostazioni.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.orange)
+        }
         HStack(alignment: .bottom, spacing: 8) {
+            Button { store.pickAndAttachFiles() } label: {
+                Image(systemName: "paperclip")
+            }
+            .buttonStyle(.borderless)
+            .help("Importa file di testo nella conversazione")
+            .disabled(store.isGenerating)
             TextField("Scrivi un messaggio…", text: $store.input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...6)
@@ -189,12 +215,57 @@ struct ChatView: View {
                 Button { store.send() } label: {
                     Image(systemName: "arrow.up.circle.fill")
                 }
-                .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          && store.attachments.isEmpty)
             }
         }
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
+    }
+}
+
+/// A staged text-file attachment shown above the composer, with a remove button.
+struct AttachmentChip: View {
+    let name: String
+    let bytes: Int
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text").font(.caption2)
+            Text(name).font(.caption).lineLimit(1)
+            Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                .font(.caption2).foregroundStyle(.secondary)
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Rimuovi allegato")
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+    }
+}
+
+/// Filename badges shown under a user message that imported text files.
+struct AttachmentBadges: View {
+    let names: [String]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(names, id: \.self) { name in
+                    Label(name, systemImage: "doc.text")
+                        .font(.caption2).lineLimit(1)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+        }
     }
 }
 
@@ -225,6 +296,9 @@ struct MessageRow: View {
                     } else if message.role == .assistant && message.reasoning.isEmpty
                                 && message.toolCalls.isEmpty && message.toolStreamText.isEmpty {
                         ProgressView().controlSize(.small)
+                    }
+                    if !message.attachments.isEmpty {
+                        AttachmentBadges(names: message.attachments)
                     }
                     if !message.toolStreamText.isEmpty {
                         ToolStreamView(text: message.toolStreamText)
