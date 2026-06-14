@@ -326,8 +326,8 @@ public actor InferenceService {
                 : (isProject ? ["project_list", "project_read", "project_search"]
                              : ["project_read", "project_search"])
         }
-        // Without an imported project, project/git tools can't do anything → drop them.
-        if projectInfo == nil { granted = granted.filter { !$0.hasPrefix("project_") && $0 != "git" } }
+        // Without an imported project, project-scoped tools can't do anything → drop them.
+        if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
         var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
         let specs = ToolRegistry.specs(enabled: Set(granted))
         let toolLine = granted.isEmpty ? "Non hai tool: rispondi con le tue conoscenze."

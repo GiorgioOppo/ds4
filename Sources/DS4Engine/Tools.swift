@@ -26,12 +26,19 @@ public struct ToolOutput: Sendable, Equatable {
 }
 
 public enum ToolRegistry {
-    /// The built-in tools. project_write/project_edit have side effects (they
-    /// modify files INSIDE the active project root only); everything else is pure.
+    /// The built-in tools. project_write/project_edit/file_write have side effects
+    /// (they modify files INSIDE the active project root only); everything else is pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
-                                                 projectWrite, projectEdit, git,
+                                                 projectWrite, projectEdit, fileRead, fileWrite, git,
                                                  agentsList, subagentSearch, subagentRun]
+
+    /// Tools that require an imported project (a root to operate in). The sub-agent
+    /// resolver drops these when no project is loaded.
+    public static let projectScoped: Set<String> = [
+        "project_list", "project_read", "project_search", "project_edit", "project_write",
+        "file_read", "file_write", "git",
+    ]
 
     public static func builtin(named name: String) -> BuiltinTool? {
         builtins.first { $0.spec.name == name }
@@ -134,6 +141,27 @@ public enum ToolRegistry {
             guard let f = stringArg(argsJSON, "find") else { return "Argomento 'find' mancante." }
             let r = stringArg(argsJSON, "replace") ?? ""
             return ProjectCache.shared.editTool(path: p, find: f, replace: r)
+        })
+
+    /// Read any file inside the project root (raw, not limited to the index).
+    static let fileRead = BuiltinTool(
+        spec: ToolSpec(name: "file_read",
+                       description: "Leggi un file QUALSIASI dentro la radice del progetto importato (anche non indicizzato), restituito come testo. Per letture paginate dei file indicizzati usa project_read.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice del progetto"}},"required":["path"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            return ProjectCache.shared.readFileTool(path: p)
+        })
+
+    /// Create/overwrite any file inside the project root (any extension).
+    static let fileWrite = BuiltinTool(
+        spec: ToolSpec(name: "file_write",
+                       description: "Crea o sovrascrivi un file QUALSIASI dentro la radice del progetto importato (qualunque estensione); crea le cartelle intermedie. Per piccole modifiche a file esistenti preferisci project_edit.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"contenuto completo del file"}},"required":["path","content"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
+            return ProjectCache.shared.writeFileTool(path: p, content: c)
         })
 
     static let git = BuiltinTool(

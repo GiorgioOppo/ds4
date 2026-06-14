@@ -34,7 +34,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Alla fine riassumi in 2-3 frasi cosa hai cambiato e dove (file:riga). Se il task è ambiguo o rischioso, fermati e chiedi.
               """,
               toolNames: ["project_list", "project_read", "project_search",
-                          "project_write", "project_edit", "git"]),
+                          "project_write", "project_edit", "file_read", "file_write", "git"]),
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
               systemPrompt: """
               Sei un orchestratore: scomponi il compito e DELEGA a sub-agent isolati, senza leggere o modificare tu stesso i file.

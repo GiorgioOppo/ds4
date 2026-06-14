@@ -282,4 +282,57 @@ public final class ProjectCache: @unchecked Sendable {
         }
         lock.unlock()
     }
+
+    // MARK: - Raw file read/write (any file inside the project root)
+
+    /// Validate a relative path against the project root: inside it, no traversal.
+    /// Unlike `writableURL`, no text-extension restriction (raw files allowed).
+    private func rootRelativeURL(_ relPath: String) -> URL? {
+        guard let root = rootURL() else { return nil }
+        guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
+        let url = root.appendingPathComponent(relPath).standardizedFileURL
+        guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
+        return url
+    }
+
+    /// Read ANY file inside the project root (not just the index), decoded as text
+    /// and capped. Returns an error string for binary/unreadable content.
+    public func readFileTool(path relPath: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            return "File non trovato o illeggibile: '\(relPath)'."
+        }
+        let cap = 96 * 1024
+        guard let text = String(data: data.prefix(cap), encoding: .utf8) else {
+            return "File non testuale ('\(relPath)', \(data.count) byte): non leggibile come testo."
+        }
+        var out = "\(relPath) (\(data.count) byte):\n\(text)"
+        if data.count > cap { out += "\n… (troncato a \(cap / 1024) KB; usa project_read per letture paginate dei file indicizzati)" }
+        return out
+    }
+
+    /// Create or overwrite ANY file inside the project root (any extension; creates
+    /// intermediate dirs). Updates the index when the file is textual so
+    /// project_read/search stay consistent.
+    public func writeFileTool(path relPath: String, content: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        let existed = FileManager.default.fileExists(atPath: url.path)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            return "Scrittura fallita: \(error.localizedDescription)"
+        }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: content) }
+        let lines = content.components(separatedBy: "\n").count
+        return "\(existed ? "Sovrascritto" : "Creato") '\(relPath)' (\(lines) righe)."
+    }
 }
