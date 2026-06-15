@@ -73,10 +73,12 @@ final class ChatStore {
 
     // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
     // restores matching prefixes on cold starts. Applied on the NEXT model load.
-    var diskKVEnabled: Bool = UserDefaults.standard.bool(forKey: "DS4DiskKV") {
+    // ON by default (8 GB budget) so conversations are checkpointed and re-prefill
+    // is avoided across reloads; the explicit user choice is then persisted.
+    var diskKVEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
     }
-    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 4096 {
+    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192 {
         didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
