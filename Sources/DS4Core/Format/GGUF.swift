@@ -239,6 +239,21 @@ public final class GGUFModel {
     /// Base of the mmap, for reading tensor bytes by absolute offset.
     public var mapBase: UnsafeRawPointer { UnsafeRawPointer(base) }
 
+    /// Hint the OS to read these mmap byte ranges ahead (POSIX_MADV_WILLNEED), so
+    /// the SSD I/O for the NEXT layer overlaps the current layer's compute. A pure
+    /// advisory on the read-only mapping — it cannot affect correctness. Static so
+    /// a caller can run it on a background queue capturing only Sendable values
+    /// (the base pointer + the precomputed ranges), never the model itself.
+    public static func prefetch(base: UnsafeRawPointer, ranges: [(offset: UInt64, bytes: UInt64)]) {
+        let page = Int(getpagesize())
+        let m = UnsafeMutableRawPointer(mutating: base)
+        for r in ranges where r.bytes > 0 {
+            let start = Int(r.offset)
+            let lo = start - (start % page)                       // page-align down
+            _ = posix_madvise(m.advanced(by: lo), (start - lo) + Int(r.bytes), POSIX_MADV_WILLNEED)
+        }
+    }
+
     /// Open and map the GGUF. `metalMapping` uses MAP_SHARED (for no-copy Metal
     /// buffers); otherwise MAP_PRIVATE.
     public init(path: String, metalMapping: Bool = true, prefetchCPU: Bool = false) throws {
