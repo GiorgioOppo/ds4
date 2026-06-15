@@ -230,13 +230,10 @@ final class ChatStore {
     /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
     var awaitingManualResults = false
     private var partialAutoOutputs: [ToolOutput] = []
-    /// Guard against a tool loop (model re-calling instead of answering).
-    /// Agentic roles (write tools) get a larger budget: a code task legitimately
-    /// chains many explore/read/edit/verify rounds.
+    /// Tool-loop bound. Illimitato su richiesta: il loop si ferma comunque quando
+    /// il contesto è pieno o l'utente preme Stop.
     private var toolRounds = 0
-    private var maxToolRounds: Int {
-        selectedAgent.toolNames.contains("project_write") ? 16 : 6
-    }
+    private var maxToolRounds: Int { .max }
 
     // Live state.
     var phase: Phase = .needsModel

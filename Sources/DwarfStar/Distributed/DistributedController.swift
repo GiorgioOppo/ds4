@@ -55,11 +55,9 @@ final class DistributedController {
     /// re-rendered in full on every send (stateless coordinator).
     private var turns: [ChatTurn] = []
     private var toolRounds = 0
-    /// Agentic roles (write tools) get a larger budget — but distributed rounds
-    /// re-prefill the whole conversation, so keep it tighter than local.
-    private var maxToolRounds: Int {
-        selectedAgent.toolNames.contains("project_write") ? 10 : 4
-    }
+    /// Tool-loop bound. Illimitato su richiesta (nota: ogni round distribuito
+    /// ri-prefilla l'intera conversazione). Si ferma per contesto pieno o Stop.
+    private var maxToolRounds: Int { .max }
 
     // Agent (role): same library as the local chat, own selection. Tools run
     // LOCALLY on this (coordinator) Mac — incl. project_* against the active project.

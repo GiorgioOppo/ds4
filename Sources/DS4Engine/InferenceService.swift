@@ -359,7 +359,7 @@ public actor InferenceService {
     /// the sub-agent's internal tool rounds happen in a separate, discarded context.
     /// The target's content prefix is cached (content-keyed) and reused next time.
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
-                            maxTokens: Int = 1024, maxRounds: Int = 6) async throws -> SubAgentRun {
+                            maxTokens: Int = 1024, maxRounds: Int = .max) async throws -> SubAgentRun {
         let ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
