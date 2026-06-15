@@ -32,14 +32,14 @@ public enum ToolRegistry {
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
                                                  projectWrite, projectEdit,
-                                                 fileRead, fileWrite, fileAdd, fileModify, git,
+                                                 fileRead, fileLines, fileWrite, fileAdd, fileModify, git,
                                                  agentsList, subagentSearch, subagentRun]
 
     /// Tools that require an imported project (a root to operate in). The sub-agent
     /// resolver drops these when no project is loaded.
     public static let projectScoped: Set<String> = [
         "project_list", "project_read", "project_search", "project_edit", "project_write",
-        "file_read", "file_write", "file_add", "file_modify", "git",
+        "file_read", "file_lines", "file_write", "file_add", "file_modify", "git",
     ]
 
     public static func builtin(named name: String) -> BuiltinTool? {
@@ -156,6 +156,16 @@ public enum ToolRegistry {
             return ProjectCache.shared.readFileTool(path: p,
                                                     fromLine: intArg(argsJSON, "from_line"),
                                                     toLine: intArg(argsJSON, "to_line"))
+        })
+
+    /// Count the lines of a file (for choosing line ranges).
+    static let fileLines = BuiltinTool(
+        spec: ToolSpec(name: "file_lines",
+                       description: "Conta le righe (e i byte) di un file dentro la radice del progetto. Utile PRIMA di file_read/file_modify/file_add per scegliere correttamente gli intervalli di riga.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"}},"required":["path"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            return ProjectCache.shared.lineCountTool(path: p)
         })
 
     /// Create/overwrite the WHOLE file inside the project root.

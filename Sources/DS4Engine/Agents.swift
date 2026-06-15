@@ -33,8 +33,8 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               5) Se il repo è git e l'utente lo chiede, committa con git "commit -am <messaggio conciso>".
               Alla fine riassumi in 2-3 frasi cosa hai cambiato e dove (file:riga). Se il task è ambiguo o rischioso, fermati e chiedi.
               """,
-              toolNames: ["project_list", "project_read", "project_search",
-                          "project_edit", "file_read", "file_add", "file_modify", "git"]),
+              toolNames: ["project_list", "project_read", "project_search", "project_edit",
+                          "file_read", "file_lines", "file_add", "file_modify", "git"]),
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
               systemPrompt: """
               Sei un orchestratore: scomponi il compito e DELEGA a sub-agent isolati, senza leggere o modificare tu stesso i file.
@@ -58,7 +58,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Se è importato un progetto, salva i documenti con file_write (es. doc.tex) e fai piccole modifiche con project_edit; leggi riferimenti e file esistenti con project_read/project_search. Senza progetto, restituisci il LaTeX completo nella risposta.
               """,
               toolNames: ["project_read", "project_search",
-                          "file_read", "file_write", "file_add", "file_modify"]),
+                          "file_read", "file_lines", "file_write", "file_add", "file_modify"]),
         .init(id: "documentatore", name: "Documentazione", icon: "book.closed",
               systemPrompt: """
               Documenti un progetto in Markdown. Procedi in 4 passi:
@@ -69,7 +69,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Documenta SOLO ciò che hai letto nel codice (niente invenzioni). Concludi con l'elenco dei file di documentazione creati/aggiornati.
               """,
               toolNames: ["project_list", "project_read", "project_search",
-                          "file_read", "file_write", "file_add", "file_modify"]),
+                          "file_read", "file_lines", "file_write", "file_add", "file_modify"]),
     ]
 }
 

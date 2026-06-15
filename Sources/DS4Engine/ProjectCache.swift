@@ -331,6 +331,22 @@ public final class ProjectCache: @unchecked Sendable {
         return out
     }
 
+    /// Count the lines (and bytes) of a file in the project root. Uses the SAME
+    /// split as file_read/file_modify/file_add so the line numbers are consistent.
+    public func lineCountTool(path relPath: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            return "File non trovato o illeggibile: '\(relPath)'."
+        }
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "File non testuale ('\(relPath)', \(data.count) byte)."
+        }
+        let lines = text.components(separatedBy: "\n").count
+        return "\(relPath): \(lines) righe, \(data.count) byte."
+    }
+
     /// Create or overwrite the WHOLE file inside the project root (any extension;
     /// creates intermediate dirs). For line-level changes use addLinesTool /
     /// modifyLinesTool. Updates the index when the file is textual.
