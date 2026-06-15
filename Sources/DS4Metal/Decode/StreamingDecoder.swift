@@ -685,12 +685,14 @@ public final class StreamingDecoder {
             }, warm: { il in usage.top(layer: il, n: S) })
         }
         // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
-        // compute. Resolve the byte ranges on the decode thread (the non-routed
-        // weights, plus the usage-prior hottest experts), then madvise WILLNEED on a
-        // background queue. Hint-only — cannot affect numerics. Tunable: DS4_PREFETCH=0
-        // disables; DS4_PREFETCH_EXPERTS sets the speculative expert count (0 = dense only).
-        let prefetchOn = ProcessInfo.processInfo.environment["DS4_PREFETCH"] != "0"
-        let prefetchExperts = ProcessInfo.processInfo.environment["DS4_PREFETCH_EXPERTS"].flatMap(Int.init) ?? 8
+        // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
+        // can STEAL SSD bandwidth from the real gather (worse when the usage prior is
+        // cold) — it must be measured per machine. Opt in with DS4_PREFETCH=1 (then
+        // it prefetches the always-needed non-routed weights). DS4_PREFETCH_EXPERTS>0
+        // additionally prefetches that many usage-prior experts (speculative; off by
+        // default). Hint-only on the read-only mapping — cannot affect numerics.
+        let prefetchOn = ProcessInfo.processInfo.environment["DS4_PREFETCH"] == "1"
+        let prefetchExperts = ProcessInfo.processInfo.environment["DS4_PREFETCH_EXPERTS"].flatMap(Int.init) ?? 0
         let denseNames = ["hc_attn_fn.weight", "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
                           "attn_output_a.weight", "attn_output_b.weight", "hc_ffn_fn.weight",
                           "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
