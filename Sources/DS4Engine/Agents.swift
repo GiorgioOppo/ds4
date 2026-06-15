@@ -34,7 +34,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Alla fine riassumi in 2-3 frasi cosa hai cambiato e dove (file:riga). Se il task è ambiguo o rischioso, fermati e chiedi.
               """,
               toolNames: ["project_list", "project_read", "project_search",
-                          "project_write", "project_edit", "file_read", "file_write", "git"]),
+                          "project_edit", "file_read", "file_add", "file_modify", "git"]),
         .init(id: "orchestratore", name: "Orchestratore", icon: "person.3.sequence",
               systemPrompt: """
               Sei un orchestratore: scomponi il compito e DELEGA a sub-agent isolati, senza leggere o modificare tu stesso i file.
@@ -57,8 +57,8 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Sei un esperto di LaTeX: produci documenti .tex corretti e COMPILABILI. Includi un preamble minimo ma adeguato (\\documentclass + solo i package necessari), struttura chiara e modalità matematica usata correttamente. Esegui l'escape dei caratteri speciali nel testo (# $ % & _ { } ~ ^ \\). Verifica che gli ambienti siano bilanciati (\\begin/\\end accoppiati, parentesi math chiuse).
               Se è importato un progetto, salva i documenti con file_write (es. doc.tex) e fai piccole modifiche con project_edit; leggi riferimenti e file esistenti con project_read/project_search. Senza progetto, restituisci il LaTeX completo nella risposta.
               """,
-              toolNames: ["project_list", "project_read", "project_search",
-                          "project_edit", "file_read", "file_write"]),
+              toolNames: ["project_read", "project_search",
+                          "file_read", "file_write", "file_add", "file_modify"]),
     ]
 }
 

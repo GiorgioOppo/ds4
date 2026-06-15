@@ -26,18 +26,20 @@ public struct ToolOutput: Sendable, Equatable {
 }
 
 public enum ToolRegistry {
-    /// The built-in tools. project_write/project_edit/file_write have side effects
-    /// (they modify files INSIDE the active project root only); everything else is pure.
+    /// The built-in tools. project_write/project_edit and file_write/file_add/
+    /// file_modify have side effects (they modify files INSIDE the active project
+    /// root only); everything else is pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  projectList, projectRead, projectSearch,
-                                                 projectWrite, projectEdit, fileRead, fileWrite, git,
+                                                 projectWrite, projectEdit,
+                                                 fileRead, fileWrite, fileAdd, fileModify, git,
                                                  agentsList, subagentSearch, subagentRun]
 
     /// Tools that require an imported project (a root to operate in). The sub-agent
     /// resolver drops these when no project is loaded.
     public static let projectScoped: Set<String> = [
         "project_list", "project_read", "project_search", "project_edit", "project_write",
-        "file_read", "file_write", "git",
+        "file_read", "file_write", "file_add", "file_modify", "git",
     ]
 
     public static func builtin(named name: String) -> BuiltinTool? {
@@ -156,17 +158,38 @@ public enum ToolRegistry {
                                                     toLine: intArg(argsJSON, "to_line"))
         })
 
-    /// Create/overwrite any file inside the project root, or splice a line range.
+    /// Create/overwrite the WHOLE file inside the project root.
     static let fileWrite = BuiltinTool(
         spec: ToolSpec(name: "file_write",
-                       description: "Scrivi un file QUALSIASI dentro la radice del progetto importato (qualunque estensione; crea le cartelle). Senza from_line/to_line crea o sovrascrive l'INTERO file. Con from_line/to_line (1-based, incluse) SOSTITUISCE quelle righe di un file esistente con 'content' (content vuoto = cancella le righe; to_line omesso = una sola riga). Per sostituzioni puntuali su testo esatto preferisci project_edit.",
-                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"contenuto (intero file, oppure le righe sostitutive)"},"from_line":{"type":"number","description":"prima riga da sostituire, 1-based (opzionale)"},"to_line":{"type":"number","description":"ultima riga da sostituire inclusa, 1-based (opzionale)"}},"required":["path","content"]}"#),
+                       description: "Crea o sovrascrivi l'INTERO file dentro la radice del progetto importato (qualunque estensione; crea le cartelle). Per AGGIUNGERE righe usa file_add, per MODIFICARE righe esistenti usa file_modify.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"contenuto completo del file"}},"required":["path","content"]}"#),
         run: { argsJSON in
             guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
             guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
-            return ProjectCache.shared.writeFileTool(path: p, content: c,
-                                                     fromLine: intArg(argsJSON, "from_line"),
-                                                     toLine: intArg(argsJSON, "to_line"))
+            return ProjectCache.shared.writeFileTool(path: p, content: c)
+        })
+
+    /// ADD lines (insert) without overwriting.
+    static let fileAdd = BuiltinTool(
+        spec: ToolSpec(name: "file_add",
+                       description: "AGGIUNGI righe a un file (senza sovrascrivere): inserisce 'content' PRIMA della riga 'at_line' (1-based); senza 'at_line' accoda in fondo. Crea il file se non esiste.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"righe da inserire"},"at_line":{"type":"number","description":"inserisci prima di questa riga, 1-based (opzionale: in coda)"}},"required":["path","content"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
+            return ProjectCache.shared.addLinesTool(path: p, content: c, atLine: intArg(argsJSON, "at_line"))
+        })
+
+    /// MODIFY (replace) a line range.
+    static let fileModify = BuiltinTool(
+        spec: ToolSpec(name: "file_modify",
+                       description: "MODIFICA un file sostituendo le righe [from_line, to_line] (1-based, incluse) con 'content' (to_line omesso = una sola riga; 'content' vuoto = cancella quelle righe). Il file deve esistere. Per sostituzioni su testo esatto preferisci project_edit.",
+                       parametersJSON: #"{"type":"object","properties":{"path":{"type":"string","description":"percorso relativo alla radice"},"content":{"type":"string","description":"righe sostitutive (vuoto = cancella)"},"from_line":{"type":"number","description":"prima riga da sostituire, 1-based"},"to_line":{"type":"number","description":"ultima riga inclusa, 1-based (opzionale = from_line)"}},"required":["path","content","from_line"]}"#),
+        run: { argsJSON in
+            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
+            guard let c = stringArg(argsJSON, "content") else { return "Argomento 'content' mancante." }
+            guard let f = intArg(argsJSON, "from_line") else { return "Argomento 'from_line' mancante." }
+            return ProjectCache.shared.modifyLinesTool(path: p, content: c, fromLine: f, toLine: intArg(argsJSON, "to_line"))
         })
 
     static let git = BuiltinTool(

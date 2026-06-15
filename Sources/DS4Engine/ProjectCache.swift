@@ -331,43 +331,16 @@ public final class ProjectCache: @unchecked Sendable {
         return out
     }
 
-    /// Write ANY file inside the project root (any extension; creates dirs). Without
-    /// a range: create/overwrite the whole file. With `fromLine`/`toLine` (1-based,
-    /// inclusive): SPLICE — replace those lines of an existing file with `content`
-    /// (empty content deletes them; `toLine` omitted = one line; `fromLine` = lines+1
-    /// appends). Updates the index when the file is textual.
-    public func writeFileTool(path relPath: String, content: String,
-                              fromLine: Int? = nil, toLine: Int? = nil) -> String {
+    /// Create or overwrite the WHOLE file inside the project root (any extension;
+    /// creates intermediate dirs). For line-level changes use addLinesTool /
+    /// modifyLinesTool. Updates the index when the file is textual.
+    public func writeFileTool(path relPath: String, content: String) -> String {
         guard let url = rootRelativeURL(relPath) else {
             return "Nessun progetto importato o percorso non valido: '\(relPath)'."
         }
         guard content.utf8.count <= Self.maxFileBytes else {
             return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
         }
-        let textual = Self.textExtensions.contains(url.pathExtension.lowercased())
-
-        // Line-range splice into an existing text file.
-        if let f = fromLine {
-            guard let data = try? Data(contentsOf: url), let existing = String(data: data, encoding: .utf8) else {
-                return "File non trovato o non testuale: '\(relPath)' (la scrittura per righe richiede un file di testo esistente)."
-            }
-            var lines = existing.components(separatedBy: "\n")
-            let n = lines.count
-            let from = max(1, f)
-            guard from <= n + 1 else { return "from_line \(from) oltre la fine del file (\(n) righe)." }
-            // Inclusive end: single line if toLine omitted; (from-1) = pure insertion; append when from=n+1.
-            let to = min(max(from - 1, toLine ?? from), n)
-            let newLines = content.isEmpty ? [] : content.components(separatedBy: "\n")
-            let removed = to - (from - 1)
-            lines.replaceSubrange((from - 1)..<to, with: newLines)
-            let updated = lines.joined(separator: "\n")
-            do { try updated.write(to: url, atomically: true, encoding: .utf8) }
-            catch { return "Scrittura fallita: \(error.localizedDescription)" }
-            if textual { upsertIndex(relPath, content: updated) }
-            return "Righe \(from)\(to >= from ? "-\(to)" : " (inserimento)") di '\(relPath)': \(removed) rimosse → \(newLines.count) inserite."
-        }
-
-        // Whole-file create/overwrite.
         let existed = FileManager.default.fileExists(atPath: url.path)
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
@@ -376,8 +349,71 @@ public final class ProjectCache: @unchecked Sendable {
         } catch {
             return "Scrittura fallita: \(error.localizedDescription)"
         }
-        if textual { upsertIndex(relPath, content: content) }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: content) }
         let lines = content.components(separatedBy: "\n").count
         return "\(existed ? "Sovrascritto" : "Creato") '\(relPath)' (\(lines) righe)."
+    }
+
+    /// ADD lines WITHOUT overwriting: insert `content` before line `atLine` (1-based);
+    /// `atLine` omitted or beyond the end appends. Creates the file if absent.
+    /// Updates the index when the file is textual.
+    public func addLinesTool(path relPath: String, content: String, atLine: Int? = nil) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard !content.isEmpty else { return "Niente da aggiungere ('content' vuoto)." }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        // New file: just create it.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return writeFileTool(path: relPath, content: content)
+        }
+        guard let data = try? Data(contentsOf: url), let existing = String(data: data, encoding: .utf8) else {
+            return "File non testuale: '\(relPath)'."
+        }
+        var lines = existing.components(separatedBy: "\n")
+        let n = lines.count
+        let newLines = content.components(separatedBy: "\n")
+        let at = min(max(1, atLine ?? (n + 1)), n + 1)        // insert BEFORE this line; n+1 = append
+        lines.insert(contentsOf: newLines, at: at - 1)
+        let updated = lines.joined(separator: "\n")
+        guard updated.utf8.count <= Self.maxFileBytes else {
+            return "File risultante troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        catch { return "Scrittura fallita: \(error.localizedDescription)" }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
+        return "Aggiunte \(newLines.count) righe a '\(relPath)' \(at > n ? "in coda" : "prima della riga \(at)")."
+    }
+
+    /// MODIFY by REPLACING lines [fromLine, toLine] (1-based, inclusive) of an
+    /// existing text file with `content` (`toLine` omitted = a single line; empty
+    /// `content` = delete those lines). Updates the index when the file is textual.
+    public func modifyLinesTool(path relPath: String, content: String, fromLine: Int, toLine: Int? = nil) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        guard let data = try? Data(contentsOf: url), let existing = String(data: data, encoding: .utf8) else {
+            return "File non trovato o non testuale: '\(relPath)'."
+        }
+        var lines = existing.components(separatedBy: "\n")
+        let n = lines.count
+        guard fromLine >= 1, fromLine <= n else {
+            return "from_line \(fromLine) fuori intervallo (1…\(n)). Per aggiungere righe usa file_add."
+        }
+        let from = fromLine
+        let to = min(max(from, toLine ?? from), n)
+        let newLines = content.isEmpty ? [] : content.components(separatedBy: "\n")
+        let removed = to - from + 1
+        lines.replaceSubrange((from - 1)..<to, with: newLines)
+        let updated = lines.joined(separator: "\n")
+        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        catch { return "Scrittura fallita: \(error.localizedDescription)" }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
+        return "Modificate righe \(from)-\(to) di '\(relPath)': \(removed) rimosse → \(newLines.count) inserite."
     }
 }
