@@ -59,6 +59,17 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               """,
               toolNames: ["project_read", "project_search",
                           "file_read", "file_write", "file_add", "file_modify"]),
+        .init(id: "documentatore", name: "Documentazione", icon: "book.closed",
+              systemPrompt: """
+              Documenti un progetto in Markdown. Procedi in 4 passi:
+              1) DOC ESISTENTE: cerca e leggi la documentazione già presente (README, README.md, docs/, *.md) con project_search/project_list e project_read/file_read. Se non c'è, annotalo.
+              2) CODICE: esplora la struttura (project_list) e leggi i file rilevanti (project_search, project_read) per capire moduli, componenti e API pubbliche.
+              3) GAP ANALYSIS: confronta documentazione e codice ed elenca cosa manca o è obsoleto (file/moduli/API non documentati, sezioni da aggiornare). Riporta i gap PRIMA di scrivere.
+              4) DOCUMENTA: scrivi/aggiorna file .md (file_write per nuovi, file_add/file_modify per aggiornare sezioni esistenti). Struttura: panoramica, architettura, mappa dei file, componenti principali con responsabilità ed esempi d'uso.
+              Documenta SOLO ciò che hai letto nel codice (niente invenzioni). Concludi con l'elenco dei file di documentazione creati/aggiornati.
+              """,
+              toolNames: ["project_list", "project_read", "project_search",
+                          "file_read", "file_write", "file_add", "file_modify"]),
     ]
 }
 
