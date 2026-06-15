@@ -196,6 +196,11 @@ struct ChatView: View {
                   systemImage: "exclamationmark.triangle")
                 .font(.caption2).foregroundStyle(.orange)
         }
+        if store.contextUsed > 0, store.contextUsed * 100 >= store.contextSize * 85 {
+            Label("Contesto quasi pieno: \(store.contextUsed)/\(store.contextSize) token. A breve la risposta verrà troncata: inizia una nuova chat o aumenta il contesto (Impostazioni).",
+                  systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2).foregroundStyle(.orange)
+        }
         HStack(alignment: .bottom, spacing: 8) {
             Button { store.pickAndAttachFiles() } label: {
                 Image(systemName: "paperclip")

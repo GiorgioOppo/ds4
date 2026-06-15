@@ -253,6 +253,8 @@ final class ChatStore {
     var think = false
     var isGenerating = false
     var status = ""          // live prefill/decode progress
+    /// Tokens committed to the KV (≈ context used); drives the near-full warning.
+    var contextUsed = 0
 
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
@@ -476,6 +478,7 @@ final class ChatStore {
         messages.removeAll()
         attachments = []
         attachmentNote = nil
+        contextUsed = 0
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false
@@ -506,7 +509,13 @@ final class ChatStore {
     }
 
     private func finishIfIdle() {
-        if pendingManualCalls.isEmpty { isGenerating = false; status = "" }
+        if pendingManualCalls.isEmpty { isGenerating = false; status = ""; refreshContextUsage() }
+    }
+
+    /// Refresh the committed-token count (context usage) from the engine.
+    private func refreshContextUsage() {
+        guard let service else { contextUsed = 0; return }
+        Task { contextUsed = await service.committedTokens() }
     }
 
     /// Drain one generation stream into the assistant message at `index`.

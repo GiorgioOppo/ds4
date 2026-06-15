@@ -237,6 +237,9 @@ public actor InferenceService {
     /// The raw Jinja chat template embedded in the GGUF (for inspection), if any.
     public func chatTemplate() -> String? { model.string("tokenizer.chat_template") }
 
+    /// Tokens currently committed to the KV (used to warn before the context fills).
+    public func committedTokens() -> Int { committedIds.count }
+
     public struct BenchPoint: Sendable {
         public let contextTokens: Int
         public let prefillTps: Double
