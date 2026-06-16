@@ -64,6 +64,29 @@ targets:
       - target: DS4Metal
       - sdk: Metal.framework
 
+  # Unit tests for the pure-Swift engine — mirrors the SwiftPM DS4CoreTests
+  # target so `swift test` and the Xcode test action exercise the same files.
+  # A logic-test bundle (no host app): it links the static engine libraries and
+  # @testable-imports them (Debug builds enable testability). Metal kernel tests
+  # still self-skip unless their (currently hardcoded) metalDir exists.
+  DS4CoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/DS4CoreTests
+        excludes: ["**/README.md", "README.md"]
+    dependencies:
+      - target: DS4Core
+      - target: DS4Metal
+      - target: DS4Engine
+      - sdk: Metal.framework
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.dwarfstar.tests
+        # Codeless/logic test bundle — no signing identity needed locally.
+        CODE_SIGN_STYLE: Automatic
+
   DwarfStar:
     type: application
     platform: macOS
@@ -75,6 +98,13 @@ targets:
       - target: DS4Core
       - target: DS4Metal
       - sdk: Metal.framework
+    # Generate a DwarfStar scheme whose Test action runs the engine unit tests
+    # (⌘U in Xcode). Without this the test bundle would exist but no scheme would
+    # drive it.
+    scheme:
+      testTargets:
+        - DS4CoreTests
+      gatherCoverageData: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
