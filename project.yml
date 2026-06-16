@@ -29,13 +29,15 @@ targets:
     type: library.static
     platform: macOS
     sources:
-      - Sources/DS4Core
+      - path: Sources/DS4Core
+        excludes: ["**/README.md", "README.md"]
 
   DS4Metal:
     type: library.static
     platform: macOS
     sources:
-      - Sources/DS4Metal
+      - path: Sources/DS4Metal
+        excludes: ["**/README.md", "README.md"]
     dependencies:
       - target: DS4Core
       - sdk: Metal.framework
@@ -44,7 +46,8 @@ targets:
     type: library.static
     platform: macOS
     sources:
-      - Sources/DS4Engine
+      - path: Sources/DS4Engine
+        excludes: ["**/README.md", "README.md"]
     dependencies:
       - target: DS4Core
       - target: DS4Metal
@@ -54,7 +57,8 @@ targets:
     type: tool
     platform: macOS
     sources:
-      - Sources/DS4Demo
+      - path: Sources/DS4Demo
+        excludes: ["**/README.md", "README.md"]
     dependencies:
       - target: DS4Core
       - target: DS4Metal
@@ -64,7 +68,8 @@ targets:
     type: application
     platform: macOS
     sources:
-      - Sources/DwarfStar
+      - path: Sources/DwarfStar
+        excludes: ["**/README.md", "README.md"]
     dependencies:
       - target: DS4Engine
       - target: DS4Core
