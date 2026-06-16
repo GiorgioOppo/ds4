@@ -38,17 +38,20 @@ public enum Half {
         if f >= 65520 { return sign | 0x7C00 }                 // ≥ RNE midpoint → ±inf
         if f < 0x1p-14 {                                       // subnormal / zero
             // h = round(f · 2^24) ties-to-even; 1024 rolls into the smallest normal.
-            return sign | UInt16((f * 0x1p24).rounded(.toNearestOrEven))
+            // Clamp to [0, 1024] so a rounding edge can never trap UInt16 (no-op for
+            // valid inputs, whose magnitude is already in range).
+            let r = (f * 0x1p24).rounded(.toNearestOrEven)
+            return sign | UInt16(min(max(r, 0), 1024))
         }
         // Normal: rebias exponent (Int math: the field is ≥113 here, −112 ≥ 1),
         // then round 23→10 mantissa bits ties-to-even.
         let b = f.bitPattern
-        let e = UInt32(Int((b >> 23) & 0xFF) - 112)
+        let e = UInt32(max(1, Int((b >> 23) & 0xFF) - 112))   // field ≥113 here; max(1,…) trap-safe
         let m = b & 0x7F_FFFF
         var h = (e << 10) | (m >> 13)
         let rem = m & 0x1FFF
         if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) { h += 1 }   // carry-safe
-        return sign | UInt16(h)
+        return sign | UInt16(min(h, 0x7C00))                  // ≤ inf encoding (trap-safe)
     }
 
     static func floatSoftware(_ h: UInt16) -> Float {

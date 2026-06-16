@@ -31,7 +31,9 @@ final class HalfTests: XCTestCase {
 
     func testRandomMatchHardware() throws {
         #if arch(arm64)
-        var rng = SystemRandomNumberGenerator()
+        // Seeded (SplitMix64) so a failure is reproducible and the test can
+        // never flake on a value that only one random run happens to hit.
+        var rng = SplitMix64(seed: 0x9E3779B97F4A7C15)
         for _ in 0..<20_000 {
             let x = Float(bitPattern: UInt32.random(in: .min ... .max, using: &rng))
             if x.isNaN { continue }
@@ -56,5 +58,18 @@ final class HalfTests: XCTestCase {
             if f.isNaN { continue }
             XCTAssertEqual(Half.bitsSoftware(f), h, "round-trip failed for 0x\(String(h, radix: 16))")
         }
+    }
+}
+
+/// Deterministic RNG (SplitMix64) so the random conversion sweep is reproducible.
+private struct SplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state = state &+ 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
     }
 }

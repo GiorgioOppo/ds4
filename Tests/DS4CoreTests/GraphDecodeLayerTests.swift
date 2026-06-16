@@ -36,7 +36,7 @@ final class GraphDecodeLayerTests: XCTestCase {
 
     func testDecodeLayerSmoke() throws {
         let rt = try makeRuntime()
-        var d = DSV4Dims(nEmbd: 512, nHC: 4, headDim: 512, nHead: 2, qRank: 256, qDim: 1024,
+        let d = DSV4Dims(nEmbd: 512, nHC: 4, headDim: 512, nHead: 2, qRank: 256, qDim: 1024,
                          sharedFfn: 512, nExperts: 256, expertFfn: 256, k: 6, nRot: 64, vocab: 1000, nOutGroup: 2, nLoraO: 128)
         let hcDim = d.nHC * d.nEmbd
         let nKeys = 32, pos = 0

@@ -58,10 +58,13 @@ let package = Package(
         .executableTarget(
             name: "DwarfStar",
             dependencies: ["DS4Engine"],
+            // Assets.xcassets is the .app icon catalog: consumed by the xcodegen
+            // .xcodeproj build, but SwiftPM has no asset-catalog compiler — exclude
+            // it here so `swift build`/`swift test` don't warn about unhandled files.
             exclude: ["README.md", "App/README.md", "Chat/README.md", "Models/README.md",
                       "Project/README.md", "Tuning/README.md", "Server/README.md",
                       "Distributed/README.md", "Bench/README.md", "Diagnostics/README.md",
-                      "Settings/README.md", "Support/README.md"]
+                      "Settings/README.md", "Support/README.md", "Assets.xcassets"]
         ),
 
         // Pure-Swift engine demo CLI: drives DS4Core + DS4Metal directly (Metal
