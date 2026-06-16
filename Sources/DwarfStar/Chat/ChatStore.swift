@@ -64,6 +64,16 @@ final class ChatStore {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        // Restore the persisted chats (newest first). Always keep at least one so
+        // there is an active conversation to write into.
+        sessions = ChatSessionStore.loadAll()
+        if let first = sessions.first {
+            activeSessionId = first.id
+        } else {
+            let s = ChatSession(agentId: selectedAgentId, systemNote: systemPrompt)
+            sessions = [s]
+            activeSessionId = s.id
+        }
     }
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
@@ -200,15 +210,7 @@ final class ChatStore {
 
     func selectAgent(_ id: String) {
         selectedAgentId = id
-        generation?.cancel()
-        isGenerating = false
-        status = ""
-        messages.removeAll()
-        pendingManualCalls = []
-        partialAutoOutputs = []
-        awaitingManualResults = false
-        toolRounds = 0
-        applyAgent()
+        startNewChat()   // a role switch starts a fresh persisted chat with that role
     }
 
     // Discovered GGUF files on disk.
@@ -267,6 +269,19 @@ final class ChatStore {
     var status = ""          // live prefill/decode progress
     /// Tokens committed to the KV (≈ context used); drives the near-full warning.
     var contextUsed = 0
+
+    // MARK: - Chat sessions (persistent, multiple)
+
+    /// All persisted chats, newest first. The active one's transcript is mirrored
+    /// in `messages`; the others live on disk and are loaded on demand.
+    var sessions: [ChatSession] = []
+    /// Id of the chat currently shown in `messages`.
+    var activeSessionId: String = ""
+    /// True when the engine's KV already holds the active chat. False right after a
+    /// persisted chat is restored: the next send re-primes the engine from the
+    /// visible history (the disk-KV cache restores the prefix), after which turns
+    /// are incremental again.
+    private var enginePrimed = true
 
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
@@ -328,7 +343,7 @@ final class ChatStore {
                     self.service = svc
                     self.info = info
                     self.phase = .ready
-                    self.applyAgent()   // role + tools + per-agent usage profile
+                    self.activate(self.activeSessionId)   // load the active chat + apply its role
                 }
             } catch {
                 await MainActor.run { self.phase = .failed("\(error)") }
@@ -357,16 +372,25 @@ final class ChatStore {
         input = ""
         attachments = []
         attachmentNote = nil
+        // If the engine doesn't hold this (reopened) chat yet, re-feed the prior
+        // turns on this first send. Capture them BEFORE appending the new rows.
+        let primed = enginePrimed
+        let history = primed ? [] : Self.chatTurns(from: messages)
+        let sys = primed ? nil : (resolvedAgent().systemPrompt.isEmpty ? nil : resolvedAgent().systemPrompt)
+        enginePrimed = true
         messages.append(UIMessage(role: .user, text: typed, attachments: atts.map(\.name)))
         let index = appendAssistant()
         isGenerating = true
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
+        persistActiveSession()             // checkpoint the user turn right away
 
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
         generation = Task { [weak self] in
-            let stream = await service.send(userText: text, thinkMode: mode,
-                                            sampling: params, maxTokens: 4096)
+            let stream = primed
+                ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
+                : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
+                                                thinkMode: mode, sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
@@ -480,22 +504,115 @@ final class ChatStore {
         Task { await service.resetExpertUsage(); refreshTuningInfo() }
     }
 
-    func newChat() {
-        guard let service else { return }
-        generation?.cancel()              // stop any in-flight generation/tool loop
+    // MARK: - Sessions (create / switch / delete / rename / persist)
+
+    func newChat() { startNewChat() }
+
+    /// Make a fresh persisted chat with the current role active. Reuses the current
+    /// chat if it's still empty (so flipping the agent before sending anything
+    /// doesn't pile up blank chats).
+    private func startNewChat() {
+        generation?.cancel()
         isGenerating = false
         status = ""
-        let agentSys = resolvedAgent().systemPrompt
-        let sys = agentSys.isEmpty ? nil : agentSys
-        messages.removeAll()
+        clearTransientTurnState()
+        contextUsed = 0
+        enginePrimed = true
+        if let i = sessions.firstIndex(where: { $0.id == activeSessionId }),
+           messages.isEmpty, sessions[i].messages.isEmpty {
+            sessions[i].agentId = selectedAgentId
+            sessions[i].systemNote = systemPrompt
+            ChatSessionStore.save(sessions[i])
+        } else {
+            persistActiveSession()
+            let session = ChatSession(agentId: selectedAgentId, systemNote: systemPrompt,
+                                      modelName: info?.name ?? "")
+            sessions.insert(session, at: 0)
+            activeSessionId = session.id
+            messages.removeAll()
+            ChatSessionStore.save(session)
+        }
+        applyAgent()                      // role + tools + usage profile + resetConversation
+    }
+
+    /// Switch to an existing chat: persist the current one, then restore the target.
+    func switchSession(_ id: String) {
+        guard id != activeSessionId else { return }
+        persistActiveSession()
+        activate(id)
+    }
+
+    func deleteSession(_ id: String) {
+        let wasActive = (id == activeSessionId)
+        ChatSessionStore.delete(id)
+        sessions.removeAll { $0.id == id }
+        guard wasActive else { return }
+        if let next = sessions.first { activate(next.id) } else { startNewChat() }
+    }
+
+    func renameSession(_ id: String, to title: String) {
+        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[i].title = trimmed.isEmpty ? ChatSession.untitled : trimmed
+        ChatSessionStore.save(sessions[i])
+    }
+
+    /// Restore a session into the live UI and reset the engine to its role (without
+    /// persisting the previous one — callers do that first when needed). A non-empty
+    /// chat must re-prime on the next send, since the engine no longer holds its KV.
+    private func activate(_ id: String) {
+        guard let target = sessions.first(where: { $0.id == id }) else { return }
+        generation?.cancel()
+        isGenerating = false
+        status = ""
+        clearTransientTurnState()
+        activeSessionId = id
+        messages = target.messages.map { UIMessage(stored: $0) }
+        contextUsed = 0
+        systemPrompt = target.systemNote
+        if target.agentId != selectedAgentId, agents.contains(where: { $0.id == target.agentId }) {
+            selectedAgentId = target.agentId
+        }
+        enginePrimed = messages.isEmpty
+        applyAgent()                      // reset engine to the role; first send re-primes
+    }
+
+    /// Snapshot the live transcript into the active session and write it to disk.
+    /// Trailing/empty assistant placeholders are dropped so a chat interrupted
+    /// mid-generation doesn't reopen with a blank bubble.
+    private func persistActiveSession() {
+        guard let i = sessions.firstIndex(where: { $0.id == activeSessionId }) else { return }
+        let kept = messages.filter {
+            !($0.role == .assistant && $0.text.isEmpty && $0.reasoning.isEmpty
+              && $0.toolCalls.isEmpty && $0.subAgent == nil)
+        }
+        sessions[i].messages = kept.map { StoredMessage(from: $0) }
+        sessions[i].agentId = selectedAgentId
+        sessions[i].systemNote = systemPrompt
+        if let name = info?.name { sessions[i].modelName = name }
+        sessions[i].updatedAt = Date()
+        if sessions[i].title == ChatSession.untitled {
+            sessions[i].title = Self.deriveTitle(from: messages)
+        }
+        ChatSessionStore.save(sessions[i])
+    }
+
+    private func clearTransientTurnState() {
         attachments = []
         attachmentNote = nil
-        contextUsed = 0
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false
         toolRounds = 0
-        Task { await service.resetConversation(systemPrompt: sys) }
+    }
+
+    /// First non-empty user line, for an auto title.
+    private static func deriveTitle(from messages: [UIMessage]) -> String {
+        guard let first = messages.first(where: { $0.role == .user && !$0.text.isEmpty }) else {
+            return ChatSession.untitled
+        }
+        let line = first.text.split(separator: "\n").first.map(String.init) ?? first.text
+        return String(line.prefix(48))
     }
 
     // MARK: - Internals
@@ -521,7 +638,12 @@ final class ChatStore {
     }
 
     private func finishIfIdle() {
-        if pendingManualCalls.isEmpty { isGenerating = false; status = ""; refreshContextUsage() }
+        if pendingManualCalls.isEmpty {
+            isGenerating = false
+            status = ""
+            refreshContextUsage()
+            persistActiveSession()        // checkpoint the completed turn
+        }
     }
 
     /// Refresh the committed-token count (context usage) from the engine.
@@ -642,5 +764,78 @@ final class ChatStore {
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
         }
+    }
+}
+
+// MARK: - Persistence mapping (UIMessage <-> StoredMessage)
+
+extension ChatRole {
+    var persistedString: String {
+        switch self {
+        case .system: return "system"
+        case .user: return "user"
+        case .assistant: return "assistant"
+        case .tool: return "tool"
+        }
+    }
+    init(persisted: String) {
+        switch persisted {
+        case "user": self = .user
+        case "assistant": self = .assistant
+        case "tool": self = .tool
+        default: self = .system
+        }
+    }
+}
+
+extension StoredMessage {
+    init(from m: UIMessage) {
+        self.role = m.role.persistedString
+        self.reasoning = m.reasoning
+        self.text = m.text
+        self.attachments = m.attachments
+        self.toolCalls = m.toolCalls.map { StoredToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) }
+        self.subAgent = m.subAgent.map {
+            StoredSubAgent(target: $0.target, question: $0.question, answer: $0.answer, steps: $0.steps)
+        }
+    }
+}
+
+extension UIMessage {
+    init(stored s: StoredMessage) {
+        self.init(role: ChatRole(persisted: s.role),
+                  reasoning: s.reasoning,
+                  text: s.text,
+                  toolStreamText: "",
+                  toolCalls: s.toolCalls.map { ToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) },
+                  attachments: s.attachments,
+                  subAgent: s.subAgent.map {
+                      InferenceService.SubAgentRun(target: $0.target, question: $0.question,
+                                                   answer: $0.answer, steps: $0.steps)
+                  })
+    }
+}
+
+extension ChatStore {
+    /// Rebuild engine turns from the visible transcript to re-prime a reopened chat.
+    /// Attachments (one-shot context) are not restored; tool results are re-fed by
+    /// their displayed content so the model keeps the thread.
+    static func chatTurns(from messages: [UIMessage]) -> [ChatTurn] {
+        var turns: [ChatTurn] = []
+        for m in messages {
+            switch m.role {
+            case .user:
+                turns.append(.user(m.text))
+            case .assistant:
+                if m.text.isEmpty && m.toolCalls.isEmpty { continue }
+                turns.append(.assistant(text: m.text, toolCalls: m.toolCalls))
+            case .tool:
+                let content = m.subAgent?.answer ?? m.text
+                turns.append(.toolResult(callId: m.toolCalls.first?.id ?? "", name: "", content: content))
+            case .system:
+                continue
+            }
+        }
+        return turns
     }
 }

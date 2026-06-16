@@ -525,6 +525,25 @@ public actor InferenceService {
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
+    /// Re-prime a REOPENED conversation whose KV the engine no longer holds (the
+    /// GUI restored a persisted chat), then generate the reply. The prior `history`
+    /// turns + the new user turn are rendered as one prompt: on a cold KV the disk
+    /// cache restores the longest matching prefix (so this is NOT a full re-prefill
+    /// when the chat was checkpointed), and only the remainder is prefilled. After
+    /// this call the KV holds the whole conversation, so the next turns reuse it
+    /// incrementally via `send`. `tools` (set by the agent) are preserved.
+    public func sendWithHistory(_ history: [ChatTurn], userText: String, systemPrompt: String?,
+                                thinkMode: DS4ThinkMode, sampling: SamplingParams,
+                                maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+        resetConversation(systemPrompt: systemPrompt)
+        var turns: [ChatTurn] = self.systemPrompt.map { [.system($0)] } ?? []
+        turns.append(contentsOf: history)
+        turns.append(.user(userText))
+        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
+                                         markup: markup, compactTools: compactTools)
+        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+    }
+
     /// Append tool results (inside a user turn) and continue the assistant turn.
     public func provideToolResults(_ outputs: [ToolOutput], thinkMode: DS4ThinkMode,
                                    sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {

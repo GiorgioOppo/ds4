@@ -5,6 +5,7 @@ import DS4Core
 struct ChatView: View {
     @Bindable var store: ChatStore
     @State private var showTools = false
+    @State private var showChats = false
     @State private var projects: [ProjectLibrary.SavedProject] = []
     @State private var activeProjectName: String?
 
@@ -53,6 +54,15 @@ struct ChatView: View {
             temperatureMenu
             Toggle("Thinking", isOn: $store.think)
                 .toggleStyle(.switch)
+            Button {
+                showChats = true
+            } label: {
+                Label("Chat", systemImage: "bubble.left.and.bubble.right")
+            }
+            .popover(isPresented: $showChats, arrowEdge: .bottom) {
+                ChatListView(store: store)
+            }
+            .help("Apri, rinomina o elimina le conversazioni salvate")
             Button {
                 store.newChat()
             } label: {
