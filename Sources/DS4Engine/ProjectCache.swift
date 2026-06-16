@@ -119,12 +119,17 @@ public final class ProjectCache: @unchecked Sendable {
 
     // MARK: - Tool surface (text in / text out, hard-capped)
 
-    /// List the entries one level under `relPath` ("" = project root).
+    /// List the entries one level under `relPath` ("" / "." = project root).
     public func listTool(path relPath: String) -> String {
         lock.lock(); defer { lock.unlock() }
         guard root != nil else { return "Nessun progetto importato." }
-        let prefix = relPath.isEmpty ? "" : relPath.hasSuffix("/") ? relPath : relPath + "/"
-        guard relPath.isEmpty || !relPath.contains("..") else { return "Percorso non valido." }
+        // Normalize root sentinels: "" / "." / "./" all mean the project root, and a
+        // leading "./" is stripped (indexed paths have no "./" prefix).
+        var p = relPath
+        if p == "." || p == "./" { p = "" }
+        else if p.hasPrefix("./") { p = String(p.dropFirst(2)) }
+        guard p.isEmpty || !p.contains("..") else { return "Percorso non valido." }
+        let prefix = p.isEmpty ? "" : (p.hasSuffix("/") ? p : p + "/")
         var dirs = Set<String>()
         var leaf: [String] = []
         for f in files where f.hasPrefix(prefix) {
