@@ -38,20 +38,17 @@ public enum Half {
         if f >= 65520 { return sign | 0x7C00 }                 // ≥ RNE midpoint → ±inf
         if f < 0x1p-14 {                                       // subnormal / zero
             // h = round(f · 2^24) ties-to-even; 1024 rolls into the smallest normal.
-            // Clamp to [0, 1024] so a rounding edge can never trap UInt16 (no-op for
-            // valid inputs, whose magnitude is already in range).
-            let r = (f * 0x1p24).rounded(.toNearestOrEven)
-            return sign | UInt16(min(max(r, 0), 1024))
+            return sign | UInt16((f * 0x1p24).rounded(.toNearestOrEven))
         }
-        // Normal: rebias exponent (Int math: the field is ≥113 here, −112 ≥ 1),
+        // Normal: rebias exponent (Int math: the field is ≥113 here, so −112 ≥ 1),
         // then round 23→10 mantissa bits ties-to-even.
         let b = f.bitPattern
-        let e = UInt32(max(1, Int((b >> 23) & 0xFF) - 112))   // field ≥113 here; max(1,…) trap-safe
+        let e = UInt32(Int((b >> 23) & 0xFF) - 112)
         let m = b & 0x7F_FFFF
         var h = (e << 10) | (m >> 13)
         let rem = m & 0x1FFF
         if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) { h += 1 }   // carry-safe
-        return sign | UInt16(min(h, 0x7C00))                  // ≤ inf encoding (trap-safe)
+        return sign | UInt16(h)
     }
 
     static func floatSoftware(_ h: UInt16) -> Float {
@@ -66,6 +63,10 @@ public enum Half {
         if exp == 0x1F {                                       // ±inf / NaN
             return Float(bitPattern: sign | 0x7F80_0000 | (mant << 13))
         }
-        return Float(bitPattern: sign | ((exp - 15 + 127) << 23) | (mant << 13))
+        // f16 bias 15 → f32 bias 127, i.e. +112. MUST be written (exp + 112):
+        // the algebraically-equal (exp − 15 + 127) evaluates (exp − 15) first,
+        // which UNDERFLOWS the UInt32 for exp < 15 and traps (SIGTRAP) — even
+        // though the final exponent is in range. This is the only normal-range path.
+        return Float(bitPattern: sign | ((exp + 112) << 23) | (mant << 13))
     }
 }
