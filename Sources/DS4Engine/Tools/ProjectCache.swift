@@ -53,6 +53,23 @@ public final class ProjectCache: @unchecked Sendable {
         var found: [String] = []
         var total = 0
         let fm = FileManager.default
+        // Strip the root prefix robustly: the enumerator can return URLs whose
+        // prefix is the symlink-RESOLVED root (e.g. macOS /var → /private/var)
+        // while `rootURL.path` is the unresolved form — a plain string replace
+        // then leaves the "relative" path absolute and every project_* lookup
+        // misses. Match the plain prefix first (the common, no-symlink case: no
+        // extra syscall); fall back to the resolved prefix. The stored root stays
+        // `rootURL`, so reads go through the original (security-scoped) path.
+        let plainPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        let resolvedRoot = rootURL.resolvingSymlinksInPath().path
+        let resolvedPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+        func relativize(_ url: URL) -> String {
+            if url.path.hasPrefix(plainPrefix) { return String(url.path.dropFirst(plainPrefix.count)) }
+            let resolved = url.resolvingSymlinksInPath().path
+            if resolved.hasPrefix(resolvedPrefix) { return String(resolved.dropFirst(resolvedPrefix.count)) }
+            if resolved.hasPrefix(plainPrefix) { return String(resolved.dropFirst(plainPrefix.count)) }
+            return url.lastPathComponent
+        }
         if let en = fm.enumerator(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
                                   options: [.skipsHiddenFiles]) {
             for case let url as URL in en {
@@ -64,8 +81,7 @@ public final class ProjectCache: @unchecked Sendable {
                 let size = vals?.fileSize ?? 0
                 guard size > 0, size <= Self.maxFileBytes else { continue }
                 guard Self.looksTextual(url) else { continue }
-                let rel = url.path.replacingOccurrences(of: rootURL.path + "/", with: "")
-                found.append(rel)
+                found.append(relativize(url))
                 total += size
                 if found.count >= Self.maxFiles { break }
             }
