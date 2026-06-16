@@ -126,8 +126,8 @@ extension StreamingDecoder {
     private func writeFloatsArray(_ a: [Float], into t: GPUTensor, at offset: Int) {
         guard !a.isEmpty else { return }
         a.withUnsafeBytes {
-            memcpy(t.buffer.contents().advanced(by: t.byteOffset + offset * 4),
-                   $0.baseAddress!, $0.count)
+            _ = memcpy(t.buffer.contents().advanced(by: t.byteOffset + offset * 4),
+                       $0.baseAddress!, $0.count)
         }
     }
 }

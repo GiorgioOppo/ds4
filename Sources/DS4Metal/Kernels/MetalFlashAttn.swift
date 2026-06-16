@@ -89,7 +89,6 @@ extension MetalRuntime {
         var kvF16 = [UInt16](repeating: 0, count: nKeys * headDim)
         for i in 0..<kvF16.count { kvF16[i] = Half.bits(kv[i]) }   // portable f32→f16 (arch-safe)
 
-        let rowBytes = headDim * 4
         let rowBytesF16 = headDim * 2
         let maskBytes = nKeys * 2
         let padBytes = 2 * ncpsg * rowBytesF16 + ncpsg * 2

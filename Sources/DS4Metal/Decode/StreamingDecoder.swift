@@ -332,7 +332,7 @@ public final class StreamingDecoder {
         for j in 0..<n {
             try Task.checkCancellation()
             let pos = posBase + j
-            var t = Date()
+            let t = Date()
             try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
@@ -423,7 +423,7 @@ public final class StreamingDecoder {
     /// CPU-write `a` into the head of a shared GPU buffer (safe between commits).
     private func writeFloats(_ a: [Float], into t: GPUTensor) {
         a.withUnsafeBytes {
-            memcpy(t.buffer.contents().advanced(by: t.byteOffset), $0.baseAddress!, $0.count)
+            _ = memcpy(t.buffer.contents().advanced(by: t.byteOffset), $0.baseAddress!, $0.count)
         }
     }
 
@@ -710,7 +710,7 @@ public final class StreamingDecoder {
                           "attn_compressor_kv.weight", "attn_compressor_gate.weight"]
         let expertTensors = [("ffn_gate_exps.weight", gateBytes), ("ffn_up_exps.weight", upBytes),
                              ("ffn_down_exps.weight", downBytes)]
-        let mapBase = model.mapBase
+        let mapBaseAddr = Int(bitPattern: model.mapBase)   // Sendable: cross into the bg queue as an int
         let prefetchQ = DispatchQueue(label: "ds4.prefetch", qos: .utility)
         let prefetch: ((Int) -> Void)? = prefetchOn ? { il in
             var ranges: [(offset: UInt64, bytes: UInt64)] = []
@@ -727,7 +727,12 @@ public final class StreamingDecoder {
                     }
                 }
             }
-            prefetchQ.async { GGUFModel.prefetch(base: mapBase, ranges: ranges) }
+            let snapshot = ranges   // immutable copy for the @Sendable background block
+            prefetchQ.async {
+                if let base = UnsafeRawPointer(bitPattern: mapBaseAddr) {
+                    GGUFModel.prefetch(base: base, ranges: snapshot)
+                }
+            }
         } : nil
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },

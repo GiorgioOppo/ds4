@@ -551,8 +551,8 @@ public actor InferenceService {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.generate(suffix: suffix, think: think, sampling: sampling,
-                                            maxTokens: maxTokens, continuation: continuation)
+                    try self.generate(suffix: suffix, think: think, sampling: sampling,
+                                      maxTokens: maxTokens, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
