@@ -55,14 +55,25 @@ The engine is a faithful Swift reimplementation; correctness is the project's
 
 | Tab | What it does |
 |---|---|
-| **Chat** | streaming chat (markdown), reasoning collassabile, tool-call live, riuso KV multi-turno, import progetto · modo **Locale** (in-process) o **Distribuito** (coordina il cluster di worker) |
+| **Chat** | streaming chat (markdown), reasoning collassabile, tool-call live, riuso KV multi-turno, import progetto e **import di file di testo**, avviso di contesto quasi pieno · modo **Locale** (in-process) o **Distribuito** (coordina il cluster di worker) |
 | **Agenti** | ruoli con prompt/icone/tool per agente, editor completo, export/import JSON, profilo di uso esperti per agente |
 | **Progetto** | libreria di progetti (cartelle indicizzate, bookmark sandbox); i tool `project_list/read/search` li esplorano senza toccare la memoria chat |
 | **Tuning** | slot della cache esperti, hit-rate, concentrazione del routing per layer (la "usage imatrix") |
 | **Server** | server HTTP **nativo in-process** OpenAI/Anthropic-compatible (vedi sotto) |
 | **Worker** | questo Mac come worker del cluster distribuito (possiede uno slice di layer; il coordinatore sta in Chat → Distribuito) |
-| **Benchmark** | nativo: prefill + generazione (token/s) del motore in-process a contesti crescenti, con grafico (Swift Charts) |
+| **Benchmark** | nativo: prefill + generazione (token/s) a contesti crescenti, con grafico (Swift Charts); motore **Locale** o **Distribuito** (riusa il coordinatore connesso) |
 | **Diagnostica** | dump dei token e del chat template (tokenizer nativo, niente sottoprocessi) |
+
+### Tool & agenti
+
+Built-in tool (function calling DSML) — **uno per file** in `Sources/DS4Engine/Tools/Builtins/`:
+
+- **Progetto** (sull'indice): `project_list` · `project_read` · `project_search` · `project_write` · `project_edit` (find/replace esatto)
+- **File grezzi** (radice progetto, anche per **intervallo di righe**): `file_read` · `file_lines` · `file_write` (intero file) · `file_add` (inserisci) · `file_modify` (sostituisci `[from,to]`)
+- **Altri**: `git` (locale, whitelist, no rete) · `calculator` · `add`/`subtract`/`multiply` · `now`
+- **Sub-agenti**: `agents_list` (scopri ruoli e tool) · `subagent_search` · `subagent_run(target, question, agent?, tools?)` — esegue un sub-agent a **contesto isolato** (KV separata per file/progetto, costruita lazy + cache su disco); nel KV del main entrano **solo** la domanda e la risposta, non l'elaborazione interna.
+
+Agenti predefiniti (ruolo = system prompt + tool + profilo esperti): **Generale** · **Coding** · **Code** (coding autonomo) · **Orchestratore** (delega ai sub-agent) · **Matematica** · **Scrittura** · **LaTeX** · **Documentazione** (gap analysis doc↔codice → Markdown).
 
 ### Quick start
 
@@ -121,9 +132,12 @@ Sources/
   DS4Metal/       Metal runtime + kernels + decode graph: StreamingDecoder
                   (forward/prefill/slice), expert slot-cache, usage stats,
                   GGUF weight loaders (no-copy mmap)
-  DS4Engine/      InferenceService (actor, event stream), ToolRegistry, agents,
-                  ProjectCache, Diagnostics, Distributed/ (protocol, transport,
-                  worker, coordinator)
+  DS4Engine/      InferenceService + sub-agent, tool, KV su disco, distribuito:
+    Service/        InferenceService (actor, event stream), DiskKVStore, Diagnostics
+    Tools/          ToolRegistry + un file per tool in Builtins/, ProjectCache,
+                    GitTool, Agents (AgentProfile + AgentRegistry)
+    Download/       ModelDownloader (GGUF resumibile + verifica SHA-256)
+    Distributed/    protocol, transport, worker, coordinator
   DS4Demo/        CLI demo: Metal self-test + GGUF token streaming
   DwarfStar/      SwiftUI app (one folder per tab)
 metal/            kernel sources (source of truth; embedded by make embed-kernels)
@@ -131,6 +145,9 @@ templates/        the model's chat template, re-written as commented Jinja
 scripts/          GGUF analysis tools (spectrum, graph export) + kernel embedding
 docs/             detailed documentation (IT)
 ```
+
+Ogni cartella sotto `Sources/` (e i top-level `docs/`, `metal/`, `scripts/`,
+`packaging/`, `Tests/`) ha un `README.md` che ne descrive contenuto e relazioni.
 
 ## CLI demo
 
@@ -154,17 +171,27 @@ user-selected file access with app-scope bookmarks (models, projects).
 ## Status
 
 **Working** (verified on a MacBook Pro M1 Pro 16 GB): model load + streaming
-chat on the 2-bit GGUF, thinking, multi-turn KV reuse, DSML tool calling with
-built-in tools (clock, calculator, add/subtract/multiply, project tools),
-agents + per-agent expert profiles, project library, tuning (expert cache),
-native HTTP server (OpenAI `chat/completions` verified end-to-end, Anthropic
-`messages` verified streaming).
+chat on the 2-bit GGUF, thinking, multi-turn KV reuse, **import di file di
+testo**, DSML tool calling con i built-in (`now`, `calculator`,
+`add/subtract/multiply`, `project_*`, `file_*` anche per riga, `git`),
+agenti + profili esperti per-agente, project library, tuning (expert cache),
+disk-KV cache (default on), native HTTP server (OpenAI `chat/completions`
+verified end-to-end, Anthropic `messages` verified streaming).
 
-**Implemented, needs on-device validation**: `/v1/responses`, distributed
-inference (protocol + worker/coordinator + UI are in place; numerical parity
-and multi-Mac runs not yet verified).
+**Implemented, needs on-device validation**: `/v1/responses`, **sub-agenti a
+contesto isolato** (snapshot/restore del KV main + KV cache per file/progetto) e
+i nuovi agenti (Orchestratore/LaTeX/Documentazione), distributed inference
+(protocol + worker/coordinator + UI in place; numerical parity and multi-Mac
+runs not yet verified), distributed benchmark.
+
+**Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
+`DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
+all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead
+`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`).
 
 **Known gaps**: decode on a 16 GB machine is I/O-bound (~57% expert gather) —
-that is the physics of streaming 284B from SSD, and the distributed mode is the
-intended mitigation. No subprocess-driven panels remain: server, distributed
-and benchmark are all native in-process.
+that is the physics of streaming 284B from SSD; distributed mode is the intended
+mitigation. Il contesto di **default è 1M token** (modificabile in Impostazioni):
+le cache KV scalano col contesto → su RAM contenuta **abbassalo** (il raw-KV ring
+sgancia solo la raw cache, non le righe compresse). No subprocess-driven panels
+remain: server, distributed and benchmark are all native in-process.
