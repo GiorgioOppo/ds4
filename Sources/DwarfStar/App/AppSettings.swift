@@ -18,7 +18,10 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(modelPath, forKey: "DS4ModelPath") }
     }
 
-    var contextSize: Int = UserDefaults.standard.object(forKey: "DS4ContextSize") as? Int ?? 8192 {
+    // Default context window. NOTE: 1M is intentional but heavy — the KV caches +
+    // scratch scale with it (≈tens of GB at 1M even with the raw-KV ring on; ≈88 GB
+    // raw alone with the ring OFF). Lower it in Impostazioni on small-RAM machines.
+    var contextSize: Int = UserDefaults.standard.object(forKey: "DS4ContextSize") as? Int ?? 1_000_000 {
         didSet { UserDefaults.standard.set(contextSize, forKey: "DS4ContextSize") }
     }
 
