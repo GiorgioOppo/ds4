@@ -146,8 +146,16 @@ public final class StreamingDecoder {
         }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
+        // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
+        // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
+        // the older rows need not stay resident — the ring cuts the raw-KV RAM from
+        // O(contextSize) to a constant. The write slot, attention staging and
+        // export/import all key off `rawCache.count/headDim`, so the full cache is a
+        // no-wrap special case (behaviour identical). Opt-in: validate the parity
+        // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
+        let rawRows = (ProcessInfo.processInfo.environment["DS4_RAW_RING"] == "1") ? min(dims.nSWA, maxKeys) : maxKeys
         rawCaches = try (0..<nLayers).map { il in
-            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim)
+            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: rawRows * dims.headDim)
                                  : try GPUTensor.zeros(rt, floatCount: 1)
         }
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)

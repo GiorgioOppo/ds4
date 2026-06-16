@@ -249,7 +249,8 @@ extension GraphContext {
         try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
-        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
+        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot,
+                       rawRow: pos % (rawCache.count / d.headDim))   // ring slot (= pos with the full cache)
         // 3.5) Indexer scoring (only when the comp rows exceed the top-K): the
         // indexer query comes from qr_norm via indexer.attn_q_b (+rope+Hadamard),
         // the head weights from attn_norm via indexer.proj. C: indexer_allowed_decode_one.

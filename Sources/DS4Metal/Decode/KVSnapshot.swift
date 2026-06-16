@@ -49,7 +49,14 @@ extension StreamingDecoder {
             }
             let rawStart = max(0, nKeys - d.nSWA)
             let rows = nKeys - rawStart
-            let raw = readFloats(rawCaches[i], from: rawStart * d.headDim, count: rows * d.headDim)
+            // De-rotate the (possibly ring-buffer) raw cache into a chronological window.
+            // Full cache: physStart == rawStart and it never wraps -> identical to before.
+            let rawRows = rawCaches[i].count / d.headDim
+            let physStart = rawStart % rawRows
+            let raw: [Float] = (physStart + rows <= rawRows)
+                ? readFloats(rawCaches[i], from: physStart * d.headDim, count: rows * d.headDim)
+                : readFloats(rawCaches[i], from: physStart * d.headDim, count: (rawRows - physStart) * d.headDim)
+                    + readFloats(rawCaches[i], from: 0, count: (rows - (rawRows - physStart)) * d.headDim)
             layers.append(KVLayerSnapshot(rawStart: rawStart, raw: raw,
                                           comp: snapshotComp(compStates[i]),
                                           idx: snapshotComp(indexStates[i])))
@@ -68,7 +75,18 @@ extension StreamingDecoder {
         for i in 0..<nLayers {
             guard kvRange.contains(i) else { continue }
             let layer = s.layers[i]
-            writeFloatsArray(layer.raw, into: rawCaches[i], at: layer.rawStart * d.headDim)
+            // Re-rotate the chronological window back into the (possibly ring) raw cache.
+            // Full cache: physStart == rawStart and it never wraps -> identical to before.
+            let rawRows = rawCaches[i].count / d.headDim
+            let rows = layer.raw.count / d.headDim
+            let physStart = layer.rawStart % rawRows
+            if physStart + rows <= rawRows {
+                writeFloatsArray(layer.raw, into: rawCaches[i], at: physStart * d.headDim)
+            } else {
+                let seg1 = (rawRows - physStart) * d.headDim
+                writeFloatsArray(Array(layer.raw[0..<seg1]), into: rawCaches[i], at: physStart * d.headDim)
+                writeFloatsArray(Array(layer.raw[seg1...]), into: rawCaches[i], at: 0)
+            }
             try restoreComp(compStates[i], from: layer.comp, rowDim: d.headDim)
             try restoreComp(indexStates[i], from: layer.idx, rowDim: d.nIndexerHeadDim)
         }

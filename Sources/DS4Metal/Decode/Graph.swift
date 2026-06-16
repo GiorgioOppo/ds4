@@ -112,7 +112,18 @@ extension GraphContext {
         }
         // Raw span: only the SWA window starting at `rawStartRow` (rows hold their
         // absolute-RoPE'd values, so a shifted span is exactly the C slid cache).
-        cpyF32toF16(kvF32, srcOff: rawStartRow * headDim * 4, dstOff: 0, count: nKeys * headDim)
+        // With a ring-buffer raw cache (count < contextSize) the window can wrap;
+        // copy it in up to two segments so kvF16 holds it in chronological order.
+        // With the full cache it never wraps -> a single copy identical to before.
+        let rawRows = kvF32.count / headDim
+        let physStart = ((rawStartRow % rawRows) + rawRows) % rawRows
+        if physStart + nKeys <= rawRows {
+            cpyF32toF16(kvF32, srcOff: physStart * headDim * 4, dstOff: 0, count: nKeys * headDim)
+        } else {
+            let seg1 = rawRows - physStart                       // older rows at the physical tail
+            cpyF32toF16(kvF32, srcOff: physStart * headDim * 4, dstOff: 0, count: seg1 * headDim)
+            cpyF32toF16(kvF32, srcOff: 0, dstOff: seg1 * headDim * 2, count: (nKeys - seg1) * headDim)
+        }
         if let comp = comp, nComp > 0 {
             cpyF32toF16(comp, srcOff: comp.byteOffset, dstOff: nKeys * headDim * 2, count: nComp * headDim)
         }
