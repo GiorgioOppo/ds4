@@ -102,6 +102,11 @@ struct ModelLoadView: View {
                     Text("A fine risposta lo stato KV viene salvato su disco; una nuova conversazione (o una richiesta al server) che inizia con un prefisso già visto lo ripristina invece di rifare il prefill. Si applica al prossimo caricamento.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
+                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                if store.rawRingEnabled {
+                    Text("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto → RAM KV indipendente dal contesto. Sperimentale: verifica gli output dopo un contesto lungo. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
             }
 
             Section("Agente (ruolo)") {

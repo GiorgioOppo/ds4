@@ -63,6 +63,7 @@ final class ChatStore {
     init(settings: AppSettings) {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
     }
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
@@ -80,6 +81,15 @@ final class ChatStore {
     }
     var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192 {
         didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
+    }
+    /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
+    /// instead of the full context, so the KV RAM is constant. Sets the engine env
+    /// var; applied on the NEXT model load.
+    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
+            _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
+        }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
     static var diskKVDirectory: URL {

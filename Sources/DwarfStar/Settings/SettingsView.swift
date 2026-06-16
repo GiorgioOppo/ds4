@@ -63,6 +63,12 @@ struct SettingsView: View {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",
                             value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
                 }
+                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                if store.rawRingEnabled {
+                    Label("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto. Sperimentale — verifica gli output dopo un contesto lungo.",
+                          systemImage: "flask")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 Text("Si applicano al prossimo caricamento del modello.")
                     .font(.caption).foregroundStyle(.tertiary)
             }

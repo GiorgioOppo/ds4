@@ -153,7 +153,8 @@ public final class StreamingDecoder {
         // export/import all key off `rawCache.count/headDim`, so the full cache is a
         // no-wrap special case (behaviour identical). Opt-in: validate the parity
         // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
-        let rawRows = (ProcessInfo.processInfo.environment["DS4_RAW_RING"] == "1") ? min(dims.nSWA, maxKeys) : maxKeys
+        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false   // live (set from the UI toggle)
+        let rawRows = ringOn ? min(dims.nSWA, maxKeys) : maxKeys
         rawCaches = try (0..<nLayers).map { il in
             kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: rawRows * dims.headDim)
                                  : try GPUTensor.zeros(rt, floatCount: 1)
