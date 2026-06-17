@@ -228,10 +228,33 @@ public actor InferenceService {
     }
 
     public func modelInfo() -> ModelInfo {
-        // Raw KV cache footprint: nLayer x contextSize x headDim x F32.
-        let kv = UInt64(DSV4Shape.nLayer) * UInt64(contextSize) * UInt64(dims.headDim) * 4
         return ModelInfo(name: modelName, layers: DSV4Shape.nLayer, nEmbd: dims.nEmbd,
-                         nVocab: dims.vocab, contextSize: contextSize, routedQuantBits: 4, kvCacheBytes: kv)
+                         nVocab: dims.vocab, contextSize: contextSize, routedQuantBits: 4,
+                         kvCacheBytes: estimatedKVCacheBytes())
+    }
+
+    /// Worst-case (full-context) KV-cache RAM, matching what the decoder actually
+    /// allocates — so the figure reflects the raw-KV ring. Without the ring the raw
+    /// cache is nLayer × ctx × headDim × F32 (dominant); with it the raw cache is a
+    /// constant nSWA-row window and only the NSA-compressed rows (ctx/ratio) + the
+    /// indexer scale with the context. A static ctx×headDim formula would keep
+    /// reporting the huge number even with the ring on.
+    private func estimatedKVCacheBytes() -> UInt64 {
+        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false
+        let headDim = UInt64(dims.headDim)
+        let ctx = UInt64(contextSize)
+        let rawRows = ringOn ? UInt64(min(dims.nSWA, contextSize)) : ctx
+        var bytes: UInt64 = 0
+        for il in 0..<DSV4Shape.nLayer {
+            bytes += rawRows * headDim * 4                                  // raw cache (every layer)
+            let ratio = DSV4Shape.compressRatio(layer: il)
+            guard ratio > 0 else { continue }
+            bytes += (ctx / UInt64(ratio)) * headDim * 4                   // NSA compressor cache
+            if ratio == 4 {
+                bytes += (ctx / 4) * UInt64(dims.nIndexerHeadDim) * 4       // indexer compressor (ratio-4 only)
+            }
+        }
+        return bytes
     }
 
     /// The raw Jinja chat template embedded in the GGUF (for inspection), if any.
