@@ -77,14 +77,21 @@ public enum GGUFWeights {
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optT, small: optT)
-        // Per-layer routed-expert quant (mixed-precision GGUFs): read the ACTUAL
-        // tensor types so a boosted layer decodes with the right kernel. The exps
-        // tensors exist in the GGUF even when loadExperts==false (streaming path);
-        // unknown/missing types keep the .q4_K default (same as the global fallback).
+        setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
+        return w
+    }
+
+    /// Set `w`'s per-layer routed-expert quant from the GGUF tensor types
+    /// (mixed-precision support). MUST be called from EVERY LayerWeights builder
+    /// (`layer`, `layerMappedDense`) so `decodeExperts` dispatches the right kernel:
+    /// it reads `w.*Quant`, not the model-global `DSV4Dims` quant. The exps tensors
+    /// exist in the GGUF even when not loaded as GPUTensors (streaming); unknown or
+    /// missing types keep the `.q4_K` default (matches the global fallback).
+    static func setExpertQuant(_ w: inout LayerWeights, _ model: GGUFModel, _ il: Int) {
+        let p = "blk.\(il)."
         if let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.gateQuant = g }
         if let u = model.findTensor(p + "ffn_up_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.upQuant = u }
         if let dn = model.findTensor(p + "ffn_down_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.downQuant = dn }
-        return w
     }
 
     /// Number of routed layers whose expert quant differs from the model-global
@@ -166,6 +173,7 @@ public enum GGUFWeights {
             compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optM, small: optT)
+        setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
 
