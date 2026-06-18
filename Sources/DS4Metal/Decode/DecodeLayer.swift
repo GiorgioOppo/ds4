@@ -107,6 +107,13 @@ public struct LayerWeights {
     public var idxGate: GPUTensor?        // F16 indexer_compressor_gate [nEmbd x coff*128]
     public var idxApe: GPUTensor?         // F16 indexer_compressor_ape  [coff*128 x ratio]
     public var idxNorm: GPUTensor?        // F32 indexer_compressor_norm [128]
+    // Routed-expert quant PER LAYER. Mixed-precision GGUFs upcast some layers
+    // (e.g. a few to Q4_K over an IQ2_XXS/Q2_K base via --tensor-type); the decode
+    // kernels dispatch on THESE, not on the model-global DSV4Dims quant. Detected
+    // from the actual tensor types in GGUFWeights.layer; default = the common Q4_K.
+    public var gateQuant: MoEQuant = .q4_K
+    public var upQuant: MoEQuant = .q4_K
+    public var downQuant: MoEQuant = .q4_K
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -343,29 +350,30 @@ extension GraphContext {
         try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
         try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
-        // routed MoE over the provided experts (per-tensor quant: gate/up + down).
-        // Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when the
-        // quant scheme has the kernels; otherwise the validated 5-dispatch path.
-        let pairFused = d.fusedMoE && d.gateQuant == d.upQuant
-            && (d.gateQuant == .iq2_xxs || d.gateQuant == .q4_K)
+        // routed MoE over the provided experts, dispatched on the PER-LAYER quant
+        // (w.*Quant) — so a mixed-precision GGUF's boosted layer uses the right
+        // kernel. Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when
+        // the quant scheme has the kernels; otherwise the validated 5-dispatch path.
+        let pairFused = d.fusedMoE && w.gateQuant == w.upQuant
+            && (w.gateQuant == .iq2_xxs || w.gateQuant == .q4_K)
         if pairFused {
-            try moePairSwiGLU(d.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
+            try moePairSwiGLU(w.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
                               activation: x, weights: s.rw, gateScratch: s.gate6,
                               upScratch: s.up6, mid: s.mid6,
                               k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
         } else {
-            try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
             try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
         }
         // down_sum6 hardcodes 6 expert slots: usable only at full k.
         let sumFused = d.fusedMoE && kk == 6
-            && (d.downQuant == .q2_K || d.downQuant == .q4_K)
+            && (w.downQuant == .q2_K || w.downQuant == .q4_K)
         if sumFused {
-            try moeDownSum6(d.downQuant, experts: downExp, ids: ids, mid: s.mid6,
+            try moeDownSum6(w.downQuant, experts: downExp, ids: ids, mid: s.mid6,
                             out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd)
         } else {
-            try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
             try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
         }
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)

@@ -456,7 +456,11 @@ public final class StreamingDecoder {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            if let cache = slotCache {
+            // The slot cache is a single size-class (the model-global/first-layer
+            // quant). A mixed-precision layer (different expert bytes) can't share
+            // the pool, so it falls through to the per-layer-correct gather path.
+            let onClass = w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant
+            if let cache = slotCache, onClass {
                 // Persistent + changing experts: hits are already resident in the
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.

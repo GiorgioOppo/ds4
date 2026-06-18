@@ -38,25 +38,35 @@ il grader `ds4-eval`, la CLI `ds4_cli.c`.
 | `1cfa5cc` Refactor streaming expert cache API | streaming | **N/A** — refactoring multi-backend, nessun cambio di comportamento. |
 | `7a77a28` Release cache margin on mlock failure · `cd57428` Cap oversized caches | streaming | **N/A / marginale** — legati a `mlock` e allo slab allocator C. Noi non facciamo `mlock`; la slot-cache è opt-in e già limitata per slot. |
 | `f2d701a` Fix distributed SSD streaming layer slices | distribuito | **Differito** — il nostro distribuito è "implementato, non ancora validato numericamente". Da rivedere *insieme* alla validazione del distribuito, non prima. |
-| **`81f35e7` (+`b548d86`) mixed-precision routed experts** | streaming/quant | **Gap reale, non urgente** — vedi sotto. |
+| **`81f35e7` (+`b548d86`) mixed-precision routed experts** | streaming/quant | **Portato** — quant degli esperti **per-layer** (decode + cache). Vedi sotto. |
 
 Commit non elencati (ROCm/CUDA, MTP, agente TTY, `ds4-eval`): fuori perimetro.
 
+## Risolti
+
+### Esperti a precisione mista per-layer (`81f35e7`) — portato
+
+Supporto ai GGUF con esperti routed **non uniformi tra i layer** (es. base
+IQ2_XXS/Q2_K con alcuni layer upcastati a Q4_K via `--tensor-type`). Implementazione
+(no-op byte-identico sui modelli uniformi):
+
+- **Quant per-layer su `LayerWeights`** (`gateQuant/upQuant/downQuant`), rilevato dai
+  tipi reali dei tensori in `GGUFWeights.layer` (i tensori esperti esistono nel GGUF
+  anche in streaming, `loadExperts==false`).
+- **Decode per-layer**: `decodeExperts` sceglie i kernel su `w.*Quant` invece del
+  globale `d.*Quant`. Copre sia il decode sia il prefill batched (stessa funzione).
+- **Gather già corretto**: `GGUFWeights.gatherExperts` calcola i byte/expert dal
+  `blockBytes` del tensore → copia il numero giusto di byte per ogni layer.
+- **Slot-cache** (opt-in): è a singola size-class (quant globale); i layer fuori-classe
+  saltano la cache e usano il gather (corretto). `fill`/`warm` partono solo da
+  `acquire`, quindi basta il gate in `runLayer` (nessuna modifica a `ExpertSlotCache`).
+- **Log** all'avvio (`InferenceService`) della quota di layer fuori-classe.
+
+Da validare on-device con un GGUF misto (qui non si compila e non c'è un fixture misto).
+
 ## Gap aperti
 
-### 1. Esperti a precisione mista per-layer (`81f35e7`) — non urgente
-
-`GGUFWeights.detectMoEQuant` (`Sources/DS4Metal/Model/GGUFWeights.swift`) legge il
-quant degli esperti dal **primo** layer MoE e lo applica **uniformemente a tutti**.
-Corretto per il modello standard (IQ2_XXS uniforme). Ma un GGUF con alcuni layer
-"boostati" (es. Q4_K via `--tensor-type`) verrebbe decodificato col quant sbagliato
-sui layer fuori-quant → output corrotto su quei layer.
-
-Per supportarlo servirebbe: rilevamento quant **per-layer**, scelta del kernel di
-decode per-layer, e gestione delle size-class nella gather/slot-cache. Da fare solo
-se serve davvero usare GGUF a precisione mista.
-
-### 2. Fix distribuito (`f2d701a`) — differito
+### Fix distribuito (`f2d701a`) — differito
 
 Da valutare quando si affronta la validazione numerica del distribuito.
 

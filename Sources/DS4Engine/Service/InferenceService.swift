@@ -120,6 +120,14 @@ public actor InferenceService {
         let mq = GGUFWeights.detectMoEQuant(model)
         configuredDims.gateQuant = mq.gate; configuredDims.upQuant = mq.up
         configuredDims.downQuant = mq.down; configuredDims.routerF16 = mq.routerF16
+        // Mixed-precision GGUFs (some routed layers upcast, e.g. to Q4_K): those
+        // layers decode per-layer and bypass the single-class expert slot-cache,
+        // reading experts via the mmap gather. Uniform models report 0 (no-op).
+        let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: DSV4Shape.nLayer)
+        if mixed > 0 {
+            FileHandle.standardError.write(Data(
+                "ds4: GGUF a precisione mista: \(mixed)/\(DSV4Shape.nLayer) layer routed fuori dalla classe \(mq.gate)/\(mq.up)/\(mq.down) — decodificati per-layer, bypassano la cache esperti\n".utf8))
+        }
         // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
         // per token = less expert I/O, lower quality. Honored by the streaming path.
         if let s = ProcessInfo.processInfo.environment["DS4_ACTIVE_EXPERTS"], let kk = Int(s) {

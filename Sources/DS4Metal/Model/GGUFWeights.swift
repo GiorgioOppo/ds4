@@ -77,7 +77,34 @@ public enum GGUFWeights {
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optT, small: optT)
+        // Per-layer routed-expert quant (mixed-precision GGUFs): read the ACTUAL
+        // tensor types so a boosted layer decodes with the right kernel. The exps
+        // tensors exist in the GGUF even when loadExperts==false (streaming path);
+        // unknown/missing types keep the .q4_K default (same as the global fallback).
+        if let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.gateQuant = g }
+        if let u = model.findTensor(p + "ffn_up_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.upQuant = u }
+        if let dn = model.findTensor(p + "ffn_down_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.downQuant = dn }
         return w
+    }
+
+    /// Number of routed layers whose expert quant differs from the model-global
+    /// class (the first routed layer = `detectMoEQuant`). >0 ⇒ a mixed-precision
+    /// GGUF: those layers decode through the per-layer kernel and bypass the
+    /// (single-size-class) expert slot-cache, reading experts via the mmap gather.
+    public static func mixedPrecisionLayerCount(_ model: GGUFModel, nLayers: Int) -> Int {
+        let cls = detectMoEQuant(model)
+        func q(_ p: String, _ s: String) -> MoEQuant? {
+            model.findTensor(p + s).flatMap { MoEQuant.from(ggufType: $0.type) }
+        }
+        var n = 0
+        for il in 0..<nLayers {
+            let p = "blk.\(il)."
+            guard model.findTensor(p + "ffn_gate_exps.weight") != nil else { continue }   // dense layer
+            if q(p, "ffn_gate_exps.weight") != cls.gate
+                || q(p, "ffn_up_exps.weight") != cls.up
+                || q(p, "ffn_down_exps.weight") != cls.down { n += 1 }
+        }
+        return n
     }
 
     /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
