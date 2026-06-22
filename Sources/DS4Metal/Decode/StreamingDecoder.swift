@@ -173,8 +173,17 @@ public final class StreamingDecoder {
         // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
         let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false   // live (set from the UI toggle)
         let rawRows = ringOn ? min(dims.nSWA, maxKeys) : maxKeys
+        // lazyZeros (no memset): the raw cache is sized for the FULL context but only
+        // rows 0..<pos are ever written, and attention reads only written rows (the
+        // NSA window is the last nSWA, always recently written). With eager .zeros the
+        // memset commits maxKeys*headDim*4*nLayer of PHYSICAL RAM at load (≈2 GB/layer
+        // at a 1M ctx!), which on the SSD-streaming path evicts the page cache the
+        // experts/dense weights live in → more re-faults → slower decode. Zero-fill-on-
+        // demand makes the physical footprint scale with the tokens ACTUALLY generated,
+        // so a large default context is free until the conversation grows. (Unwritten
+        // rows are never read; if they were, fresh shared pages read back as zero.)
         rawCaches = try (0..<nLayers).map { il in
-            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: rawRows * dims.headDim)
+            kvRange.contains(il) ? try GPUTensor.lazyZeros(rt, floatCount: rawRows * dims.headDim)
                                  : try GPUTensor.zeros(rt, floatCount: 1)
         }
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
