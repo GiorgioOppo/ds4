@@ -190,14 +190,14 @@ anticipa e batcha il read-ahead a freddo dei soli slab che servono davvero (non
 speculativo). Riduce i fault a freddo, no-op a caldo, solo advisory (non cambia i
 numeri). Toggle in Impostazioni → Memoria.
 
-**Pesi densi residenti (`DS4_RESIDENT_DENSE=1`, opt-in)**: copia i ~5 GB di pesi
-non-esperti per layer (`q_b`, `output_a`, FFN condivisa, …) in buffer **wired**
-una volta sola, invece di mapparli no-copy. Senza, su una macchina dove il modello
-non entra in RAM la churn dei 71 GB di esperti **eviice** quei pesi caldi dalla page
-cache → `route/attn` li **rifaulta dall'SSD ogni token** (il "compute" che non si
-scalda). Inchiodandoli, il matvec d'attenzione torna RAM-bound. Costa ~5 GB wired:
-conviene quando ci sta (può raddoppiare i tok/s), su RAM molto stretta può premere
-sulla cache esperti.
+**Pesi densi residenti (`DS4_RESIDENT_DENSE`, toggle in Impostazioni → Memoria,
+default ON con RAM ≥ 24 GB)**: copia i ~5 GB di pesi non-esperti per layer (`q_b`,
+`output_a`, FFN condivisa, …) in buffer **wired** una volta sola, invece di mapparli
+no-copy. Senza, su una macchina dove il modello non entra in RAM la churn dei 71 GB
+di esperti **eviice** quei pesi caldi dalla page cache → `route/attn` li **rifaulta
+dall'SSD ogni token** (il "compute" che non si scalda), e con loro anche embedding e
+output head. Inchiodandoli, il matvec torna RAM-bound. Costa ~5 GB wired: misurato
+**~+40% tok/s** su M1 Pro 32 GB; su poca RAM (≤16 GB) lascialo **OFF**.
 
 **Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
 `DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port

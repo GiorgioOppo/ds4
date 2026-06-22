@@ -110,6 +110,9 @@ struct ModelLoadView: View {
                 Toggle("Read-ahead esperti selezionati (madvise)", isOn: $store.willNeedEnabled)
                 Text("Anticipa la lettura dei 6 esperti scelti subito prima del gather: riduce i fault a freddo (su poca RAM), no-op a caldo. Solo advisory, non cambia gli output. Consigliato ON. Si applica al prossimo caricamento.")
                     .font(.caption).foregroundStyle(.tertiary)
+                Toggle("Pesi densi residenti (~5 GB wired)", isOn: $store.residentDenseEnabled)
+                Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce (su questa macchina ~+40%). Costa ~5 GB di RAM wired: default ON con RAM ≥ 24 GB, OFF su poca RAM. Si applica al prossimo caricamento.")
+                    .font(.caption).foregroundStyle(.tertiary)
             }
 
             Section("Agente (ruolo)") {

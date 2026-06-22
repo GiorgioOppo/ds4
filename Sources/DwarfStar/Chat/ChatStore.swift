@@ -65,6 +65,7 @@ final class ChatStore {
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
+        _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON ≥24GB RAM
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -110,6 +111,20 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(willNeedEnabled, forKey: "DS4WillNeed")
             _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
+    /// per layer in buffer wired (residenti) invece di mapparli no-copy, così la
+    /// churn degli esperti non li eviice dalla page cache → route/attn RAM-bound.
+    /// Stessi numeri (è solo copia vs mmap). DEFAULT ON quando la RAM è abbondante
+    /// (≥24 GB), OFF su poca RAM (i ~5 GB wired premerebbero troppo). Si applica al
+    /// prossimo caricamento del modello.
+    var residentDenseEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4ResidentDense") as? Bool)
+        ?? (MemoryInfo.physicalBytes >= 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
+            _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
         }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
