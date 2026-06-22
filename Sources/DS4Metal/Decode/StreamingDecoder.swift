@@ -632,11 +632,9 @@ public final class StreamingDecoder {
     public static func fromGGUFExpertCached(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                             nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
+        let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] == "1"
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let u = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_up_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
-            return (g, u, dn)
+            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims, willNeed: willNeed)
         }
         // Memoize the non-routed (dense + NSA compressor) weights: loaded once,
         // resident across tokens (the C --ssd-streaming model). Only the 6 selected
@@ -659,11 +657,9 @@ public final class StreamingDecoder {
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
+        let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] == "1"
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let u = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_up_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
-            return (g, u, dn)
+            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims, willNeed: willNeed)
         }
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.

@@ -187,7 +187,10 @@ runs not yet verified), distributed benchmark.
 **Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
 `DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
 all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead
-`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`).
+`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`) · `DS4_WILLNEED_EXPERTS`
+(`madvise(WILLNEED)` sui **6 esperti selezionati** prima del gather: anticipa il
+read-ahead a freddo dei soli slab che servono davvero, non speculativo — riduce i
+fault a freddo, no-op a caldo).
 
 **Known gaps**: decode on a 16 GB machine is I/O-bound (~57% expert gather) —
 that is the physics of streaming 284B from SSD; distributed mode is the intended

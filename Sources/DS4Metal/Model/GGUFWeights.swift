@@ -220,6 +220,40 @@ public enum GGUFWeights {
         return try GPUTensor.bytes(rt, packed, elementCount: ids.count * expertBytes)
     }
 
+    /// Byte ranges (offset-from-mapBase, length) of the SELECTED experts' slabs in
+    /// one routed tensor — used to POSIX_MADV_WILLNEED them before the gather copy.
+    static func expertRanges(_ model: GGUFModel, _ name: String, ids: [Int32],
+                             inDim: Int, outRows: Int) -> [(offset: UInt64, bytes: UInt64)] {
+        guard let t = model.findTensor(name), let info = GGUF.typeInfo(t.type), info.blockElems == 256 else { return [] }
+        let expertBytes = UInt64(outRows * (inDim / 256) * Int(info.blockBytes))
+        return ids.map { (offset: UInt64(t.absOffset) + UInt64($0) * expertBytes, bytes: expertBytes) }
+    }
+
+    /// Gather the selected experts (gate/up/down, packed) for layer `il`. With
+    /// `willNeed`, first hint the OS to read the exact slabs we're about to copy
+    /// (POSIX_MADV_WILLNEED) so the cold SSD readahead is front-loaded and batched
+    /// instead of paid as ~one minor fault per page inside the memcpy. The hint
+    /// targets the ACTUALLY-selected experts (non-speculative) — unlike a usage-prior
+    /// prefetch it never reads experts we won't use, and on warm pages it's a cheap
+    /// no-op. Advisory only: cannot change numerics. Opt-in via DS4_WILLNEED_EXPERTS.
+    public static func gatherLayerExperts(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int,
+                                          ids: [Int32], dims: DSV4Dims, willNeed: Bool) throws
+        -> (GPUTensor, GPUTensor, GPUTensor) {
+        let gn = "blk.\(il).ffn_gate_exps.weight"
+        let un = "blk.\(il).ffn_up_exps.weight"
+        let dnn = "blk.\(il).ffn_down_exps.weight"
+        if willNeed {
+            var ranges = expertRanges(model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            ranges += expertRanges(model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            ranges += expertRanges(model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+            GGUFModel.prefetch(base: model.mapBase, ranges: ranges)
+        }
+        let g = try gatherExperts(rt, model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+        let u = try gatherExperts(rt, model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+        let dn = try gatherExperts(rt, model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+        return (g, u, dn)
+    }
+
     /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
     /// (the ExpertSlotCache fill primitive; dst is a shared-storage pool tensor).
     public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
