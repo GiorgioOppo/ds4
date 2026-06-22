@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 @MainActor
 enum ModelPicker {
     private static let bookmarkKey = "ds4.modelBookmark"
+    private static let pathKey = "ds4.modelPath"   // plain-path fallback (unsandboxed `make app` build)
 
     /// Present an open panel to choose a `.gguf` file. Returns its path and starts
     /// security-scoped access; persists a bookmark for next launch.
@@ -32,19 +33,33 @@ enum ModelPicker {
     /// Resolve a previously-picked model, starting security-scoped access. Returns
     /// its path if the bookmark still resolves.
     static func restoreBookmark() -> String? {
-        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return nil }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
-                                 relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
-        guard url.startAccessingSecurityScopedResource() else { return nil }
-        if stale { saveBookmark(url) }   // refresh a stale bookmark
-        return url.path
+        if let data = UserDefaults.standard.data(forKey: bookmarkKey) {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+                                  relativeTo: nil, bookmarkDataIsStale: &stale),
+               url.startAccessingSecurityScopedResource() {
+                if stale { saveBookmark(url) }   // refresh a stale bookmark
+                return url.path
+            }
+        }
+        // Plain-path fallback (unsandboxed build has full file access — no scope needed).
+        if let path = UserDefaults.standard.string(forKey: pathKey),
+           FileManager.default.isReadableFile(atPath: path) {
+            return path
+        }
+        return nil
     }
 
     private static func saveBookmark(_ url: URL) {
         if let data = try? url.bookmarkData(options: .withSecurityScope,
                                             includingResourceValuesForKeys: nil, relativeTo: nil) {
             UserDefaults.standard.set(data, forKey: bookmarkKey)
+            UserDefaults.standard.removeObject(forKey: pathKey)
+        } else {
+            // Unsandboxed (make app): security-scoped bookmarks unavailable — the
+            // engine has full file access, so remember the plain path to re-open it.
+            UserDefaults.standard.set(url.path, forKey: pathKey)
+            UserDefaults.standard.removeObject(forKey: bookmarkKey)
         }
     }
 }
