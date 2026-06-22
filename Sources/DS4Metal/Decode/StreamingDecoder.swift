@@ -22,6 +22,8 @@ import DS4Core
 public struct DecodeProfile: Sendable {
     public var embedS = 0.0       // token embedding
     public var routeS = 0.0       // attention + router (compute)
+    public var routePreS = 0.0    // DS4_PROFILE_ROUTE: route phase 1 (Q/KV proj + compressor)
+    public var routeAttnS = 0.0   // DS4_PROFILE_ROUTE: route phase 2 (attention + out proj + HC + router)
     public var gatherS = 0.0      // gather the 6 selected experts from the mmap (EXPERT I/O)
     public var expertsS = 0.0     // shared FFN + routed MoE matvec (compute)
     public var layerOtherS = 0.0  // non-split decode path (resident experts)
@@ -45,10 +47,15 @@ public struct DecodeProfile: Sendable {
             let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
             cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
         }
+        var routeSplit = ""   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commit)
+        if routePreS + routeAttnS > 0 {
+            routeSplit = "\n     ├ pre  \(ms(routePreS)) ms/token (Q/KV proj + compressor)"
+                       + "\n     └ attn \(ms(routeAttnS)) ms/token (attention + out proj + HC + router)"
+        }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
-          route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute
+          route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute\(routeSplit)
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
           experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
@@ -72,6 +79,10 @@ public final class StreamingDecoder {
     /// Per-phase decode timing (opt-in: read after a run, reset between runs).
     public var profile = DecodeProfile()
     public func resetProfile() { profile = DecodeProfile() }
+    /// DS4_PROFILE_ROUTE=1: split route/attn into pre (Q/KV proj + compressor) and
+    /// attn (attention + out proj + HC + router), each its own command buffer + timed.
+    /// Adds a commit/wait per layer (absolute numbers inflate); read the RATIO.
+    let profileRoute = ProcessInfo.processInfo.environment["DS4_PROFILE_ROUTE"] == "1"
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -514,18 +525,43 @@ public final class StreamingDecoder {
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxWeights && indexerActive(i, pos: pos)
         if active, let idx {
+            // Indexer layers always split (CPU top-k sits between pre and attn).
+            var t = Date()
             let c1 = GraphContext(rt); try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: true)
             c1.commit()
+            if profileRoute { profile.routePreS += Date().timeIntervalSince(t) }
             applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
+            t = Date()
             let c2 = GraphContext(rt); try c2.begin()
             try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
             c2.commit()
+            if profileRoute { profile.routeAttnS += Date().timeIntervalSince(t) }
+        } else if profileRoute {
+            // Profiling: split the merged path so pre (Q/KV proj + compressor) and
+            // attn (attention + out proj + HC + router) are timed separately. The
+            // extra commit/wait inflates the ABSOLUTE time — read the RATIO.
+            clearMaskIfDirty()
+            var t = Date()
+            let c1 = GraphContext(rt); try c1.begin()
+            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              indexerScoring: false)
+            c1.commit()
+            profile.routePreS += Date().timeIntervalSince(t)
+            t = Date()
+            let c2 = GraphContext(rt); try c2.begin()
+            try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nComp: nComp, comp: compStates[i])
+            c2.commit()
+            profile.routeAttnS += Date().timeIntervalSince(t)
         } else {
             clearMaskIfDirty()
             let c1 = GraphContext(rt); try c1.begin()
