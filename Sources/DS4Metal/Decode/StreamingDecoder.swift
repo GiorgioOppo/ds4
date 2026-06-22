@@ -734,8 +734,24 @@ public final class StreamingDecoder {
                 }
             }
         } : nil
+        // Dense-weight residency. Default: per-layer dense weights are NO-COPY mmap
+        // views (evictable). On a machine where the 70GB model can't fit, the 71GB
+        // expert stream churns the page cache and EVICTS the ~5GB of hot dense
+        // weights (q_b/output_a/…, read every token) → route/attn re-faults them
+        // from SSD every token (the "compute" that doesn't warm up). DS4_RESIDENT_DENSE=1
+        // copies them into resident (wired) Metal buffers ONCE (memoized), so they
+        // stay put and the matvec is RAM-bound. Costs ~5GB wired — worth it when it
+        // fits, frees route/attn; on very tight RAM it can pressure the expert cache.
+        let residentDense = ProcessInfo.processInfo.environment["DS4_RESIDENT_DENSE"] == "1"
+        let denseProvider: (Int) throws -> LayerWeights
+        if residentDense {
+            let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
+            denseProvider = { try denseCache.get($0) }
+        } else {
+            denseProvider = { try GGUFWeights.layerMappedDense(rt, model, $0) }
+        }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
-                                    layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
+                                    layerProvider: denseProvider,
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                     expertGather: gather, slotCache: cache, usage: usage,
                                     prefetch: prefetch, kvLayers: kvLayers)

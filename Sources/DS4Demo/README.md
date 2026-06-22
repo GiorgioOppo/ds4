@@ -59,6 +59,7 @@ Sono **opt-in / sperimentali**: cambiano prestazioni o RAM, non i numeri (salvo
 | `DS4_PREFETCH` | `=1` | off | Read-ahead (`madvise`) dei pesi non-routed del **layer successivo** sovrapposto al compute corrente. Default off: su path I/O-bound può **rubare banda SSD** al gather reale. Da misurare per macchina. |
 | `DS4_PREFETCH_EXPERTS` | intero | `0` | Con `DS4_PREFETCH=1`, prefetcha anche questo numero di esperti "probabili" (speculativo, dalla usage prior). |
 | `DS4_WILLNEED_EXPERTS` | `=0` per disattivare | **on** | `madvise(WILLNEED)` sui **6 esperti effettivamente selezionati** subito prima del gather: anticipa e batcha il read-ahead a freddo dei soli slab che verranno copiati. Non speculativo (a differenza di `DS4_PREFETCH_EXPERTS`, non legge esperti inutili); no-op a caldo. Solo advisory, non cambia i numeri. Default ON; `=0` per il vecchio comportamento on-demand. |
+| `DS4_RESIDENT_DENSE` | `=1` | off | Copia i ~5 GB di pesi **non-esperti** per layer in buffer **wired** (residenti) invece di mapparli no-copy. Evita che la churn degli esperti li evicti dalla page cache → `route/attn` non li rifaulta più dall'SSD ogni token. Costa ~5 GB di RAM wired; conviene quando ci sta (può ~raddoppiare i tok/s su modello che non entra in RAM). |
 | `DS4_FUSED_MOE` | `=0` per disattivare | on | Kernel MoE fusi (pair-SwiGLU / down-sum6). `=0` usa il path non fuso, utile per **confronto A/B** numerico. |
 
 ---

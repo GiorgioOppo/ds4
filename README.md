@@ -190,6 +190,15 @@ anticipa e batcha il read-ahead a freddo dei soli slab che servono davvero (non
 speculativo). Riduce i fault a freddo, no-op a caldo, solo advisory (non cambia i
 numeri). Toggle in Impostazioni → Memoria.
 
+**Pesi densi residenti (`DS4_RESIDENT_DENSE=1`, opt-in)**: copia i ~5 GB di pesi
+non-esperti per layer (`q_b`, `output_a`, FFN condivisa, …) in buffer **wired**
+una volta sola, invece di mapparli no-copy. Senza, su una macchina dove il modello
+non entra in RAM la churn dei 71 GB di esperti **eviice** quei pesi caldi dalla page
+cache → `route/attn` li **rifaulta dall'SSD ogni token** (il "compute" che non si
+scalda). Inchiodandoli, il matvec d'attenzione torna RAM-bound. Costa ~5 GB wired:
+conviene quando ci sta (può raddoppiare i tok/s), su RAM molto stretta può premere
+sulla cache esperti.
+
 **Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
 `DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
 all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead
