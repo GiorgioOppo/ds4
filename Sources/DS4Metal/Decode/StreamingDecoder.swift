@@ -22,8 +22,12 @@ import DS4Core
 public struct DecodeProfile: Sendable {
     public var embedS = 0.0       // token embedding
     public var routeS = 0.0       // attention + router (compute)
-    public var routePreS = 0.0    // DS4_PROFILE_ROUTE: route phase 1 (Q/KV proj + compressor)
-    public var routeAttnS = 0.0   // DS4_PROFILE_ROUTE: route phase 2 (attention + out proj + HC + router)
+    // DS4_PROFILE_ROUTE: route/attn split into 5 timed sub-phases (ratios meaningful).
+    public var routeCompS = 0.0       // hc-pre + NSA compressor (attn + indexer)
+    public var routeQS = 0.0          // Q projection (q_a, q_b)
+    public var routeKvS = 0.0         // KV projection + indexer scoring
+    public var routeAttnPhaseS = 0.0  // flash-attn
+    public var routeOutS = 0.0        // output proj + HC-reduce + router
     public var gatherS = 0.0      // gather the 6 selected experts from the mmap (EXPERT I/O)
     public var expertsS = 0.0     // shared FFN + routed MoE matvec (compute)
     public var layerOtherS = 0.0  // non-split decode path (resident experts)
@@ -47,10 +51,13 @@ public struct DecodeProfile: Sendable {
             let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
             cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
         }
-        var routeSplit = ""   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commit)
-        if routePreS + routeAttnS > 0 {
-            routeSplit = "\n     ├ pre  \(ms(routePreS)) ms/token (Q/KV proj + compressor)"
-                       + "\n     └ attn \(ms(routeAttnS)) ms/token (attention + out proj + HC + router)"
+        var routeSplit = ""   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commits)
+        if routeCompS + routeQS + routeKvS + routeAttnPhaseS + routeOutS > 0 {
+            routeSplit = "\n     ├ comp \(ms(routeCompS)) ms/token (hc-pre + NSA compressor)"
+                       + "\n     ├ q    \(ms(routeQS)) ms/token (q_a + q_b proj)"
+                       + "\n     ├ kv   \(ms(routeKvS)) ms/token (kv proj + indexer)"
+                       + "\n     ├ attn \(ms(routeAttnPhaseS)) ms/token (flash-attn)"
+                       + "\n     └ out  \(ms(routeOutS)) ms/token (output proj + HC + router)"
         }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
@@ -525,43 +532,39 @@ public final class StreamingDecoder {
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxWeights && indexerActive(i, pos: pos)
         if active, let idx {
-            // Indexer layers always split (CPU top-k sits between pre and attn).
-            var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
+            // Indexer layers always split (CPU top-k sits between pre and attn). The
+            // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
+            let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: true)
+            try c1.phase("kv")
             c1.commit()
-            if profileRoute { profile.routePreS += Date().timeIntervalSince(t) }
             applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
-            t = Date()
-            let c2 = GraphContext(rt); try c2.begin()
+            let c2 = GraphContext(rt); if profileRoute { c2.phaseTimes = [:] }; try c2.begin()
             try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
+            try c2.phase("out")
             c2.commit()
-            if profileRoute { profile.routeAttnS += Date().timeIntervalSince(t) }
+            if profileRoute { accumulateRoutePhases(c1, c2) }
         } else if profileRoute {
-            // Profiling: split the merged path so pre (Q/KV proj + compressor) and
-            // attn (attention + out proj + HC + router) are timed separately. The
-            // extra commit/wait inflates the ABSOLUTE time — read the RATIO.
+            // Profiling: split route/attn into 5 timed sub-phases (comp, q, kv, attn,
+            // out). The extra commits inflate the ABSOLUTE time — read the RATIOS.
             clearMaskIfDirty()
-            var t = Date()
-            let c1 = GraphContext(rt); try c1.begin()
-            let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
-                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
-                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
-                                              indexerScoring: false)
-            c1.commit()
-            profile.routePreS += Date().timeIntervalSince(t)
-            t = Date()
-            let c2 = GraphContext(rt); try c2.begin()
-            try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                   nComp: nComp, comp: compStates[i])
-            c2.commit()
-            profile.routeAttnS += Date().timeIntervalSince(t)
+            let c = GraphContext(rt); c.phaseTimes = [:]; try c.begin()
+            let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                             rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                             comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                             indexerScoring: false)
+            try c.phase("kv")
+            try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                  nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                  nComp: nComp, comp: compStates[i])
+            try c.phase("out")
+            c.commit()
+            accumulateRoutePhases(c, nil)
         } else {
             clearMaskIfDirty()
             let c1 = GraphContext(rt); try c1.begin()
@@ -574,6 +577,19 @@ public final class StreamingDecoder {
                                    nComp: nComp, comp: compStates[i])
             c1.commit()
         }
+    }
+
+    /// Accumulate per-sub-phase route timings (DS4_PROFILE_ROUTE) into the profile.
+    private func accumulateRoutePhases(_ a: GraphContext, _ b: GraphContext?) {
+        func add(_ pt: [String: Double]) {
+            profile.routeCompS += pt["comp", default: 0]
+            profile.routeQS += pt["q", default: 0]
+            profile.routeKvS += pt["kv", default: 0]
+            profile.routeAttnPhaseS += pt["attn", default: 0]
+            profile.routeOutS += pt["out", default: 0]
+        }
+        if let pt = a.phaseTimes { add(pt) }
+        if let pt = b?.phaseTimes { add(pt) }
     }
 
     /// Will the indexer restrict this token's compressed rows on layer `i`?

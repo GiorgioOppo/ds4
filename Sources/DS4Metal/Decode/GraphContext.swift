@@ -13,6 +13,11 @@ public final class GraphContext {
     private var cb: MTLCommandBuffer?
     private var enc: MTLComputeCommandEncoder?
 
+    /// Profiling (DS4_PROFILE_ROUTE): set to `[:]` to time sub-phases. `phase(name)`
+    /// then flushes the buffer and accumulates the wall-clock under `name`. nil = off.
+    public var phaseTimes: [String: Double]?
+    private var phaseStart = Date()
+
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
     public func begin() throws {
@@ -20,6 +25,22 @@ public final class GraphContext {
             throw MetalError.bufferAlloc
         }
         cb = c; enc = e
+        phaseStart = Date()
+    }
+
+    /// Mark the end of a named sub-phase: when `phaseTimes` is enabled, commit+wait,
+    /// record the elapsed (CPU-encode + GPU-exec) time under `name`, and start a
+    /// fresh command buffer. A no-op when profiling is off. MUST be called outside
+    /// any pushDebugGroup/popDebugGroup pair (it breaks the command buffer).
+    public func phase(_ name: String) throws {
+        guard phaseTimes != nil else { return }
+        enc?.endEncoding(); cb?.commit(); cb?.waitUntilCompleted()
+        phaseTimes![name, default: 0] += Date().timeIntervalSince(phaseStart)
+        guard let c = rt.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+        cb = c; enc = e
+        phaseStart = Date()
     }
 
     /// Flush: end encoding, commit, wait. After this the GPUTensor outputs are readable.

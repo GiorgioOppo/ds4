@@ -242,6 +242,7 @@ extension GraphContext {
                                          comp: idx, rope: rope, pos: pos, rmsEps: rmsEps,
                                          nRot: d.nRot, finalize: .indexerQat)
         }
+        try phase("comp")                             // DS4_PROFILE_ROUTE boundary (hc-pre + compressor)
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
         encoder.pushDebugGroup("q-proj")              // Instruments: name the GPU phase
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
@@ -252,6 +253,7 @@ extension GraphContext {
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
         encoder.popDebugGroup()                       // q-proj
+        try phase("q")                                // DS4_PROFILE_ROUTE boundary (q proj)
         // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
         encoder.pushDebugGroup("kv-proj")
         try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
@@ -304,6 +306,7 @@ extension GraphContext {
                           rawStartRow: rawLo, hasSinks: true,
                           comp: comp?.cache, nComp: nComp)
         encoder.popDebugGroup()                       // attention
+        try phase("attn")                             // DS4_PROFILE_ROUTE boundary (flash-attn)
         encoder.pushDebugGroup("attn-out")
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
