@@ -243,6 +243,7 @@ extension GraphContext {
                                          nRot: d.nRot, finalize: .indexerQat)
         }
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
+        encoder.pushDebugGroup("q-proj")              // Instruments: name the GPU phase
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
         try matmulQ8_0(weight: w.qB, x: s.qrNorm, out: s.q, inDim: d.qRank, outDim: d.qDim)
@@ -250,7 +251,9 @@ extension GraphContext {
         try ropeTail(x: s.q, nTok: 1, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
+        encoder.popDebugGroup()                       // q-proj
         // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
+        encoder.pushDebugGroup("kv-proj")
         try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
         try rmsNorm(s.kvRaw, weight: w.kvNorm, out: s.kv, rows: 1, n: d.headDim, eps: rmsEps)
         try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
@@ -258,6 +261,7 @@ extension GraphContext {
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
         try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot,
                        rawRow: pos % (rawCache.count / d.headDim))   // ring slot (= pos with the full cache)
+        encoder.popDebugGroup()                       // kv-proj
         // 3.5) Indexer scoring (only when the comp rows exceed the top-K): the
         // indexer query comes from qr_norm via indexer.attn_q_b (+rope+Hadamard),
         // the head weights from attn_norm via indexer.proj. C: indexer_allowed_decode_one.
@@ -294,10 +298,13 @@ extension GraphContext {
         //    the model and degrades long generations. Rows carry their absolute
         //    RoPE position, so dropping the oldest is exactly the C semantics.
         let rawLo = max(0, nKeys - d.nSWA)
+        encoder.pushDebugGroup("attention")
         try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
                           pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys - rawLo,
                           rawStartRow: rawLo, hasSinks: true,
                           comp: comp?.cache, nComp: nComp)
+        encoder.popDebugGroup()                       // attention
+        encoder.pushDebugGroup("attn-out")
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
         //    hcExpand4(blockOut, curHc, post=split[4:8], comb=split[8:24]) = afterAttn.
@@ -311,6 +318,8 @@ extension GraphContext {
         try hcExpand4(blockOut: s.blockOut, residual: curHc, post: s.split, comb: s.split,
                       blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+        encoder.popDebugGroup()                       // attn-out
+        encoder.pushDebugGroup("hc-router")
         // 6) HC-reduce pre-FFN (on afterAttn)
         try hcReduce(curHc: s.afterAttn, mixerFn: w.hcFfnFn, scale: w.ffnScale, base: w.ffnBase,
                      norm: w.ffnNorm, s: s, d: d, eps: rmsEps)
@@ -325,6 +334,7 @@ extension GraphContext {
         try unary(s.sp, op: .sqrt, out: s.probs, width: d.nExperts)
         try routerFinalizeTop6(probs: s.probs, selected: s.selected)
         try routerWeights(probs: s.probs, selected: s.selected, weights: s.rw)
+        encoder.popDebugGroup()                       // hc-router
     }
 
     /// Phase 2: shared FFN + routed MoE (over `gateExp`/`upExp`/`downExp` indexed
