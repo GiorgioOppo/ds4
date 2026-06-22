@@ -184,13 +184,16 @@ i nuovi agenti (Orchestratore/LaTeX/Documentazione), distributed inference
 (protocol + worker/coordinator + UI in place; numerical parity and multi-Mac
 runs not yet verified), distributed benchmark.
 
+**Read-ahead esperti (`DS4_WILLNEED_EXPERTS`, DEFAULT ON, opt-out con `=0`)**:
+`madvise(WILLNEED)` sui **6 esperti selezionati** subito prima del gather —
+anticipa e batcha il read-ahead a freddo dei soli slab che servono davvero (non
+speculativo). Riduce i fault a freddo, no-op a caldo, solo advisory (non cambia i
+numeri). Toggle in Impostazioni → Memoria.
+
 **Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
 `DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
 all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead
-`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`) · `DS4_WILLNEED_EXPERTS`
-(`madvise(WILLNEED)` sui **6 esperti selezionati** prima del gather: anticipa il
-read-ahead a freddo dei soli slab che servono davvero, non speculativo — riduce i
-fault a freddo, no-op a caldo).
+`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`).
 
 **Known gaps**: decode on a 16 GB machine is I/O-bound (~57% expert gather) —
 that is the physics of streaming 284B from SSD; distributed mode is the intended

@@ -58,7 +58,7 @@ Sono **opt-in / sperimentali**: cambiano prestazioni o RAM, non i numeri (salvo
 | `DS4_EXPERT_CACHE_SLOTS` | intero | `0` (off) | Pool LRU per layer che tiene gli esperti "caldi" residenti in GPU (solo i miss vengono copiati dall'mmap). Memoria **wired** ~6.9 MB/slot × layer: su poca RAM parti piccolo (8) e guarda l'hit-rate nel profilo. Minimo effettivo 8 quando attivo. |
 | `DS4_PREFETCH` | `=1` | off | Read-ahead (`madvise`) dei pesi non-routed del **layer successivo** sovrapposto al compute corrente. Default off: su path I/O-bound può **rubare banda SSD** al gather reale. Da misurare per macchina. |
 | `DS4_PREFETCH_EXPERTS` | intero | `0` | Con `DS4_PREFETCH=1`, prefetcha anche questo numero di esperti "probabili" (speculativo, dalla usage prior). |
-| `DS4_WILLNEED_EXPERTS` | `=1` | off | `madvise(WILLNEED)` sui **6 esperti effettivamente selezionati** subito prima del gather: anticipa e batcha il read-ahead a freddo dei soli slab che verranno copiati. Non speculativo (a differenza di `DS4_PREFETCH_EXPERTS`, non legge esperti inutili); no-op a caldo. Solo advisory, non cambia i numeri. |
+| `DS4_WILLNEED_EXPERTS` | `=0` per disattivare | **on** | `madvise(WILLNEED)` sui **6 esperti effettivamente selezionati** subito prima del gather: anticipa e batcha il read-ahead a freddo dei soli slab che verranno copiati. Non speculativo (a differenza di `DS4_PREFETCH_EXPERTS`, non legge esperti inutili); no-op a caldo. Solo advisory, non cambia i numeri. Default ON; `=0` per il vecchio comportamento on-demand. |
 | `DS4_FUSED_MOE` | `=0` per disattivare | on | Kernel MoE fusi (pair-SwiGLU / down-sum6). `=0` usa il path non fuso, utile per **confronto A/B** numerico. |
 
 ---

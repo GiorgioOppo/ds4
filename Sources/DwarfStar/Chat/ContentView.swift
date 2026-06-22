@@ -107,6 +107,9 @@ struct ModelLoadView: View {
                     Text("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto → RAM KV indipendente dal contesto. Sperimentale: verifica gli output dopo un contesto lungo. Si applica al prossimo caricamento.")
                         .font(.caption).foregroundStyle(.orange)
                 }
+                Toggle("Read-ahead esperti selezionati (madvise)", isOn: $store.willNeedEnabled)
+                Text("Anticipa la lettura dei 6 esperti scelti subito prima del gather: riduce i fault a freddo (su poca RAM), no-op a caldo. Solo advisory, non cambia gli output. Consigliato ON. Si applica al prossimo caricamento.")
+                    .font(.caption).foregroundStyle(.tertiary)
             }
 
             Section("Agente (ruolo)") {

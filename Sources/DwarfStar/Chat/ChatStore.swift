@@ -64,6 +64,7 @@ final class ChatStore {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -99,6 +100,16 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
             _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
+        }
+    }
+    /// madvise(WILLNEED) sui 6 esperti selezionati prima del gather: anticipa e
+    /// batcha il read-ahead a freddo dei soli slab che servono. Solo advisory (non
+    /// cambia i numeri). DEFAULT ON; si applica al PROSSIMO caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var willNeedEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4WillNeed") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(willNeedEnabled, forKey: "DS4WillNeed")
+            _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)
         }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
