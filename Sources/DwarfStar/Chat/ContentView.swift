@@ -139,6 +139,8 @@ struct ModelLoadView: View {
             Section("Contesto e system prompt") {
                 Stepper("Contesto: \(store.contextSize) token",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
+                Text("Le cache KV crescono col contesto e tolgono page cache allo stream esperti: su poca RAM un contesto alto rallenta molto la generazione. Il default è tarato sulla RAM (4096 su ≤16 GB, come la demo); alzalo solo se ti serve davvero una finestra più lunga.")
+                    .font(.caption).foregroundStyle(.secondary)
                 TextField("System prompt aggiuntivo (si somma al ruolo dell'agente)",
                           text: $store.systemPrompt, axis: .vertical)
                     .lineLimit(2...6)
