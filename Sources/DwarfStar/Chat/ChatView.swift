@@ -82,9 +82,10 @@ struct ChatView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Slider(value: $store.temperature, in: 0...1.5, step: 0.05)
                     .frame(width: 220)
-                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo.")
+                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo. 0 = greedy (deterministico, come la demo).")
                     .font(.caption2).foregroundStyle(.secondary)
                 HStack {
+                    Button("Greedy (0)") { store.temperature = 0 }
                     Button("Preciso (0.3)") { store.temperature = 0.3 }
                     Button("Default (0.6)") { store.temperature = 0.6 }
                 }
