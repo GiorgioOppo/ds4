@@ -22,9 +22,9 @@ BUILD_DIR="$GUI_DIR/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 SIGN_IDENTITY="${DS4_SIGN_IDENTITY:--}"   # default: ad-hoc
 
-echo "==> Building engine static library"
-( cd "$GUI_DIR" && make engine )
-
+# Pure-Swift stack: no separate engine static library — `swift build` compiles
+# DS4Core + DS4Metal + DS4Engine + DwarfStar together (Metal kernels are embedded
+# in the binary via Sources/DS4Metal/Runtime/KernelSources.swift).
 echo "==> Building SwiftPM release"
 ( cd "$GUI_DIR" && swift build -c release --product "$APP_NAME" )
 
@@ -54,10 +54,10 @@ set_key LSMinimumSystemVersion 14.0
 $PB -c "Set :NSHighResolutionCapable true" "$PLIST" 2>/dev/null \
     || $PB -c "Add :NSHighResolutionCapable bool true" "$PLIST"
 
-# Required: the Metal kernel sources, compiled at runtime by the engine. These
-# are vendored inside the DS4-gui project (GUI_DIR/metal), so the bundle does
-# not depend on the upstream tree.
-cp -R "$GUI_DIR/metal" "$APP/Contents/Resources/metal"
+# Optional fallback: the Metal kernel SOURCES. The runtime compiles the kernels
+# EMBEDDED in the binary (Sources/DS4Metal/Runtime/KernelSources.swift), so the
+# bundle does not need this folder; copy it only if present (harmless extra).
+[ -d "$GUI_DIR/metal" ] && cp -R "$GUI_DIR/metal" "$APP/Contents/Resources/metal"
 
 # Optional app icon.
 if [ -f "$PKG_DIR/AppIcon.icns" ]; then
