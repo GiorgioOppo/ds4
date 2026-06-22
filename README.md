@@ -191,13 +191,15 @@ speculativo). Riduce i fault a freddo, no-op a caldo, solo advisory (non cambia 
 numeri). Toggle in Impostazioni → Memoria.
 
 **Pesi densi residenti (`DS4_RESIDENT_DENSE`, toggle in Impostazioni → Memoria,
-default ON con RAM ≥ 24 GB)**: copia i ~5 GB di pesi non-esperti per layer (`q_b`,
+default ON da 16 GB in su)**: copia i ~5 GB di pesi non-esperti per layer (`q_b`,
 `output_a`, FFN condivisa, …) in buffer **wired** una volta sola, invece di mapparli
 no-copy. Senza, su una macchina dove il modello non entra in RAM la churn dei 71 GB
 di esperti **eviice** quei pesi caldi dalla page cache → `route/attn` li **rifaulta
 dall'SSD ogni token** (il "compute" che non si scalda), e con loro anche embedding e
 output head. Inchiodandoli, il matvec torna RAM-bound. Costa ~5 GB wired: misurato
-**~+40% tok/s** su M1 Pro 32 GB; su poca RAM (≤16 GB) lascialo **OFF**.
+**~+40% tok/s** su M1 Pro 32 GB, ed è il fattore che rendeva la GUI **~2× più lenta
+della demo** quando restava spento sotto i 24 GB. Su 16 GB il guadagno netto è
+comunque positivo; se la RAM va in pressione, **spegnilo dal toggle**.
 
 **Tuning del matvec Q8 (`DS4_Q8_NSG`, default `4`)**: simdgroup-per-threadgroup del
 matvec Q8_0 denso (le proiezioni `q_b`/`output_a` che dominano `route/attn`). Il

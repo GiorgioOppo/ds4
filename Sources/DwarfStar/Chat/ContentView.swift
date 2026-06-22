@@ -111,7 +111,7 @@ struct ModelLoadView: View {
                 Text("Anticipa la lettura dei 6 esperti scelti subito prima del gather: riduce i fault a freddo (su poca RAM), no-op a caldo. Solo advisory, non cambia gli output. Consigliato ON. Si applica al prossimo caricamento.")
                     .font(.caption).foregroundStyle(.tertiary)
                 Toggle("Pesi densi residenti (~5 GB wired)", isOn: $store.residentDenseEnabled)
-                Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce (su questa macchina ~+40%). Costa ~5 GB di RAM wired: default ON con RAM ≥ 24 GB, OFF su poca RAM. Si applica al prossimo caricamento.")
+                Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce (il rifault di ~5 GB/token è ciò che rendeva la UI ~2× più lenta della demo). Costa ~5 GB di RAM wired: default ON da 16 GB in su; se la RAM va in pressione spegnilo. Si applica al prossimo caricamento.")
                     .font(.caption).foregroundStyle(.tertiary)
                 Toggle("Profilo decode route/attn (diagnostico)", isOn: $store.profileRouteEnabled)
                 if store.profileRouteEnabled {
