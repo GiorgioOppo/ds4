@@ -199,6 +199,16 @@ dall'SSD ogni token** (il "compute" che non si scalda), e con loro anche embeddi
 output head. Inchiodandoli, il matvec torna RAM-bound. Costa ~5 GB wired: misurato
 **~+40% tok/s** su M1 Pro 32 GB; su poca RAM (≤16 GB) lascialo **OFF**.
 
+**Tuning del matvec Q8 (`DS4_Q8_NSG`, default `4`)**: simdgroup-per-threadgroup del
+matvec Q8_0 denso (le proiezioni `q_b`/`output_a` che dominano `route/attn`). Il
+kernel e la sua dispatch sono **identici al riferimento C** (`ds4_gpu_make_q8_0_mv_dispatch`,
+`nsg=4`/`nr0=2`) — non c'è inefficienza di port da correggere. `NSG` è però solo una
+**partizione del lavoro** (divide la riduzione K su `NSG` simdgroup e somma esattamente
+su quelli; shmem e grid non dipendono da `NSG`), quindi **qualunque `1…8` dà risultati
+identici**: cambia solo l'occupancy / il latency-hiding. L'ottimo è hardware-specifico,
+quindi è esposto come knob da **sweepare on-device** (`DS4_Q8_NSG=2/4/6/8`) — il default
+resta la config di riferimento.
+
 **Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
 `DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
 all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead

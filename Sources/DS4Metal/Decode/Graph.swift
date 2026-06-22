@@ -491,7 +491,7 @@ extension GraphContext {
                              nGroups: Int, groupDim: Int, rank: Int) throws {
         precondition(groupDim % 32 == 0)
         let rowABytes = (groupDim / 32) * 34
-        let nsg: Int16 = 4, nr0 = 2
+        let nsg = GraphContext.q8NSG, nr0 = 2   // nsg tunable via DS4_Q8_NSG (default 4 = reference)
         let args = MetalRuntime.attnLowArgs(nGroups: nGroups, groupDim: groupDim, rank: rank, rowABytes: rowABytes)
         let pso = try rt.mulMVPipeline("kernel_dsv4_attn_out_low_q8_0_f32", nsg: nsg)
         let e = encoder

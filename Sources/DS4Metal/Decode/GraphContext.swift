@@ -18,6 +18,25 @@ public final class GraphContext {
     public var phaseTimes: [String: Double]?
     private var phaseStart = Date()
 
+    /// DS4_Q8_NSG: simdgroups-per-threadgroup for the dense Q8_0 matvec (and the
+    /// grouped attn-output low-rank matvec, which shares the same K-split kernel).
+    /// Default 4 — exactly the reference `ds4_gpu_make_q8_0_mv_dispatch()` config.
+    ///
+    /// This is a *pure work-partition* lever, not a math change: the kernel splits the
+    /// reduction (K) dimension across NSG simdgroups and `helper_mv_reduce_and_write`
+    /// sums across exactly NSG of them; the threadgroup-memory size (NW*NR0*4) and the
+    /// grid width ((outDim+NR0-1)/NR0) are both independent of NSG. So any value in
+    /// 1...8 produces identical results — only occupancy / DRAM-latency hiding changes.
+    /// Exposed because the optimal NSG is hardware-specific (M1 Pro vs M2/M3) and can
+    /// only be found by sweeping on-device; we can't benchmark here. Read once.
+    static let q8NSG: Int16 = {
+        if let v = ProcessInfo.processInfo.environment["DS4_Q8_NSG"].flatMap(Int.init),
+           v >= 1, v <= 8 {
+            return Int16(v)
+        }
+        return 4
+    }()
+
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
     public func begin() throws {
@@ -123,7 +142,7 @@ public final class GraphContext {
     public func matmulQ8_0(weight: GPUTensor, x: GPUTensor, out: GPUTensor,
                            inDim: Int, outDim: Int) throws {
         precondition(inDim % 32 == 0)
-        let nsg: Int16 = 4, nr0 = 2
+        let nsg = GraphContext.q8NSG, nr0 = 2   // nsg tunable via DS4_Q8_NSG (default 4 = reference)
         let rowBytes = (inDim / 32) * 34
         let args = MetalRuntime.mulMVArgs(ne00: inDim, ne01: outDim, nb00: 34, nb01: UInt64(rowBytes),
                                           nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 1,
