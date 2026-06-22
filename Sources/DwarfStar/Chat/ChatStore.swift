@@ -117,15 +117,14 @@ final class ChatStore {
     /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
     /// per layer in buffer wired (residenti) invece di mapparli no-copy, così la
     /// churn degli esperti non li eviice dalla page cache → route/attn RAM-bound.
-    /// Stessi numeri (è solo copia vs mmap). DEFAULT ON da 16 GB in su: anche su 16 GB
-    /// evita di rifaultare ~5 GB di pesi densi (q_b/output_a/FFN condivisa) dall'SSD
-    /// ad ogni token — il costo dominante che rendeva la UI ~2× più lenta della demo.
-    /// I ~5 GB wired premono sulla page cache degli esperti, ma il guadagno netto è
-    /// positivo (misurato); se su poca RAM andasse in pressione, spegnilo dal toggle.
-    /// Si applica al prossimo caricamento del modello.
+    /// Stessi numeri (è solo copia vs mmap). DEFAULT ON solo con RAM abbondante
+    /// (≥24 GB): su 16 GB inchiodare ~5 GB wired manda in pressione di memoria
+    /// (swap / meno page cache per gli esperti) e MISURATO PEGGIORA — resta OFF di
+    /// default lì, ma il toggle permette di provarlo. Si applica al prossimo
+    /// caricamento del modello.
     var residentDenseEnabled: Bool =
         (UserDefaults.standard.object(forKey: "DS4ResidentDense") as? Bool)
-        ?? (MemoryInfo.physicalBytes >= 16 * 1_073_741_824) {
+        ?? (MemoryInfo.physicalBytes >= 24 * 1_073_741_824) {
         didSet {
             UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
             _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
