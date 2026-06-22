@@ -599,7 +599,11 @@ public actor InferenceService {
     private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
-            let task = Task {
+            // .userInitiated: this is the task that actually runs the (synchronous,
+            // GPU-blocking) decode loop on the actor's executor. The chat path already
+            // drives it from a .userInitiated task, but other callers (HTTP server,
+            // sub-agents) may not — pin it so the decode never runs at a throttled QoS.
+            let task = Task(priority: .userInitiated) {
                 do {
                     try self.generate(suffix: suffix, think: think, sampling: sampling,
                                       maxTokens: maxTokens, continuation: continuation)
