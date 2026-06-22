@@ -412,7 +412,12 @@ final class ChatStore {
 
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
-        generation = Task { [weak self] in
+        // .userInitiated: the decode runs on the InferenceService actor's executor at
+        // THIS task's QoS. A default-priority task lets macOS deprioritize the work —
+        // and, worse for the SSD-streaming path, throttle its expert-gather reads — so
+        // the app decodes slower than the foreground CLI demo. Match the model-load
+        // task's priority (and the CLI's foreground QoS) explicitly.
+        generation = Task(priority: .userInitiated) { [weak self] in
             let stream = primed
                 ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
                 : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
@@ -783,7 +788,7 @@ final class ChatStore {
         isGenerating = true
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
-        generation = Task { [weak self] in
+        generation = Task(priority: .userInitiated) { [weak self] in   // see send(): keep decode QoS high
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
                                                           sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
