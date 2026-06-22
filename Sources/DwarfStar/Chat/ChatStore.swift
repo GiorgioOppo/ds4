@@ -66,6 +66,7 @@ final class ChatStore {
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON ≥24GB RAM
+        _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -125,6 +126,18 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
             _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Profilo decode route/attn (DS4_PROFILE_ROUTE): splitta route/attn in 5 fasi
+    /// (comp/q/kv/attn/out), ognuna con commit+wait dedicato. DIAGNOSTICO: i commit
+    /// extra RALLENTANO la generazione (gli assoluti si gonfiano; conta il RAPPORTO),
+    /// quindi DEFAULT OFF e NON usarlo mentre misuri la velocità. Il report finisce
+    /// nel Log motore a fine turno. Si applica al prossimo caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var profileRouteEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ProfileRoute") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(profileRouteEnabled, forKey: "DS4ProfileRoute")
+            _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)
         }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
@@ -674,6 +687,17 @@ final class ChatStore {
             status = ""
             refreshContextUsage()
             persistActiveSession()        // checkpoint the completed turn
+            if profileRouteEnabled { emitDecodeProfile() }
+        }
+    }
+
+    /// Print the last turn's decode profile to stderr so it lands in the Log motore
+    /// (EngineLog captures fd 2), mirroring the demo's `log(dec.profile.report())`.
+    private func emitDecodeProfile() {
+        guard let service else { return }
+        Task {
+            let report = await service.decodeProfileReport()
+            FileHandle.standardError.write(Data(("\n" + report + "\n").utf8))
         }
     }
 

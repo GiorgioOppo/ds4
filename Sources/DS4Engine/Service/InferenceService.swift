@@ -656,6 +656,11 @@ public actor InferenceService {
                                                    : "prefill +\(suffixIds.count) token (riuso KV)…"))
         var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: startPos)
         committedIds.append(contentsOf: suffixIds)
+        // Profile the DECODE only (not the prefill), matching DS4Demo: reset the
+        // per-phase counters at the prefill→decode boundary so decodeProfileReport()
+        // reflects steady-state generation. The decode loop is opaque to the UI (it
+        // runs inside the stream's task), so this is the only place to reset cleanly.
+        decoder.resetProfile()
         // The committed KV now ends with an open assistant turn; mark it immediately
         // so a mid-decode interruption still closes the turn on the next suffix.
         needsClose = true

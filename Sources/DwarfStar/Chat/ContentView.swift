@@ -113,6 +113,11 @@ struct ModelLoadView: View {
                 Toggle("Pesi densi residenti (~5 GB wired)", isOn: $store.residentDenseEnabled)
                 Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce (su questa macchina ~+40%). Costa ~5 GB di RAM wired: default ON con RAM ≥ 24 GB, OFF su poca RAM. Si applica al prossimo caricamento.")
                     .font(.caption).foregroundStyle(.tertiary)
+                Toggle("Profilo decode route/attn (diagnostico)", isOn: $store.profileRouteEnabled)
+                if store.profileRouteEnabled {
+                    Text("Splitta route/attn in 5 fasi (comp/q/kv/attn/out) e scrive il report nel Log motore a fine turno. ⚠️ I commit extra per fase RALLENTANO la generazione: usalo per capire DOVE va il tempo (conta il rapporto), non per misurare la velocità. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
             }
 
             Section("Agente (ruolo)") {
