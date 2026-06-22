@@ -87,7 +87,12 @@ echo "==> Code signing ($SIGN_IDENTITY)"
 # Sign nested binaries first, then the app.
 find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
     codesign --force --timestamp=none --sign "$SIGN_IDENTITY" {} \; 2>/dev/null || true
-codesign --force --deep --timestamp=none --sign "$SIGN_IDENTITY" "$APP"
+# Sign WITH the sandbox entitlements (same as the xcodeproj build) so the open
+# panel grants file access and security-scoped bookmarks work — without them the
+# bundle can't read the user-picked GGUF. (Ad-hoc identity: session access works;
+# app-scope bookmarks may not persist across rebuilds, which is fine for a local app.)
+codesign --force --deep --timestamp=none \
+    --entitlements "$PKG_DIR/DwarfStar.entitlements" --sign "$SIGN_IDENTITY" "$APP"
 
 echo "==> Verifying"
 codesign --verify --verbose "$APP" || true
