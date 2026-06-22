@@ -78,6 +78,11 @@ if [ -f "$ROOT_DIR/speed-bench/promessi_sposi.txt" ]; then
     cp "$ROOT_DIR/speed-bench/promessi_sposi.txt" "$APP/Contents/Resources/speed-bench/"
 fi
 
+# Strip extended attributes (resource forks / Finder info / com.apple.quarantine
+# / provenance) that copied-in files can carry — codesign refuses them with
+# "resource fork, Finder information, or similar detritus not allowed".
+xattr -cr "$APP" 2>/dev/null || true
+
 echo "==> Code signing ($SIGN_IDENTITY)"
 # Sign nested binaries first, then the app.
 find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
