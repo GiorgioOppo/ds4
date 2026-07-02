@@ -64,6 +64,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
+                Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",

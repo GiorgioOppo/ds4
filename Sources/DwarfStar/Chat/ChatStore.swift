@@ -66,9 +66,11 @@ final class ChatStore {
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
+        // (Con DS4_DENSE_STREAM attivo il motore da' comunque precedenza allo stream.)
         UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
         _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
@@ -139,11 +141,29 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)
         }
     }
+    /// Streaming double-buffered dei pesi densi (DS4_DENSE_STREAM): invece di
+    /// tenere ~6 GB di densi residenti/cachati, ogni layer viene letto con
+    /// pread+F_NOCACHE in un ring a 2 slot (~300 MB) UN LAYER IN ANTICIPO, così
+    /// l'I/O SSD del layer i+1 si sovrappone al compute del layer i. Byte
+    /// identici → numeriche identiche. MISURATO su M1 Pro 16 GB: route/attn
+    /// −87%, 0.17 → 0.34 tok/s dalla baseline, primo token 8.7 s invece di 24,
+    /// prefill −65%. DEFAULT ON sotto i 24 GB; sopra conviene la residenza
+    /// piena (automatica), quindi lì default OFF. Prevale su DS4_RESIDENT_DENSE.
+    /// Si applica al prossimo caricamento del modello.
+    var denseStreamEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4DenseStream") as? Bool)
+        ?? (MemoryInfo.physicalBytes < 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(denseStreamEnabled, forKey: "DS4DenseStream")
+            _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)
+        }
+    }
     /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
     /// in buffer residenti invece di mapparli no-copy. NON esposto nella GUI e
     /// deciso SOLO dalla RAM (ON ≥24 GB): nella demo CLI a contesto corto su
     /// 16 GB risultava più veloce, ma nell'app reale (SwiftUI, trascrizioni,
     /// server, contesti più lunghi) il budget wired sfora e RALLENTA — misurato.
+    /// Con DS4_DENSE_STREAM attivo il motore da' comunque precedenza allo stream.
     /// Il knob env DS4_RESIDENT_DENSE resta per la demo/gli esperimenti.
     static var residentDenseAuto: Bool { MemoryInfo.physicalBytes >= 24 * 1_073_741_824 }
     /// Profilo decode route/attn (DS4_PROFILE_ROUTE): splitta route/attn in 5 fasi
