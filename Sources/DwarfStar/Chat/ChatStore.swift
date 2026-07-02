@@ -90,11 +90,12 @@ final class ChatStore {
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    /// DEFAULT 12: il punto dolce misurato su M1 Pro 16 GB con dense stream +
-    /// pread + MLOCK (56% hit, ridistribuzione usage-driven attiva). Senza
-    /// MLOCK i pool grandi vengono compressi/paginati e conviene 8; oltre 12
-    /// su ≤16 GB il budget bloccato inizia a competere con KV e sistema.
-    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 12 {
+    /// DEFAULT 16: il punto dolce misurato su M1 Pro 16 GB con dense stream +
+    /// pread + MLOCK + Q4 (63% hit, ridistribuzione usage-driven attiva,
+    /// 1.17 tok/s a regime). Senza MLOCK i pool grandi vengono compressi/
+    /// paginati e conviene 8; senza Q4 il budget bloccato è più tirato e il
+    /// punto dolce scende a 12.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 16 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
 
@@ -164,10 +165,11 @@ final class ChatStore {
     /// q_b / output_a / output_b (Q8, 107 dei ~145 MB/layer) requantizzate al
     /// load e tenute residenti (~1.4 GB, mlockate). MISURATO su M1 Pro 16 GB:
     /// 0.88 → 1.17 tok/s. ATTENZIONE: è l'unica opzione LOSSY — deriva di
-    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente.
-    /// DEFAULT OFF: la qualità la sceglie l'utente. Richiede il dense stream;
-    /// si applica al prossimo caricamento del modello.
-    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? false {
+    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente
+    /// (validato dall'autore sul campo). DEFAULT ON con avviso in GUI; il
+    /// toggle resta per chi preferisce la fedeltà piena. Richiede il dense
+    /// stream; si applica al prossimo caricamento del modello.
+    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
             _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
