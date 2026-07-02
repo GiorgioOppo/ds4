@@ -404,6 +404,17 @@ final class ChatStore {
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
 
+    /// THE single in-process engine, loaded once in Settings and SHARED by every
+    /// feature (Chat, Benchmark, Server). There is never a second full engine:
+    /// with the default resident-Q4 + mlock config a second copy doubles wired
+    /// memory and OOM-crashes on 16 GB. `InferenceService` is an actor, so
+    /// concurrent callers are serialized safely. nil until a model is ready.
+    var sharedEngine: InferenceService? { isReady ? service : nil }
+    /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
+    /// KV, so it's refused while the chat is mid-generation.
+    var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }
+    var loadedModelPath: String? { isReady ? modelPath : nil }
+
     var isReady: Bool { if case .ready = phase { return true } else { return false } }
     var availableTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
 

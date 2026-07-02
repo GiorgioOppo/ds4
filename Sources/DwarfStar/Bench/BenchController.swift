@@ -28,12 +28,14 @@ enum BenchMode: String, CaseIterable, Identifiable {
 final class BenchController {
     let settings: AppSettings
     let dist: DistributedController
+    let store: ChatStore
     var modelPath: String { settings.modelPath }
     var contextSize: Int { settings.contextSize }
 
-    init(settings: AppSettings, dist: DistributedController) {
+    init(settings: AppSettings, dist: DistributedController, store: ChatStore) {
         self.settings = settings
         self.dist = dist
+        self.store = store
     }
     var mode: BenchMode = .local
     var ctxStart = 512
@@ -79,18 +81,25 @@ final class BenchController {
         }
     }
 
-    /// Local in-process benchmark: load a private engine and sweep the frontiers.
+    /// Local in-process benchmark on THE shared engine (the one loaded in
+    /// Settings). It never loads a second model: a second engine doubles the
+    /// resident Q4 + mlocked buffers and OOM-crashes on a 16 GB Mac. The run
+    /// rewrites the shared KV — the next chat turn rebuilds from committed ids.
     private func runLocal(frontiers: [Int], gen: Int) {
-        let path = ProcessStream.absolutePath(modelPath)
-        let ctx = contextSize
+        guard let svc = store.benchmarkService else {
+            log = store.isReady
+                ? "The engine is generating. Wait for the chat turn to finish, then run the benchmark.\n"
+                : "No model loaded. Load the model in Settings first — the benchmark reuses that single engine.\n"
+            isRunning = false; runningMode = nil
+            return
+        }
         let (logCont, rowCont) = makeChannels()
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
 
-        // Heavy work off the main actor; results stream back via the channels.
+        // Heavy work off the main actor; the actor reference is Sendable.
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
-                onLog("Loading model...\n")
-                let svc = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
+                onLog("Running on the shared engine (no second model copy)...\n")
                 for c in frontiers {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")
