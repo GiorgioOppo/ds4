@@ -65,7 +65,8 @@ final class ChatStore {
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
-        _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON ≥24GB RAM
+        _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON (misurato con PREAD)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
@@ -81,7 +82,11 @@ final class ChatStore {
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    var expertCacheSlots: Int = UserDefaults.standard.integer(forKey: "DS4ExpertCacheSlots") {
+    /// DEFAULT 8: il punto dolce misurato su M1 Pro 16 GB con densi residenti +
+    /// pread diretto (~50% hit). 12+ slot insieme ai densi residenti sfonda il
+    /// budget wired dei 16 GB (swap: crollo a 0.05 tok/s) — alzare solo con RAM
+    /// abbondante o densi residenti OFF.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 8 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
 
@@ -114,17 +119,33 @@ final class ChatStore {
             _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)
         }
     }
+    /// Lettura diretta degli esperti (DS4_EXPERT_PREAD): pread + F_NOCACHE dei soli
+    /// slab selezionati, direttamente nei buffer di destinazione, SENZA passare
+    /// dalla page cache. Su RAM stretta il churn degli esperti (~1 GB/token)
+    /// smette così di evictare i pesi densi: misurato su M1 Pro 16 GB vale ~+20%
+    /// di tok/s da solo e rende conveniente i densi residenti (insieme: 0.17 →
+    /// 0.27 tok/s). Con RAM abbondante conviene invece la page cache (i re-read
+    /// degli esperti tiepidi sono gratis) → DEFAULT ON sotto i 24 GB, OFF sopra.
+    /// Stessi byte, stesse numeriche. Si applica al prossimo caricamento.
+    var expertPreadEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4ExpertPread") as? Bool)
+        ?? (MemoryInfo.physicalBytes < 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(expertPreadEnabled, forKey: "DS4ExpertPread")
+            _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)
+        }
+    }
     /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
-    /// per layer in buffer wired (residenti) invece di mapparli no-copy, così la
-    /// churn degli esperti non li eviice dalla page cache → route/attn RAM-bound.
-    /// Stessi numeri (è solo copia vs mmap). DEFAULT ON solo con RAM abbondante
-    /// (≥24 GB): su 16 GB inchiodare ~5 GB wired manda in pressione di memoria
-    /// (swap / meno page cache per gli esperti) e MISURATO PEGGIORA — resta OFF di
-    /// default lì, ma il toggle permette di provarlo. Si applica al prossimo
-    /// caricamento del modello.
+    /// per layer in buffer residenti invece di mapparli no-copy, così route/attn
+    /// diventa RAM-bound. Stessi numeri (è solo copia vs mmap). DEFAULT ON: la
+    /// vecchia regressione sui 16 GB era misurata SENZA pread diretto (la page
+    /// cache era contesa dal churn degli esperti); con DS4_EXPERT_PREAD attivo la
+    /// combinazione è la config più veloce misurata su M1 Pro 16 GB (0.27 tok/s,
+    /// +59% sulla baseline). Costa ~1 min di warm-up al caricamento. Si applica
+    /// al prossimo caricamento del modello.
     var residentDenseEnabled: Bool =
         (UserDefaults.standard.object(forKey: "DS4ResidentDense") as? Bool)
-        ?? (MemoryInfo.physicalBytes >= 24 * 1_073_741_824) {
+        ?? true {
         didSet {
             UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
             _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
