@@ -133,6 +133,11 @@ public final class StreamingDecoder {
     let hcA, hcB, embd: GPUTensor
     let flat, pre, owts, otmp, oembd, onormed, logits: GPUTensor
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
+    /// Persistent staging for the decode slot-cache ids: rewritten every layer
+    /// instead of allocating a fresh 24-byte MTLBuffer per layer per token
+    /// (~43 allocations/token). Safe to reuse: the routed command buffer that
+    /// reads it is committed AND waited before the next layer overwrites it.
+    let slotsScratch: GPUTensor
 
     public init(rt: MetalRuntime, dims: DSV4Dims, rope: RopeParams, nLayers: Int,
                 layerProvider: @escaping (Int) throws -> LayerWeights,
@@ -173,6 +178,7 @@ public final class StreamingDecoder {
         }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
+        slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
         // the older rows need not stay resident — the ring cuts the raw-KV RAM from
@@ -360,7 +366,7 @@ public final class StreamingDecoder {
     /// ≤ min(6·tokens, 256) expert reads per layer instead of 6·tokens.
     private func batchedExpertLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                                     cur: [GPUTensor], other: [GPUTensor], n: Int, posBase: Int,
-                                    gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor)) throws {
+                                    gather: @escaping (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor)) throws {
         // Phase A: sequential routes; save per-token FFN inputs + selection.
         var curT: [GPUTensor] = [], attnT: [GPUTensor] = [], splitT: [GPUTensor] = []
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
@@ -386,6 +392,7 @@ public final class StreamingDecoder {
         // Phase B: group consecutive tokens while the union stays under the cap,
         // gather each group's union once, run every token's FFN with remapped ids.
         let cap = maxUnionExperts
+        var groups: [(tokens: Range<Int>, union: [Int32])] = []
         var j0 = 0
         while j0 < n {
             var union: [Int32] = []
@@ -397,13 +404,34 @@ public final class StreamingDecoder {
                 for id in fresh { union.append(id); seen.insert(id) }
                 j1 += 1
             }
+            groups.append((tokens: j0..<j1, union: union))
+            j0 = j1
+        }
+
+        // PIPELINE: every group's union is known up front (phase A did all the
+        // routes), so group g+1's expert I/O runs on a background queue WHILE
+        // group g's FFNs run on the GPU. Deterministic — no speculation: we
+        // read exactly the experts the router selected. The background work
+        // touches only the read-only mmap and creates fresh Metal buffers
+        // (MTLDevice is thread-safe) — disjoint from the FFN scratch.
+        let bg = PrefillGather(layer: i, gather: gather)
+        var pending: PrefillGather.Pending? = nil
+        defer { pending?.join() }   // never leave a background gather running on error/cancel
+        for (gi, group) in groups.enumerated() {
             var t = Date()
-            let (g, u, dn) = try gather(i, union)        // each unique expert ONCE
-            profile.gatherS += Date().timeIntervalSince(t)
+            let g: GPUTensor, u: GPUTensor, dn: GPUTensor
+            if let p = pending {
+                pending = nil
+                (g, u, dn) = try p.wait()   // residual only: the I/O ran during the previous group's FFNs
+            } else {
+                (g, u, dn) = try gather(i, group.union)   // first group: nothing to overlap yet
+            }
+            profile.gatherS += Date().timeIntervalSince(t)   // EXPOSED (non-overlapped) I/O time
             profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
+            if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
             var posOf: [Int32: Int32] = [:]
-            for (p, id) in union.enumerated() { posOf[id] = Int32(p) }
-            for j in j0..<j1 {
+            for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
+            for j in group.tokens {
                 try Task.checkCancellation()
                 let K = idsT[j].count
                 let remapped = idsT[j].map { posOf[$0]! }
@@ -419,7 +447,6 @@ public final class StreamingDecoder {
                 c2.commit()
                 profile.expertsS += Date().timeIntervalSince(t)
             }
-            j0 = j1
             // g/u/dn drop here -> the group's packed union tensors are freed
         }
     }
@@ -521,8 +548,12 @@ public final class StreamingDecoder {
                 profile.expertHits += cache.hits - h0
                 profile.expertMisses += cache.misses - m0
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
-                let slotsBuf = try GPUTensor.bytes(rt, slots.withUnsafeBytes { Array($0) },
-                                                   elementCount: K)
+                // Persistent staging (no per-layer alloc): c2 below is committed
+                // and waited before the next layer can overwrite this buffer.
+                slots.withUnsafeBytes {
+                    memcpy(slotsScratch.buffer.contents(), $0.baseAddress!, $0.count)
+                }
+                let slotsBuf = slotsScratch
                 t = Date()
                 c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
@@ -887,5 +918,46 @@ final class CachedLayerProvider {
     func get(_ il: Int) throws -> LayerWeights {
         if let w = cache[il] { return w }
         let w = try make(il); cache[il] = w; return w
+    }
+}
+
+/// Background expert-gather for the batched prefill pipeline: runs one union's
+/// gather on a background queue so the SSD I/O of group g+1 overlaps the GPU
+/// FFNs of group g. @unchecked Sendable: the gather closure only reads the
+/// read-only GGUF mmap and creates FRESH Metal buffers (MTLDevice is
+/// thread-safe); the result is handed back through the semaphore, which gives
+/// the consumer a happens-before edge on everything the worker wrote.
+private final class PrefillGather: @unchecked Sendable {
+    typealias Tensors = (GPUTensor, GPUTensor, GPUTensor)
+    private let layer: Int
+    private let gather: (Int, [Int32]) throws -> Tensors
+
+    init(layer: Int, gather: @escaping (Int, [Int32]) throws -> Tensors) {
+        self.layer = layer
+        self.gather = gather
+    }
+
+    final class Pending: @unchecked Sendable {
+        fileprivate var result: Result<Tensors, Error>?
+        fileprivate let sem = DispatchSemaphore(value: 0)
+        /// Block until the gather completes; returns the tensors or rethrows.
+        /// Consume ONCE: call either wait() or join(), never both.
+        func wait() throws -> Tensors {
+            sem.wait()
+            return try result!.get()
+        }
+        /// Block until the gather completes, discarding the outcome (the
+        /// error/cancellation path — the pipeline must never leave a worker
+        /// touching the mmap after the caller unwinds).
+        func join() { sem.wait() }
+    }
+
+    func start(_ union: [Int32]) -> Pending {
+        let p = Pending()
+        DispatchQueue.global(qos: .userInitiated).async {
+            p.result = Result { try self.gather(self.layer, union) }
+            p.sem.signal()
+        }
+        return p
     }
 }
