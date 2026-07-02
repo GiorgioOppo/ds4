@@ -114,10 +114,11 @@ public struct LayerWeights {
     public var gateQuant: MoEQuant = .q4_K
     public var upQuant: MoEQuant = .q4_K
     public var downQuant: MoEQuant = .q4_K
-    // DS4_DENSE_Q4: the giant q_b / output_b projections were requantized
-    // Q8_0 → Q4_K at load (resident); the route dispatch reads THESE flags.
+    // DS4_DENSE_Q4: the giant q_b / output_a / output_b projections were
+    // requantized Q8_0 → Q4_K at load (resident); the dispatch reads THESE flags.
     public var qBQ4 = false
     public var attnOutQ4 = false
+    public var attnOutAQ4 = false
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -148,6 +149,7 @@ public final class DecodeScratch {
     let sgate, sup, smid, sdown, sharedOut, ffnOut: GPUTensor
     let idxQ, idxW, idxScores: GPUTensor   // NSA indexer: q [64×128], weights [64], scores [maxComp]
     let id0: GPUTensor   // [Int32 0] — dense matvec via the MoE id-kernel (k=1, DS4_DENSE_Q4)
+    let idsGroup: GPUTensor   // [0..nOutGroup-1] — grouped attn-out as an all-selected "MoE" (DS4_DENSE_Q4)
 
     public init(_ rt: MetalRuntime, _ d: DSV4Dims, maxKeys: Int) throws {
         let hcDim = d.nHC * d.nEmbd
@@ -176,6 +178,8 @@ public final class DecodeScratch {
         idxW = try .zeros(rt, floatCount: d.nIndexerHead)
         idxScores = try .zeros(rt, floatCount: maxKeys)   // ≥ maxComp rows, generous
         id0 = try .zerosBytes(rt, byteLength: 4)          // Int32(0)
+        idsGroup = try .bytes(rt, Array(0..<Int32(d.nOutGroup)).withUnsafeBytes { Array($0) },
+                              elementCount: d.nOutGroup)
     }
 }
 
@@ -328,8 +332,17 @@ extension GraphContext {
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow,
                      pos0: pos, posStep: 1, inverse: true)
-        try attnOutLowQ8(outputA: w.attnOutA, heads: s.heads, low: s.attnLow,
-                         nGroups: d.nOutGroup, groupDim: d.attnGroupDim, rank: d.nLoraO)
+        if w.attnOutAQ4 {
+            // DS4_DENSE_Q4: the grouped low-rank projection IS a MoE matvec
+            // with all nOutGroup "experts" selected — group g's weight slab
+            // maps heads[g·groupDim…] to low[g·rank…] (perExpertAct row g).
+            try moeMatvecID(.q4_K, experts: w.attnOutA, ids: s.idsGroup, activation: s.heads,
+                            out: s.attnLow, k: d.nOutGroup, inDim: d.attnGroupDim,
+                            outDim: d.nLoraO, perExpertAct: true)
+        } else {
+            try attnOutLowQ8(outputA: w.attnOutA, heads: s.heads, low: s.attnLow,
+                             nGroups: d.nOutGroup, groupDim: d.attnGroupDim, rank: d.nLoraO)
+        }
         if w.attnOutQ4 {
             // DS4_DENSE_Q4: output_b requantized to Q4_K (see q_b above).
             try moeMatvecID(.q4_K, experts: w.attnOut, ids: s.id0, activation: s.attnLow, out: s.blockOut,

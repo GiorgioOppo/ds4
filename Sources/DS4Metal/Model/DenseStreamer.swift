@@ -111,11 +111,14 @@ public final class DenseStreamer: @unchecked Sendable {
                 // they leave the per-token stream entirely — the SSD budget
                 // drops by ~3 GB/token. Intentionally lossy (Q8→Q4 requant);
                 // everything else is untouched.
-                if q4Dense, f == .qB || f == .attnOut,
+                if q4Dense, f == .qB || f == .attnOut || f == .attnOutA,
                    let q4 = try Self.requantQ4(rt, model, fd: fd, tensor: t) {
                     if lockResident { q4.lockResident() }
-                    if f == .qB { w.qB = q4; w.qBQ4 = true }
-                    else { w.attnOut = q4; w.attnOutQ4 = true }
+                    switch f {
+                    case .qB: w.qB = q4; w.qBQ4 = true
+                    case .attnOut: w.attnOut = q4; w.attnOutQ4 = true
+                    default: w.attnOutA = q4; w.attnOutAQ4 = true
+                    }
                     continue
                 }
                 plan.append(Entry(field: f, fileOffset: Int(t.absOffset),
