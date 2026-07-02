@@ -87,13 +87,13 @@ final class ChatStore {
         }
     }
     var systemPrompt = ""
-    /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
+    /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    /// DEFAULT 8: il punto dolce misurato su M1 Pro 16 GB con densi residenti +
-    /// pread diretto (~50% hit). 12+ slot insieme ai densi residenti sfonda il
-    /// budget wired dei 16 GB (swap: crollo a 0.05 tok/s) — alzare solo con RAM
-    /// abbondante o densi residenti OFF.
-    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 8 {
+    /// DEFAULT 12: il punto dolce misurato su M1 Pro 16 GB con dense stream +
+    /// pread + MLOCK (56% hit, ridistribuzione usage-driven attiva). Senza
+    /// MLOCK i pool grandi vengono compressi/paginati e conviene 8; oltre 12
+    /// su ≤16 GB il budget bloccato inizia a competere con KV e sistema.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 12 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
 
