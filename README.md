@@ -154,7 +154,34 @@ Ogni cartella sotto `Sources/` (e i top-level `docs/`, `metal/`, `scripts/`,
 ```sh
 swift run DS4Demo                  # Metal bring-up + GPU self-test
 swift run DS4Demo <model.gguf> 4   # stream 4 tokens through StreamingDecoder
+swift run DS4Demo <model.gguf> 32 "Spiega la RoPE in breve"
 ```
+
+Sintassi completa:
+
+```sh
+swift run DS4Demo [gguf-path] [maxNew] [prompt]
+```
+
+| Argomento | Default | Effetto |
+|---|---|---|
+| `gguf-path` | — | File `.gguf` da aprire. Se omesso, la demo fa solo bring-up Metal + self-test GPU. |
+| `maxNew` | `4` | Token da generare. `0` esegue solo il forward di prova, senza decode streaming. |
+| `prompt` | `"ciao come stai? rispondi in 1 parola"` | Prompt utente, applicato al chat template del modello. Per passarlo devi indicare anche `maxNew`. |
+
+I parametri avanzati passano da variabili d'ambiente:
+
+| Obiettivo | Parametri utili |
+|---|---|
+| Controllare il GGUF prima del decode | `DS4_TYPES_ONLY=1` stampa dtype/tokenizer e poi esce. |
+| Capire dove va il tempo | `DS4_DIAG=1` misura SSD, routing, cache esperti e banda del gather; `DS4_PROFILE_ROUTE=1` spezza `route/attn` in sottofasi. |
+| Rendere i benchmark ripetibili | `DS4_WARMUP=N` esclude i primi token dal profilo; `DS4_USAGE_FILE=<path|off>` controlla lo storico degli esperti usato per pre-warm/cache. |
+| Ridurre I/O o pressione memoria | `DS4_EXPERT_PREAD=1`, `DS4_WILLNEED_EXPERTS=0`, `DS4_RAW_RING=1`, `DS4_RESIDENT_DENSE=1`, `DS4_ACTIVE_EXPERTS=1…6`. |
+| Tuning cache esperti | `DS4_EXPERT_CACHE_SLOTS=N`, `DS4_EXPERT_CACHE_UNIFORM=1`, `DS4_PREFILL_UNION=N`. |
+| Tuning sperimentale | `DS4_Q8_NSG=1…8`, `DS4_PREFETCH=1`, `DS4_PREFETCH_EXPERTS=N`, `DS4_FUSED_MOE=0`. |
+
+La tabella completa con esempi A/B sta in
+[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.md).
 
 ## Packaging a .app
 
