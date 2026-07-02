@@ -67,6 +67,7 @@ final class ChatStore {
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -156,6 +157,19 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(denseStreamEnabled, forKey: "DS4DenseStream")
             _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)
+        }
+    }
+    /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
+    /// output head residente e staging dello stream (~3.3 GB con i default).
+    /// I buffer Metal shared sono memoria anonima che macOS COMPRIME tra un
+    /// token e l'altro: MISURATO su M1 Pro 16 GB, bloccarli vale head 235→19 ms
+    /// ed experts 748→144 ms (totale −38%, 0.39 → 0.52+ tok/s). Best-effort
+    /// (fallimenti ignorati), numeriche identiche. DEFAULT ON; si applica al
+    /// prossimo caricamento del modello.
+    var mlockEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4MLock") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(mlockEnabled, forKey: "DS4MLock")
+            _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)
         }
     }
     /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
