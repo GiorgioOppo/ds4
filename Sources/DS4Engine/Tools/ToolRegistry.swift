@@ -31,7 +31,7 @@ public enum ToolRegistry {
     /// project_write/project_edit and file_write/file_add/file_modify have side
     /// effects (they modify files INSIDE the active project root only); else pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
-                                                 webSearch, webFetch,
+                                                 webSearch, webFetch, webPageInfo, webFetchMany,
                                                  projectList, projectRead, projectSearch,
                                                  projectWrite, projectEdit,
                                                  fileRead, fileLines, fileWrite, fileAdd, fileModify, git,
