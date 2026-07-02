@@ -188,6 +188,18 @@ do {
     let dec = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
                                                               nLayers: DSV4Shape.nLayer, maxKeys: 4096)
     log("DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…")
+    // Persistenza della usage imatrix TRA i run della demo (l'app la persiste
+    // per agente). Senza, i pool della slot-cache nascono al primo token con
+    // storia vuota: l'allocazione usage-driven resterebbe un'anteprima nella
+    // tabella diagnostica senza mai applicarsi. Col file, dal secondo run i
+    // pool partono GIÀ caldi (pre-warm sugli esperti storicamente hot) e con
+    // la ridistribuzione attiva. Default: <gguf>.usage.json; DS4_USAGE_FILE
+    // per cambiare percorso, DS4_USAGE_FILE=off per disattivare.
+    let usagePath = ProcessInfo.processInfo.environment["DS4_USAGE_FILE"] ?? (ggufPath + ".usage.json")
+    if usagePath != "off", let data = FileManager.default.contents(atPath: usagePath) {
+        dec.usage?.load(data)
+        log("DS4Demo: usage imatrix caricata (\(dec.usage?.totalRoutes ?? 0) route) da \(usagePath)")
+    }
     let t0 = Date()
     let logits = try dec.forward(token: 0, pos: 0, nKeys: 1)
     let dt = Date().timeIntervalSince(t0)
@@ -298,6 +310,11 @@ do {
                 }
             }
         }
+    }
+    // Salva la usage imatrix per il prossimo run (vedi load sopra).
+    if usagePath != "off", let data = dec.usage?.serialize() {
+        try? data.write(to: URL(fileURLWithPath: usagePath))
+        log("DS4Demo: usage imatrix salvata (\(dec.usage?.totalRoutes ?? 0) route) in \(usagePath)")
     }
     exit(0)
 } catch {
