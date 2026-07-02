@@ -354,15 +354,39 @@ extension GraphContext {
                               ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                               cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
                               split: GPUTensor? = nil) throws {
-        let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
+        try decodeSharedFFN(w: w, s: s, d: d, cur: cur)
+        try decodeRoutedExperts(w: w, s: s, d: d, gateExp: gateExp, upExp: upExp,
+                                downExp: downExp, ids: ids, outHc: outHc, activeK: activeK,
+                                cur: cur, afterAttn: afterAttn, split: split)
+    }
+
+    /// The shared-expert FFN half of decodeExperts (gate/up -> swiglu -> down into
+    /// s.sharedOut). It does NOT depend on the routing selection, so the streaming
+    /// decode path commits it asynchronously and the GPU runs it WHILE the CPU
+    /// gathers the routed experts from the SSD (I/O/compute overlap). Same
+    /// dispatches in the same order as the fused sequence — identical numerics.
+    public func decodeSharedFFN(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                cur: GPUTensor? = nil) throws {
         let x = cur ?? s.cur
-        let resid = afterAttn ?? s.afterAttn
-        let sp = split ?? s.split
         // shared FFN: gate/up -> swiglu -> down
         try matmulQ8_0(weight: w.sharedGate, x: x, out: s.sgate, inDim: d.nEmbd, outDim: d.sharedFfn)
         try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
         try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
+    }
+
+    /// The routed-MoE half of decodeExperts: matvec over the provided experts, add
+    /// of s.sharedOut (which MUST already be encoded — decodeSharedFFN, either on
+    /// this command buffer or on one already committed) and the HC expand -> outHc.
+    public func decodeRoutedExperts(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                    gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
+                                    ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
+                                    cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
+                                    split: GPUTensor? = nil) throws {
+        let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
+        let x = cur ?? s.cur
+        let resid = afterAttn ?? s.afterAttn
+        let sp = split ?? s.split
         // routed MoE over the provided experts, dispatched on the PER-LAYER quant
         // (w.*Quant) — so a mixed-precision GGUF's boosted layer uses the right
         // kernel. Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when

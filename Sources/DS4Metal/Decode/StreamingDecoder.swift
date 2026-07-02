@@ -493,6 +493,14 @@ public final class StreamingDecoder {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
+            // I/O–compute OVERLAP: the shared-expert FFN does not depend on the
+            // routing selection, so commit it asynchronously FIRST — the GPU
+            // crunches it while the CPU gathers the routed experts from the SSD.
+            // On error the in-flight buffer is waited before rethrowing, so a
+            // rebuilt turn can never race a stale write into the scratch.
+            let c1 = GraphContext(rt); try c1.begin()
+            try c1.decodeSharedFFN(w: w, s: scratch, d: d)
+            c1.commitAsync()
             // The slot cache is a single size-class (the model-global/first-layer
             // quant). A mixed-precision layer (different expert bytes) can't share
             // the pool, so it falls through to the per-layer-correct gather path.
@@ -503,7 +511,10 @@ public final class StreamingDecoder {
                 // mmap. The matvec indexes the pool with slot ids.
                 t = Date()
                 let h0 = cache.hits, m0 = cache.misses
-                let (pool, slots) = try cache.acquire(layer: i, ids: ids)
+                let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
+                do { acquired = try cache.acquire(layer: i, ids: ids) }
+                catch { c1.waitCompleted(); throw error }
+                let (pool, slots) = acquired
                 profile.gatherS += Date().timeIntervalSince(t)
                 // Deltas, not cumulative totals: the cache counts since load,
                 // the profile since resetProfile().
@@ -513,22 +524,27 @@ public final class StreamingDecoder {
                 let slotsBuf = try GPUTensor.bytes(rt, slots.withUnsafeBytes { Array($0) },
                                                    elementCount: K)
                 t = Date()
+                c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
-                                     upExp: pool.up, downExp: pool.down,
-                                     ids: slotsBuf, outHc: other, activeK: K)
+                try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
+                                           upExp: pool.up, downExp: pool.down,
+                                           ids: slotsBuf, outHc: other, activeK: K)
                 c2.commit()
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {
                 // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
                 t = Date()
-                let (g, u, dn) = try gather(i, ids)
+                let gathered: (GPUTensor, GPUTensor, GPUTensor)
+                do { gathered = try gather(i, ids) }
+                catch { c1.waitCompleted(); throw error }
+                let (g, u, dn) = gathered
                 profile.gatherS += Date().timeIntervalSince(t)
                 profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
                 t = Date()
+                c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                     ids: idsPacked, outHc: other, activeK: K)
+                try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                           ids: idsPacked, outHc: other, activeK: K)
                 c2.commit()
                 profile.expertsS += Date().timeIntervalSince(t)
             }

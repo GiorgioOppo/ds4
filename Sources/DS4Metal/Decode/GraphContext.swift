@@ -70,6 +70,22 @@ public final class GraphContext {
         enc = nil; cb = nil
     }
 
+    /// End encoding and commit WITHOUT waiting — pair with waitCompleted().
+    /// Lets CPU work (e.g. the expert-gather SSD I/O) overlap the GPU execution.
+    /// No further encodes are allowed on this context after this call.
+    public func commitAsync() {
+        enc?.endEncoding()
+        cb?.commit()
+        enc = nil
+    }
+
+    /// Wait for a commitAsync()'d command buffer; outputs are readable after this.
+    /// Safe to call more than once (idempotent).
+    public func waitCompleted() {
+        cb?.waitUntilCompleted()
+        cb = nil
+    }
+
     var encoder: MTLComputeCommandEncoder { enc! }
 
     // MARK: - tensor-ops (encode into the shared encoder; no commit)
