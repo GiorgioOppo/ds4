@@ -150,8 +150,10 @@ do {
             var se: Float = 0, sx: Float = 0
             for i in 0..<n { let d = xs[i] - back[i]; se += d * d; sx += xs[i] * xs[i] }
             let rel = (se / max(sx, 1e-12)).squareRoot()
+            // Dati UNIFORMI in (-1,1): l'errore Q4_K atteso è ~5-6% (su pesi
+            // reali, ~gaussiani, è ~2-3%). Un bug di packing darebbe >20%.
             log(String(format: "  Q4_K roundtrip: errore relativo %.2f%% %@", rel * 100,
-                       rel < 0.05 ? "(OK)" : "(SOSPETTO: attesi ~1-4%)"))
+                       rel < 0.08 ? "(OK — atteso ~5-6% su dati uniformi)" : "(SOSPETTO: probabile bug di packing)"))
         }
         // Costo FISSO di un command buffer (commit + waitUntilCompleted, vuoto):
         // il decode streaming ne usa ~3 per layer × 43 layer ≈ 130+ per token.
