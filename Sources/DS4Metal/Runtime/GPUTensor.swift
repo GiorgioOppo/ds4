@@ -115,6 +115,17 @@ public final class GPUTensor {
         return GPUTensor(buffer: b, byteLength: byteLength, count: elementCount)
     }
 
+    /// Best-effort mlock of the buffer's backing pages (DS4_MLOCK=1). Shared
+    /// MTLBuffers are plain anonymous memory: macOS may COMPRESS/page them out
+    /// between uses — a buffer touched once per token (expert pools, resident
+    /// output head) is a prime target, and re-reading it through the compressor
+    /// costs ~2.4 GB/s instead of RAM speed. Locking pins the pages. Failure
+    /// (RLIMIT_MEMLOCK or memory pressure) is ignored: it is only a hint.
+    @discardableResult
+    public func lockResident() -> Bool {
+        mlock(buffer.contents(), buffer.length) == 0
+    }
+
     /// Read back the first `count` F32 elements (default: whole tensor).
     public func floatArray(_ n: Int? = nil) -> [Float] {
         let c = n ?? (byteLength / 4)
