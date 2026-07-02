@@ -249,7 +249,11 @@ do {
             }
             let base = max(8, envSlots)
             let alloc = usage.slotAllocation(base: base)
-            if alloc == nil {
+            if base <= 8 {
+                // 8 = floor LRU (k+2): nessun layer può scendere sotto, quindi
+                // non c'è budget da spostare sui layer concentrati.
+                log("  allocazione usage-driven: S=8 è il floor LRU — nulla da ridistribuire; usa DS4_EXPERT_CACHE_SLOTS≥10")
+            } else if alloc == nil {
                 log("  allocazione usage-driven: storia insufficiente (~43+ token/layer) -> uniforme \(base); rilancia con più token")
             }
             log("  layer   route  conc(top8)  conc(top16)  slot")
