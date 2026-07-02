@@ -135,7 +135,17 @@ public final class DenseStreamer: @unchecked Sendable {
             // model (<gguf>.q4dense, ~1.4 GB) — the first load pays the requant
             // once, every later load preads the cache in ~0.5 s. Invalidated by
             // model size / job-list mismatches; write failures are ignored.
-            let cachePath = model.path + ".q4dense"
+            // Cache location: next to the model by default (demo/CLI), or in
+            // DS4_Q4_CACHE_DIR when set — the SANDBOXED app can't write next
+            // to a picker-selected file, so it points this at Application
+            // Support (a silent write failure would mean re-requant per load).
+            let cachePath: String
+            if let dir = ProcessInfo.processInfo.environment["DS4_Q4_CACHE_DIR"], !dir.isEmpty {
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                cachePath = dir + "/" + (model.path as NSString).lastPathComponent + ".q4dense"
+            } else {
+                cachePath = model.path + ".q4dense"
+            }
             var converted: [GPUTensor]
             LoadProgress.shared.begin("Lettura cache Q4…", from: 0.32, to: 0.92, units: q4Jobs.count)
             if let cached = Self.loadQ4Cache(rt, path: cachePath, modelSize: Int(model.size), jobs: q4Jobs) {

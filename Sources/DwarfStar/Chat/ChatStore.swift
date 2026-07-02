@@ -68,7 +68,11 @@ final class ChatStore {
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
-        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default OFF (lossy, opt-in)
+        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        // La cache del requant Q4 va in Application Support: l'app sandboxed
+        // non può scrivere accanto al GGUF scelto col picker (il fallimento
+        // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
+        _ = setenv("DS4_Q4_CACHE_DIR", Self.q4CacheDirectory.path, 1)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -212,6 +216,13 @@ final class ChatStore {
     static var diskKVDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("DwarfStar/kv-cache", isDirectory: true)
+    }
+
+    /// Application Support/DwarfStar/q4-cache: i .q4dense del requant Q4
+    /// (~1.4 GB per modello) — scrivibile anche in sandbox.
+    static var q4CacheDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("DwarfStar/q4-cache", isDirectory: true)
     }
 
     // Tuning tab state.
