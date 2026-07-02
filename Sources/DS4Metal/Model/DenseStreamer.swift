@@ -88,7 +88,7 @@ public final class DenseStreamer: @unchecked Sendable {
     /// Total bytes streamed per full pass over `layers` (diagnostics).
     public private(set) var bytesPerPass = 0
 
-    public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>) throws {
+    public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false) throws {
         guard let fd = model.uncachedFD() else {
             throw GGUFWeights.LoadError.message("DenseStreamer: cannot open F_NOCACHE descriptor")
         }
@@ -117,6 +117,12 @@ public final class DenseStreamer: @unchecked Sendable {
             throw MetalError.bufferAlloc
         }
         slots = [a, b]
+        if lockResident {
+            // DS4_MLOCK: the staging ring is rewritten every ~70 ms — pin it so
+            // the memory compressor never touches it. Best-effort.
+            _ = mlock(a.contents(), maxSlot)
+            _ = mlock(b.contents(), maxSlot)
+        }
     }
 
     /// LayerProvider entry point (DECODE thread only). Returns layer `il`'s

@@ -795,7 +795,23 @@ public final class StreamingDecoder {
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
-        let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
+        let (embed, headMapped) = try GGUFWeights.outputHeadMapped(rt, model)
+        var head = headMapped
+        // DS4_MLOCK=1: pin the hot resident buffers (expert pools, resident
+        // head, dense-stream staging). Shared MTLBuffers are anonymous memory
+        // that macOS COMPRESSES between uses — a buffer touched once per token
+        // re-reads at ~2.4 GB/s through the compressor instead of RAM speed
+        // (the measured 235 ms output head on a "resident" copy). Best-effort.
+        let lockResident = ProcessInfo.processInfo.environment["DS4_MLOCK"] == "1"
+        // With DS4_DENSE_STREAM the dense weights no longer occupy RAM (~300 MB
+        // of staging instead of ~6 GB), so the OUTPUT HEAD (~560 MB Q8, read in
+        // full every token) gets copied RESIDENT: mapped it was re-read through
+        // a cold page cache at ~2 GB/s (~260 ms/token measured). The embedding
+        // table stays mapped — the decode stages one 8 KB row per token anyway.
+        if ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1" {
+            head.head = try GGUFWeights.tensor(rt, model, "output.weight")
+            if lockResident { head.head.lockResident() }
+        }
         let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         // DS4_EXPERT_PREAD=1: expert slabs pread() DIRECT from disk (F_NOCACHE)
         // instead of memcpy'd from the mmap. Zero page-cache footprint for the
@@ -842,16 +858,38 @@ public final class StreamingDecoder {
                 }
             }
             cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: { slots in
-                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
-                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
-                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
+                let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
+                         up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
+                         down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
+                if lockResident {
+                    // DS4_MLOCK: a hit must cost zero I/O — pin the pool so the
+                    // compressor can't steal cold slots between reuses.
+                    p.gate.lockResident(); p.up.lockResident(); p.down.lockResident()
+                }
+                return p
             }, fill: { il, id, pool, slot in
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
-                                           expertBytes: gateBytes, into: pool.gate, slot: slot, uncachedFD: uncachedFD)
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_up_exps.weight", id: id,
-                                           expertBytes: upBytes, into: pool.up, slot: slot, uncachedFD: uncachedFD)
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
-                                           expertBytes: downBytes, into: pool.down, slot: slot, uncachedFD: uncachedFD)
+                // The 3 slabs (gate/up/down) of a missing expert are read
+                // CONCURRENTLY: with fillAll's parallelism across misses this
+                // raises the NVMe queue depth from ~misses to ~3×misses. It
+                // matters most under DS4_DENSE_STREAM, where the gather shares
+                // the disk with the dense reads and depth is what keeps it fed.
+                let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
+                    ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
+                    ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
+                    ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
+                let lock = NSLock()
+                var firstError: Error? = nil
+                DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
+                    do {
+                        try GGUFWeights.copyExpert(model, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
+                                                   into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD)
+                    } catch {
+                        lock.lock()
+                        if firstError == nil { firstError = error }
+                        lock.unlock()
+                    }
+                }
+                if let e = firstError { throw e }
             }, prefetch: fillPrefetch, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
                slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
@@ -924,7 +962,8 @@ public final class StreamingDecoder {
         let denseStream = ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1"
         let denseProvider: (Int) throws -> LayerWeights
         if denseStream {
-            let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers)
+            let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers,
+                                             lockResident: lockResident)
             denseProvider = { try streamer.weights($0) }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
