@@ -5,6 +5,13 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
   generateEmptyDirectories: true
+# Reference-only groups shown in the Xcode navigator, NOT compiled into any
+# target. metal/*.metal is the source of truth for the GPU kernels: they are
+# embedded as strings in Sources/DS4Metal/Runtime/KernelSources.swift by
+# `make embed-kernels` and compiled at app launch, so they must never be added
+# to a target's sources (Xcode would build a competing default.metallib).
+fileGroups:
+  - metal
 settings:
   base:
     SWIFT_VERSION: "6.0"
