@@ -9,6 +9,8 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 | `now` | `Clock.swift` | Current date/time in ISO-8601 format. |
 | `calculator` | `Calculator.swift` | Evaluates an arithmetic expression. |
 | `add`/`subtract`/`multiply` | `Add`/`Subtract`/`Multiply.swift` | Two-operand arithmetic. |
+| `web_search` | `WebSearch.swift` | Web search (DuckDuckGo, keyless); returns title/url/snippet. Override the endpoint with `DS4_SEARCH_URL` (must contain `%@`). |
+| `web_fetch` | `WebFetch.swift` | Fetches an http(s) URL and returns readable text (HTML stripped). |
 | `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project. |
 | `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | Writes or edits indexed text files. |
 | `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | Raw file access, including line-based reads/edits. |
@@ -22,3 +24,15 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 2. Add the tool to `builtins[]`.
 3. Add it to `projectScoped` if it requires an active imported project.
 4. Add it to `subAgentGrantable` only when isolated sub-agents may safely use it.
+
+## Web Tools & Safety
+
+`web_search`/`web_fetch` are the only tools that reach the network. Because they
+run on model-emitted arguments (attacker-influençable via prompt injection from
+an imported project or a fetched page), every request goes through the SSRF
+guard in `../WebClient.swift`: **http/https only**, and the host must resolve to
+a **public** address — loopback, private (10/8, 172.16/12, 192.168/16, CGNAT),
+link-local, and IPv6 ULA/loopback are refused, and each redirect hop is
+re-validated. Responses are capped at 3 MB / 20 s. The app needs the
+`network.client` entitlement (already present). Note: macOS ATS may block plain
+`http://` pages; HTTPS always works.

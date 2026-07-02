@@ -46,6 +46,15 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               If the task is ambiguous or risky, stop and ask before delegating changes.
               """,
               toolNames: ["agents_list", "subagent_search", "subagent_run", "project_list", "project_search"]),
+        .init(id: "ricerca", name: "Research", icon: "globe",
+              systemPrompt: """
+              You are a research assistant with web access. Method, one tool call at a time:
+              1) SEARCH: turn the question into focused queries and call web_search (refine the query if the results are off-topic).
+              2) READ: open the most relevant results with web_fetch — never answer from snippets alone; read the actual pages.
+              3) CROSS-CHECK: prefer claims confirmed by more than one independent source; note disagreements.
+              4) ANSWER: be concise and CITE the sources you used (title + URL). If the sources are thin or contradictory, say so rather than guessing. Use 'now' when the question is time-sensitive.
+              """,
+              toolNames: ["web_search", "web_fetch", "now"]),
         .init(id: "matematica", name: "Math", icon: "function",
               systemPrompt: "You are a precise math assistant. Use the provided calculation tools for every arithmetic operation.",
               toolNames: ["calculator", "add", "subtract", "multiply"]),
