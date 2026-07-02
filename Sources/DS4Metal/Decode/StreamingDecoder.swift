@@ -914,8 +914,19 @@ public final class StreamingDecoder {
         // stay put and the matvec is RAM-bound. Costs ~5GB wired — worth it when it
         // fits, frees route/attn; on very tight RAM it can pressure the expert cache.
         let residentDense = ProcessInfo.processInfo.environment["DS4_RESIDENT_DENSE"] == "1"
+        // DS4_DENSE_STREAM=1: the dense weights don't try to be resident AT ALL —
+        // they are pread(F_NOCACHE) into a 2-slot staging ring, one layer AHEAD,
+        // so the SSD read of layer i+1 overlaps the GPU compute of layer i (the
+        // dense access pattern is perfectly sequential, no speculation needed).
+        // ~300 MB of staging instead of ~6 GB resident; frees the page cache for
+        // embed/head and the RAM for the expert cache. Takes precedence over
+        // DS4_RESIDENT_DENSE. Same bytes → identical numerics.
+        let denseStream = ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1"
         let denseProvider: (Int) throws -> LayerWeights
-        if residentDense {
+        if denseStream {
+            let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers)
+            denseProvider = { try streamer.weights($0) }
+        } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
             denseProvider = { try denseCache.get($0) }
         } else {
