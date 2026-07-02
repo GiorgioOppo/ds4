@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct DwarfStarApp: App {
@@ -11,6 +12,14 @@ struct DwarfStarApp: App {
         let settings = AppSettings()
         _settings = State(initialValue: settings)
         _store = State(initialValue: ChatStore(settings: settings))
+        // Unbundled executables (`swift run DwarfStar`) are not activated by
+        // Launch Services: the window appears but never becomes KEY, so the
+        // keyboard never reaches any TextField (clicks still work). Activate
+        // explicitly once the run loop is up — harmless in a bundled .app.
+        DispatchQueue.main.async {
+            NSApplication.shared.setActivationPolicy(.regular)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
     }
 
     var body: some Scene {
