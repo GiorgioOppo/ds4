@@ -19,6 +19,12 @@ public final class ExpertUsageStats {
         totalRoutes += ids.count
     }
 
+    /// Total routed picks recorded for a layer (0 = no data / dense layer).
+    public func routes(layer: Int) -> Int {
+        guard layer >= 0, layer < counts.count else { return 0 }
+        return counts[layer].values.reduce(0, +)
+    }
+
     /// The historically hottest experts of a layer (descending by count).
     public func top(layer: Int, n: Int) -> [Int32] {
         guard layer >= 0, layer < counts.count else { return [] }

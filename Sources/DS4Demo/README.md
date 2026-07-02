@@ -43,6 +43,7 @@ legge a runtime (gli stessi knob valgono per l'app e per i test).
 | Variabile | Valori | Default | Effetto |
 |-----------|--------|---------|---------|
 | `DS4_TYPES_ONLY` | presenza (`=1`) | off | **Modalità audit**: stampa il dtype GGUF dei pesi che il motore si aspetta (esperti, router, attn…), i token speciali del tokenizer e gli id del prompt, poi esce **senza** caricare il decoder. Diagnostica un GGUF "sbagliato" prima di sprecare I/O. |
+| `DS4_DIAG` | `=1` | off | **Modalità diagnosi** delle ottimizzazioni di streaming. Prima del run: dump dei knob attivi, benchmark del disco `F_NOCACHE` (sequenziale = tetto del gather, random coda-1 = gather senza hint, random parallelo = gather con madvise+copie concorrenti) e check dei **pesi MTP** nel GGUF (decodifica speculativa possibile?). Dopo il run: tabella per layer (route, concentrazione top-8/top-16, slot allocati dall'usage) e il **verdetto** banda-effettiva-gather vs tetto SSD (sotto ~60% → il sidecar expert-bundle può rendere; sopra → puntare su hit-rate/MTP). Per la tabella allocazione servono ~43+ token generati e `DS4_EXPERT_CACHE_SLOTS` attivo. |
 | `DS4_ACTIVE_EXPERTS` | `1…6` | `6` | Riduce i top-k esperti attivi per token. Meno esperti = meno I/O (più veloce su macchine con poca RAM), qualità inferiore. Clampato a `[1, k]`. |
 
 ### Knob del motore (validi anche per la demo)
@@ -56,6 +57,7 @@ Sono **opt-in / sperimentali**: cambiano prestazioni o RAM, non i numeri (salvo
 | `DS4_RAW_RING` | `=1` | off | Raw-KV come **ring buffer di `nSWA` (128) righe** invece dell'intero contesto → RAM della raw-KV **costante** (l'attention NSA legge solo le ultime `nSWA` righe). Riallinea il port all'upstream. |
 | `DS4_PREFILL_UNION` | intero | `64` | Massimo numero di esperti per gruppo nell'I/O batchato del prefill (limita la memoria transitoria delle union, ~7 MB/esperto sul 2-bit). Mai sotto `k` (6). |
 | `DS4_EXPERT_CACHE_SLOTS` | intero | `0` (off) | Pool LRU per layer che tiene gli esperti "caldi" residenti in GPU (solo i miss vengono copiati dall'mmap). Memoria **wired** ~6.9 MB/slot × layer: su poca RAM parti piccolo (8) e guarda l'hit-rate nel profilo. Minimo effettivo 8 quando attivo. |
+| `DS4_EXPERT_CACHE_UNIFORM` | `=1` | off | Disattiva l'allocazione **usage-driven** degli slot (che a budget totale invariato dà più slot ai layer con routing concentrato, floor 8, cap 64, ricalcolata al load e al cambio agente) e torna a S slot uguali per ogni layer. Serve per l'A/B: confronta l'hit-rate del profilo nelle due modalità a parità di conversazione. |
 | `DS4_PREFETCH` | `=1` | off | Read-ahead (`madvise`) dei pesi non-routed del **layer successivo** sovrapposto al compute corrente. Default off: su path I/O-bound può **rubare banda SSD** al gather reale. Da misurare per macchina. |
 | `DS4_PREFETCH_EXPERTS` | intero | `0` | Con `DS4_PREFETCH=1`, prefetcha anche questo numero di esperti "probabili" (speculativo, dalla usage prior). |
 | `DS4_WILLNEED_EXPERTS` | `=0` per disattivare | **on** | `madvise(WILLNEED)` sui **6 esperti effettivamente selezionati** subito prima del gather: anticipa e batcha il read-ahead a freddo dei soli slab che verranno copiati. Non speculativo (a differenza di `DS4_PREFETCH_EXPERTS`, non legge esperti inutili); no-op a caldo. Solo advisory, non cambia i numeri. Default ON; `=0` per il vecchio comportamento on-demand. |
@@ -111,6 +113,33 @@ DS4_ACTIVE_EXPERTS=4 DS4_RAW_RING=1 DS4_EXPERT_CACHE_SLOTS=8 \
                  swift run DS4Demo /path/model.gguf 8 "1+1?"   # fusi (default)
 DS4_FUSED_MOE=0  swift run DS4Demo /path/model.gguf 8 "1+1?"   # non fusi
 ```
+
+**7. Diagnosi completa delle ottimizzazioni di streaming** — banda del disco,
+pesi MTP, routing per layer e verdetto finale (≥48 token per la tabella
+allocazione; la cache slot va attivata per misurare gli hit):
+
+```sh
+DS4_DIAG=1 DS4_EXPERT_CACHE_SLOTS=8 \
+  swift run DS4Demo /path/model.gguf 48 "Raccontami la storia di Roma."
+# ── Diagnosi (DS4_DIAG=1) ──
+#   knob: DS4_EXPERT_CACHE_SLOTS=8  DS4_WILLNEED_EXPERTS=·  …
+#   SSD (F_NOCACHE, slab 2 MB):
+#     sequenziale         5.10 GB/s   <- tetto teorico del gather
+#     random coda 1       1.80 GB/s   <- gather senza hint/parallelismo
+#     random parallelo    4.20 GB/s   <- gather con madvise + copie parallele
+#   MTP: nessun peso nel GGUF -> decodifica speculativa NON possibile con questo file
+# … generazione + profilo …
+# ── Diagnosi cache esperti ──
+#   layer   route  conc(top8)  conc(top16)  slot
+#       2     288       0.41        0.55    14
+#   …
+#   gather effettivo 3.90 GB/s = 76% del tetto SSD (5.10 GB/s) -> vicino alla fisica del disco: puntare su hit-rate/MTP
+```
+
+Gli A/B utili con questa modalità: `DS4_WILLNEED_EXPERTS=0` vs default (quanto
+rendono gli hint), `DS4_EXPERT_CACHE_UNIFORM=1` vs default (quanto rende
+l'allocazione usage-driven), sweep di `DS4_EXPERT_CACHE_SLOTS` (8/12/16) e di
+`DS4_Q8_NSG` (2/4/6/8).
 
 ---
 

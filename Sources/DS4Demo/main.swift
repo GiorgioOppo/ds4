@@ -14,6 +14,92 @@ import DS4Metal
 
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
+// ── DS4_DIAG=1: diagnosi delle ottimizzazioni di streaming ──
+// Stampa i numeri che decidono la PROSSIMA ottimizzazione: banda grezza del
+// disco (il tetto del gather), presenza dei pesi MTP (decodifica speculativa
+// possibile?), knob attivi, e — dopo la generazione — concentrazione del
+// routing + allocazione slot per layer e il verdetto gather vs SSD.
+
+/// Banda del file modello BYPASSANDO la page cache (F_NOCACHE) — misura il
+/// disco vero, ripetibile. Tre scenari con slab da ~2 MB (la taglia di un
+/// esperto 2-bit): sequenziale (tetto), random a coda 1 (il gather senza
+/// hint), random parallelo (il gather con madvise + copie concorrenti).
+func diskBench(path: String) -> (report: String, seqGBs: Double) {
+    let fd = open(path, O_RDONLY)
+    guard fd >= 0 else { return ("  SSD: open fallita (\(String(cString: strerror(errno))))", 0) }
+    defer { close(fd) }
+    _ = fcntl(fd, F_NOCACHE, 1)
+    var st = stat()
+    guard fstat(fd, &st) == 0, st.st_size > 0 else { return ("  SSD: fstat fallita", 0) }
+    let fileSize = Int(st.st_size)
+    let slab = min(2 << 20, fileSize)            // ~2 MB
+    let align = 1 << 14                          // offset a pagine da 16 KB
+    let nSlabs = 24
+    var rng = SystemRandomNumberGenerator()
+    func randOff() -> Int {
+        (Int.random(in: 0..<max(1, fileSize - slab), using: &rng) / align) * align
+    }
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: slab, alignment: align)
+    defer { buf.deallocate() }
+    // 1) sequenziale (fino a 1 GB)
+    let seqTotal = min(1 << 30, fileSize)
+    var done = 0
+    var t0 = Date()
+    while done < seqTotal {
+        let n = pread(fd, buf, min(slab, seqTotal - done), off_t(done))
+        if n <= 0 { break }
+        done += n
+    }
+    let seq = Double(done) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    // 2) random, coda 1: uno slab alla volta
+    let offs1 = (0..<nSlabs).map { _ in randOff() }
+    t0 = Date()
+    for off in offs1 { _ = pread(fd, buf, slab, off_t(off)) }
+    let qd1 = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    // 3) random, in parallelo: tutti gli slab insieme (pread è thread-safe)
+    let offs2 = (0..<nSlabs).map { _ in randOff() }
+    t0 = Date()
+    DispatchQueue.concurrentPerform(iterations: offs2.count) { i in
+        let b = UnsafeMutableRawPointer.allocate(byteCount: slab, alignment: align)
+        defer { b.deallocate() }
+        _ = pread(fd, b, slab, off_t(offs2[i]))
+    }
+    let qdN = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    let report = String(format: """
+      SSD (F_NOCACHE, slab %d MB):
+        sequenziale       %6.2f GB/s   <- tetto teorico del gather
+        random coda 1     %6.2f GB/s   <- gather senza hint/parallelismo
+        random parallelo  %6.2f GB/s   <- gather con madvise + copie parallele
+    """, slab >> 20, seq, qd1, qdN)
+    return (report, seq)
+}
+
+/// Pesi MTP (Multi-Token Prediction) nel GGUF: se presenti, la decodifica
+/// speculativa (draft con la testa MTP + verifica batch) è possibile. Le
+/// conversioni llama.cpp li chiamano blk.N.nextn.* (eh_proj, embed_tokens,
+/// enorm, hnorm, shared_head.*); altri converter usano nomi mtp.*.
+func mtpReport(_ model: GGUFModel) -> String {
+    let pats = ["nextn", "mtp", "eh_proj"]
+    let found = model.tensors.filter { t in pats.contains { t.name.lowercased().contains($0) } }
+    guard !found.isEmpty else {
+        return "  MTP: nessun peso nel GGUF -> decodifica speculativa NON possibile con questo file"
+    }
+    var s = "  MTP: \(found.count) tensori presenti -> decodifica speculativa POSSIBILE"
+    for t in found.prefix(8) { s += "\n    \(t.name)  \(t.typeName)  \(ByteCountFormatter.string(fromByteCount: Int64(t.bytes), countStyle: .memory))" }
+    if found.count > 8 { s += "\n    … e altri \(found.count - 8)" }
+    return s
+}
+
+/// I knob DS4_* attivi: rende ogni run auto-documentante (i confronti A/B
+/// hanno senso solo a knob uguali).
+func knobReport() -> String {
+    let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_WILLNEED_EXPERTS",
+                 "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                 "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE", "DS4_PROFILE_ROUTE"]
+    let env = ProcessInfo.processInfo.environment
+    return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
+}
+
 do {
     let rt = try MetalRuntime()   // kernels embedded in the binary — no folder needed
     log("DS4Demo: Metal runtime up on \(rt.deviceName), \(rt.functionNames.count) kernels compiled")
@@ -28,8 +114,19 @@ do {
     let ggufPath = args[1]
     let maxNew = args.count >= 3 ? (Int(args[2]) ?? 4) : 4
 
+    let diag = ProcessInfo.processInfo.environment["DS4_DIAG"] == "1"
+    var diskSeqGBs = 0.0
+    if diag {
+        log("── Diagnosi (DS4_DIAG=1) ──")
+        log(knobReport())
+        let bench = diskBench(path: ggufPath)
+        diskSeqGBs = bench.seqGBs
+        log(bench.report)
+    }
+
     log("DS4Demo: opening \(ggufPath) …")
     let model = try GGUFModel(path: ggufPath, metalMapping: true, prefetchCPU: false)
+    if diag { log(mtpReport(model)) }
     // Quant-format audit (DS4_TYPES_ONLY=1): print the GGUF dtype of the per-layer
     // weights the engine assumes (experts=Q4_K, router=Q8). Mismatch => garbage.
     if ProcessInfo.processInfo.environment["DS4_TYPES_ONLY"] != nil {
@@ -117,6 +214,46 @@ do {
                    total > 0 ? Double(genTokens) / total : 0))
         log("")
         log(dec.profile.report())
+
+        // ── Diagnosi post-run: routing, allocazione slot, verdetto gather ──
+        if diag, let usage = dec.usage {
+            log("")
+            log("── Diagnosi cache esperti ──")
+            let envSlots = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"].flatMap(Int.init) ?? 0
+            if envSlots == 0 {
+                log("  slot-cache OFF (imposta DS4_EXPERT_CACHE_SLOTS=8.. per misurare gli hit)")
+            }
+            let base = max(8, envSlots)
+            let alloc = usage.slotAllocation(base: base)
+            if alloc == nil {
+                log("  allocazione usage-driven: storia insufficiente (~43+ token/layer) -> uniforme \(base); rilancia con più token")
+            }
+            log("  layer   route  conc(top8)  conc(top16)  slot")
+            for il in 0..<DSV4Shape.nLayer {
+                let r = usage.routes(layer: il)
+                guard r > 0 else { continue }
+                log(String(format: "  %5d %7d       %.2f        %.2f  %4d", il, r,
+                           usage.concentration(layer: il, n: 8),
+                           usage.concentration(layer: il, n: 16),
+                           alloc?[il] ?? base))
+            }
+            // Verdetto: banda effettiva del gather vs tetto sequenziale del disco.
+            // Sotto ~60% del tetto il sidecar expert-bundle (slab contigui) può
+            // ancora rendere; sopra, il gather è vicino alla fisica del disco e
+            // conviene puntare su hit-rate (slot) o decodifica speculativa (MTP).
+            if dec.profile.gatherBytes > 0, dec.profile.gatherS > 0 {
+                let eff = Double(dec.profile.gatherBytes) / dec.profile.gatherS / 1e9
+                if diskSeqGBs > 0 {
+                    let pct = eff / diskSeqGBs * 100
+                    log(String(format: "  gather effettivo %.2f GB/s = %.0f%% del tetto SSD (%.2f GB/s) -> %@",
+                               eff, pct, diskSeqGBs,
+                               pct < 60 ? "margine: il sidecar expert-bundle può rendere"
+                                        : "vicino alla fisica del disco: puntare su hit-rate/MTP"))
+                } else {
+                    log(String(format: "  gather effettivo %.2f GB/s (banda SSD non misurata)", eff))
+                }
+            }
+        }
     }
     exit(0)
 } catch {
