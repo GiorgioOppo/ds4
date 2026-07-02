@@ -68,6 +68,7 @@ final class ChatStore {
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
+        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default OFF (lossy, opt-in)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -157,6 +158,19 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(denseStreamEnabled, forKey: "DS4DenseStream")
             _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Requant Q4_K delle tre proiezioni giganti dell'attention (DS4_DENSE_Q4):
+    /// q_b / output_a / output_b (Q8, 107 dei ~145 MB/layer) requantizzate al
+    /// load e tenute residenti (~1.4 GB, mlockate). MISURATO su M1 Pro 16 GB:
+    /// 0.88 → 1.17 tok/s. ATTENZIONE: è l'unica opzione LOSSY — deriva di
+    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente.
+    /// DEFAULT OFF: la qualità la sceglie l'utente. Richiede il dense stream;
+    /// si applica al prossimo caricamento del modello.
+    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
+            _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
         }
     }
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,

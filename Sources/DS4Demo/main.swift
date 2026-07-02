@@ -101,7 +101,7 @@ func knobReport() -> String {
                  "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
                  "DS4_PREFILL_UNION", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
-                 "DS4_DENSE_STREAM", "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
+                 "DS4_DENSE_STREAM", "DS4_DENSE_Q4", "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }
@@ -125,6 +125,36 @@ do {
     if diag {
         log("── Diagnosi (DS4_DIAG=1) ──")
         log(knobReport())
+        // Self-test del requantizer Q4_K (DS4_DENSE_Q4): roundtrip sintetico.
+        // Un bug di packing farebbe esplodere l'errore; l'atteso è ~1-4%.
+        do {
+            let n = 256 * 64
+            var xs = [Float](repeating: 0, count: n)
+            var state: UInt64 = 0x9E3779B97F4A7C15
+            for i in 0..<n {   // xorshift riproducibile
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17
+                xs[i] = Float(Int64(bitPattern: state) % 10007) / 10007.0
+            }
+            var packed = [UInt8](repeating: 0, count: n / 256 * 144)
+            var back = [Float](repeating: 0, count: n)
+            xs.withUnsafeBufferPointer { xp in
+                packed.withUnsafeMutableBytes { pp in
+                    Quantize.quantizeQ4_K(xp.baseAddress!, count: n, into: pp.baseAddress!)
+                }
+            }
+            packed.withUnsafeBytes { pp in
+                back.withUnsafeMutableBufferPointer { bp in
+                    Quantize.dequantQ4_K(pp.baseAddress!, count: n, into: bp.baseAddress!)
+                }
+            }
+            var se: Float = 0, sx: Float = 0
+            for i in 0..<n { let d = xs[i] - back[i]; se += d * d; sx += xs[i] * xs[i] }
+            let rel = (se / max(sx, 1e-12)).squareRoot()
+            // Dati UNIFORMI in (-1,1): l'errore Q4_K atteso è ~5-6% (su pesi
+            // reali, ~gaussiani, è ~2-3%). Un bug di packing darebbe >20%.
+            log(String(format: "  Q4_K roundtrip: errore relativo %.2f%% %@", rel * 100,
+                       rel < 0.08 ? "(OK — atteso ~5-6% su dati uniformi)" : "(SOSPETTO: probabile bug di packing)"))
+        }
         // Costo FISSO di un command buffer (commit + waitUntilCompleted, vuoto):
         // il decode streaming ne usa ~3 per layer × 43 layer ≈ 130+ per token.
         // Se questo round-trip costa millisecondi, il "compute" del profilo è in

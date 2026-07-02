@@ -962,8 +962,14 @@ public final class StreamingDecoder {
         let denseStream = ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1"
         let denseProvider: (Int) throws -> LayerWeights
         if denseStream {
+            // DS4_DENSE_Q4=1 (requires the stream): the two giant plain-matvec
+            // projections (q_b, output_b — Q8, 71 of ~145 MB/layer) are
+            // requantized to Q4_K at load and kept RESIDENT: half their bytes,
+            // read at RAM speed, and ~3 GB/token OFF the SSD stream. LOSSY on
+            // those two tensors (Q8→Q4 requant) — opt-in, A/B the output.
+            let q4Dense = ProcessInfo.processInfo.environment["DS4_DENSE_Q4"] == "1"
             let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers,
-                                             lockResident: lockResident)
+                                             lockResident: lockResident, q4Dense: q4Dense)
             denseProvider = { try streamer.weights($0) }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }

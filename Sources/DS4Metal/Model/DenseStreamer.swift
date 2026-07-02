@@ -88,7 +88,8 @@ public final class DenseStreamer: @unchecked Sendable {
     /// Total bytes streamed per full pass over `layers` (diagnostics).
     public private(set) var bytesPerPass = 0
 
-    public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false) throws {
+    public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false,
+                q4Dense: Bool = false) throws {
         guard let fd = model.uncachedFD() else {
             throw GGUFWeights.LoadError.message("DenseStreamer: cannot open F_NOCACHE descriptor")
         }
@@ -101,14 +102,31 @@ public final class DenseStreamer: @unchecked Sendable {
         for il in layers {
             var plan: [Entry] = []
             var off = 0
+            var w = try GGUFWeights.layerSmallSkeleton(rt, model, il)
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
+                // DS4_DENSE_Q4: the two giant plain-matvec projections are
+                // requantized Q8_0 → Q4_K ONCE at load and kept resident
+                // (~0.9 GB total, locked with DS4_MLOCK): half the bytes AND
+                // they leave the per-token stream entirely — the SSD budget
+                // drops by ~3 GB/token. Intentionally lossy (Q8→Q4 requant);
+                // everything else is untouched.
+                if q4Dense, f == .qB || f == .attnOut || f == .attnOutA,
+                   let q4 = try Self.requantQ4(rt, model, fd: fd, tensor: t) {
+                    if lockResident { q4.lockResident() }
+                    switch f {
+                    case .qB: w.qB = q4; w.qBQ4 = true
+                    case .attnOut: w.attnOut = q4; w.attnOutQ4 = true
+                    default: w.attnOutA = q4; w.attnOutAQ4 = true
+                    }
+                    continue
+                }
                 plan.append(Entry(field: f, fileOffset: Int(t.absOffset),
                                   bytes: Int(t.bytes), stageOffset: off))
                 off += (Int(t.bytes) + align - 1) / align * align
             }
             entries[il] = plan
-            skeleton[il] = try GGUFWeights.layerSmallSkeleton(rt, model, il)
+            skeleton[il] = w
             bytesPerPass += plan.reduce(0) { $0 + $1.bytes }
             maxSlot = max(maxSlot, off)
         }
@@ -161,6 +179,36 @@ public final class DenseStreamer: @unchecked Sendable {
             }
         }
         return makeWeights(il, slot: slot)
+    }
+
+    /// Q8_0 → Q4_K requant of one tensor into a resident buffer (DS4_DENSE_Q4).
+    /// Returns nil when the tensor is not Q8_0 (or not superblock-shaped): the
+    /// caller keeps streaming it unchanged. Reads the source bytes through the
+    /// F_NOCACHE descriptor (no page-cache footprint at load either).
+    private static func requantQ4(_ rt: MetalRuntime, _ model: GGUFModel, fd: Int32,
+                                  tensor t: GGUFModel.Tensor) throws -> GPUTensor? {
+        guard let info = GGUF.typeInfo(t.type), info.name == "q8_0" else { return nil }
+        let elems = Int(t.elements)
+        guard elems % 256 == 0 else { return nil }
+        var q8 = [UInt8](repeating: 0, count: Int(t.bytes))
+        let ok = q8.withUnsafeMutableBytes {
+            GGUFWeights.preadFull(fd, into: $0.baseAddress!, bytes: $0.count, offset: Int(t.absOffset))
+        }
+        guard ok else {
+            throw GGUFWeights.LoadError.message("DenseStreamer: pread failed requantizing \(t.name)")
+        }
+        var f32 = [Float](repeating: 0, count: elems)
+        q8.withUnsafeBytes { src in
+            f32.withUnsafeMutableBufferPointer { dst in
+                Quantize.dequantQ8_0(src.baseAddress!, count: elems, into: dst.baseAddress!)
+            }
+        }
+        let outBytes = elems / 256 * 144
+        let gpu = try GPUTensor.uninitializedBytes(rt, byteLength: outBytes, elementCount: outBytes)
+        f32.withUnsafeBufferPointer {
+            Quantize.quantizeQ4_K($0.baseAddress!, count: elems, into: gpu.buffer.contents())
+        }
+        return gpu
     }
 
     /// pread every tensor of layer `il` into `slot`, all slabs CONCURRENTLY
