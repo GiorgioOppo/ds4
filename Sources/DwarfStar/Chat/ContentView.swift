@@ -110,9 +110,6 @@ struct ModelLoadView: View {
                 Toggle("Read ahead selected experts (madvise)", isOn: $store.willNeedEnabled)
                 Text("Starts reading the 6 selected experts just before gather: reduces cold faults on low-RAM systems, no-op when hot. Advisory only; does not change outputs. Recommended ON. Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
-                Toggle("Resident dense weights (~5 GB wired)", isOn: $store.residentDenseEnabled)
-                Text("Keeps non-expert weights (attention + shared FFN) resident in RAM instead of re-faulting them from SSD every token. Faster with enough RAM (~+40% at 32 GB). Costs ~5 GB wired RAM; default ON only with >=24 GB RAM. On 16 GB it can be worse due to memory pressure. Applies on the next model load.")
-                    .font(.caption).foregroundStyle(.tertiary)
                 Toggle("Decode route/attn profile (diagnostic)", isOn: $store.profileRouteEnabled)
                 if store.profileRouteEnabled {
                     Text("Splits route/attn into 5 phases (comp/q/kv/attn/out) and writes the report to the engine log at the end of the turn. Extra commits slow generation: use it to understand where time goes, not to measure speed. Applies on the next model load.")

@@ -177,6 +177,37 @@ public enum GGUFWeights {
         return w
     }
 
+    /// SMALL-ONLY skeleton for the dense-STREAMING path (DS4_DENSE_STREAM): the
+    /// tiny norm/scale/base/sinks tensors are COPIED resident once (they are the
+    /// ones read by non-byteOffset-aware kernels), every BIG dense field is a
+    /// 1-byte dummy that DenseStreamer swaps for a staging-slot view per call.
+    /// Field split identical to layerMappedDense — same weights, different home.
+    static func layerSmallSkeleton(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int) throws -> LayerWeights {
+        let p = "blk.\(il)."
+        func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
+        func optT(_ s: String) throws -> GPUTensor? { model.findTensor(p + s) == nil ? nil : try tensor(rt, model, p + s) }
+        let dummy = try GPUTensor.zerosBytes(rt, byteLength: 1)
+        var w = LayerWeights(
+            hcAttnFn: dummy, attnScale: try T("hc_attn_scale.weight"),
+            attnBase: try T("hc_attn_base.weight"), attnNorm: try T("attn_norm.weight"),
+            qA: dummy, qANorm: try T("attn_q_a_norm.weight"), qB: dummy,
+            kvW: dummy, kvNorm: try T("attn_kv_a_norm.weight"),
+            attnSinks: try T("attn_sinks.weight"),
+            attnOutA: dummy, attnOut: dummy,
+            hcFfnFn: dummy, ffnScale: try T("hc_ffn_scale.weight"),
+            ffnBase: try T("hc_ffn_base.weight"), ffnNorm: try T("ffn_norm.weight"),
+            sharedGate: dummy, sharedUp: dummy,
+            sharedDown: dummy, routerW: dummy,
+            expGate: dummy, expUp: dummy, expDown: dummy,   // experts gathered separately
+            compKv: nil, compGate: nil,
+            compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
+        // Indexer: only the SMALL ape/norm are loaded here; the big projections
+        // are streamed (DenseStreamer fills them when the layer has them).
+        try loadIndexer(&w, model, il, big: { _ in nil }, small: optT)
+        setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
+        return w
+    }
+
     /// Output head + embedding with the big tensors (embed F16, output Q8, output_hc_fn
     /// F16) as NO-COPY mmap views; the small norm/scale/base are copied.
     public static func outputHeadMapped(_ rt: MetalRuntime, _ model: GGUFModel) throws -> (embed: GPUTensor, head: OutputHeadWeights) {
