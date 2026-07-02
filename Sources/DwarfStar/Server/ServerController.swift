@@ -1,22 +1,23 @@
 import Foundation
 import DS4Engine
 
-/// Owns a native, in-process HTTP server (`LocalServer`) that exposes the model
-/// over an OpenAI-compatible API. Unlike the old C `ds4-server` subprocess, this
-/// loads its OWN `InferenceService` in-process: the GGUF weights are no-copy mmap
-/// views, so the OS page cache shares them with the chat engine (no second copy
-/// of the weights in RAM). Only the KV cache + Metal scratch are independent.
+/// Native, in-process HTTP server (`LocalServer`) exposing the model over an
+/// OpenAI-compatible API. It does NOT load its own engine: it wraps THE single
+/// shared `InferenceService` loaded in Settings (same weights, same KV, same
+/// resident-Q4/mlock buffers — a second engine would double wired memory and
+/// OOM on 16 GB). The shared actor serializes chat and server calls; the server
+/// remains one-request-at-a-time.
 @MainActor
 @Observable
 final class ServerController {
     // Configuration (editable before Start).
     let settings: AppSettings
+    let store: ChatStore
     var modelPath: String { settings.modelPath }
 
-    init(settings: AppSettings) { self.settings = settings }
+    init(settings: AppSettings, store: ChatStore) { self.settings = settings; self.store = store }
     var host = "127.0.0.1"
     var port = 8000
-    var contextSize = 8192
     var maxTokens = 1024
     var cors = false
 
@@ -25,7 +26,6 @@ final class ServerController {
     var isRunning = false
     var isLoading = false
 
-    private var engine: InferenceService?
     private var server: LocalServer?
     private var logTask: Task<Void, Never>?
 
@@ -33,18 +33,20 @@ final class ServerController {
 
     func start() {
         guard !isRunning, !isLoading else { return }
+        guard let engine = store.sharedEngine else {
+            log = "No model loaded. Load the model in Settings first — the server exposes that single shared engine.\n"
+            return
+        }
         isLoading = true
-        log = "Loading in-process model...\n"
+        log = "Starting server on the shared engine...\n"
 
         let path = ProcessStream.absolutePath(modelPath)
         let name = (path as NSString).lastPathComponent
-        let ctx = contextSize
         let cfg = LocalServer.Config(host: host, port: UInt16(clamping: port),
                                      cors: cors, maxTokens: maxTokens)
 
         // Sendable log channel: the server (any thread) yields lines; we drain them
-        // on the main actor. Avoids capturing this @MainActor object in a @Sendable
-        // closure (Swift 6 concurrency-safe).
+        // on the main actor (Swift 6 concurrency-safe, no @MainActor capture).
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         logTask?.cancel()
         logTask = Task { [weak self] in
@@ -52,26 +54,16 @@ final class ServerController {
         }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
 
-        // Load the model OFF the main thread (mmap + Metal setup is heavy). The
-        // detached task captures only Sendable values (no self), then we hop back
-        // to the main actor to publish state.
-        // Disk KV (shared setting with the chat): the stateless API re-sends the
-        // whole transcript each request, so prefix restore is its biggest win.
-        let kvOn = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true
-        let kvDir = kvOn ? ChatStore.diskKVDirectory : nil
-        let kvBudget = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192
-        let loadTask = Task.detached { () -> (InferenceService, LocalServer) in
-            let eng = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
-            await eng.setDiskKV(directory: kvDir, budgetMB: kvBudget)
-            let srv = LocalServer(engine: eng, modelName: name, config: cfg, onLog: onLog)
+        // Only bind the listening socket off the main actor; the engine (and its
+        // disk-KV, set when the chat loaded it) is already live and shared.
+        let startTask = Task.detached { () -> LocalServer in
+            let srv = LocalServer(engine: engine, modelName: name, config: cfg, onLog: onLog)
             try srv.start()
-            return (eng, srv)
+            return srv
         }
         Task {
             do {
-                let (eng, srv) = try await loadTask.value
-                self.engine = eng
-                self.server = srv
+                self.server = try await startTask.value
                 self.isLoading = false
                 self.isRunning = true
             } catch {
@@ -84,8 +76,7 @@ final class ServerController {
 
     func stop() {
         server?.stop()
-        server = nil
-        engine = nil                  // release the model (KV + scratch)
+        server = nil                  // the shared engine stays alive for the chat
         logTask?.cancel()
         logTask = nil
         isRunning = false

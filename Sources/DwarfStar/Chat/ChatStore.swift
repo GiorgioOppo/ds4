@@ -68,7 +68,11 @@ final class ChatStore {
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
-        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default OFF (lossy, opt-in)
+        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        // La cache del requant Q4 va in Application Support: l'app sandboxed
+        // non può scrivere accanto al GGUF scelto col picker (il fallimento
+        // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
+        _ = setenv("DS4_Q4_CACHE_DIR", Self.q4CacheDirectory.path, 1)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -90,11 +94,12 @@ final class ChatStore {
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    /// DEFAULT 12: il punto dolce misurato su M1 Pro 16 GB con dense stream +
-    /// pread + MLOCK (56% hit, ridistribuzione usage-driven attiva). Senza
-    /// MLOCK i pool grandi vengono compressi/paginati e conviene 8; oltre 12
-    /// su ≤16 GB il budget bloccato inizia a competere con KV e sistema.
-    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 12 {
+    /// DEFAULT 16: il punto dolce misurato su M1 Pro 16 GB con dense stream +
+    /// pread + MLOCK + Q4 (63% hit, ridistribuzione usage-driven attiva,
+    /// 1.17 tok/s a regime). Senza MLOCK i pool grandi vengono compressi/
+    /// paginati e conviene 8; senza Q4 il budget bloccato è più tirato e il
+    /// punto dolce scende a 12.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 16 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
 
@@ -164,10 +169,11 @@ final class ChatStore {
     /// q_b / output_a / output_b (Q8, 107 dei ~145 MB/layer) requantizzate al
     /// load e tenute residenti (~1.4 GB, mlockate). MISURATO su M1 Pro 16 GB:
     /// 0.88 → 1.17 tok/s. ATTENZIONE: è l'unica opzione LOSSY — deriva di
-    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente.
-    /// DEFAULT OFF: la qualità la sceglie l'utente. Richiede il dense stream;
-    /// si applica al prossimo caricamento del modello.
-    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? false {
+    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente
+    /// (validato dall'autore sul campo). DEFAULT ON con avviso in GUI; il
+    /// toggle resta per chi preferisce la fedeltà piena. Richiede il dense
+    /// stream; si applica al prossimo caricamento del modello.
+    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
             _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
@@ -210,6 +216,13 @@ final class ChatStore {
     static var diskKVDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("DwarfStar/kv-cache", isDirectory: true)
+    }
+
+    /// Application Support/DwarfStar/q4-cache: i .q4dense del requant Q4
+    /// (~1.4 GB per modello) — scrivibile anche in sandbox.
+    static var q4CacheDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("DwarfStar/q4-cache", isDirectory: true)
     }
 
     // Tuning tab state.
@@ -391,6 +404,17 @@ final class ChatStore {
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
 
+    /// THE single in-process engine, loaded once in Settings and SHARED by every
+    /// feature (Chat, Benchmark, Server). There is never a second full engine:
+    /// with the default resident-Q4 + mlock config a second copy doubles wired
+    /// memory and OOM-crashes on 16 GB. `InferenceService` is an actor, so
+    /// concurrent callers are serialized safely. nil until a model is ready.
+    var sharedEngine: InferenceService? { isReady ? service : nil }
+    /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
+    /// KV, so it's refused while the chat is mid-generation.
+    var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }
+    var loadedModelPath: String? { isReady ? modelPath : nil }
+
     var isReady: Bool { if case .ready = phase { return true } else { return false } }
     var availableTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
 
@@ -429,14 +453,32 @@ final class ChatStore {
     }
 
     /// Open the model off the main thread, then flip to `.ready`.
+    /// Avanzamento del caricamento del modello (0…1) + fase corrente: scritti
+    /// dal motore via LoadProgress e riletti qui a ~8 Hz mentre `.loading`.
+    var loadFraction: Double = 0
+    var loadStage: String = ""
+
     func load() {
         guard phase != .loading else { return }
         phase = .loading
+        loadFraction = 0
+        loadStage = ""
+        LoadProgress.shared.reset()
+        // Poll del progresso finché il load è in corso (si auto-cancella).
+        let poller = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let s = LoadProgress.shared.snapshot
+                self?.loadFraction = s.fraction
+                self?.loadStage = s.stage
+                try? await Task.sleep(nanoseconds: 120_000_000)
+            }
+        }
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudget = diskKVBudgetMB
         Task.detached(priority: .userInitiated) {
+            defer { poller.cancel() }
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,

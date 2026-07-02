@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The single place where the model and HOW it runs are configured. Every other
 /// screen (chat, server, benchmark, diagnostics, worker) inherits these values.
@@ -71,6 +72,16 @@ struct SettingsView: View {
                     Label("Requantizes the three giant attention projections Q8→Q4_K at load (~+30% tok/s measured). Slightly lossy: greedy outputs can occasionally differ while staying coherent. Requires dense-weight streaming.",
                           systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange)
+                    HStack(spacing: 6) {
+                        Text("Q4 cache: \(ChatStore.q4CacheDirectory.path)")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([ChatStore.q4CacheDirectory])
+                        }
+                        .font(.caption2)
+                    }
                 }
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
@@ -106,9 +117,11 @@ struct SettingsView: View {
                     Button("Reload") { store.load() }
                 }
             case .loading:
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading model...").font(.callout).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: min(max(store.loadFraction, 0), 1))
+                        .progressViewStyle(.linear)
+                    Text(store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             case .needsModel, .failed:
                 if case .failed(let message) = store.phase {

@@ -19,8 +19,11 @@ struct ChatTabView: View {
                 ChatView(store: store)
             case .loading:
                 VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Loading model...").foregroundStyle(.secondary)
+                    ProgressView(value: min(max(store.loadFraction, 0), 1))
+                        .progressViewStyle(.linear)
+                        .frame(maxWidth: 360)
+                    Text(store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                        .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .needsModel, .failed:

@@ -110,9 +110,11 @@ generation and the next turn rebuilds KV if needed.
 ## HTTP Server
 
 The Server tab starts an OpenAI/Anthropic-compatible server on
-`Network.framework`. It is native and in-process: no subprocess, and GGUF weights
-are mmap-shared with the chat engine. KV cache and GPU scratch are separate, so
-chat and server requests still compete for compute and memory bandwidth.
+`Network.framework`. It is native and in-process and exposes **the single shared
+engine** loaded in Settings — no subprocess and no second model copy (a second
+engine would double the resident-Q4 + mlocked buffers and OOM on 16 GB). The
+`InferenceService` actor serializes callers, so a server request waits for an
+in-flight chat turn and vice versa. Benchmark reuses the same shared engine.
 
 | Method | Path | API |
 |---|---|---|

@@ -43,8 +43,8 @@ struct RootView: View {
         self.settings = settings
         let distributed = DistributedController(settings: settings)
         _distributed = State(initialValue: distributed)
-        _server = State(initialValue: ServerController(settings: settings))
-        _bench = State(initialValue: BenchController(settings: settings, dist: distributed))
+        _server = State(initialValue: ServerController(settings: settings, store: store))
+        _bench = State(initialValue: BenchController(settings: settings, dist: distributed, store: store))
         _diagnostics = State(initialValue: DiagnosticsController(settings: settings))
     }
 

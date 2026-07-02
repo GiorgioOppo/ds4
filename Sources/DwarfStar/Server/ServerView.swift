@@ -10,21 +10,24 @@ struct ServerView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Native HTTP server: exposes the in-process loaded model through an OpenAI-compatible endpoint. No external process.",
+                    Label("Native HTTP server: exposes the single shared engine through an OpenAI-compatible endpoint. No external process, no second model copy.",
                           systemImage: "server.rack")
                         .font(.callout).foregroundStyle(.secondary)
-                    if modelLoadedInProcess {
-                        Label("Chat already has a model loaded. Weights are shared through mmap (no second RAM copy), but KV cache and GPU work are separate: using chat and server together competes for resources.",
+                    if !modelLoadedInProcess {
+                        Label("No model loaded. Load the model in Settings first — the server exposes that one shared engine.",
                               systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange).font(.callout)
+                    } else {
+                        Label("The server and the chat share ONE engine: requests are serialized, so a server request waits for an in-flight chat turn (and vice versa).",
+                              systemImage: "info.circle")
+                            .foregroundStyle(.secondary).font(.callout)
                     }
                 }
 
                 Section("Model (from Settings)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    Stepper("Context: \(controller.contextSize) tokens",
-                            value: $controller.contextSize, in: 1024...200_000, step: 1024)
-                        .disabled(controller.isRunning)
+                    LabeledContent("Engine", value: modelLoadedInProcess
+                                   ? "shared with Chat (loaded)" : "not loaded")
                     Stepper("Max tokens per response: \(controller.maxTokens)",
                             value: $controller.maxTokens, in: 64...8192, step: 64)
                         .disabled(controller.isRunning)
