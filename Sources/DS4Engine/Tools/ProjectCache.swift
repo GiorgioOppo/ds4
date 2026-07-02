@@ -41,6 +41,7 @@ public final class ProjectCache: @unchecked Sendable {
         "yml", "yaml", "toml", "ini", "cfg", "sh", "bash", "zsh",
         "html", "css", "xml", "plist", "entitlements", "modulemap",
         "java", "kt", "rs", "go", "rb", "sql", "gradle", "cmake", "make",
+        "tex", "bib", "cls", "sty", "latex",
     ]
 
     // MARK: - Import / clear (GUI side)
@@ -52,6 +53,23 @@ public final class ProjectCache: @unchecked Sendable {
         var found: [String] = []
         var total = 0
         let fm = FileManager.default
+        // Strip the root prefix robustly: the enumerator can return URLs whose
+        // prefix is the symlink-RESOLVED root (e.g. macOS /var → /private/var)
+        // while `rootURL.path` is the unresolved form — a plain string replace
+        // then leaves the "relative" path absolute and every project_* lookup
+        // misses. Match the plain prefix first (the common, no-symlink case: no
+        // extra syscall); fall back to the resolved prefix. The stored root stays
+        // `rootURL`, so reads go through the original (security-scoped) path.
+        let plainPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        let resolvedRoot = rootURL.resolvingSymlinksInPath().path
+        let resolvedPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+        func relativize(_ url: URL) -> String {
+            if url.path.hasPrefix(plainPrefix) { return String(url.path.dropFirst(plainPrefix.count)) }
+            let resolved = url.resolvingSymlinksInPath().path
+            if resolved.hasPrefix(resolvedPrefix) { return String(resolved.dropFirst(resolvedPrefix.count)) }
+            if resolved.hasPrefix(plainPrefix) { return String(resolved.dropFirst(plainPrefix.count)) }
+            return url.lastPathComponent
+        }
         if let en = fm.enumerator(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
                                   options: [.skipsHiddenFiles]) {
             for case let url as URL in en {
@@ -63,8 +81,7 @@ public final class ProjectCache: @unchecked Sendable {
                 let size = vals?.fileSize ?? 0
                 guard size > 0, size <= Self.maxFileBytes else { continue }
                 guard Self.looksTextual(url) else { continue }
-                let rel = url.path.replacingOccurrences(of: rootURL.path + "/", with: "")
-                found.append(rel)
+                found.append(relativize(url))
                 total += size
                 if found.count >= Self.maxFiles { break }
             }
@@ -98,6 +115,16 @@ public final class ProjectCache: @unchecked Sendable {
         return Array(files.prefix(n))
     }
 
+    /// All indexed relative paths (sub-agent target search / project map).
+    public func fileList() -> [String] { lock.lock(); defer { lock.unlock() }; return files }
+
+    /// The entire indexed text of `relPath` (to seed a sub-agent's KV context);
+    /// nil if not in the index. Capped by the same per-file limit as the index.
+    public func fullText(of relPath: String) -> String? {
+        guard !relPath.contains("..") else { return nil }
+        return fileContents(relPath)
+    }
+
     static func looksTextual(_ url: URL) -> Bool {
         if textExtensions.contains(url.pathExtension.lowercased()) { return true }
         guard let fh = try? FileHandle(forReadingFrom: url),
@@ -108,12 +135,17 @@ public final class ProjectCache: @unchecked Sendable {
 
     // MARK: - Tool surface (text in / text out, hard-capped)
 
-    /// List the entries one level under `relPath` ("" = project root).
+    /// List the entries one level under `relPath` ("" / "." = project root).
     public func listTool(path relPath: String) -> String {
         lock.lock(); defer { lock.unlock() }
         guard root != nil else { return "Nessun progetto importato." }
-        let prefix = relPath.isEmpty ? "" : relPath.hasSuffix("/") ? relPath : relPath + "/"
-        guard relPath.isEmpty || !relPath.contains("..") else { return "Percorso non valido." }
+        // Normalize root sentinels: "" / "." / "./" all mean the project root, and a
+        // leading "./" is stripped (indexed paths have no "./" prefix).
+        var p = relPath
+        if p == "." || p == "./" { p = "" }
+        else if p.hasPrefix("./") { p = String(p.dropFirst(2)) }
+        guard p.isEmpty || !p.contains("..") else { return "Percorso non valido." }
+        let prefix = p.isEmpty ? "" : (p.hasSuffix("/") ? p : p + "/")
         var dirs = Set<String>()
         var leaf: [String] = []
         for f in files where f.hasPrefix(prefix) {
@@ -271,5 +303,154 @@ public final class ProjectCache: @unchecked Sendable {
             infoValue = Info(name: inf.name, fileCount: files.count, totalBytes: inf.totalBytes)
         }
         lock.unlock()
+    }
+
+    // MARK: - Raw file read/write (any file inside the project root)
+
+    /// Validate a relative path against the project root: inside it, no traversal.
+    /// Unlike `writableURL`, no text-extension restriction (raw files allowed).
+    private func rootRelativeURL(_ relPath: String) -> URL? {
+        guard let root = rootURL() else { return nil }
+        guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
+        let url = root.appendingPathComponent(relPath).standardizedFileURL
+        guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
+        return url
+    }
+
+    /// Read ANY file inside the project root (not just the index), decoded as text.
+    /// Without a range: the whole file (capped). With `fromLine`/`toLine` (1-based,
+    /// inclusive): only those lines, numbered. Errors on binary/unreadable content.
+    public func readFileTool(path relPath: String, fromLine: Int? = nil, toLine: Int? = nil) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            return "File non trovato o illeggibile: '\(relPath)'."
+        }
+        // Line range: return only [from, to] with line numbers (like project_read).
+        if fromLine != nil || toLine != nil {
+            guard let text = String(data: data, encoding: .utf8) else {
+                return "File non testuale ('\(relPath)', \(data.count) byte): non leggibile come testo."
+            }
+            let lines = text.components(separatedBy: "\n")
+            let n = lines.count
+            let from = max(1, fromLine ?? 1)
+            guard from <= n else { return "'\(relPath)' ha solo \(n) righe." }
+            let to = min(n, toLine ?? n)
+            guard to >= from else { return "Intervallo non valido: to_line (\(to)) < from_line (\(from))." }
+            var out = "\(relPath) — righe \(from)-\(to) di \(n):\n"
+            for i in (from - 1)..<to { out += "\(i + 1)\t\(lines[i])\n" }
+            return out
+        }
+        // Whole file, capped.
+        let cap = 96 * 1024
+        guard let text = String(data: data.prefix(cap), encoding: .utf8) else {
+            return "File non testuale ('\(relPath)', \(data.count) byte): non leggibile come testo."
+        }
+        var out = "\(relPath) (\(data.count) byte):\n\(text)"
+        if data.count > cap { out += "\n… (troncato a \(cap / 1024) KB; passa from_line/to_line per un intervallo)" }
+        return out
+    }
+
+    /// Count the lines (and bytes) of a file in the project root. Uses the SAME
+    /// split as file_read/file_modify/file_add so the line numbers are consistent.
+    public func lineCountTool(path relPath: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            return "File non trovato o illeggibile: '\(relPath)'."
+        }
+        guard let text = String(data: data, encoding: .utf8) else {
+            return "File non testuale ('\(relPath)', \(data.count) byte)."
+        }
+        let lines = text.components(separatedBy: "\n").count
+        return "\(relPath): \(lines) righe, \(data.count) byte."
+    }
+
+    /// Create or overwrite the WHOLE file inside the project root (any extension;
+    /// creates intermediate dirs). For line-level changes use addLinesTool /
+    /// modifyLinesTool. Updates the index when the file is textual.
+    public func writeFileTool(path relPath: String, content: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        let existed = FileManager.default.fileExists(atPath: url.path)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            return "Scrittura fallita: \(error.localizedDescription)"
+        }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: content) }
+        let lines = content.components(separatedBy: "\n").count
+        return "\(existed ? "Sovrascritto" : "Creato") '\(relPath)' (\(lines) righe)."
+    }
+
+    /// ADD lines WITHOUT overwriting: insert `content` before line `atLine` (1-based);
+    /// `atLine` omitted or beyond the end appends. Creates the file if absent.
+    /// Updates the index when the file is textual.
+    public func addLinesTool(path relPath: String, content: String, atLine: Int? = nil) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard !content.isEmpty else { return "Niente da aggiungere ('content' vuoto)." }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        // New file: just create it.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return writeFileTool(path: relPath, content: content)
+        }
+        guard let data = try? Data(contentsOf: url), let existing = String(data: data, encoding: .utf8) else {
+            return "File non testuale: '\(relPath)'."
+        }
+        var lines = existing.components(separatedBy: "\n")
+        let n = lines.count
+        let newLines = content.components(separatedBy: "\n")
+        let at = min(max(1, atLine ?? (n + 1)), n + 1)        // insert BEFORE this line; n+1 = append
+        lines.insert(contentsOf: newLines, at: at - 1)
+        let updated = lines.joined(separator: "\n")
+        guard updated.utf8.count <= Self.maxFileBytes else {
+            return "File risultante troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        catch { return "Scrittura fallita: \(error.localizedDescription)" }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
+        return "Aggiunte \(newLines.count) righe a '\(relPath)' \(at > n ? "in coda" : "prima della riga \(at)")."
+    }
+
+    /// MODIFY by REPLACING lines [fromLine, toLine] (1-based, inclusive) of an
+    /// existing text file with `content` (`toLine` omitted = a single line; empty
+    /// `content` = delete those lines). Updates the index when the file is textual.
+    public func modifyLinesTool(path relPath: String, content: String, fromLine: Int, toLine: Int? = nil) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "Nessun progetto importato o percorso non valido: '\(relPath)'."
+        }
+        guard content.utf8.count <= Self.maxFileBytes else {
+            return "Contenuto troppo grande (max \(Self.maxFileBytes / 1024) KB)."
+        }
+        guard let data = try? Data(contentsOf: url), let existing = String(data: data, encoding: .utf8) else {
+            return "File non trovato o non testuale: '\(relPath)'."
+        }
+        var lines = existing.components(separatedBy: "\n")
+        let n = lines.count
+        guard fromLine >= 1, fromLine <= n else {
+            return "from_line \(fromLine) fuori intervallo (1…\(n)). Per aggiungere righe usa file_add."
+        }
+        let from = fromLine
+        let to = min(max(from, toLine ?? from), n)
+        let newLines = content.isEmpty ? [] : content.components(separatedBy: "\n")
+        let removed = to - from + 1
+        lines.replaceSubrange((from - 1)..<to, with: newLines)
+        let updated = lines.joined(separator: "\n")
+        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        catch { return "Scrittura fallita: \(error.localizedDescription)" }
+        if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
+        return "Modificate righe \(from)-\(to) di '\(relPath)': \(removed) rimosse → \(newLines.count) inserite."
     }
 }

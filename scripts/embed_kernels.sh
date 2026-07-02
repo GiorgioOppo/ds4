@@ -1,8 +1,8 @@
 #!/bin/sh
-# Regenerate Sources/DS4Metal/Runtime/KernelSources.swift from metal/*.metal —
-# embeds the kernel sources in the binary so MetalRuntime() needs no on-disk
-# kernel folder. metal/ stays the source of truth; this file is generated.
-# Keep the order in sync with MetalRuntime.kernelFiles.
+# Regenerate Sources/DS4Metal/Runtime/KernelSources.swift from metal/*.metal — embeds the
+# kernel sources in the binary so MetalRuntime() needs no on-disk kernel folder.
+# metal/ stays the source of truth; this file is generated. Keep the order in
+# sync with MetalRuntime.kernelFiles.
 set -e
 cd "$(dirname "$0")/.."
 out=Sources/DS4Metal/Runtime/KernelSources.swift

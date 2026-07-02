@@ -12,3 +12,6 @@ weights/
 # "DwarfStar 2.xcodeproj" copies if the project is open during xcodegen).
 xcuserdata/
 DwarfStar *.xcodeproj/
+
+# Instruments traces (binary, large — never commit)
+*.trace

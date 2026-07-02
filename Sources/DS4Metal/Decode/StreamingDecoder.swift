@@ -22,6 +22,12 @@ import DS4Core
 public struct DecodeProfile: Sendable {
     public var embedS = 0.0       // token embedding
     public var routeS = 0.0       // attention + router (compute)
+    // DS4_PROFILE_ROUTE: route/attn split into 5 timed sub-phases (ratios meaningful).
+    public var routeCompS = 0.0       // hc-pre + NSA compressor (attn + indexer)
+    public var routeQS = 0.0          // Q projection (q_a, q_b)
+    public var routeKvS = 0.0         // KV projection + indexer scoring
+    public var routeAttnPhaseS = 0.0  // flash-attn
+    public var routeOutS = 0.0        // output proj + HC-reduce + router
     public var gatherS = 0.0      // gather the 6 selected experts from the mmap (EXPERT I/O)
     public var expertsS = 0.0     // shared FFN + routed MoE matvec (compute)
     public var layerOtherS = 0.0  // non-split decode path (resident experts)
@@ -54,10 +60,18 @@ public struct DecodeProfile: Sendable {
             let gbs = Double(gatherBytes) / gatherS / 1e9
             cacheLine += "\n  gather IO    \(String(format: "%6.1f", mbTok)) MB/token — banda effettiva \(String(format: "%.2f", gbs)) GB/s"
         }
+        var routeSplit = ""   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commits)
+        if routeCompS + routeQS + routeKvS + routeAttnPhaseS + routeOutS > 0 {
+            routeSplit = "\n     ├ comp \(ms(routeCompS)) ms/token (hc-pre + NSA compressor)"
+                       + "\n     ├ q    \(ms(routeQS)) ms/token (q_a + q_b proj)"
+                       + "\n     ├ kv   \(ms(routeKvS)) ms/token (kv proj + indexer)"
+                       + "\n     ├ attn \(ms(routeAttnPhaseS)) ms/token (flash-attn)"
+                       + "\n     └ out  \(ms(routeOutS)) ms/token (output proj + HC + router)"
+        }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
-          route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute
+          route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute\(routeSplit)
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
           experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
@@ -81,6 +95,10 @@ public final class StreamingDecoder {
     /// Per-phase decode timing (opt-in: read after a run, reset between runs).
     public var profile = DecodeProfile()
     public func resetProfile() { profile = DecodeProfile() }
+    /// DS4_PROFILE_ROUTE=1: split route/attn into pre (Q/KV proj + compressor) and
+    /// attn (attention + out proj + HC + router), each its own command buffer + timed.
+    /// Adds a commit/wait per layer (absolute numbers inflate); read the RATIO.
+    let profileRoute = ProcessInfo.processInfo.environment["DS4_PROFILE_ROUTE"] == "1"
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -93,6 +111,11 @@ public final class StreamingDecoder {
     /// Routing-frequency statistics (the "usage imatrix"): fed by every route,
     /// persisted by the service, and used to pre-warm the slot cache.
     public let usage: ExpertUsageStats?
+    /// Optional read-ahead hook. `prefetch(i)` resolves layer i's mmap byte ranges
+    /// (cheap, on the decode thread) and madvises them WILLNEED on a background
+    /// queue, so the next layer's SSD I/O overlaps the current layer's compute.
+    /// nil = off (resident paths don't need it). Cannot affect numerics.
+    let prefetch: ((Int) -> Void)?
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
@@ -118,12 +141,14 @@ public final class StreamingDecoder {
                 expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
                 slotCache: ExpertSlotCache? = nil,
                 usage: ExpertUsageStats? = nil,
+                prefetch: ((Int) -> Void)? = nil,
                 kvLayers: Range<Int>? = nil) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         self.slotCache = slotCache
         self.usage = usage
+        self.prefetch = prefetch
         let hcDim = dims.nHC * dims.nEmbd
         // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
         // (a worker never runs the other layers — dummy 1-float buffers there).
@@ -148,8 +173,26 @@ public final class StreamingDecoder {
         }
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
+        // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
+        // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
+        // the older rows need not stay resident — the ring cuts the raw-KV RAM from
+        // O(contextSize) to a constant. The write slot, attention staging and
+        // export/import all key off `rawCache.count/headDim`, so the full cache is a
+        // no-wrap special case (behaviour identical). Opt-in: validate the parity
+        // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
+        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false   // live (set from the UI toggle)
+        let rawRows = ringOn ? min(dims.nSWA, maxKeys) : maxKeys
+        // lazyZeros (no memset): the raw cache is sized for the FULL context but only
+        // rows 0..<pos are ever written, and attention reads only written rows (the
+        // NSA window is the last nSWA, always recently written). With eager .zeros the
+        // memset commits maxKeys*headDim*4*nLayer of PHYSICAL RAM at load (≈2 GB/layer
+        // at a 1M ctx!), which on the SSD-streaming path evicts the page cache the
+        // experts/dense weights live in → more re-faults → slower decode. Zero-fill-on-
+        // demand makes the physical footprint scale with the tokens ACTUALLY generated,
+        // so a large default context is free until the conversation grows. (Unwritten
+        // rows are never read; if they were, fresh shared pages read back as zero.)
         rawCaches = try (0..<nLayers).map { il in
-            kvRange.contains(il) ? try GPUTensor.zeros(rt, floatCount: maxKeys * dims.headDim)
+            kvRange.contains(il) ? try GPUTensor.lazyZeros(rt, floatCount: rawRows * dims.headDim)
                                  : try GPUTensor.zeros(rt, floatCount: 1)
         }
         hcA = try .zeros(rt, floatCount: hcDim); hcB = try .zeros(rt, floatCount: hcDim)
@@ -167,6 +210,7 @@ public final class StreamingDecoder {
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
             let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
+            if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
             try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
                          cur: cur, other: other, pos: pos, nKeys: nKeys)
             swap(&cur, &other)
@@ -203,6 +247,7 @@ public final class StreamingDecoder {
         var cur = hcA, other = hcB
         for i in start...end {
             let w = try layerProvider(i)
+            if i + 1 <= end { prefetch?(i + 1) }
             try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
                          cur: cur, other: other, pos: pos, nKeys: nKeys)
             swap(&cur, &other)
@@ -279,6 +324,7 @@ public final class StreamingDecoder {
         for i in 0..<nLayers {
             try Task.checkCancellation()
             let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
+            if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
             let layerRope = DSV4Shape.ropeParams(layer: i)
             if let gather = expertGather, n > 1 {
                 try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
@@ -322,7 +368,7 @@ public final class StreamingDecoder {
         for j in 0..<n {
             try Task.checkCancellation()
             let pos = posBase + j
-            var t = Date()
+            let t = Date()
             try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
@@ -414,7 +460,7 @@ public final class StreamingDecoder {
     /// CPU-write `a` into the head of a shared GPU buffer (safe between commits).
     private func writeFloats(_ a: [Float], into t: GPUTensor) {
         a.withUnsafeBytes {
-            memcpy(t.buffer.contents().advanced(by: t.byteOffset), $0.baseAddress!, $0.count)
+            _ = memcpy(t.buffer.contents().advanced(by: t.byteOffset), $0.baseAddress!, $0.count)
         }
     }
 
@@ -447,7 +493,11 @@ public final class StreamingDecoder {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            if let cache = slotCache {
+            // The slot cache is a single size-class (the model-global/first-layer
+            // quant). A mixed-precision layer (different expert bytes) can't share
+            // the pool, so it falls through to the per-layer-correct gather path.
+            let onClass = w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant
+            if let cache = slotCache, onClass {
                 // Persistent + changing experts: hits are already resident in the
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.
@@ -506,18 +556,39 @@ public final class StreamingDecoder {
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxWeights && indexerActive(i, pos: pos)
         if active, let idx {
-            let c1 = GraphContext(rt); try c1.begin()
+            // Indexer layers always split (CPU top-k sits between pre and attn). The
+            // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
+            let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: true)
+            try c1.phase("kv")
             c1.commit()
             applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
-            let c2 = GraphContext(rt); try c2.begin()
+            let c2 = GraphContext(rt); if profileRoute { c2.phaseTimes = [:] }; try c2.begin()
             try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
+            try c2.phase("out")
             c2.commit()
+            if profileRoute { accumulateRoutePhases(c1, c2) }
+        } else if profileRoute {
+            // Profiling: split route/attn into 5 timed sub-phases (comp, q, kv, attn,
+            // out). The extra commits inflate the ABSOLUTE time — read the RATIOS.
+            clearMaskIfDirty()
+            let c = GraphContext(rt); c.phaseTimes = [:]; try c.begin()
+            let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                             rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                             comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                             indexerScoring: false)
+            try c.phase("kv")
+            try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                                  nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                  nComp: nComp, comp: compStates[i])
+            try c.phase("out")
+            c.commit()
+            accumulateRoutePhases(c, nil)
         } else {
             clearMaskIfDirty()
             let c1 = GraphContext(rt); try c1.begin()
@@ -530,6 +601,19 @@ public final class StreamingDecoder {
                                    nComp: nComp, comp: compStates[i])
             c1.commit()
         }
+    }
+
+    /// Accumulate per-sub-phase route timings (DS4_PROFILE_ROUTE) into the profile.
+    private func accumulateRoutePhases(_ a: GraphContext, _ b: GraphContext?) {
+        func add(_ pt: [String: Double]) {
+            profile.routeCompS += pt["comp", default: 0]
+            profile.routeQS += pt["q", default: 0]
+            profile.routeKvS += pt["kv", default: 0]
+            profile.routeAttnPhaseS += pt["attn", default: 0]
+            profile.routeOutS += pt["out", default: 0]
+        }
+        if let pt = a.phaseTimes { add(pt) }
+        if let pt = b?.phaseTimes { add(pt) }
     }
 
     /// Will the indexer restrict this token's compressed rows on layer `i`?
@@ -624,11 +708,9 @@ public final class StreamingDecoder {
     public static func fromGGUFExpertCached(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                             nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
+        let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let u = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_up_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
-            return (g, u, dn)
+            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims, willNeed: willNeed)
         }
         // Memoize the non-routed (dense + NSA compressor) weights: loaded once,
         // resident across tokens (the C --ssd-streaming model). Only the 6 selected
@@ -651,15 +733,18 @@ public final class StreamingDecoder {
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
+        let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            let g = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_gate_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let u = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_up_exps.weight", ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-            let dn = try GGUFWeights.gatherExperts(rt, model, "blk.\(il).ffn_down_exps.weight", ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
-            return (g, u, dn)
+            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims, willNeed: willNeed)
         }
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.
         let usage = ExpertUsageStats(nLayers: nLayers)
+        // Per-expert slab sizes in the mmap (expert e at absOffset + e*bytes); shared
+        // by the slot-cache fill and the read-ahead prefetch.
+        let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
+        let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
+        let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
         // Persistent + changing experts (cacheSlots param, else env
         // DS4_EXPERT_CACHE_SLOTS; default off): per layer, an N-slot LRU pool
         // keeps hot experts resident in GPU buffers; only misses are memcpy'd
@@ -671,9 +756,6 @@ public final class StreamingDecoder {
         var cache: ExpertSlotCache? = nil
         if nSlots > 0 {
             let S = max(8, nSlots)
-            let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
-            let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
-            let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
             cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: {
                 (gate: try GPUTensor.zerosBytes(rt, byteLength: S * gateBytes),
                  up: try GPUTensor.zerosBytes(rt, byteLength: S * upBytes),
@@ -695,10 +777,68 @@ public final class StreamingDecoder {
                 }
             }, warm: { il in usage.top(layer: il, n: S) })
         }
+        // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
+        // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
+        // can STEAL SSD bandwidth from the real gather (worse when the usage prior is
+        // cold) — it must be measured per machine. Opt in with DS4_PREFETCH=1 (then
+        // it prefetches the always-needed non-routed weights). DS4_PREFETCH_EXPERTS>0
+        // additionally prefetches that many usage-prior experts (speculative; off by
+        // default). Hint-only on the read-only mapping — cannot affect numerics.
+        let prefetchOn = ProcessInfo.processInfo.environment["DS4_PREFETCH"] == "1"
+        let prefetchExperts = ProcessInfo.processInfo.environment["DS4_PREFETCH_EXPERTS"].flatMap(Int.init) ?? 0
+        let denseNames = ["hc_attn_fn.weight", "attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+                          "attn_output_a.weight", "attn_output_b.weight", "hc_ffn_fn.weight",
+                          "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                          "ffn_gate_inp.weight", "indexer.attn_q_b.weight", "indexer.proj.weight",
+                          "indexer_compressor_kv.weight", "indexer_compressor_gate.weight",
+                          "attn_compressor_kv.weight", "attn_compressor_gate.weight"]
+        let expertTensors = [("ffn_gate_exps.weight", gateBytes), ("ffn_up_exps.weight", upBytes),
+                             ("ffn_down_exps.weight", downBytes)]
+        let mapBaseAddr = Int(bitPattern: model.mapBase)   // Sendable: cross into the bg queue as an int
+        let prefetchQ = DispatchQueue(label: "ds4.prefetch", qos: .utility)
+        let prefetch: ((Int) -> Void)? = prefetchOn ? { il in
+            var ranges: [(offset: UInt64, bytes: UInt64)] = []
+            let p = "blk.\(il)."
+            for s in denseNames {
+                if let t = model.findTensor(p + s) { ranges.append((offset: t.absOffset, bytes: t.bytes)) }
+            }
+            if prefetchExperts > 0 {
+                let hot = usage.top(layer: il, n: prefetchExperts)   // decode thread (same as record)
+                for (name, ebytes) in expertTensors {
+                    if let t = model.findTensor(p + name) {
+                        for e in hot { ranges.append((offset: t.absOffset + UInt64(e) * UInt64(ebytes),
+                                                      bytes: UInt64(ebytes))) }
+                    }
+                }
+            }
+            let snapshot = ranges   // immutable copy for the @Sendable background block
+            prefetchQ.async {
+                if let base = UnsafeRawPointer(bitPattern: mapBaseAddr) {
+                    GGUFModel.prefetch(base: base, ranges: snapshot)
+                }
+            }
+        } : nil
+        // Dense-weight residency. Default: per-layer dense weights are NO-COPY mmap
+        // views (evictable). On a machine where the 70GB model can't fit, the 71GB
+        // expert stream churns the page cache and EVICTS the ~5GB of hot dense
+        // weights (q_b/output_a/…, read every token) → route/attn re-faults them
+        // from SSD every token (the "compute" that doesn't warm up). DS4_RESIDENT_DENSE=1
+        // copies them into resident (wired) Metal buffers ONCE (memoized), so they
+        // stay put and the matvec is RAM-bound. Costs ~5GB wired — worth it when it
+        // fits, frees route/attn; on very tight RAM it can pressure the expert cache.
+        let residentDense = ProcessInfo.processInfo.environment["DS4_RESIDENT_DENSE"] == "1"
+        let denseProvider: (Int) throws -> LayerWeights
+        if residentDense {
+            let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
+            denseProvider = { try denseCache.get($0) }
+        } else {
+            denseProvider = { try GGUFWeights.layerMappedDense(rt, model, $0) }
+        }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
-                                    layerProvider: { try GGUFWeights.layerMappedDense(rt, model, $0) },
+                                    layerProvider: denseProvider,
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather, slotCache: cache, usage: usage, kvLayers: kvLayers)
+                                    expertGather: gather, slotCache: cache, usage: usage,
+                                    prefetch: prefetch, kvLayers: kvLayers)
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

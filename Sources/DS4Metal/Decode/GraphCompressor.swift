@@ -34,7 +34,13 @@ public final class CompressorState {
         let rows = coff * ratio
         stateKv = try .zeros(rt, floatCount: rows * width)
         stateScore = try .floats(rt, [Float](repeating: -1e30, count: rows * width))
-        cache = try .zeros(rt, floatCount: maxComp * headDim)
+        // Sized to the full context (maxComp = maxKeys/ratio) but allocated
+        // zero-fill-on-demand: only the rows actually emitted ([0..count], the only
+        // region attention/indexer ever read) cost physical RAM. So a 1M-context
+        // model no longer commits ~13 GB of compressor caches up front. reset()
+        // doesn't touch cache (rows are overwritten as re-emitted), so skipping the
+        // zero is safe — unwritten rows are never read.
+        cache = try .lazyZeros(rt, floatCount: maxComp * headDim)
         kvCur = try .zeros(rt, floatCount: width)
         scCur = try .zeros(rt, floatCount: width)
         rowScratch = try .zeros(rt, floatCount: headDim)

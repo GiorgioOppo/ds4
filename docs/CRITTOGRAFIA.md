@@ -19,7 +19,7 @@ incorpora algoritmi di cifratura proprietari o non esenti. Conseguenza pratica:
 
 | Componente | Crittografia | Esente? |
 |---|---|---|
-| **Download dei modelli** (`ModelDownloader` → `huggingface.co`) | **HTTPS/TLS** tramite `URLSession`/Foundation: cifratura standard del sistema operativo | ✅ esente (cifratura standard OS) |
+| **Download dei modelli** (`ModelDownloader` → `huggingface.co`) | **HTTPS/TLS** tramite `URLSession`/Foundation; **SHA-256** (`CryptoKit.SHA256`) per **verificare l'integrità** del GGUF scaricato | ✅ esente (TLS = cifratura standard OS; SHA-256 = hashing, non cifratura) |
 | **KV cache su disco** (`KVCFile`, `DiskKVStore`) | **SHA-1** (`CryptoKit.Insecure.SHA1`) per **nominare** i file di checkpoint | ✅ non è cifratura — è una funzione di hash (non controllata) |
 | **Server HTTP locale** (`LocalServer`) | nessuna — **HTTP in chiaro** | ✅ nessuna cifratura |
 | **Inferenza distribuita** (`DistTransport`) | nessuna — **TCP in chiaro** sulla LAN | ✅ nessuna cifratura |
@@ -27,9 +27,15 @@ incorpora algoritmi di cifratura proprietari o non esenti. Conseguenza pratica:
 
 Note:
 - **Niente crittografia proprietaria.** L'unico modulo crypto importato è
-  `CryptoKit`, usato esclusivamente per l'**hash SHA-1** dei nomi file della
-  cache KV (porting fedele del formato `ds4_kvstore.c`). L'hashing **non** è
-  cifratura ai fini dell'export.
+  `CryptoKit`, usato esclusivamente per **funzioni di hash**: SHA-1 per i nomi
+  file della cache KV (porting fedele del formato `ds4_kvstore.c`) e SHA-256 per
+  la **verifica d'integrità** dei modelli scaricati (content pinning). L'hashing
+  **non** è cifratura ai fini dell'export.
+- **Perché SHA-256 e non il pinning TLS.** L'endpoint `resolve/main/…` di Hugging
+  Face fa redirect verso la sua CDN LFS (chiavi fuori dal nostro controllo, che
+  ruotano spesso): il pinning a chiave pubblica ATS sarebbe fragile. La verifica
+  dell'hash del contenuto protegge da file manomesso/corrotto a prescindere dal
+  canale TLS ed è immune alla rotazione delle chiavi della CDN.
 - L'HTTPS è gestito interamente dal sistema operativo: l'app non implementa TLS,
   si limita a usare le API di rete standard.
 

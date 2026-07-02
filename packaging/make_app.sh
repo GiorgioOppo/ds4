@@ -22,9 +22,9 @@ BUILD_DIR="$GUI_DIR/build"
 APP="$BUILD_DIR/$APP_NAME.app"
 SIGN_IDENTITY="${DS4_SIGN_IDENTITY:--}"   # default: ad-hoc
 
-echo "==> Building engine static library"
-( cd "$GUI_DIR" && make engine )
-
+# Pure-Swift stack: no separate engine static library — `swift build` compiles
+# DS4Core + DS4Metal + DS4Engine + DwarfStar together (Metal kernels are embedded
+# in the binary via Sources/DS4Metal/Runtime/KernelSources.swift).
 echo "==> Building SwiftPM release"
 ( cd "$GUI_DIR" && swift build -c release --product "$APP_NAME" )
 
@@ -54,10 +54,10 @@ set_key LSMinimumSystemVersion 14.0
 $PB -c "Set :NSHighResolutionCapable true" "$PLIST" 2>/dev/null \
     || $PB -c "Add :NSHighResolutionCapable bool true" "$PLIST"
 
-# Required: the Metal kernel sources, compiled at runtime by the engine. These
-# are vendored inside the DS4-gui project (GUI_DIR/metal), so the bundle does
-# not depend on the upstream tree.
-cp -R "$GUI_DIR/metal" "$APP/Contents/Resources/metal"
+# Optional fallback: the Metal kernel SOURCES. The runtime compiles the kernels
+# EMBEDDED in the binary (Sources/DS4Metal/Runtime/KernelSources.swift), so the
+# bundle does not need this folder; copy it only if present (harmless extra).
+[ -d "$GUI_DIR/metal" ] && cp -R "$GUI_DIR/metal" "$APP/Contents/Resources/metal"
 
 # Optional app icon.
 if [ -f "$PKG_DIR/AppIcon.icns" ]; then
@@ -78,10 +78,21 @@ if [ -f "$ROOT_DIR/speed-bench/promessi_sposi.txt" ]; then
     cp "$ROOT_DIR/speed-bench/promessi_sposi.txt" "$APP/Contents/Resources/speed-bench/"
 fi
 
+# Strip extended attributes (resource forks / Finder info / com.apple.quarantine
+# / provenance) that copied-in files can carry — codesign refuses them with
+# "resource fork, Finder information, or similar detritus not allowed".
+xattr -cr "$APP" 2>/dev/null || true
+
 echo "==> Code signing ($SIGN_IDENTITY)"
 # Sign nested binaries first, then the app.
 find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
     codesign --force --timestamp=none --sign "$SIGN_IDENTITY" {} \; 2>/dev/null || true
+# Sign WITHOUT the App Sandbox. `make app` is ad-hoc signed (identity "-"), and an
+# ad-hoc + sandboxed app cannot get file access through Powerbox — the open panel
+# won't let you browse/select the GGUF. Unsandboxed = full local file access and
+# NSOpenPanel works directly (the security-scoped bookmark code degrades to a plain
+# path, see ModelPicker). For a sandboxed, distributable app sign with a Developer
+# ID via the xcodeproj build (which applies packaging/DwarfStar.entitlements).
 codesign --force --deep --timestamp=none --sign "$SIGN_IDENTITY" "$APP"
 
 echo "==> Verifying"

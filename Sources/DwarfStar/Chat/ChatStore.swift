@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 import DS4Engine
 import DS4Core
 
@@ -12,6 +14,21 @@ struct UIMessage: Identifiable {
     var text: String
     var toolStreamText: String = ""   // raw tool markup shown live while it generates
     var toolCalls: [ToolCall] = []
+    /// Names of text files imported with this (user) message — shown as badges; the
+    /// full content was folded into the turn actually sent to the model.
+    var attachments: [String] = []
+    /// Set on a `.tool` message that reports an isolated sub-agent run (question,
+    /// answer, and a collapsible trace of its internal steps).
+    var subAgent: InferenceService.SubAgentRun?
+}
+
+/// A text file staged in the composer: its full content is folded into the next
+/// user turn sent to the model; the transcript shows only the filename + size.
+struct ChatAttachment: Identifiable, Equatable {
+    let id = UUID()
+    let name: String
+    let content: String
+    var bytes: Int { content.utf8.count }
 }
 
 /// Main-thread view model. Owns the `InferenceService` actor and mirrors its
@@ -43,7 +60,24 @@ final class ChatStore {
     }
     var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
 
-    init(settings: AppSettings) { self.settings = settings }
+    init(settings: AppSettings) {
+        self.settings = settings
+        AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
+        _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON ≥24GB RAM
+        _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        // Restore the persisted chats (newest first). Always keep at least one so
+        // there is an active conversation to write into.
+        sessions = ChatSessionStore.loadAll()
+        if let first = sessions.first {
+            activeSessionId = first.id
+        } else {
+            let s = ChatSession(agentId: selectedAgentId, systemNote: systemPrompt)
+            sessions = [s]
+            activeSessionId = s.id
+        }
+    }
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Wired memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
@@ -53,11 +87,60 @@ final class ChatStore {
 
     // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
     // restores matching prefixes on cold starts. Applied on the NEXT model load.
-    var diskKVEnabled: Bool = UserDefaults.standard.bool(forKey: "DS4DiskKV") {
+    // ON by default (8 GB budget) so conversations are checkpointed and re-prefill
+    // is avoided across reloads; the explicit user choice is then persisted.
+    var diskKVEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
     }
-    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 4096 {
+    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192 {
         didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
+    }
+    /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
+    /// instead of the full context, so the KV RAM is constant. Sets the engine env
+    /// var; applied on the NEXT model load.
+    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
+            _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
+        }
+    }
+    /// madvise(WILLNEED) sui 6 esperti selezionati prima del gather: anticipa e
+    /// batcha il read-ahead a freddo dei soli slab che servono. Solo advisory (non
+    /// cambia i numeri). DEFAULT ON; si applica al PROSSIMO caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var willNeedEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4WillNeed") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(willNeedEnabled, forKey: "DS4WillNeed")
+            _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
+    /// per layer in buffer wired (residenti) invece di mapparli no-copy, così la
+    /// churn degli esperti non li eviice dalla page cache → route/attn RAM-bound.
+    /// Stessi numeri (è solo copia vs mmap). DEFAULT ON solo con RAM abbondante
+    /// (≥24 GB): su 16 GB inchiodare ~5 GB wired manda in pressione di memoria
+    /// (swap / meno page cache per gli esperti) e MISURATO PEGGIORA — resta OFF di
+    /// default lì, ma il toggle permette di provarlo. Si applica al prossimo
+    /// caricamento del modello.
+    var residentDenseEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4ResidentDense") as? Bool)
+        ?? (MemoryInfo.physicalBytes >= 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
+            _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Profilo decode route/attn (DS4_PROFILE_ROUTE): splitta route/attn in 5 fasi
+    /// (comp/q/kv/attn/out), ognuna con commit+wait dedicato. DIAGNOSTICO: i commit
+    /// extra RALLENTANO la generazione (gli assoluti si gonfiano; conta il RAPPORTO),
+    /// quindi DEFAULT OFF e NON usarlo mentre misuri la velocità. Il report finisce
+    /// nel Log motore a fine turno. Si applica al prossimo caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var profileRouteEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ProfileRoute") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(profileRouteEnabled, forKey: "DS4ProfileRoute")
+            _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)
+        }
     }
     /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
     static var diskKVDirectory: URL {
@@ -71,7 +154,9 @@ final class ChatStore {
     // Agents (roles). Selecting one starts a fresh chat with its role and swaps
     // the per-agent expert-usage profile (the cache re-warms with ITS experts).
     // Editable + persisted; edits apply on the next new chat / agent switch.
-    var agents: [AgentProfile] = ChatStore.loadAgents()
+    var agents: [AgentProfile] = ChatStore.loadAgents() {
+        didSet { AgentRegistry.shared.set(agents) }   // keep the engine-side agents_list tool in sync
+    }
     var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgent") ?? "generale" {
         didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgent") }
     }
@@ -166,15 +251,7 @@ final class ChatStore {
 
     func selectAgent(_ id: String) {
         selectedAgentId = id
-        generation?.cancel()
-        isGenerating = false
-        status = ""
-        messages.removeAll()
-        pendingManualCalls = []
-        partialAutoOutputs = []
-        awaitingManualResults = false
-        toolRounds = 0
-        applyAgent()
+        startNewChat()   // a role switch starts a fresh persisted chat with that role
     }
 
     // Discovered GGUF files on disk.
@@ -208,22 +285,44 @@ final class ChatStore {
     /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
     var awaitingManualResults = false
     private var partialAutoOutputs: [ToolOutput] = []
-    /// Guard against a tool loop (model re-calling instead of answering).
-    /// Agentic roles (write tools) get a larger budget: a code task legitimately
-    /// chains many explore/read/edit/verify rounds.
+    /// Tool-loop bound. Illimitato su richiesta: il loop si ferma comunque quando
+    /// il contesto è pieno o l'utente preme Stop.
     private var toolRounds = 0
-    private var maxToolRounds: Int {
-        selectedAgent.toolNames.contains("project_write") ? 16 : 6
-    }
+    private var maxToolRounds: Int { .max }
 
     // Live state.
     var phase: Phase = .needsModel
     var info: ModelInfo?
     var messages: [UIMessage] = []
     var input = ""
+    /// Text files staged for the next message (folded into the user turn on send).
+    var attachments: [ChatAttachment] = []
+    /// Transient composer note (e.g. a file that couldn't be decoded as text).
+    var attachmentNote: String?
+    /// Rough token estimate of the staged attachments (≈4 chars/token); nil if none.
+    /// Used to warn before they overflow the context window.
+    var attachmentTokenEstimate: Int? {
+        guard !attachments.isEmpty else { return nil }
+        return attachments.reduce(0) { $0 + $1.content.count } / 4
+    }
     var think = false
     var isGenerating = false
     var status = ""          // live prefill/decode progress
+    /// Tokens committed to the KV (≈ context used); drives the near-full warning.
+    var contextUsed = 0
+
+    // MARK: - Chat sessions (persistent, multiple)
+
+    /// All persisted chats, newest first. The active one's transcript is mirrored
+    /// in `messages`; the others live on disk and are loaded on demand.
+    var sessions: [ChatSession] = []
+    /// Id of the chat currently shown in `messages`.
+    var activeSessionId: String = ""
+    /// True when the engine's KV already holds the active chat. False right after a
+    /// persisted chat is restored: the next send re-primes the engine from the
+    /// visible history (the disk-KV cache restores the prefix), after which turns
+    /// are incremental again.
+    private var enginePrimed = true
 
     private var service: InferenceService?
     private var generation: Task<Void, Never>?
@@ -285,7 +384,7 @@ final class ChatStore {
                     self.service = svc
                     self.info = info
                     self.phase = .ready
-                    self.applyAgent()   // role + tools + per-agent usage profile
+                    self.activate(self.activeSessionId)   // load the active chat + apply its role
                 }
             } catch {
                 await MainActor.run { self.phase = .failed("\(error)") }
@@ -303,21 +402,41 @@ final class ChatStore {
 
     private var thinkMode: DS4ThinkMode { think ? .high : .none }
 
-    /// Send the current input and stream the reply, running the tool loop.
+    /// Send the current input (+ any imported text files) and stream the reply,
+    /// running the tool loop. Attachments are folded into the turn sent to the
+    /// model; the transcript shows just the typed text and the filenames.
     func send() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let service, !text.isEmpty, !isGenerating else { return }
+        let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let service, !isGenerating, !(typed.isEmpty && attachments.isEmpty) else { return }
+        let atts = attachments
+        let text = Self.composeUserText(typed: typed, attachments: atts)
         input = ""
-        messages.append(UIMessage(role: .user, text: text))
+        attachments = []
+        attachmentNote = nil
+        // If the engine doesn't hold this (reopened) chat yet, re-feed the prior
+        // turns on this first send. Capture them BEFORE appending the new rows.
+        let primed = enginePrimed
+        let history = primed ? [] : Self.chatTurns(from: messages)
+        let sys = primed ? nil : (resolvedAgent().systemPrompt.isEmpty ? nil : resolvedAgent().systemPrompt)
+        enginePrimed = true
+        messages.append(UIMessage(role: .user, text: typed, attachments: atts.map(\.name)))
         let index = appendAssistant()
         isGenerating = true
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
+        persistActiveSession()             // checkpoint the user turn right away
 
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
-        generation = Task { [weak self] in
-            let stream = await service.send(userText: text, thinkMode: mode,
-                                            sampling: params, maxTokens: 4096)
+        // .userInitiated: the decode runs on the InferenceService actor's executor at
+        // THIS task's QoS. A default-priority task lets macOS deprioritize the work —
+        // and, worse for the SSD-streaming path, throttle its expert-gather reads — so
+        // the app decodes slower than the foreground CLI demo. Match the model-load
+        // task's priority (and the CLI's foreground QoS) explicitly.
+        generation = Task(priority: .userInitiated) { [weak self] in
+            let stream = primed
+                ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
+                : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
+                                                thinkMode: mode, sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
@@ -356,6 +475,64 @@ final class ChatStore {
 
     func stop() { generation?.cancel() }
 
+    // MARK: - Text-file attachments
+
+    /// Present an open panel for one or more text files and stage their contents.
+    /// Honors the App Sandbox: each pick grants security-scoped access for the
+    /// one-shot read (entitlement: files.user-selected.read-write).
+    func pickAndAttachFiles() {
+        attachmentNote = nil
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.title = "Importa file di testo"
+        panel.prompt = "Importa"
+        // Prefer text types; allow any file (.data) so odd extensions can still be
+        // picked — non-text content simply fails to decode and is reported.
+        panel.allowedContentTypes = [.text, .plainText, .sourceCode, .json, .xml,
+                                     .commaSeparatedText, .log, .data]
+        guard panel.runModal() == .OK else { return }
+        importFiles(panel.urls)
+    }
+
+    /// Read each URL as text (UTF-8, then Latin-1) and stage it; collect failures.
+    func importFiles(_ urls: [URL]) {
+        var failed: [String] = []
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let text = Self.readText(url) else { failed.append(url.lastPathComponent); continue }
+            let name = url.lastPathComponent
+            // Re-importing the identical file is a no-op (avoid duplicate context).
+            if !attachments.contains(where: { $0.name == name && $0.content == text }) {
+                attachments.append(ChatAttachment(name: name, content: text))
+            }
+        }
+        if !failed.isEmpty {
+            attachmentNote = "Non leggibili come testo: \(failed.joined(separator: ", "))"
+        }
+    }
+
+    func removeAttachment(_ id: UUID) { attachments.removeAll { $0.id == id } }
+
+    /// Decode a file as text: UTF-8 first, then Latin-1 (covers most legacy files).
+    static func readText(_ url: URL) -> String? {
+        if let s = try? String(contentsOf: url, encoding: .utf8) { return s }
+        return try? String(contentsOf: url, encoding: .isoLatin1)
+    }
+
+    /// Fold staged attachments + the typed message into the text sent to the model.
+    /// Each file is delimited so the model can tell content apart from the prompt.
+    static func composeUserText(typed: String, attachments: [ChatAttachment]) -> String {
+        guard !attachments.isEmpty else { return typed }
+        var parts: [String] = attachments.map {
+            "--- File allegato: \($0.name) ---\n\($0.content)\n--- fine: \($0.name) ---"
+        }
+        if !typed.isEmpty { parts.append(typed) }
+        return parts.joined(separator: "\n\n")
+    }
+
     // MARK: - Tuning tab
 
     func refreshTuningInfo() {
@@ -373,22 +550,133 @@ final class ChatStore {
         Task { await service.resetExpertUsage(); refreshTuningInfo() }
     }
 
-    func newChat() {
-        guard let service else { return }
-        generation?.cancel()              // stop any in-flight generation/tool loop
+    // MARK: - Sessions (create / switch / delete / rename / persist)
+
+    func newChat() { startNewChat() }
+
+    /// Make a fresh persisted chat with the current role active. Reuses the current
+    /// chat if it's still empty (so flipping the agent before sending anything
+    /// doesn't pile up blank chats).
+    private func startNewChat() {
+        generation?.cancel()
         isGenerating = false
         status = ""
-        let agentSys = resolvedAgent().systemPrompt
-        let sys = agentSys.isEmpty ? nil : agentSys
-        messages.removeAll()
+        clearTransientTurnState()
+        contextUsed = 0
+        enginePrimed = true
+        if let i = sessions.firstIndex(where: { $0.id == activeSessionId }),
+           messages.isEmpty, sessions[i].messages.isEmpty {
+            sessions[i].agentId = selectedAgentId
+            sessions[i].systemNote = systemPrompt
+            ChatSessionStore.save(sessions[i])
+        } else {
+            persistActiveSession()
+            let session = ChatSession(agentId: selectedAgentId, systemNote: systemPrompt,
+                                      modelName: info?.name ?? "")
+            sessions.insert(session, at: 0)
+            activeSessionId = session.id
+            messages.removeAll()
+            ChatSessionStore.save(session)
+        }
+        applyAgent()                      // role + tools + usage profile + resetConversation
+    }
+
+    /// Switch to an existing chat: persist the current one, then restore the target.
+    func switchSession(_ id: String) {
+        guard id != activeSessionId else { return }
+        persistActiveSession()
+        activate(id)
+    }
+
+    func deleteSession(_ id: String) {
+        let wasActive = (id == activeSessionId)
+        ChatSessionStore.delete(id)
+        sessions.removeAll { $0.id == id }
+        guard wasActive else { return }
+        if let next = sessions.first { activate(next.id) } else { startNewChat() }
+    }
+
+    func renameSession(_ id: String, to title: String) {
+        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessions[i].title = trimmed.isEmpty ? ChatSession.untitled : trimmed
+        ChatSessionStore.save(sessions[i])
+    }
+
+    /// Restore a session into the live UI and reset the engine to its role (without
+    /// persisting the previous one — callers do that first when needed). A non-empty
+    /// chat must re-prime on the next send, since the engine no longer holds its KV.
+    private func activate(_ id: String) {
+        guard let target = sessions.first(where: { $0.id == id }) else { return }
+        generation?.cancel()
+        isGenerating = false
+        status = ""
+        clearTransientTurnState()
+        activeSessionId = id
+        messages = target.messages.map { UIMessage(stored: $0) }
+        contextUsed = 0
+        systemPrompt = target.systemNote
+        if target.agentId != selectedAgentId, agents.contains(where: { $0.id == target.agentId }) {
+            selectedAgentId = target.agentId
+        }
+        enginePrimed = messages.isEmpty
+        applyAgent()                      // reset engine to the role; first send re-primes
+    }
+
+    /// Snapshot the live transcript into the active session and write it to disk.
+    /// Trailing/empty assistant placeholders are dropped so a chat interrupted
+    /// mid-generation doesn't reopen with a blank bubble.
+    private func persistActiveSession() {
+        guard let i = sessions.firstIndex(where: { $0.id == activeSessionId }) else { return }
+        let kept = messages.filter {
+            !($0.role == .assistant && $0.text.isEmpty && $0.reasoning.isEmpty
+              && $0.toolCalls.isEmpty && $0.subAgent == nil)
+        }
+        sessions[i].messages = kept.map { StoredMessage(from: $0) }
+        sessions[i].agentId = selectedAgentId
+        sessions[i].systemNote = systemPrompt
+        if let name = info?.name { sessions[i].modelName = name }
+        sessions[i].updatedAt = Date()
+        if sessions[i].title == ChatSession.untitled {
+            sessions[i].title = Self.deriveTitle(from: messages)
+        }
+        ChatSessionStore.save(sessions[i])
+    }
+
+    private func clearTransientTurnState() {
+        attachments = []
+        attachmentNote = nil
         pendingManualCalls = []
         partialAutoOutputs = []
         awaitingManualResults = false
         toolRounds = 0
-        Task { await service.resetConversation(systemPrompt: sys) }
+    }
+
+    /// First non-empty user line, for an auto title.
+    private static func deriveTitle(from messages: [UIMessage]) -> String {
+        guard let first = messages.first(where: { $0.role == .user && !$0.text.isEmpty }) else {
+            return ChatSession.untitled
+        }
+        let line = first.text.split(separator: "\n").first.map(String.init) ?? first.text
+        return String(line.prefix(48))
     }
 
     // MARK: - Internals
+
+    /// Parse the (target, question, agent, tools) arguments of a `subagent_run`
+    /// call. `tools` accepts a JSON array or a comma/space-separated string (some
+    /// models quote list arguments).
+    private static func subAgentArgs(_ json: String) -> (target: String, question: String, agent: String, tools: [String]) {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ("", "", "", []) }
+        var tools: [String] = []
+        if let arr = obj["tools"] as? [Any] { tools = arr.compactMap { $0 as? String } }
+        else if let s = obj["tools"] as? String {
+            tools = s.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init)
+        }
+        return ((obj["target"] as? String) ?? "", (obj["question"] as? String) ?? "",
+                (obj["agent"] as? String) ?? "", tools)
+    }
 
     private func appendAssistant() -> Int {
         messages.append(UIMessage(role: .assistant, text: ""))
@@ -396,7 +684,29 @@ final class ChatStore {
     }
 
     private func finishIfIdle() {
-        if pendingManualCalls.isEmpty { isGenerating = false; status = "" }
+        if pendingManualCalls.isEmpty {
+            isGenerating = false
+            status = ""
+            refreshContextUsage()
+            persistActiveSession()        // checkpoint the completed turn
+            if profileRouteEnabled { emitDecodeProfile() }
+        }
+    }
+
+    /// Print the last turn's decode profile to stderr so it lands in the Log motore
+    /// (EngineLog captures fd 2), mirroring the demo's `log(dec.profile.report())`.
+    private func emitDecodeProfile() {
+        guard let service else { return }
+        Task {
+            let report = await service.decodeProfileReport()
+            FileHandle.standardError.write(Data(("\n" + report + "\n").utf8))
+        }
+    }
+
+    /// Refresh the committed-token count (context usage) from the engine.
+    private func refreshContextUsage() {
+        guard let service else { contextUsed = 0; return }
+        Task { contextUsed = await service.committedTokens() }
     }
 
     /// Drain one generation stream into the assistant message at `index`.
@@ -460,6 +770,25 @@ final class ChatStore {
         var outputs: [ToolOutput] = []
         var manual: [ToolCall] = []
         for c in calls {
+            // subagent_run runs ON the engine (it drives the decoder in an isolated
+            // context): the main KV only commits this call + the returned answer.
+            if c.name == "subagent_run" {
+                let (target, question, agent, tools) = Self.subAgentArgs(c.argumentsJSON)
+                status = "sub-agent su \(target)…"
+                let run: InferenceService.SubAgentRun
+                do {
+                    run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
+                } catch is CancellationError {
+                    run = InferenceService.SubAgentRun(target: target, question: question,
+                                                       answer: "(sub-agent interrotto)", steps: [])
+                } catch {
+                    run = InferenceService.SubAgentRun(target: target, question: question,
+                                                       answer: "Errore sub-agent: \(error)", steps: [])
+                }
+                messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
+                continue
+            }
             if let out = ToolRegistry.execute(c) {
                 outputs.append(out)
                 messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
@@ -485,12 +814,85 @@ final class ChatStore {
         isGenerating = true
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
-        generation = Task { [weak self] in
+        generation = Task(priority: .userInitiated) { [weak self] in   // see send(): keep decode QoS high
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
                                                           sampling: params, maxTokens: 4096)
             await self?.consume(stream, into: index)
             let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
             if !continued { await MainActor.run { self?.finishIfIdle() } }
         }
+    }
+}
+
+// MARK: - Persistence mapping (UIMessage <-> StoredMessage)
+
+extension ChatRole {
+    var persistedString: String {
+        switch self {
+        case .system: return "system"
+        case .user: return "user"
+        case .assistant: return "assistant"
+        case .tool: return "tool"
+        }
+    }
+    init(persisted: String) {
+        switch persisted {
+        case "user": self = .user
+        case "assistant": self = .assistant
+        case "tool": self = .tool
+        default: self = .system
+        }
+    }
+}
+
+extension StoredMessage {
+    init(from m: UIMessage) {
+        self.role = m.role.persistedString
+        self.reasoning = m.reasoning
+        self.text = m.text
+        self.attachments = m.attachments
+        self.toolCalls = m.toolCalls.map { StoredToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) }
+        self.subAgent = m.subAgent.map {
+            StoredSubAgent(target: $0.target, question: $0.question, answer: $0.answer, steps: $0.steps)
+        }
+    }
+}
+
+extension UIMessage {
+    init(stored s: StoredMessage) {
+        self.init(role: ChatRole(persisted: s.role),
+                  reasoning: s.reasoning,
+                  text: s.text,
+                  toolStreamText: "",
+                  toolCalls: s.toolCalls.map { ToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.argumentsJSON) },
+                  attachments: s.attachments,
+                  subAgent: s.subAgent.map {
+                      InferenceService.SubAgentRun(target: $0.target, question: $0.question,
+                                                   answer: $0.answer, steps: $0.steps)
+                  })
+    }
+}
+
+extension ChatStore {
+    /// Rebuild engine turns from the visible transcript to re-prime a reopened chat.
+    /// Attachments (one-shot context) are not restored; tool results are re-fed by
+    /// their displayed content so the model keeps the thread.
+    static func chatTurns(from messages: [UIMessage]) -> [ChatTurn] {
+        var turns: [ChatTurn] = []
+        for m in messages {
+            switch m.role {
+            case .user:
+                turns.append(.user(m.text))
+            case .assistant:
+                if m.text.isEmpty && m.toolCalls.isEmpty { continue }
+                turns.append(.assistant(text: m.text, toolCalls: m.toolCalls))
+            case .tool:
+                let content = m.subAgent?.answer ?? m.text
+                turns.append(.toolResult(callId: m.toolCalls.first?.id ?? "", name: "", content: content))
+            case .system:
+                continue
+            }
+        }
+        return turns
     }
 }

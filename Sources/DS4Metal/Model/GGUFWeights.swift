@@ -77,7 +77,41 @@ public enum GGUFWeights {
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optT, small: optT)
+        setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
+    }
+
+    /// Set `w`'s per-layer routed-expert quant from the GGUF tensor types
+    /// (mixed-precision support). MUST be called from EVERY LayerWeights builder
+    /// (`layer`, `layerMappedDense`) so `decodeExperts` dispatches the right kernel:
+    /// it reads `w.*Quant`, not the model-global `DSV4Dims` quant. The exps tensors
+    /// exist in the GGUF even when not loaded as GPUTensors (streaming); unknown or
+    /// missing types keep the `.q4_K` default (matches the global fallback).
+    static func setExpertQuant(_ w: inout LayerWeights, _ model: GGUFModel, _ il: Int) {
+        let p = "blk.\(il)."
+        if let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.gateQuant = g }
+        if let u = model.findTensor(p + "ffn_up_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.upQuant = u }
+        if let dn = model.findTensor(p + "ffn_down_exps.weight").flatMap({ MoEQuant.from(ggufType: $0.type) }) { w.downQuant = dn }
+    }
+
+    /// Number of routed layers whose expert quant differs from the model-global
+    /// class (the first routed layer = `detectMoEQuant`). >0 ⇒ a mixed-precision
+    /// GGUF: those layers decode through the per-layer kernel and bypass the
+    /// (single-size-class) expert slot-cache, reading experts via the mmap gather.
+    public static func mixedPrecisionLayerCount(_ model: GGUFModel, nLayers: Int) -> Int {
+        let cls = detectMoEQuant(model)
+        func q(_ p: String, _ s: String) -> MoEQuant? {
+            model.findTensor(p + s).flatMap { MoEQuant.from(ggufType: $0.type) }
+        }
+        var n = 0
+        for il in 0..<nLayers {
+            let p = "blk.\(il)."
+            guard model.findTensor(p + "ffn_gate_exps.weight") != nil else { continue }   // dense layer
+            if q(p, "ffn_gate_exps.weight") != cls.gate
+                || q(p, "ffn_up_exps.weight") != cls.up
+                || q(p, "ffn_down_exps.weight") != cls.down { n += 1 }
+        }
+        return n
     }
 
     /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
@@ -139,6 +173,7 @@ public enum GGUFWeights {
             compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optM, small: optT)
+        setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
 
@@ -162,6 +197,11 @@ public enum GGUFWeights {
         return try GPUTensor.mappedNoCopy(rt, ptr: ptr, byteLength: Int(t.bytes), elementCount: Int(t.bytes))
     }
 
+    /// DS4_WILLNEED_EXPERTS=0 disables EVERY expert readahead hint (adviseRange /
+    /// adviseExpert / gatherLayerExperts' batched prefetch) — the measurement
+    /// baseline. Default ON: the hints target only actually-selected slabs.
+    static let willNeedExperts = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"
+
     /// Kick off async readahead of an mmap range: page-aligned madvise(WILLNEED).
     /// Advising ALL the slabs of a gather before the first copy lets the NVMe
     /// work on every region concurrently, instead of one page fault at a time.
@@ -177,6 +217,7 @@ public enum GGUFWeights {
     /// adviseRange). Out-of-bounds ids are ignored — this is only a hint.
     public static func adviseExpert(_ model: GGUFModel, _ name: String, id: Int32,
                                     expertBytes: Int) {
+        guard willNeedExperts else { return }
         guard let t = model.findTensor(name), id >= 0,
               (Int(id) + 1) * expertBytes <= Int(t.bytes) else { return }
         adviseRange(model.mapBase + Int(t.absOffset) + Int(id) * expertBytes, expertBytes)
@@ -201,7 +242,9 @@ public enum GGUFWeights {
             throw LoadError.message("gatherExperts: \(name) expert \(e) outside tensor bounds")
         }
         let base = model.mapBase + Int(t.absOffset)
-        for e in ids { adviseRange(base + Int(e) * expertBytes, expertBytes) }
+        if willNeedExperts {
+            for e in ids { adviseRange(base + Int(e) * expertBytes, expertBytes) }
+        }
         let dst = try GPUTensor.uninitializedBytes(rt, byteLength: ids.count * expertBytes,
                                                    elementCount: ids.count * expertBytes)
         let dstBase = dst.buffer.contents()
@@ -209,6 +252,40 @@ public enum GGUFWeights {
             memcpy(dstBase + i * expertBytes, base + Int(ids[i]) * expertBytes, expertBytes)
         }
         return dst
+    }
+
+    /// Byte ranges (offset-from-mapBase, length) of the SELECTED experts' slabs in
+    /// one routed tensor — used to POSIX_MADV_WILLNEED them before the gather copy.
+    static func expertRanges(_ model: GGUFModel, _ name: String, ids: [Int32],
+                             inDim: Int, outRows: Int) -> [(offset: UInt64, bytes: UInt64)] {
+        guard let t = model.findTensor(name), let info = GGUF.typeInfo(t.type), info.blockElems == 256 else { return [] }
+        let expertBytes = UInt64(outRows * (inDim / 256) * Int(info.blockBytes))
+        return ids.map { (offset: UInt64(t.absOffset) + UInt64($0) * expertBytes, bytes: expertBytes) }
+    }
+
+    /// Gather the selected experts (gate/up/down, packed) for layer `il`. With
+    /// `willNeed`, first hint the OS to read the exact slabs we're about to copy
+    /// (POSIX_MADV_WILLNEED) so the cold SSD readahead is front-loaded and batched
+    /// instead of paid as ~one minor fault per page inside the memcpy. The hint
+    /// targets the ACTUALLY-selected experts (non-speculative) — unlike a usage-prior
+    /// prefetch it never reads experts we won't use, and on warm pages it's a cheap
+    /// no-op. Advisory only: cannot change numerics. Opt-in via DS4_WILLNEED_EXPERTS.
+    public static func gatherLayerExperts(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int,
+                                          ids: [Int32], dims: DSV4Dims, willNeed: Bool) throws
+        -> (GPUTensor, GPUTensor, GPUTensor) {
+        let gn = "blk.\(il).ffn_gate_exps.weight"
+        let un = "blk.\(il).ffn_up_exps.weight"
+        let dnn = "blk.\(il).ffn_down_exps.weight"
+        if willNeed {
+            var ranges = expertRanges(model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            ranges += expertRanges(model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+            ranges += expertRanges(model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+            GGUFModel.prefetch(base: model.mapBase, ranges: ranges)
+        }
+        let g = try gatherExperts(rt, model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+        let u = try gatherExperts(rt, model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
+        let dn = try gatherExperts(rt, model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+        return (g, u, dn)
     }
 
     /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
