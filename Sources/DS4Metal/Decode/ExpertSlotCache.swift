@@ -31,7 +31,12 @@ public final class ExpertSlotCache {
     public private(set) var misses = 0
     private var pools: [Int: LayerPool] = [:]
     private var tick: UInt64 = 0
-    private let makePool: () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
+    /// Optional per-layer slot-count override (e.g. the usage-driven allocation:
+    /// same total budget, more slots where the routing concentrates). Consulted
+    /// once per layer at pool creation — so also after every invalidate().
+    /// nil (or a nil provider) = the uniform slotsPerLayer.
+    private let slotsFor: ((_ layer: Int) -> Int)?
+    private let makePool: (_ slots: Int) throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
     /// Copy expert `id` of layer `layer` into pool slot `slot` (all 3 matrices).
     /// MUST be safe to call concurrently for distinct slots (misses are filled
     /// in parallel — each fill writes only its own slot's slabs).
@@ -46,16 +51,24 @@ public final class ExpertSlotCache {
 
     public init(slotsPerLayer: Int,
                 bytesPerExpert: Int = 0,
-                makePool: @escaping () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
+                makePool: @escaping (_ slots: Int) throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
                 fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void,
                 prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
-                warm: ((_ layer: Int) -> [Int32])? = nil) {
+                warm: ((_ layer: Int) -> [Int32])? = nil,
+                slotsFor: ((_ layer: Int) -> Int)? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)   // ≥ k+2 so this tick's ids never starve eviction
         self.bytesPerExpert = bytesPerExpert
         self.makePool = makePool
         self.fill = fill
         self.prefetch = prefetch
         self.warm = warm
+        self.slotsFor = slotsFor
+    }
+
+    /// Slot count for a layer's pool: per-layer override, floored at 8 (≥ k+2,
+    /// so one acquire's ids can never starve the LRU eviction).
+    private func slotCount(_ layer: Int) -> Int {
+        max(8, slotsFor?(layer) ?? slotsPerLayer)
     }
 
     /// Run `fill` for every (id, slot) pair CONCURRENTLY (distinct slots write
@@ -94,15 +107,16 @@ public final class ExpertSlotCache {
     /// evict LRU slots, never a slot already touched by this call.
     public func acquire(layer: Int, ids: [Int32]) throws -> (pool: LayerPool, slots: [Int32]) {
         if pools[layer] == nil {
-            let p = try makePool()
+            let S = slotCount(layer)
+            let p = try makePool(S)
             var fresh = LayerPool(gate: p.gate, up: p.up, down: p.down,
-                                  owner: Array(repeating: -1, count: slotsPerLayer),
-                                  lastUse: Array(repeating: 0, count: slotsPerLayer),
+                                  owner: Array(repeating: -1, count: S),
+                                  lastUse: Array(repeating: 0, count: S),
                                   slotOf: [:])
             // Pre-warm with the historically hottest experts (usage-stats prior):
             // they start as the oldest entries, so a wrong prior is evicted fast.
             if let warm {
-                let warmIds = Array(warm(layer).prefix(slotsPerLayer))
+                let warmIds = Array(warm(layer).prefix(S))
                 try fillAll(layer: layer,
                             pairs: warmIds.enumerated().map { (id: $1, slot: $0) }, pool: fresh)
                 for (s, id) in warmIds.enumerated() {
@@ -135,7 +149,7 @@ public final class ExpertSlotCache {
             // never a slot already touched by this call.
             var victim = -1
             var best = UInt64.max
-            for s in 0..<slotsPerLayer where pool.lastUse[s] != tick {
+            for s in 0..<pool.owner.count where pool.lastUse[s] != tick {
                 if pool.owner[s] < 0 { victim = s; break }
                 if pool.lastUse[s] < best { best = pool.lastUse[s]; victim = s }
             }

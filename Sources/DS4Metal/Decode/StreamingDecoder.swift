@@ -803,10 +803,10 @@ public final class StreamingDecoder {
         var cache: ExpertSlotCache? = nil
         if nSlots > 0 {
             let S = max(8, nSlots)
-            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: {
-                (gate: try GPUTensor.zerosBytes(rt, byteLength: S * gateBytes),
-                 up: try GPUTensor.zerosBytes(rt, byteLength: S * upBytes),
-                 down: try GPUTensor.zerosBytes(rt, byteLength: S * downBytes))
+            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
             }, fill: { il, id, pool, slot in
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
                                            expertBytes: gateBytes, into: pool.gate, slot: slot)
@@ -822,7 +822,17 @@ public final class StreamingDecoder {
                     GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
                     GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
                 }
-            }, warm: { il in usage.top(layer: il, n: S) })
+            }, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
+               slotsFor: { il in
+                // Usage-driven allocation: same total wired budget (S × routed
+                // layers) but more slots where the routing concentrates, fewer
+                // where it's flat. Recomputed at pool creation — i.e. at load
+                // and after every invalidate() (agent switch), when the usage
+                // prior has changed. Falls back to the uniform S until there's
+                // enough history to trust. Opt-out: DS4_EXPERT_CACHE_UNIFORM=1.
+                if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" { return S }
+                return usage.slotAllocation(base: S)?[il] ?? S
+            })
         }
         // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
         // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
