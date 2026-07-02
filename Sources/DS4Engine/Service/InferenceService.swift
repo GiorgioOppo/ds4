@@ -18,11 +18,18 @@ public enum ChatRole: Sendable { case system, user, assistant, tool }
 
 public enum InferenceError: Error, CustomStringConvertible {
     case contextExceeded(prompt: Int, context: Int)
+    case contextMemoryExceeded(context: Int, estimatedBytes: UInt64, budgetBytes: UInt64)
     public var description: String {
         switch self {
         case let .contextExceeded(p, c):
             return "the conversation (\(p) tokens) exceeds the context (\(c)). Start a new chat or increase the context."
+        case let .contextMemoryExceeded(c, estimated, budget):
+            return "the configured context (\(c) tokens) would allocate about \(Self.gib(estimated)) of live KV/compressor memory, above the safe budget of \(Self.gib(budget)). Disk KV only checkpoints completed prefixes; it does not make the live KV cache disk-resident. Reduce the context or enable a smaller model/quantization."
         }
+    }
+
+    private static func gib(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))), countStyle: .memory)
     }
 }
 
@@ -59,6 +66,9 @@ public struct ModelInfo: Sendable {
     public let contextSize: Int
     public let routedQuantBits: Int
     public let kvCacheBytes: UInt64
+    public let rawKVBytes: UInt64
+    public let compressedKVBytes: UInt64
+    public let indexerKVBytes: UInt64
 }
 
 public enum GenEvent: Sendable {
@@ -133,6 +143,14 @@ public actor InferenceService {
         if let s = ProcessInfo.processInfo.environment["DS4_ACTIVE_EXPERTS"], let kk = Int(s) {
             configuredDims.activeExperts = max(1, min(kk, configuredDims.k))
         }
+        let ringOn = Self.rawRingEnabled
+        let estimatedKV = Self.estimatedLiveKVBytes(contextSize: contextSize, dims: configuredDims, rawRing: ringOn)
+        let safeBudget = Self.safeLiveKVBudgetBytes()
+        if estimatedKV > safeBudget {
+            throw InferenceError.contextMemoryExceeded(context: contextSize,
+                                                      estimatedBytes: estimatedKV,
+                                                      budgetBytes: safeBudget)
+        }
         self.dims = configuredDims
         self.contextSize = contextSize
         self.modelName = (modelPath as NSString).lastPathComponent
@@ -155,6 +173,49 @@ public actor InferenceService {
         let subBits: UInt8 = configuredDims.gateQuant == .iq2_xxs ? 2 : 4
         self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: modelName),
                                       budgetMB: 8192, quantBits: subBits, contextSize: contextSize)
+    }
+
+    nonisolated static var rawRingEnabled: Bool {
+        getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? true
+    }
+
+    nonisolated static func safeLiveKVBudgetBytes() -> UInt64 {
+        let ram = ProcessInfo.processInfo.physicalMemory
+        let hardCap = UInt64(24) << 30
+        return min(max(UInt64(2) << 30, ram / 3), hardCap)
+    }
+
+    nonisolated static func estimatedLiveKVBytes(contextSize: Int, dims: DSV4Dims, rawRing: Bool) -> UInt64 {
+        let b = estimatedLiveKVBreakdown(contextSize: contextSize, dims: dims, rawRing: rawRing)
+        return b.raw + b.compressed + b.indexer
+    }
+
+    nonisolated static func estimatedLiveKVBreakdown(contextSize: Int, dims: DSV4Dims, rawRing: Bool) -> (raw: UInt64, compressed: UInt64, indexer: UInt64) {
+        let ctx = UInt64(max(0, contextSize))
+        let headDim = UInt64(dims.headDim)
+        let rawRows = rawRing ? UInt64(min(dims.nSWA, contextSize)) : ctx
+        var rawBytes: UInt64 = 0
+        var compressedBytes: UInt64 = 0
+        var indexerBytes: UInt64 = 0
+        for il in 0..<DSV4Shape.nLayer {
+            rawBytes += rawRows * headDim * 4
+            let ratio = DSV4Shape.compressRatio(layer: il)
+            guard ratio > 0 else { continue }
+            let ratioU = UInt64(ratio)
+            let compRows = ctx / ratioU + 8
+            compressedBytes += compRows * headDim * 4
+            let coff = ratio == 4 ? UInt64(2) : UInt64(1)
+            let width = coff * headDim
+            compressedBytes += 2 * (coff * ratioU * width) * 4
+            if ratio == 4 {
+                let idxDim = UInt64(dims.nIndexerHeadDim)
+                let idxRows = ctx / 4 + 8
+                indexerBytes += idxRows * idxDim * 4
+                let idxWidth = UInt64(2) * idxDim
+                indexerBytes += 2 * (UInt64(2) * 4 * idxWidth) * 4
+            }
+        }
+        return (rawBytes, compressedBytes, indexerBytes)
     }
 
     /// Directory holding the per-file / per-project sub-agent KV caches.
@@ -236,9 +297,12 @@ public actor InferenceService {
     }
 
     public func modelInfo() -> ModelInfo {
+        let kv = estimatedKVBreakdown()
         return ModelInfo(name: modelName, layers: DSV4Shape.nLayer, nEmbd: dims.nEmbd,
                          nVocab: dims.vocab, contextSize: contextSize, routedQuantBits: 4,
-                         kvCacheBytes: estimatedKVCacheBytes())
+                         kvCacheBytes: kv.raw + kv.compressed + kv.indexer,
+                         rawKVBytes: kv.raw, compressedKVBytes: kv.compressed,
+                         indexerKVBytes: kv.indexer)
     }
 
     /// Worst-case (full-context) KV-cache RAM, matching what the decoder actually
@@ -248,21 +312,11 @@ public actor InferenceService {
     /// indexer scale with the context. A static ctx×headDim formula would keep
     /// reporting the huge number even with the ring on.
     private func estimatedKVCacheBytes() -> UInt64 {
-        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false
-        let headDim = UInt64(dims.headDim)
-        let ctx = UInt64(contextSize)
-        let rawRows = ringOn ? UInt64(min(dims.nSWA, contextSize)) : ctx
-        var bytes: UInt64 = 0
-        for il in 0..<DSV4Shape.nLayer {
-            bytes += rawRows * headDim * 4                                  // raw cache (every layer)
-            let ratio = DSV4Shape.compressRatio(layer: il)
-            guard ratio > 0 else { continue }
-            bytes += (ctx / UInt64(ratio)) * headDim * 4                   // NSA compressor cache
-            if ratio == 4 {
-                bytes += (ctx / 4) * UInt64(dims.nIndexerHeadDim) * 4       // indexer compressor (ratio-4 only)
-            }
-        }
-        return bytes
+        Self.estimatedLiveKVBytes(contextSize: contextSize, dims: dims, rawRing: Self.rawRingEnabled)
+    }
+
+    private func estimatedKVBreakdown() -> (raw: UInt64, compressed: UInt64, indexer: UInt64) {
+        Self.estimatedLiveKVBreakdown(contextSize: contextSize, dims: dims, rawRing: Self.rawRingEnabled)
     }
 
     /// The raw Jinja chat template embedded in the GGUF (for inspection), if any.
@@ -773,13 +827,26 @@ public actor InferenceService {
         // Disk KV checkpoint (interval-gated: each entry is tens of MB).
         if let store = diskKV,
            committedIds.count - lastDiskStoreCount >= store.options.storeIntervalTokens {
-            continuation.yield(.progress("salvataggio KV su disco…"))
-            // First checkpoint of a conversation = "cold" (anchor: the shared
-            // system/agent prefix, 2× protected in eviction); later = "continued"
-            // (superseded under pressure by longer checkpoints of the same chat).
-            let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
-            store.store(tokens: committedIds, modelName: modelName,
-                        snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
+            let estimatedSnapshot = Self.estimatedLiveKVBytes(contextSize: committedIds.count,
+                                                              dims: dims,
+                                                              rawRing: Self.rawRingEnabled)
+            // Exporting a checkpoint duplicates the live KV into Swift arrays, and
+            // DiskKVStore.store then serializes it to Data. If the entry cannot fit
+            // the disk budget, or the temporary copy itself is too large, skip it
+            // instead of driving macOS into swap just to return false later.
+            let safeTemporary = Self.safeLiveKVBudgetBytes() / 3
+            if store.canStore(estimatedBytes: estimatedSnapshot),
+               estimatedSnapshot <= safeTemporary {
+                continuation.yield(.progress("salvataggio KV su disco…"))
+                // First checkpoint of a conversation = "cold" (anchor: the shared
+                // system/agent prefix, 2× protected in eviction); later = "continued"
+                // (superseded under pressure by longer checkpoints of the same chat).
+                let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
+                store.store(tokens: committedIds, modelName: modelName,
+                            snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
+            } else {
+                continuation.yield(.progress("checkpoint KV saltato: troppo grande per il budget memoria/disco"))
+            }
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))

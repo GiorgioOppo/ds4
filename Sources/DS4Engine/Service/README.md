@@ -8,9 +8,10 @@ Inference service and persistence.
   runs benchmarks; switches agent profiles and usage imatrices; and runs
   **sub-agents** through `runSubAgent`, snapshotting/restoring the main KV around
   an isolated context.
-- **`DiskKVStore.swift`** implements disk-backed KV cache in the `ds4_kvstore`
-  style: prefix checkpoints, cold restore, and budget-aware eviction. It is also
-  used for content-keyed sub-agent KV caches.
+- **`DiskKVStore.swift`** implements disk-backed KV checkpoints in the
+  `ds4_kvstore` style: prefix checkpoints, cold restore, and budget-aware
+  eviction. It does not replace the live KV/compressor buffers used during
+  prefill/decode. It is also used for content-keyed sub-agent KV caches.
 - **`Diagnostics.swift`** dumps tokens and chat-template rendering through the
   native tokenizer, without subprocesses.
 

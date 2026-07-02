@@ -30,7 +30,10 @@ struct ChatView: View {
                 Text(store.info?.name ?? "DeepSeek V4")
                     .font(.headline)
                 if let info = store.info {
-                    Text("\(info.layers) layer · \(info.routedQuantBits)-bit · ctx \(info.contextSize) · KV ~\(kvSize(info.kvCacheBytes))")
+                    Text("\(info.layers) layer · \(info.routedQuantBits)-bit · ctx \(info.contextSize) · KV \(kvSize(info.kvCacheBytes))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("raw \(kvSize(info.rawKVBytes)) · comp \(kvSize(info.compressedKVBytes)) · idx \(kvSize(info.indexerKVBytes))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

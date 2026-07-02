@@ -80,7 +80,7 @@ intentional exceptions.
 
 | Variable | Values | Default | Effect |
 |---|---|---|---|
-| `DS4_RAW_RING` | `=1` | off | Stores raw KV in an `nSWA` ring instead of the whole context. Sliding-window attention reads only the latest 128 rows, so this makes raw-KV memory constant. It does not eliminate every compressed KV cache. |
+| `DS4_RAW_RING` | `0`/`1` | on | Stores raw KV in an `nSWA` ring instead of the whole context. Sliding-window attention reads only the latest 128 rows, so this makes raw-KV memory constant. It does not eliminate every compressed KV cache. Set `0` for the legacy full raw cache when debugging. |
 | `DS4_PREFILL_UNION` | integer | `64` | Maximum number of experts grouped together in layer-major prefill I/O. Higher values reduce I/O rounds but use more temporary memory; lower values reduce peak memory but may slow prefill. Never below `k` (6). |
 | `DS4_EXPERT_CACHE_SLOTS` | integer | `0` (off) | Enables a per-layer LRU GPU cache for MoE experts. Each slot costs about 6.9 MB wired per layer on the 2-bit model. `8` is the effective minimum when enabled. If hit-rate rises, SSD gather drops; if RAM pressure rises, performance may worsen. |
 | `DS4_EXPERT_CACHE_UNIFORM` | `=1` | off | Disables usage-driven slot redistribution. By default, layers with concentrated routing receive more slots at the same total budget. Use this for A/B comparisons. |

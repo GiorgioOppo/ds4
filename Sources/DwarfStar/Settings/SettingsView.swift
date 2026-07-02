@@ -88,11 +88,11 @@ struct SettingsView: View {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",
                             value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
                 }
-                Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
+                Toggle("Raw-KV ring: constant raw-KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {
-                    Label("Keeps only the attention window (128 rows) in RAM instead of the full context. Experimental: verify outputs after a long context.",
-                          systemImage: "flask")
-                        .font(.caption).foregroundStyle(.orange)
+                    Label("Keeps only the attention window (128 rows) in RAM instead of the full raw context. Compressed KV still grows with context length.",
+                          systemImage: "memorychip")
+                        .font(.caption).foregroundStyle(.tertiary)
                 }
                 Text("Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)

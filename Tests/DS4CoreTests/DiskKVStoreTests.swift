@@ -35,6 +35,31 @@ final class DiskKVStoreTests: XCTestCase {
         return KVSnapshot(nKeys: nKeys, headDim: headDim, layers: ls)
     }
 
+    func testLiveKVEstimateScalesWithContextAndRawRing() {
+        let dims = DSV4Shape.dims
+        let small = InferenceService.estimatedLiveKVBytes(contextSize: 4096, dims: dims, rawRing: true)
+        let longRing = InferenceService.estimatedLiveKVBytes(contextSize: 1_000_000, dims: dims, rawRing: true)
+        let longFullRaw = InferenceService.estimatedLiveKVBytes(contextSize: 1_000_000, dims: dims, rawRing: false)
+        XCTAssertGreaterThan(longRing, small)
+        XCTAssertGreaterThan(longFullRaw, longRing)
+    }
+
+    func testLiveKVBreakdownSumsToTotal() {
+        let dims = DSV4Shape.dims
+        let b = InferenceService.estimatedLiveKVBreakdown(contextSize: 32768, dims: dims, rawRing: true)
+        XCTAssertGreaterThan(b.raw, 0)
+        XCTAssertGreaterThan(b.compressed, 0)
+        XCTAssertGreaterThan(b.indexer, 0)
+        XCTAssertEqual(b.raw + b.compressed + b.indexer,
+                       InferenceService.estimatedLiveKVBytes(contextSize: 32768, dims: dims, rawRing: true))
+    }
+
+    func testDiskKVCanStoreUsesBudgetBeforeExport() throws {
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2, contextSize: 8192)
+        XCTAssertTrue(store.canStore(estimatedBytes: 63 * 1_048_576))
+        XCTAssertFalse(store.canStore(estimatedBytes: 65 * 1_048_576))
+    }
+
     func testStoreAndFindLongestPrefix() throws {
         let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2, contextSize: 8192,
                                     options: { var o = DiskKVStore.Options(); o.minTokens = 4; return o }())

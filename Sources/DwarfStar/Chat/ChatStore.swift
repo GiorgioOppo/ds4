@@ -116,7 +116,7 @@ final class ChatStore {
     /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
     /// instead of the full context, so the KV RAM is constant. Sets the engine env
     /// var; applied on the NEXT model load.
-    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? false {
+    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
             _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
