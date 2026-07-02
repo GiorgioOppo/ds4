@@ -81,8 +81,10 @@ enum GitTool {
         do { try proc.run() } catch {
             return "git non eseguibile: \(error.localizedDescription) (servono i Command Line Tools)."
         }
-        // Read concurrently (a full pipe would deadlock waitUntilExit).
-        var data = Data()
+        // Read concurrently (a full pipe would deadlock waitUntilExit). Only the
+        // reader thread mutates `data`; the main thread reads it after the process
+        // has exited (and a short drain), so the access is serialized in practice.
+        nonisolated(unsafe) var data = Data()
         let reader = Thread {
             while let chunk = try? pipe.fileHandleForReading.read(upToCount: 64 * 1024), !chunk.isEmpty {
                 data.append(chunk)

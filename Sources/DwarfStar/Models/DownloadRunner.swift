@@ -15,6 +15,9 @@ final class DownloadRunner {
 
     private var task: Task<Void, Never>?
 
+    /// Download events multiplexed onto one stream: byte progress + phase messages.
+    private enum DLEvent: Sendable { case progress(Int64, Int64); case status(String) }
+
     func run(target: String, scriptDir: String) {
         guard !isRunning else { return }
         guard let t = ModelDownloader.target(target) else {
@@ -28,21 +31,29 @@ final class DownloadRunner {
         progressText = ""
 
         // Task inherits @MainActor (DownloadRunner is @MainActor), so we consume
-        // progress and update state directly here; the download runs in an async
+        // events and update state directly here; the download runs in an async
         // let child that captures only Sendable values (target, dir, continuation).
         task = Task {
-            let (stream, cont) = AsyncStream<(Int64, Int64)>.makeStream()
+            let (stream, cont) = AsyncStream<DLEvent>.makeStream()
             async let dl: String = {
-                let url = try await ModelDownloader.download(target: t, ggufDir: ggufDir) { done, total in
-                    cont.yield((done, total))
-                }
+                let url = try await ModelDownloader.download(
+                    target: t, ggufDir: ggufDir,
+                    onProgress: { done, total in cont.yield(.progress(done, total)) },
+                    onStatus: { msg in cont.yield(.status(msg)) })
                 cont.finish()
                 return url.path
             }()
 
-            for await (done, total) in stream where total > 0 {
-                progress = Double(done) / Double(total)
-                progressText = String(format: "%.1f / %.1f GB", Double(done) / 1e9, Double(total) / 1e9)
+            for await ev in stream {
+                switch ev {
+                case .progress(let done, let total) where total > 0:
+                    progress = Double(done) / Double(total)
+                    progressText = String(format: "%.1f / %.1f GB", Double(done) / 1e9, Double(total) / 1e9)
+                case .progress:
+                    break
+                case .status(let msg):
+                    log += msg + "\n"
+                }
             }
 
             do {

@@ -5,6 +5,7 @@ import DS4Core
 struct ChatView: View {
     @Bindable var store: ChatStore
     @State private var showTools = false
+    @State private var showChats = false
     @State private var projects: [ProjectLibrary.SavedProject] = []
     @State private var activeProjectName: String?
 
@@ -54,6 +55,15 @@ struct ChatView: View {
             Toggle("Thinking", isOn: $store.think)
                 .toggleStyle(.switch)
             Button {
+                showChats = true
+            } label: {
+                Label("Chat", systemImage: "bubble.left.and.bubble.right")
+            }
+            .popover(isPresented: $showChats, arrowEdge: .bottom) {
+                ChatListView(store: store)
+            }
+            .help("Apri, rinomina o elimina le conversazioni salvate")
+            Button {
                 store.newChat()
             } label: {
                 Label("Nuova chat", systemImage: "square.and.pencil")
@@ -72,9 +82,10 @@ struct ChatView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Slider(value: $store.temperature, in: 0...1.5, step: 0.05)
                     .frame(width: 220)
-                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo.")
+                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo. 0 = greedy (deterministico, come la demo).")
                     .font(.caption2).foregroundStyle(.secondary)
                 HStack {
+                    Button("Greedy (0)") { store.temperature = 0 }
                     Button("Preciso (0.3)") { store.temperature = 0.3 }
                     Button("Default (0.6)") { store.temperature = 0.6 }
                 }
@@ -167,7 +178,7 @@ struct ChatView: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
         if store.isGenerating && !store.status.isEmpty {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)
@@ -176,7 +187,38 @@ struct ChatView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        if !store.attachments.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(store.attachments) { att in
+                        AttachmentChip(name: att.name, bytes: att.bytes) {
+                            store.removeAttachment(att.id)
+                        }
+                    }
+                }
+            }
+        }
+        if let note = store.attachmentNote {
+            Label(note, systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.orange)
+        }
+        if let est = store.attachmentTokenEstimate, est > store.contextSize - 256 {
+            Label("Allegati ~\(est) token: rischiano di superare il contesto (\(store.contextSize)). Riduci i file o aumenta il contesto in Impostazioni.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.orange)
+        }
+        if store.contextUsed > 0, store.contextUsed * 100 >= store.contextSize * 85 {
+            Label("Contesto quasi pieno: \(store.contextUsed)/\(store.contextSize) token. A breve la risposta verrà troncata: inizia una nuova chat o aumenta il contesto (Impostazioni).",
+                  systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2).foregroundStyle(.orange)
+        }
         HStack(alignment: .bottom, spacing: 8) {
+            Button { store.pickAndAttachFiles() } label: {
+                Image(systemName: "paperclip")
+            }
+            .buttonStyle(.borderless)
+            .help("Importa file di testo nella conversazione")
+            .disabled(store.isGenerating)
             TextField("Scrivi un messaggio…", text: $store.input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...6)
@@ -189,7 +231,8 @@ struct ChatView: View {
                 Button { store.send() } label: {
                     Image(systemName: "arrow.up.circle.fill")
                 }
-                .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          && store.attachments.isEmpty)
             }
         }
         }
@@ -198,12 +241,60 @@ struct ChatView: View {
     }
 }
 
+/// A staged text-file attachment shown above the composer, with a remove button.
+struct AttachmentChip: View {
+    let name: String
+    let bytes: Int
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text").font(.caption2)
+            Text(name).font(.caption).lineLimit(1)
+            Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                .font(.caption2).foregroundStyle(.secondary)
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Rimuovi allegato")
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+    }
+}
+
+/// Filename badges shown under a user message that imported text files.
+struct AttachmentBadges: View {
+    let names: [String]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(names, id: \.self) { name in
+                    Label(name, systemImage: "doc.text")
+                        .font(.caption2).lineLimit(1)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+            }
+        }
+    }
+}
+
 struct MessageRow: View {
     let message: UIMessage
 
     var body: some View {
         if message.role == .tool {
-            ToolResultRow(text: message.text)
+            if let run = message.subAgent {
+                SubAgentView(run: run)
+            } else {
+                ToolResultRow(text: message.text)
+            }
         } else {
             HStack {
                 if message.role == .user { Spacer(minLength: 40) }
@@ -225,6 +316,9 @@ struct MessageRow: View {
                     } else if message.role == .assistant && message.reasoning.isEmpty
                                 && message.toolCalls.isEmpty && message.toolStreamText.isEmpty {
                         ProgressView().controlSize(.small)
+                    }
+                    if !message.attachments.isEmpty {
+                        AttachmentBadges(names: message.attachments)
                     }
                     if !message.toolStreamText.isEmpty {
                         ToolStreamView(text: message.toolStreamText)
@@ -425,6 +519,45 @@ struct ToolCallView: View {
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// A completed isolated sub-agent run: target + answer, with a collapsible trace
+/// of the internal steps (which never entered the main conversation's context).
+struct SubAgentView: View {
+    let run: InferenceService.SubAgentRun
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Sub-agent · \(run.target)", systemImage: "person.3.sequence")
+                .font(.caption.bold()).foregroundStyle(.purple)
+            if !run.question.isEmpty {
+                Text(run.question).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Text(run.answer).font(.callout).textSelection(.enabled)
+            if !run.steps.isEmpty {
+                DisclosureGroup(isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(run.steps.enumerated()), id: \.offset) { _, step in
+                            Text(step)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                } label: {
+                    Label("Passi interni (\(run.steps.count))", systemImage: "list.bullet.indent")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.purple.opacity(0.07))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.purple.opacity(0.25)))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }

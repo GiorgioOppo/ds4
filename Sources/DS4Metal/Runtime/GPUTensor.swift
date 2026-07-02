@@ -52,6 +52,21 @@ public final class GPUTensor {
         return GPUTensor(buffer: b, byteLength: floatCount * 4, count: floatCount)
     }
 
+    /// Allocate `floatCount` F32 elements WITHOUT the memset, so the pages stay
+    /// zero-fill-on-demand: a buffer sized to the full context costs physical RAM
+    /// proportional to what is actually written, not to its capacity. Use ONLY
+    /// for buffers whose not-yet-written region is never read (e.g. the NSA
+    /// compressor cache, read only over [0..count]); initial contents are
+    /// undefined. This is how a 1M-context model avoids committing ~13 GB of
+    /// compressor caches up front when the conversation is short.
+    public static func lazyZeros(_ rt: MetalRuntime, floatCount: Int) throws -> GPUTensor {
+        let len = max(1, floatCount) * 4
+        guard let b = rt.device.makeBuffer(length: len, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        return GPUTensor(buffer: b, byteLength: floatCount * 4, count: floatCount)
+    }
+
     /// Allocate a zeroed raw byte buffer (e.g. F16 scratch, mask, tmp).
     public static func zerosBytes(_ rt: MetalRuntime, byteLength: Int) throws -> GPUTensor {
         let len = max(1, byteLength)
@@ -60,6 +75,17 @@ public final class GPUTensor {
         }
         memset(b.contents(), 0, len)
         return GPUTensor(buffer: b, byteLength: byteLength, count: byteLength)
+    }
+
+    /// Allocate an UNINITIALIZED raw byte buffer. Only for destinations the
+    /// caller overwrites entirely before any read (e.g. the expert-gather pack
+    /// target) — skips the memset of zerosBytes on multi-MB buffers.
+    public static func uninitializedBytes(_ rt: MetalRuntime, byteLength: Int, elementCount: Int) throws -> GPUTensor {
+        let len = max(1, byteLength)
+        guard let b = rt.device.makeBuffer(length: len, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        return GPUTensor(buffer: b, byteLength: byteLength, count: elementCount)
     }
 
     /// Upload an F32 array.

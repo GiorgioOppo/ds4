@@ -13,6 +13,30 @@ public final class GraphContext {
     private var cb: MTLCommandBuffer?
     private var enc: MTLComputeCommandEncoder?
 
+    /// Profiling (DS4_PROFILE_ROUTE): set to `[:]` to time sub-phases. `phase(name)`
+    /// then flushes the buffer and accumulates the wall-clock under `name`. nil = off.
+    public var phaseTimes: [String: Double]?
+    private var phaseStart = Date()
+
+    /// DS4_Q8_NSG: simdgroups-per-threadgroup for the dense Q8_0 matvec (and the
+    /// grouped attn-output low-rank matvec, which shares the same K-split kernel).
+    /// Default 4 — exactly the reference `ds4_gpu_make_q8_0_mv_dispatch()` config.
+    ///
+    /// This is a *pure work-partition* lever, not a math change: the kernel splits the
+    /// reduction (K) dimension across NSG simdgroups and `helper_mv_reduce_and_write`
+    /// sums across exactly NSG of them; the threadgroup-memory size (NW*NR0*4) and the
+    /// grid width ((outDim+NR0-1)/NR0) are both independent of NSG. So any value in
+    /// 1...8 produces identical results — only occupancy / DRAM-latency hiding changes.
+    /// Exposed because the optimal NSG is hardware-specific (M1 Pro vs M2/M3) and can
+    /// only be found by sweeping on-device; we can't benchmark here. Read once.
+    static let q8NSG: Int16 = {
+        if let v = ProcessInfo.processInfo.environment["DS4_Q8_NSG"].flatMap(Int.init),
+           v >= 1, v <= 8 {
+            return Int16(v)
+        }
+        return 4
+    }()
+
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
     public func begin() throws {
@@ -20,6 +44,22 @@ public final class GraphContext {
             throw MetalError.bufferAlloc
         }
         cb = c; enc = e
+        phaseStart = Date()
+    }
+
+    /// Mark the end of a named sub-phase: when `phaseTimes` is enabled, commit+wait,
+    /// record the elapsed (CPU-encode + GPU-exec) time under `name`, and start a
+    /// fresh command buffer. A no-op when profiling is off. MUST be called outside
+    /// any pushDebugGroup/popDebugGroup pair (it breaks the command buffer).
+    public func phase(_ name: String) throws {
+        guard phaseTimes != nil else { return }
+        enc?.endEncoding(); cb?.commit(); cb?.waitUntilCompleted()
+        phaseTimes![name, default: 0] += Date().timeIntervalSince(phaseStart)
+        guard let c = rt.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+        cb = c; enc = e
+        phaseStart = Date()
     }
 
     /// Flush: end encoding, commit, wait. After this the GPUTensor outputs are readable.
@@ -28,6 +68,22 @@ public final class GraphContext {
         cb?.commit()
         cb?.waitUntilCompleted()
         enc = nil; cb = nil
+    }
+
+    /// End encoding and commit WITHOUT waiting — pair with waitCompleted().
+    /// Lets CPU work (e.g. the expert-gather SSD I/O) overlap the GPU execution.
+    /// No further encodes are allowed on this context after this call.
+    public func commitAsync() {
+        enc?.endEncoding()
+        cb?.commit()
+        enc = nil
+    }
+
+    /// Wait for a commitAsync()'d command buffer; outputs are readable after this.
+    /// Safe to call more than once (idempotent).
+    public func waitCompleted() {
+        cb?.waitUntilCompleted()
+        cb = nil
     }
 
     var encoder: MTLComputeCommandEncoder { enc! }
@@ -102,7 +158,7 @@ public final class GraphContext {
     public func matmulQ8_0(weight: GPUTensor, x: GPUTensor, out: GPUTensor,
                            inDim: Int, outDim: Int) throws {
         precondition(inDim % 32 == 0)
-        let nsg: Int16 = 4, nr0 = 2
+        let nsg = GraphContext.q8NSG, nr0 = 2   // nsg tunable via DS4_Q8_NSG (default 4 = reference)
         let rowBytes = (inDim / 32) * 34
         let args = MetalRuntime.mulMVArgs(ne00: inDim, ne01: outDim, nb00: 34, nb01: UInt64(rowBytes),
                                           nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 1,

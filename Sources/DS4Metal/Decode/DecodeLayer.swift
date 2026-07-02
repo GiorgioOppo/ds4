@@ -107,6 +107,13 @@ public struct LayerWeights {
     public var idxGate: GPUTensor?        // F16 indexer_compressor_gate [nEmbd x coff*128]
     public var idxApe: GPUTensor?         // F16 indexer_compressor_ape  [coff*128 x ratio]
     public var idxNorm: GPUTensor?        // F32 indexer_compressor_norm [128]
+    // Routed-expert quant PER LAYER. Mixed-precision GGUFs upcast some layers
+    // (e.g. a few to Q4_K over an IQ2_XXS/Q2_K base via --tensor-type); the decode
+    // kernels dispatch on THESE, not on the model-global DSV4Dims quant. Detected
+    // from the actual tensor types in GGUFWeights.layer; default = the common Q4_K.
+    public var gateQuant: MoEQuant = .q4_K
+    public var upQuant: MoEQuant = .q4_K
+    public var downQuant: MoEQuant = .q4_K
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -235,7 +242,9 @@ extension GraphContext {
                                          comp: idx, rope: rope, pos: pos, rmsEps: rmsEps,
                                          nRot: d.nRot, finalize: .indexerQat)
         }
+        try phase("comp")                             // DS4_PROFILE_ROUTE boundary (hc-pre + compressor)
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
+        encoder.pushDebugGroup("q-proj")              // Instruments: name the GPU phase
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
         try matmulQ8_0(weight: w.qB, x: s.qrNorm, out: s.q, inDim: d.qRank, outDim: d.qDim)
@@ -243,13 +252,18 @@ extension GraphContext {
         try ropeTail(x: s.q, nTok: 1, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
+        encoder.popDebugGroup()                       // q-proj
+        try phase("q")                                // DS4_PROFILE_ROUTE boundary (q proj)
         // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
+        encoder.pushDebugGroup("kv-proj")
         try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
         try rmsNorm(s.kvRaw, weight: w.kvNorm, out: s.kv, rows: 1, n: d.headDim, eps: rmsEps)
         try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
                      attnFactor: rope.attnFactor, betaFast: rope.betaFast, betaSlow: rope.betaSlow, pos0: pos, posStep: 1)
-        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot, rawRow: pos)
+        try kvFP8Store(kv: s.kv, rawCache: rawCache, headDim: d.headDim, nRot: d.nRot,
+                       rawRow: pos % (rawCache.count / d.headDim))   // ring slot (= pos with the full cache)
+        encoder.popDebugGroup()                       // kv-proj
         // 3.5) Indexer scoring (only when the comp rows exceed the top-K): the
         // indexer query comes from qr_norm via indexer.attn_q_b (+rope+Hadamard),
         // the head weights from attn_norm via indexer.proj. C: indexer_allowed_decode_one.
@@ -286,10 +300,14 @@ extension GraphContext {
         //    the model and degrades long generations. Rows carry their absolute
         //    RoPE position, so dropping the oldest is exactly the C semantics.
         let rawLo = max(0, nKeys - d.nSWA)
+        encoder.pushDebugGroup("attention")
         try flashAttnCore(q: s.q, kvF32: rawCache, kvF16: s.kvF16, mask: s.mask, sinks: w.attnSinks,
                           pad: s.pad, tmp: s.tmp, heads: s.heads, nHead: d.nHead, nKeys: nKeys - rawLo,
                           rawStartRow: rawLo, hasSinks: true,
                           comp: comp?.cache, nComp: nComp)
+        encoder.popDebugGroup()                       // attention
+        try phase("attn")                             // DS4_PROFILE_ROUTE boundary (flash-attn)
+        encoder.pushDebugGroup("attn-out")
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
         //    hcExpand4(blockOut, curHc, post=split[4:8], comb=split[8:24]) = afterAttn.
@@ -303,6 +321,8 @@ extension GraphContext {
         try hcExpand4(blockOut: s.blockOut, residual: curHc, post: s.split, comb: s.split,
                       blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+        encoder.popDebugGroup()                       // attn-out
+        encoder.pushDebugGroup("hc-router")
         // 6) HC-reduce pre-FFN (on afterAttn)
         try hcReduce(curHc: s.afterAttn, mixerFn: w.hcFfnFn, scale: w.ffnScale, base: w.ffnBase,
                      norm: w.ffnNorm, s: s, d: d, eps: rmsEps)
@@ -317,6 +337,7 @@ extension GraphContext {
         try unary(s.sp, op: .sqrt, out: s.probs, width: d.nExperts)
         try routerFinalizeTop6(probs: s.probs, selected: s.selected)
         try routerWeights(probs: s.probs, selected: s.selected, weights: s.rw)
+        encoder.popDebugGroup()                       // hc-router
     }
 
     /// Phase 2: shared FFN + routed MoE (over `gateExp`/`upExp`/`downExp` indexed
@@ -333,38 +354,63 @@ extension GraphContext {
                               ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                               cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
                               split: GPUTensor? = nil) throws {
-        let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
+        try decodeSharedFFN(w: w, s: s, d: d, cur: cur)
+        try decodeRoutedExperts(w: w, s: s, d: d, gateExp: gateExp, upExp: upExp,
+                                downExp: downExp, ids: ids, outHc: outHc, activeK: activeK,
+                                cur: cur, afterAttn: afterAttn, split: split)
+    }
+
+    /// The shared-expert FFN half of decodeExperts (gate/up -> swiglu -> down into
+    /// s.sharedOut). It does NOT depend on the routing selection, so the streaming
+    /// decode path commits it asynchronously and the GPU runs it WHILE the CPU
+    /// gathers the routed experts from the SSD (I/O/compute overlap). Same
+    /// dispatches in the same order as the fused sequence — identical numerics.
+    public func decodeSharedFFN(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                cur: GPUTensor? = nil) throws {
         let x = cur ?? s.cur
-        let resid = afterAttn ?? s.afterAttn
-        let sp = split ?? s.split
         // shared FFN: gate/up -> swiglu -> down
         try matmulQ8_0(weight: w.sharedGate, x: x, out: s.sgate, inDim: d.nEmbd, outDim: d.sharedFfn)
         try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
         try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
-        // routed MoE over the provided experts (per-tensor quant: gate/up + down).
-        // Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when the
-        // quant scheme has the kernels; otherwise the validated 5-dispatch path.
-        let pairFused = d.fusedMoE && d.gateQuant == d.upQuant
-            && (d.gateQuant == .iq2_xxs || d.gateQuant == .q4_K)
+    }
+
+    /// The routed-MoE half of decodeExperts: matvec over the provided experts, add
+    /// of s.sharedOut (which MUST already be encoded — decodeSharedFFN, either on
+    /// this command buffer or on one already committed) and the HC expand -> outHc.
+    public func decodeRoutedExperts(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                    gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
+                                    ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
+                                    cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
+                                    split: GPUTensor? = nil) throws {
+        let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
+        let x = cur ?? s.cur
+        let resid = afterAttn ?? s.afterAttn
+        let sp = split ?? s.split
+        // routed MoE over the provided experts, dispatched on the PER-LAYER quant
+        // (w.*Quant) — so a mixed-precision GGUF's boosted layer uses the right
+        // kernel. Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when
+        // the quant scheme has the kernels; otherwise the validated 5-dispatch path.
+        let pairFused = d.fusedMoE && w.gateQuant == w.upQuant
+            && (w.gateQuant == .iq2_xxs || w.gateQuant == .q4_K)
         if pairFused {
-            try moePairSwiGLU(d.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
+            try moePairSwiGLU(w.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
                               activation: x, weights: s.rw, gateScratch: s.gate6,
                               upScratch: s.up6, mid: s.mid6,
                               k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
         } else {
-            try moeMatvecID(d.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeMatvecID(d.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
             try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
         }
         // down_sum6 hardcodes 6 expert slots: usable only at full k.
         let sumFused = d.fusedMoE && kk == 6
-            && (d.downQuant == .q2_K || d.downQuant == .q4_K)
+            && (w.downQuant == .q2_K || w.downQuant == .q4_K)
         if sumFused {
-            try moeDownSum6(d.downQuant, experts: downExp, ids: ids, mid: s.mid6,
+            try moeDownSum6(w.downQuant, experts: downExp, ids: ids, mid: s.mid6,
                             out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd)
         } else {
-            try moeMatvecID(d.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
             try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
         }
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)

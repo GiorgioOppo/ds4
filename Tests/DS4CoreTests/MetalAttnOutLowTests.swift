@@ -32,7 +32,6 @@ final class MetalAttnOutLowTests: XCTestCase {
         func rf() -> Float { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Float(Int32(truncatingIfNeeded: seed >> 33)) / Float(1 << 30) }
 
         let nGroups = 4, groupDim = 512, rank = 128
-        let rowABytes = (groupDim / 32) * 34
         // weights: nGroups groups of (rank x groupDim) -> Q8
         var wF = [[[Float]]](repeating: [[Float]](repeating: [Float](repeating: 0, count: groupDim), count: rank), count: nGroups)
         var outA: [UInt8] = []

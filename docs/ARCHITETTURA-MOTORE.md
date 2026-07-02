@@ -610,6 +610,25 @@ ospitare `maxKeys` righe raw + fino a `maxKeys/4` righe compresse (il ratio-4 è
 il più denso). All'inizio di ogni sequenza (`pos == 0`) resetta tutti gli stati
 compressore.
 
+### Knob di streaming opt-in (default OFF)
+
+- **Raw-KV ring** (`DS4_RAW_RING`, anche via toggle in Impostazioni): la raw cache
+  `rawCaches[i]` passa da `maxKeys` righe a un **ring di `nSWA`** (l'attenzione vede
+  solo l'ultima finestra SWA) → RAM della raw cache **costante** (da O(contesto) a
+  ~11 MB). Implementato in modo trasparente: il modulo è implicito in
+  `rawCache.count/headDim`, la scrittura va in `pos % nSWA`, lo staging
+  dell'attenzione **de-ruota** il ring in ordine cronologico (kernel flash
+  invariato), ed `exportKV`/`importKV` de-ruotano/ri-ruotano; con la cache piena
+  (default) non c'è mai wrap → identico bit-a-bit. **Riallinea il port
+  all'upstream**: `ds4.c`/`ds4_metal.m` usano già una finestra scorrevole
+  (`raw_cap = n_swa`, scrittura `% raw_cap`, `raw_start` nell'attenzione). Le
+  **righe compresse** restano ∝ contesto (candidate a un offload su disco).
+- **Prefetch** (`DS4_PREFETCH`, +`DS4_PREFETCH_EXPERTS`): durante il calcolo del
+  layer `i` si fa `madvise(WILLNEED)` sulle pagine mmap del layer `i+1` (pesi
+  non-routed + esperti probabili dalla usage imatrix), su una coda di background →
+  l'I/O da SSD si sovrappone al compute. Hint-only su mapping read-only: non può
+  alterare i numeri.
+
 ---
 
 ## 11. Decoder — dai logit al token (`Sampler`)
@@ -760,17 +779,40 @@ Il servizio mantiene `turns` (conversazione) e `tools`. Ogni generazione:
 `provideToolResults(_:)` accoda i `toolResult` e rilancia la generazione: il
 modello vede gli output e produce la risposta finale o altre chiamate.
 
-### Registry e tool demo
+### Registry e tool
 
-`ToolRegistry` (DS4Engine) espone i built-in auto-eseguibili — **`now`** (data/ora
-ISO-8601), **`calculator`** (aritmetica sicura tramite un valutatore a discesa
-ricorsiva, niente `NSExpression`) e i tre tool a due operandi **`add` /
-`subtract` / `multiply`** (costruiti da `binaryTool`, accettano numeri o stringhe
-numeriche) — e `execute(_:)` che restituisce un `ToolOutput` oppure `nil` per i
-tool non integrati (risultato manuale dalla UI).
+`ToolRegistry` (DS4Engine, `Tools/`) raccoglie i built-in auto-eseguibili —
+**uno per file** in `Tools/Builtins/` (ognuno è una `extension ToolRegistry {
+static let X }`); il core `ToolRegistry.swift` tiene la superficie del registry
+(`builtins`, `projectScoped`, `subAgentGrantable`, `execute`, `specs`) e gli
+helper condivisi (parsing argomenti, `binaryTool`, valutatore aritmetico).
+`execute(_:)` restituisce un `ToolOutput` oppure `nil` per i tool non integrati
+(risultato manuale dalla UI). Gruppi: aritmetica (`now`, `calculator`,
+`add/subtract/multiply`), progetto (`project_list/read/search/write/edit`), file
+grezzi (`file_read/lines/write/add/modify`, anche per intervallo di righe), `git`,
+e sub-agenti (`agents_list`, `subagent_search`, `subagent_run`). `projectScoped`
+marca i tool che richiedono un progetto; `subAgentGrantable` quelli concedibili a
+un sub-agent (esclusi i `subagent_*` e `agents_list` → niente sub-agent annidati).
 
-I percorsi puri (renderer, parser, tool demo) sono coperti da test Swift-only:
-`ChatToolsTests`, `ToolRegistryTests`.
+### Sub-agenti — context-switch sul decoder
+
+`subagent_run` è **gestito dall'engine**: `ChatStore` lo intercetta e chiama
+`InferenceService.runSubAgent(target:question:agent:tools:)` invece di
+`ToolRegistry.execute`. Il runner:
+
+1. fa lo **snapshot** del KV main (`decoder.exportKV` — finestra raw + stato del
+   compressore, economico) e salva `committedIds`;
+2. costruisce/ripristina la **KV cache content-key** del target (file o `"project"`)
+   da un `DiskKVStore` dedicato (`subagent-kv/`): prima volta `prefill` + `store`,
+   poi `snapshot(forTokens:)`;
+3. esegue il loop tool del sub-agent (`decodeSubTurn`, eseguendo i suoi tool via
+   `ToolRegistry.execute`), bounded dal contesto;
+4. **ripristina** il main (`decoder.importKV(snapshot)` + `committedIds`).
+
+Al main torna solo la risposta (come tool-result), quindi committa `[chiamata
+subagent_run] + [risposta]`, non l'elaborazione interna. Il context-switch è
+corretto perché `importKV` ristabilisce uno stato **risumibile completo**
+(finestra SWA + compressore ricorrente), esattamente come per il disk-KV.
 
 ---
 

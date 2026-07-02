@@ -102,6 +102,22 @@ struct ModelLoadView: View {
                     Text("A fine risposta lo stato KV viene salvato su disco; una nuova conversazione (o una richiesta al server) che inizia con un prefisso già visto lo ripristina invece di rifare il prefill. Si applica al prossimo caricamento.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
+                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                if store.rawRingEnabled {
+                    Text("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto → RAM KV indipendente dal contesto. Sperimentale: verifica gli output dopo un contesto lungo. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Toggle("Read-ahead esperti selezionati (madvise)", isOn: $store.willNeedEnabled)
+                Text("Anticipa la lettura dei 6 esperti scelti subito prima del gather: riduce i fault a freddo (su poca RAM), no-op a caldo. Solo advisory, non cambia gli output. Consigliato ON. Si applica al prossimo caricamento.")
+                    .font(.caption).foregroundStyle(.tertiary)
+                Toggle("Pesi densi residenti (~5 GB wired)", isOn: $store.residentDenseEnabled)
+                Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce su macchine con RAM abbondante (~+40% a 32 GB). Costa ~5 GB di RAM wired: default ON solo con RAM ≥ 24 GB. Su 16 GB tende a PEGGIORARE (pressione di memoria): provalo ma se rallenta lascialo OFF. Si applica al prossimo caricamento.")
+                    .font(.caption).foregroundStyle(.tertiary)
+                Toggle("Profilo decode route/attn (diagnostico)", isOn: $store.profileRouteEnabled)
+                if store.profileRouteEnabled {
+                    Text("Splitta route/attn in 5 fasi (comp/q/kv/attn/out) e scrive il report nel Log motore a fine turno. ⚠️ I commit extra per fase RALLENTANO la generazione: usalo per capire DOVE va il tempo (conta il rapporto), non per misurare la velocità. Si applica al prossimo caricamento.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
             }
 
             Section("Agente (ruolo)") {
@@ -123,6 +139,8 @@ struct ModelLoadView: View {
             Section("Contesto e system prompt") {
                 Stepper("Contesto: \(store.contextSize) token",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
+                Text("Le cache KV crescono col contesto e tolgono page cache allo stream esperti: su poca RAM un contesto alto rallenta molto la generazione. Il default è tarato sulla RAM (4096 su ≤16 GB, come la demo); alzalo solo se ti serve davvero una finestra più lunga.")
+                    .font(.caption).foregroundStyle(.secondary)
                 TextField("System prompt aggiuntivo (si somma al ruolo dell'agente)",
                           text: $store.systemPrompt, axis: .vertical)
                     .lineLimit(2...6)

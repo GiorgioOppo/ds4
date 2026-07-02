@@ -93,11 +93,16 @@ Punti importanti:
 |---|---|
 | `Sources/DS4Core/` | Parser GGUF, tokenizer, sampler, forma del modello, piani KV/SSD. |
 | `Sources/DS4Metal/` | Runtime Metal, tensori GPU, kernel, grafo di calcolo, decoder, loader pesi. |
-| `Sources/DS4Engine/` | `InferenceService` (la facciata async usata dalla GUI), downloader, diagnostica. |
+| `Sources/DS4Engine/Service/` | `InferenceService` (attore + sub-agent), `DiskKVStore`, diagnostica. |
+| `Sources/DS4Engine/Tools/` | `ToolRegistry` + un file per tool in `Builtins/`, `ProjectCache`, `GitTool`, `Agents`. |
+| `Sources/DS4Engine/Download/` | `ModelDownloader` (GGUF resumibile + verifica SHA-256). |
+| `Sources/DS4Engine/Distributed/` | Coordinatore/worker, protocollo, transport. |
 | `Sources/DS4Demo/` | La demo CLI (`main.swift`). |
-| `Sources/DwarfStar/` | L'app SwiftUI (App, Chat, Server, Bench, Diagnostics, Models, Support). |
+| `Sources/DwarfStar/` | L'app SwiftUI (App, Chat, Server, Bench, Diagnostics, Models, Project, Tuning, Settings, Support). |
 | `metal/` | Sorgenti dei kernel Metal (fonte di verità, poi incorporati). |
 | `Tests/DS4CoreTests/` | Suite di test sui kernel, sul grafo, tokenizer, GGUF, sampler, ecc. |
+
+> Ogni cartella sotto `Sources/` ha un proprio `README.md` con il dettaglio dei file.
 
 ---
 
@@ -333,17 +338,27 @@ In fase `ready` appare la **`ChatView`**, divisa in tre parti:
 #### Tool (function calling)
 
 Il pulsante **Tool** nell'header apre un foglio dove abiliti il function calling
-e scegli quali **tool integrati** esporre al modello. I built-in di demo sono:
+e scegli quali **tool integrati** esporre al modello. Ogni tool è definito in un
+file in `Sources/DS4Engine/Tools/Builtins/`. I built-in sono:
 
 - **`now`** — data/ora corrente (ISO-8601), auto-eseguibile;
 - **`calculator`** — valuta un'espressione aritmetica (`+ - * / ( )`),
   auto-eseguibile in modo sicuro (input ristretto a cifre/operatori);
-- **`add` / `subtract` / `multiply`** — operano su due numeri `a` e `b`
-  (somma, sottrazione, moltiplicazione); accettano numeri JSON o stringhe
-  numeriche;
+- **`add` / `subtract` / `multiply`** — operano su due numeri `a` e `b`;
 - **`project_list` / `project_read` / `project_search`** — esplorano il
   **progetto attivo** (tab Progetto): elenco file, lettura paginata con numeri
-  di riga, ricerca testuale. Sono i tool dell'agente *coding*.
+  di riga, ricerca testuale (sull'indice);
+- **`project_write` / `project_edit`** — creano/sovrascrivono file di testo
+  indicizzati, oppure sostituiscono *una* occorrenza esatta (find/replace);
+- **`file_read` / `file_lines` / `file_write` / `file_add` / `file_modify`** —
+  accesso **grezzo** a qualsiasi file nella radice del progetto (anche non
+  indicizzato), con operazioni **per intervallo di righe**: leggi tutto o
+  `[from,to]`, conta le righe, sovrascrivi l'intero file, *aggiungi* righe
+  (insert), *modifica* righe (replace; content vuoto = cancella);
+- **`git`** — sottocomandi git locali (whitelist: status/diff/log/commit/…; no
+  rete) nella radice del progetto;
+- **`agents_list` / `subagent_search` / `subagent_run`** — orchestrazione di
+  sub-agenti (vedi sotto).
 
 Nel foglio **Tool** c'è anche il toggle **"Dichiarazione compatta"** (attivo di
 default): invece dello schema completo dei tool manda solo `nome(parametri)` + una
@@ -387,6 +402,35 @@ pannello **Diagnostica** ("Mostra chat template + formato tool") o via
 > viene marcata *dirty* e il turno successivo la **ricostruisce** dagli id
 > committati (il compressore NSA è ricorrente e non può tornare indietro).
 
+#### Sub-agenti (contesto isolato)
+
+L'agente **Orchestratore** può delegare a **sub-agenti** che girano in un
+contesto **isolato**, senza condividere la finestra del main:
+
+1. `agents_list` — elenca i ruoli disponibili e i tool di ciascuno (per scegliere
+   a chi delegare e con quale set minimo di tool).
+2. `subagent_search(query)` — trova i file del progetto candidati come *target*.
+3. `subagent_run(target, question, agent?, tools?)` — l'engine **mette in pausa il
+   main**, ne fa uno snapshot del KV, apre un contesto isolato seminato dal
+   contenuto del `target` (file o `"project"`) via una **KV cache costruita lazy**
+   (content-key, su disco), esegue il sub-agent (read/edit col set di tool
+   concesso) e poi **ripristina lo snapshot del main**. Nel KV del main entrano
+   **solo** la chiamata e la risposta, non l'elaborazione interna.
+
+Con `agent` il sub-agent assume un **ruolo** esistente (system prompt + i suoi
+tool); in alternativa `tools` è l'insieme minimo concesso (precedenza:
+`tools` > tool del ruolo > sola lettura). Senza progetto importato gira comunque
+su un contesto "task". I passi interni sono in una card collassabile. Dettagli in
+[`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md) §14.
+
+#### Import di file di testo
+
+Il pulsante **graffetta** nel composer importa uno o più file di testo (pannello
+sandbox, multi-selezione). Il contenuto viene **piegato nel turno utente** inviato
+al modello (delimitato per file); la trascrizione mostra solo i nomi come badge.
+Un avviso compare se gli allegati (o la conversazione) rischiano di superare il
+contesto.
+
 ---
 
 ## 7. Configurazione automatica e preset hardware
@@ -428,6 +472,27 @@ lo tiene residente automaticamente — non esistono più i toggle del motore C
 
 Dopo il caricamento, l'header della chat mostra una stima dell'impronta della
 **KV cache** (`nLayer × contesto × headDim × F32`).
+
+### KV cache: riuso, disco e RAM
+
+- **Riuso multi-turno**: la conversazione è append-only (`committedIds`); ogni
+  turno fa il prefill **solo del suffisso nuovo**. La chat avvisa quando il
+  contesto è quasi pieno (≥85%): oltre il limite la risposta viene troncata.
+- **KV su disco** (`DiskKVStore`, **on di default**, budget 8 GB): a fine turno lo
+  stato KV viene checkpointato su disco e ripristinato a freddo se un nuovo prompt
+  inizia con un prefisso già visto (utile anche per il server stateless). **Non**
+  estende la finestra viva (il limite resta `contextSize`).
+- **Footprint**: la KV scala col contesto — la raw cache `nLayer × contesto ×
+  headDim × 4` + le righe compresse NSA (~`contesto/ratio`). Il contesto di
+  **default è 1M token** (modificabile in Impostazioni): pesante (decine di GB a
+  1M), **abbassalo** su RAM contenuta.
+- **Raw-KV ring** (`DS4_RAW_RING`, opt-in, anche via toggle in Impostazioni):
+  alloca la raw cache come **ring di `nSWA` righe** invece dell'intero contesto
+  (l'attenzione NSA vede solo la finestra) → RAM della raw cache **costante**.
+  Riallinea il port all'**upstream**, che già usa una finestra scorrevole. Le
+  righe **compresse** non sono toccate (restano ∝ contesto → passo successivo).
+- **Prefetch** (`DS4_PREFETCH`, opt-in): read-ahead `madvise` dei pesi del layer
+  successivo per sovrapporre l'I/O da SSD al compute.
 
 ---
 

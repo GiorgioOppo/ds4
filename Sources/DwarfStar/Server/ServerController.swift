@@ -57,8 +57,9 @@ final class ServerController {
         // to the main actor to publish state.
         // Disk KV (shared setting with the chat): the stateless API re-sends the
         // whole transcript each request, so prefix restore is its biggest win.
-        let kvDir = UserDefaults.standard.bool(forKey: "DS4DiskKV") ? ChatStore.diskKVDirectory : nil
-        let kvBudget = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 4096
+        let kvOn = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true
+        let kvDir = kvOn ? ChatStore.diskKVDirectory : nil
+        let kvBudget = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192
         let loadTask = Task.detached { () -> (InferenceService, LocalServer) in
             let eng = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
             await eng.setDiskKV(directory: kvDir, budgetMB: kvBudget)

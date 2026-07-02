@@ -57,11 +57,24 @@ struct SettingsView: View {
             }
             Section("Memoria") {
                 Stepper("Cache esperti: \(store.expertCacheSlots) slot/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
-                        value: $store.expertCacheSlots, in: 0...64, step: 8)
+                        value: $store.expertCacheSlots, in: 0...64, step: 4)
+                if store.expertCacheSlots > 8 && store.residentDenseEnabled && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
+                    Label("Con i densi residenti su ≤16 GB, oltre 8 slot la memoria wired va in swap (misurato: crollo a 0.05 tok/s).",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Toggle("Esperti via pread diretto (F_NOCACHE) — consigliato ≤16 GB", isOn: $store.expertPreadEnabled)
+                Toggle("Pesi densi residenti (~5 GB, warm-up ~1 min al load)", isOn: $store.residentDenseEnabled)
                 Toggle("KV su disco (riusa i prefissi tra sessioni)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",
                             value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                }
+                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                if store.rawRingEnabled {
+                    Label("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto. Sperimentale — verifica gli output dopo un contesto lungo.",
+                          systemImage: "flask")
+                        .font(.caption).foregroundStyle(.orange)
                 }
                 Text("Si applicano al prossimo caricamento del modello.")
                     .font(.caption).foregroundStyle(.tertiary)

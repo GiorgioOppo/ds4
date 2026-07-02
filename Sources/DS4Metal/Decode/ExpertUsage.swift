@@ -19,6 +19,12 @@ public final class ExpertUsageStats {
         totalRoutes += ids.count
     }
 
+    /// Total routed picks recorded for a layer (0 = no data / dense layer).
+    public func routes(layer: Int) -> Int {
+        guard layer >= 0, layer < counts.count else { return 0 }
+        return counts[layer].values.reduce(0, +)
+    }
+
     /// The historically hottest experts of a layer (descending by count).
     public func top(layer: Int, n: Int) -> [Int32] {
         guard layer >= 0, layer < counts.count else { return [] }
@@ -34,6 +40,45 @@ public final class ExpertUsageStats {
         guard total > 0 else { return 0 }
         let top = counts[layer].values.sorted(by: >).prefix(n).reduce(0, +)
         return Double(top) / Double(total)
+    }
+
+    /// Usage-driven per-layer slot allocation for the expert cache: keep the
+    /// SAME total wired budget (`base` slots × layers with data) but move slots
+    /// to the layers where the routing mass concentrates. Greedy on the marginal
+    /// hit gain: slot #(r+1) of a layer is worth the routing share of its
+    /// (r+1)-th hottest expert, so after giving every layer the LRU floor, the
+    /// remaining budget goes to the highest marginal shares anywhere. Layers
+    /// with flat routing (uniform ≈ 1/256 shares) naturally shrink toward the
+    /// floor; concentrated layers grow toward `cap`.
+    ///
+    /// Returns nil when there is not enough history to trust (< ~43 tokens per
+    /// active layer on average) — the caller falls back to the uniform `base`.
+    /// Layers with no data are absent from the result (caller default applies).
+    public func slotAllocation(base: Int, floor: Int = 8, cap: Int = 64) -> [Int: Int]? {
+        let active = counts.indices.filter { !counts[$0].isEmpty }
+        guard !active.isEmpty, base > floor else { return nil }
+        guard totalRoutes >= 256 * active.count else { return nil }   // ≥ ~43 tokens of history
+        let capped = max(floor, cap)
+        var alloc: [Int: Int] = [:]
+        // Marginal gains: (layer, share of the layer's routes captured by its
+        // rank-r expert) for ranks floor..<cap — the value of ONE MORE slot.
+        var gains: [(layer: Int, share: Double)] = []
+        for il in active {
+            alloc[il] = floor
+            let total = Double(counts[il].values.reduce(0, +))
+            guard total > 0 else { continue }
+            let sorted = counts[il].values.sorted(by: >)
+            for r in floor..<min(capped, sorted.count) {
+                gains.append((layer: il, share: Double(sorted[r]) / total))
+            }
+        }
+        var remaining = (base - floor) * active.count
+        for g in gains.sorted(by: { $0.share > $1.share }) {
+            if remaining == 0 { break }
+            alloc[g.layer]! += 1
+            remaining -= 1
+        }
+        return alloc
     }
 
     // MARK: Persistence — compact JSON [[ [id, count], … ] × nLayers].
