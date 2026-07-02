@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The single place where the model and HOW it runs are configured. Every other
 /// screen (chat, server, benchmark, diagnostics, worker) inherits these values.
