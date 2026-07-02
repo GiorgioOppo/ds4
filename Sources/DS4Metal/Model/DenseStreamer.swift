@@ -129,25 +129,40 @@ public final class DenseStreamer: @unchecked Sendable {
             maxSlot = max(maxSlot, off)
         }
         if !q4Jobs.isEmpty {
-            var converted = [GPUTensor?](repeating: nil, count: q4Jobs.count)
-            let lock = NSLock()
-            var firstError: Error?
-            try converted.withUnsafeMutableBufferPointer { out in
-                DispatchQueue.concurrentPerform(iterations: q4Jobs.count) { i in
-                    do {
-                        out[i] = try Self.requantQ4(rt, model, fd: fd, tensor: q4Jobs[i].t)
-                    } catch {
-                        lock.lock()
-                        if firstError == nil { firstError = error }
-                        lock.unlock()
+            // Requant CACHE: the converted Q4 tensors are persisted next to the
+            // model (<gguf>.q4dense, ~1.4 GB) — the first load pays the requant
+            // once, every later load preads the cache in ~0.5 s. Invalidated by
+            // model size / job-list mismatches; write failures are ignored.
+            let cachePath = model.path + ".q4dense"
+            var converted: [GPUTensor]
+            if let cached = Self.loadQ4Cache(rt, path: cachePath, modelSize: Int(model.size), jobs: q4Jobs) {
+                converted = cached
+            } else {
+                var fresh = [GPUTensor?](repeating: nil, count: q4Jobs.count)
+                let lock = NSLock()
+                var firstError: Error?
+                try fresh.withUnsafeMutableBufferPointer { out in
+                    DispatchQueue.concurrentPerform(iterations: q4Jobs.count) { i in
+                        do {
+                            out[i] = try Self.requantQ4(rt, model, fd: fd, tensor: q4Jobs[i].t)
+                        } catch {
+                            lock.lock()
+                            if firstError == nil { firstError = error }
+                            lock.unlock()
+                        }
                     }
+                    if let e = firstError { throw e }
                 }
-                if let e = firstError { throw e }
+                converted = try fresh.enumerated().map { i, t in
+                    guard let t else {
+                        throw GGUFWeights.LoadError.message("DenseStreamer: requant failed on layer \(q4Jobs[i].il)")
+                    }
+                    return t
+                }
+                Self.writeQ4Cache(path: cachePath, modelSize: Int(model.size), jobs: q4Jobs, tensors: converted)
             }
             for (i, job) in q4Jobs.enumerated() {
-                guard let q4 = converted[i] else {
-                    throw GGUFWeights.LoadError.message("DenseStreamer: requant failed on layer \(job.il)")
-                }
+                let q4 = converted[i]
                 if lockResident { q4.lockResident() }
                 switch job.f {
                 case .qB: skeleton[job.il]!.qB = q4; skeleton[job.il]!.qBQ4 = true
@@ -205,6 +220,93 @@ public final class DenseStreamer: @unchecked Sendable {
             }
         }
         return makeWeights(il, slot: slot)
+    }
+
+    // MARK: Q4 requant cache (<gguf>.q4dense)
+    //
+    // Layout: "DSQ4" | version u32 | modelSize u64 | jobCount u32
+    //         then per job: il u32 | field u32 | bytes u64 | fileOffset u64
+    //         then the Q4_K blobs (4 KB aligned).
+    private static let q4CacheMagic: UInt32 = 0x34515344   // "DSQ4" little-endian
+
+    /// Load the requant cache if it exists and matches the job list exactly.
+    /// Reads through F_NOCACHE straight into the resident buffers (~0.5 s for
+    /// ~1.4 GB) — the requant is paid only on the very first load.
+    private static func loadQ4Cache(_ rt: MetalRuntime, path: String, modelSize: Int,
+                                    jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)]) -> [GPUTensor]? {
+        let cfd = open(path, O_RDONLY)
+        guard cfd >= 0 else { return nil }
+        defer { close(cfd) }
+        _ = fcntl(cfd, F_NOCACHE, 1)
+        let headBytes = 20 + jobs.count * 24
+        var head = [UInt8](repeating: 0, count: headBytes)
+        let okHead = head.withUnsafeMutableBytes {
+            GGUFWeights.preadFull(cfd, into: $0.baseAddress!, bytes: headBytes, offset: 0)
+        }
+        guard okHead else { return nil }
+        func u32(_ o: Int) -> UInt32 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
+        func u64(_ o: Int) -> UInt64 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt64.self) } }
+        guard u32(0) == q4CacheMagic, u32(4) == 1,
+              u64(8) == UInt64(modelSize), u32(16) == UInt32(jobs.count) else { return nil }
+        var records: [(bytes: Int, offset: Int)] = []
+        for (i, job) in jobs.enumerated() {
+            let o = 20 + i * 24
+            let expected = Int(job.t.elements) / 256 * 144
+            guard u32(o) == UInt32(job.il), u32(o + 4) == UInt32(job.f.rawValue),
+                  u64(o + 8) == UInt64(expected) else { return nil }
+            records.append((bytes: expected, offset: Int(u64(o + 16))))
+        }
+        var out = [GPUTensor?](repeating: nil, count: jobs.count)
+        var failed = false
+        let lock = NSLock()
+        out.withUnsafeMutableBufferPointer { buf in
+            DispatchQueue.concurrentPerform(iterations: records.count) { i in
+                guard let t = try? GPUTensor.uninitializedBytes(rt, byteLength: records[i].bytes,
+                                                                elementCount: records[i].bytes),
+                      GGUFWeights.preadFull(cfd, into: t.buffer.contents(),
+                                            bytes: records[i].bytes, offset: records[i].offset) else {
+                    lock.lock(); failed = true; lock.unlock()
+                    return
+                }
+                buf[i] = t
+            }
+        }
+        guard !failed else { return nil }
+        return out.compactMap { $0 }.count == jobs.count ? out.map { $0! } : nil
+    }
+
+    /// Persist the converted tensors (best-effort: failures leave no cache and
+    /// the next load simply requantizes again).
+    private static func writeQ4Cache(path: String, modelSize: Int,
+                                     jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)],
+                                     tensors: [GPUTensor]) {
+        let align = 4096
+        let headBytes = 20 + jobs.count * 24
+        var offset = (headBytes + align - 1) / align * align
+        var head = Data(capacity: headBytes)
+        func put32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { head.append(contentsOf: $0) } }
+        func put64(_ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { head.append(contentsOf: $0) } }
+        put32(q4CacheMagic); put32(1); put64(UInt64(modelSize)); put32(UInt32(jobs.count))
+        var offsets: [Int] = []
+        for (i, job) in jobs.enumerated() {
+            put32(UInt32(job.il)); put32(UInt32(job.f.rawValue))
+            put64(UInt64(tensors[i].byteLength)); put64(UInt64(offset))
+            offsets.append(offset)
+            offset += (tensors[i].byteLength + align - 1) / align * align
+        }
+        FileManager.default.createFile(atPath: path, contents: nil)
+        guard let fh = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? fh.close() }
+        do {
+            try fh.write(contentsOf: head)
+            for (i, t) in tensors.enumerated() {
+                try fh.seek(toOffset: UInt64(offsets[i]))
+                try fh.write(contentsOf: Data(bytesNoCopy: t.buffer.contents(),
+                                              count: t.byteLength, deallocator: .none))
+            }
+        } catch {
+            try? FileManager.default.removeItem(atPath: path)   // never leave a torn cache
+        }
     }
 
     /// Q8_0 → Q4_K requant of one tensor into a resident buffer (DS4_DENSE_Q4).
