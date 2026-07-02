@@ -7,7 +7,8 @@ Chat view model and UI.
   routing `subagent_run` back into the engine (malformed calls — bad JSON,
   missing question, unknown agent id, ungrantable tools — are rejected with an
   explanatory error fed back to the model and shown in the transcript; valid
-  runs appear immediately as an in-progress card), handles text attachments, shows
+  runs appear immediately as an in-progress card that streams the sub-agent's
+  internal steps live and keeps them on error/stop), handles text attachments, shows
   near-context-full warnings, applies memory settings such as expert cache, disk
   KV, and raw-KV ring, and manages **multiple persistent chats**. The active chat
   lives in `messages`; inactive chats are stored on disk.

@@ -20,6 +20,9 @@ struct UIMessage: Identifiable {
     /// Set on a `.tool` message that reports an isolated sub-agent run (question,
     /// answer, and a collapsible trace of its internal steps).
     var subAgent: InferenceService.SubAgentRun?
+    /// True while that sub-agent is still executing: the card shows a spinner and
+    /// the latest internal step live; flipped off when the final run replaces it.
+    var subAgentRunning: Bool = false
 }
 
 /// A text file staged in the composer: its full content is folded into the next
@@ -923,24 +926,43 @@ final class ChatStore {
                 }
                 status = "sub-agent su \(target)…"
                 // Show the run in the transcript IMMEDIATELY (a sub-agent can take
-                // minutes); the placeholder is updated in place when it finishes.
+                // minutes) and stream its internal steps into the card as they
+                // happen; the placeholder is replaced in place when it finishes.
                 let placeholder = messages.count
                 messages.append(UIMessage(role: .tool, text: "",
                     subAgent: InferenceService.SubAgentRun(
                         target: target.isEmpty ? "project" : target, question: question,
-                        answer: "… sub-agent running …", steps: [])))
+                        answer: "", steps: []),
+                    subAgentRunning: true))
+                // The steps streamed so far: kept when the run errors out/stops, so
+                // the transcript shows how far it got instead of losing the trace.
+                func streamedSteps() -> [String] {
+                    placeholder < messages.count ? (messages[placeholder].subAgent?.steps ?? []) : []
+                }
                 let run: InferenceService.SubAgentRun
                 do {
-                    run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
+                    run = try await service.runSubAgent(
+                        target: target, question: question, agent: agent, tools: tools,
+                        onStep: { [weak self] step in
+                            Task { @MainActor in
+                                guard let self, placeholder < self.messages.count,
+                                      self.messages[placeholder].subAgentRunning,
+                                      let sa = self.messages[placeholder].subAgent else { return }
+                                self.messages[placeholder].subAgent = InferenceService.SubAgentRun(
+                                    target: sa.target, question: sa.question,
+                                    answer: sa.answer, steps: sa.steps + [step])
+                            }
+                        })
                 } catch is CancellationError {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "(sub-agent stopped)", steps: [])
+                                                       answer: "(sub-agent stopped)", steps: streamedSteps())
                 } catch {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "Sub-agent error: \(error)", steps: [])
+                                                       answer: "Sub-agent error: \(error)", steps: streamedSteps())
                 }
                 if placeholder < messages.count, messages[placeholder].subAgent != nil {
                     messages[placeholder].subAgent = run
+                    messages[placeholder].subAgentRunning = false
                 } else {
                     messages.append(UIMessage(role: .tool, text: "", subAgent: run))
                 }

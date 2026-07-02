@@ -291,7 +291,7 @@ struct MessageRow: View {
     var body: some View {
         if message.role == .tool {
             if let run = message.subAgent {
-                SubAgentView(run: run)
+                SubAgentView(run: run, running: message.subAgentRunning)
             } else {
                 ToolResultRow(text: message.text)
             }
@@ -523,20 +523,33 @@ struct ToolCallView: View {
     }
 }
 
-/// A completed isolated sub-agent run: target + answer, with a collapsible trace
-/// of the internal steps (which never entered the main conversation's context).
+/// An isolated sub-agent run: target + answer, with a collapsible trace of the
+/// internal steps (which never entered the main conversation's context). While
+/// `running`, the card shows a spinner and the LATEST step live instead of the
+/// (not yet available) answer — the execution detail as it happens.
 struct SubAgentView: View {
     let run: InferenceService.SubAgentRun
+    var running: Bool = false
     @State private var expanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("Sub-agent · \(run.target)", systemImage: "person.3.sequence")
-                .font(.caption.bold()).foregroundStyle(.purple)
+            HStack(spacing: 6) {
+                Label("Sub-agent · \(run.target)", systemImage: "person.3.sequence")
+                    .font(.caption.bold()).foregroundStyle(.purple)
+                if running { ProgressView().controlSize(.small) }
+            }
             if !run.question.isEmpty {
                 Text(run.question).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
             }
-            Text(run.answer).font(.callout).textSelection(.enabled)
+            if running {
+                Text(run.steps.last ?? "starting…")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else {
+                Text(run.answer).font(.callout).textSelection(.enabled)
+            }
             if !run.steps.isEmpty {
                 DisclosureGroup(isExpanded: $expanded) {
                     VStack(alignment: .leading, spacing: 2) {

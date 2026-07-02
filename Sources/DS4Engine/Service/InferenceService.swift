@@ -392,8 +392,11 @@ public actor InferenceService {
     /// ever sees the question (the tool call) and this answer (the tool result) —
     /// the sub-agent's internal tool rounds happen in a separate, discarded context.
     /// The target's content prefix is cached (content-keyed) and reused next time.
+    /// `onStep` fires as each internal step is recorded (KV reuse, tool calls…),
+    /// so the UI can show live execution detail; the same lines end up in `steps`.
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
-                            maxTokens: Int = 1024, maxRounds: Int = .max) async throws -> SubAgentRun {
+                            maxTokens: Int = 1024, maxRounds: Int = .max,
+                            onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
         let ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
@@ -410,6 +413,7 @@ public actor InferenceService {
         }
 
         var steps: [String] = []
+        func note(_ s: String) { steps.append(s); onStep?(s) }
         let sampling = SamplingParams()
 
         // 1. Build or restore the content-keyed KV prefix (lazy cache).
@@ -424,14 +428,15 @@ public actor InferenceService {
         var pos = 0
         if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
             try decoder.importKV(snap); pos = prefixIds.count
-            steps.append("KV \"\(ctx.label)\" reused (\(pos) tokens)")
+            note("KV \"\(ctx.label)\" reused (\(pos) tokens)")
         } else {
+            note("prefill \"\(ctx.label)\" (\(prefixIds.count) tokens)…")
             _ = try decoder.prefill(tokens: prefixIds, startPos: 0); pos = prefixIds.count
             subKV?.store(tokens: prefixIds, modelName: modelName,
                          snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
-            steps.append("KV \"\(ctx.label)\" created (\(pos) tokens)")
+            note("KV \"\(ctx.label)\" created (\(pos) tokens)")
         }
-        steps.append("tool: " + ctx.toolNames.joined(separator: ", "))
+        note("tool: " + (ctx.toolNames.isEmpty ? "(none)" : ctx.toolNames.joined(separator: ", ")))
 
         // 2. Sub-agent tool loop: question → answer/tool-calls → results → … (bounded).
         var recent: [Int] = []
@@ -440,7 +445,8 @@ public actor InferenceService {
         var round = 0
         while true {
             let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
-            guard pos + suffixIds.count < contextSize else { steps.append("sub-agent context exhausted"); break }
+            guard pos + suffixIds.count < contextSize else { note("sub-agent context exhausted"); break }
+            note("round \(round + 1): generating…")
             var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: pos)
             pos += suffixIds.count
             let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
@@ -452,13 +458,13 @@ public actor InferenceService {
             for c in turn.calls {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
-                steps.append("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
+                note("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
                 results += "<tool_result>" + out.content + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
         let final = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        steps.append("answer: \(final.count) characters")
+        note("answer: \(final.count) characters")
         return SubAgentRun(target: ctx.label, question: question,
                            answer: final.isEmpty ? "(no answer)" : final, steps: steps)
     }
