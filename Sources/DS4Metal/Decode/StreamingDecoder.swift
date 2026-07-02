@@ -795,6 +795,7 @@ public final class StreamingDecoder {
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
+        LoadProgress.shared.set(0.02, "Apertura pesi…")
         let (embed, headMapped) = try GGUFWeights.outputHeadMapped(rt, model)
         var head = headMapped
         // DS4_MLOCK=1: pin the hot resident buffers (expert pools, resident
@@ -809,6 +810,7 @@ public final class StreamingDecoder {
         // a cold page cache at ~2 GB/s (~260 ms/token measured). The embedding
         // table stays mapped — the decode stages one 8 KB row per token anyway.
         if ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1" {
+            LoadProgress.shared.set(0.04, "Output head residente…")
             head.head = try GGUFWeights.tensor(rt, model, "output.weight")
             if lockResident { head.head.lockResident() }
         }
@@ -977,11 +979,14 @@ public final class StreamingDecoder {
         } else {
             denseProvider = { try GGUFWeights.layerMappedDense(rt, model, $0) }
         }
-        return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
-                                    layerProvider: denseProvider,
-                                    embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
-                                    expertGather: gather, slotCache: cache, usage: usage,
-                                    prefetch: prefetch, kvLayers: kvLayers)
+        LoadProgress.shared.set(0.95, "Allocazione KV e scratch…")
+        let dec = try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
+                                       layerProvider: denseProvider,
+                                       embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
+                                       expertGather: gather, slotCache: cache, usage: usage,
+                                       prefetch: prefetch, kvLayers: kvLayers)
+        LoadProgress.shared.set(1.0, "Pronto")
+        return dec
     }
 
     /// Mapped-experts streaming decoder: per layer the dense weights are copied,

@@ -107,10 +107,12 @@ public final class DenseStreamer: @unchecked Sendable {
         // 129 independent (layer, tensor) requants saturate every core, ~6-8×
         // faster load than converting layer by layer.
         var q4Jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
+        LoadProgress.shared.begin("Preparazione layer densi…", from: 0.08, to: 0.30, units: layers.count)
         for il in layers {
             var plan: [Entry] = []
             var off = 0
             let w = try GGUFWeights.layerSmallSkeleton(rt, model, il)
+            LoadProgress.shared.advance()
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
                 if q4Dense, f == .qB || f == .attnOut || f == .attnOutA,
@@ -135,9 +137,12 @@ public final class DenseStreamer: @unchecked Sendable {
             // model size / job-list mismatches; write failures are ignored.
             let cachePath = model.path + ".q4dense"
             var converted: [GPUTensor]
+            LoadProgress.shared.begin("Lettura cache Q4…", from: 0.32, to: 0.92, units: q4Jobs.count)
             if let cached = Self.loadQ4Cache(rt, path: cachePath, modelSize: Int(model.size), jobs: q4Jobs) {
                 converted = cached
             } else {
+                LoadProgress.shared.begin("Riquantizzazione Q4 (solo il primo avvio)…",
+                                          from: 0.32, to: 0.88, units: q4Jobs.count)
                 var fresh = [GPUTensor?](repeating: nil, count: q4Jobs.count)
                 let lock = NSLock()
                 var firstError: Error?
@@ -145,6 +150,7 @@ public final class DenseStreamer: @unchecked Sendable {
                     DispatchQueue.concurrentPerform(iterations: q4Jobs.count) { i in
                         do {
                             out[i] = try Self.requantQ4(rt, model, fd: fd, tensor: q4Jobs[i].t)
+                            LoadProgress.shared.advance()
                         } catch {
                             lock.lock()
                             if firstError == nil { firstError = error }
@@ -159,6 +165,7 @@ public final class DenseStreamer: @unchecked Sendable {
                     }
                     return t
                 }
+                LoadProgress.shared.set(0.90, "Scrittura cache Q4…")
                 Self.writeQ4Cache(path: cachePath, modelSize: Int(model.size), jobs: q4Jobs, tensors: converted)
             }
             for (i, job) in q4Jobs.enumerated() {
@@ -269,6 +276,7 @@ public final class DenseStreamer: @unchecked Sendable {
                     return
                 }
                 buf[i] = t
+                LoadProgress.shared.advance()
             }
         }
         guard !failed else { return nil }

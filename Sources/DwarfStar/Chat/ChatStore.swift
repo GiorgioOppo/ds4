@@ -431,14 +431,32 @@ final class ChatStore {
     }
 
     /// Open the model off the main thread, then flip to `.ready`.
+    /// Avanzamento del caricamento del modello (0…1) + fase corrente: scritti
+    /// dal motore via LoadProgress e riletti qui a ~8 Hz mentre `.loading`.
+    var loadFraction: Double = 0
+    var loadStage: String = ""
+
     func load() {
         guard phase != .loading else { return }
         phase = .loading
+        loadFraction = 0
+        loadStage = ""
+        LoadProgress.shared.reset()
+        // Poll del progresso finché il load è in corso (si auto-cancella).
+        let poller = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let s = LoadProgress.shared.snapshot
+                self?.loadFraction = s.fraction
+                self?.loadStage = s.stage
+                try? await Task.sleep(nanoseconds: 120_000_000)
+            }
+        }
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudget = diskKVBudgetMB
         Task.detached(priority: .userInitiated) {
+            defer { poller.cancel() }
             do {
                 let svc = try InferenceService(modelPath: path,
                                                contextSize: ctx,

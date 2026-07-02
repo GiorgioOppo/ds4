@@ -106,9 +106,11 @@ struct SettingsView: View {
                     Button("Reload") { store.load() }
                 }
             case .loading:
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading model...").font(.callout).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: min(max(store.loadFraction, 0), 1))
+                        .progressViewStyle(.linear)
+                    Text(store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             case .needsModel, .failed:
                 if case .failed(let message) = store.phase {
