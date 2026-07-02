@@ -227,9 +227,14 @@ public final class GGUFModel {
     public let maxTensorBytes: UInt64
     public let tensors: [Tensor]
 
+    /// Path the model was opened from (for auxiliary descriptors / diagnostics).
+    public let path: String
+
     private let map: UnsafeMutableRawPointer
     private let base: UnsafePointer<UInt8>
     private let fd: Int32
+    /// Lazily-opened second descriptor with F_NOCACHE (see uncachedFD()).
+    private var noCacheFD: Int32 = -1
     private let kvs: [KV]
     private let kvIndex: [String: Int]
     private let tensorIndex: [String: Int]
@@ -238,6 +243,22 @@ public final class GGUFModel {
     public var n_tensors: UInt64 { UInt64(tensors.count) }
     /// Base of the mmap, for reading tensor bytes by absolute offset.
     public var mapBase: UnsafeRawPointer { UnsafeRawPointer(base) }
+
+    /// A second descriptor on the same file with F_NOCACHE set: pread()s on it
+    /// go (mostly) straight from disk to the destination buffer WITHOUT filling
+    /// the unified page cache. Used for expert streaming (DS4_EXPERT_PREAD):
+    /// the slabs get copied into wired GPU pools anyway, so caching them a
+    /// second time only evicts the dense weights on tight-RAM machines.
+    /// Lazily opened, closed in deinit. Call from ONE thread (model load);
+    /// the returned fd itself is safe for concurrent pread().
+    public func uncachedFD() -> Int32? {
+        if noCacheFD >= 0 { return noCacheFD }
+        let f = open(path, O_RDONLY)
+        guard f >= 0 else { return nil }
+        _ = fcntl(f, F_NOCACHE, 1)
+        noCacheFD = f
+        return f
+    }
 
     /// Hint the OS to read these mmap byte ranges ahead (POSIX_MADV_WILLNEED), so
     /// the SSD I/O for the NEXT layer overlaps the current layer's compute. A pure
@@ -270,6 +291,7 @@ public final class GGUFModel {
             close(fd); throw GGUFError.mmapFailed(path)
         }
 
+        self.path = path
         self.fd = fd
         self.map = region
         self.size = UInt64(st.st_size)
@@ -377,6 +399,7 @@ public final class GGUFModel {
     deinit {
         munmap(map, Int(size))
         close(fd)
+        if noCacheFD >= 0 { close(noCacheFD) }
     }
 
     /// Helper that tears the mapping down if a header read throws mid-init.

@@ -22,9 +22,11 @@ func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .u
 
 /// Banda del file modello BYPASSANDO la page cache (F_NOCACHE) — misura il
 /// disco vero, ripetibile. Tre scenari con slab da ~2 MB (la taglia di un
-/// esperto 2-bit): sequenziale (tetto), random a coda 1 (il gather senza
-/// hint), random parallelo (il gather con madvise + copie concorrenti).
-func diskBench(path: String) -> (report: String, seqGBs: Double) {
+/// esperto 2-bit): sequenziale a coda 1, random a coda 1 (il gather senza
+/// hint), random parallelo (il gather con madvise/pread paralleli). Il TETTO
+/// del disco è il massimo dei tre: sugli NVMe Apple il parallelo random può
+/// superare il sequenziale a coda 1 (serve profondità di coda, non località).
+func diskBench(path: String) -> (report: String, ceilingGBs: Double) {
     let fd = open(path, O_RDONLY)
     guard fd >= 0 else { return ("  SSD: open fallita (\(String(cString: strerror(errno))))", 0) }
     defer { close(fd) }
@@ -65,13 +67,15 @@ func diskBench(path: String) -> (report: String, seqGBs: Double) {
         _ = pread(fd, b, slab, off_t(offs2[i]))
     }
     let qdN = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    let ceiling = max(seq, qd1, qdN)
     let report = String(format: """
       SSD (F_NOCACHE, slab %d MB):
-        sequenziale       %6.2f GB/s   <- tetto teorico del gather
-        random coda 1     %6.2f GB/s   <- gather senza hint/parallelismo
-        random parallelo  %6.2f GB/s   <- gather con madvise + copie parallele
-    """, slab >> 20, seq, qd1, qdN)
-    return (report, seq)
+        sequenziale coda 1  %6.2f GB/s
+        random coda 1       %6.2f GB/s   <- gather senza hint/parallelismo
+        random parallelo    %6.2f GB/s   <- gather con madvise/pread paralleli
+        TETTO               %6.2f GB/s   <- riferimento per la banda effettiva
+    """, slab >> 20, seq, qd1, qdN, ceiling)
+    return (report, ceiling)
 }
 
 /// Pesi MTP (Multi-Token Prediction) nel GGUF: se presenti, la decodifica
@@ -93,8 +97,9 @@ func mtpReport(_ model: GGUFModel) -> String {
 /// I knob DS4_* attivi: rende ogni run auto-documentante (i confronti A/B
 /// hanno senso solo a knob uguali).
 func knobReport() -> String {
-    let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_WILLNEED_EXPERTS",
-                 "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+    let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
+                 "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
+                 "DS4_PREFILL_UNION", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE", "DS4_PROFILE_ROUTE"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
@@ -115,12 +120,12 @@ do {
     let maxNew = args.count >= 3 ? (Int(args[2]) ?? 4) : 4
 
     let diag = ProcessInfo.processInfo.environment["DS4_DIAG"] == "1"
-    var diskSeqGBs = 0.0
+    var diskCeilingGBs = 0.0
     if diag {
         log("── Diagnosi (DS4_DIAG=1) ──")
         log(knobReport())
         let bench = diskBench(path: ggufPath)
-        diskSeqGBs = bench.seqGBs
+        diskCeilingGBs = bench.ceilingGBs
         log(bench.report)
     }
 
@@ -243,10 +248,10 @@ do {
             // conviene puntare su hit-rate (slot) o decodifica speculativa (MTP).
             if dec.profile.gatherBytes > 0, dec.profile.gatherS > 0 {
                 let eff = Double(dec.profile.gatherBytes) / dec.profile.gatherS / 1e9
-                if diskSeqGBs > 0 {
-                    let pct = eff / diskSeqGBs * 100
+                if diskCeilingGBs > 0 {
+                    let pct = eff / diskCeilingGBs * 100
                     log(String(format: "  gather effettivo %.2f GB/s = %.0f%% del tetto SSD (%.2f GB/s) -> %@",
-                               eff, pct, diskSeqGBs,
+                               eff, pct, diskCeilingGBs,
                                pct < 60 ? "margine: il sidecar expert-bundle può rendere"
                                         : "vicino alla fisica del disco: puntare su hit-rate/MTP"))
                 } else {

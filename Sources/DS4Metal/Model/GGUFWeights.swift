@@ -223,14 +223,31 @@ public enum GGUFWeights {
         adviseRange(model.mapBase + Int(t.absOffset) + Int(id) * expertBytes, expertBytes)
     }
 
+    /// pread the full range (loops on short reads). Thread-safe on a shared fd
+    /// (explicit offsets, no shared cursor). Returns false on I/O error.
+    static func preadFull(_ fd: Int32, into dst: UnsafeMutableRawPointer,
+                          bytes: Int, offset: Int) -> Bool {
+        var done = 0
+        while done < bytes {
+            let n = pread(fd, dst + done, bytes - done, off_t(offset + done))
+            if n <= 0 { return false }
+            done += n
+        }
+        return true
+    }
+
     /// Expert-cache: pack ONLY the `ids` selected experts of a Q4_K MoE tensor
     /// (ffn_*_exps, layout [inDim, outRows, nExpert]) from the mmap into a small
     /// K-expert buffer, so streaming loads ~K/256 of the expert weight per layer.
     /// Call moeMatvecQ4K with ids remapped to 0..<K against the returned tensor.
     /// The slabs are madvise'd up front and copied CONCURRENTLY straight into the
     /// shared Metal buffer (queue depth ~= ids.count on the SSD, single copy).
+    /// With `uncachedFD` (DS4_EXPERT_PREAD) the slabs are pread() DIRECT from
+    /// disk instead — zero page-cache footprint, so the expert churn stops
+    /// evicting the dense weights on tight-RAM machines. Same bytes either way.
     public static func gatherExperts(_ rt: MetalRuntime, _ model: GGUFModel, _ name: String,
-                                     ids: [Int32], inDim: Int, outRows: Int) throws -> GPUTensor {
+                                     ids: [Int32], inDim: Int, outRows: Int,
+                                     uncachedFD: Int32? = nil) throws -> GPUTensor {
         guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
         // Per-expert byte size from the tensor's actual GGUF block layout (q4_K=144,
         // q2_K=84, iq2_xxs=66 per 256 elems) — NOT hardcoded Q4_K.
@@ -241,13 +258,26 @@ public enum GGUFWeights {
         for e in ids where e < 0 || (Int(e) + 1) * expertBytes > Int(t.bytes) {
             throw LoadError.message("gatherExperts: \(name) expert \(e) outside tensor bounds")
         }
+        let dst = try GPUTensor.uninitializedBytes(rt, byteLength: ids.count * expertBytes,
+                                                   elementCount: ids.count * expertBytes)
+        let dstBase = dst.buffer.contents()
+        if let fd = uncachedFD {
+            let absBase = Int(t.absOffset)
+            let failed = NSLock()
+            var anyFailure = false
+            DispatchQueue.concurrentPerform(iterations: ids.count) { i in
+                if !preadFull(fd, into: dstBase + i * expertBytes, bytes: expertBytes,
+                              offset: absBase + Int(ids[i]) * expertBytes) {
+                    failed.lock(); anyFailure = true; failed.unlock()
+                }
+            }
+            if anyFailure { throw LoadError.message("gatherExperts: pread failed on \(name)") }
+            return dst
+        }
         let base = model.mapBase + Int(t.absOffset)
         if willNeedExperts {
             for e in ids { adviseRange(base + Int(e) * expertBytes, expertBytes) }
         }
-        let dst = try GPUTensor.uninitializedBytes(rt, byteLength: ids.count * expertBytes,
-                                                   elementCount: ids.count * expertBytes)
-        let dstBase = dst.buffer.contents()
         DispatchQueue.concurrentPerform(iterations: ids.count) { i in
             memcpy(dstBase + i * expertBytes, base + Int(ids[i]) * expertBytes, expertBytes)
         }
@@ -271,27 +301,31 @@ public enum GGUFWeights {
     /// prefetch it never reads experts we won't use, and on warm pages it's a cheap
     /// no-op. Advisory only: cannot change numerics. Opt-in via DS4_WILLNEED_EXPERTS.
     public static func gatherLayerExperts(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int,
-                                          ids: [Int32], dims: DSV4Dims, willNeed: Bool) throws
+                                          ids: [Int32], dims: DSV4Dims, willNeed: Bool,
+                                          uncachedFD: Int32? = nil) throws
         -> (GPUTensor, GPUTensor, GPUTensor) {
         let gn = "blk.\(il).ffn_gate_exps.weight"
         let un = "blk.\(il).ffn_up_exps.weight"
         let dnn = "blk.\(il).ffn_down_exps.weight"
-        if willNeed {
+        if willNeed && uncachedFD == nil {   // madvise is a page-cache hint: pointless with direct pread
             var ranges = expertRanges(model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
             ranges += expertRanges(model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
             ranges += expertRanges(model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
             GGUFModel.prefetch(base: model.mapBase, ranges: ranges)
         }
-        let g = try gatherExperts(rt, model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-        let u = try gatherExperts(rt, model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn)
-        let dn = try gatherExperts(rt, model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd)
+        let g = try gatherExperts(rt, model, gn, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn, uncachedFD: uncachedFD)
+        let u = try gatherExperts(rt, model, un, ids: ids, inDim: dims.nEmbd, outRows: dims.expertFfn, uncachedFD: uncachedFD)
+        let dn = try gatherExperts(rt, model, dnn, ids: ids, inDim: dims.expertFfn, outRows: dims.nEmbd, uncachedFD: uncachedFD)
         return (g, u, dn)
     }
 
     /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
     /// (the ExpertSlotCache fill primitive; dst is a shared-storage pool tensor).
+    /// With `uncachedFD` the slab is pread() DIRECT from disk (F_NOCACHE): zero
+    /// page-cache footprint — see gatherExperts.
     public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
-                                  expertBytes: Int, into dst: GPUTensor, slot: Int) throws {
+                                  expertBytes: Int, into dst: GPUTensor, slot: Int,
+                                  uncachedFD: Int32? = nil) throws {
         guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
         guard id >= 0, (Int(id) + 1) * expertBytes <= Int(t.bytes) else {
             throw LoadError.message("copyExpert: \(name) expert \(id) outside tensor bounds")
@@ -299,9 +333,16 @@ public enum GGUFWeights {
         guard dst.byteOffset + (slot + 1) * expertBytes <= dst.buffer.length else {
             throw LoadError.message("copyExpert: slot \(slot) outside pool buffer")
         }
+        let dstPtr = dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes)
+        if let fd = uncachedFD {
+            guard preadFull(fd, into: dstPtr, bytes: expertBytes,
+                            offset: Int(t.absOffset) + Int(id) * expertBytes) else {
+                throw LoadError.message("copyExpert: pread failed on \(name) expert \(id)")
+            }
+            return
+        }
         let src = model.mapBase + Int(t.absOffset) + Int(id) * expertBytes
-        memcpy(dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes),
-               src, expertBytes)
+        memcpy(dstPtr, src, expertBytes)
     }
 
     /// Assemble the output-head weights + embedding table.

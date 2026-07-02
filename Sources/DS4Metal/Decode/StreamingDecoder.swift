@@ -138,6 +138,14 @@ public final class StreamingDecoder {
     /// (~43 allocations/token). Safe to reuse: the routed command buffer that
     /// reads it is committed AND waited before the next layer overwrites it.
     let slotsScratch: GPUTensor
+    /// One embedding-table ROW (F16, nEmbd × 2 B), CPU-staged per token.
+    /// Binding the full multi-hundred-MB no-copy table to a command buffer
+    /// makes Metal wire the WHOLE mapping every token — on tight-RAM machines
+    /// where the expert churn evicts it, that re-faults it from SSD each time
+    /// (the ~500 ms "embed" phase). Staging the row costs an ~8 KB memcpy and
+    /// keeps the table out of the GPU residency set. Identical bytes → same
+    /// numerics.
+    let embedRowStage: GPUTensor
 
     public init(rt: MetalRuntime, dims: DSV4Dims, rope: RopeParams, nLayers: Int,
                 layerProvider: @escaping (Int) throws -> LayerWeights,
@@ -179,6 +187,7 @@ public final class StreamingDecoder {
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
         // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
         // the older rows need not stay resident — the ring cuts the raw-KV RAM from
@@ -452,12 +461,19 @@ public final class StreamingDecoder {
     }
 
     /// Embed one token into the HC state buffer `hc` (own command buffer).
+    /// The token's table row is CPU-staged into `embedRowStage` and the kernel
+    /// runs on that (token 0 of a 1-row table) — see embedRowStage for why.
     private func embedToken(_ token: Int, into hc: GPUTensor) throws {
         let t = Date()
+        let rowBytes = embedRowStage.byteLength
+        precondition(token >= 0 && token < d.vocab, "embedToken: token \(token) out of vocab")
+        memcpy(embedRowStage.buffer.contents(),
+               embedTable.buffer.contents() + embedTable.byteOffset + token * rowBytes,
+               rowBytes)
         let ec = GraphContext(rt)
         try ec.begin()
-        try ec.embedTokenHC(table: embedTable, token: token, embd: embd, hc: hc,
-                            nEmbd: d.nEmbd, nVocab: d.vocab, nHC: d.nHC)
+        try ec.embedTokenHC(table: embedRowStage, token: 0, embd: embd, hc: hc,
+                            nEmbd: d.nEmbd, nVocab: 1, nHC: d.nHC)
         ec.commit()
         profile.embedS += Date().timeIntervalSince(t)
     }
@@ -781,8 +797,16 @@ public final class StreamingDecoder {
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
         let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
+        // DS4_EXPERT_PREAD=1: expert slabs pread() DIRECT from disk (F_NOCACHE)
+        // instead of memcpy'd from the mmap. Zero page-cache footprint for the
+        // ~1 GB/token of expert churn, so it stops evicting the DENSE weights
+        // (route/attn/embed/head re-fault them otherwise on 16 GB machines).
+        // Same bytes, same numerics — only the I/O path changes. A/B per machine.
+        let uncachedFD: Int32? =
+            ProcessInfo.processInfo.environment["DS4_EXPERT_PREAD"] == "1" ? model.uncachedFD() : nil
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims, willNeed: willNeed)
+            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
+                                               willNeed: willNeed, uncachedFD: uncachedFD)
         }
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.
@@ -803,26 +827,32 @@ public final class StreamingDecoder {
         var cache: ExpertSlotCache? = nil
         if nSlots > 0 {
             let S = max(8, nSlots)
+            // Readahead every missing slab (3 matrices × N ids) BEFORE the
+            // copies: the NVMe serves all the regions concurrently. With
+            // DS4_EXPERT_PREAD the fill bypasses the page cache, so the
+            // madvise hint would be pointless — prefetch disabled (nil).
+            var fillPrefetch: ((Int, [Int32]) -> Void)? = nil
+            if uncachedFD == nil {
+                fillPrefetch = { il, ids in
+                    for id in ids {
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: gateBytes)
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
+                    }
+                }
+            }
             cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: { slots in
                 (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
                  up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
                  down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
             }, fill: { il, id, pool, slot in
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
-                                           expertBytes: gateBytes, into: pool.gate, slot: slot)
+                                           expertBytes: gateBytes, into: pool.gate, slot: slot, uncachedFD: uncachedFD)
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_up_exps.weight", id: id,
-                                           expertBytes: upBytes, into: pool.up, slot: slot)
+                                           expertBytes: upBytes, into: pool.up, slot: slot, uncachedFD: uncachedFD)
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
-                                           expertBytes: downBytes, into: pool.down, slot: slot)
-            }, prefetch: { il, ids in
-                // Readahead every missing slab (3 matrices × N ids) BEFORE the
-                // copies: the NVMe serves all the regions concurrently.
-                for id in ids {
-                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: gateBytes)
-                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
-                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
-                }
-            }, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
+                                           expertBytes: downBytes, into: pool.down, slot: slot, uncachedFD: uncachedFD)
+            }, prefetch: fillPrefetch, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
                slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
                 // layers) but more slots where the routing concentrates, fewer
