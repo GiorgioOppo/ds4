@@ -58,13 +58,12 @@ struct SettingsView: View {
             Section("Memory") {
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
-                if store.expertCacheSlots > 8 && store.residentDenseEnabled && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                    Label("With resident dense weights on <=16 GB, more than 8 slots can push wired memory into swap (measured drop: 0.05 tok/s).",
+                if store.expertCacheSlots > 12 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
+                    Label("Each slot costs ~0.3 GB of wired memory (6.9 MB × 43 layers): with low RAM too many slots swap and decode collapses.",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
-                Toggle("Resident dense weights (~5 GB, ~1 min load warm-up)", isOn: $store.residentDenseEnabled)
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",

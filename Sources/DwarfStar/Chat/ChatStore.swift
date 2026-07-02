@@ -66,7 +66,11 @@ final class ChatStore {
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
-        _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)   // default ON (misurato con PREAD)
+        // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
+        // su 16 GB nell'app rallenta; il valore persistito di vecchie build
+        // viene ripulito così non può restare incollato un ON stantio.
+        UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
+        _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
@@ -136,21 +140,12 @@ final class ChatStore {
         }
     }
     /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
-    /// per layer in buffer residenti invece di mapparli no-copy, così route/attn
-    /// diventa RAM-bound. Stessi numeri (è solo copia vs mmap). DEFAULT ON: la
-    /// vecchia regressione sui 16 GB era misurata SENZA pread diretto (la page
-    /// cache era contesa dal churn degli esperti); con DS4_EXPERT_PREAD attivo la
-    /// combinazione è la config più veloce misurata su M1 Pro 16 GB (0.27 tok/s,
-    /// +59% sulla baseline). Costa ~1 min di warm-up al caricamento. Si applica
-    /// al prossimo caricamento del modello.
-    var residentDenseEnabled: Bool =
-        (UserDefaults.standard.object(forKey: "DS4ResidentDense") as? Bool)
-        ?? true {
-        didSet {
-            UserDefaults.standard.set(residentDenseEnabled, forKey: "DS4ResidentDense")
-            _ = setenv("DS4_RESIDENT_DENSE", residentDenseEnabled ? "1" : "0", 1)
-        }
-    }
+    /// in buffer residenti invece di mapparli no-copy. NON esposto nella GUI e
+    /// deciso SOLO dalla RAM (ON ≥24 GB): nella demo CLI a contesto corto su
+    /// 16 GB risultava più veloce, ma nell'app reale (SwiftUI, trascrizioni,
+    /// server, contesti più lunghi) il budget wired sfora e RALLENTA — misurato.
+    /// Il knob env DS4_RESIDENT_DENSE resta per la demo/gli esperimenti.
+    static var residentDenseAuto: Bool { MemoryInfo.physicalBytes >= 24 * 1_073_741_824 }
     /// Profilo decode route/attn (DS4_PROFILE_ROUTE): splitta route/attn in 5 fasi
     /// (comp/q/kv/attn/out), ognuna con commit+wait dedicato. DIAGNOSTICO: i commit
     /// extra RALLENTANO la generazione (gli assoluti si gonfiano; conta il RAPPORTO),
