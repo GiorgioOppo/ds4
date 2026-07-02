@@ -855,12 +855,28 @@ public final class StreamingDecoder {
                  up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
                  down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
             }, fill: { il, id, pool, slot in
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id,
-                                           expertBytes: gateBytes, into: pool.gate, slot: slot, uncachedFD: uncachedFD)
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_up_exps.weight", id: id,
-                                           expertBytes: upBytes, into: pool.up, slot: slot, uncachedFD: uncachedFD)
-                try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
-                                           expertBytes: downBytes, into: pool.down, slot: slot, uncachedFD: uncachedFD)
+                // The 3 slabs (gate/up/down) of a missing expert are read
+                // CONCURRENTLY: with fillAll's parallelism across misses this
+                // raises the NVMe queue depth from ~misses to ~3×misses. It
+                // matters most under DS4_DENSE_STREAM, where the gather shares
+                // the disk with the dense reads and depth is what keeps it fed.
+                let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
+                    ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
+                    ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
+                    ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
+                let lock = NSLock()
+                var firstError: Error? = nil
+                DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
+                    do {
+                        try GGUFWeights.copyExpert(model, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
+                                                   into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD)
+                    } catch {
+                        lock.lock()
+                        if firstError == nil { firstError = error }
+                        lock.unlock()
+                    }
+                }
+                if let e = firstError { throw e }
             }, prefetch: fillPrefetch, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
                slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
