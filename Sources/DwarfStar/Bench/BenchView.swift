@@ -12,35 +12,35 @@ struct BenchView: View {
             Form {
                 Section {
                     Label(controller.mode == .local
-                          ? "Benchmark nativo: misura prefill e generazione (token/s) del motore in-process a contesti crescenti. Carica una propria copia del modello (pesi mmap condivisi)."
-                          : "Benchmark distribuito: misura prefill e generazione (token/s) sul cluster, riusando il coordinatore già connesso in Chat → Distribuito (nessuna seconda connessione).",
+                          ? "Native benchmark: measures prefill and generation throughput (tokens/s) for the in-process engine at growing context sizes. Loads its own model instance; weights are mmap-shared."
+                          : "Distributed benchmark: measures prefill and generation throughput (tokens/s) on the cluster, reusing the coordinator already connected in Chat -> Distributed.",
                           systemImage: "gauge.with.dots.needle.67percent")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Motore") {
-                    Picker("Motore", selection: $controller.mode) {
+                Section("Engine") {
+                    Picker("Engine", selection: $controller.mode) {
                         ForEach(BenchMode.allCases) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     if controller.mode == .distributed {
                         LabeledContent("Route", value: controller.distRoute)
                         if !controller.distConnected {
-                            Label("Coordinatore non connesso: aprilo in Chat → Distribuito e premi «Connetti».",
+                            Label("Coordinator not connected: open it in Chat -> Distributed and press Connect.",
                                   systemImage: "exclamationmark.triangle")
                                 .font(.callout).foregroundStyle(.orange)
                         }
                     }
                 }
                 .disabled(controller.isRunning)
-                Section("Modello (da Impostazioni)") {
+                Section("Model (from Settings)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    LabeledContent("Contesto", value: "\(controller.contextSize) token")
+                    LabeledContent("Context", value: "\(controller.contextSize) tokens")
                 }
-                Section("Frontiere di contesto") {
+                Section("Context Frontiers") {
                     Stepper("Start: \(controller.ctxStart)", value: $controller.ctxStart, in: 64...200_000, step: 256)
                     Stepper("Max: \(controller.ctxMax)", value: $controller.ctxMax, in: 256...200_000, step: 256)
-                    Stepper("Passo: \(controller.stepIncr)", value: $controller.stepIncr, in: 64...32_768, step: 256)
-                    Stepper("Token generati per punto: \(controller.genTokens)",
+                    Stepper("Step: \(controller.stepIncr)", value: $controller.stepIncr, in: 64...32_768, step: 256)
+                    Stepper("Generated tokens per point: \(controller.genTokens)",
                             value: $controller.genTokens, in: 1...512, step: 8)
                 }
                 .disabled(controller.isRunning)
@@ -48,11 +48,11 @@ struct BenchView: View {
                     if controller.isRunning {
                         runningBadge
                         Button(role: .destructive) { controller.stop() } label: {
-                            Label("Ferma", systemImage: "stop.fill")
+                            Label("Stop", systemImage: "stop.fill")
                         }
                     } else {
                         Button { controller.run() } label: {
-                            Label("Avvia benchmark", systemImage: "play.fill")
+                            Label("Start Benchmark", systemImage: "play.fill")
                         }
                         .disabled(controller.mode == .distributed && !controller.distConnected)
                     }
@@ -64,10 +64,10 @@ struct BenchView: View {
             Divider()
 
             if controller.rows.isEmpty {
-                ContentUnavailableView("Nessun dato", systemImage: "chart.xyaxis.line",
+                ContentUnavailableView("No Data", systemImage: "chart.xyaxis.line",
                                        description: Text(controller.isRunning
-                                                         ? "Benchmark in corso — \(controller.runningLabel ?? "")"
-                                                         : "Avvia un benchmark per vedere il throughput."))
+                                                         ? "Benchmark running - \(controller.runningLabel ?? "")"
+                                                         : "Start a benchmark to see throughput."))
                     .frame(maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
@@ -96,7 +96,7 @@ struct BenchView: View {
         let distributed = controller.runningMode == .distributed
         return HStack(spacing: 8) {
             ProgressView().controlSize(.small)
-            Label("In esecuzione: \(controller.runningLabel ?? "")",
+            Label("Running: \(controller.runningLabel ?? "")",
                   systemImage: distributed ? "network" : "memorychip")
                 .foregroundStyle(distributed ? Color.blue : Color.green)
                 .font(.callout)
@@ -107,26 +107,26 @@ struct BenchView: View {
     private var throughputChart: some View {
         Chart {
             ForEach(controller.rows) { row in
-                LineMark(x: .value("Contesto", row.ctxTokens),
+                LineMark(x: .value("Context", row.ctxTokens),
                          y: .value("t/s", row.prefillTps),
-                         series: .value("Serie", "Prefill"))
-                    .foregroundStyle(by: .value("Serie", "Prefill"))
-                PointMark(x: .value("Contesto", row.ctxTokens),
+                         series: .value("Series", "Prefill"))
+                    .foregroundStyle(by: .value("Series", "Prefill"))
+                PointMark(x: .value("Context", row.ctxTokens),
                           y: .value("t/s", row.prefillTps))
-                    .foregroundStyle(by: .value("Serie", "Prefill"))
+                    .foregroundStyle(by: .value("Series", "Prefill"))
             }
             ForEach(controller.rows) { row in
-                LineMark(x: .value("Contesto", row.ctxTokens),
+                LineMark(x: .value("Context", row.ctxTokens),
                          y: .value("t/s", row.genTps),
-                         series: .value("Serie", "Generazione"))
-                    .foregroundStyle(by: .value("Serie", "Generazione"))
-                PointMark(x: .value("Contesto", row.ctxTokens),
+                         series: .value("Series", "Generation"))
+                    .foregroundStyle(by: .value("Series", "Generation"))
+                PointMark(x: .value("Context", row.ctxTokens),
                           y: .value("t/s", row.genTps))
-                    .foregroundStyle(by: .value("Serie", "Generazione"))
+                    .foregroundStyle(by: .value("Series", "Generation"))
             }
         }
-        .chartXAxisLabel("Token di contesto")
-        .chartYAxisLabel("Token/secondo")
+        .chartXAxisLabel("Context Tokens")
+        .chartYAxisLabel("Tokens/second")
         .chartLegend(position: .top)
     }
 }

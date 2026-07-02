@@ -20,15 +20,15 @@ enum GitTool {
 
     static func run(argsLine: String) -> String {
         guard let root = ProjectCache.shared.rootURL() else {
-            return "Nessun progetto importato: il tool git lavora sulla cartella del progetto attivo."
+            return "No project imported: the git tool runs in the active project folder."
         }
         let tokens = tokenize(argsLine)
-        guard let sub = tokens.first else { return "Argomento 'args' vuoto. Esempio: {\"args\":\"diff --stat\"}." }
+        guard let sub = tokens.first else { return "Empty 'args' argument. Example: {\"args\":\"diff --stat\"}." }
         guard allowedSubcommands.contains(sub) else {
-            return "Sottocomando git non permesso: '\(sub)'. Permessi: \(allowedSubcommands.sorted().joined(separator: ", "))."
+            return "Git subcommand not allowed: '\(sub)'. Allowed: \(allowedSubcommands.sorted().joined(separator: ", "))."
         }
         if let bad = tokens.first(where: { forbiddenTokens.contains($0) }) {
-            return "Opzione non permessa: '\(bad)'."
+            return "Option not allowed: '\(bad)'."
         }
 
         // Sandbox blocks ~/.gitconfig, so a commit may lack an identity: probe and
@@ -38,7 +38,7 @@ enum GitTool {
             args = ["-c", "user.name=DwarfStar Agent", "-c", "user.email=agent@dwarfstar.local"] + args
         }
         let out = execute(args, in: root, timeout: timeoutSeconds)
-        return out.isEmpty ? "(nessun output — comando riuscito)" : out
+        return out.isEmpty ? "(no output - command succeeded)" : out
     }
 
     /// Whitespace tokenizer with double/single-quote support (no shell semantics).
@@ -98,7 +98,7 @@ enum GitTool {
         }
         if proc.isRunning {
             proc.terminate()
-            return "git interrotto: timeout di \(Int(timeout))s."
+            return "git stopped: timeout after \(Int(timeout))s."
         }
         // Drain whatever the reader has collected.
         Thread.sleep(forTimeInterval: 0.05)
@@ -107,7 +107,7 @@ enum GitTool {
             text = "exit \(proc.terminationStatus)\n" + text
         }
         if text.count > maxOutput {
-            text = String(text.prefix(maxOutput)) + "\n… (output troncato a \(maxOutput) caratteri)"
+            text = String(text.prefix(maxOutput)) + "\n... (output truncated to \(maxOutput) characters)"
         }
         return text
     }

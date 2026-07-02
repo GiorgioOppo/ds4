@@ -1,7 +1,13 @@
 # Tests/DS4CoreTests
 
-Test di parità/unitari per `DS4Core` + `DS4Metal` + `DS4Engine` (XCTest). Ogni file mira a un kernel o componente e ne confronta l'output con un riferimento (spesso una versione CPU faithful).
+Parity and unit tests for `DS4Core`, `DS4Metal`, and `DS4Engine` with XCTest.
+Each file targets a kernel or component and compares the output against a
+reference, often a CPU-faithful implementation.
 
-Aree coperte: kernel Metal (`Graph*`, `Metal*`, `MoE`), `StreamingDecoder`, GGUF loader, Half, KVCFile, downloader (`sha256Hex`, target map).
+Covered areas include Metal kernels (`Graph*`, `Metal*`, `MoE`),
+`StreamingDecoder`, the GGUF loader, `Half`, `KVCFile`, and downloader utilities
+such as `sha256Hex` and the target map.
 
-Da aggiungere quando si tocca un'invariante numerica (es. il **raw-KV ring**): un test che genera N>nSWA token con e senza la feature e asserisce l'uguaglianza.
+When touching a numerical invariant, such as the **raw-KV ring**, add a test that
+generates more than `nSWA` tokens with and without the feature and asserts
+equality.

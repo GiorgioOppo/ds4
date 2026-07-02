@@ -1,13 +1,19 @@
 # Sources
 
-Tutto il codice Swift, diviso per **target** (moduli). Pipeline: `DS4Core → DS4Metal → DS4Engine → DwarfStar`.
+All Swift code, split by **target**. The main dependency pipeline is:
 
-| Target | Tipo | Ruolo |
+```text
+DS4Core -> DS4Metal -> DS4Engine -> DwarfStar
+```
+
+| Target | Type | Role |
 |---|---|---|
-| `DS4Core/` | libreria | core puro: GGUF mmap, tokenizer, sampler, shape, formato chat/tool (no Metal) |
-| `DS4Metal/` | libreria | runtime Metal + grafo di decode + kernel (port di `ds4_metal.m`) |
-| `DS4Engine/` | libreria | `InferenceService` (attore), tool/agenti, KV su disco, sub-agent, distribuito |
-| `DwarfStar/` | app | GUI SwiftUI (chat, agenti, progetti, server, benchmark, diagnostica) |
-| `DS4Demo/` | CLI | demo: bring-up Metal + streaming GGUF |
+| `DS4Core/` | library | Pure Swift core: GGUF mmap, tokenizer, sampler, model shape, chat/tool format. No Metal dependency. |
+| `DS4Metal/` | library | Metal runtime, decode graph, KV cache, and GPU kernels; this is the Swift/Metal port of `ds4_metal.m`. |
+| `DS4Engine/` | library | `InferenceService` actor, tools/agents, disk KV, sub-agents, model download, and distributed inference. |
+| `DwarfStar/` | app | SwiftUI macOS GUI: chat, agents, projects, server, benchmark, diagnostics, distributed mode, and settings. |
+| `DS4Demo/` | CLI | Minimal command-line demo for Metal bring-up and GGUF streaming/generation. |
 
-Swift non usa le cartelle per i moduli: dentro un target le sottocartelle sono solo organizzazione (gli `import` non cambiano). I confini tra target invece sono reali (vedi le `dependencies` in `Package.swift`).
+Swift does not use folders as module boundaries. Inside a target, subdirectories
+are only organizational; imports do not change. Boundaries between targets are
+real and are declared through `dependencies` in `Package.swift`.

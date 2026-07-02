@@ -1,8 +1,13 @@
 # DwarfStar/App
 
-Shell dell'app e stato condiviso.
+Application shell and shared state.
 
-- **`DwarfStarApp.swift`** — `@main`: crea lo `ChatStore` e la finestra.
-- **`RootView.swift`** — `NavigationSplitView` con la sidebar; istanzia e condivide i controller (Chat, Distribuito, Server, Bench, Diagnostica).
-- **`AppSettings.swift`** — settings persistiti (path modello, contesto…) posseduti da Impostazioni e proxati dagli altri controller.
-- **`AppEnvironment.swift`** — risoluzione dei path (dev vs bundle), preset hardware in base alla RAM, helper memoria.
+- **`DwarfStarApp.swift`** is the `@main` entry point. It creates `ChatStore` and
+  the main window.
+- **`RootView.swift`** owns the `NavigationSplitView` sidebar and instantiates the
+  shared controllers for Chat, Distributed, Server, Bench, and Diagnostics.
+- **`AppSettings.swift`** stores persisted settings such as model path and context
+  length. Settings owns these values; other controllers read them through the
+  shared app state.
+- **`AppEnvironment.swift`** resolves paths for development vs bundled app runs,
+  computes RAM-based hardware presets, and exposes memory helpers.

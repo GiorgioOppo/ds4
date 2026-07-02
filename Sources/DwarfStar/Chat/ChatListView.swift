@@ -17,16 +17,16 @@ struct ChatListView: View {
                     store.newChat()
                     dismiss()
                 } label: {
-                    Label("Nuova", systemImage: "square.and.pencil")
+                    Label("New", systemImage: "square.and.pencil")
                 }
                 .buttonStyle(.borderless)
-                .help("Inizia una nuova conversazione")
+                .help("Start a new conversation")
             }
             .padding(10)
             Divider()
 
             if store.sessions.isEmpty {
-                Text("Nessuna chat salvata")
+                Text("No saved chats")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -41,12 +41,12 @@ struct ChatListView: View {
             }
         }
         .frame(width: 320, height: 420)
-        .alert("Rinomina chat", isPresented: Binding(
+        .alert("Rename Chat", isPresented: Binding(
             get: { renamingId != nil },
             set: { if !$0 { renamingId = nil } })) {
-            TextField("Titolo", text: $renameText)
-            Button("Annulla", role: .cancel) { renamingId = nil }
-            Button("Salva") {
+            TextField("Title", text: $renameText)
+            Button("Cancel", role: .cancel) { renamingId = nil }
+            Button("Save") {
                 if let id = renamingId { store.renameSession(id, to: renameText) }
                 renamingId = nil
             }
@@ -65,7 +65,7 @@ struct ChatListView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(session.title.isEmpty ? ChatSession.untitled : session.title)
                         .lineLimit(1)
-                    Text("\(session.messages.count) messaggi · \(session.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                    Text("\(session.messages.count) messages · \(session.updatedAt.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -81,10 +81,10 @@ struct ChatListView: View {
             Button {
                 renameText = session.title
                 renamingId = session.id
-            } label: { Label("Rinomina", systemImage: "pencil") }
+            } label: { Label("Rename", systemImage: "pencil") }
             Button(role: .destructive) {
                 store.deleteSession(session.id)
-            } label: { Label("Elimina", systemImage: "trash") }
+            } label: { Label("Delete", systemImage: "trash") }
         }
     }
 }

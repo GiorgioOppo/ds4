@@ -8,9 +8,9 @@ struct DownloadView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Scarica un modello")
+            Text("Download a Model")
                 .font(.title2).bold()
-            Text("Download nativo da Hugging Face in \(store.scriptDir)/gguf. I download parziali riprendono automaticamente.")
+            Text("Native download from Hugging Face into \(store.scriptDir)/gguf. Partial downloads resume automatically.")
                 .font(.caption).foregroundStyle(.secondary)
 
             ForEach(ModelCatalog.downloadTargets) { target in
@@ -20,7 +20,7 @@ struct DownloadView: View {
                         Text(target.detail).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Scarica") {
+                    Button("Download") {
                         runner.run(target: target.id, scriptDir: store.scriptDir)
                     }
                     .disabled(runner.isRunning)
@@ -42,17 +42,17 @@ struct DownloadView: View {
 
             if runner.isRunning {
                 ProgressView(value: runner.progress) {
-                    Text("Download di \(runner.currentTarget ?? "")… \(runner.progressText)")
+                    Text("Downloading \(runner.currentTarget ?? "")... \(runner.progressText)")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
 
             HStack {
                 if runner.isRunning {
-                    Button("Annulla") { runner.cancel() }
+                    Button("Cancel") { runner.cancel() }
                 }
                 Spacer()
-                Button("Chiudi") {
+                Button("Close") {
                     store.scanModels()
                     dismiss()
                 }

@@ -1,3 +1,6 @@
 # DwarfStar/Settings
 
-- **`SettingsView.swift`** — pannello Impostazioni: modello e contesto (impostati una volta, ereditati ovunque), e la sezione Memoria (cache esperti, KV su disco + budget, raw-KV ring). I valori si applicano al **prossimo caricamento** del modello.
+- **`SettingsView.swift`** renders global Settings. Model path and context length
+  are configured once and inherited everywhere. The Memory section controls
+  expert cache, disk KV plus budget, and raw-KV ring behavior. Values apply on
+  the **next model load**.

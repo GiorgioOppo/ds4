@@ -24,7 +24,7 @@ final class DownloadRunner {
             log += "Unknown target: \(target)\n"; return
         }
         let ggufDir = (scriptDir as NSString).appendingPathComponent("gguf")
-        log = "Scarico \(t.file)\n→ \(ggufDir)\n(circa \(t.approxGB) GB; i download parziali riprendono)\n"
+        log = "Downloading \(t.file)\n-> \(ggufDir)\n(about \(t.approxGB) GB; partial downloads resume)\n"
         currentTarget = target
         isRunning = true
         progress = 0
@@ -58,11 +58,11 @@ final class DownloadRunner {
 
             do {
                 let path = try await dl
-                log += "\nCompletato: \(path)\n"; progress = 1
+                log += "\nCompleted: \(path)\n"; progress = 1
             } catch is CancellationError {
-                log += "\n[annullato — il file .part resta per riprendere]\n"
+                log += "\n[canceled - the .part file is kept for resume]\n"
             } catch {
-                log += "\nErrore: \(error)\n"
+                log += "\nError: \(error)\n"
             }
             isRunning = false
         }

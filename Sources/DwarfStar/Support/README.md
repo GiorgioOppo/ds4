@@ -1,6 +1,8 @@
 # DwarfStar/Support
 
-Utility trasversali della GUI.
+Cross-cutting GUI utilities.
 
-- **`EngineLog.swift`** — buffer/tail dei log del motore (mostrato in coda agli errori in chat).
-- **`ProcessStream.swift`** — helper per path assoluti e stream di sottoprocessi.
+- **`EngineLog.swift`** stores a tail buffer of engine logs, shown after chat
+  errors to give the user immediate context.
+- **`ProcessStream.swift`** provides helpers for absolute paths and subprocess
+  output streams.

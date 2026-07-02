@@ -37,7 +37,7 @@ struct ChatView: View {
             }
             Spacer()
             projectMenu
-            Picker("Agente", selection: Binding(get: { store.selectedAgentId },
+            Picker("Agent", selection: Binding(get: { store.selectedAgentId },
                                                 set: { store.selectAgent($0) })) {
                 ForEach(store.agents) { agent in
                     Label(agent.name, systemImage: agent.icon).tag(agent.id)
@@ -45,7 +45,7 @@ struct ChatView: View {
             }
             .pickerStyle(.menu)
             .fixedSize()
-            .help("Cambia ruolo: nuova chat con il system prompt e i tool dell'agente; la cache esperti si ri-scalda col SUO profilo d'uso.")
+            .help("Change role: starts a new chat with the agent's system prompt and tools; the expert cache warms from that agent's usage profile.")
             Button {
                 showTools = true
             } label: {
@@ -66,7 +66,7 @@ struct ChatView: View {
             Button {
                 store.newChat()
             } label: {
-                Label("Nuova chat", systemImage: "square.and.pencil")
+                Label("New Chat", systemImage: "square.and.pencil")
             }
         }
         .padding(.horizontal)
@@ -78,25 +78,25 @@ struct ChatView: View {
     private var temperatureMenu: some View {
         Menu {
             VStack(alignment: .leading) {
-                Text("Temperatura: \(store.temperature, format: .number.precision(.fractionLength(2)))")
+                Text("Temperature: \(store.temperature, format: .number.precision(.fractionLength(2)))")
                     .font(.caption).foregroundStyle(.secondary)
                 Slider(value: $store.temperature, in: 0...1.5, step: 0.05)
                     .frame(width: 220)
-                Text("Bassa = più focalizzato, meno deriva. Alta = più creativo. 0 = greedy (deterministico, come la demo).")
+                Text("Low = more focused, less drift. High = more creative. 0 = greedy, deterministic like the demo.")
                     .font(.caption2).foregroundStyle(.secondary)
                 HStack {
                     Button("Greedy (0)") { store.temperature = 0 }
-                    Button("Preciso (0.3)") { store.temperature = 0.3 }
+                    Button("Precise (0.3)") { store.temperature = 0.3 }
                     Button("Default (0.6)") { store.temperature = 0.6 }
                 }
                 .buttonStyle(.borderless).font(.caption)
 
                 Divider()
-                Text("Penalità ripetizione: \(store.repetitionPenalty, format: .number.precision(.fractionLength(2)))")
+                Text("Repetition penalty: \(store.repetitionPenalty, format: .number.precision(.fractionLength(2)))")
                     .font(.caption).foregroundStyle(.secondary)
                 Slider(value: $store.repetitionPenalty, in: 1.0...1.5, step: 0.05)
                     .frame(width: 220)
-                Text("Alza (1.15–1.3) se il modello entra in loop di ripetizione dopo molti token.")
+                Text("Raise it (1.15-1.3) if the model starts repeating after many tokens.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
             .padding(8)
@@ -106,7 +106,7 @@ struct ChatView: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .help("Temperatura di campionamento: abbassala (0.3–0.4) se il modello sbanda o ripete.")
+        .help("Sampling temperature: lower it (0.3-0.4) if the model drifts or repeats.")
     }
 
     private var toolButtonTitle: String {
@@ -119,7 +119,7 @@ struct ChatView: View {
     private var projectMenu: some View {
         Menu {
             if projects.isEmpty {
-                Text("Nessun progetto salvato")
+                Text("No saved projects")
             }
             ForEach(projects) { p in
                 Button {
@@ -139,13 +139,13 @@ struct ChatView: View {
                     refreshProject()
                 }
             } label: {
-                Label("Importa cartella…", systemImage: "folder.badge.plus")
+                Label("Import Folder...", systemImage: "folder.badge.plus")
             }
         } label: {
-            Label(activeProjectName ?? "Progetto", systemImage: "folder")
+            Label(activeProjectName ?? "Project", systemImage: "folder")
         }
         .fixedSize()
-        .help("Progetto attivo per i tool project_* dell'agente. L'import non tocca la memoria della chat.")
+        .help("Active project for the agent's project_* tools. Importing does not touch chat memory.")
         .onAppear { refreshProject() }
     }
 
@@ -203,12 +203,12 @@ struct ChatView: View {
                 .font(.caption2).foregroundStyle(.orange)
         }
         if let est = store.attachmentTokenEstimate, est > store.contextSize - 256 {
-            Label("Allegati ~\(est) token: rischiano di superare il contesto (\(store.contextSize)). Riduci i file o aumenta il contesto in Impostazioni.",
+            Label("Attachments are ~\(est) tokens and may exceed the context (\(store.contextSize)). Reduce files or increase context in Settings.",
                   systemImage: "exclamationmark.triangle")
                 .font(.caption2).foregroundStyle(.orange)
         }
         if store.contextUsed > 0, store.contextUsed * 100 >= store.contextSize * 85 {
-            Label("Contesto quasi pieno: \(store.contextUsed)/\(store.contextSize) token. A breve la risposta verrà troncata: inizia una nuova chat o aumenta il contesto (Impostazioni).",
+            Label("Context nearly full: \(store.contextUsed)/\(store.contextSize) tokens. Responses may soon be truncated: start a new chat or increase context in Settings.",
                   systemImage: "exclamationmark.triangle.fill")
                 .font(.caption2).foregroundStyle(.orange)
         }
@@ -217,9 +217,9 @@ struct ChatView: View {
                 Image(systemName: "paperclip")
             }
             .buttonStyle(.borderless)
-            .help("Importa file di testo nella conversazione")
+            .help("Import text files into the conversation")
             .disabled(store.isGenerating)
-            TextField("Scrivi un messaggio…", text: $store.input, axis: .vertical)
+            TextField("Write a message...", text: $store.input, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...6)
                 .onSubmit { store.send() }
@@ -258,7 +258,7 @@ struct AttachmentChip: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
-            .help("Rimuovi allegato")
+            .help("Remove attachment")
         }
         .padding(.horizontal, 8).padding(.vertical, 4)
         .background(Color.secondary.opacity(0.12))
@@ -485,7 +485,7 @@ struct ToolStreamView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Label("Generazione chiamata tool…", systemImage: "wrench.and.screwdriver")
+            Label("Generating tool call...", systemImage: "wrench.and.screwdriver")
                 .font(.caption.bold())
                 .foregroundStyle(.orange.opacity(0.7))
             Text(text)
@@ -508,7 +508,7 @@ struct ToolCallView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Label("Chiamata tool: \(call.name)", systemImage: "wrench.and.screwdriver.fill")
+            Label("Tool call: \(call.name)", systemImage: "wrench.and.screwdriver.fill")
                 .font(.caption.bold())
                 .foregroundStyle(.orange)
             Text(call.argumentsJSON)
@@ -549,7 +549,7 @@ struct SubAgentView: View {
                         }
                     }
                 } label: {
-                    Label("Passi interni (\(run.steps.count))", systemImage: "list.bullet.indent")
+                    Label("Internal steps (\(run.steps.count))", systemImage: "list.bullet.indent")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
@@ -589,7 +589,7 @@ struct ReasoningView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
-            Label("Ragionamento", systemImage: "brain")
+            Label("Reasoning", systemImage: "brain")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -607,13 +607,13 @@ struct ToolPickerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Tool").font(.title2).bold()
-            Toggle("Abilita i tool (function calling)", isOn: $store.toolsEnabled)
+            Toggle("Enable tools (function calling)", isOn: $store.toolsEnabled)
                 .onChange(of: store.toolsEnabled) { store.syncTools() }
-            Text("Quando abilitati, i tool selezionati vengono dichiarati al modello. I tool integrati vengono eseguiti automaticamente; per altri tool potrai inserire il risultato a mano.")
+            Text("When enabled, selected tools are declared to the model. Built-in tools run automatically; for other tools you can enter the result manually.")
                 .font(.caption).foregroundStyle(.secondary)
 
             Divider()
-            Text("Tool integrati").font(.headline)
+            Text("Built-in Tools").font(.headline)
             ForEach(store.availableTools) { tool in
                 Toggle(isOn: Binding(
                     get: { store.enabledToolNames.contains(tool.name) },
@@ -631,16 +631,16 @@ struct ToolPickerView: View {
             }
 
             Divider()
-            Toggle("Dichiarazione compatta (solo nome+parametri)", isOn: $store.compactTools)
+            Toggle("Compact declaration (name + parameters only)", isOn: $store.compactTools)
                 .onChange(of: store.compactTools) { store.syncTools() }
                 .disabled(!store.toolsEnabled)
-            Text("Meno token di prefill: invece dello schema completo manda solo `nome(parametri)` + una riga di formato. Più economico ma si discosta dal testo di addestramento.")
+            Text("Fewer prefill tokens: sends only `name(parameters)` plus one format line instead of the full schema. Cheaper, but less faithful to the training text.")
                 .font(.caption).foregroundStyle(.secondary)
 
             Spacer()
             HStack {
                 Spacer()
-                Button("Chiudi") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Close") { dismiss() }.keyboardShortcut(.defaultAction)
             }
         }
         .padding()
@@ -655,8 +655,8 @@ struct ManualToolResultsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Risultati dei tool").font(.title2).bold()
-            Text("Il modello ha chiamato dei tool non integrati. Inserisci il risultato (idealmente JSON) per ciascuno e invia per continuare.")
+            Text("Tool Results").font(.title2).bold()
+            Text("The model called tools that are not built in. Enter a result, ideally JSON, for each one and submit to continue.")
                 .font(.caption).foregroundStyle(.secondary)
 
             ForEach(store.pendingManualCalls) { call in
@@ -672,9 +672,9 @@ struct ManualToolResultsView: View {
             }
 
             HStack {
-                Button("Annulla") { store.cancelManualResults() }
+                Button("Cancel") { store.cancelManualResults() }
                 Spacer()
-                Button("Invia risultati") { store.submitManualResults(contents) }
+                Button("Submit Results") { store.submitManualResults(contents) }
                     .keyboardShortcut(.defaultAction)
             }
         }

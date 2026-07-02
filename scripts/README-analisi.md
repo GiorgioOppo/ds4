@@ -1,50 +1,61 @@
-# Analisi di compressione del GGUF
+# GGUF Compression Analysis
 
-Due strumenti Python per ragionare *sui numeri* prima di investire in nuovi
-kernel o fine-tuning (vedi la discussione su quantizzazione / rappresentazione
-"a grafo" coi pesi sugli archi).
+Two Python tools help reason from measured numbers before investing in new
+kernels, compression strategies, or fine-tuning work. They are especially useful
+for exploring quantization and graph-style representations where weights live on
+edges.
 
 ```sh
-pip install -U gguf numpy        # gguf di llama.cpp = dequantizzazione corretta di tutti i formati
+pip install -U gguf numpy        # llama.cpp's gguf package provides correct dequantization
 ```
 
-## 1. `gguf_spectrum.py` — quanto è comprimibile?
+## 1. `gguf_spectrum.py`: How Compressible Is It?
 
-Per i tensori principali calcola lo **spettro dei valori singolari** e riporta il
-rank effettivo (90/95/99% dell'energia) e il guadagno se fattorizzati low-rank.
-Per gli **esperti** stima la **ridondanza fra i 256** (PCA fra esperti) → quante
-"basi" condivise basterebbero.
+For the main tensors, this script computes the **singular-value spectrum** and
+reports the effective rank at 90/95/99% retained energy, plus the potential
+parameter savings from low-rank factorization.
+
+For **experts**, it estimates **redundancy across the 256 experts** with PCA over
+expert matrices. That tells you how many shared bases might be enough before a
+quality recovery pass.
 
 ```sh
-python3 scripts/gguf_spectrum.py model.gguf                      # layer 2, dense
+python3 scripts/gguf_spectrum.py model.gguf                      # layer 2, dense tensors
 python3 scripts/gguf_spectrum.py model.gguf --layers 0,2,20 --experts
-python3 scripts/gguf_spectrum.py model.gguf --full              # +output/embeddings (lento)
+python3 scripts/gguf_spectrum.py model.gguf --full              # also output/embeddings; slower
 ```
 
-Legge **misura soltanto**, non modifica nulla. Serve a decidere *dove* conviene
-fattorizzare.
+The script only reads and measures. It does not modify the model. Use the output
+to decide *where* factorization is worth trying.
 
-## 2. `gguf_to_graph.py` — i pesi dai nodi agli archi
+## 2. `gguf_to_graph.py`: Moving Weights From Nodes To Edges
 
-Trasforma le matrici in un **grafo fattorizzato**: ogni `W[out×in]` diventa un
-cammino `in ──B[r×in]──► (bottleneck r) ──A[out×r]──► out` (SVD troncata
-`W≈A·B`). I **parametri vivono sugli archi** A, B; i nodi sono spazi di
-attivazione senza parametri. Emette il grafo (JSON / Graphviz DOT), opzionalmente
-i fattori (`.npz`), e il riepilogo compressione + **errore di ricostruzione**.
+This script turns matrices into a **factorized graph**. Each `W[out x in]` becomes
+a path:
+
+```text
+in -- B[r x in] --> bottleneck r -- A[out x r] --> out
+```
+
+The factorization is truncated SVD, so `W ~= A * B`. Parameters live on the A/B
+edges, while nodes are parameter-free activation spaces. The tool can emit the
+graph as JSON or Graphviz DOT, optionally write factors as `.npz`, and report the
+compression summary plus **reconstruction error**.
 
 ```sh
 python3 scripts/gguf_to_graph.py model.gguf --layers 2 --energy 0.95 --dot graph.dot
-dot -Tsvg graph.dot -o graph.svg                                # visualizza il grafo
+dot -Tsvg graph.dot -o graph.svg
 python3 scripts/gguf_to_graph.py model.gguf --layers 0,2 --experts --rank 64 --npz factors.npz
 ```
 
-⚠️ La fattorizzazione è **lossy** (lo script stampa l'errore relativo per matrice):
-per recuperare la qualità servirebbe un fine-tuning. Lo strumento costruisce e
-misura il grafo, non produce un modello pronto all'uso.
+The factorization is **lossy**. The script prints the relative error for each
+matrix; recovering model quality would require fine-tuning. This tool builds and
+measures the graph representation, but it does not produce a ready-to-run model.
 
-## Nota sui formati
+## Format Notes
 
-L'engine Swift esegue solo: esperti **Q4_K / Q2_K / IQ2_XXS**, densi **Q8_0**,
-più F16/F32. Gli script dequantizzano qualunque formato (via `gguf.quants`), ma
-per ANALIZZARE gli esperti col massimo dettaglio conviene la GGUF **q4**
-(esperti Q4_K) — il modello a 2 bit è già al limite dei formati supportati.
+The Swift engine executes expert tensors in **Q4_K / Q2_K / IQ2_XXS**, dense
+tensors in **Q8_0**, plus F16/F32 where needed. The analysis scripts can
+dequantize any format supported by `gguf.quants`, but for high-detail expert
+analysis the **q4** GGUF is usually the best input because experts remain Q4_K.
+The 2-bit model is already close to the edge of the supported formats.

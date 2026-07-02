@@ -1,4 +1,8 @@
 # DwarfStar/Bench
 
-- **`BenchController.swift`** — benchmark nativo: misura prefill + generazione (token/s) a contesti crescenti. Motore selezionabile **Locale** (engine in-process) o **Distribuito** (riusa il coordinatore già connesso).
-- **`BenchView.swift`** — UI: selettore motore, frontiere di contesto, grafico del throughput (Swift Charts), indicatore del motore in esecuzione.
+- **`BenchController.swift`** runs the native benchmark. It measures prefill and
+  generation throughput in tokens/second at increasing context sizes. The engine
+  can be **Local** (in-process) or **Distributed** (reusing the connected
+  coordinator).
+- **`BenchView.swift`** renders the engine selector, context boundaries,
+  throughput chart with Swift Charts, and running-engine indicator.

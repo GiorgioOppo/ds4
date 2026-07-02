@@ -83,16 +83,16 @@ enum HardwarePresets {
         switch gb {
         case ..<24:
             return HardwarePreset(contextSize: 4096, prefersTwoBit: true,
-                summary: "≈\(Int(gb.rounded())) GB: sotto il minimo del progetto (64 GB). Quant 2-bit, contesto 4096; i pesi vengono streamati da SSD (lento ma funziona).")
+                summary: "≈\(Int(gb.rounded())) GB: below the project's 64 GB minimum. Use the 2-bit quant and a 4096 context; weights are streamed from SSD (slow, but works).")
         case ..<80:
             return HardwarePreset(contextSize: 8192, prefersTwoBit: true,
-                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit, contesto 8192; gran parte dei pesi resta in page cache.")
+                summary: "≈\(Int(gb.rounded())) GB: 2-bit quant, 8192 context; most weights stay in the page cache.")
         case ..<200:
             return HardwarePreset(contextSize: 32768, prefersTwoBit: true,
-                summary: "≈\(Int(gb.rounded())) GB: quant 2-bit interamente in RAM, contesto 32768.")
+                summary: "≈\(Int(gb.rounded())) GB: 2-bit quant fully in RAM, 32768 context.")
         default:
             return HardwarePreset(contextSize: 32768, prefersTwoBit: false,
-                summary: "≈\(Int(gb.rounded())) GB: anche la quant Q4 entra in RAM, contesto 32768.")
+                summary: "≈\(Int(gb.rounded())) GB: even the Q4 quant fits in RAM, 32768 context.")
         }
     }
 
@@ -127,10 +127,10 @@ enum MemoryInfo {
         let ram = physicalBytes
         guard let size = fileSize(modelPath), size > 0 else { return nil }
         if size > ram * 4 {
-            return "Le parti non-routed del modello e la KV cache devono stare in RAM. Con \(gib(ram)) di RAM e un modello da \(gib(size)), il rischio di esaurire la memoria (crash) è alto: usa un contesto ridotto o la quant a 2 bit."
+            return "The model's non-routed weights and KV cache must fit in RAM. With \(gib(ram)) of RAM and a \(gib(size)) model, running out of memory is likely: use a smaller context or the 2-bit quant."
         }
         if size > ram {
-            return "Il modello (\(gib(size))) è più grande della RAM (\(gib(ram))): i pesi verranno streamati da SSD a ogni token — funziona, ma molto lentamente (decine di secondi per token)."
+            return "The model (\(gib(size))) is larger than RAM (\(gib(ram))): weights will stream from SSD on every token. It works, but can be very slow."
         }
         return nil
     }

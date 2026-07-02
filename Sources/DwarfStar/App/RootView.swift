@@ -2,14 +2,14 @@ import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable {
     case chat = "Chat"
-    case settings = "Impostazioni"
-    case agents = "Agenti"
-    case project = "Progetto"
+    case settings = "Settings"
+    case agents = "Agents"
+    case project = "Project"
     case tuning = "Tuning"
     case server = "Server"
     case distributed = "Worker"
     case benchmark = "Benchmark"
-    case diagnostics = "Diagnostica"
+    case diagnostics = "Diagnostics"
 
     var id: String { rawValue }
     var icon: String {

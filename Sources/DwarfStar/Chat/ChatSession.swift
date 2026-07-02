@@ -31,7 +31,7 @@ struct ChatSession: Codable, Identifiable {
         self.messages = []
     }
 
-    static let untitled = "Nuova chat"
+    static let untitled = "New Chat"
 }
 
 /// Codable mirror of `UIMessage`.

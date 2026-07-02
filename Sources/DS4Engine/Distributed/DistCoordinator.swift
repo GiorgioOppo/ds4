@@ -46,7 +46,7 @@ public final class DistCoordinator: @unchecked Sendable {
     private var returnListener: DistReturnListener?
     private var returnIter: AsyncStream<DistResult>.Iterator?
 
-    public var routeSummary: String { "\(engine.nLayers) layer · \(entries.count) worker" }
+    public var routeSummary: String { "\(engine.nLayers) layers · \(entries.count) workers" }
 
     public init(config: Config) throws {
         self.config = config
@@ -64,12 +64,12 @@ public final class DistCoordinator: @unchecked Sendable {
             let (type, payload) = try await conn.readFrame()
             guard type == .hello, let h = DistHello.decode(payload) else { throw DistError.badFrame }
             if h.modelName != engine.modelName {
-                onLog("attenzione: worker \(p.host) ha modello '\(h.modelName)' ≠ '\(engine.modelName)'\n")
+                onLog("warning: worker \(p.host) has model '\(h.modelName)' != '\(engine.modelName)'\n")
             }
             conns.append(conn)
             entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: h.layerStart,
                                           layerEnd: h.layerEnd, hasOutput: h.hasOutput))
-            onLog("route: \(p.host):\(p.port) → layer \(h.layerStart)…\(h.layerEnd)\(h.hasOutput ? " +output" : "")\n")
+            onLog("route: \(p.host):\(p.port) -> layers \(h.layerStart)...\(h.layerEnd)\(h.hasOutput ? " +output" : "")\n")
         }
         // Sort by layerStart, keep conns aligned, validate contiguous full coverage.
         let order = entries.indices.sorted { entries[$0].layerStart < entries[$1].layerStart }
@@ -77,21 +77,21 @@ public final class DistCoordinator: @unchecked Sendable {
         conns = order.map { conns[$0] }
         var expected = 0
         for e in entries {
-            guard e.layerStart == expected else { throw DistError.sliceGap("atteso layer \(expected), trovato \(e.layerStart)") }
+            guard e.layerStart == expected else { throw DistError.sliceGap("expected layer \(expected), found \(e.layerStart)") }
             expected = e.layerEnd + 1
         }
         guard expected == engine.nLayers else {
-            throw DistError.sliceGap("copertura \(expected)/\(engine.nLayers) layer — la route deve coprire 0…\(engine.nLayers - 1) in modo contiguo (manca da \(expected) in poi)")
+            throw DistError.sliceGap("coverage \(expected)/\(engine.nLayers) layers: the route must cover 0...\(engine.nLayers - 1) contiguously (missing from \(expected) onward)")
         }
         if config.forward {
             let l = DistReturnListener()
             try l.start(port: config.returnPort)
             returnListener = l
             returnIter = l.results.makeAsyncIterator()
-            onLog("listener di ritorno su :\(config.returnPort)\n")
+            onLog("return listener on :\(config.returnPort)\n")
         }
-        onLog("route completa: \(engine.nLayers) layer su \(entries.count) worker"
-              + (config.forward ? " · inoltro worker→worker" : " · relay") + "\n")
+        onLog("route complete: \(engine.nLayers) layers on \(entries.count) workers"
+              + (config.forward ? " · worker-to-worker forwarding" : " · relay") + "\n")
     }
 
     public func disconnect() {
@@ -116,8 +116,8 @@ public final class DistCoordinator: @unchecked Sendable {
                      onToken: @Sendable (String) -> Void) async throws -> [ToolCall] {
         guard !entries.isEmpty else { throw DistError.closed }
         let ids = engine.chatPromptIds(turns: turns, tools: tools, think: think)
-        guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt oltre il contesto") }
-        onLog("prefill \(ids.count) token (chunk \(config.prefillChunk))…\n")
+        guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt exceeds context") }
+        onLog("prefill \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
 
         // PREFILL the whole prompt in chunks, fresh KV (posBase 0 resets workers).
         var pos = 0
@@ -139,14 +139,14 @@ public final class DistCoordinator: @unchecked Sendable {
             }
             pos += end - start
             start = end
-            onProgress("prefill \(pos)/\(ids.count) token…")
+            onProgress("prefill \(pos)/\(ids.count) tokens...")
         }
         guard !lastLogits.isEmpty else { throw DistError.badFrame }
         // Diagnose where the pipeline breaks: a sane top token here = prefill OK,
         // problem in decode; garbage here = problem in embed/slice/head/wire.
         if let mx = lastLogits.indices.max(by: { lastLogits[$0] < lastLogits[$1] }) {
             let finite = lastLogits.filter { $0.isFinite }.count
-            onLog(String(format: "diag: prefill top=%d (%@) logit=%.2f · %d/%d finiti\n",
+            onLog(String(format: "diag: prefill top=%d (%@) logit=%.2f · %d/%d finite\n",
                          mx, engine.tokenText(mx), lastLogits[mx], finite, lastLogits.count))
         }
 
@@ -197,12 +197,12 @@ public final class DistCoordinator: @unchecked Sendable {
             lastLogits = logits
             pos += 1; produced += 1
             let elapsed = Date().timeIntervalSince(t0)
-            onProgress(String(format: "%d token · %.2f tok/s", produced,
+            onProgress(String(format: "%d tokens · %.2f tok/s", produced,
                               elapsed > 0 ? Double(produced) / elapsed : 0))
         }
         if pendingLT, !inTool { emit("<") }
         let dt = Date().timeIntervalSince(t0)
-        onLog("[\(produced) token · \(String(format: "%.2f", dt > 0 ? Double(produced) / dt : 0)) tok/s]\n")
+        onLog("[\(produced) tokens · \(String(format: "%.2f", dt > 0 ? Double(produced) / dt : 0)) tok/s]\n")
         guard inTool else { return engine.parseToolCalls(visible).calls }
         return engine.parseToolCalls(visible + toolText).calls
     }

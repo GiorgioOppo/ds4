@@ -1,251 +1,275 @@
 # DwarfStar — DeepSeek-V4 on macOS
 
-Native Swift / SwiftUI app for **DeepSeek-V4-Flash (284B MoE)** on Apple Silicon,
-with a **pure-Swift Metal inference engine** (a faithful port of the upstream
-`ds4.c` / `ds4_metal.m`). No C engine, no prebuilt static lib, no external links.
-The 2-bit GGUF runs on a 16 GB MacBook by streaming weights from SSD.
+DwarfStar is a native Swift / SwiftUI application for running
+**DeepSeek-V4-Flash (284B MoE)** on Apple Silicon with a **pure-Swift Metal
+inference engine**. The engine is a faithful port of upstream `ds4.c` /
+`ds4_metal.m`: no C runtime engine, no prebuilt static library, and no external
+process for normal inference. The 2-bit GGUF runs on a 16 GB MacBook by
+streaming routed expert weights from SSD.
 
-> 📖 **Documentazione dettagliata (IT):** [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md)
-> (uso, GUI, tool, agenti, server, distribuito) · [`docs/ARCHITETTURA-MOTORE.md`](docs/ARCHITETTURA-MOTORE.md)
-> (interni del motore: tokenizer, decoder, MoE, NSA, streaming, cache esperti) ·
-> [`docs/CRITTOGRAFIA.md`](docs/CRITTOGRAFIA.md) (crittografia ed export compliance App Store).
+> Detailed documentation:
+> [`docs/DOCUMENTAZIONE.md`](docs/DOCUMENTAZIONE.md) for usage, GUI, tools,
+> agents, server, distributed inference, and troubleshooting ·
+> [`docs/ARCHITETTURA-MOTORE.md`](docs/ARCHITETTURA-MOTORE.md) for engine
+> internals · [`docs/CRITTOGRAFIA.md`](docs/CRITTOGRAFIA.md) for encryption and
+> App Store export compliance.
 
 ## Architecture
 
+```text
+DwarfStar (SwiftUI)            <- chat · agents · projects · tuning · server ·
+        |                         distributed worker · benchmark · diagnostics
+   DS4Engine (Swift)           <- InferenceService actor, event streams,
+        |                         DSML tools, agents, ProjectCache,
+        |                         HTTP server, distributed coordinator/worker
+   DS4Core + DS4Metal (Swift)  <- GGUF mmap, tokenizer, sampler, chat rendering,
+        |                         Metal runtime, decode graph, expert cache
+   metal/*.metal               <- kernel source of truth, embedded at build time
 ```
-DwarfStar (SwiftUI)            ← chat · agenti · progetti · tuning · server ·
-        │                        distribuito · benchmark · diagnostica
-   DS4Engine (Swift)           ← InferenceService (actor): prompt → event stream;
-        │                        tools (DSML) · agenti · ProjectCache ·
-        │                        distributed runtime (worker/coordinator)
-   DS4Core + DS4Metal (Swift)  ← pure-Swift engine: GGUF mmap, tokenizer, sampler,
-        │                        Metal runtime + decode graph, expert slot-cache
-   metal/*.metal               ← kernels, embedded in the binary at build time
-```
 
-The engine is a faithful Swift reimplementation; correctness is the project's
-#1 rule, validated by the tests in `Tests/DS4CoreTests/`.
+Correctness is the primary project rule. The Swift engine is validated by the
+tests in `Tests/DS4CoreTests/`, with many kernels and graph stages checked
+against the upstream behavior.
 
-### Engine key facts
+## Engine Facts
 
-- **SSD streaming is the only path.** Non-routed weights are no-copy `mmap`
-  views (resident via the OS page cache, evictable); per token only the
-  **6/256 routed experts** of the current layer are gathered. The model never
-  needs to fit in RAM.
-- **Metal kernels embedded in the binary** (`make embed-kernels` regenerates
-  `Sources/DS4Metal/Runtime/KernelSources.swift` from `metal/*.metal`). No
-  on-disk `metal/` folder is needed at runtime. Fused MoE kernels
-  (pair-SwiGLU / down-sum6) cover q4_K, q2_K, iq2_xxs experts.
-- **Expert slot-cache + usage imatrix.** An optional per-layer LRU pool keeps
-  hot experts resident on GPU; routing-frequency statistics are persisted
-  per model **and per agent** and pre-warm the cache (Tuning tab).
-- **Multi-turn KV reuse.** The conversation is append-only (`committedIds`):
-  each turn prefills only the new suffix; an interrupted generation rebuilds
-  the KV from the exact committed ids (the NSA compressor is recurrent and
-  cannot rewind).
-- **Tool calling (DSML).** The DeepSeek-V4 native format: an XML scheme on the
-  `｜DSML｜` control token, rendered exactly like the GGUF's `chat_template`
-  (compact or full declaration). Tool results return as
-  `<tool_result>…</tool_result>` inside a user turn.
-- **Layer-major prefill** in chunks (512): each layer's weights are loaded once
-  per chunk and applied to all its tokens; the routed-FFN phase gathers the
-  **union** of the chunk's experts once instead of 6 per token.
+- **SSD streaming is the only model-load path.** Non-routed weights are no-copy
+  `mmap` views backed by the OS page cache. On each token, only the routed
+  experts selected for the current layer are gathered. The full model never has
+  to fit in RAM.
+- **Metal kernels are embedded in the binary.** `make embed-kernels` regenerates
+  `Sources/DS4Metal/Runtime/KernelSources.swift` from `metal/*.metal`, so a
+  packaged app does not need an on-disk `metal/` folder at runtime.
+- **Fused MoE kernels cover the deployed expert formats.** Pair-SwiGLU and
+  down-sum6 paths cover q4_K, q2_K, and iq2_xxs experts.
+- **Expert slot-cache is optional and usage-driven.** A per-layer LRU cache can
+  keep hot experts resident on GPU. Routing-frequency statistics are persisted
+  per model and per agent, then used to pre-warm and redistribute cache slots.
+- **Multi-turn KV reuse is append-only.** `InferenceService` tracks exact
+  committed token ids. Each new turn prefills only the suffix that is not
+  already in the KV. If generation is interrupted, the next turn rebuilds from
+  committed ids because the NSA compressor is recurrent and cannot rewind.
+- **Tool calling uses native DSML.** The model's `｜DSML｜` control token opens an
+  XML-style call format rendered from the GGUF chat template. Tool results are
+  returned as `<tool_result>...</tool_result>` inside a user turn.
+- **Layer-major prefill amortizes I/O.** Prefill runs in chunks: each layer's
+  weights are loaded once per chunk and applied to all prompt tokens. The routed
+  FFN phase gathers the union of experts for that chunk rather than 6 experts
+  per token.
 
-## The app
+## The App
 
-| Tab | What it does |
+| Tab | Purpose |
 |---|---|
-| **Chat** | streaming chat (markdown), reasoning collassabile, tool-call live, riuso KV multi-turno, import progetto e **import di file di testo**, avviso di contesto quasi pieno · modo **Locale** (in-process) o **Distribuito** (coordina il cluster di worker) |
-| **Agenti** | ruoli con prompt/icone/tool per agente, editor completo, export/import JSON, profilo di uso esperti per agente |
-| **Progetto** | libreria di progetti (cartelle indicizzate, bookmark sandbox); i tool `project_list/read/search` li esplorano senza toccare la memoria chat |
-| **Tuning** | slot della cache esperti, hit-rate, concentrazione del routing per layer (la "usage imatrix") |
-| **Server** | server HTTP **nativo in-process** OpenAI/Anthropic-compatible (vedi sotto) |
-| **Worker** | questo Mac come worker del cluster distribuito (possiede uno slice di layer; il coordinatore sta in Chat → Distribuito) |
-| **Benchmark** | nativo: prefill + generazione (token/s) a contesti crescenti, con grafico (Swift Charts); motore **Locale** o **Distribuito** (riusa il coordinatore connesso) |
-| **Diagnostica** | dump dei token e del chat template (tokenizer nativo, niente sottoprocessi) |
+| **Chat** | Streaming markdown chat, collapsible reasoning, live tool calls, multi-turn KV reuse, text-file attachments, active project menu, near-context-full warnings, Local or Distributed mode. |
+| **Settings** | Shared model path, context size, memory knobs, local model load, and distributed coordinator route. |
+| **Agents** | Role editor: system prompt, icon, tools, JSON import/export, and per-agent expert-usage profile. |
+| **Project** | Library of imported folders with sandbox bookmarks. Project tools explore the active project without consuming chat context until a tool reads content. |
+| **Tuning** | Expert cache slots, hit-rate, per-layer routing concentration, and the usage imatrix. |
+| **Server** | Native in-process OpenAI/Anthropic-compatible HTTP server. |
+| **Worker** | Runs this Mac as a distributed worker that owns a contiguous layer slice. |
+| **Benchmark** | Native throughput benchmark for prefill and generation across growing context sizes, local or distributed. |
+| **Diagnostics** | Native tokenizer dump and chat-template/tool-format inspection. |
 
-### Tool & agenti
+## Built-In Tools and Agents
 
-Built-in tool (function calling DSML) — **uno per file** in `Sources/DS4Engine/Tools/Builtins/`:
+Built-in DSML tools live one per file under
+`Sources/DS4Engine/Tools/Builtins/`.
 
-- **Progetto** (sull'indice): `project_list` · `project_read` · `project_search` · `project_write` · `project_edit` (find/replace esatto)
-- **File grezzi** (radice progetto, anche per **intervallo di righe**): `file_read` · `file_lines` · `file_write` (intero file) · `file_add` (inserisci) · `file_modify` (sostituisci `[from,to]`)
-- **Altri**: `git` (locale, whitelist, no rete) · `calculator` · `add`/`subtract`/`multiply` · `now`
-- **Sub-agenti**: `agents_list` (scopri ruoli e tool) · `subagent_search` · `subagent_run(target, question, agent?, tools?)` — esegue un sub-agent a **contesto isolato** (KV separata per file/progetto, costruita lazy + cache su disco); nel KV del main entrano **solo** la domanda e la risposta, non l'elaborazione interna.
+- **Project index tools:** `project_list`, `project_read`, `project_search`,
+  `project_write`, `project_edit`.
+- **Raw project-root file tools:** `file_read`, `file_lines`, `file_write`,
+  `file_add`, `file_modify`.
+- **Utilities:** `git` (local whitelist, no network), `calculator`,
+  `add`, `subtract`, `multiply`, `now`.
+- **Sub-agents:** `agents_list`, `subagent_search`,
+  `subagent_run(target, question, agent?, tools?)`. Sub-agents run in an
+  isolated context with their own content-keyed KV prefix cache. The main chat
+  receives only the delegated question and returned answer, not the sub-agent's
+  internal work.
 
-Agenti predefiniti (ruolo = system prompt + tool + profilo esperti): **Generale** · **Coding** · **Code** (coding autonomo) · **Orchestratore** (delega ai sub-agent) · **Matematica** · **Scrittura** · **LaTeX** · **Documentazione** (gap analysis doc↔codice → Markdown).
+Default agents are **General**, **Coding**, **Code**, **Orchestrator**,
+**Math**, **Writing**, **LaTeX**, and **Documentation**. Each agent is a system
+prompt plus a tool allow-list plus a dedicated expert-usage profile.
 
-### Quick start
+## Quick Start
 
 ```sh
 make                  # swift build
-make xcodeproj        # (re)generate DwarfStar.xcodeproj (xcodegen) — run after adding files
+make xcodeproj        # regenerate DwarfStar.xcodeproj after adding files
 swift run DwarfStar   # launch the app
 make test             # unit tests
 ```
 
-In the app: choose the GGUF with **Sfoglia** (App Sandbox: typed paths won't
-open — the picker grants a security-scoped bookmark that persists across
-launches), press **Carica modello**, then chat. **Thinking** toggles
-chain-of-thought; **Stop** cancels (the next turn rebuilds the KV if needed).
+In the app, choose a GGUF from **Settings** with **Browse**. With App Sandbox
+enabled, typed paths are not enough; the file picker grants a security-scoped
+bookmark that persists across launches. Press **Load Model**, then open **Chat**.
+The **Thinking** toggle enables reasoning-token handling; **Stop** cancels
+generation and the next turn rebuilds KV if needed.
 
-### HTTP server (native, in-process)
+## HTTP Server
 
 The Server tab starts an OpenAI/Anthropic-compatible server on
-`Network.framework` — no subprocess, and the GGUF weights are mmap-shared with
-the chat engine (no second copy in RAM). One request at a time (single model).
+`Network.framework`. It is native and in-process: no subprocess, and GGUF weights
+are mmap-shared with the chat engine. KV cache and GPU scratch are separate, so
+chat and server requests still compete for compute and memory bandwidth.
 
 | Method | Path | API |
 |---|---|---|
 | GET | `/v1/models`, `/v1/models/{id}` | OpenAI |
-| POST | `/v1/chat/completions` | OpenAI chat (stream + non) |
-| POST | `/v1/responses` | OpenAI Responses (stream + non) |
-| POST | `/v1/completions` | OpenAI legacy (stream + non) |
-| POST | `/v1/messages` | Anthropic Messages (stream + non) |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions, stream and non-stream |
+| POST | `/v1/responses` | OpenAI Responses, stream and non-stream |
+| POST | `/v1/completions` | OpenAI legacy completions |
+| POST | `/v1/messages` | Anthropic Messages |
 
 ```sh
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","stream":true,"messages":[{"role":"user","content":"Ciao"}]}'
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","stream":true,
+       "messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### Distributed inference (multiple Macs)
+## Distributed Inference
 
-Pipeline parallelism by contiguous layer ranges, modelled on `ds4_distributed.c`:
-each **worker** owns a layer slice (weights *and* KV shard — allocated only for
-its slice), the **coordinator** owns embedding, sampling and the prompt. The HC
-hidden state (`nHC×nEmbd` floats, transported at 32/16/8 bit) flows through the
-workers per token. Start the workers first, then the coordinator; the route must
-cover all the model's layers contiguously (Flash 43, Pro 61; validated).
+Distributed mode implements pipeline parallelism by contiguous layer ranges,
+modelled on `ds4_distributed.c`.
 
-Per-node win: each worker streams only ~1/N of the experts, so its hot working
-set is N× more likely to fit in RAM → fewer SSD page faults. Prefill runs in
-chunks (default 32 tokens/frame); optional worker→worker forwarding halves the
-hops (needs the coordinator's LAN address for the return path).
+- Each **worker** owns a layer slice, its weights, and the KV shard for that
+  slice only.
+- The **coordinator** owns embedding, sampling, prompt rendering, and tool
+  execution.
+- The HC hidden state (`nHC x nEmbd` floats, transported at 32/16/8 bit) flows
+  through workers for every token.
+- Workers must be started first. The coordinator route must cover all model
+  layers contiguously: Flash has 43 layers, Pro has 61.
 
-## Layout
+The per-node benefit is reduced expert I/O: each worker streams roughly `1/N` of
+the routed experts, making the hot working set more likely to stay in RAM.
+Prefill runs in chunks, default 32 tokens per distributed frame. Optional
+worker-to-worker forwarding can reduce network hops, but requires the
+coordinator's LAN return address.
 
-```
-Makefile / Package.swift / project.yml    build, SwiftPM package, xcodegen spec
+## Repository Layout
+
+```text
+Makefile / Package.swift / project.yml
 Sources/
-  DS4Core/        engine core: GGUF mmap parser, BPE tokenizer (control tokens),
-                  sampler, model shape, chat/tools rendering + DSML parser
-  DS4Metal/       Metal runtime + kernels + decode graph: StreamingDecoder
-                  (forward/prefill/slice), expert slot-cache, usage stats,
-                  GGUF weight loaders (no-copy mmap)
-  DS4Engine/      InferenceService + sub-agent, tool, KV su disco, distribuito:
-    Service/        InferenceService (actor, event stream), DiskKVStore, Diagnostics
-    Tools/          ToolRegistry + un file per tool in Builtins/, ProjectCache,
-                    GitTool, Agents (AgentProfile + AgentRegistry)
-    Download/       ModelDownloader (GGUF resumibile + verifica SHA-256)
-    Distributed/    protocol, transport, worker, coordinator
-  DS4Demo/        CLI demo: Metal self-test + GGUF token streaming
-  DwarfStar/      SwiftUI app (one folder per tab)
-metal/            kernel sources (source of truth; embedded by make embed-kernels)
-templates/        the model's chat template, re-written as commented Jinja
-scripts/          GGUF analysis tools (spectrum, graph export) + kernel embedding
-docs/             detailed documentation (IT)
+  DS4Core/        GGUF parser, tokenizer, sampler, model shape,
+                  chat/tool rendering, DSML parser
+  DS4Metal/       Metal runtime, kernels, decode graph, StreamingDecoder,
+                  expert slot-cache, no-copy GGUF weight loaders
+  DS4Engine/      InferenceService, disk KV cache, tools, agents,
+                  model downloader, distributed runtime
+  DS4Demo/        CLI demo: Metal bring-up, GGUF audit, token streaming
+  DwarfStar/      SwiftUI app, one feature folder per tab
+metal/            Metal kernel source of truth
+templates/        commented Jinja rewrite of the model chat template
+scripts/          GGUF analysis tools and kernel embedding helpers
+docs/             detailed English documentation
+packaging/        .app bundle assembly and signing inputs
+Tests/            unit and parity tests
 ```
 
-Ogni cartella sotto `Sources/` (e i top-level `docs/`, `metal/`, `scripts/`,
-`packaging/`, `Tests/`) ha un `README.md` che ne descrive contenuto e relazioni.
+Every major folder has a local `README.md` explaining ownership and how it
+connects to the rest of the system.
 
-## CLI demo
+## CLI Demo
 
 ```sh
-swift run DS4Demo                  # Metal bring-up + GPU self-test
-swift run DS4Demo <model.gguf> 4   # stream 4 tokens through StreamingDecoder
-swift run DS4Demo <model.gguf> 32 "Spiega la RoPE in breve"
+swift run DS4Demo
+swift run DS4Demo <model.gguf> 4
+swift run DS4Demo <model.gguf> 32 "Explain RoPE briefly"
 ```
 
-Sintassi completa:
+Full syntax:
 
 ```sh
 swift run DS4Demo [gguf-path] [maxNew] [prompt]
 ```
 
-| Argomento | Default | Effetto |
+| Argument | Default | Meaning |
 |---|---|---|
-| `gguf-path` | — | File `.gguf` da aprire. Se omesso, la demo fa solo bring-up Metal + self-test GPU. |
-| `maxNew` | `4` | Token da generare. `0` esegue solo il forward di prova, senza decode streaming. |
-| `prompt` | `"ciao come stai? rispondi in 1 parola"` | Prompt utente, applicato al chat template del modello. Per passarlo devi indicare anche `maxNew`. |
+| `gguf-path` | none | GGUF file to open. If omitted, the demo only brings up Metal and runs the GPU self-test. |
+| `maxNew` | `4` | Number of tokens to generate. `0` runs only the one-token forward smoke test. |
+| `prompt` | `"ciao come stai? rispondi in 1 parola"` | User prompt rendered through the model chat template. Because arguments are positional, pass `maxNew` before passing a prompt. |
 
-I parametri avanzati passano da variabili d'ambiente:
+Advanced demo and engine knobs are documented in
+[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.md). Common ones:
+`DS4_TYPES_ONLY=1`, `DS4_DIAG=1`, `DS4_WARMUP=N`,
+`DS4_USAGE_FILE=<path|off>`, `DS4_ACTIVE_EXPERTS=1...6`,
+`DS4_EXPERT_CACHE_SLOTS=N`, `DS4_EXPERT_PREAD=1`,
+`DS4_RAW_RING=1`, `DS4_RESIDENT_DENSE=1`, `DS4_Q8_NSG=1...8`,
+`DS4_PREFETCH=1`, `DS4_PREFETCH_EXPERTS=N`, `DS4_FUSED_MOE=0`,
+and `DS4_PROFILE_ROUTE=1`.
 
-| Obiettivo | Parametri utili |
-|---|---|
-| Controllare il GGUF prima del decode | `DS4_TYPES_ONLY=1` stampa dtype/tokenizer e poi esce. |
-| Capire dove va il tempo | `DS4_DIAG=1` misura SSD, routing, cache esperti e banda del gather; `DS4_PROFILE_ROUTE=1` spezza `route/attn` in sottofasi. |
-| Rendere i benchmark ripetibili | `DS4_WARMUP=N` esclude i primi token dal profilo; `DS4_USAGE_FILE=<path|off>` controlla lo storico degli esperti usato per pre-warm/cache. |
-| Ridurre I/O o pressione memoria | `DS4_EXPERT_PREAD=1`, `DS4_WILLNEED_EXPERTS=0`, `DS4_RAW_RING=1`, `DS4_RESIDENT_DENSE=1`, `DS4_ACTIVE_EXPERTS=1…6`. |
-| Tuning cache esperti | `DS4_EXPERT_CACHE_SLOTS=N`, `DS4_EXPERT_CACHE_UNIFORM=1`, `DS4_PREFILL_UNION=N`. |
-| Tuning sperimentale | `DS4_Q8_NSG=1…8`, `DS4_PREFETCH=1`, `DS4_PREFETCH_EXPERTS=N`, `DS4_FUSED_MOE=0`. |
-
-La tabella completa con esempi A/B sta in
-[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.md).
-
-## Packaging a .app
+## Packaging a `.app`
 
 ```sh
-make app          # -> build/DwarfStar.app (release, ad-hoc signed)
+make app          # -> build/DwarfStar.app, release, ad-hoc signed
 open build/DwarfStar.app
 ```
 
-For distribution, sign with a Developer ID and notarize (see
-`packaging/make_app.sh`). The sandbox entitlements include
-`network.client` + `network.server` (HTTP server / distributed) and
-user-selected file access with app-scope bookmarks (models, projects).
+For distribution, sign with a Developer ID and notarize. See
+`packaging/make_app.sh`. The sandbox entitlements include `network.client`,
+`network.server`, and user-selected file access with app-scope bookmarks for
+models and projects.
 
 ## Status
 
-**Working** (verified on a MacBook Pro M1 Pro 16 GB): model load + streaming
-chat on the 2-bit GGUF, thinking, multi-turn KV reuse, **import di file di
-testo**, DSML tool calling con i built-in (`now`, `calculator`,
-`add/subtract/multiply`, `project_*`, `file_*` anche per riga, `git`),
-agenti + profili esperti per-agente, project library, tuning (expert cache),
-disk-KV cache (default on), native HTTP server (OpenAI `chat/completions`
-verified end-to-end, Anthropic `messages` verified streaming).
+Working and verified on a MacBook Pro M1 Pro 16 GB:
 
-**Implemented, needs on-device validation**: `/v1/responses`, **sub-agenti a
-contesto isolato** (snapshot/restore del KV main + KV cache per file/progetto) e
-i nuovi agenti (Orchestratore/LaTeX/Documentazione), distributed inference
-(protocol + worker/coordinator + UI in place; numerical parity and multi-Mac
-runs not yet verified), distributed benchmark.
+- model load and streaming chat on the 2-bit GGUF;
+- thinking/reasoning handling;
+- multi-turn KV reuse;
+- text-file attachments;
+- DSML tool calling with built-ins;
+- agents and per-agent expert profiles;
+- project library;
+- tuning panel and expert cache controls;
+- disk-KV cache, default on;
+- native HTTP server, verified for OpenAI `chat/completions` and Anthropic
+  `messages` streaming.
 
-**Read-ahead esperti (`DS4_WILLNEED_EXPERTS`, DEFAULT ON, opt-out con `=0`)**:
-`madvise(WILLNEED)` sui **6 esperti selezionati** subito prima del gather —
-anticipa e batcha il read-ahead a freddo dei soli slab che servono davvero (non
-speculativo). Riduce i fault a freddo, no-op a caldo, solo advisory (non cambia i
-numeri). Toggle in Impostazioni → Memoria.
+Implemented, still requiring broader on-device validation:
 
-**Pesi densi residenti (`DS4_RESIDENT_DENSE`, toggle in Impostazioni → Memoria,
-default ON con RAM ≥ 24 GB)**: copia i ~5 GB di pesi non-esperti per layer (`q_b`,
-`output_a`, FFN condivisa, …) in buffer **wired** una volta sola, invece di mapparli
-no-copy. Senza, su una macchina dove il modello non entra in RAM la churn dei 71 GB
-di esperti **eviice** quei pesi caldi dalla page cache → `route/attn` li **rifaulta
-dall'SSD ogni token** (il "compute" che non si scalda), e con loro anche embedding e
-output head. Inchiodandoli, il matvec torna RAM-bound. Costa ~5 GB wired: misurato
-**~+40% tok/s** su M1 Pro 32 GB. **Su 16 GB invece tende a PEGGIORARE**: i 5 GB wired
-mandano la macchina in pressione di memoria (swap / meno page cache per gli esperti),
-quindi lì il default è **OFF** — il guadagno è solo dove la RAM avanza.
+- `/v1/responses`;
+- isolated-context sub-agents with main-KV snapshot/restore and per-file/project
+  content-keyed KV cache;
+- newer default agents: Orchestrator, LaTeX, Documentation;
+- distributed inference protocol, worker/coordinator, UI, and benchmark;
+- numerical parity and multi-Mac distributed runs.
 
-**Tuning del matvec Q8 (`DS4_Q8_NSG`, default `4`)**: simdgroup-per-threadgroup del
-matvec Q8_0 denso (le proiezioni `q_b`/`output_a` che dominano `route/attn`). Il
-kernel e la sua dispatch sono **identici al riferimento C** (`ds4_gpu_make_q8_0_mv_dispatch`,
-`nsg=4`/`nr0=2`) — non c'è inefficienza di port da correggere. `NSG` è però solo una
-**partizione del lavoro** (divide la riduzione K su `NSG` simdgroup e somma esattamente
-su quelli; shmem e grid non dipendono da `NSG`), quindi **qualunque `1…8` dà risultati
-identici**: cambia solo l'occupancy / il latency-hiding. L'ottimo è hardware-specifico,
-quindi è esposto come knob da **sweepare on-device** (`DS4_Q8_NSG=2/4/6/8`) — il default
-resta la config di riferimento.
+## Performance Knobs
 
-**Knob sperimentali (opt-in, default OFF — validare con i test di parità)**:
-`DS4_RAW_RING` (raw-KV come ring di `nSWA` → RAM KV costante; **riallinea il port
-all'upstream**, che già usa una finestra scorrevole) · `DS4_PREFETCH` (read-ahead
-`madvise` del layer successivo, +`DS4_PREFETCH_EXPERTS`).
+**Selected-expert read-ahead (`DS4_WILLNEED_EXPERTS`, default ON).**
+The engine calls `madvise(WILLNEED)` on the experts selected by the router just
+before gather. This is not speculative: it asks the OS to read exactly the slabs
+that will be copied. It reduces cold page faults, is a no-op when hot, and does
+not change numerics.
 
-**Known gaps**: decode on a 16 GB machine is I/O-bound (~57% expert gather) —
-that is the physics of streaming 284B from SSD; distributed mode is the intended
-mitigation. Il contesto di **default è 1M token** (modificabile in Impostazioni):
-le cache KV scalano col contesto → su RAM contenuta **abbassalo** (il raw-KV ring
-sgancia solo la raw cache, non le righe compresse). No subprocess-driven panels
-remain: server, distributed and benchmark are all native in-process.
+**Resident dense weights (`DS4_RESIDENT_DENSE`).**
+Copies roughly 5 GB of non-expert per-layer weights into wired buffers instead
+of leaving them as evictable mmap views. This helps when expert streaming evicts
+hot dense weights from the page cache, causing `route/attn`, embedding, and head
+weights to re-fault from SSD every token. It can improve throughput on 24/32 GB
+machines, but can hurt on 16 GB by increasing memory pressure.
+
+**Q8 matvec tuning (`DS4_Q8_NSG`, default `4`).**
+Controls simdgroups per threadgroup for dense Q8_0 matvecs. It does not change
+results; it changes occupancy and latency hiding. Sweep `2/4/6/8` on the target
+Mac when tuning.
+
+**Experimental opt-ins.**
+`DS4_RAW_RING` keeps raw KV in an `nSWA` ring, reducing raw-KV memory for long
+contexts. `DS4_PREFETCH` and `DS4_PREFETCH_EXPERTS` add speculative read-ahead
+for the next layer and likely experts. Validate these with parity tests and
+on-device profiling before relying on them.
+
+## Known Limits
+
+On 16 GB systems, decode is I/O-bound. That is the physics of streaming a 284B
+MoE model from SSD; distributed inference is the intended mitigation. KV memory
+still scales with context, so keep context modest on low-RAM systems. The
+raw-KV ring reduces only the raw cache, not every compressed KV row. Server,
+distributed inference, diagnostics, and benchmark are native in-process panels;
+no subprocess-driven UI panels remain.

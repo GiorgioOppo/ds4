@@ -7,7 +7,7 @@ extension ToolRegistry {
                        description: "Search a text (case-insensitive) across the imported project; returns file:line matches.",
                        parametersJSON: #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
         run: { argsJSON in
-            guard let q = stringArg(argsJSON, "query") else { return "Argomento 'query' mancante." }
+            guard let q = stringArg(argsJSON, "query") else { return "Missing 'query' argument." }
             return ProjectCache.shared.searchTool(query: q)
         })
 }

@@ -1,9 +1,19 @@
 # DS4Engine/Service
 
-Il servizio di inferenza e la sua persistenza.
+Inference service and persistence.
 
-- **`InferenceService.swift`** — attore centrale. Possiede il `StreamingDecoder`; rende `send`/`provideToolResults`/`complete` come stream di eventi; gestisce il riuso KV append-only (`committedIds`), il benchmark, lo switch agente + usage imatrix, e i **sub-agent** (`runSubAgent`: snapshot/restore del KV main attorno a un contesto isolato).
-- **`DiskKVStore.swift`** — KV cache su disco (modello `ds4_kvstore`): checkpoint per-prefisso, restore a freddo, eviction sotto budget. Usato anche per le KV cache content-key dei sub-agent.
-- **`Diagnostics.swift`** — dump token / chat template (tokenizer nativo, niente sottoprocessi).
+- **`InferenceService.swift`** is the central actor. It owns the
+  `StreamingDecoder`; exposes `send`, `provideToolResults`, and `complete` as
+  event streams; manages append-only multi-turn KV reuse through `committedIds`;
+  runs benchmarks; switches agent profiles and usage imatrices; and runs
+  **sub-agents** through `runSubAgent`, snapshotting/restoring the main KV around
+  an isolated context.
+- **`DiskKVStore.swift`** implements disk-backed KV cache in the `ds4_kvstore`
+  style: prefix checkpoints, cold restore, and budget-aware eviction. It is also
+  used for content-keyed sub-agent KV caches.
+- **`Diagnostics.swift`** dumps tokens and chat-template rendering through the
+  native tokenizer, without subprocesses.
 
-`InferenceService` è grosso: il sub-agent sarebbe un candidato a `SubAgent.swift` (extension) una volta sciolti i `private`.
+`InferenceService` is intentionally central today. The sub-agent implementation
+is a good future candidate for a `SubAgent.swift` extension once the current
+`private` boundaries are loosened.

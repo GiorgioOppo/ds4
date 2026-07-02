@@ -43,8 +43,8 @@ public final class DistWorker: @unchecked Sendable {
         let l = try NWListener(using: params, on: port)
         l.stateUpdateHandler = { [onLog, config] state in
             switch state {
-            case .ready: onLog("worker layer \(config.layerStart)…\(config.layerEnd) in ascolto su :\(config.port)\n")
-            case .failed(let e): onLog("worker listener fallito: \(e)\n")
+            case .ready: onLog("worker layers \(config.layerStart)...\(config.layerEnd) listening on :\(config.port)\n")
+            case .failed(let e): onLog("worker listener failed: \(e)\n")
             default: break
             }
         }

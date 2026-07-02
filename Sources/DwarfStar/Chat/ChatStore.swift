@@ -206,7 +206,7 @@ final class ChatStore {
 
     func addAgent() {
         let id = "custom-\(UUID().uuidString.prefix(8))"
-        agents.append(AgentProfile(id: id, name: "Nuovo agente", icon: "person.fill.questionmark",
+        agents.append(AgentProfile(id: id, name: "New Agent", icon: "person.fill.questionmark",
                                    systemPrompt: "", toolNames: []))
         saveAgents()
     }
@@ -377,9 +377,9 @@ final class ChatStore {
         if preset.prefersTwoBit {
             if let twoBit = discoveredModels.first(where: { HardwarePresets.isTwoBit($0.name) }) {
                 modelPath = twoBit.path
-                note += " Selezionato il modello 2-bit: \(twoBit.name)."
+                note += " Selected 2-bit model: \(twoBit.name)."
             } else {
-                note += " Nessun modello 2-bit trovato: scaricalo con il pulsante “Scarica…” (target q2-imatrix) o `./download_model.sh q2-imatrix`."
+                note += " No 2-bit model found: download it with the Download button (target q2-imatrix) or `./download_model.sh q2-imatrix`."
             }
         }
         presetNote = note
@@ -486,7 +486,7 @@ final class ChatStore {
     func cancelManualResults() {
         if !pendingManualCalls.isEmpty {
             let names = pendingManualCalls.map(\.name).joined(separator: ", ")
-            messages.append(UIMessage(role: .tool, text: "✗ risultati non forniti per: \(names)"))
+            messages.append(UIMessage(role: .tool, text: "✗ no results provided for: \(names)"))
         }
         pendingManualCalls = []
         partialAutoOutputs = []
@@ -507,8 +507,8 @@ final class ChatStore {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.title = "Importa file di testo"
-        panel.prompt = "Importa"
+        panel.title = "Import Text Files"
+        panel.prompt = "Import"
         // Prefer text types; allow any file (.data) so odd extensions can still be
         // picked — non-text content simply fails to decode and is reported.
         panel.allowedContentTypes = [.text, .plainText, .sourceCode, .json, .xml,
@@ -531,7 +531,7 @@ final class ChatStore {
             }
         }
         if !failed.isEmpty {
-            attachmentNote = "Non leggibili come testo: \(failed.joined(separator: ", "))"
+            attachmentNote = "Could not read as text: \(failed.joined(separator: ", "))"
         }
     }
 
@@ -548,7 +548,7 @@ final class ChatStore {
     static func composeUserText(typed: String, attachments: [ChatAttachment]) -> String {
         guard !attachments.isEmpty else { return typed }
         var parts: [String] = attachments.map {
-            "--- File allegato: \($0.name) ---\n\($0.content)\n--- fine: \($0.name) ---"
+            "--- Attached file: \($0.name) ---\n\($0.content)\n--- end: \($0.name) ---"
         }
         if !typed.isEmpty { parts.append(typed) }
         return parts.joined(separator: "\n\n")
@@ -784,7 +784,7 @@ final class ChatStore {
 
         toolRounds += 1
         if toolRounds > maxToolRounds {
-            messages.append(UIMessage(role: .tool, text: "⚠️ troppi round di tool (\(maxToolRounds)) — interrotto."))
+            messages.append(UIMessage(role: .tool, text: "Too many tool rounds (\(maxToolRounds)); stopped."))
             return false
         }
 
@@ -801,10 +801,10 @@ final class ChatStore {
                     run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
                 } catch is CancellationError {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "(sub-agent interrotto)", steps: [])
+                                                       answer: "(sub-agent stopped)", steps: [])
                 } catch {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "Errore sub-agent: \(error)", steps: [])
+                                                       answer: "Sub-agent error: \(error)", steps: [])
                 }
                 messages.append(UIMessage(role: .tool, text: "", subAgent: run))
                 outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))

@@ -1,3 +1,6 @@
 # DwarfStar/Diagnostics
 
-- **`DiagnosticsController.swift` / `DiagnosticsView.swift`** — dump dei token e del chat template tramite il tokenizer nativo (niente sottoprocessi). Utile per verificare la tokenizzazione e il rendering del prompt/tool.
+- **`DiagnosticsController.swift` / `DiagnosticsView.swift`** dump tokens and
+  chat-template rendering through the native tokenizer, without subprocesses.
+  This is useful when verifying tokenization, prompt rendering, tool schemas, or
+  DSML tool-call formatting.

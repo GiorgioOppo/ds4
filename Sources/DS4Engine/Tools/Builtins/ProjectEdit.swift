@@ -7,8 +7,8 @@ extension ToolRegistry {
                        description: "Replace ONE exact occurrence of 'find' with 'replace' in a project file. 'find' must match exactly (incl. indentation) and be unique in the file — include surrounding lines to disambiguate.",
                        parametersJSON: #"{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"]}"#),
         run: { argsJSON in
-            guard let p = stringArg(argsJSON, "path") else { return "Argomento 'path' mancante." }
-            guard let f = stringArg(argsJSON, "find") else { return "Argomento 'find' mancante." }
+            guard let p = stringArg(argsJSON, "path") else { return "Missing 'path' argument." }
+            guard let f = stringArg(argsJSON, "find") else { return "Missing 'find' argument." }
             let r = stringArg(argsJSON, "replace") ?? ""
             return ProjectCache.shared.editTool(path: p, find: f, replace: r)
         })

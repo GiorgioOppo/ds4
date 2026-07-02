@@ -19,8 +19,8 @@ enum ModelPicker {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.title = "Scegli un modello GGUF"
-        panel.prompt = "Apri"
+        panel.title = "Choose a GGUF Model"
+        panel.prompt = "Open"
         if let gguf = UTType(filenameExtension: "gguf") {
             panel.allowedContentTypes = [gguf, .data]   // prefer .gguf, still allow any file
         }

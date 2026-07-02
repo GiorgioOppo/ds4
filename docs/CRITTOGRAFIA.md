@@ -1,60 +1,69 @@
-# Crittografia ed export compliance — DwarfStar
+# Encryption and Export Compliance — DwarfStar
 
-Documento di riferimento sull'uso della crittografia nell'app, ai fini della
-**dichiarazione di export compliance** richiesta da Apple (App Store / TestFlight)
-e per chiarezza di sicurezza.
+This document records how DwarfStar uses cryptography, both for Apple export
+compliance (App Store / TestFlight) and for operational security clarity.
 
-## Dichiarazione (sintesi)
+## Compliance Summary
 
-L'app è marcata **`ITSAppUsesNonExemptEncryption = NO`** (in `project.yml` →
-`INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO`, finisce nell'`Info.plist`
-generato).
+The app is marked as:
 
-Significa: l'app usa **solo crittografia esente** — quella standard fornita dal
-sistema operativo (HTTPS/TLS) e una funzione di hash. **Non** implementa né
-incorpora algoritmi di cifratura proprietari o non esenti. Conseguenza pratica:
-**nessun report annuale di autoclassificazione** e **nessun CCATS** richiesti.
+```text
+ITSAppUsesNonExemptEncryption = NO
+```
 
-## Cosa usa l'app, componente per componente
+In this project the value is set in `project.yml` as
+`INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO`, and is propagated into the
+generated `Info.plist`.
 
-| Componente | Crittografia | Esente? |
+That means DwarfStar uses **only exempt encryption**: standard operating-system
+HTTPS/TLS and hashing functions. The app does **not** implement or embed custom,
+proprietary, or non-exempt encryption algorithms. In practical App Store terms,
+this means no annual self-classification report and no CCATS are required for the
+current feature set.
+
+## Cryptography by Component
+
+| Component | Cryptography Used | Exempt? |
 |---|---|---|
-| **Download dei modelli** (`ModelDownloader` → `huggingface.co`) | **HTTPS/TLS** tramite `URLSession`/Foundation; **SHA-256** (`CryptoKit.SHA256`) per **verificare l'integrità** del GGUF scaricato | ✅ esente (TLS = cifratura standard OS; SHA-256 = hashing, non cifratura) |
-| **KV cache su disco** (`KVCFile`, `DiskKVStore`) | **SHA-1** (`CryptoKit.Insecure.SHA1`) per **nominare** i file di checkpoint | ✅ non è cifratura — è una funzione di hash (non controllata) |
-| **Server HTTP locale** (`LocalServer`) | nessuna — **HTTP in chiaro** | ✅ nessuna cifratura |
-| **Inferenza distribuita** (`DistTransport`) | nessuna — **TCP in chiaro** sulla LAN | ✅ nessuna cifratura |
-| **Motore di inferenza** (DS4Core/DS4Metal/DS4Engine) | nessuna | — |
+| **Model downloads** (`ModelDownloader` -> `huggingface.co`) | **HTTPS/TLS** through Foundation `URLSession`; **SHA-256** (`CryptoKit.SHA256`) to verify downloaded GGUF integrity | Yes. TLS is OS-provided standard encryption; SHA-256 is hashing, not encryption. |
+| **Disk KV cache** (`KVCFile`, `DiskKVStore`) | **SHA-1** (`CryptoKit.Insecure.SHA1`) to name checkpoint files | Yes. This is hashing, not encryption. |
+| **Local HTTP server** (`LocalServer`) | None; plain HTTP | Yes. No encryption. |
+| **Distributed inference transport** (`DistTransport`) | None; plain TCP over LAN | Yes. No encryption. |
+| **Inference engine** (`DS4Core`, `DS4Metal`, `DS4Engine`) | None | Not applicable. |
 
-Note:
-- **Niente crittografia proprietaria.** L'unico modulo crypto importato è
-  `CryptoKit`, usato esclusivamente per **funzioni di hash**: SHA-1 per i nomi
-  file della cache KV (porting fedele del formato `ds4_kvstore.c`) e SHA-256 per
-  la **verifica d'integrità** dei modelli scaricati (content pinning). L'hashing
-  **non** è cifratura ai fini dell'export.
-- **Perché SHA-256 e non il pinning TLS.** L'endpoint `resolve/main/…` di Hugging
-  Face fa redirect verso la sua CDN LFS (chiavi fuori dal nostro controllo, che
-  ruotano spesso): il pinning a chiave pubblica ATS sarebbe fragile. La verifica
-  dell'hash del contenuto protegge da file manomesso/corrotto a prescindere dal
-  canale TLS ed è immune alla rotazione delle chiavi della CDN.
-- L'HTTPS è gestito interamente dal sistema operativo: l'app non implementa TLS,
-  si limita a usare le API di rete standard.
+Important notes:
 
-## Avvertenza di sicurezza (non export compliance, ma rilevante)
+- **No custom encryption.** The only crypto framework imported by the project is
+  `CryptoKit`, and it is used only for hash functions: SHA-1 for KV-cache file
+  names, matching the ported `ds4_kvstore.c` format, and SHA-256 for model-file
+  integrity verification.
+- **Hashing is not encryption** for export-compliance purposes. It does not hide
+  data; it identifies or verifies data.
+- **Why content SHA-256 instead of TLS pinning.** Hugging Face `resolve/main/...`
+  URLs redirect to an LFS CDN whose public keys are outside this app's control and
+  may rotate. ATS public-key pinning would be fragile. Hashing the final content
+  protects against corruption or tampering regardless of CDN key rotation.
+- **TLS is entirely OS-provided.** DwarfStar does not implement TLS; it uses
+  Apple networking APIs.
 
-Il **server HTTP** e il **transport distribuito** viaggiano **in chiaro**:
+## Security Warning
 
-- il server è pensato per `127.0.0.1` (locale); se lo esponi su `0.0.0.0` o sulla
-  LAN, le richieste/risposte (prompt e testo generato) **non sono cifrate**;
-- l'inferenza distribuita scambia stati nascosti e token tra i Mac **in chiaro**
-  sulla rete locale.
+The local server and distributed transport are intentionally simple and run in
+plain text:
 
-Usali solo su **reti fidate**. Per esposizione oltre il loopback, mettili dietro
-un reverse proxy con TLS (es. Caddy/Nginx) o un tunnel (WireGuard/SSH).
+- The HTTP server is intended for `127.0.0.1`. If you bind it to `0.0.0.0` or a
+  LAN address, prompts and generated text are not encrypted.
+- Distributed inference exchanges hidden states and token data between Macs in
+  clear text on the local network.
 
-## Come rispondere in App Store Connect
+Use these features only on trusted networks. If you expose the server beyond
+loopback, place it behind TLS, for example through Caddy, Nginx, WireGuard, or an
+SSH tunnel.
 
-Con `ITSAppUsesNonExemptEncryption = NO` già nell'`Info.plist`, App Store
-Connect **non** porrà più la domanda sulla crittografia a ogni build, e non sarà
-necessario allegare documentazione di export. Se in futuro venisse aggiunta
-crittografia **non** esente (es. cifratura end-to-end proprietaria dei dati), la
-dichiarazione andrà aggiornata a `YES` e fornita la documentazione richiesta.
+## App Store Connect Answer
+
+With `ITSAppUsesNonExemptEncryption = NO` in `Info.plist`, App Store Connect
+should not require encryption documentation for every build. If future versions
+add non-exempt encryption, such as custom end-to-end encryption of user data, the
+declaration must be changed to `YES` and the required export documentation must
+be supplied.

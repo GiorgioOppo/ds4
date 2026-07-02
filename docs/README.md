@@ -1,8 +1,8 @@
-# docs
+# Documentation
 
-Documentazione dettagliata (in italiano).
+Detailed English documentation for DwarfStar and the pure-Swift DS4 engine.
 
-- **`DOCUMENTAZIONE.md`** — uso, GUI, tool, agenti, server, distribuito.
-- **`ARCHITETTURA-MOTORE.md`** — interni del motore: tokenizer, decoder, MoE, NSA, streaming, cache esperti.
-- **`CRITTOGRAFIA.md`** — uso della crittografia ed export compliance (App Store): solo cifratura esente (TLS) + hashing (SHA-1 nomi KV, SHA-256 integrità download).
-- **`UPSTREAM-SYNC.md`** — confronto col C upstream (`antirez/ds4`): baseline dell'ultima revisione, verdetto sui commit recenti, gap aperti, come rifare il confronto.
+- **`DOCUMENTAZIONE.md`** — user-facing guide: app workflow, settings, tools, agents, server, distributed inference, diagnostics, troubleshooting.
+- **`ARCHITETTURA-MOTORE.md`** — engine internals: GGUF loading, tokenizer, decoder graph, MoE, NSA attention, streaming, expert cache, KV reuse, tools, distributed execution.
+- **`CRITTOGRAFIA.md`** — encryption and export-compliance notes for App Store review: exempt TLS plus hashing only.
+- **`UPSTREAM-SYNC.md`** — sync notes against upstream C (`antirez/ds4`): current baseline, recent commits, what is in scope, what has been ported, and how to repeat the comparison.

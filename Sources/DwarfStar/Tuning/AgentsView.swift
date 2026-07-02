@@ -25,7 +25,7 @@ struct AgentsView: View {
     var body: some View {
         Form {
             Section {
-                Text("Un agente è un ruolo: un system prompt che definisce il comportamento, i tool che può chiamare, e un profilo d'uso esperti dedicato (la cache si scalda con gli esperti di QUEL ruolo). Le modifiche si applicano alla prossima nuova chat o al cambio di agente.")
+                Text("An agent is a role: a system prompt that defines behavior, the tools it may call, and a dedicated expert-usage profile. The cache warms with the experts used by that role. Changes apply on the next new chat or agent switch.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -34,20 +34,20 @@ struct AgentsView: View {
                     HStack {
                         Label(agent.name, systemImage: agent.icon).font(.headline)
                         if agent.id == store.selectedAgentId {
-                            Text("attivo")
+                            Text("active")
                                 .font(.caption)
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(Color.accentColor.opacity(0.2))
                                 .clipShape(Capsule())
                         }
                         Spacer()
-                        Button("Usa") { store.selectAgent(agent.id) }
+                        Button("Use") { store.selectAgent(agent.id) }
                             .disabled(agent.id == store.selectedAgentId)
                     }
 
-                    TextField("Nome", text: $agent.name)
+                    TextField("Name", text: $agent.name)
 
-                    DisclosureGroup("Icona") {
+                    DisclosureGroup("Icon") {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 36))], spacing: 8) {
                             ForEach(AgentIcons.all, id: \.self) { symbol in
                                 Button { agent.icon = symbol } label: {
@@ -65,7 +65,7 @@ struct AgentsView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("System prompt (definizione del ruolo)")
+                        Text("System prompt (role definition)")
                             .font(.caption).foregroundStyle(.secondary)
                         TextEditor(text: $agent.systemPrompt)
                             .font(.body)
@@ -74,7 +74,7 @@ struct AgentsView: View {
                                 .stroke(Color.secondary.opacity(0.3)))
                     }
 
-                    DisclosureGroup("Tool dell'agente (\(agent.toolNames.count))") {
+                    DisclosureGroup("Agent tools (\(agent.toolNames.count))") {
                         ForEach(store.availableTools) { tool in
                             Toggle(isOn: Binding(
                                 get: { agent.toolNames.contains(tool.name) },
@@ -95,7 +95,7 @@ struct AgentsView: View {
 
                     if !store.isDefaultAgent(agent.id) {
                         Button(role: .destructive) { store.deleteAgent(agent.id) } label: {
-                            Label("Elimina agente", systemImage: "trash")
+                            Label("Delete Agent", systemImage: "trash")
                         }
                     }
                 }
@@ -103,24 +103,24 @@ struct AgentsView: View {
 
             Section {
                 Button { store.addAgent() } label: {
-                    Label("Nuovo agente", systemImage: "plus")
+                    Label("New Agent", systemImage: "plus")
                 }
                 Button { store.restoreDefaultAgents() } label: {
-                    Label("Ripristina predefiniti", systemImage: "arrow.counterclockwise")
+                    Label("Restore Defaults", systemImage: "arrow.counterclockwise")
                 }
                 HStack {
                     Button { exportAgents() } label: {
-                        Label("Esporta…", systemImage: "square.and.arrow.up")
+                        Label("Export...", systemImage: "square.and.arrow.up")
                     }
                     Button { importAgents() } label: {
-                        Label("Importa…", systemImage: "square.and.arrow.down")
+                        Label("Import...", systemImage: "square.and.arrow.down")
                     }
                 }
                 if !ioMessage.isEmpty {
                     Text(ioMessage).font(.caption).foregroundStyle(.secondary)
                 }
                 if !store.isReady {
-                    Text("Nessun modello caricato: la selezione viene ricordata e applicata al caricamento.")
+                    Text("No model loaded: the selection is remembered and applied when a model loads.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
             }
@@ -132,16 +132,16 @@ struct AgentsView: View {
     /// Save the whole agent set as JSON (user-picked location, sandbox-safe).
     private func exportAgents() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "agenti-dwarfstar.json"
+        panel.nameFieldStringValue = "dwarfstar-agents.json"
         panel.allowedContentTypes = [.json]
-        panel.title = "Esporta agenti"
+        panel.title = "Export Agents"
         guard panel.runModal() == .OK, let url = panel.url,
               let data = store.exportAgentsData() else { return }
         do {
             try data.write(to: url)
-            ioMessage = "Esportati \(store.agents.count) agenti in \(url.lastPathComponent)."
+            ioMessage = "Exported \(store.agents.count) agents to \(url.lastPathComponent)."
         } catch {
-            ioMessage = "Esportazione fallita: \(error.localizedDescription)"
+            ioMessage = "Export failed: \(error.localizedDescription)"
         }
     }
 
@@ -150,10 +150,10 @@ struct AgentsView: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.json]
         panel.allowsMultipleSelection = false
-        panel.title = "Importa agenti"
+        panel.title = "Import Agents"
         guard panel.runModal() == .OK, let url = panel.url,
               let data = try? Data(contentsOf: url) else { return }
         let n = store.importAgents(from: data)
-        ioMessage = n > 0 ? "Importati/aggiornati \(n) agenti." : "File non valido: nessun agente importato."
+        ioMessage = n > 0 ? "Imported/updated \(n) agents." : "Invalid file: no agents imported."
     }
 }

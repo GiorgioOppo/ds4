@@ -1,7 +1,10 @@
-# scripts
+# Scripts
 
-Script di build/analisi.
+Build and analysis scripts.
 
-- **`embed_kernels.sh`** — rigenera `Sources/DS4Metal/Runtime/KernelSources.swift` da `metal/*.metal` (embed dei sorgenti kernel nel binario). Invocato da `make embed-kernels`.
+- **`embed_kernels.sh`** regenerates
+  `Sources/DS4Metal/Runtime/KernelSources.swift` from `metal/*.metal`, embedding
+  kernel source code into the binary. It is invoked by `make embed-kernels`.
 
-Eventuali altri tool di analisi GGUF (spettro, export grafo) vanno qui.
+GGUF analysis tools, such as spectrum inspection and graph export, also belong in
+this directory.

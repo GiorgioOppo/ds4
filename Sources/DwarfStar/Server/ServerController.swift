@@ -11,7 +11,7 @@ import DS4Engine
 final class ServerController {
     // Configuration (editable before Start).
     let settings: AppSettings
-    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+    var modelPath: String { settings.modelPath }
 
     init(settings: AppSettings) { self.settings = settings }
     var host = "127.0.0.1"
@@ -34,7 +34,7 @@ final class ServerController {
     func start() {
         guard !isRunning, !isLoading else { return }
         isLoading = true
-        log = "Caricamento modello in-process…\n"
+        log = "Loading in-process model...\n"
 
         let path = ProcessStream.absolutePath(modelPath)
         let name = (path as NSString).lastPathComponent
@@ -75,7 +75,7 @@ final class ServerController {
                 self.isLoading = false
                 self.isRunning = true
             } catch {
-                logCont.yield("avvio fallito: \(error)\n")
+                logCont.yield("start failed: \(error)\n")
                 self.isLoading = false
                 self.isRunning = false
             }
@@ -90,6 +90,6 @@ final class ServerController {
         logTask = nil
         isRunning = false
         isLoading = false
-        log += "[server fermato]\n"
+        log += "[server stopped]\n"
     }
 }

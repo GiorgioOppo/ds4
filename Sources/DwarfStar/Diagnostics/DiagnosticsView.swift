@@ -8,25 +8,25 @@ struct DiagnosticsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("Tokenizzazione (nativa, DS4Core.Tokenizer)") {
-                    LabeledContent("Modello (da Impostazioni)",
+                Section("Tokenization (native, DS4Core.Tokenizer)") {
+                    LabeledContent("Model (from Settings)",
                                    value: (controller.modelPath as NSString).lastPathComponent)
-                    TextField("Testo", text: $controller.text, axis: .vertical)
+                    TextField("Text", text: $controller.text, axis: .vertical)
                         .lineLimit(2...6)
-                    Text("Apre il GGUF solo per il tokenizer (puro Swift, niente subprocess). Il modello si sceglie nella scheda Impostazioni.")
+                    Text("Opens the GGUF only for the tokenizer (pure Swift, no subprocess). Choose the model in Settings.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
                     if controller.isRunning {
                         Button(role: .destructive) { controller.cancel() } label: {
-                            Label("Annulla", systemImage: "stop.fill")
+                            Label("Cancel", systemImage: "stop.fill")
                         }
                     } else {
                         Button { controller.dumpTokens() } label: {
-                            Label("Tokenizza", systemImage: "text.magnifyingglass")
+                            Label("Tokenize", systemImage: "text.magnifyingglass")
                         }
                         Button { controller.dumpChatTemplate() } label: {
-                            Label("Mostra chat template + formato tool", systemImage: "doc.text.magnifyingglass")
+                            Label("Show chat template + tool format", systemImage: "doc.text.magnifyingglass")
                         }
                     }
                 }
@@ -37,7 +37,7 @@ struct DiagnosticsView: View {
             Divider()
 
             ScrollView {
-                Text(controller.output.isEmpty ? "Nessun output." : controller.output)
+                Text(controller.output.isEmpty ? "No output." : controller.output)
                     .font(.system(.caption, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
@@ -58,12 +58,12 @@ struct EngineConsole: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Console motore (stderr)")
+            Text("Engine Console (stderr)")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 8).padding(.top, 6)
             ScrollView {
-                Text(log.text.isEmpty ? "Nessun messaggio dal motore." : log.text)
+                Text(log.text.isEmpty ? "No engine messages." : log.text)
                     .font(.system(.caption2, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)

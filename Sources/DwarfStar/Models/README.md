@@ -1,7 +1,11 @@
 # DwarfStar/Models
 
-Selezione, scansione e download dei modelli GGUF.
+GGUF model selection, scanning, and downloads.
 
-- **`ModelPicker.swift`** — selezione sandbox-friendly via `NSOpenPanel` + bookmark security-scoped (riapre lo stesso file tra i lanci).
-- **`ModelCatalog.swift`** — scansione delle cartelle per i `.gguf` presenti.
-- **`DownloadView.swift` / `DownloadRunner.swift`** — UI e driver del download nativo (`DS4Engine.ModelDownloader`), con progresso e fasi (verifica integrità).
+- **`ModelPicker.swift`** provides sandbox-friendly selection through
+  `NSOpenPanel` plus security-scoped bookmarks, so the same file can be reopened
+  across launches.
+- **`ModelCatalog.swift`** scans configured folders for available `.gguf` files.
+- **`DownloadView.swift` / `DownloadRunner.swift`** provide the UI and driver for
+  the native downloader (`DS4Engine.ModelDownloader`), including progress phases
+  and integrity verification.

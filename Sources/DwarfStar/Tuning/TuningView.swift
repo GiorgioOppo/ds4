@@ -11,49 +11,49 @@ struct TuningView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Il fine-tuning dei pesi non è possibile on-device: il motore è solo-inferenza (nessun backward pass) e i pesi 2-bit quantizzati non sono addestrabili. Questa scheda ottimizza il runtime: quali esperti tenere residenti in RAM e il profilo d'uso che li seleziona.",
+                    Label("Weight fine-tuning is not possible on-device: the engine is inference-only (no backward pass), and quantized 2-bit weights are not trainable. This tab tunes runtime behavior: which experts stay resident in RAM and the usage profile that selects them.",
                           systemImage: "info.circle")
                         .font(.callout).foregroundStyle(.secondary)
                 }
 
-                Section("Cache esperti — persistenti + dinamici") {
-                    Stepper("Slot per layer: \(store.expertCacheSlots == 0 ? "off" : "\(store.expertCacheSlots)")",
+                Section("Expert Cache - Persistent + Dynamic") {
+                    Stepper("Slots per layer: \(store.expertCacheSlots == 0 ? "off" : "\(store.expertCacheSlots)")",
                             value: $store.expertCacheSlots, in: 0...64, step: 8)
-                    Text("Ogni slot tiene un esperto residente in GPU (≈7 MB/slot × 43 layer sul modello 2-bit: 8 slot ≈ 2,4 GB wired). Gli esperti caldi restano in RAM (hit = zero copie); i freddi ruotano via LRU. Si applica al prossimo caricamento del modello.")
+                    Text("Each slot keeps one expert resident on the GPU (about 7 MB/slot x 43 layers on the 2-bit model: 8 slots is about 2.4 GB wired). Hot experts stay in RAM (hit = zero copies); cold experts rotate out via LRU. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let info = store.tuningInfo, info.cacheHits + info.cacheMisses > 0 {
                         let rate = Double(info.cacheHits) / Double(info.cacheHits + info.cacheMisses) * 100
                         LabeledContent("Hit rate",
                                        value: String(format: "%.0f%%  (%d hit / %d miss)", rate, info.cacheHits, info.cacheMisses))
                         Text(rate < 15
-                             ? "Hit rate basso: il routing è quasi uniforme su questo carico — la cache non sta ripagando, valuta di spegnerla."
-                             : "Hit rate utile: gli esperti persistenti stanno risparmiando I/O.")
+                             ? "Low hit rate: routing is almost uniform for this workload, so the cache is not paying off. Consider turning it off."
+                             : "Useful hit rate: resident experts are saving I/O.")
                             .font(.caption)
                             .foregroundStyle(rate < 15 ? .orange : .green)
                     }
                 }
 
-                Section("Profilo d'uso esperti (\"imatrix d'uso\")") {
-                    LabeledContent("Agente attivo", value: store.selectedAgent.name)
+                Section("Expert Usage Profile (Usage Imatrix)") {
+                    LabeledContent("Active agent", value: store.selectedAgent.name)
                     if let info = store.tuningInfo {
-                        LabeledContent("Routing registrati", value: "\(info.totalRoutes)")
+                        LabeledContent("Recorded routes", value: "\(info.totalRoutes)")
                     }
-                    Text("Conta quanto spesso il router sceglie ogni esperto nel TUO uso reale. Il profilo è PER-AGENTE (ruoli diversi instradano verso esperti diversi): cambiando agente la cache si ri-scalda con il suo profilo. Persistito tra le sessioni.")
+                    Text("Counts how often the router picks each expert in your real usage. The profile is per-agent (different roles route to different experts): switching agents warms the cache from that profile. Persisted across sessions.")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack {
                         Button { store.refreshTuningInfo() } label: {
-                            Label("Aggiorna", systemImage: "arrow.clockwise")
+                            Label("Refresh", systemImage: "arrow.clockwise")
                         }
                         Button { store.saveExpertUsage() } label: {
-                            Label("Salva profilo", systemImage: "square.and.arrow.down")
+                            Label("Save Profile", systemImage: "square.and.arrow.down")
                         }
                         Button(role: .destructive) { store.resetExpertUsage() } label: {
-                            Label("Azzera", systemImage: "trash")
+                            Label("Reset", systemImage: "trash")
                         }
                     }
                     .disabled(!store.isReady)
                     if !store.isReady {
-                        Text("Carica un modello nella scheda Chat per raccogliere il profilo.")
+                        Text("Load a model in Chat to collect the profile.")
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }
@@ -65,7 +65,7 @@ struct TuningView: View {
             // Per-layer concentration: the honest signal for cache viability.
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Concentrazione per layer (quota dei routing catturata dai top-8 esperti; ~3% = uniforme, alto = cache conveniente)")
+                    Text("Per-layer concentration (share of routing captured by the top-8 experts; ~3% = uniform, high = cache-friendly)")
                         .font(.caption.bold()).foregroundStyle(.secondary)
                         .padding(.bottom, 4)
                     if let info = store.tuningInfo, !info.layerSummaries.isEmpty {
@@ -75,7 +75,7 @@ struct TuningView: View {
                                 .textSelection(.enabled)
                         }
                     } else {
-                        Text("Nessun dato — genera qualche risposta e premi Aggiorna.")
+                        Text("No data yet - generate a few responses and press Refresh.")
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }

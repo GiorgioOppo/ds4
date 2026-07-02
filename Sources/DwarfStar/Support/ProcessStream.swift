@@ -25,7 +25,7 @@ final class ProcessStream {
                workingDir: String?,
                onOutput: @escaping @MainActor (String) -> Void,
                onExit: @escaping @MainActor (Int32) -> Void) -> String? {
-        guard process == nil else { return "già in esecuzione" }
+        guard process == nil else { return "already running" }
         let binary = Self.absolutePath(executable)
         guard FileManager.default.fileExists(atPath: binary) else {
             return "non trovato: \(binary)"

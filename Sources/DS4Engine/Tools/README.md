@@ -1,9 +1,18 @@
 # DS4Engine/Tools
 
-Il function-calling: i tool integrati che il modello può invocare, più la libreria progetti su cui operano.
+Function-calling support: built-in tools the model can invoke, plus the project
+library they operate on.
 
-- **`ToolRegistry.swift`** — superficie del registry (`builtins`, `projectScoped`, `subAgentGrantable`, `execute`, `specs`) + gli helper condivisi (parsing argomenti, tool aritmetici, valutatore di espressioni).
-- **`Builtins/`** — **un file per tool** (`extension ToolRegistry { static let X }`). Aggiungere un tool = nuovo file qui + voce in `builtins[]`.
-- **`ProjectCache.swift`** — indice di un progetto importato + i tool `project_*`/`file_*` (read/list/search/write/edit/add/modify per riga). Non tocca la memoria della chat.
-- **`GitTool.swift`** — esecuzione di sottocomandi git locali (whitelist, no rete) nella radice del progetto.
-- **`Agents.swift`** — `AgentProfile` (ruolo = system prompt + tool + profilo esperti) e `AgentRegistry` (roster condiviso, letto da `agents_list`).
+- **`ToolRegistry.swift`** defines the registry surface: `builtins`,
+  `projectScoped`, `subAgentGrantable`, `execute`, `specs`, plus shared helpers
+  for argument parsing, arithmetic tools, and expression evaluation.
+- **`Builtins/`** contains **one file per tool** using
+  `extension ToolRegistry { static let X = BuiltinTool(...) }`. Adding a tool
+  means adding a file here and registering it in `builtins[]`.
+- **`ProjectCache.swift`** indexes imported projects and backs the `project_*`
+  and `file_*` tools for read/list/search/write/edit/add/line-modify operations.
+  It does not touch chat memory.
+- **`GitTool.swift`** runs whitelisted local git subcommands in the project root.
+  Network operations are intentionally excluded.
+- **`Agents.swift`** defines `AgentProfile` (system prompt, tools, and expert
+  profile) and `AgentRegistry`, the shared roster read by `agents_list`.

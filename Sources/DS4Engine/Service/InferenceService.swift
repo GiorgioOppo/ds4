@@ -21,7 +21,7 @@ public enum InferenceError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case let .contextExceeded(p, c):
-            return "la conversazione (\(p) token) supera il contesto (\(c)). Inizia una nuova chat o aumenta il contesto."
+            return "the conversation (\(p) tokens) exceeds the context (\(c)). Start a new chat or increase the context."
         }
     }
 }
@@ -126,7 +126,7 @@ public actor InferenceService {
         let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: DSV4Shape.nLayer)
         if mixed > 0 {
             FileHandle.standardError.write(Data(
-                "ds4: GGUF a precisione mista: \(mixed)/\(DSV4Shape.nLayer) layer routed fuori dalla classe \(mq.gate)/\(mq.up)/\(mq.down) — decodificati per-layer, bypassano la cache esperti\n".utf8))
+                "ds4: mixed-precision GGUF: \(mixed)/\(DSV4Shape.nLayer) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); decoded per-layer, bypassing expert cache\n".utf8))
         }
         // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
         // per token = less expert I/O, lower quality. Honored by the streaming path.
@@ -364,26 +364,26 @@ public actor InferenceService {
         if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
         var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
         let specs = ToolRegistry.specs(enabled: Set(granted))
-        let toolLine = granted.isEmpty ? "Non hai tool: rispondi con le tue conoscenze."
-                                       : "Tool a disposizione (usa SOLO questi): " + granted.joined(separator: ", ") + "."
+        let toolLine = granted.isEmpty ? "You have no tools: answer from your own knowledge."
+                                       : "Available tools (use only these): " + granted.joined(separator: ", ") + "."
         let rolePrefix = (role.map { $0.systemPrompt.isEmpty ? "" : $0.systemPrompt + "\n\n" }) ?? ""
         let roleLabel = role.map { " · \($0.name)" } ?? ""
 
         if let info = projectInfo, isProject {
             let map = ProjectCache.shared.fileList().prefix(200).joined(separator: "\n")
-            let content = "Progetto «\(info.name)» — \(info.fileCount) file.\nMappa (parziale):\n\(map)\n\n"
-            let sys = rolePrefix + "Sei un sub-agent autonomo che lavora SOLO sul progetto importato. \(toolLine) Concludi con una risposta sintetica: cosa hai trovato/fatto, con file:riga."
-            return SubContext(system: sys, content: content, tools: specs, label: "progetto:\(info.name)\(roleLabel)", toolNames: granted)
+            let content = "Project \"\(info.name)\" - \(info.fileCount) files.\nPartial map:\n\(map)\n\n"
+            let sys = rolePrefix + "You are an autonomous sub-agent working only on the imported project. \(toolLine) Conclude with a concise answer: what you found/did, with file:line."
+            return SubContext(system: sys, content: content, tools: specs, label: "project:\(info.name)\(roleLabel)", toolNames: granted)
         }
         if let text = fileText {
-            let content = "Contenuto del file «\(t)» (già in contesto):\n```\n\(text)\n```\n\n"
-            let sys = rolePrefix + "Sei un sub-agent focalizzato sul file «\(t)», già in contesto. \(toolLine) Se modifichi, agisci SOLO su questo file (find esatto e unico, indentazione inclusa). Concludi con una risposta sintetica."
+            let content = "Contents of file \"\(t)\" (already in context):\n```\n\(text)\n```\n\n"
+            let sys = rolePrefix + "You are a sub-agent focused on file \"\(t)\", already in context. \(toolLine) If you edit, act only on this file (exact and unique find text, including indentation). Conclude with a concise answer."
             return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)\(roleLabel)", toolNames: granted)
         }
         // No project imported (or the file isn't in it): a plain sub-agent that
         // answers the task directly — NOT an error (a chat may have no project).
-        let note = projectInfo == nil ? "" : "Nota: «\(t)» non è nel progetto importato. "
-        let sys = rolePrefix + "Sei un sub-agent. \(note)\(toolLine) Esegui il compito e concludi con una risposta sintetica."
+        let note = projectInfo == nil ? "" : "Note: \"\(t)\" is not in the imported project. "
+        let sys = rolePrefix + "You are a sub-agent. \(note)\(toolLine) Complete the task and conclude with a concise answer."
         return SubContext(system: sys, content: "", tools: specs, label: "task\(roleLabel)", toolNames: granted)
     }
 
@@ -419,17 +419,17 @@ public actor InferenceService {
         let prefixIds = tok.tokenizeRenderedChat(prefixText).map { Int($0) }
         guard prefixIds.count < contextSize - 32 else {
             return SubAgentRun(target: ctx.label, question: question,
-                               answer: "Il contenuto di «\(ctx.label)» eccede il contesto del sub-agent.", steps: steps)
+                               answer: "The contents of \"\(ctx.label)\" exceed the sub-agent context.", steps: steps)
         }
         var pos = 0
         if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
             try decoder.importKV(snap); pos = prefixIds.count
-            steps.append("KV «\(ctx.label)» riusata (\(pos) token)")
+            steps.append("KV \"\(ctx.label)\" reused (\(pos) tokens)")
         } else {
             _ = try decoder.prefill(tokens: prefixIds, startPos: 0); pos = prefixIds.count
             subKV?.store(tokens: prefixIds, modelName: modelName,
                          snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
-            steps.append("KV «\(ctx.label)» creata (\(pos) token)")
+            steps.append("KV \"\(ctx.label)\" created (\(pos) tokens)")
         }
         steps.append("tool: " + ctx.toolNames.joined(separator: ", "))
 
@@ -440,7 +440,7 @@ public actor InferenceService {
         var round = 0
         while true {
             let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
-            guard pos + suffixIds.count < contextSize else { steps.append("contesto sub-agent esaurito"); break }
+            guard pos + suffixIds.count < contextSize else { steps.append("sub-agent context exhausted"); break }
             var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: pos)
             pos += suffixIds.count
             let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
@@ -451,16 +451,16 @@ public actor InferenceService {
             var results = ""
             for c in turn.calls {
                 let out = ToolRegistry.execute(c)
-                    ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool non disponibile nel sub-agent"}"#)
+                    ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
                 steps.append("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
                 results += "<tool_result>" + out.content + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
         let final = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        steps.append("risposta: \(final.count) caratteri")
+        steps.append("answer: \(final.count) characters")
         return SubAgentRun(target: ctx.label, question: question,
-                           answer: final.isEmpty ? "(nessuna risposta)" : final, steps: steps)
+                           answer: final.isEmpty ? "(no answer)" : final, steps: steps)
     }
 
     /// Decode one assistant turn in the sub-agent context: returns the visible

@@ -1,25 +1,30 @@
 # Tests
 
-Test unitari dell'engine puro-Swift. La **correttezza è la regola #1** del progetto: questi test validano il port contro il riferimento C.
+Unit tests for the pure-Swift engine layers. **Correctness is rule #1** in this
+project: these tests validate the Swift port against the original C reference and
+against CPU-faithful implementations where useful.
 
-- **`DS4CoreTests/`** — kernel (matvec MoE, flash-attn, norm, RoPE…), grafo di decode, GGUF, tokenizer, sampler, serializzazione KV, downloader.
+- **`DS4CoreTests/`** covers MoE matvec kernels, flash attention, normalization,
+  RoPE, the decode graph, GGUF loading, tokenization, sampling, KV serialization,
+  and the downloader.
 
 ```sh
-make test        # oppure: swift test
+make test        # or: swift test
 ```
 
-## Esecuzione da Xcode
+## Running From Xcode
 
-I test sono anche un target del `.xcodeproj` generato (`DS4CoreTests`, un
-*logic-test bundle* senza app host). Dopo `make xcodeproj`, apri `DwarfStar.xcodeproj`
-e premi **⌘U**: lo schema `DwarfStar` ha la Test action collegata a `DS4CoreTests`.
+The tests are also wired into the generated `.xcodeproj` as the `DS4CoreTests`
+logic-test bundle, without an app host. After generating the project, open
+`DwarfStar.xcodeproj` and press **Cmd+U**. The `DwarfStar` scheme has its Test
+action connected to `DS4CoreTests`.
 
 ```sh
 make xcodeproj
 xcodebuild test -project DwarfStar.xcodeproj -scheme DwarfStar -destination 'platform=macOS'
 ```
 
-> I test dei kernel Metal si auto-saltano (`XCTSkipUnless`) finché il loro
-> `metalDir` — attualmente un percorso assoluto fisso in cima a ogni file di test
-> — non punta alla cartella `metal/` reale; vanno aggiornati per usare i kernel
-> embedded (`MetalRuntime()`) prima che girino in CI/Xcode.
+> Metal kernel tests currently self-skip with `XCTSkipUnless` until their
+> `metalDir`, currently a fixed absolute path at the top of each test file, points
+> at the real `metal/` directory. They should be migrated to the embedded kernels
+> through `MetalRuntime()` before being enabled in CI/Xcode.

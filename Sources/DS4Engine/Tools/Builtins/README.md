@@ -1,17 +1,24 @@
 # DS4Engine/Tools/Builtins
 
-Un file per tool integrato. Ogni file è una `extension ToolRegistry { static let <tool> = BuiltinTool(...) }`; gli helper (`stringArg`, `intArg`, `binaryTool`, …) vivono in `../ToolRegistry.swift`.
+One file per built-in tool. Each file adds an
+`extension ToolRegistry { static let <tool> = BuiltinTool(...) }`; shared helpers
+such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 
-| Tool | File | Cosa fa |
+| Tool | File | Purpose |
 |---|---|---|
-| `now` | `Clock.swift` | data/ora ISO-8601 |
-| `calculator` | `Calculator.swift` | valuta un'espressione aritmetica |
-| `add`/`subtract`/`multiply` | `Add`/`Subtract`/`Multiply.swift` | aritmetica a 2 operandi |
-| `project_list`/`read`/`search` | `Project*.swift` | esplora il progetto (indice) |
-| `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | scrive/edita file di testo indicizzati |
-| `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | accesso grezzo ai file (anche per riga) |
-| `git` | `Git.swift` | git locale (whitelist) |
-| `agents_list` | `AgentsList.swift` | elenca ruoli e tool (per l'orchestratore) |
-| `subagent_search`/`run` | `Subagent*.swift` | delega a un sub-agent isolato (run gestito dall'engine) |
+| `now` | `Clock.swift` | Current date/time in ISO-8601 format. |
+| `calculator` | `Calculator.swift` | Evaluates an arithmetic expression. |
+| `add`/`subtract`/`multiply` | `Add`/`Subtract`/`Multiply.swift` | Two-operand arithmetic. |
+| `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project. |
+| `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | Writes or edits indexed text files. |
+| `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | Raw file access, including line-based reads/edits. |
+| `git` | `Git.swift` | Local whitelisted git operations. |
+| `agents_list` | `AgentsList.swift` | Lists available roles and tools for orchestration. |
+| `subagent_search`/`run` | `Subagent*.swift` | Delegates work to isolated sub-agents; `run` is executed by the engine. |
 
-**Aggiungere un tool**: crea `Builtins/NuovoTool.swift` con la `extension`, poi aggiungi il nome a `builtins[]` (e a `projectScoped` se richiede un progetto).
+## Adding A Tool
+
+1. Create `Builtins/NewTool.swift` with the `ToolRegistry` extension.
+2. Add the tool to `builtins[]`.
+3. Add it to `projectScoped` if it requires an active imported project.
+4. Add it to `subAgentGrantable` only when isolated sub-agents may safely use it.

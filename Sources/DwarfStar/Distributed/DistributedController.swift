@@ -78,7 +78,7 @@ final class DistributedController {
     private var coordLogTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
 
-    var workerSummary: String { "worker :\(port) · layer \(layerStart)…\(layerEnd)\(hasOutput ? " +output" : "")" }
+    var workerSummary: String { "worker :\(port) · layers \(layerStart)...\(layerEnd)\(hasOutput ? " +output" : "")" }
 
     /// The connected coordinator, exposed so the Benchmark panel can reuse the live
     /// route instead of opening a second connection (nil unless connected). The
@@ -93,7 +93,7 @@ final class DistributedController {
 
     func startWorker() {
         guard !workerRunning, !workerLoading else { return }
-        workerLoading = true; workerLog = "Caricamento modello (worker)…\n"
+        workerLoading = true; workerLog = "Loading model (worker)...\n"
         let cfg = DistWorker.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                     port: UInt16(clamping: port), layerStart: layerStart,
                                     layerEnd: layerEnd, hasOutput: hasOutput, contextSize: contextSize)
@@ -108,14 +108,14 @@ final class DistributedController {
         }
         Task {
             do { self.worker = try await loadTask.value; self.workerLoading = false; self.workerRunning = true }
-            catch { logCont.yield("avvio worker fallito: \(error)\n"); self.workerLoading = false; self.workerRunning = false }
+            catch { logCont.yield("worker start failed: \(error)\n"); self.workerLoading = false; self.workerRunning = false }
         }
     }
 
     func stopWorker() {
         worker?.stop(); worker = nil
         workerRunning = false; workerLoading = false
-        workerLog += "[worker fermato]\n"
+        workerLog += "[worker stopped]\n"
     }
 
     // MARK: Coordinator — connect / chat
@@ -123,11 +123,11 @@ final class DistributedController {
     func connectCoordinator() {
         guard !connected, !coordLoading else { return }
         let peers = parsePeers()
-        guard !peers.isEmpty else { coordLog += "nessun worker indicato\n"; return }
+        guard !peers.isEmpty else { coordLog += "no workers specified\n"; return }
         if forwardEnabled, returnHost.trimmingCharacters(in: .whitespaces).isEmpty {
-            coordLog += "inoltro: indica l'host di ritorno (IP LAN di questo Mac)\n"; return
+            coordLog += "forwarding: enter the return host (this Mac's LAN IP)\n"; return
         }
-        coordLoading = true; coordLog = "Caricamento modello (coordinatore)…\n"
+        coordLoading = true; coordLog = "Loading model (coordinator)...\n"
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
@@ -146,7 +146,7 @@ final class DistributedController {
                 self.coordinator = coord
                 self.coordLoading = false; self.connected = true
             } catch {
-                logCont.yield("connessione fallita: \(error)\n")
+                logCont.yield("connection failed: \(error)\n")
                 self.coordLoading = false; self.connected = false
             }
         }
@@ -158,7 +158,7 @@ final class DistributedController {
         Task.detached { coord?.disconnect() }
         coordinator = nil
         connected = false; isGenerating = false
-        coordLog += "[disconnesso]\n"
+        coordLog += "[disconnected]\n"
     }
 
     /// Send the current input as a chat turn and stream the reply, running the
@@ -167,7 +167,7 @@ final class DistributedController {
     func sendChat() {
         let text = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard connected, !isGenerating, !benchmarkActive, !text.isEmpty, coordinator != nil else {
-            if benchmarkActive { coordLog += "benchmark in corso: attendi la fine prima di chattare.\n" }
+            if benchmarkActive { coordLog += "benchmark running: wait for it to finish before chatting.\n" }
             return
         }
         chatInput = ""
@@ -227,7 +227,7 @@ final class DistributedController {
             cont.finish()
             switch result {
             case .failure(let error):
-                if !(error is CancellationError) { self.coordLog += "errore: \(error)\n" }
+                if !(error is CancellationError) { self.coordLog += "error: \(error)\n" }
                 self.isGenerating = false; self.status = ""
             case .success(let calls):
                 self.finishTurn(index: index, calls: calls)
@@ -246,14 +246,14 @@ final class DistributedController {
         guard !calls.isEmpty else { isGenerating = false; status = ""; return }
         toolRounds += 1
         guard toolRounds <= maxToolRounds else {
-            messages.append(UIMessage(role: .tool, text: "⚠️ troppi round di tool (\(maxToolRounds)) — interrotto."))
+            messages.append(UIMessage(role: .tool, text: "Too many tool rounds (\(maxToolRounds)); stopped."))
             isGenerating = false; status = ""
             return
         }
         for c in calls {
             let out = ToolRegistry.execute(c)
                 ?? ToolOutput(callId: c.id, name: c.name,
-                              content: #"{"error":"tool non integrato: non supportato in distribuito"}"#)
+                              content: #"{"error":"tool is not built in: unsupported in distributed mode"}"#)
             messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
             turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
         }
@@ -263,14 +263,14 @@ final class DistributedController {
     func stopGeneration() {
         coordTask?.cancel()
         isGenerating = false
-        coordLog += "[interrotto] (la prossima domanda riparte da capo)\n"
+        coordLog += "[stopped] (the next question starts from scratch)\n"
     }
 
     func newChat() {
         messages.removeAll()
         turns.removeAll()
         toolRounds = 0
-        agents = ChatStore.loadAgents()   // pick up edits from the Agenti tab
+        agents = ChatStore.loadAgents()
     }
 
     // MARK: Helpers

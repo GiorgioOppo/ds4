@@ -1,9 +1,16 @@
 # DS4Core
 
-Core dell'engine, **puro Swift senza Metal**: parsing del modello, tokenizer, campionamento e formato della chat/tool. È la base condivisa da `DS4Metal` e `DS4Engine`, ed è la più coperta dai test (`Tests/DS4CoreTests`).
+The engine's **pure Swift, no-Metal** foundation. It contains model parsing,
+tokenization, sampling, and the chat/tool prompt format. `DS4Metal` and
+`DS4Engine` both build on this target, and this layer has the broadest unit-test
+coverage under `Tests/DS4CoreTests`.
 
-- **`Format/`** — formati su disco: GGUF (mmap), Half (f16), KVCFile (checkpoint KV su disco).
-- **`Inference/`** — shape del modello, tokenizer BPE (token di controllo), sampler, rendering chat + parser DSML dei tool.
-- **`Streaming/`** — pianificazione della cache SSD e lock di memoria simulato.
+- **`Format/`**: on-disk formats and low-level helpers, including GGUF mmap,
+  `Half` f16 conversion, and `KVCFile` disk checkpoints for KV cache state.
+- **`Inference/`**: model shape, DeepSeek-V4 BPE tokenizer and control tokens,
+  sampler, chat rendering, and DSML tool-call parsing.
+- **`Streaming/`**: SSD cache planning and simulated memory locking used to
+  reason about working sets before real runtime wiring.
 
-Nessuna dipendenza esterna; nessun link a Metal (così gira/compila ovunque e i test sono veloci).
+There are no external dependencies and no link to Metal. That keeps this target
+portable, fast to compile, and easy to test.

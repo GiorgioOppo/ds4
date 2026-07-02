@@ -10,30 +10,30 @@ struct ServerView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Server HTTP nativo: espone il modello caricato in-process su un endpoint compatibile con l'API OpenAI. Nessun processo esterno.",
+                    Label("Native HTTP server: exposes the in-process loaded model through an OpenAI-compatible endpoint. No external process.",
                           systemImage: "server.rack")
                         .font(.callout).foregroundStyle(.secondary)
                     if modelLoadedInProcess {
-                        Label("La chat ha già un modello caricato. I pesi sono mmap condivisi (niente doppia copia in RAM), ma KV cache e GPU sono separate: usare chat e server insieme contende le risorse.",
+                        Label("Chat already has a model loaded. Weights are shared through mmap (no second RAM copy), but KV cache and GPU work are separate: using chat and server together competes for resources.",
                               systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange).font(.callout)
                     }
                 }
 
-                Section("Modello (da Impostazioni)") {
+                Section("Model (from Settings)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    Stepper("Contesto: \(controller.contextSize) token",
+                    Stepper("Context: \(controller.contextSize) tokens",
                             value: $controller.contextSize, in: 1024...200_000, step: 1024)
                         .disabled(controller.isRunning)
-                    Stepper("Max token per risposta: \(controller.maxTokens)",
+                    Stepper("Max tokens per response: \(controller.maxTokens)",
                             value: $controller.maxTokens, in: 64...8192, step: 64)
                         .disabled(controller.isRunning)
                 }
 
-                Section("Rete") {
+                Section("Network") {
                     HStack {
                         TextField("Host", text: $controller.host)
-                        TextField("Porta", value: $controller.port, format: .number.grouping(.never))
+                        TextField("Port", value: $controller.port, format: .number.grouping(.never))
                             .frame(width: 80)
                     }
                     .disabled(controller.isRunning)
@@ -45,23 +45,23 @@ struct ServerView: View {
                     HStack(spacing: 12) {
                         if controller.isRunning {
                             Button(role: .destructive) { controller.stop() } label: {
-                                Label("Ferma server", systemImage: "stop.fill")
+                                Label("Stop Server", systemImage: "stop.fill")
                             }
-                            Label("In ascolto su \(controller.endpoint)", systemImage: "dot.radiowaves.left.and.right")
+                            Label("Listening on \(controller.endpoint)", systemImage: "dot.radiowaves.left.and.right")
                                 .foregroundStyle(.green).font(.callout)
                         } else if controller.isLoading {
                             ProgressView().controlSize(.small)
-                            Text("Caricamento modello…").font(.callout).foregroundStyle(.secondary)
+                            Text("Loading model...").font(.callout).foregroundStyle(.secondary)
                         } else {
                             Button { controller.start() } label: {
-                                Label("Avvia server", systemImage: "play.fill")
+                                Label("Start Server", systemImage: "play.fill")
                             }
                         }
                     }
                 }
 
                 if controller.isRunning {
-                    Section("Esempio") {
+                    Section("Example") {
                         Text(curlExample)
                             .font(.system(.caption2, design: .monospaced))
                             .textSelection(.enabled)
@@ -69,12 +69,12 @@ struct ServerView: View {
                     }
                 }
 
-                Section("Endpoint supportati") {
-                    endpointRow("GET", "/v1/models", "elenco modelli")
+                Section("Supported Endpoints") {
+                    endpointRow("GET", "/v1/models", "model list")
                     endpointRow("POST", "/v1/chat/completions", "OpenAI chat (stream + non)")
                     endpointRow("POST", "/v1/responses", "OpenAI Responses (stream + non)")
                     endpointRow("POST", "/v1/messages", "Anthropic Messages (stream + non)")
-                    endpointRow("POST", "/v1/completions", "OpenAI completamento legacy")
+                    endpointRow("POST", "/v1/completions", "OpenAI legacy completion")
                 }
             }
             .formStyle(.grouped)
@@ -112,7 +112,7 @@ struct ServerView: View {
         curl \(controller.endpoint)/chat/completions \\
           -H "Content-Type: application/json" \\
           -d '{"model":"deepseek-v4-flash","stream":true,
-               "messages":[{"role":"user","content":"Ciao"}]}'
+               "messages":[{"role":"user","content":"Hello"}]}'
         """
     }
 }

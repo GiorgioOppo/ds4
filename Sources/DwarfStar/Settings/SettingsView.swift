@@ -16,14 +16,14 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             Form {
                 modelSection
-                Section("Modalità") {
-                    Picker("Esecuzione", selection: $settings.mode) {
+                Section("Mode") {
+                    Picker("Execution", selection: $settings.mode) {
                         ForEach(AppSettings.EngineMode.allCases) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     Text(settings.mode == .local
-                         ? "Il modello gira in-process su questo Mac."
-                         : "Questo Mac coordina un cluster di worker (i worker si avviano nella scheda Worker, su questo o altri Mac).")
+                         ? "The model runs in-process on this Mac."
+                         : "This Mac coordinates a worker cluster. Start workers from the Worker tab, on this Mac or other Macs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 switch settings.mode {
@@ -43,40 +43,40 @@ struct SettingsView: View {
 
     private var modelSection: some View {
         Group {
-            Section("Modello") {
+            Section("Model") {
                 HStack {
-                    TextField("Modello GGUF", text: $settings.modelPath)
-                    Button("Sfoglia") { if let p = ModelPicker.pickGGUF() { settings.modelPath = p } }
+                    TextField("GGUF model", text: $settings.modelPath)
+                    Button("Browse") { if let p = ModelPicker.pickGGUF() { settings.modelPath = p } }
                 }
-                Stepper("Contesto: \(settings.contextSize) token",
+                Stepper("Context: \(settings.contextSize) tokens",
                         value: $settings.contextSize, in: 1024...1_000_000, step: 1024)
                 if let warning = MemoryInfo.loadWarning(modelPath: settings.modelPath) {
                     Label(warning, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
-            Section("Memoria") {
-                Stepper("Cache esperti: \(store.expertCacheSlots) slot/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
+            Section("Memory") {
+                Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
                 if store.expertCacheSlots > 8 && store.residentDenseEnabled && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                    Label("Con i densi residenti su ≤16 GB, oltre 8 slot la memoria wired va in swap (misurato: crollo a 0.05 tok/s).",
+                    Label("With resident dense weights on <=16 GB, more than 8 slots can push wired memory into swap (measured drop: 0.05 tok/s).",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                Toggle("Esperti via pread diretto (F_NOCACHE) — consigliato ≤16 GB", isOn: $store.expertPreadEnabled)
-                Toggle("Pesi densi residenti (~5 GB, warm-up ~1 min al load)", isOn: $store.residentDenseEnabled)
-                Toggle("KV su disco (riusa i prefissi tra sessioni)", isOn: $store.diskKVEnabled)
+                Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
+                Toggle("Resident dense weights (~5 GB, ~1 min load warm-up)", isOn: $store.residentDenseEnabled)
+                Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",
                             value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
                 }
-                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {
-                    Label("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto. Sperimentale — verifica gli output dopo un contesto lungo.",
+                    Label("Keeps only the attention window (128 rows) in RAM instead of the full context. Experimental: verify outputs after a long context.",
                           systemImage: "flask")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                Text("Si applicano al prossimo caricamento del modello.")
+                Text("Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
             }
         }
@@ -85,23 +85,23 @@ struct SettingsView: View {
     // MARK: Locale
 
     @ViewBuilder private var localSection: some View {
-        Section("Motore locale") {
+        Section("Local Engine") {
             switch store.phase {
             case .ready:
                 HStack {
-                    Label("Modello caricato", systemImage: "checkmark.circle.fill")
+                    Label("Model loaded", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                     if let info = store.info {
                         Text("\(info.layers) layer · ctx \(info.contextSize)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Ricarica") { store.load() }
+                    Button("Reload") { store.load() }
                 }
             case .loading:
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Caricamento del modello…").font(.callout).foregroundStyle(.secondary)
+                    Text("Loading model...").font(.callout).foregroundStyle(.secondary)
                 }
             case .needsModel, .failed:
                 if case .failed(let message) = store.phase {
@@ -109,10 +109,10 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.red)
                 }
                 Button { store.load() } label: {
-                    Label("Carica modello", systemImage: "play.fill")
+                    Label("Load Model", systemImage: "play.fill")
                 }
             }
-            Text("La chat (scheda Chat) usa questo motore; Tuning e l'agente locale pure.")
+            Text("The Chat tab uses this engine; Tuning and the local agent use it too.")
                 .font(.caption).foregroundStyle(.tertiary)
         }
     }
@@ -121,24 +121,24 @@ struct SettingsView: View {
 
     @ViewBuilder private var distributedSection: some View {
         if !dist.connected {
-            Section("Worker (uno per riga, host:porta, in ordine di layer)") {
+            Section("Workers (one per line, host:port, in layer order)") {
                 TextEditor(text: $dist.peersText)
                     .font(.system(.callout, design: .monospaced))
                     .frame(height: 64)
             }
             .disabled(dist.coordLoading)
-            Section("Trasporto") {
-                Picker("Bit attivazioni", selection: $dist.activationBits) {
+            Section("Transport") {
+                Picker("Activation bits", selection: $dist.activationBits) {
                     Text("32").tag(32); Text("16").tag(16); Text("8").tag(8)
                 }
                 Stepper("Chunk prefill: \(dist.prefillChunk) token",
                         value: $dist.prefillChunk, in: 1...256, step: 8)
-                Stepper("Max token per risposta: \(dist.maxTokens)",
+                Stepper("Max tokens per response: \(dist.maxTokens)",
                         value: $dist.maxTokens, in: 16...4096, step: 16)
-                Toggle("Inoltro worker→worker", isOn: $dist.forwardEnabled)
+                Toggle("Worker-to-worker forwarding", isOn: $dist.forwardEnabled)
                 if dist.forwardEnabled {
-                    TextField("Host di ritorno (IP LAN di questo Mac)", text: $dist.returnHost)
-                    TextField("Porta di ritorno", value: $dist.returnPort, format: .number.grouping(.never))
+                    TextField("Return host (this Mac's LAN IP)", text: $dist.returnHost)
+                    TextField("Return port", value: $dist.returnPort, format: .number.grouping(.never))
                         .frame(width: 100)
                 }
             }
@@ -147,26 +147,26 @@ struct SettingsView: View {
                 if dist.coordLoading {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text("Connessione…").font(.callout).foregroundStyle(.secondary)
+                        Text("Connecting...").font(.callout).foregroundStyle(.secondary)
                     }
                 } else {
                     Button { dist.connectCoordinator() } label: {
-                        Label("Connetti al cluster", systemImage: "link")
+                        Label("Connect to Cluster", systemImage: "link")
                     }
                 }
             }
         } else {
             Section("Cluster") {
                 HStack {
-                    Label("Connesso · \(dist.parsePeers().count) worker · \(dist.modelLayers) layer",
+                    Label("Connected · \(dist.parsePeers().count) workers · \(dist.modelLayers) layers",
                           systemImage: "link")
                         .foregroundStyle(.green)
                     Spacer()
                     Button(role: .destructive) { dist.disconnectCoordinator() } label: {
-                        Label("Disconnetti", systemImage: "xmark.circle")
+                        Label("Disconnect", systemImage: "xmark.circle")
                     }
                 }
-                Text("La chat (scheda Chat) ora gira sul cluster.")
+                Text("The Chat tab now runs on the cluster.")
                     .font(.caption).foregroundStyle(.tertiary)
             }
         }

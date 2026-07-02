@@ -1,7 +1,13 @@
-# packaging
+# Packaging
 
-Assemblaggio e firma della `.app`.
+Files and scripts for assembling and signing the macOS `.app` bundle.
 
-- **`make_app.sh`** — costruisce `build/DwarfStar.app` dalla release SwiftPM: copia l'eseguibile, l'`Info.plist`, i kernel `metal/` (richiesti a runtime), firma ad-hoc. Per la distribuzione: ri-firmare con Developer ID e notarizzare. Invocato da `make app`.
-- **`Info.plist`** — metadati del bundle (il `make_app.sh` ne reimposta gli essenziali via PlistBuddy).
-- **`DwarfStar.entitlements`** — entitlement del sandbox: file user-selected (read-write) + bookmark, network client/server. Referenziato da `project.yml`.
+- **`make_app.sh`** builds `build/DwarfStar.app` from the SwiftPM release binary.
+  It copies the executable, applies `Info.plist`, includes the `metal/` kernels
+  required at runtime, and performs ad-hoc signing. For distribution, re-sign
+  with Developer ID and notarize the bundle. Invoked by `make app`.
+- **`Info.plist`** contains bundle metadata. `make_app.sh` resets the essential
+  fields with PlistBuddy during packaging.
+- **`DwarfStar.entitlements`** declares the sandbox capabilities used by the app:
+  user-selected read/write files, app-scoped bookmarks, and network client/server
+  access. The entitlements file is referenced by `project.yml`.

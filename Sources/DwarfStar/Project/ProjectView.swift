@@ -42,8 +42,8 @@ enum ProjectLibrary {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.title = "Importa una cartella di progetto"
-        panel.prompt = "Importa"
+        panel.title = "Import a Project Folder"
+        panel.prompt = "Import"
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         _ = url.startAccessingSecurityScopedResource()
         guard let bm = try? url.bookmarkData(options: .withSecurityScope,
@@ -117,32 +117,32 @@ struct ProjectView: View {
     var body: some View {
         Form {
             Section {
-                Text("I progetti importati vivono in una cache separata dalla memoria della chat: l'import non consuma contesto. L'agente (es. Coding) esplora il progetto ATTIVO con i tool project_list / project_read / project_search; solo le parti lette entrano in conversazione.")
+                Text("Imported projects live in a cache separate from chat memory: importing does not consume context. The agent (for example Coding) explores the active project with project_list / project_read / project_search; only the parts it reads enter the conversation.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Progetti salvati") {
+            Section("Saved Projects") {
                 if projects.isEmpty {
-                    Text("Nessun progetto salvato.").foregroundStyle(.secondary)
+                    Text("No saved projects.").foregroundStyle(.secondary)
                 }
                 ForEach(projects) { project in
                     HStack {
                         Label(project.name, systemImage: "folder")
                         if project.id == ProjectLibrary.activeId {
-                            Text("attivo")
+                            Text("active")
                                 .font(.caption)
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(Color.accentColor.opacity(0.2))
                                 .clipShape(Capsule())
                         }
                         Spacer()
-                        Button("Attiva") { activate(project) }
+                        Button("Activate") { activate(project) }
                             .disabled(project.id == ProjectLibrary.activeId)
                         Button(role: .destructive) { remove(project) } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
-                        .help("Rimuovi dalla libreria (la cartella su disco non viene toccata)")
+                        .help("Remove from the library (the folder on disk is not touched)")
                     }
                 }
                 Button {
@@ -151,33 +151,33 @@ struct ProjectView: View {
                         activate(p)
                     }
                 } label: {
-                    Label("Importa cartella…", systemImage: "folder.badge.plus")
+                    Label("Import Folder...", systemImage: "folder.badge.plus")
                 }
-                Text("Solo file di testo (≤1 MB ciascuno, max 3000); cartelle come .git e node_modules escluse. Le cartelle restano accessibili tra i riavvii (bookmark sandbox).")
+                Text("Text files only (<=1 MB each, max 3000); folders like .git and node_modules are excluded. Folders remain accessible across launches through sandbox bookmarks.")
                     .font(.caption).foregroundStyle(.tertiary)
             }
 
-            Section("Progetto attivo") {
+            Section("Active Project") {
                 if let p = info {
-                    LabeledContent("Nome", value: p.name)
-                    LabeledContent("File indicizzati", value: "\(p.fileCount)")
-                    LabeledContent("Dimensione testo", value: ByteCountFormatter.string(
+                    LabeledContent("Name", value: p.name)
+                    LabeledContent("Indexed files", value: "\(p.fileCount)")
+                    LabeledContent("Text size", value: ByteCountFormatter.string(
                         fromByteCount: Int64(p.totalBytes), countStyle: .file))
                 } else {
-                    Text("Nessun progetto attivo.").foregroundStyle(.secondary)
+                    Text("No active project.").foregroundStyle(.secondary)
                 }
                 if !message.isEmpty {
                     Text(message).font(.caption).foregroundStyle(.orange)
                 }
             }
 
-            Section("Uso con gli agenti") {
-                Text("L'agente Coding predefinito ha già i tool di progetto. Cambiando progetto attivo, i tool leggono il nuovo; i risultati già in conversazione restano (apri una Nuova chat per ripartire puliti).")
+            Section("Use with Agents") {
+                Text("The default Coding agent already has project tools. When you change the active project, tools read the new one; results already in the conversation remain. Start a New Chat for a clean slate.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             if !preview.isEmpty {
-                Section("Anteprima file (\(preview.count) di \(info?.fileCount ?? 0))") {
+                Section("File Preview (\(preview.count) of \(info?.fileCount ?? 0))") {
                     ForEach(preview, id: \.self) { f in
                         Text(f).font(.system(.caption, design: .monospaced))
                     }
@@ -202,7 +202,7 @@ struct ProjectView: View {
     private func activate(_ project: ProjectLibrary.SavedProject) {
         message = ""
         guard let i = ProjectLibrary.activate(project) else {
-            message = "Cartella non più accessibile (spostata o eliminata?). Rimuovila e re-importala."
+            message = "Folder is no longer accessible (moved or deleted?). Remove it and import it again."
             return
         }
         info = i

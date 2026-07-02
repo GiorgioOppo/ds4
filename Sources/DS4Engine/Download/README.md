@@ -1,5 +1,12 @@
 # DS4Engine/Download
 
-Download dei modelli.
+Native model download support.
 
-- **`ModelDownloader.swift`** — download GGUF **resumibile** (HTTP Range) dall'endpoint `resolve` di Hugging Face, direttamente in `<ggufDir>/<file>.part`. Nessun script/curl esterno. Verifica l'**integrità SHA-256** del file scaricato contro un digest noto (`ModelTarget.sha256`) quando configurato; altrimenti riporta il digest calcolato. La verifica del contenuto è la difesa robusta (immune alla rotazione delle chiavi della CDN), non il pinning TLS.
+- **`ModelDownloader.swift`** performs **resumable** GGUF downloads with HTTP
+  Range requests from Hugging Face `resolve` endpoints, writing directly to
+  `<ggufDir>/<file>.part`. It does not shell out to scripts or `curl`.
+
+When `ModelTarget.sha256` is configured, the downloader verifies the downloaded
+file against that known SHA-256 digest. Otherwise it reports the calculated
+digest. Content verification is the robust defense here because it survives CDN
+key rotation; this code does not rely on TLS pinning.

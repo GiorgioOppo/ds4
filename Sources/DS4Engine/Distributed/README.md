@@ -1,8 +1,20 @@
 # DS4Engine/Distributed
 
-Inferenza distribuita per parallelismo di pipeline su range di layer contigui (modellata su `ds4_distributed.c`). Ogni **worker** possiede uno slice di layer (pesi + shard KV); il **coordinatore** possiede embedding, sampling e prompt. Lo stato HC (`nHC×nEmbd` float, trasportato a 32/16/8 bit) attraversa i worker per token.
+Distributed inference with pipeline parallelism across contiguous layer ranges,
+modeled after `ds4_distributed.c`.
 
-- **`DistEngine.swift`** — engine per-nodo: espone le slice-op di basso livello (embed/forwardSlice/head) + tokenizer/sampling per il coordinatore.
-- **`DistCoordinator.swift`** — connette i worker, valida la copertura contigua dei layer, esegue una chat multi-turno sul cluster; include `benchmark()`.
-- **`DistWorker.swift`** — il nodo worker (ascolta il coordinatore, esegue il suo slice).
-- **`DistProtocol.swift` / `DistTransport.swift`** — frame del protocollo e connessione async su `NWConnection` (TCP, in chiaro: usare su reti fidate).
+Each **worker** owns a slice of layers, including weights and its KV shard. The
+**coordinator** owns embeddings, sampling, prompt rendering, and cluster control.
+For each token, the HC state (`nHC x nEmbd` floats, transported as 32/16/8-bit
+depending on configuration) moves through the worker chain.
+
+- **`DistEngine.swift`** is the per-node engine. It exposes low-level slice
+  operations (`embed`, `forwardSlice`, `head`) plus tokenizer/sampling utilities
+  needed by the coordinator.
+- **`DistCoordinator.swift`** connects workers, validates contiguous layer
+  coverage, runs multi-turn chat on the cluster, and exposes `benchmark()`.
+- **`DistWorker.swift`** implements the worker node: it listens for a coordinator
+  and executes its assigned layer slice.
+- **`DistProtocol.swift` / `DistTransport.swift`** define protocol frames and the
+  async `NWConnection` transport. TCP traffic is plaintext, so use it only on
+  trusted networks.

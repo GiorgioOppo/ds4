@@ -81,7 +81,7 @@ public enum ModelDownloader {
             switch self {
             case .http(let c): return "HTTP \(c)"
             case .checksumMismatch(let e, let g):
-                return "SHA-256 non corrisponde — atteso \(e), ottenuto \(g). Il file scaricato è stato rimosso (possibile corruzione o manomissione)."
+                return "SHA-256 mismatch: expected \(e), got \(g). The downloaded file was removed (possible corruption or tampering)."
             }
         }
     }
@@ -174,11 +174,11 @@ public enum ModelDownloader {
                                onStatus: @Sendable (String) -> Void) throws {
         guard let expected = target.sha256, !expected.isEmpty else {
             if let d = computed {
-                onStatus("SHA-256: \(d)\nNessun digest atteso configurato per “\(target.id)”: incollalo in ModelTarget.sha256 per attivare la verifica automatica.")
+                onStatus("SHA-256: \(d)\nNo expected digest configured for \"\(target.id)\": paste it into ModelTarget.sha256 to enable automatic verification.")
             }
             return
         }
-        onStatus("Verifica integrità (SHA-256)…")
+        onStatus("Verifying integrity (SHA-256)...")
         var total: Int64 = 1
         if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
            let sz = attrs[.size] as? Int64 { total = sz }
@@ -187,7 +187,7 @@ public enum ModelDownloader {
             try? FileManager.default.removeItem(at: file)
             throw DownloadError.checksumMismatch(expected: expected.lowercased(), got: got)
         }
-        onStatus("✓ SHA-256 verificato")
+        onStatus("SHA-256 verified")
     }
 
     /// Stream a file from disk and return its lowercase-hex SHA-256, reporting the

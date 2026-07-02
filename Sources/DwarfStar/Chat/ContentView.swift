@@ -11,9 +11,9 @@ struct ContentView: View {
         case .loading:
             VStack(spacing: 12) {
                 ProgressView()
-                Text("Caricamento del modello…")
+                Text("Loading model...")
                     .foregroundStyle(.secondary)
-                Text("Mappa il GGUF e compila i kernel Metal. Può richiedere alcuni secondi.")
+                Text("Maps the GGUF and compiles Metal kernels. This can take a few seconds.")
                     .font(.footnote)
                     .foregroundStyle(.tertiary)
             }
@@ -33,7 +33,7 @@ struct ModelLoadView: View {
         Form {
             Section {
                 if store.discoveredModels.isEmpty {
-                    Text("Nessun GGUF trovato in \(store.scriptDir) o \(store.scriptDir)/gguf.")
+                    Text("No GGUF found in \(store.scriptDir) or \(store.scriptDir)/gguf.")
                         .foregroundStyle(.secondary)
                         .font(.callout)
                 } else {
@@ -59,20 +59,20 @@ struct ModelLoadView: View {
                 }
             } header: {
                 HStack {
-                    Text("Modelli disponibili")
+                    Text("Available Models")
                     Spacer()
                     Button { store.scanModels() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
-                    Button { showDownload = true } label: { Label("Scarica…", systemImage: "arrow.down.circle") }
+                    Button { showDownload = true } label: { Label("Download...", systemImage: "arrow.down.circle") }
                         .buttonStyle(.borderless)
                 }
             }
 
-            Section("Configurazione automatica") {
+            Section("Automatic Configuration") {
                 Button {
                     store.applyRecommendedPreset()
                 } label: {
-                    Label("Configura per la tua RAM (\(MemoryInfo.gib(MemoryInfo.physicalBytes)))",
+                    Label("Configure for your RAM (\(MemoryInfo.gib(MemoryInfo.physicalBytes)))",
                           systemImage: "wand.and.stars")
                 }
                 if let note = store.presetNote {
@@ -80,48 +80,48 @@ struct ModelLoadView: View {
                 }
             }
 
-            Section("Percorsi") {
-                TextField("Percorso GGUF", text: $store.modelPath)
+            Section("Paths") {
+                TextField("GGUF path", text: $store.modelPath)
                 Button {
                     if let path = ModelPicker.pickGGUF() { store.modelPath = path }
                 } label: {
-                    Label("Sfoglia…", systemImage: "folder")
+                    Label("Browse...", systemImage: "folder")
                 }
-                Text("Con l'App Sandbox attiva è necessario selezionare il file qui: il percorso scelto resta accessibile e viene ricordato al prossimo avvio.")
+                Text("With App Sandbox enabled, select the file here: the chosen path remains accessible and is remembered on the next launch.")
                     .font(.caption).foregroundStyle(.secondary)
                 // Metal kernels are embedded in the app — no folder to set.
             }
 
-            Section("Memoria") {
-                Text("Lo streaming da SSD è sempre attivo: i pesi non-routed sono mappati no-copy (page cache) e per ogni token vengono letti solo i 6 expert selezionati. Se il modello entra in RAM, la page cache lo tiene residente automaticamente.")
+            Section("Memory") {
+                Text("SSD streaming is always enabled: non-routed weights are no-copy mapped through the page cache, and each token reads only the 6 selected experts. If the model fits in RAM, the page cache keeps it resident automatically.")
                     .font(.caption).foregroundStyle(.secondary)
-                Toggle("KV su disco (riusa i prefissi tra sessioni)", isOn: $store.diskKVEnabled)
+                Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
                     Stepper("Budget: \(store.diskKVBudgetMB) MB",
                             value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
-                    Text("A fine risposta lo stato KV viene salvato su disco; una nuova conversazione (o una richiesta al server) che inizia con un prefisso già visto lo ripristina invece di rifare il prefill. Si applica al prossimo caricamento.")
+                    Text("At the end of a response, the KV state is saved to disk; a new conversation or server request that starts with a known prefix restores it instead of redoing prefill. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
-                Toggle("Raw-KV ring (sperimentale): RAM della KV costante", isOn: $store.rawRingEnabled)
+                Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {
-                    Text("Tiene in RAM solo la finestra di attenzione (128 righe) invece dell'intero contesto → RAM KV indipendente dal contesto. Sperimentale: verifica gli output dopo un contesto lungo. Si applica al prossimo caricamento.")
+                    Text("Keeps only the attention window (128 rows) in RAM instead of the full context, making raw KV RAM independent of context length. Experimental: verify outputs after a long context. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.orange)
                 }
-                Toggle("Read-ahead esperti selezionati (madvise)", isOn: $store.willNeedEnabled)
-                Text("Anticipa la lettura dei 6 esperti scelti subito prima del gather: riduce i fault a freddo (su poca RAM), no-op a caldo. Solo advisory, non cambia gli output. Consigliato ON. Si applica al prossimo caricamento.")
+                Toggle("Read ahead selected experts (madvise)", isOn: $store.willNeedEnabled)
+                Text("Starts reading the 6 selected experts just before gather: reduces cold faults on low-RAM systems, no-op when hot. Advisory only; does not change outputs. Recommended ON. Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
-                Toggle("Pesi densi residenti (~5 GB wired)", isOn: $store.residentDenseEnabled)
-                Text("Tiene i pesi non-esperti (attenzione + FFN condivisa) residenti in RAM invece di rifaultarli dall'SSD ogni token → più veloce su macchine con RAM abbondante (~+40% a 32 GB). Costa ~5 GB di RAM wired: default ON solo con RAM ≥ 24 GB. Su 16 GB tende a PEGGIORARE (pressione di memoria): provalo ma se rallenta lascialo OFF. Si applica al prossimo caricamento.")
+                Toggle("Resident dense weights (~5 GB wired)", isOn: $store.residentDenseEnabled)
+                Text("Keeps non-expert weights (attention + shared FFN) resident in RAM instead of re-faulting them from SSD every token. Faster with enough RAM (~+40% at 32 GB). Costs ~5 GB wired RAM; default ON only with >=24 GB RAM. On 16 GB it can be worse due to memory pressure. Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
-                Toggle("Profilo decode route/attn (diagnostico)", isOn: $store.profileRouteEnabled)
+                Toggle("Decode route/attn profile (diagnostic)", isOn: $store.profileRouteEnabled)
                 if store.profileRouteEnabled {
-                    Text("Splitta route/attn in 5 fasi (comp/q/kv/attn/out) e scrive il report nel Log motore a fine turno. ⚠️ I commit extra per fase RALLENTANO la generazione: usalo per capire DOVE va il tempo (conta il rapporto), non per misurare la velocità. Si applica al prossimo caricamento.")
+                    Text("Splits route/attn into 5 phases (comp/q/kv/attn/out) and writes the report to the engine log at the end of the turn. Extra commits slow generation: use it to understand where time goes, not to measure speed. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
 
-            Section("Agente (ruolo)") {
-                Picker("Agente", selection: Binding(get: { store.selectedAgentId },
+            Section("Agent (Role)") {
+                Picker("Agent", selection: Binding(get: { store.selectedAgentId },
                                                     set: { store.selectAgent($0) })) {
                     ForEach(store.agents) { agent in
                         Label(agent.name, systemImage: agent.icon).tag(agent.id)
@@ -132,16 +132,16 @@ struct ModelLoadView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(3)
                 }
-                Text("Definisce ruolo e tool della chat. Visualizza e modifica i prompt nella scheda “Agenti”.")
+                Text("Defines the chat role and tools. View and edit prompts in the Agents tab.")
                     .font(.caption).foregroundStyle(.tertiary)
             }
 
-            Section("Contesto e system prompt") {
-                Stepper("Contesto: \(store.contextSize) token",
+            Section("Context and System Prompt") {
+                Stepper("Context: \(store.contextSize) tokens",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
-                Text("Le cache KV crescono col contesto e tolgono page cache allo stream esperti: su poca RAM un contesto alto rallenta molto la generazione. Il default è tarato sulla RAM (4096 su ≤16 GB, come la demo); alzalo solo se ti serve davvero una finestra più lunga.")
+                Text("KV caches grow with context and take page cache away from expert streaming. On low RAM, a large context slows generation a lot. The default is RAM-aware (4096 on <=16 GB, like the demo); raise it only if you need a longer window.")
                     .font(.caption).foregroundStyle(.secondary)
-                TextField("System prompt aggiuntivo (si somma al ruolo dell'agente)",
+                TextField("Additional system prompt (added to the agent role)",
                           text: $store.systemPrompt, axis: .vertical)
                     .lineLimit(2...6)
             }
@@ -164,10 +164,10 @@ struct ModelLoadView: View {
                 Button {
                     store.load()
                 } label: {
-                    Label("Carica modello", systemImage: "bolt.fill")
+                    Label("Load Model", systemImage: "bolt.fill")
                 }
                 .keyboardShortcut(.return, modifiers: [.command])
-                Text("RAM di sistema: \(MemoryInfo.gib(MemoryInfo.physicalBytes))")
+                Text("System RAM: \(MemoryInfo.gib(MemoryInfo.physicalBytes))")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

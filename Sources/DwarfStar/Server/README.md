@@ -1,10 +1,17 @@
 # DwarfStar/Server
 
-Server HTTP **nativo in-process** (su `Network.framework`), OpenAI/Anthropic-compatible. Niente sottoprocesso; i pesi GGUF sono condivisi (mmap) con l'engine della chat. Una richiesta alla volta.
+Native in-process HTTP server built on `Network.framework`, compatible with
+OpenAI and Anthropic-style APIs. It does not launch a subprocess; GGUF weights
+are shared through mmap with the chat engine. Requests are processed one at a
+time.
 
-- **`ServerController.swift`** — avvio/stop, configurazione, wiring del KV su disco.
-- **`LocalServer.swift`** — il server: routing degli endpoint (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/messages`, `/v1/models`), streaming SSE e non.
-- **`ChatRequestParser.swift`** — parsing dei body di richiesta nei tipi dell'engine.
-- **`ServerView.swift`** — UI del pannello.
+- **`ServerController.swift`** starts/stops the server, applies configuration,
+  and wires disk KV.
+- **`LocalServer.swift`** implements endpoint routing for
+  `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/messages`, and
+  `/v1/models`, including streaming and non-streaming responses.
+- **`ChatRequestParser.swift`** parses request bodies into engine-level types.
+- **`ServerView.swift`** renders the server panel.
 
-⚠️ HTTP in chiaro: pensato per `127.0.0.1`; oltre il loopback mettilo dietro TLS.
+HTTP traffic is plaintext. The intended default is `127.0.0.1`; if you expose it
+beyond loopback, put it behind TLS.

@@ -11,23 +11,23 @@ struct WorkerView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("Questo Mac come WORKER: possiede uno slice di layer e resta in ascolto del coordinatore. Avvia i worker, poi connetti il coordinatore (scheda Chat → Distribuito).",
+                    Label("This Mac as a worker: owns a layer slice and listens for the coordinator. Start workers first, then connect the coordinator from Chat -> Distributed.",
                           systemImage: "rectangle.3.group")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Modello (da Impostazioni)") {
+                Section("Model (from Settings)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    LabeledContent("Contesto", value: "\(controller.contextSize) token")
+                    LabeledContent("Context", value: "\(controller.contextSize) tokens")
                 }
 
-                Section("Worker — modello da \(controller.modelLayers) layer (0…\(controller.modelLayers - 1))") {
-                    TextField("Porta", value: $controller.port, format: .number.grouping(.never))
-                    Stepper("Primo layer: \(controller.layerStart)", value: $controller.layerStart,
+                Section("Worker - \(controller.modelLayers)-layer model (0...\(controller.modelLayers - 1))") {
+                    TextField("Port", value: $controller.port, format: .number.grouping(.never))
+                    Stepper("First layer: \(controller.layerStart)", value: $controller.layerStart,
                             in: 0...(controller.modelLayers - 1))
-                    Stepper("Ultimo layer: \(controller.layerEnd)", value: $controller.layerEnd,
+                    Stepper("Last layer: \(controller.layerEnd)", value: $controller.layerEnd,
                             in: controller.layerStart...(controller.modelLayers - 1))
-                    Toggle("Possiede l'output head (ultimo slice)", isOn: $controller.hasOutput)
-                    Text("La route dei worker deve coprire tutti i \(controller.modelLayers) layer in modo contiguo. Su un solo Mac: un worker 0…\(controller.modelLayers - 1) con output head.")
+                    Toggle("Owns the output head (last slice)", isOn: $controller.hasOutput)
+                    Text("The worker route must cover all \(controller.modelLayers) layers contiguously. On one Mac: one worker 0...\(controller.modelLayers - 1) with the output head.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(controller.workerRunning)
@@ -36,16 +36,16 @@ struct WorkerView: View {
                     HStack(spacing: 12) {
                         if controller.workerRunning {
                             Button(role: .destructive) { controller.stopWorker() } label: {
-                                Label("Ferma worker", systemImage: "stop.fill")
+                                Label("Stop Worker", systemImage: "stop.fill")
                             }
                             Label(controller.workerSummary, systemImage: "dot.radiowaves.left.and.right")
                                 .foregroundStyle(.green).font(.callout)
                         } else if controller.workerLoading {
                             ProgressView().controlSize(.small)
-                            Text("Caricamento…").font(.callout).foregroundStyle(.secondary)
+                            Text("Loading...").font(.callout).foregroundStyle(.secondary)
                         } else {
                             Button { controller.startWorker() } label: {
-                                Label("Avvia worker", systemImage: "play.fill")
+                                Label("Start Worker", systemImage: "play.fill")
                             }
                         }
                     }
@@ -83,11 +83,11 @@ struct CoordinatorChatView: View {
             }
         } else {
             ContentUnavailableView {
-                Label("Cluster non connesso", systemImage: "rectangle.3.group")
+                Label("Cluster Not Connected", systemImage: "rectangle.3.group")
             } description: {
-                Text("Configura modello, worker e route nella scheda Impostazioni, poi premi Connetti.")
+                Text("Configure the model, workers, and route in Settings, then press Connect.")
             } actions: {
-                Button("Apri Impostazioni") { openSettings() }
+                Button("Open Settings") { openSettings() }
             }
         }
     }
@@ -101,13 +101,13 @@ struct CoordinatorChatView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(modelName)
                     .font(.headline)
-                Text("distribuito · \(controller.modelLayers) layer su \(controller.parsePeers().count) worker · ctx \(controller.contextSize) · \(controller.forwardEnabled ? "inoltro" : "relay")")
+                Text("distributed · \(controller.modelLayers) layers on \(controller.parsePeers().count) workers · ctx \(controller.contextSize) · \(controller.forwardEnabled ? "forwarding" : "relay")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             projectMenu
-            Picker("Agente", selection: Binding(get: { controller.selectedAgentId },
+            Picker("Agent", selection: Binding(get: { controller.selectedAgentId },
                                                 set: { controller.selectAgent($0) })) {
                 ForEach(controller.agents) { agent in
                     Label(agent.name, systemImage: agent.icon).tag(agent.id)
@@ -115,18 +115,18 @@ struct CoordinatorChatView: View {
             }
             .pickerStyle(.menu)
             .fixedSize()
-            .help("Ruolo della chat distribuita: nuova chat con il system prompt e i tool dell'agente. I tool girano su QUESTO Mac (coordinatore).")
+            .help("Distributed chat role: starts a new chat with the agent's system prompt and tools. Tools run on this Mac, the coordinator.")
             Toggle("Thinking", isOn: $controller.think)
                 .toggleStyle(.switch)
             Button {
                 controller.newChat()
             } label: {
-                Label("Nuova chat", systemImage: "square.and.pencil")
+                Label("New Chat", systemImage: "square.and.pencil")
             }
             Button(role: .destructive) {
                 controller.disconnectCoordinator()
             } label: {
-                Label("Disconnetti", systemImage: "xmark.circle")
+                Label("Disconnect", systemImage: "xmark.circle")
             }
         }
         .padding(.horizontal)
@@ -138,7 +138,7 @@ struct CoordinatorChatView: View {
     private var projectMenu: some View {
         Menu {
             if projects.isEmpty {
-                Text("Nessun progetto salvato")
+                Text("No saved projects")
             } else {
                 ForEach(projects) { p in
                     Button {
@@ -157,13 +157,13 @@ struct CoordinatorChatView: View {
                     refreshProject()
                 }
             } label: {
-                Label("Importa cartella…", systemImage: "folder.badge.plus")
+                Label("Import Folder...", systemImage: "folder.badge.plus")
             }
         } label: {
-            Label(activeProjectName ?? "Progetto", systemImage: "folder")
+            Label(activeProjectName ?? "Project", systemImage: "folder")
         }
         .fixedSize()
-        .help("Progetto attivo per i tool project_* dell'agente (eseguiti sul coordinatore).")
+        .help("Active project for the agent's project_* tools, executed on the coordinator.")
         .onAppear { refreshProject() }
     }
 
@@ -197,7 +197,7 @@ struct CoordinatorChatView: View {
                 }
             }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Scrivi un messaggio…", text: $controller.chatInput, axis: .vertical)
+                TextField("Write a message...", text: $controller.chatInput, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(1...6)
                     .onSubmit { controller.sendChat() }

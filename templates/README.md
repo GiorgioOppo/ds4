@@ -1,23 +1,30 @@
-# Chat template (tool calling)
+# Chat Template (Tool Calling)
 
-[`chat_template.jinja`](chat_template.jinja) è il `chat_template` Jinja di
-DeepSeek-V4 **con il supporto ai tool**, fedele al formato su cui il modello è
-addestrato (verificato contro il `tokenizer.chat_template` del GGUF), riformattato
-e commentato. Produce output **byte-identico** all'originale.
+[`chat_template.jinja`](chat_template.jinja) is the DeepSeek-V4 Jinja
+`chat_template` **with tool-calling support**. It follows the format the model was
+trained on, was checked against the `tokenizer.chat_template` stored in the GGUF,
+and has only been reformatted/commented for readability. The rendered output is
+byte-identical to the original template.
 
-## A cosa serve
+## Purpose
 
-- **Riferimento/spec**: è il formato che il renderer Swift del progetto
-  (`Sources/DS4Core/Inference/ChatTools.swift` → `ChatRenderer`) rispecchia 1:1.
-- **Altri runtime**: usalo con stack che consumano il `chat_template`
-  (llama.cpp, vLLM, `transformers`) o per **ri-incorporarlo** in un GGUF.
+- **Reference/specification:** this is the format mirrored 1:1 by the Swift
+  renderer in
+  [`ChatRenderer`](../Sources/DS4Core/Inference/ChatTools.swift).
+- **External runtimes:** use it with stacks that consume tokenizer chat templates,
+  such as llama.cpp, vLLM, or `transformers`, or to re-embed the template into a
+  GGUF.
+- **Regression aid:** when changing the Swift renderer, this template is the
+  canonical source for spacing, special tokens, tool schemas, tool invocations,
+  and thinking tags.
 
-## Formato (riassunto)
+## Format Summary
 
-- **Dichiarazione tool** in un blocco system `## Tools …` + schemi delle funzioni
-  in JSON (`tool['function'] | tojson`, chiavi ordinate).
-- **Chiamata** (XML sul token `｜DSML｜`):
-  ```
+- **Tool declarations** are emitted inside a system block headed by `## Tools`,
+  followed by JSON function schemas (`tool['function'] | tojson`, sorted keys).
+- **Tool calls** use XML-like DSML on the `｜DSML｜` token:
+
+  ```xml
   <｜DSML｜tool_calls>
   <｜DSML｜invoke name="get_weather">
   <｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>
@@ -25,37 +32,55 @@ e commentato. Produce output **byte-identico** all'originale.
   </｜DSML｜invoke>
   </｜DSML｜tool_calls>
   ```
-  Stringhe → `string="true"` valore grezzo; altri tipi → `string="false"` valore JSON.
-- **Risultato tool** dentro un turno utente: `<｜User｜><tool_result>…</tool_result>`
-  (risultati consecutivi non ripetono `<｜User｜>`).
-- Ogni turno assistant apre `<｜Assistant｜>` poi `</think>` (o `<think>…</think>`
-  se `thinking` è attivo e `reasoning_content` è presente — *interleaved thinking*),
-  contenuto, eventuali tool-call, e chiude con `<｜end▁of▁sentence｜>`.
-- Nessuna newline tra `BOS` e system.
 
-## Uso con `transformers`
+  Strings are emitted with `string="true"` and raw text values. Other types are
+  emitted with `string="false"` and JSON values.
+- **Tool results** are injected into a user turn as
+  `<｜User｜><tool_result>...</tool_result>`. Consecutive tool results do not repeat
+  the `<｜User｜>` prefix.
+- **Assistant turns** start with `<｜Assistant｜>`, then either `</think>` or
+  `<think>...</think>` when `thinking` is enabled and `reasoning_content` is
+  present, followed by assistant content, optional tool calls, and
+  `<｜end▁of▁sentence｜>`.
+- There is **no newline** between `BOS` and the system content.
+
+## Example With `transformers`
 
 ```python
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("…")
+
+tok = AutoTokenizer.from_pretrained("...")
 with open("templates/chat_template.jinja") as f:
     tok.chat_template = f.read()
 
 messages = [
-    {"role": "user", "content": "Che ore sono?"},
+    {"role": "user", "content": "What time is it?"},
 ]
-tools = [{"type": "function", "function": {
-    "name": "now", "description": "Current date/time (ISO-8601).",
-    "parameters": {"type": "object", "properties": {}}}}]
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "now",
+        "description": "Current date/time (ISO-8601).",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}]
 
 prompt = tok.apply_chat_template(
-    messages, tools=tools, add_generation_prompt=True, thinking=False, tokenize=False)
+    messages,
+    tools=tools,
+    add_generation_prompt=True,
+    thinking=False,
+    tokenize=False,
+)
 print(prompt)
 ```
 
-## Riferimenti
+## References
 
-- Schema/spec: paper DeepSeek-V4, Table 4 (tool-call schema), Table 5 (token speciali).
-- Implementazione Swift equivalente: `ChatRenderer` in
-  [`Sources/DS4Core/Inference/ChatTools.swift`](../Sources/DS4Core/Inference/ChatTools.swift).
-- Dettagli motore: [`docs/ARCHITETTURA-MOTORE.md`](../docs/ARCHITETTURA-MOTORE.md) §14.
+- Schema/specification: DeepSeek-V4 paper, Table 4 for the tool-call schema and
+  Table 5 for special tokens.
+- Equivalent Swift implementation:
+  [`ChatRenderer`](../Sources/DS4Core/Inference/ChatTools.swift).
+- Engine details:
+  [`docs/ARCHITETTURA-MOTORE.md`](../docs/ARCHITETTURA-MOTORE.md), section 14.

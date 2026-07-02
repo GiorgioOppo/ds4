@@ -8,10 +8,10 @@ import DS4Engine
 @Observable
 final class DiagnosticsController {
     let settings: AppSettings
-    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+    var modelPath: String { settings.modelPath }
 
     init(settings: AppSettings) { self.settings = settings }
-    var text = "Ciao, come stai?"
+    var text = "Hello, how are you?"
     var output = ""
     var isRunning = false
 
@@ -27,9 +27,9 @@ final class DiagnosticsController {
                 let dump = try await Task.detached { try Diagnostics.dumpTokens(modelPath: path, text: t) }.value
                 output = dump
             } catch is CancellationError {
-                output = "[annullato]\n"
+                output = "[canceled]\n"
             } catch {
-                output = "Errore: \(error)\n"
+                output = "Error: \(error)\n"
             }
             isRunning = false
         }
@@ -49,9 +49,9 @@ final class DiagnosticsController {
                 let dump = try await Task.detached { try Diagnostics.dumpChatTemplate(modelPath: path) }.value
                 output = dump
             } catch is CancellationError {
-                output = "[annullato]\n"
+                output = "[canceled]\n"
             } catch {
-                output = "Errore: \(error)\n"
+                output = "Error: \(error)\n"
             }
             isRunning = false
         }

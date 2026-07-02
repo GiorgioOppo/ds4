@@ -1,6 +1,11 @@
 # DwarfStar/Distributed
 
-UI dell'inferenza distribuita (il motore sta in `DS4Engine/Distributed`).
+UI for distributed inference. The engine and protocol live under
+`DS4Engine/Distributed`.
 
-- **`DistributedController.swift`** — guida sia il ruolo **worker** (questo Mac possiede uno slice di layer) sia il **coordinatore** (in Chat → Distribuito: connette i worker ed esegue la chat sul cluster). Espone la connessione al pannello Benchmark.
-- **`DistributedView.swift`** — il pannello Worker (slice di layer, porta, log).
+- **`DistributedController.swift`** drives both roles. As a **worker**, this Mac
+  owns a slice of layers. As a **coordinator** from Chat -> Distributed, it
+  connects workers and runs chat over the cluster. It also exposes the connected
+  coordinator to the Benchmark panel.
+- **`DistributedView.swift`** renders the Worker panel, including layer slice,
+  port, and logs.

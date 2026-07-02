@@ -8,8 +8,8 @@ import SwiftUI
 @Observable
 final class AppSettings {
     enum EngineMode: String, CaseIterable, Identifiable {
-        case local = "Locale"
-        case distributed = "Distribuito"
+        case local = "Local"
+        case distributed = "Distributed"
         var id: String { rawValue }
     }
 

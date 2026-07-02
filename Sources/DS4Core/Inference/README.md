@@ -1,8 +1,13 @@
 # DS4Core/Inference
 
-Pezzi puri dell'inferenza (niente GPU).
+Pure inference-facing pieces that do not touch the GPU.
 
-- **`Tokenizer.swift`** — BPE con i token di controllo DeepSeek-V4 (BOS/EOS, `<｜User｜>`, `<think>`, `｜DSML｜`…); `tokenizeRenderedChat`, `tokenText`.
-- **`ChatTools.swift`** — tipi `ToolSpec`/`ToolCall`/`ChatTurn`, rendering del prompt chat + dei tool nel formato DSML, e `ToolCallParser` (estrae le tool-call dal testo generato).
-- **`Sampler.swift`** — campionamento (temperature, top-k/p, min-p, penalità di ripetizione).
-- **`ModelShape.swift`** — descrizione della shape del modello.
+- **`Tokenizer.swift`** implements BPE with DeepSeek-V4 control tokens such as
+  BOS/EOS, `<｜User｜>`, `<think>`, and `｜DSML｜`. Important entry points include
+  `tokenizeRenderedChat` and `tokenText`.
+- **`ChatTools.swift`** defines `ToolSpec`, `ToolCall`, and `ChatTurn`; renders
+  chat/tool prompts in the DSML format; and provides `ToolCallParser`, which
+  extracts tool calls from generated text.
+- **`Sampler.swift`** implements temperature, top-k/top-p, min-p, and repetition
+  penalty sampling.
+- **`ModelShape.swift`** describes the model dimensions consumed by the runtime.

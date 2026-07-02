@@ -1,6 +1,9 @@
 # DS4Core/Streaming
 
-Supporto allo streaming dei pesi da SSD (il modello non sta tutto in RAM).
+Support code for streaming model weights from SSD when the full model cannot
+remain resident in RAM.
 
-- **`SSDCachePlan.swift`** — pianificazione di cosa tenere residente vs streammare.
-- **`SimulatedMemoryLock.swift`** — lock di memoria simulato (per ragionare sul working set senza wiring reale).
+- **`SSDCachePlan.swift`** plans what should stay resident and what can be
+  streamed on demand.
+- **`SimulatedMemoryLock.swift`** provides a simulated memory lock, useful for
+  reasoning about the working set before adding real platform-specific wiring.

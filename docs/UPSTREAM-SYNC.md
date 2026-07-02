@@ -1,85 +1,90 @@
-# Sincronizzazione con l'upstream (`antirez/ds4`)
+# Upstream Sync (`antirez/ds4`)
 
-Il motore di DwarfStar è una **riscrittura pure-Swift** del C upstream
-[`antirez/ds4`](https://github.com/antirez/ds4.git). Questo file tiene traccia
-dell'ultima volta che abbiamo confrontato i commit upstream con il nostro port,
-così la prossima revisione riparte da un punto noto invece che da zero.
+DwarfStar's engine is a **pure-Swift rewrite** of the upstream C project
+[`antirez/ds4`](https://github.com/antirez/ds4.git). This file records the last
+upstream comparison so that the next review starts from a known baseline instead
+of rediscovering the same commit history.
 
-## Baseline corrente
+## Current Baseline
 
-| | |
+| Field | Value |
 |---|---|
-| Upstream HEAD valutato | `80ebbc3` |
-| Data | 2026-06-17 |
-| Repo | `https://github.com/antirez/ds4.git` |
-| Esito | **Nessun cambiamento urgente da portare** per il percorso del modello standard. |
+| Upstream HEAD reviewed | `80ebbc3` |
+| Date | 2026-06-17 |
+| Repository | `https://github.com/antirez/ds4.git` |
+| Result | **No urgent changes required** for the standard model path. |
 
-## Cosa confrontare (e cosa ignorare)
+## What Is in Scope
 
-Condividiamo con l'upstream solo il **motore di inferenza**. I file rilevanti:
+DwarfStar shares only the inference-engine surface with upstream. These upstream
+files are relevant:
 
-- `ds4.c` — decoder, MoE/NSA, streaming, cache esperti → noi: `DS4Core` + `DS4Metal`.
-- `ds4_metal.m` — runtime e kernel Metal → noi: `DS4Metal`.
-- `ds4_server.c` — server HTTP → noi: `Sources/DwarfStar/Server`.
+- `ds4.c` — decoder, MoE/NSA, SSD streaming, expert cache. DwarfStar equivalent:
+  `DS4Core` + `DS4Metal`.
+- `ds4_metal.m` — Metal runtime and kernels. DwarfStar equivalent: `DS4Metal`.
+- `ds4_server.c` — HTTP server behavior. DwarfStar equivalent:
+  `Sources/DwarfStar/Server`.
 
-**Da ignorare** (non li portiamo): backend `ds4_cuda.cu` / `ds4_rocm.cu` / `rocm/`,
-MTP / speculative decoding, l'agente da terminale (`ds4_agent.c`, raw mode/TTY),
-il grader `ds4-eval`, la CLI `ds4_cli.c`.
+Out of scope for this port: CUDA/ROCm backends (`ds4_cuda.cu`, `ds4_rocm.cu`,
+`rocm/`), MTP/speculative decoding, the terminal agent (`ds4_agent.c`,
+raw-mode/TTY behavior), `ds4-eval`, and `ds4_cli.c`.
 
-## Verdetto sui commit recenti (≤ `80ebbc3`)
+## Recent Commit Review (Through `80ebbc3`)
 
-| Commit | Area | Verdetto per il nostro port |
+| Commit | Area | Port Decision |
 |---|---|---|
-| `d75e23d` Guard Metal tensor frees | Metal | **N/A** — guard contro il double-free di handle ObjC *bridged* in C. In Swift `GPUTensor` è ARC, niente free manuale: il bug non esiste. |
-| `8384adf` Fix Metal SSD streaming cache reuse | Metal/streaming | **N/A** — evita di evictare uno slot esperto mentre un command buffer è ancora *in volo*. Da noi `GraphContext.commit()` fa sempre `waitUntilCompleted` → nessun CB in volo al gather/evict successivo. Race impossibile per costruzione (niente pipelining). |
-| `91bafb5` Recover tool calls inside unclosed `<think>` | server/gen | **N/A** — il loop C ignora i marker tool dentro `<think>`. Il nostro `InferenceService.generate` entra in modalità tool sul token DSML *a prescindere* da `inReasoning`, e se non parsabile la mostra come testo invece di scartarla. |
-| `fd2d173` Harden server JSON parsing | server | **N/A** — irrobustisce un parser JSON scritto a mano in C. Noi usiamo `JSONSerialization` (Foundation). |
-| `cafc134` Fix server const warning | server | **N/A** — warning C. |
-| `1cfa5cc` Refactor streaming expert cache API | streaming | **N/A** — refactoring multi-backend, nessun cambio di comportamento. |
-| `7a77a28` Release cache margin on mlock failure · `cd57428` Cap oversized caches | streaming | **N/A / marginale** — legati a `mlock` e allo slab allocator C. Noi non facciamo `mlock`; la slot-cache è opt-in e già limitata per slot. |
-| `f2d701a` Fix distributed SSD streaming layer slices | distribuito | **Differito** — il nostro distribuito è "implementato, non ancora validato numericamente". Da rivedere *insieme* alla validazione del distribuito, non prima. |
-| **`81f35e7` (+`b548d86`) mixed-precision routed experts** | streaming/quant | **Portato** — quant degli esperti **per-layer** (decode + cache). Vedi sotto. |
+| `d75e23d` Guard Metal tensor frees | Metal | **N/A.** Guards against double-free of bridged Objective-C handles in C. Swift `GPUTensor` is ARC-managed; the bug does not exist in this port. |
+| `8384adf` Fix Metal SSD streaming cache reuse | Metal/streaming | **N/A.** Avoids evicting an expert slot while a command buffer is still in flight. DwarfStar's `GraphContext.commit()` waits for completion, so no gather/evict command buffer race exists. |
+| `91bafb5` Recover tool calls inside unclosed `<think>` | server/generation | **N/A.** DwarfStar enters tool mode on the DSML token regardless of `inReasoning`; if parsing fails, the markup is shown as text instead of being discarded. |
+| `fd2d173` Harden server JSON parsing | server | **N/A.** The C parser was handwritten; DwarfStar uses Foundation `JSONSerialization`. |
+| `cafc134` Fix server const warning | server | **N/A.** C-only warning. |
+| `1cfa5cc` Refactor streaming expert cache API | streaming | **N/A.** Multi-backend refactor with no behavioral change to port. |
+| `7a77a28` Release cache margin on mlock failure / `cd57428` Cap oversized caches | streaming | **N/A / marginal.** Tied to C `mlock` and slab allocator behavior. DwarfStar does not `mlock`; expert slot-cache is opt-in and slot-limited. |
+| `f2d701a` Fix distributed SSD streaming layer slices | distributed | **Deferred.** DwarfStar's distributed mode is implemented but still needs numerical validation. Review together with that validation work. |
+| `81f35e7` + `b548d86` mixed-precision routed experts | streaming/quant | **Ported.** Per-layer routed expert quantization is supported. See below. |
 
-Commit non elencati (ROCm/CUDA, MTP, agente TTY, `ds4-eval`): fuori perimetro.
+Commits not listed here, such as ROCm/CUDA, MTP, terminal agent, and `ds4-eval`
+work, are currently outside the DwarfStar port boundary.
 
-## Risolti
+## Ported: Per-Layer Mixed-Precision Routed Experts
 
-### Esperti a precisione mista per-layer (`81f35e7`) — portato
+Some GGUFs use non-uniform routed expert quantization across layers, for example
+an IQ2_XXS/Q2_K base with selected layers upcast to Q4_K via `--tensor-type`.
+DwarfStar supports this without changing uniform-model behavior:
 
-Supporto ai GGUF con esperti routed **non uniformi tra i layer** (es. base
-IQ2_XXS/Q2_K con alcuni layer upcastati a Q4_K via `--tensor-type`). Implementazione
-(no-op byte-identico sui modelli uniformi):
+- `LayerWeights` stores per-layer `gateQuant`, `upQuant`, and `downQuant`.
+- `GGUFWeights.layer` detects the real tensor types even when experts are not
+  fully loaded (`loadExperts == false`).
+- `decodeExperts` selects kernels from the layer-local quant fields instead of
+  global `DSV4Dims` quant fields, covering both decode and batched prefill.
+- `GGUFWeights.gatherExperts` already computes bytes per expert from tensor
+  `blockBytes`, so the copy size is correct per layer.
+- Expert slot-cache remains a single size-class cache. Out-of-class mixed layers
+  bypass it and use direct gather, which is correct.
+- `InferenceService` logs the count of out-of-class layers at startup.
 
-- **Quant per-layer su `LayerWeights`** (`gateQuant/upQuant/downQuant`), rilevato dai
-  tipi reali dei tensori in `GGUFWeights.layer` (i tensori esperti esistono nel GGUF
-  anche in streaming, `loadExperts==false`).
-- **Decode per-layer**: `decodeExperts` sceglie i kernel su `w.*Quant` invece del
-  globale `d.*Quant`. Copre sia il decode sia il prefill batched (stessa funzione).
-- **Gather già corretto**: `GGUFWeights.gatherExperts` calcola i byte/expert dal
-  `blockBytes` del tensore → copia il numero giusto di byte per ogni layer.
-- **Slot-cache** (opt-in): è a singola size-class (quant globale); i layer fuori-classe
-  saltano la cache e usano il gather (corretto). `fill`/`warm` partono solo da
-  `acquire`, quindi basta il gate in `runLayer` (nessuna modifica a `ExpertSlotCache`).
-- **Log** all'avvio (`InferenceService`) della quota di layer fuori-classe.
+This still needs on-device validation with a mixed GGUF fixture.
 
-Da validare on-device con un GGUF misto (qui non si compila e non c'è un fixture misto).
+## Open Gap: Distributed Fix
 
-## Gap aperti
+`f2d701a` should be reviewed when distributed inference receives numerical
+parity validation. The current priority is validating the distributed pipeline
+as a whole before porting upstream slice-level fixes in isolation.
 
-### Fix distribuito (`f2d701a`) — differito
-
-Da valutare quando si affronta la validazione numerica del distribuito.
-
-## Come rifare il confronto
+## How to Repeat the Comparison
 
 ```sh
 git clone --depth 60 https://github.com/antirez/ds4.git /tmp/ds4-upstream
-git -C /tmp/ds4-upstream log --oneline --since=2026-06-17   # nuovi commit dopo la baseline
-# per i soli file che portiamo:
+git -C /tmp/ds4-upstream log --oneline --since=2026-06-17
 git -C /tmp/ds4-upstream log --oneline 80ebbc3..HEAD -- ds4.c ds4_metal.m ds4_server.c
 ```
 
-Per ogni nuovo commit, chiedersi: tocca un'area che condividiamo (motore/Metal/server)
-ed è un **cambio di comportamento/correttezza** (non un fix C-specifico di memoria,
-non ROCm/CUDA/MTP/TTY)? Se sì → valutare il port; altrimenti annotarlo qui come N/A.
-Aggiornare poi la baseline al nuovo HEAD.
+For every new commit, ask:
+
+- Does it touch an area DwarfStar shares with upstream: engine, Metal, or server?
+- Is it a behavioral or correctness change, rather than a C-specific memory,
+  warning, or backend-only change?
+- Is it outside the excluded surfaces: CUDA/ROCm, MTP, TTY agent, eval tooling?
+
+If the answer is yes, evaluate a Swift port. Otherwise, record the commit as
+N/A and advance the baseline after review.

@@ -20,16 +20,16 @@ struct ChatTabView: View {
             case .loading:
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("Caricamento del modello…").foregroundStyle(.secondary)
+                    Text("Loading model...").foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .needsModel, .failed:
                 ContentUnavailableView {
-                    Label("Nessun modello caricato", systemImage: "shippingbox")
+                    Label("No Model Loaded", systemImage: "shippingbox")
                 } description: {
                     Text(placeholderText)
                 } actions: {
-                    Button("Apri Impostazioni") { openSettings() }
+                    Button("Open Settings") { openSettings() }
                 }
             }
         case .distributed:
@@ -39,8 +39,8 @@ struct ChatTabView: View {
 
     private var placeholderText: String {
         if case .failed(let message) = store.phase {
-            return "Caricamento fallito: \(message)\nConfigura il modello nella scheda Impostazioni."
+            return "Load failed: \(message)\nConfigure the model in Settings."
         }
-        return "Scegli il modello GGUF e caricalo nella scheda Impostazioni."
+        return "Choose a GGUF model and load it in Settings."
     }
 }

@@ -13,8 +13,8 @@ struct BenchRow: Identifiable {
 /// Which engine the benchmark exercises: the in-process local engine, or the
 /// already-connected distributed cluster (Chat → Distribuito).
 enum BenchMode: String, CaseIterable, Identifiable {
-    case local = "Locale"
-    case distributed = "Distribuito"
+    case local = "Local"
+    case distributed = "Distributed"
     var id: String { rawValue }
 }
 
@@ -28,7 +28,7 @@ enum BenchMode: String, CaseIterable, Identifiable {
 final class BenchController {
     let settings: AppSettings
     let dist: DistributedController
-    var modelPath: String { settings.modelPath }      // inherited (Impostazioni)
+    var modelPath: String { settings.modelPath }
     var contextSize: Int { settings.contextSize }
 
     init(settings: AppSettings, dist: DistributedController) {
@@ -51,13 +51,13 @@ final class BenchController {
 
     /// Whether a distributed benchmark is possible right now (route connected, idle).
     var distConnected: Bool { dist.connectedCoordinator != nil }
-    var distRoute: String { dist.connectedCoordinator?.routeSummary ?? "non connesso" }
+    var distRoute: String { dist.connectedCoordinator?.routeSummary ?? "not connected" }
 
     /// Human label for the engine currently running (nil when idle).
     var runningLabel: String? {
         switch runningMode {
-        case .local:       return "Locale (motore in-process)"
-        case .distributed: return "Distribuito · \(distRoute)"
+        case .local:       return "Local (in-process engine)"
+        case .distributed: return "Distributed · \(distRoute)"
         case nil:          return nil
         }
     }
@@ -89,11 +89,11 @@ final class BenchController {
         // Heavy work off the main actor; results stream back via the channels.
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
-                onLog("Caricamento modello…\n")
+                onLog("Loading model...\n")
                 let svc = try InferenceService(modelPath: path, contextSize: ctx, systemPrompt: nil)
                 for c in frontiers {
                     try Task.checkCancellation()
-                    onLog("contesto \(c): prefill + \(gen) token…\n")
+                    onLog("context \(c): prefill + \(gen) tokens...\n")
                     let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTps, kvcacheBytes: Int64(p.kvBytes)))
@@ -112,12 +112,12 @@ final class BenchController {
     /// route is connected or a chat generation is in flight (it resets cluster KV).
     private func runDistributed(frontiers: [Int], gen: Int) {
         guard let coord = dist.connectedCoordinator else {
-            log = "Nessun coordinatore connesso. Apri Chat → Distribuito e premi «Connetti» prima del benchmark distribuito.\n"
+            log = "No coordinator connected. Open Chat -> Distributed and press Connect before running a distributed benchmark.\n"
             isRunning = false; runningMode = nil
             return
         }
         guard !dist.isGenerating else {
-            log = "Il coordinatore sta generando una risposta: attendi o ferma la chat distribuita prima del benchmark.\n"
+            log = "The coordinator is generating a response. Wait or stop distributed chat before benchmarking.\n"
             isRunning = false; runningMode = nil
             return
         }
@@ -127,10 +127,10 @@ final class BenchController {
 
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
-                onLog("Benchmark distribuito sulla route già connessa (\(coord.routeSummary))…\n")
+                onLog("Distributed benchmark on the already-connected route (\(coord.routeSummary))...\n")
                 for c in frontiers {
                     try Task.checkCancellation()
-                    onLog("contesto \(c): prefill + \(gen) token…\n")
+                    onLog("context \(c): prefill + \(gen) tokens...\n")
                     let p = try await coord.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTps, kvcacheBytes: Int64(p.kvBytes)))
@@ -163,7 +163,7 @@ final class BenchController {
                         onComplete: @escaping @MainActor () -> Void = {}) {
         self.benchWork = benchWork
         work = Task {
-            if let err = await benchWork.value { logCont.yield("errore: \(err)\n") }
+            if let err = await benchWork.value { logCont.yield("error: \(err)\n") }
             logCont.finish(); rowCont.finish()
             onComplete()
             self.isRunning = false; self.runningMode = nil
@@ -172,6 +172,6 @@ final class BenchController {
 
     func stop() {
         benchWork?.cancel(); benchWork = nil
-        log += "\n[interruzione…]\n"
+        log += "\n[stopping...]\n"
     }
 }
