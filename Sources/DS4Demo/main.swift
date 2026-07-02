@@ -199,10 +199,18 @@ do {
                    Date().timeIntervalSince(pf0) / Double(max(1, ids.count))))
         // Decode: stream each token's bytes to stdout AS it is produced (like ds4).
         dec.resetProfile()   // profila solo la fase di decode (non il prefill)
+        // Warm-up escluso dal profilo: i primi token pagano costi una-tantum
+        // (wiring dei densi residenti, riassestamento della memoria, cache
+        // fredde) che su run corti dominano la media e falsano la diagnosi.
+        // Il profilo riparte dal token `warmup`+1; il tempo di regime è
+        // riportato a parte. DS4_WARMUP per cambiarlo (0 = come prima).
+        let warmup = ProcessInfo.processInfo.environment["DS4_WARMUP"].flatMap(Int.init)
+            ?? (diag ? min(4, max(0, maxNew - 1)) : 0)
         stdout.write(Data("\nRisposta: ".utf8))
         var rng: UInt64 = 1
         var genTokens = 0
         let genStart = Date()
+        var steadyStart = genStart
         for _ in 0..<maxNew {
             let next = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
             if Int32(next) == tok.eosId { break }
@@ -212,11 +220,22 @@ do {
             genTokens += 1
             let dt = Date().timeIntervalSince(t0)
             log(String(format: "  [tok %d  %.1fs  %.2f tok/s]", genTokens, dt, dt > 0 ? 1.0 / dt : 0))
+            if genTokens == warmup {
+                dec.resetProfile()
+                steadyStart = Date()
+            }
         }
         stdout.write(Data("\n".utf8))
         let total = Date().timeIntervalSince(genStart)
         log(String(format: "DS4Demo: %d tokens in %.1fs (%.2f tok/s)", genTokens, total,
                    total > 0 ? Double(genTokens) / total : 0))
+        if warmup > 0 && genTokens > warmup {
+            let steadyTokens = genTokens - warmup
+            let steadyS = Date().timeIntervalSince(steadyStart)
+            log(String(format: "DS4Demo: REGIME (dal token %d): %d token in %.1fs (%.2f tok/s) — profilo sotto = solo regime",
+                       warmup + 1, steadyTokens, steadyS,
+                       steadyS > 0 ? Double(steadyTokens) / steadyS : 0))
+        }
         log("")
         log(dec.profile.report())
 
