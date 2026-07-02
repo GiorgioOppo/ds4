@@ -784,6 +784,30 @@ final class ChatStore {
                 (obj["agent"] as? String) ?? "", tools)
     }
 
+    /// Validate a `subagent_run` call before executing it: nil when well-formed,
+    /// otherwise an explanatory error the model can act on (fix and retry).
+    /// Silent fallbacks here (empty question, ignored unknown role…) would waste
+    /// a whole sub-agent run and leave the user staring at a garbage answer.
+    private static func subAgentCallProblem(_ argumentsJSON: String,
+                                            question: String, agent: String, tools: [String]) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] != nil else {
+            return #"the arguments are not a JSON object; expected {"target":"<file path or project>","question":"<self-contained task>"}"#
+        }
+        if question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "missing 'question': pass a self-contained task (the sub-agent does not see this chat)"
+        }
+        let agentId = agent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !agentId.isEmpty, !AgentRegistry.shared.all().contains(where: { $0.id == agentId }) {
+            let ids = AgentRegistry.shared.all().map(\.id).joined(separator: ", ")
+            return "unknown agent '\(agentId)'; available agent ids: \(ids) (see agents_list)"
+        }
+        if !tools.isEmpty, !tools.contains(where: { ToolRegistry.subAgentGrantable.contains($0) }) {
+            return "none of the requested tools exist or are grantable to sub-agents; grantable tools: \(ToolRegistry.subAgentGrantable.sorted().joined(separator: ", "))"
+        }
+        return nil
+    }
+
     private func appendAssistant() -> Int {
         messages.append(UIMessage(role: .assistant, text: ""))
         return messages.count - 1
@@ -840,12 +864,19 @@ final class ChatStore {
                 }
             }
             // The stream ended: the raw live markup was ephemeral feedback — drop it
-            // (a parsed call shows as a card; an unparsable block is surfaced as text).
-            // Also scrub any malformed tool markup the model emitted as text (degraded
-            // 2-bit output) so the final bubble shows clean prose.
+            // (a parsed call shows as a card). Also scrub any malformed tool markup
+            // the model emitted as text (degraded 2-bit output) so the final bubble
+            // shows clean prose. A tool block that streamed but never parsed into a
+            // call must NOT vanish silently: surface it as an explicit error row so
+            // the user sees the model attempted (and botched) a tool call.
             if index < messages.count {
+                let unparsed = messages[index].toolStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
                 messages[index].toolStreamText = ""
                 messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
+                if !unparsed.isEmpty, messages[index].toolCalls.isEmpty {
+                    messages.append(UIMessage(role: .tool,
+                        text: "✗ malformed tool call (not executed): \(String(unparsed.prefix(300)))"))
+                }
             }
         } catch is CancellationError {
             // User-initiated stop: keep the partial text, no error banner.
@@ -880,7 +911,24 @@ final class ChatStore {
             // context): the main KV only commits this call + the returned answer.
             if c.name == "subagent_run" {
                 let (target, question, agent, tools) = Self.subAgentArgs(c.argumentsJSON)
+                // A malformed call must fail loudly BEFORE spending a sub-agent run
+                // on it: the explanatory error goes back to the model (so it can fix
+                // the call) and into the transcript (so the failure is visible).
+                if let problem = Self.subAgentCallProblem(c.argumentsJSON, question: question,
+                                                          agent: agent, tools: tools) {
+                    messages.append(UIMessage(role: .tool, text: "✗ subagent_run not executed: \(problem)"))
+                    outputs.append(ToolOutput(callId: c.id, name: c.name,
+                                              content: "Error, sub-agent NOT run: \(problem)"))
+                    continue
+                }
                 status = "sub-agent su \(target)…"
+                // Show the run in the transcript IMMEDIATELY (a sub-agent can take
+                // minutes); the placeholder is updated in place when it finishes.
+                let placeholder = messages.count
+                messages.append(UIMessage(role: .tool, text: "",
+                    subAgent: InferenceService.SubAgentRun(
+                        target: target.isEmpty ? "project" : target, question: question,
+                        answer: "… sub-agent running …", steps: [])))
                 let run: InferenceService.SubAgentRun
                 do {
                     run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
@@ -891,7 +939,11 @@ final class ChatStore {
                     run = InferenceService.SubAgentRun(target: target, question: question,
                                                        answer: "Sub-agent error: \(error)", steps: [])
                 }
-                messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                if placeholder < messages.count, messages[placeholder].subAgent != nil {
+                    messages[placeholder].subAgent = run
+                } else {
+                    messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                }
                 outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
                 continue
             }

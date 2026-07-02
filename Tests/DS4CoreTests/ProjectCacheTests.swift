@@ -38,7 +38,7 @@ final class ProjectCacheTests: XCTestCase {
         let sub = ProjectCache.shared.listTool(path: "Sources")
         XCTAssertTrue(sub.contains("Main.swift"))
         XCTAssertTrue(sub.contains("Long.txt"))
-        XCTAssertTrue(ProjectCache.shared.listTool(path: "../etc").contains("non valido"))
+        XCTAssertTrue(ProjectCache.shared.listTool(path: "../etc").contains("Invalid path"))
     }
 
     func testReadPaginated() {
@@ -48,17 +48,58 @@ final class ProjectCacheTests: XCTestCase {
         let second = ProjectCache.shared.readTool(path: "Sources/Long.txt", fromLine: 121)
         XCTAssertTrue(second.contains("121\tline 121"))
         XCTAssertTrue(ProjectCache.shared.readTool(path: "nope.swift", fromLine: 1)
-            .contains("non trovato"))
+            .contains("not found"))
     }
 
     func testSearch() {
         let hits = ProjectCache.shared.searchTool(query: "ANSWER")
         XCTAssertTrue(hits.contains("Sources/Main.swift:1"))
-        XCTAssertTrue(ProjectCache.shared.searchTool(query: "zzz_not_there").contains("Nessun risultato"))
+        XCTAssertTrue(ProjectCache.shared.searchTool(query: "zzz_not_there").contains("No results"))
+    }
+
+    /// Scoped search: a path prefix restricts the files considered.
+    func testSearchWithPathFilter() {
+        XCTAssertTrue(ProjectCache.shared.searchTool(query: "answer", pathPrefix: "Sources")
+            .contains("Sources/Main.swift:1"))
+        XCTAssertTrue(ProjectCache.shared.searchTool(query: "answer", pathPrefix: "Sources/Main.swift")
+            .contains("Sources/Main.swift:1"))
+        XCTAssertTrue(ProjectCache.shared.searchTool(query: "answer", pathPrefix: "Elsewhere")
+            .contains("No indexed files"))
+        XCTAssertTrue(ProjectCache.shared.searchTool(query: "answer", pathPrefix: "../etc")
+            .contains("Invalid path"))
+    }
+
+    /// project_tree: whole-project overview with per-directory file counts.
+    func testTree() {
+        let tree = ProjectCache.shared.treeTool()
+        XCTAssertTrue(tree.contains("Sources/ (2)"), "got: \(tree)")
+        XCTAssertTrue(ProjectCache.shared.treeTool(maxDepth: 1).contains("Sources/ (2)"))
+    }
+
+    /// project_find: match by path substring and by '*' wildcard.
+    func testFind() {
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "main").contains("Sources/Main.swift"))
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "*.txt").contains("Sources/Long.txt"))
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "Sources/*.swift").contains("Sources/Main.swift"))
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "zzz_nope").contains("No files match"))
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "x").contains("too short"))
+    }
+
+    /// file_delete: removes the file and de-indexes it; directories and
+    /// traversal are refused.
+    func testDeleteFile() {
+        _ = ProjectCache.shared.writeFileTool(path: "tmp/Doomed.txt", content: "bye")
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "Doomed").contains("tmp/Doomed.txt"))
+        XCTAssertTrue(ProjectCache.shared.deleteFileTool(path: "tmp/Doomed.txt").contains("Deleted"))
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "Doomed").contains("No files match"))
+        XCTAssertTrue(ProjectCache.shared.deleteFileTool(path: "tmp/Doomed.txt").contains("not found"))
+        XCTAssertTrue(ProjectCache.shared.deleteFileTool(path: "Sources").contains("directory"))
+        XCTAssertTrue(ProjectCache.shared.deleteFileTool(path: "../evil").contains("invalid path"))
     }
 
     func testToolsAreRegistered() {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
-        XCTAssertTrue(names.isSuperset(of: ["project_list", "project_read", "project_search"]))
+        XCTAssertTrue(names.isSuperset(of: ["project_tree", "project_list", "project_find",
+                                            "project_read", "project_search", "file_delete"]))
     }
 }

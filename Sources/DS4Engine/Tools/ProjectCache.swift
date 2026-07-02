@@ -184,11 +184,81 @@ public final class ProjectCache: @unchecked Sendable {
         return out
     }
 
-    /// Case-insensitive substring search across the indexed files.
-    public func searchTool(query: String) -> String {
+    /// Compact overview of the whole project in ONE call: the directories up to
+    /// `maxDepth` levels (each with the number of indexed files beneath it) plus
+    /// the root files. Complements project_list, which shows one level per call.
+    public func treeTool(maxDepth: Int = 3) -> String {
+        lock.lock(); let snapshot = files; let inf = infoValue; lock.unlock()
+        guard let inf else { return "No project imported." }
+        let depth = max(1, min(maxDepth, 6))
+        var counts: [String: Int] = [:]          // dir path (≤ depth components) → files beneath
+        var rootFiles: [String] = []
+        for f in snapshot {
+            let comps = f.split(separator: "/").map(String.init)
+            guard comps.count > 1 else { rootFiles.append(f); continue }
+            for d in 1...min(comps.count - 1, depth) {
+                counts[comps.prefix(d).joined(separator: "/"), default: 0] += 1
+            }
+        }
+        var lines: [String] = []
+        for dir in counts.keys.sorted() {
+            let comps = dir.components(separatedBy: "/")
+            lines.append(String(repeating: "  ", count: comps.count - 1)
+                         + (comps.last ?? dir) + "/ (\(counts[dir] ?? 0))")
+        }
+        lines.append(contentsOf: rootFiles)
+        var out = "Project \"\(inf.name)\": \(inf.fileCount) files. Directories to depth \(depth) (file count in parentheses), then root files:"
+        out += "\n" + lines.prefix(Self.maxListEntries).joined(separator: "\n")
+        if lines.count > Self.maxListEntries {
+            out += "\n... (+\(lines.count - Self.maxListEntries) more entries; use project_list on a subfolder)"
+        }
+        return out
+    }
+
+    /// Find indexed files whose PATH matches `pattern`: case-insensitive
+    /// substring, with '*' as a wildcard for any run of characters.
+    /// Complements searchTool, which searches file CONTENTS.
+    public func findTool(pattern: String) -> String {
+        lock.lock(); let snapshot = files; let hasRoot = root != nil; lock.unlock()
+        guard hasRoot else { return "No project imported." }
+        let p = pattern.trimmingCharacters(in: .whitespaces)
+        guard p.count >= 2 else { return "Pattern too short (min 2 characters)." }
+        let hits: [String]
+        if p.contains("*") {
+            let escaped = NSRegularExpression.escapedPattern(for: p)
+                .replacingOccurrences(of: "\\*", with: ".*")
+            guard let re = try? NSRegularExpression(pattern: escaped, options: [.caseInsensitive]) else {
+                return "Invalid pattern."
+            }
+            hits = snapshot.filter {
+                re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil
+            }
+        } else {
+            let q = p.lowercased()
+            hits = snapshot.filter { $0.lowercased().contains(q) }
+        }
+        guard !hits.isEmpty else {
+            return "No files match '\(pattern)'. Use project_search to search file contents instead."
+        }
+        var out = hits.prefix(Self.maxSearchHits).joined(separator: "\n")
+        if hits.count > Self.maxSearchHits { out += "\n... (limit of \(Self.maxSearchHits) results reached)" }
+        return out
+    }
+
+    /// Case-insensitive substring search across the indexed files. An optional
+    /// `pathPrefix` restricts the search to one subfolder (or a single file) —
+    /// fewer hits burned on the wrong part of the tree, faster on big projects.
+    public func searchTool(query: String, pathPrefix: String? = nil) -> String {
         let q = query.lowercased()
         guard q.count >= 2 else { return "Query too short." }
-        lock.lock(); let snapshot = files; lock.unlock()
+        lock.lock(); var snapshot = files; lock.unlock()
+        if var p = pathPrefix?.trimmingCharacters(in: .whitespaces), !p.isEmpty, p != "." {
+            guard !p.contains("..") else { return "Invalid path." }
+            if p.hasPrefix("./") { p = String(p.dropFirst(2)) }
+            let dirPrefix = p.hasSuffix("/") ? p : p + "/"
+            snapshot = snapshot.filter { $0 == p || $0.hasPrefix(dirPrefix) }
+            if snapshot.isEmpty { return "No indexed files under '\(p)'." }
+        }
         var hits: [String] = []
         for f in snapshot {
             guard let text = fileContents(f) else { continue }
@@ -452,5 +522,33 @@ public final class ProjectCache: @unchecked Sendable {
         catch { return "Write failed: \(error.localizedDescription)" }
         if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
         return "Modified lines \(from)-\(to) of '\(relPath)': \(removed) removed -> \(newLines.count) inserted."
+    }
+
+    /// DELETE one file inside the project root (never directories). Destructive
+    /// but confined to the imported project; with a git repo the file is
+    /// recoverable. The index and content cache are updated.
+    public func deleteFileTool(path relPath: String) -> String {
+        guard let url = rootRelativeURL(relPath) else {
+            return "No project imported or invalid path: '\(relPath)'."
+        }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            return "File not found: '\(relPath)'."
+        }
+        guard !isDir.boolValue else {
+            return "'\(relPath)' is a directory: only single files can be deleted."
+        }
+        do { try FileManager.default.removeItem(at: url) }
+        catch { return "Delete failed: \(error.localizedDescription)" }
+        lock.lock()
+        files.removeAll { $0 == relPath }
+        if let old = contents.removeValue(forKey: relPath) {
+            cachedBytes = max(0, cachedBytes - old.utf8.count)
+        }
+        if let inf = infoValue {
+            infoValue = Info(name: inf.name, fileCount: files.count, totalBytes: inf.totalBytes)
+        }
+        lock.unlock()
+        return "Deleted '\(relPath)'."
     }
 }

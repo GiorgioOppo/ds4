@@ -357,7 +357,7 @@ public actor InferenceService {
         if granted.isEmpty, let role { granted = role.toolNames.filter { ToolRegistry.subAgentGrantable.contains($0) } }
         if granted.isEmpty {
             granted = projectInfo == nil ? []
-                : (isProject ? ["project_list", "project_read", "project_search"]
+                : (isProject ? ["project_tree", "project_list", "project_find", "project_read", "project_search"]
                              : ["project_read", "project_search"])
         }
         // Without an imported project, project-scoped tools can't do anything → drop them.
