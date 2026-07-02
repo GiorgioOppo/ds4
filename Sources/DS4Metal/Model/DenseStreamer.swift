@@ -246,13 +246,23 @@ public final class DenseStreamer: @unchecked Sendable {
     //         then the Q4_K blobs (4 KB aligned).
     private static let q4CacheMagic: UInt32 = 0x34515344   // "DSQ4" little-endian
 
+    /// Engine-side stderr log (the demo shows it inline; the app captures
+    /// stderr into the engine log). The cache is infrastructure the user can't
+    /// see failing otherwise.
+    private static func logQ4(_ s: String) {
+        FileHandle.standardError.write(Data(("DS4 q4cache: " + s + "\n").utf8))
+    }
+
     /// Load the requant cache if it exists and matches the job list exactly.
     /// Reads through F_NOCACHE straight into the resident buffers (~0.5 s for
     /// ~1.4 GB) — the requant is paid only on the very first load.
     private static func loadQ4Cache(_ rt: MetalRuntime, path: String, modelSize: Int,
                                     jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)]) -> [GPUTensor]? {
         let cfd = open(path, O_RDONLY)
-        guard cfd >= 0 else { return nil }
+        guard cfd >= 0 else {
+            logQ4("assente (\(String(cString: strerror(errno)))) — riquantizzo: \(path)")
+            return nil
+        }
         defer { close(cfd) }
         _ = fcntl(cfd, F_NOCACHE, 1)
         let headBytes = 20 + jobs.count * 24
@@ -264,7 +274,10 @@ public final class DenseStreamer: @unchecked Sendable {
         func u32(_ o: Int) -> UInt32 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
         func u64(_ o: Int) -> UInt64 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt64.self) } }
         guard u32(0) == q4CacheMagic, u32(4) == 1,
-              u64(8) == UInt64(modelSize), u32(16) == UInt32(jobs.count) else { return nil }
+              u64(8) == UInt64(modelSize), u32(16) == UInt32(jobs.count) else {
+            logQ4("incompatibile (header/modello diversi) — riquantizzo: \(path)")
+            return nil
+        }
         var records: [(bytes: Int, offset: Int)] = []
         for (i, job) in jobs.enumerated() {
             let o = 20 + i * 24
@@ -289,8 +302,12 @@ public final class DenseStreamer: @unchecked Sendable {
                 LoadProgress.shared.advance()
             }
         }
-        guard !failed else { return nil }
-        return out.compactMap { $0 }.count == jobs.count ? out.map { $0! } : nil
+        guard !failed, out.compactMap({ $0 }).count == jobs.count else {
+            logQ4("lettura fallita — riquantizzo: \(path)")
+            return nil
+        }
+        logQ4("caricata (\(jobs.count) tensori): \(path)")
+        return out.map { $0! }
     }
 
     /// Persist the converted tensors (best-effort: failures leave no cache and
@@ -312,8 +329,11 @@ public final class DenseStreamer: @unchecked Sendable {
             offsets.append(offset)
             offset += (tensors[i].byteLength + align - 1) / align * align
         }
-        FileManager.default.createFile(atPath: path, contents: nil)
-        guard let fh = FileHandle(forWritingAtPath: path) else { return }
+        guard FileManager.default.createFile(atPath: path, contents: nil),
+              let fh = FileHandle(forWritingAtPath: path) else {
+            logQ4("SCRITTURA FALLITA (permessi/percorso?): \(path)")
+            return
+        }
         defer { try? fh.close() }
         do {
             try fh.write(contentsOf: head)
@@ -322,7 +342,9 @@ public final class DenseStreamer: @unchecked Sendable {
                 try fh.write(contentsOf: Data(bytesNoCopy: t.buffer.contents(),
                                               count: t.byteLength, deallocator: .none))
             }
+            logQ4("scritta (\(tensors.count) tensori, \(offset / 1_048_576) MB): \(path)")
         } catch {
+            logQ4("SCRITTURA FALLITA (\(error)) — file rimosso: \(path)")
             try? FileManager.default.removeItem(atPath: path)   // never leave a torn cache
         }
     }
