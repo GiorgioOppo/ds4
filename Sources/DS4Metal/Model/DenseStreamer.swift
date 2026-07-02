@@ -99,26 +99,24 @@ public final class DenseStreamer: @unchecked Sendable {
         // aligned — safe for setBuffer offsets and friendly to F_NOCACHE).
         let align = 4096
         var maxSlot = 1
+        // DS4_DENSE_Q4: the three giant attention projections are requantized
+        // Q8_0 → Q4_K ONCE at load and kept resident (~1.4 GB, locked with
+        // DS4_MLOCK): half the bytes, RAM-speed reads, and they leave the
+        // per-token stream entirely. Intentionally lossy; everything else is
+        // untouched. The jobs are collected here and run in PARALLEL below —
+        // 129 independent (layer, tensor) requants saturate every core, ~6-8×
+        // faster load than converting layer by layer.
+        var q4Jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
         for il in layers {
             var plan: [Entry] = []
             var off = 0
-            var w = try GGUFWeights.layerSmallSkeleton(rt, model, il)
+            let w = try GGUFWeights.layerSmallSkeleton(rt, model, il)
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
-                // DS4_DENSE_Q4: the two giant plain-matvec projections are
-                // requantized Q8_0 → Q4_K ONCE at load and kept resident
-                // (~0.9 GB total, locked with DS4_MLOCK): half the bytes AND
-                // they leave the per-token stream entirely — the SSD budget
-                // drops by ~3 GB/token. Intentionally lossy (Q8→Q4 requant);
-                // everything else is untouched.
                 if q4Dense, f == .qB || f == .attnOut || f == .attnOutA,
-                   let q4 = try Self.requantQ4(rt, model, fd: fd, tensor: t) {
-                    if lockResident { q4.lockResident() }
-                    switch f {
-                    case .qB: w.qB = q4; w.qBQ4 = true
-                    case .attnOut: w.attnOut = q4; w.attnOutQ4 = true
-                    default: w.attnOutA = q4; w.attnOutAQ4 = true
-                    }
+                   let info = GGUF.typeInfo(t.type), info.name == "q8_0",
+                   Int(t.elements) % 256 == 0 {
+                    q4Jobs.append((il: il, f: f, t: t))
                     continue
                 }
                 plan.append(Entry(field: f, fileOffset: Int(t.absOffset),
@@ -129,6 +127,34 @@ public final class DenseStreamer: @unchecked Sendable {
             skeleton[il] = w
             bytesPerPass += plan.reduce(0) { $0 + $1.bytes }
             maxSlot = max(maxSlot, off)
+        }
+        if !q4Jobs.isEmpty {
+            var converted = [GPUTensor?](repeating: nil, count: q4Jobs.count)
+            let lock = NSLock()
+            var firstError: Error?
+            try converted.withUnsafeMutableBufferPointer { out in
+                DispatchQueue.concurrentPerform(iterations: q4Jobs.count) { i in
+                    do {
+                        out[i] = try Self.requantQ4(rt, model, fd: fd, tensor: q4Jobs[i].t)
+                    } catch {
+                        lock.lock()
+                        if firstError == nil { firstError = error }
+                        lock.unlock()
+                    }
+                }
+                if let e = firstError { throw e }
+            }
+            for (i, job) in q4Jobs.enumerated() {
+                guard let q4 = converted[i] else {
+                    throw GGUFWeights.LoadError.message("DenseStreamer: requant failed on layer \(job.il)")
+                }
+                if lockResident { q4.lockResident() }
+                switch job.f {
+                case .qB: skeleton[job.il]!.qB = q4; skeleton[job.il]!.qBQ4 = true
+                case .attnOut: skeleton[job.il]!.attnOut = q4; skeleton[job.il]!.attnOutQ4 = true
+                default: skeleton[job.il]!.attnOutA = q4; skeleton[job.il]!.attnOutAQ4 = true
+                }
+            }
         }
         guard let a = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared),
               let b = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared) else {
