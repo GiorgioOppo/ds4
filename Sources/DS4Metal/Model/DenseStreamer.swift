@@ -138,18 +138,24 @@ public final class DenseStreamer: @unchecked Sendable {
             // Cache location: next to the model by default (demo/CLI), or in
             // DS4_Q4_CACHE_DIR when set — the SANDBOXED app can't write next
             // to a picker-selected file, so it points this at Application
-            // Support (a silent write failure would mean re-requant per load).
-            let cachePath: String
+            // Support. READING tries both places (a cache produced by the demo
+            // next to the GGUF gets picked up and PROMOTED into the primary
+            // location, so demo and app share one conversion when possible).
+            let sibling = model.path + ".q4dense"
+            var cachePath = sibling
             if let dir = ProcessInfo.processInfo.environment["DS4_Q4_CACHE_DIR"], !dir.isEmpty {
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                 cachePath = dir + "/" + (model.path as NSString).lastPathComponent + ".q4dense"
-            } else {
-                cachePath = model.path + ".q4dense"
             }
             var converted: [GPUTensor]
             LoadProgress.shared.begin("Lettura cache Q4…", from: 0.32, to: 0.92, units: q4Jobs.count)
             if let cached = Self.loadQ4Cache(rt, path: cachePath, modelSize: Int(model.size), jobs: q4Jobs) {
                 converted = cached
+            } else if cachePath != sibling,
+                      let cached = Self.loadQ4Cache(rt, path: sibling, modelSize: Int(model.size), jobs: q4Jobs) {
+                converted = cached
+                LoadProgress.shared.set(0.92, "Copia cache Q4…")
+                Self.writeQ4Cache(path: cachePath, modelSize: Int(model.size), jobs: q4Jobs, tensors: cached)
             } else {
                 LoadProgress.shared.begin("Riquantizzazione Q4 (solo il primo avvio)…",
                                           from: 0.32, to: 0.88, units: q4Jobs.count)
