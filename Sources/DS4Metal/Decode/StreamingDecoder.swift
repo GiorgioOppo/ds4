@@ -795,7 +795,16 @@ public final class StreamingDecoder {
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
                                                   nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
-        let (embed, head) = try GGUFWeights.outputHeadMapped(rt, model)
+        let (embed, headMapped) = try GGUFWeights.outputHeadMapped(rt, model)
+        var head = headMapped
+        // With DS4_DENSE_STREAM the dense weights no longer occupy RAM (~300 MB
+        // of staging instead of ~6 GB), so the OUTPUT HEAD (~560 MB Q8, read in
+        // full every token) gets copied RESIDENT: mapped it was re-read through
+        // a cold page cache at ~2 GB/s (~260 ms/token measured). The embedding
+        // table stays mapped — the decode stages one 8 KB row per token anyway.
+        if ProcessInfo.processInfo.environment["DS4_DENSE_STREAM"] == "1" {
+            head.head = try GGUFWeights.tensor(rt, model, "output.weight")
+        }
         let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         // DS4_EXPERT_PREAD=1: expert slabs pread() DIRECT from disk (F_NOCACHE)
         // instead of memcpy'd from the mmap. Zero page-cache footprint for the
