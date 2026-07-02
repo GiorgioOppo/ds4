@@ -114,6 +114,10 @@ public struct LayerWeights {
     public var gateQuant: MoEQuant = .q4_K
     public var upQuant: MoEQuant = .q4_K
     public var downQuant: MoEQuant = .q4_K
+    // DS4_DENSE_Q4: the giant q_b / output_b projections were requantized
+    // Q8_0 → Q4_K at load (resident); the route dispatch reads THESE flags.
+    public var qBQ4 = false
+    public var attnOutQ4 = false
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -143,6 +147,7 @@ public final class DecodeScratch {
     let gate6, up6, mid6, down6, routed: GPUTensor
     let sgate, sup, smid, sdown, sharedOut, ffnOut: GPUTensor
     let idxQ, idxW, idxScores: GPUTensor   // NSA indexer: q [64×128], weights [64], scores [maxComp]
+    let id0: GPUTensor   // [Int32 0] — dense matvec via the MoE id-kernel (k=1, DS4_DENSE_Q4)
 
     public init(_ rt: MetalRuntime, _ d: DSV4Dims, maxKeys: Int) throws {
         let hcDim = d.nHC * d.nEmbd
@@ -170,6 +175,7 @@ public final class DecodeScratch {
         idxQ = try .zeros(rt, floatCount: d.nIndexerHead * d.nIndexerHeadDim)
         idxW = try .zeros(rt, floatCount: d.nIndexerHead)
         idxScores = try .zeros(rt, floatCount: maxKeys)   // ≥ maxComp rows, generous
+        id0 = try .zerosBytes(rt, byteLength: 4)          // Int32(0)
     }
 }
 
@@ -247,7 +253,14 @@ extension GraphContext {
         encoder.pushDebugGroup("q-proj")              // Instruments: name the GPU phase
         try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
-        try matmulQ8_0(weight: w.qB, x: s.qrNorm, out: s.q, inDim: d.qRank, outDim: d.qDim)
+        if w.qBQ4 {
+            // DS4_DENSE_Q4: q_b requantized to Q4_K — dense matvec through the
+            // validated MoE id-kernel with a single "expert" (k=1, id 0).
+            try moeMatvecID(.q4_K, experts: w.qB, ids: s.id0, activation: s.qrNorm, out: s.q,
+                            k: 1, inDim: d.qRank, outDim: d.qDim, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.qB, x: s.qrNorm, out: s.q, inDim: d.qRank, outDim: d.qDim)
+        }
         try rmsNorm(s.q, weight: nil, out: s.q, rows: d.nHead, n: d.headDim, eps: rmsEps) // head norm, in-place
         try ropeTail(x: s.q, nTok: 1, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
@@ -317,7 +330,13 @@ extension GraphContext {
                      pos0: pos, posStep: 1, inverse: true)
         try attnOutLowQ8(outputA: w.attnOutA, heads: s.heads, low: s.attnLow,
                          nGroups: d.nOutGroup, groupDim: d.attnGroupDim, rank: d.nLoraO)
-        try matmulQ8_0(weight: w.attnOut, x: s.attnLow, out: s.blockOut, inDim: d.attnLowDim, outDim: d.nEmbd)
+        if w.attnOutQ4 {
+            // DS4_DENSE_Q4: output_b requantized to Q4_K (see q_b above).
+            try moeMatvecID(.q4_K, experts: w.attnOut, ids: s.id0, activation: s.attnLow, out: s.blockOut,
+                            k: 1, inDim: d.attnLowDim, outDim: d.nEmbd, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.attnOut, x: s.attnLow, out: s.blockOut, inDim: d.attnLowDim, outDim: d.nEmbd)
+        }
         try hcExpand4(blockOut: s.blockOut, residual: curHc, post: s.split, comb: s.split,
                       blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
