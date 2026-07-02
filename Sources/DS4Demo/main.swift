@@ -124,6 +124,22 @@ do {
     if diag {
         log("── Diagnosi (DS4_DIAG=1) ──")
         log(knobReport())
+        // Costo FISSO di un command buffer (commit + waitUntilCompleted, vuoto):
+        // il decode streaming ne usa ~3 per layer × 43 layer ≈ 130+ per token.
+        // Se questo round-trip costa millisecondi, il "compute" del profilo è in
+        // realtà latenza di sincronizzazione GPU<->CPU e la cura è FONDERE i
+        // command buffer, non ottimizzare i kernel.
+        do {
+            // warm-up (primo cb paga la creazione delle code)
+            for _ in 0..<5 { let c = GraphContext(rt); try c.begin(); c.commit() }
+            let n = 100
+            let t0 = Date()
+            for _ in 0..<n { let c = GraphContext(rt); try c.begin(); c.commit() }
+            let usPerCB = Date().timeIntervalSince(t0) / Double(n) * 1e6
+            let perToken = usPerCB * 130 / 1000
+            log(String(format: "  command buffer vuoto: %.0f µs/round-trip  (×130 cb/token ≈ %.0f ms/token di pura sincronizzazione)",
+                       usPerCB, perToken))
+        }
         let bench = diskBench(path: ggufPath)
         diskCeilingGBs = bench.ceilingGBs
         log(bench.report)
