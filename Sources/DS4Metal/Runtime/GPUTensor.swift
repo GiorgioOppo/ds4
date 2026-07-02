@@ -62,6 +62,17 @@ public final class GPUTensor {
         return GPUTensor(buffer: b, byteLength: byteLength, count: byteLength)
     }
 
+    /// Allocate an UNINITIALIZED raw byte buffer. Only for destinations the
+    /// caller overwrites entirely before any read (e.g. the expert-gather pack
+    /// target) — skips the memset of zerosBytes on multi-MB buffers.
+    public static func uninitializedBytes(_ rt: MetalRuntime, byteLength: Int, elementCount: Int) throws -> GPUTensor {
+        let len = max(1, byteLength)
+        guard let b = rt.device.makeBuffer(length: len, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        return GPUTensor(buffer: b, byteLength: byteLength, count: elementCount)
+    }
+
     /// Upload an F32 array.
     public static func floats(_ rt: MetalRuntime, _ a: [Float]) throws -> GPUTensor {
         let len = max(1, a.count) * 4

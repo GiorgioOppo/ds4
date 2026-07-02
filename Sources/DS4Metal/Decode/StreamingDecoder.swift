@@ -30,6 +30,7 @@ public struct DecodeProfile: Sendable {
     public var layers = 0         // total per-layer iterations
     public var expertHits = 0     // expert slot-cache hits (persistent experts)
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
+    public var gatherBytes = 0    // expert bytes copied from the mmap (EXPERT I/O volume)
 
     public init() {}
 
@@ -44,6 +45,14 @@ public struct DecodeProfile: Sendable {
         if expertHits + expertMisses > 0 {
             let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
             cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
+        }
+        // Effective gather bandwidth: how fast the expert slabs actually leave the
+        // SSD/page cache. Compare against the raw sequential bandwidth of the disk
+        // to see the streaming headroom (bytes/gatherS; page-cache hits inflate it).
+        if gatherBytes > 0 && gatherS > 0 {
+            let mbTok = Double(gatherBytes) / f / 1_048_576
+            let gbs = Double(gatherBytes) / gatherS / 1e9
+            cacheLine += "\n  gather IO    \(String(format: "%6.1f", mbTok)) MB/token — banda effettiva \(String(format: "%.2f", gbs)) GB/s"
         }
         return """
         Profilo decode — \(forwards) token, \(layers) iterazioni-layer
@@ -345,6 +354,7 @@ public final class StreamingDecoder {
             var t = Date()
             let (g, u, dn) = try gather(i, union)        // each unique expert ONCE
             profile.gatherS += Date().timeIntervalSince(t)
+            profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
             var posOf: [Int32: Int32] = [:]
             for (p, id) in union.enumerated() { posOf[id] = Int32(p) }
             for j in j0..<j1 {
@@ -442,10 +452,14 @@ public final class StreamingDecoder {
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.
                 t = Date()
+                let h0 = cache.hits, m0 = cache.misses
                 let (pool, slots) = try cache.acquire(layer: i, ids: ids)
                 profile.gatherS += Date().timeIntervalSince(t)
-                profile.expertHits = cache.hits
-                profile.expertMisses = cache.misses
+                // Deltas, not cumulative totals: the cache counts since load,
+                // the profile since resetProfile().
+                profile.expertHits += cache.hits - h0
+                profile.expertMisses += cache.misses - m0
+                profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
                 let slotsBuf = try GPUTensor.bytes(rt, slots.withUnsafeBytes { Array($0) },
                                                    elementCount: K)
                 t = Date()
@@ -460,6 +474,7 @@ public final class StreamingDecoder {
                 t = Date()
                 let (g, u, dn) = try gather(i, ids)
                 profile.gatherS += Date().timeIntervalSince(t)
+                profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
                 t = Date()
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
@@ -659,7 +674,7 @@ public final class StreamingDecoder {
             let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
             let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
             let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
-            cache = ExpertSlotCache(slotsPerLayer: S, makePool: {
+            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: {
                 (gate: try GPUTensor.zerosBytes(rt, byteLength: S * gateBytes),
                  up: try GPUTensor.zerosBytes(rt, byteLength: S * upBytes),
                  down: try GPUTensor.zerosBytes(rt, byteLength: S * downBytes))
@@ -670,6 +685,14 @@ public final class StreamingDecoder {
                                            expertBytes: upBytes, into: pool.up, slot: slot)
                 try GGUFWeights.copyExpert(model, "blk.\(il).ffn_down_exps.weight", id: id,
                                            expertBytes: downBytes, into: pool.down, slot: slot)
+            }, prefetch: { il, ids in
+                // Readahead every missing slab (3 matrices × N ids) BEFORE the
+                // copies: the NVMe serves all the regions concurrently.
+                for id in ids {
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: gateBytes)
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
+                }
             }, warm: { il in usage.top(layer: il, n: S) })
         }
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,

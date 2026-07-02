@@ -24,25 +24,60 @@ public final class ExpertSlotCache {
     }
 
     public let slotsPerLayer: Int
+    /// gate+up+down bytes of one expert — stats only (the decode profile turns
+    /// miss counts into gathered bytes / effective SSD bandwidth).
+    public let bytesPerExpert: Int
     public private(set) var hits = 0
     public private(set) var misses = 0
     private var pools: [Int: LayerPool] = [:]
     private var tick: UInt64 = 0
     private let makePool: () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
     /// Copy expert `id` of layer `layer` into pool slot `slot` (all 3 matrices).
+    /// MUST be safe to call concurrently for distinct slots (misses are filled
+    /// in parallel — each fill writes only its own slot's slabs).
     private let fill: (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void
+    /// Optional readahead hint, called with ALL the ids about to be filled BEFORE
+    /// the copies (e.g. madvise(WILLNEED) on their mmap slabs) so the SSD serves
+    /// the regions concurrently instead of fault-by-fault.
+    private let prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)?
     /// Optional warm-set provider: historically hottest experts of a layer (from
     /// the persisted usage stats); pre-filled into the pool on first use.
     private let warm: ((_ layer: Int) -> [Int32])?
 
     public init(slotsPerLayer: Int,
+                bytesPerExpert: Int = 0,
                 makePool: @escaping () throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
                 fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void,
+                prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
                 warm: ((_ layer: Int) -> [Int32])? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)   // ≥ k+2 so this tick's ids never starve eviction
+        self.bytesPerExpert = bytesPerExpert
         self.makePool = makePool
         self.fill = fill
+        self.prefetch = prefetch
         self.warm = warm
+    }
+
+    /// Run `fill` for every (id, slot) pair CONCURRENTLY (distinct slots write
+    /// disjoint pool ranges). Throws the first fill error, if any.
+    private func fillAll(layer: Int, pairs: [(id: Int32, slot: Int)], pool: LayerPool) throws {
+        guard !pairs.isEmpty else { return }
+        prefetch?(layer, pairs.map { $0.id })
+        if pairs.count == 1 {
+            try fill(layer, pairs[0].id, pool, pairs[0].slot)
+            return
+        }
+        let lock = NSLock()
+        var firstError: Error? = nil
+        DispatchQueue.concurrentPerform(iterations: pairs.count) { j in
+            do { try fill(layer, pairs[j].id, pool, pairs[j].slot) }
+            catch {
+                lock.lock()
+                if firstError == nil { firstError = error }
+                lock.unlock()
+            }
+        }
+        if let e = firstError { throw e }
     }
 
     /// Drop all pools (frees the wired buffers) and reset the hit/miss counters.
@@ -67,8 +102,10 @@ public final class ExpertSlotCache {
             // Pre-warm with the historically hottest experts (usage-stats prior):
             // they start as the oldest entries, so a wrong prior is evicted fast.
             if let warm {
-                for (s, id) in warm(layer).prefix(slotsPerLayer).enumerated() {
-                    try fill(layer, id, fresh, s)
+                let warmIds = Array(warm(layer).prefix(slotsPerLayer))
+                try fillAll(layer: layer,
+                            pairs: warmIds.enumerated().map { (id: $1, slot: $0) }, pool: fresh)
+                for (s, id) in warmIds.enumerated() {
                     fresh.owner[s] = id
                     fresh.slotOf[id] = s
                 }
@@ -88,6 +125,10 @@ public final class ExpertSlotCache {
                 missIdx.append(j)
             }
         }
+        // Assign a victim slot to every miss FIRST (serial LRU bookkeeping), then
+        // fill all the assigned slots concurrently — the SSD sees every missing
+        // slab at once instead of one page-fault stream at a time.
+        var toFill: [(id: Int32, slot: Int)] = []
         for j in missIdx {
             let id = ids[j]
             // Victim: a FREE slot if any, else the least-recently-used one —
@@ -100,12 +141,24 @@ public final class ExpertSlotCache {
             }
             precondition(victim >= 0, "expert cache: no evictable slot (S too small)")
             if pool.owner[victim] >= 0 { pool.slotOf.removeValue(forKey: pool.owner[victim]) }
-            try fill(layer, id, pool, victim)
             pool.owner[victim] = id
             pool.slotOf[id] = victim
             pool.lastUse[victim] = tick
             slots[j] = Int32(victim)
             misses += 1
+            toFill.append((id: id, slot: victim))
+        }
+        do {
+            try fillAll(layer: layer, pairs: toFill, pool: pool)
+        } catch {
+            // A fill failed: those slots hold garbage — mark every slot of this
+            // batch free so a later acquire refills instead of serving a bad hit.
+            for (id, slot) in toFill {
+                pool.owner[slot] = -1
+                pool.slotOf.removeValue(forKey: id)
+            }
+            pools[layer] = pool
+            throw error
         }
         pools[layer] = pool
         return (pool, slots)

@@ -162,10 +162,32 @@ public enum GGUFWeights {
         return try GPUTensor.mappedNoCopy(rt, ptr: ptr, byteLength: Int(t.bytes), elementCount: Int(t.bytes))
     }
 
+    /// Kick off async readahead of an mmap range: page-aligned madvise(WILLNEED).
+    /// Advising ALL the slabs of a gather before the first copy lets the NVMe
+    /// work on every region concurrently, instead of one page fault at a time.
+    static func adviseRange(_ ptr: UnsafeRawPointer, _ bytes: Int) {
+        let page = Int(getpagesize())
+        let addr = UInt(bitPattern: ptr)
+        let aligned = addr & ~UInt(page - 1)
+        guard let p = UnsafeMutableRawPointer(bitPattern: aligned) else { return }
+        madvise(p, Int(addr - aligned) + bytes, MADV_WILLNEED)
+    }
+
+    /// Readahead hint for ONE expert's slab of an ffn_*_exps tensor (see
+    /// adviseRange). Out-of-bounds ids are ignored — this is only a hint.
+    public static func adviseExpert(_ model: GGUFModel, _ name: String, id: Int32,
+                                    expertBytes: Int) {
+        guard let t = model.findTensor(name), id >= 0,
+              (Int(id) + 1) * expertBytes <= Int(t.bytes) else { return }
+        adviseRange(model.mapBase + Int(t.absOffset) + Int(id) * expertBytes, expertBytes)
+    }
+
     /// Expert-cache: pack ONLY the `ids` selected experts of a Q4_K MoE tensor
     /// (ffn_*_exps, layout [inDim, outRows, nExpert]) from the mmap into a small
     /// K-expert buffer, so streaming loads ~K/256 of the expert weight per layer.
     /// Call moeMatvecQ4K with ids remapped to 0..<K against the returned tensor.
+    /// The slabs are madvise'd up front and copied CONCURRENTLY straight into the
+    /// shared Metal buffer (queue depth ~= ids.count on the SSD, single copy).
     public static func gatherExperts(_ rt: MetalRuntime, _ model: GGUFModel, _ name: String,
                                      ids: [Int32], inDim: Int, outRows: Int) throws -> GPUTensor {
         guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
@@ -175,14 +197,18 @@ public enum GGUFWeights {
             throw LoadError.message("gatherExperts: \(name) has unsupported expert type \(t.typeName)")
         }
         let expertBytes = outRows * (inDim / 256) * Int(info.blockBytes)
-        let base = model.mapBase + Int(t.absOffset)
-        var packed = [UInt8](repeating: 0, count: ids.count * expertBytes)
-        packed.withUnsafeMutableBytes { dst in
-            for (i, e) in ids.enumerated() {
-                memcpy(dst.baseAddress! + i * expertBytes, base + Int(e) * expertBytes, expertBytes)
-            }
+        for e in ids where e < 0 || (Int(e) + 1) * expertBytes > Int(t.bytes) {
+            throw LoadError.message("gatherExperts: \(name) expert \(e) outside tensor bounds")
         }
-        return try GPUTensor.bytes(rt, packed, elementCount: ids.count * expertBytes)
+        let base = model.mapBase + Int(t.absOffset)
+        for e in ids { adviseRange(base + Int(e) * expertBytes, expertBytes) }
+        let dst = try GPUTensor.uninitializedBytes(rt, byteLength: ids.count * expertBytes,
+                                                   elementCount: ids.count * expertBytes)
+        let dstBase = dst.buffer.contents()
+        DispatchQueue.concurrentPerform(iterations: ids.count) { i in
+            memcpy(dstBase + i * expertBytes, base + Int(ids[i]) * expertBytes, expertBytes)
+        }
+        return dst
     }
 
     /// Copy ONE expert's slab from the mmap into `dst` at `slot * expertBytes`
@@ -190,6 +216,12 @@ public enum GGUFWeights {
     public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
                                   expertBytes: Int, into dst: GPUTensor, slot: Int) throws {
         guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
+        guard id >= 0, (Int(id) + 1) * expertBytes <= Int(t.bytes) else {
+            throw LoadError.message("copyExpert: \(name) expert \(id) outside tensor bounds")
+        }
+        guard dst.byteOffset + (slot + 1) * expertBytes <= dst.buffer.length else {
+            throw LoadError.message("copyExpert: slot \(slot) outside pool buffer")
+        }
         let src = model.mapBase + Int(t.absOffset) + Int(id) * expertBytes
         memcpy(dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes),
                src, expertBytes)
