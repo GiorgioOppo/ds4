@@ -104,12 +104,12 @@ public final class ExpertBundle: @unchecked Sendable {
             return nil
         }
         let hashes = layers.map { layerHash(fd: srcFD, model: model, layer: $0) }
-        // Location: next to the model by default (demo/CLI). The SANDBOXED app
-        // can neither read nor write siblings of a picker-selected file, so it
-        // sets DS4_BUNDLE_DIR (Application Support): READING tries both places
-        // (a bundle built by the demo next to the GGUF is reused when the
-        // sandbox allows it — 72 GB are NOT copied around), building goes to
-        // the directory when set.
+        // Location: next to the model whenever possible — ONE copy shared by
+        // demo and app. READING tries the sibling first, then DS4_BUNDLE_DIR
+        // (Application Support, set by the app). BUILDING prefers the sibling
+        // too and uses the directory only when the model's folder is not
+        // writable (sandboxed app / read-only volume) — 72 GB must never end
+        // up duplicated in two places.
         let sibling = model.path + ".expbundle"
         var candidates = [sibling]
         var buildPath = sibling
@@ -117,7 +117,10 @@ public final class ExpertBundle: @unchecked Sendable {
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             let inDir = dir + "/" + (model.path as NSString).lastPathComponent + ".expbundle"
             candidates.append(inDir)
-            buildPath = inDir
+            let modelDir = (model.path as NSString).deletingLastPathComponent
+            if !FileManager.default.isWritableFile(atPath: modelDir) {
+                buildPath = inDir
+            }
         }
         for path in candidates {
             if let b = openExisting(path: path, modelSize: Int(model.size), layers: layers, nExpert: nExpert,
