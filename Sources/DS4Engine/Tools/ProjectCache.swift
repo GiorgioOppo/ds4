@@ -29,7 +29,8 @@ public final class ProjectCache: @unchecked Sendable {
     static let maxFileBytes = 1 << 20            // index files up to 1 MB
     static let maxCacheBytes = 24 << 20          // content cache budget
     static let maxListEntries = 200
-    static let readChunkLines = 120              // lines per project_read call
+    static let readChunkLines = 120              // default lines per project_read call
+    static let maxReadLines = 400                // hard cap when the model asks for more
     static let maxSearchHits = 30
 
     static let skipDirs: Set<String> = [".git", ".build", ".swiftpm", "node_modules",
@@ -163,9 +164,11 @@ public final class ProjectCache: @unchecked Sendable {
         return out
     }
 
-    /// Read `relPath` from `fromLine` (1-based) for up to readChunkLines lines,
-    /// with line numbers so the model can paginate.
-    public func readTool(path relPath: String, fromLine: Int) -> String {
+    /// Read `relPath` from `fromLine` (1-based) for up to `maxLines` lines
+    /// (default readChunkLines, hard-capped at maxReadLines), with line numbers
+    /// so the model can paginate. Long files should be read in FEW large chunks:
+    /// every round-trip costs a full prefill+decode on a local model.
+    public func readTool(path relPath: String, fromLine: Int, maxLines: Int? = nil) -> String {
         guard !relPath.contains("..") else { return "Invalid path." }
         guard let text = fileContents(relPath) else {
             return "File not found in the index: '\(relPath)'. Use project_list to explore."
@@ -173,7 +176,8 @@ public final class ProjectCache: @unchecked Sendable {
         let lines = text.components(separatedBy: "\n")
         let start = max(1, fromLine)
         guard start <= lines.count else { return "'\(relPath)' has only \(lines.count) lines." }
-        let end = min(lines.count, start + Self.readChunkLines - 1)
+        let chunk = min(max(1, maxLines ?? Self.readChunkLines), Self.maxReadLines)
+        let end = min(lines.count, start + chunk - 1)
         var out = "\(relPath) - lines \(start)-\(end) of \(lines.count):\n"
         for i in (start - 1)..<end {
             out += "\(i + 1)\t\(lines[i])\n"

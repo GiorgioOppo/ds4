@@ -364,8 +364,13 @@ public actor InferenceService {
         if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
         var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
         let specs = ToolRegistry.specs(enabled: Set(granted))
-        let toolLine = granted.isEmpty ? "You have no tools: answer from your own knowledge."
+        var toolLine = granted.isEmpty ? "You have no tools: answer from your own knowledge."
                                        : "Available tools (use only these): " + granted.joined(separator: ", ") + "."
+        if granted.contains("project_read") {
+            // Every tool round costs a full prefill+decode on a local model: steer
+            // the sub-agent away from paging a long file 120 lines at a time.
+            toolLine += " Read long files in FEW large chunks: project_read accepts 'lines' up to 400 per call."
+        }
         let rolePrefix = (role.map { $0.systemPrompt.isEmpty ? "" : $0.systemPrompt + "\n\n" }) ?? ""
         let roleLabel = role.map { " · \($0.name)" } ?? ""
 
@@ -394,8 +399,11 @@ public actor InferenceService {
     /// The target's content prefix is cached (content-keyed) and reused next time.
     /// `onStep` fires as each internal step is recorded (KV reuse, tool calls…),
     /// so the UI can show live execution detail; the same lines end up in `steps`.
+    /// `maxRounds` bounds the tool rounds (default 16 — a degraded model can
+    /// otherwise loop on tools forever); when it runs out the sub-agent is asked
+    /// to answer with what it has instead of returning empty-handed.
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
-                            maxTokens: Int = 1024, maxRounds: Int = .max,
+                            maxTokens: Int = 1024, maxRounds: Int = 16,
                             onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
         let ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
@@ -414,6 +422,11 @@ public actor InferenceService {
 
         var steps: [String] = []
         func note(_ s: String) { steps.append(s); onStep?(s) }
+        // Tool results go into the trace single-line (newlines and runs of
+        // whitespace collapsed) so the card stays readable.
+        func flat(_ s: String) -> String {
+            String(s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).prefix(160))
+        }
         let sampling = SamplingParams()
 
         // 1. Build or restore the content-keyed KV prefix (lazy cache).
@@ -452,13 +465,29 @@ public actor InferenceService {
             let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
                                          sampling: sampling, maxTokens: maxTokens)
             answer = turn.visible
-            guard !turn.calls.isEmpty, round < maxRounds else { break }
+            guard !turn.calls.isEmpty else { break }
+            // Budget exhausted with the model still asking for tools: force one
+            // last answer from what it gathered instead of returning empty-handed.
+            if round >= maxRounds {
+                note("round budget (\(maxRounds)) exhausted: forcing the final answer")
+                suffix = "<｜end▁of▁sentence｜><｜User｜>Tool budget exhausted: no more tool calls. Answer the question now, concisely, with what you have."
+                    + assistantOpen(.none)
+                let finalIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+                if pos + finalIds.count < contextSize {
+                    var ll = try decoder.prefill(tokens: finalIds, startPos: pos)
+                    pos += finalIds.count
+                    let fin = try decodeSubTurn(lastLogits: &ll, pos: &pos, recent: &recent,
+                                                sampling: sampling, maxTokens: maxTokens)
+                    if !fin.visible.isEmpty { answer = fin.visible }
+                }
+                break
+            }
             round += 1
             var results = ""
             for c in turn.calls {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
-                note("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
+                note("\(c.name) \(c.argumentsJSON) → " + flat(out.content))
                 results += "<tool_result>" + out.content + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)

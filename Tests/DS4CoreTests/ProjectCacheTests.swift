@@ -57,6 +57,19 @@ final class ProjectCacheTests: XCTestCase {
         XCTAssertTrue(ProjectCache.shared.searchTool(query: "zzz_not_there").contains("No results"))
     }
 
+    /// project_read 'lines': larger chunks on demand, hard-capped at maxReadLines.
+    func testReadCustomChunk() {
+        let big = ProjectCache.shared.readTool(path: "Sources/Long.txt", fromLine: 1, maxLines: 250)
+        XCTAssertTrue(big.contains("250\tline 250"))
+        XCTAssertTrue(big.contains("from_line=251"))
+        let all = ProjectCache.shared.readTool(path: "Sources/Long.txt", fromLine: 1, maxLines: 100_000)
+        XCTAssertTrue(all.contains("300\tline 300"))     // cap 400 ≥ 300 lines → whole file
+        XCTAssertFalse(all.contains("continues"))
+        let one = ProjectCache.shared.readTool(path: "Sources/Long.txt", fromLine: 5, maxLines: 1)
+        XCTAssertTrue(one.contains("5\tline 5"))
+        XCTAssertTrue(one.contains("from_line=6"))
+    }
+
     /// Scoped search: a path prefix restricts the files considered.
     func testSearchWithPathFilter() {
         XCTAssertTrue(ProjectCache.shared.searchTool(query: "answer", pathPrefix: "Sources")

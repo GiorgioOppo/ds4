@@ -13,7 +13,7 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 | `web_fetch` | `WebFetch.swift` | Fetches an http(s) URL and returns readable text (HTML stripped); long pages are read in chunks via `offset`. |
 | `project_tree` | `ProjectTree.swift` | Whole-project overview: directories with file counts, in one call. |
 | `project_find` | `ProjectFind.swift` | Finds files by name/path (`*` wildcard); contents are `project_search`'s job. |
-| `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project (`search` accepts an optional `path` scope). |
+| `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project (`read` takes optional `lines` up to 400 per call; `search` accepts an optional `path` scope). |
 | `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | Writes or edits indexed text files. |
 | `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | Raw file access, including line-based reads/edits. |
 | `file_delete` | `FileDelete.swift` | Deletes one file inside the project root (never directories). |
