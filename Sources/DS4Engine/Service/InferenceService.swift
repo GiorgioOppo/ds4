@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-03 prefill-batch+profilo"
+    public static let engineRevision = "2026-07-03 prefill-routebatch"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -122,7 +122,8 @@ public actor InferenceService {
         let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                      "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
                      "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION",
-                     "DS4_PREFILL_FFN_BATCH", "DS4_Q8_NSG",
+                     "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_CHUNK",
+                     "DS4_Q8_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]

@@ -101,7 +101,8 @@ func mtpReport(_ model: GGUFModel) -> String {
 func knobReport() -> String {
     let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                  "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
-                 "DS4_PREFILL_UNION", "DS4_PREFILL_FFN_BATCH", "DS4_Q8_NSG",
+                 "DS4_PREFILL_UNION", "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH",
+                 "DS4_PREFILL_CHUNK", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                  "DS4_MLOCK", "DS4_PROFILE_ROUTE"]

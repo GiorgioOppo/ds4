@@ -105,6 +105,19 @@ public final class StreamingDecoder {
     /// fixed cost at 512-token chunks (43 layers × 512 sync round-trips).
     /// DS4_PREFILL_FFN_BATCH=0 restores the per-token path (A/B parity check).
     let prefillFFNBatch = ProcessInfo.processInfo.environment["DS4_PREFILL_FFN_BATCH"] != "0"
+    /// Batched prefill phase A: encode up to DS4_PREFILL_ROUTE_BATCH consecutive
+    /// tokens' routes into ONE command buffer — per-token scratch snapshots are
+    /// blit-copied GPU-side between tokens, and the CPU reads ALL the selections
+    /// after a single wait, instead of one commit+wait per token per layer.
+    /// Attention stays token-sequential INSIDE the buffer (serial encoder ⇒ same
+    /// dispatch order ⇒ identical numerics). Default 32: cuts the route syncs
+    /// 32× while keeping each buffer's GPU run bounded. 0/1 = off (parity);
+    /// layers with the indexer ACTIVE always fall back to per-token (a CPU
+    /// top-k sits between the two halves of their route).
+    let prefillRouteBatch: Int = {
+        let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
+        return max(1, v)
+    }()
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -432,24 +445,79 @@ public final class StreamingDecoder {
                                     cur: [GPUTensor], other: [GPUTensor], n: Int, posBase: Int,
                                     gather: @escaping (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor),
                                     stage: PrefillStage) throws {
-        // Phase A: sequential routes; save per-token FFN inputs + selection into
-        // the chunk's reusable staging buffers (no per-layer allocations).
+        // Phase A: routes. Attention is causal WITHIN the layer (token j attends
+        // KV written by tokens 0..j), so the routes stay token-SEQUENTIAL — but
+        // they don't need a CPU round-trip each: runs of prefillRouteBatch tokens
+        // are encoded into ONE command buffer, each token's scratch snapshot
+        // (FFN inputs + router selection) blit-copied GPU-side before the next
+        // token overwrites it, and the CPU reads all the selections after a
+        // single wait. Indexer-active tokens (CPU top-k mid-route) and
+        // DS4_PROFILE_ROUTE fall back to the per-token path.
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
         idsT.reserveCapacity(n); rwT.reserveCapacity(n)
-        for j in 0..<n {
+        var j = 0
+        while j < n {
+            // Extent of the batchable run starting at j: consecutive tokens for
+            // which the indexer stays INACTIVE — its compressed-row count grows
+            // deterministically with pos, so activation is checked prospectively
+            // (extraRows) for the whole run before encoding any of it.
+            var jEnd = j
+            if prefillRouteBatch > 1 && !profileRoute {
+                var extraRows = 0
+                while jEnd < n && (jEnd - j) < prefillRouteBatch {
+                    let pos = posBase + jEnd
+                    if indexerActive(i, pos: pos, extraRows: extraRows) { break }
+                    if let idx = indexStates[i], (pos + 1) % idx.ratio == 0 { extraRows += 1 }
+                    jEnd += 1
+                }
+            }
+            if jEnd <= j {
+                // Per-token path (indexer active, or batching off).
+                try autoreleasepool {
+                    try Task.checkCancellation()
+                    let pos = posBase + j
+                    let t = Date()
+                    try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
+                    profile.routeS += Date().timeIntervalSince(t)
+                    let (ids, rw) = readRouteSelection(layer: i)
+                    idsT.append(ids); rwT.append(rw)
+                    copyFloats(from: scratch.cur, to: stage.cur[j], count: d.nEmbd)
+                    copyFloats(from: scratch.afterAttn, to: stage.attn[j], count: d.nHC * d.nEmbd)
+                    copyFloats(from: scratch.split, to: stage.split[j], count: 24)
+                    profile.layers += 1
+                }
+                j += 1
+                continue
+            }
+            let t = Date()
             try autoreleasepool {
                 try Task.checkCancellation()
-                let pos = posBase + j
-                let t = Date()
-                try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
-                profile.routeS += Date().timeIntervalSince(t)
-                let (ids, rw) = readRouteSelection(layer: i)
+                clearMaskIfDirty()
+                let c = GraphContext(rt); try c.begin()
+                for jj in j..<jEnd {
+                    let pos = posBase + jj
+                    try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
+                                        pos: pos, nKeys: pos + 1)
+                    // Snapshot ids/weights into stage.ids/rw too: phase B reads
+                    // them back and REWRITES both buffers (remapped + padded)
+                    // strictly after this buffer completes — no aliasing.
+                    try c.blitCopies([
+                        (src: scratch.cur, dst: stage.cur[jj], bytes: d.nEmbd * 4),
+                        (src: scratch.afterAttn, dst: stage.attn[jj], bytes: d.nHC * d.nEmbd * 4),
+                        (src: scratch.split, dst: stage.split[jj], bytes: 24 * 4),
+                        (src: scratch.selected, dst: stage.ids[jj], bytes: d.k * 4),
+                        (src: scratch.rw, dst: stage.rw[jj], bytes: d.k * 4),
+                    ])
+                }
+                c.commit()
+            }
+            profile.routeS += Date().timeIntervalSince(t)
+            for jj in j..<jEnd {
+                let (ids, rw) = selection(sel: stage.ids[jj], weights: stage.rw[jj], layer: i)
                 idsT.append(ids); rwT.append(rw)
-                copyFloats(from: scratch.cur, to: stage.cur[j], count: d.nEmbd)
-                copyFloats(from: scratch.afterAttn, to: stage.attn[j], count: d.nHC * d.nEmbd)
-                copyFloats(from: scratch.split, to: stage.split[j], count: 24)
                 profile.layers += 1
             }
+            j = jEnd
         }
 
         // Phase B: group consecutive tokens while the union stays under the cap,
@@ -599,9 +667,16 @@ public final class StreamingDecoder {
     /// original total). Returns the final (ids, weights), both of count K ≤ d.k.
     /// Also feeds the usage statistics ("usage imatrix") for `layer`.
     private func readRouteSelection(layer: Int) -> (ids: [Int32], rw: [Float]) {
-        let selPtr = scratch.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
+        selection(sel: scratch.selected, weights: scratch.rw, layer: layer)
+    }
+
+    /// Core of readRouteSelection, reading from ARBITRARY buffers — the batched
+    /// route phase snapshots each token's selection into per-token buffers and
+    /// reads them all back after one commit.
+    private func selection(sel: GPUTensor, weights: GPUTensor, layer: Int) -> (ids: [Int32], rw: [Float]) {
+        let selPtr = (sel.buffer.contents() + sel.byteOffset).bindMemory(to: Int32.self, capacity: d.k)
         var ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))
-        let wptr = scratch.rw.buffer.contents().bindMemory(to: Float.self, capacity: d.k)
+        let wptr = (weights.buffer.contents() + weights.byteOffset).bindMemory(to: Float.self, capacity: d.k)
         var rw = Array(UnsafeBufferPointer(start: wptr, count: d.k))
         let K = max(1, min(d.activeExperts, d.k))
         if K < d.k {
@@ -797,10 +872,30 @@ public final class StreamingDecoder {
 
     /// Will the indexer restrict this token's compressed rows on layer `i`?
     /// (prospective count: the compressor may emit one more row for this token.)
-    private func indexerActive(_ i: Int, pos: Int) -> Bool {
+    /// `extraRows` = rows the tokens BEFORE this one in a not-yet-encoded batch
+    /// will emit — the batched route phase checks activation prospectively for
+    /// the whole run before encoding any of it.
+    private func indexerActive(_ i: Int, pos: Int, extraRows: Int = 0) -> Bool {
         guard let idx = indexStates[i] else { return false }
-        let prospective = idx.count + (((pos + 1) % idx.ratio) == 0 ? 1 : 0)
+        let prospective = idx.count + extraRows + (((pos + 1) % idx.ratio) == 0 ? 1 : 0)
         return prospective > d.indexerTopK
+    }
+
+    /// Encode ONE token's full route (pre + attention) into `c` WITHOUT
+    /// committing — the batched phase A packs many tokens per command buffer.
+    /// Caller guarantees the indexer is NOT active for (i, pos) and route
+    /// profiling is off (both need CPU work mid-route). Same two encodes, same
+    /// order as the per-token non-indexer path in encodeRoute.
+    private func encodeRouteInto(_ c: GraphContext, _ i: Int, w: LayerWeights, layerRope: RopeParams,
+                                 curHc: GPUTensor, pos: Int, nKeys: Int) throws {
+        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
+        let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                         rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                         comp: compStates[i], idx: hasIdxWeights ? indexStates[i] : nil,
+                                         indexerScoring: false)
+        try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
+                              nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                              nComp: nComp, comp: compStates[i])
     }
 
     /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:
