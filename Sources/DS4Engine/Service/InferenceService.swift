@@ -344,21 +344,28 @@ public actor InferenceService {
     /// Granted tools = explicit `requested` (∩ grantable), else the role's tools,
     /// else a read-only default. Works WITHOUT an imported project: that is not an
     /// error — the sub-agent then runs on the task alone (no project content/tools).
-    private func subContext(for target: String, agent agentId: String, toolNames requested: [String]) -> SubContext {
+    /// `seedFileContent: false` builds the FALLBACK context for a file target too
+    /// large to preload: same file focus, but the sub-agent reads it in chunks
+    /// with the read tools instead of having the text seeded into the prefix.
+    private func subContext(for target: String, agent agentId: String, toolNames requested: [String],
+                            seedFileContent: Bool = true) -> SubContext {
         let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let isProject = t.isEmpty || t.lowercased() == "project" || t == "."
         let role = agentId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil
             : AgentRegistry.shared.all().first { $0.id == agentId.trimmingCharacters(in: .whitespacesAndNewlines) }
         let projectInfo = ProjectCache.shared.info()
-        let fileText = (projectInfo != nil && !isProject) ? ProjectCache.shared.fullText(of: t) : nil
+        let fileText = (projectInfo != nil && !isProject && seedFileContent)
+            ? ProjectCache.shared.fullText(of: t) : nil
 
         // Granted = explicit ∩ grantable, else role's tools ∩ grantable, else default.
         var granted = requested.filter { ToolRegistry.subAgentGrantable.contains($0) }
         if granted.isEmpty, let role { granted = role.toolNames.filter { ToolRegistry.subAgentGrantable.contains($0) } }
         if granted.isEmpty {
+            // File targets also get raw file_read/file_lines: the target may exist
+            // in the root without being indexed (too large / unusual extension).
             granted = projectInfo == nil ? []
                 : (isProject ? ["project_tree", "project_list", "project_find", "project_read", "project_search"]
-                             : ["project_read", "project_search"])
+                             : ["project_read", "project_search", "file_read", "file_lines"])
         }
         // Without an imported project, project-scoped tools can't do anything → drop them.
         if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
@@ -385,9 +392,29 @@ public actor InferenceService {
             let sys = rolePrefix + "You are a sub-agent focused on file \"\(t)\", already in context. \(toolLine) If you edit, act only on this file (exact and unique find text, including indentation). Conclude with a concise answer."
             return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)\(roleLabel)", toolNames: granted)
         }
+        if projectInfo != nil, !isProject, !seedFileContent,
+           let full = ProjectCache.shared.fullText(of: t) {
+            // File target NOT seeded (too large for the context): keep the file
+            // focus, hand over chunked reading instead of the content itself.
+            let lineCount = full.components(separatedBy: "\n").count
+            let content = "Target file \"\(t)\" (~\(lineCount) lines): too large to preload into context.\n\n"
+            let sys = rolePrefix + "You are a sub-agent focused on file \"\(t)\" (~\(lineCount) lines), which is TOO LARGE to preload. \(toolLine) Read only the parts the task needs, in few LARGE chunks (project_read with 'lines' up to 400, continuing with from_line). Conclude with a concise answer."
+            return SubContext(system: sys, content: content, tools: specs,
+                              label: "file:\(t)\(roleLabel)", toolNames: granted)
+        }
         // No project imported (or the file isn't in it): a plain sub-agent that
         // answers the task directly — NOT an error (a chat may have no project).
-        let note = projectInfo == nil ? "" : "Note: \"\(t)\" is not in the imported project. "
+        // A file that EXISTS in the root but is outside the text index (too
+        // large / binary-looking) is still reachable via raw ranged reads.
+        var note = ""
+        if projectInfo != nil, !isProject {
+            if !t.contains(".."), let root = ProjectCache.shared.rootURL(),
+               FileManager.default.fileExists(atPath: root.appendingPathComponent(t).path) {
+                note = "Note: \"\(t)\" exists but is NOT in the text index (too large or binary): check its size with file_lines and read it in ranges with file_read (from_line/to_line). "
+            } else {
+                note = "Note: \"\(t)\" is not in the imported project. "
+            }
+        }
         let sys = rolePrefix + "You are a sub-agent. \(note)\(toolLine) Complete the task and conclude with a concise answer."
         return SubContext(system: sys, content: "", tools: specs, label: "task\(roleLabel)", toolNames: granted)
     }
@@ -409,7 +436,7 @@ public actor InferenceService {
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
                             maxTokens: Int = 4096, maxRounds: Int = 16,
                             onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
-        let ctx = subContext(for: target, agent: agent, toolNames: tools)
+        var ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
 
@@ -442,13 +469,25 @@ public actor InferenceService {
         let sampling = SamplingParams()
 
         // 1. Build or restore the content-keyed KV prefix (lazy cache).
-        let prefixText = "<｜begin▁of▁sentence｜>"
-            + ChatRenderer.systemBlock(turns: [.system(ctx.system)], tools: ctx.tools, markup: markup, compact: true)
-            + "<｜User｜>" + ctx.content
-        let prefixIds = tok.tokenizeRenderedChat(prefixText).map { Int($0) }
-        guard prefixIds.count < contextSize - 32 else {
-            return SubAgentRun(target: ctx.label, question: question,
-                               answer: "The contents of \"\(ctx.label)\" exceed the sub-agent context.", steps: steps)
+        func renderPrefix(_ c: SubContext) -> [Int] {
+            let text = "<｜begin▁of▁sentence｜>"
+                + ChatRenderer.systemBlock(turns: [.system(c.system)], tools: c.tools, markup: markup, compact: true)
+                + "<｜User｜>" + c.content
+            return tok.tokenizeRenderedChat(text).map { Int($0) }
+        }
+        var prefixIds = renderPrefix(ctx)
+        if prefixIds.count >= contextSize - 32 {
+            // File target too large to preload: fall back to CHUNKED-READ mode
+            // (same file focus, read tools instead of seeded content) rather
+            // than refusing the run outright.
+            let oversized = prefixIds.count
+            ctx = subContext(for: target, agent: agent, toolNames: tools, seedFileContent: false)
+            prefixIds = renderPrefix(ctx)
+            guard prefixIds.count < contextSize - 32 else {
+                return SubAgentRun(target: ctx.label, question: question,
+                                   answer: "The contents of \"\(ctx.label)\" exceed the sub-agent context.", steps: steps)
+            }
+            note("target too large to preload (\(oversized) tokens vs context \(contextSize)): chunked-read mode")
         }
         var pos = 0
         if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
