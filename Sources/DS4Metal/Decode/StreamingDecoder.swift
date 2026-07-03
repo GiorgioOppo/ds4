@@ -886,11 +886,18 @@ public final class StreamingDecoder {
         // three scattered ~2 MB reads (measured gather at ~49% of the SSD's
         // parallel ceiling without it). Built once next to the model; any
         // failure falls back to the plain GGUF reads below. Same bytes.
-        let bundle: ExpertBundle? =
-            ProcessInfo.processInfo.environment["DS4_EXPERT_BUNDLE"] == "1"
+        let bundleEnabled = ProcessInfo.processInfo.environment["DS4_EXPERT_BUNDLE"] == "1"
+        let bundle: ExpertBundle? = bundleEnabled
             ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
                                        gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
             : nil
+        // The bundle STATE must be visible in the engine log at EVERY load —
+        // silence ("is it even on?") is the one outcome that cannot be triaged.
+        if !bundleEnabled {
+            FileHandle.standardError.write(Data("DS4 expbundle: disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF\n".utf8))
+        } else if bundle == nil {
+            FileHandle.standardError.write(Data("DS4 expbundle: NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF\n".utf8))
+        }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
