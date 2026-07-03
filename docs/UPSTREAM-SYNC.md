@@ -39,7 +39,7 @@ raw-mode/TTY behavior), `ds4-eval`, and `ds4_cli.c`.
 | `fd2d173` Harden server JSON parsing | server | **N/A.** The C parser was handwritten; DwarfStar uses Foundation `JSONSerialization`. |
 | `cafc134` Fix server const warning | server | **N/A.** C-only warning. |
 | `1cfa5cc` Refactor streaming expert cache API | streaming | **N/A.** Multi-backend refactor with no behavioral change to port. |
-| `7a77a28` Release cache margin on mlock failure / `cd57428` Cap oversized caches | streaming | **N/A / marginal.** Tied to C `mlock` and slab allocator behavior. DwarfStar does not `mlock`; expert slot-cache is opt-in and slot-limited. |
+| `7a77a28` Release cache margin on mlock failure / `cd57428` Cap oversized caches | streaming | **Partially covered.** DwarfStar now has best-effort `DS4_MLOCK` for hot buffers and a slot-limited expert cache, but it does not use the same C slab allocator. Keep this class of failure in mind when changing cache sizing. |
 | `f2d701a` Fix distributed SSD streaming layer slices | distributed | **Deferred.** DwarfStar's distributed mode is implemented but still needs numerical validation. Review together with that validation work. |
 | `81f35e7` + `b548d86` mixed-precision routed experts | streaming/quant | **Ported.** Per-layer routed expert quantization is supported. See below. |
 

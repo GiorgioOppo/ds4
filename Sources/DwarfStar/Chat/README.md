@@ -9,8 +9,9 @@ Chat view model and UI.
   explanatory error fed back to the model and shown in the transcript; valid
   runs appear immediately as an in-progress card that streams the sub-agent's
   internal steps live and keeps them on error/stop), handles text attachments, shows
-  near-context-full warnings, applies memory settings such as expert cache, disk
-  KV, and raw-KV ring, and manages **multiple persistent chats**. The active chat
+  near-context-full warnings, applies memory settings such as expert cache,
+  expert pread, expert bundle, dense streaming, `mlock`, Q4 dense cache, disk KV,
+  and raw-KV ring, and manages **multiple persistent chats**. The active chat
   lives in `messages`; inactive chats are stored on disk.
 - **`ChatSession.swift`** defines the `Codable` chat model, including metadata and
   transcript entries as `StoredMessage`. `ChatSessionStore` persists one JSON
@@ -29,6 +30,13 @@ After app restart or after switching chats, the engine no longer owns the KV for
 that conversation. On the first new send, the visible history is rendered again
 through `InferenceService.sendWithHistory`. Disk KV can restore the prefix, then
 subsequent turns go back to incremental append-only execution.
+
+## Shared Engine
+
+When the model is loaded, `ChatStore.sharedEngine` exposes the one local
+`InferenceService` used by Chat, Server, and local Benchmark. Server start fails
+until this engine is ready. Benchmark is allowed only while chat is idle because
+benchmark runs rewrite KV state.
 
 ## Future Split Candidates
 
