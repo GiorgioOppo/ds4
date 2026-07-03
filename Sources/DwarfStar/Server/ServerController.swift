@@ -20,6 +20,8 @@ final class ServerController {
     var port = 8000
     var maxTokens = 1024
     var cors = false
+    /// Optional shared secret (Bearer / x-api-key). Empty = no authentication.
+    var apiKey = ""
 
     // Live state.
     var log = ""
@@ -42,8 +44,10 @@ final class ServerController {
 
         let path = ProcessStream.absolutePath(modelPath)
         let name = (path as NSString).lastPathComponent
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let cfg = LocalServer.Config(host: host, port: UInt16(clamping: port),
-                                     cors: cors, maxTokens: maxTokens)
+                                     cors: cors, maxTokens: maxTokens,
+                                     apiKey: key.isEmpty ? nil : key)
 
         // Sendable log channel: the server (any thread) yields lines; we drain them
         // on the main actor (Swift 6 concurrency-safe, no @MainActor capture).
