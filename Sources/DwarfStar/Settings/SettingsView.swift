@@ -65,6 +65,30 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
+                Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
+                if store.expertBundleEnabled {
+                    Label("Reuses <model>.expbundle next to the GGUF when readable (e.g. built by the demo); otherwise the first load builds it under Application Support. Same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s, +27% tok/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short. Check the engine log for 'DS4 expbundle:' lines.",
+                          systemImage: "externaldrive.badge.plus")
+                        .font(.caption).foregroundStyle(.orange)
+                    HStack(spacing: 6) {
+                        Text("Bundle dir: \(ChatStore.bundleDirectory.path)")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([ChatStore.bundleDirectory])
+                        }
+                        .font(.caption2)
+                    }
+                    HStack(spacing: 8) {
+                        Button("Generate expert bundle now") { store.buildExpertBundleNow() }
+                            .font(.caption)
+                        if let status = store.bundleBuildStatus {
+                            Text(status).font(.caption2).foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                }
                 Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
                 Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)
                 Toggle("Q4 attention projections (LOSSY, ~+30% speed)", isOn: $store.denseQ4Enabled)
@@ -85,8 +109,8 @@ struct SettingsView: View {
                 }
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
-                    Stepper("Budget: \(store.diskKVBudgetMB) MB",
-                            value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                    Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * 0.022)) GB)",
+                            value: $store.diskKVBudgetKTok, in: 128...4096, step: 128)
                 }
                 Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {

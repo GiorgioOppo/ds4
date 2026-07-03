@@ -109,8 +109,26 @@ public actor InferenceService {
     /// per-layer variants to configure, hence no streaming options here.
     /// `expertCacheSlots` enables the per-layer expert slot-cache (0/nil = off);
     /// the persisted usage stats pre-warm it with the hottest experts.
+    /// Engine revision stamp, printed to stderr at every init so the engine log
+    /// always says WHICH build is running ("I rebuilt but nothing changed" is
+    /// otherwise undiagnosable). Bump when engine behaviour changes materially.
+    public static let engineRevision = "2026-07-03 expbundle-v2+log"
+
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
+        FileHandle.standardError.write(Data("DS4 engine: revisione \(Self.engineRevision)\n".utf8))
+        // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
+        // the app even see the env vars?" must be answerable from the log alone.
+        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
+                     "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                     "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
+                     "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
+                     "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
+        let env = ProcessInfo.processInfo.environment
+        let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
+        FileHandle.standardError.write(Data("DS4 engine: knob \(knobLine)\n".utf8))
+        FileHandle.standardError.write(Data("DS4 engine: contextSize=\(contextSize) cacheSlots=\(expertCacheSlots.map(String.init) ?? "env/off")\n".utf8))
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
@@ -148,13 +166,16 @@ public actor InferenceService {
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.
-        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
+        if let data = Self.usageDataSeeded(modelName: modelName, agentId: "generale") {
             decoder.usage?.load(data)
         }
-        // Sub-agent KV cache (separate directory from the chat disk-KV; content-keyed).
+        // Sub-agent KV cache (separate directory from the chat disk-KV; content-
+        // keyed). Same 1M-token total budget as the chat store default: prefix
+        // snapshots for big files/projects are exactly where reuse pays most.
         let subBits: UInt8 = configuredDims.gateQuant == .iq2_xxs ? 2 : 4
         self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: modelName),
-                                      budgetMB: 8192, quantBits: subBits, contextSize: contextSize)
+                                      budgetMB: 0, quantBits: subBits, contextSize: contextSize,
+                                      budgetTokens: 1_000_000)
     }
 
     /// Directory holding the per-file / per-project sub-agent KV caches.
@@ -177,7 +198,7 @@ public actor InferenceService {
     public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
         saveExpertUsage()
         agentId = agent.id
-        decoder.usage?.replace(with: try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: agentId)))
+        decoder.usage?.replace(with: Self.usageDataSeeded(modelName: modelName, agentId: agentId))
         decoder.slotCache?.invalidate()
         self.tools = tools
         resetConversation(systemPrompt: agent.systemPrompt.isEmpty ? nil : agent.systemPrompt)
@@ -192,6 +213,30 @@ public actor InferenceService {
             .appendingPathComponent("DwarfStar", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("expert-usage-\(modelName)-\(agentId).json")
+    }
+
+    /// Usage profile for `agentId`, SEEDED when absent: a brand-new agent gets
+    /// the RICHEST profile saved for the same model (largest file) instead of
+    /// an empty one — the routing is mostly model-driven, so the slot-cache
+    /// warms from the first token; the agent's own history then takes over
+    /// (its file is written at every generation as before). Without this, a
+    /// fresh agent paid dozens of cold-cache turns that the demo (one big
+    /// warm usage file) never saw.
+    nonisolated static func usageDataSeeded(modelName: String, agentId: String) -> Data? {
+        if let own = try? Data(contentsOf: usageURL(modelName: modelName, agentId: agentId)) {
+            return own
+        }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar", isDirectory: true)
+        let prefix = "expert-usage-\(modelName)-"
+        let candidates = ((try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(prefix) }
+        let best = candidates.max {
+            ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                < ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return best.flatMap { try? Data(contentsOf: $0) }
     }
 
     /// Persist the routing-frequency stats (called automatically after each
@@ -344,28 +389,40 @@ public actor InferenceService {
     /// Granted tools = explicit `requested` (∩ grantable), else the role's tools,
     /// else a read-only default. Works WITHOUT an imported project: that is not an
     /// error — the sub-agent then runs on the task alone (no project content/tools).
-    private func subContext(for target: String, agent agentId: String, toolNames requested: [String]) -> SubContext {
+    /// `seedFileContent: false` builds the FALLBACK context for a file target too
+    /// large to preload: same file focus, but the sub-agent reads it in chunks
+    /// with the read tools instead of having the text seeded into the prefix.
+    private func subContext(for target: String, agent agentId: String, toolNames requested: [String],
+                            seedFileContent: Bool = true) -> SubContext {
         let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let isProject = t.isEmpty || t.lowercased() == "project" || t == "."
         let role = agentId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil
             : AgentRegistry.shared.all().first { $0.id == agentId.trimmingCharacters(in: .whitespacesAndNewlines) }
         let projectInfo = ProjectCache.shared.info()
-        let fileText = (projectInfo != nil && !isProject) ? ProjectCache.shared.fullText(of: t) : nil
+        let fileText = (projectInfo != nil && !isProject && seedFileContent)
+            ? ProjectCache.shared.fullText(of: t) : nil
 
         // Granted = explicit ∩ grantable, else role's tools ∩ grantable, else default.
         var granted = requested.filter { ToolRegistry.subAgentGrantable.contains($0) }
         if granted.isEmpty, let role { granted = role.toolNames.filter { ToolRegistry.subAgentGrantable.contains($0) } }
         if granted.isEmpty {
+            // File targets also get raw file_read/file_lines: the target may exist
+            // in the root without being indexed (too large / unusual extension).
             granted = projectInfo == nil ? []
-                : (isProject ? ["project_list", "project_read", "project_search"]
-                             : ["project_read", "project_search"])
+                : (isProject ? ["project_tree", "project_list", "project_find", "project_read", "project_search"]
+                             : ["project_read", "project_search", "file_read", "file_lines"])
         }
         // Without an imported project, project-scoped tools can't do anything → drop them.
         if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
         var seen = Set<String>(); granted = granted.filter { seen.insert($0).inserted }   // stable de-dup
         let specs = ToolRegistry.specs(enabled: Set(granted))
-        let toolLine = granted.isEmpty ? "You have no tools: answer from your own knowledge."
+        var toolLine = granted.isEmpty ? "You have no tools: answer from your own knowledge."
                                        : "Available tools (use only these): " + granted.joined(separator: ", ") + "."
+        if granted.contains("project_read") {
+            // Every tool round costs a full prefill+decode on a local model: steer
+            // the sub-agent away from paging a long file 120 lines at a time.
+            toolLine += " Read long files in FEW large chunks: project_read accepts 'lines' up to 400 per call."
+        }
         let rolePrefix = (role.map { $0.systemPrompt.isEmpty ? "" : $0.systemPrompt + "\n\n" }) ?? ""
         let roleLabel = role.map { " · \($0.name)" } ?? ""
 
@@ -380,9 +437,29 @@ public actor InferenceService {
             let sys = rolePrefix + "You are a sub-agent focused on file \"\(t)\", already in context. \(toolLine) If you edit, act only on this file (exact and unique find text, including indentation). Conclude with a concise answer."
             return SubContext(system: sys, content: content, tools: specs, label: "file:\(t)\(roleLabel)", toolNames: granted)
         }
+        if projectInfo != nil, !isProject, !seedFileContent,
+           let full = ProjectCache.shared.fullText(of: t) {
+            // File target NOT seeded (too large for the context): keep the file
+            // focus, hand over chunked reading instead of the content itself.
+            let lineCount = full.components(separatedBy: "\n").count
+            let content = "Target file \"\(t)\" (~\(lineCount) lines): too large to preload into context.\n\n"
+            let sys = rolePrefix + "You are a sub-agent focused on file \"\(t)\" (~\(lineCount) lines), which is TOO LARGE to preload. \(toolLine) Read only the parts the task needs, in few LARGE chunks (project_read with 'lines' up to 400, continuing with from_line). Conclude with a concise answer."
+            return SubContext(system: sys, content: content, tools: specs,
+                              label: "file:\(t)\(roleLabel)", toolNames: granted)
+        }
         // No project imported (or the file isn't in it): a plain sub-agent that
         // answers the task directly — NOT an error (a chat may have no project).
-        let note = projectInfo == nil ? "" : "Note: \"\(t)\" is not in the imported project. "
+        // A file that EXISTS in the root but is outside the text index (too
+        // large / binary-looking) is still reachable via raw ranged reads.
+        var note = ""
+        if projectInfo != nil, !isProject {
+            if !t.contains(".."), let root = ProjectCache.shared.rootURL(),
+               FileManager.default.fileExists(atPath: root.appendingPathComponent(t).path) {
+                note = "Note: \"\(t)\" exists but is NOT in the text index (too large or binary): check its size with file_lines and read it in ranges with file_read (from_line/to_line). "
+            } else {
+                note = "Note: \"\(t)\" is not in the imported project. "
+            }
+        }
         let sys = rolePrefix + "You are a sub-agent. \(note)\(toolLine) Complete the task and conclude with a concise answer."
         return SubContext(system: sys, content: "", tools: specs, label: "task\(roleLabel)", toolNames: granted)
     }
@@ -392,9 +469,19 @@ public actor InferenceService {
     /// ever sees the question (the tool call) and this answer (the tool result) —
     /// the sub-agent's internal tool rounds happen in a separate, discarded context.
     /// The target's content prefix is cached (content-keyed) and reused next time.
+    /// `onStep` fires as each internal step is recorded (KV reuse, tool calls…),
+    /// so the UI can show live execution detail; the same lines end up in `steps`.
+    /// `maxRounds` bounds the tool rounds (default 16 — a degraded model can
+    /// otherwise loop on tools forever); when it runs out the sub-agent is asked
+    /// to answer with what it has instead of returning empty-handed.
+    /// `maxTokens` caps ONE decode turn and includes the (discarded) reasoning
+    /// tokens: 1024 was routinely eaten by a long think before any visible
+    /// answer, which surfaced as sub-agents "cutting their replies" — hence the
+    /// 4096 default (a cap, not a target: EOS ends the turn normally).
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
-                            maxTokens: Int = 1024, maxRounds: Int = .max) async throws -> SubAgentRun {
-        let ctx = subContext(for: target, agent: agent, toolNames: tools)
+                            maxTokens: Int = 4096, maxRounds: Int = 16,
+                            onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
+        var ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
 
@@ -410,28 +497,55 @@ public actor InferenceService {
         }
 
         var steps: [String] = []
+        func note(_ s: String) { steps.append(s); onStep?(s) }
+        // Tool results go into the trace as a BOUNDED excerpt: the first lines are
+        // kept verbatim (a project_read step really shows the lines it read), but
+        // the step can't blow the card up — capped in lines and characters.
+        func excerpt(_ s: String) -> String {
+            let maxLines = 8, maxChars = 600
+            var lines = s.split(separator: "\n", omittingEmptySubsequences: false)
+            let dropped = max(0, lines.count - maxLines)
+            if dropped > 0 { lines = Array(lines.prefix(maxLines)) }
+            var out = lines.joined(separator: "\n")
+            if out.count > maxChars { out = String(out.prefix(maxChars)) + "…" }
+            if dropped > 0 { out += "\n… (+\(dropped) more lines)" }
+            return out
+        }
         let sampling = SamplingParams()
 
         // 1. Build or restore the content-keyed KV prefix (lazy cache).
-        let prefixText = "<｜begin▁of▁sentence｜>"
-            + ChatRenderer.systemBlock(turns: [.system(ctx.system)], tools: ctx.tools, markup: markup, compact: true)
-            + "<｜User｜>" + ctx.content
-        let prefixIds = tok.tokenizeRenderedChat(prefixText).map { Int($0) }
-        guard prefixIds.count < contextSize - 32 else {
-            return SubAgentRun(target: ctx.label, question: question,
-                               answer: "The contents of \"\(ctx.label)\" exceed the sub-agent context.", steps: steps)
+        func renderPrefix(_ c: SubContext) -> [Int] {
+            let text = "<｜begin▁of▁sentence｜>"
+                + ChatRenderer.systemBlock(turns: [.system(c.system)], tools: c.tools, markup: markup, compact: true)
+                + "<｜User｜>" + c.content
+            return tok.tokenizeRenderedChat(text).map { Int($0) }
+        }
+        var prefixIds = renderPrefix(ctx)
+        if prefixIds.count >= contextSize - 32 {
+            // File target too large to preload: fall back to CHUNKED-READ mode
+            // (same file focus, read tools instead of seeded content) rather
+            // than refusing the run outright.
+            let oversized = prefixIds.count
+            ctx = subContext(for: target, agent: agent, toolNames: tools, seedFileContent: false)
+            prefixIds = renderPrefix(ctx)
+            guard prefixIds.count < contextSize - 32 else {
+                return SubAgentRun(target: ctx.label, question: question,
+                                   answer: "The contents of \"\(ctx.label)\" exceed the sub-agent context.", steps: steps)
+            }
+            note("target too large to preload (\(oversized) tokens vs context \(contextSize)): chunked-read mode")
         }
         var pos = 0
         if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
             try decoder.importKV(snap); pos = prefixIds.count
-            steps.append("KV \"\(ctx.label)\" reused (\(pos) tokens)")
+            note("KV \"\(ctx.label)\" reused (\(pos) tokens)")
         } else {
+            note("prefill \"\(ctx.label)\" (\(prefixIds.count) tokens)…")
             _ = try decoder.prefill(tokens: prefixIds, startPos: 0); pos = prefixIds.count
             subKV?.store(tokens: prefixIds, modelName: modelName,
                          snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
-            steps.append("KV \"\(ctx.label)\" created (\(pos) tokens)")
+            note("KV \"\(ctx.label)\" created (\(pos) tokens)")
         }
-        steps.append("tool: " + ctx.toolNames.joined(separator: ", "))
+        note("tool: " + (ctx.toolNames.isEmpty ? "(none)" : ctx.toolNames.joined(separator: ", ")))
 
         // 2. Sub-agent tool loop: question → answer/tool-calls → results → … (bounded).
         var recent: [Int] = []
@@ -440,37 +554,71 @@ public actor InferenceService {
         var round = 0
         while true {
             let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
-            guard pos + suffixIds.count < contextSize else { steps.append("sub-agent context exhausted"); break }
+            guard pos + suffixIds.count < contextSize else { note("sub-agent context exhausted"); break }
+            note("round \(round + 1): generating…")
             var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: pos)
             pos += suffixIds.count
             let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
                                          sampling: sampling, maxTokens: maxTokens)
             answer = turn.visible
-            guard !turn.calls.isEmpty, round < maxRounds else { break }
+            var calls = turn.calls
+            if turn.truncated {
+                if turn.openTool {
+                    // The block never closed: any parsed call may carry half-generated
+                    // arguments — executing it could edit the wrong thing. Drop it.
+                    note("output cap (\(maxTokens) tokens) hit inside a tool call: truncated call discarded")
+                    calls = []
+                }
+                if calls.isEmpty {
+                    note("output cap (\(maxTokens) tokens) reached: answer truncated")
+                    if !answer.isEmpty { answer += "\n…[truncated at the \(maxTokens)-token output cap]" }
+                }
+            }
+            guard !calls.isEmpty else { break }
+            // Budget exhausted with the model still asking for tools: force one
+            // last answer from what it gathered instead of returning empty-handed.
+            if round >= maxRounds {
+                note("round budget (\(maxRounds)) exhausted: forcing the final answer")
+                suffix = "<｜end▁of▁sentence｜><｜User｜>Tool budget exhausted: no more tool calls. Answer the question now, concisely, with what you have."
+                    + assistantOpen(.none)
+                let finalIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+                if pos + finalIds.count < contextSize {
+                    var ll = try decoder.prefill(tokens: finalIds, startPos: pos)
+                    pos += finalIds.count
+                    let fin = try decodeSubTurn(lastLogits: &ll, pos: &pos, recent: &recent,
+                                                sampling: sampling, maxTokens: maxTokens)
+                    if !fin.visible.isEmpty { answer = fin.visible }
+                }
+                break
+            }
             round += 1
             var results = ""
-            for c in turn.calls {
+            for c in calls {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
-                steps.append("\(c.name) \(c.argumentsJSON) → " + String(out.content.prefix(160)))
+                note("\(c.name) \(c.argumentsJSON) → " + excerpt(out.content))
                 results += "<tool_result>" + out.content + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
         let final = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        steps.append("answer: \(final.count) characters")
+        note("answer: \(final.count) characters")
         return SubAgentRun(target: ctx.label, question: question,
                            answer: final.isEmpty ? "(no answer)" : final, steps: steps)
     }
 
     /// Decode one assistant turn in the sub-agent context: returns the visible
     /// answer text and any tool calls. Reasoning (<think>…</think>) is discarded —
-    /// only the answer and tool calls matter for the sub-agent.
+    /// but it still CONSUMES the token budget, so callers must treat `truncated`
+    /// turns explicitly (a long think can eat the whole cap before any answer).
+    /// `truncated` = the turn ended on the cap/context, not on EOS; `openTool` =
+    /// it ended INSIDE a tool block (any parsed calls have unreliable arguments).
     private func decodeSubTurn(lastLogits: inout [Float], pos: inout Int, recent: inout [Int],
                                sampling: SamplingParams, maxTokens: Int) throws
-        -> (visible: String, calls: [ToolCall]) {
+        -> (visible: String, calls: [ToolCall], truncated: Bool, openTool: Bool) {
         var rng = sampling.seed &+ UInt64(pos)
         var inTool = false, inReasoning = false
+        var sawEos = false
         var visibleBytes: [UInt8] = []
         var toolBytes: [UInt8] = []
         let dsmlId = tok.dsmlId
@@ -482,7 +630,7 @@ public actor InferenceService {
                                       topP: sampling.topP, minP: sampling.minP,
                                       repetitionPenalty: sampling.repetitionPenalty,
                                       recent: recent[lo...], rng: &rng)
-            if Int32(next) == tok.eosId { break }
+            if Int32(next) == tok.eosId { sawEos = true; break }
             if !inTool, Int32(next) == dsmlId {
                 inTool = true; toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inTool {
@@ -502,7 +650,8 @@ public actor InferenceService {
         let visibleRaw = String(bytes: visibleBytes, encoding: .utf8) ?? ""
         let toolText = String(bytes: toolBytes, encoding: .utf8) ?? ""
         let parsed = ToolCallParser.parse(inTool ? visibleRaw + toolText : visibleRaw, markup: markup)
-        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls)
+        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls,
+                !sawEos, inTool)
     }
 
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
@@ -519,11 +668,14 @@ public actor InferenceService {
 
     /// Enable/disable the disk KV cache. `dir` nil turns it off. Takes effect on
     /// the next generation; existing checkpoints in `dir` become restorable.
-    public func setDiskKV(directory: URL?, budgetMB: Int) {
+    /// The budget is in TOKENS (total across stored checkpoints — the live
+    /// context window stays `contextSize`); bytes follow the model's per-token
+    /// checkpoint size, so tokens are the stable unit to configure.
+    public func setDiskKV(directory: URL?, budgetTokens: Int) {
         guard let directory else { diskKV = nil; return }
         let bits: UInt8 = dims.gateQuant == .iq2_xxs ? 2 : 4
-        diskKV = try? DiskKVStore(directory: directory, budgetMB: budgetMB,
-                                  quantBits: bits, contextSize: contextSize)
+        diskKV = try? DiskKVStore(directory: directory, budgetMB: 0, quantBits: bits,
+                                  contextSize: contextSize, budgetTokens: max(1, budgetTokens))
     }
 
     /// Declare the tools available to the model. Tools are baked into the first

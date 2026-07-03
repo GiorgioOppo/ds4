@@ -11,6 +11,10 @@ The decode graph and KV cache: the core of per-token inference.
   writes.
 - **`Graph.swift` / `GraphContext.swift` / `GraphCompressor.swift`** encode
   command buffers and track recurrent compressor state.
+- **`IndexerSelect.swift`** is the heap-based top-K used by the NSA indexer
+  mask: same selected set as a full (score DESC, index ASC) sort at
+  O(n log k) — it runs per ratio-4 layer per token, with n growing with the
+  context.
 - **`KVSnapshot.swift`** captures CPU-side KV state, including the raw window and
   compressor state. It is used by disk KV and sub-agent context switching.
 - **`ExpertSlotCache.swift` / `ExpertUsage.swift`** implement the LRU pool of

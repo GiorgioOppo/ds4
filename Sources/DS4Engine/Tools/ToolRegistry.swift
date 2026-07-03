@@ -32,16 +32,19 @@ public enum ToolRegistry {
     /// effects (they modify files INSIDE the active project root only); else pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
                                                  webSearch, webFetch,
-                                                 projectList, projectRead, projectSearch,
+                                                 projectTree, projectList, projectFind,
+                                                 projectRead, projectSearch,
                                                  projectWrite, projectEdit,
-                                                 fileRead, fileLines, fileWrite, fileAdd, fileModify, git,
+                                                 fileRead, fileLines, fileWrite, fileAdd, fileModify,
+                                                 fileDelete, git,
                                                  agentsList, subagentSearch, subagentRun]
 
     /// Tools that require an imported project (a root to operate in). The sub-agent
     /// resolver drops these when no project is loaded.
     public static let projectScoped: Set<String> = [
-        "project_list", "project_read", "project_search", "project_edit", "project_write",
-        "file_read", "file_lines", "file_write", "file_add", "file_modify", "git",
+        "project_tree", "project_list", "project_find",
+        "project_read", "project_search", "project_edit", "project_write",
+        "file_read", "file_lines", "file_write", "file_add", "file_modify", "file_delete", "git",
     ]
 
     public static func builtin(named name: String) -> BuiltinTool? {
@@ -122,7 +125,8 @@ public enum ToolRegistry {
 
     /// Safe arithmetic evaluation via a small recursive-descent parser (no
     /// NSExpression, so a malformed input returns an error instead of throwing an
-    /// uncatchable ObjC exception). Supports + - * / , unary minus, parentheses.
+    /// uncatchable ObjC exception). Supports + - * / % ^, unary minus,
+    /// parentheses, the constants pi/e, and one-argument functions (sqrt, sin…).
     static func evaluateArithmetic(_ expr: String) -> String {
         guard let value = ArithmeticEvaluator.evaluate(expr) else {
             return #"{"error":"could not evaluate expression"}"#
@@ -131,14 +135,50 @@ public enum ToolRegistry {
     }
 }
 
-/// Minimal, crash-free arithmetic evaluator: `expr := term (('+'|'-') term)*`,
-/// `term := factor (('*'|'/') factor)*`, `factor := number | '(' expr ')' | '-' factor`.
-/// Returns nil on any malformed input. Pure and side-effect free.
+/// Minimal, crash-free arithmetic evaluator:
+/// `expr := term (('+'|'-') term)*`,
+/// `term := power (('*'|'/'|'%') power)*`,
+/// `power := factor ('^' power)?`  (right-associative),
+/// `factor := number | constant | function '(' expr ')' | '(' expr ')' | ('-'|'+') factor`.
+/// Constants: pi, e. Functions: sqrt, cbrt, abs, exp, ln, log/log10, log2,
+/// sin, cos, tan, asin, acos, atan, floor, ceil, round.
+/// Returns nil on any malformed input (a non-finite result, e.g. sqrt(-1),
+/// is rejected downstream by `formatNumberResult`). Pure and side-effect free.
 enum ArithmeticEvaluator {
     static func evaluate(_ s: String) -> Double? {
         var p = Parser(Array(s))
         guard let v = p.parseExpression(), p.atEnd else { return nil }
         return v
+    }
+
+    static func constant(_ name: String) -> Double? {
+        switch name {
+        case "pi": return .pi
+        case "e": return M_E
+        default: return nil
+        }
+    }
+
+    static func function(_ name: String, _ x: Double) -> Double? {
+        switch name {
+        case "sqrt": return x.squareRoot()
+        case "cbrt": return cbrt(x)
+        case "abs": return abs(x)
+        case "exp": return exp(x)
+        case "ln": return log(x)
+        case "log", "log10": return log10(x)
+        case "log2": return log2(x)
+        case "sin": return sin(x)
+        case "cos": return cos(x)
+        case "tan": return tan(x)
+        case "asin": return asin(x)
+        case "acos": return acos(x)
+        case "atan": return atan(x)
+        case "floor": return floor(x)
+        case "ceil": return ceil(x)
+        case "round": return x.rounded()
+        default: return nil
+        }
     }
 
     private struct Parser {
@@ -161,26 +201,56 @@ enum ArithmeticEvaluator {
         }
 
         mutating func parseTerm() -> Double? {
-            guard var acc = parseFactor() else { return nil }
-            while let op = peek(), op == "*" || op == "/" {
+            guard var acc = parsePower() else { return nil }
+            while let op = peek(), op == "*" || op == "/" || op == "%" {
                 i += 1
-                guard let rhs = parseFactor() else { return nil }
-                if op == "/" { if rhs == 0 { return nil }; acc /= rhs } else { acc *= rhs }
+                guard let rhs = parsePower() else { return nil }
+                switch op {
+                case "/": if rhs == 0 { return nil }; acc /= rhs
+                case "%": if rhs == 0 { return nil }; acc = acc.truncatingRemainder(dividingBy: rhs)
+                default: acc *= rhs
+                }
             }
             return acc
         }
 
+        /// Right-associative exponentiation: 2^3^2 = 2^(3^2) = 512.
+        mutating func parsePower() -> Double? {
+            guard let base = parseFactor() else { return nil }
+            guard peek() == "^" else { return base }
+            i += 1
+            guard let exp = parsePower() else { return nil }
+            return pow(base, exp)
+        }
+
         mutating func parseFactor() -> Double? {
             guard let ch = peek() else { return nil }
-            if ch == "-" { i += 1; guard let f = parseFactor() else { return nil }; return -f }
-            if ch == "+" { i += 1; return parseFactor() }
+            // Unary sign binds looser than '^' (so -2^2 = -(2^2) = -4, the
+            // standard convention) but tighter than * and /.
+            if ch == "-" { i += 1; guard let f = parsePower() else { return nil }; return -f }
+            if ch == "+" { i += 1; return parsePower() }
             if ch == "(" {
                 i += 1
                 guard let v = parseExpression(), peek() == ")" else { return nil }
                 i += 1
                 return v
             }
+            if ch.isLetter { return parseNameExpression() }
             return parseNumber()
+        }
+
+        /// A named constant (pi, e) or a one-argument function call f(expr).
+        mutating func parseNameExpression() -> Double? {
+            skipSpaces()
+            let start = i
+            while i < c.count, c[i].isLetter || c[i].isNumber { i += 1 }
+            let name = String(c[start..<i]).lowercased()
+            if let k = ArithmeticEvaluator.constant(name) { return k }
+            guard peek() == "(" else { return nil }
+            i += 1
+            guard let v = parseExpression(), peek() == ")" else { return nil }
+            i += 1
+            return ArithmeticEvaluator.function(name, v)
         }
 
         mutating func parseNumber() -> Double? {

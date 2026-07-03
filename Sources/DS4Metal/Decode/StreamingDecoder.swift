@@ -318,7 +318,12 @@ public final class StreamingDecoder {
         let step = max(1, chunk)
         while start < tokens.count {
             let end = min(start + step, tokens.count)
-            lastHC = try prefillRange(tokens, start: start, end: end, posBase: startPos)
+            // Drain the ObjC autorelease pool per chunk: Metal command buffers /
+            // encoders are autoreleased, and a long prefill inside one pool scope
+            // accumulates them all — transient footprint grows with the prompt.
+            lastHC = try autoreleasepool {
+                try prefillRange(tokens, start: start, end: end, posBase: startPos)
+            }
             start = end
         }
         profile.forwards += tokens.count
@@ -335,25 +340,35 @@ public final class StreamingDecoder {
         let hcDim = d.nHC * d.nEmbd
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
-        for j in 0..<n { try embedToken(tokens[start + j], into: cur[j]) }
+        try embedTokensBatch(Array(tokens[start..<end]), into: cur)
         for i in 0..<nLayers {
-            try Task.checkCancellation()
-            let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
-            if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
-            let layerRope = DSV4Shape.ropeParams(layer: i)
-            if let gather = expertGather, n > 1 {
-                try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
-                                       n: n, posBase: posBase + start, gather: gather)
-            } else {
-                for j in 0..<n {
-                    let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
-                    try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
-                                 pos: pos, nKeys: pos + 1)
+            // Per-layer pool drain: the layer weights and per-token command
+            // buffers are autoreleased ObjC objects — without this they pile up
+            // for the whole chunk instead of freeing at each EVICT.
+            try autoreleasepool {
+                try Task.checkCancellation()
+                let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
+                if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
+                let layerRope = DSV4Shape.ropeParams(layer: i)
+                if let gather = expertGather, n > 1 {
+                    try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
+                                           n: n, posBase: posBase + start, gather: gather)
+                } else {
+                    for j in 0..<n {
+                        let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
+                        try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                                     pos: pos, nKeys: pos + 1)
+                    }
                 }
+                swap(&cur, &other)                       // w drops here -> EVICT
             }
-            swap(&cur, &other)                       // w drops here -> EVICT
         }
-        return cur[n - 1]
+        // Free the chunk's activation buffers now (2·n HC tensors); only the last
+        // HC state survives into the next chunk / output head.
+        let last = cur[n - 1]
+        cur.removeAll(keepingCapacity: false)
+        other.removeAll(keepingCapacity: false)
+        return last
     }
 
     /// Max experts gathered per group in the batched prefill (bounds the packed
@@ -381,21 +396,23 @@ public final class StreamingDecoder {
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
         curT.reserveCapacity(n); attnT.reserveCapacity(n); splitT.reserveCapacity(n)
         for j in 0..<n {
-            try Task.checkCancellation()
-            let pos = posBase + j
-            let t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
-            profile.routeS += Date().timeIntervalSince(t)
-            let (ids, rw) = readRouteSelection(layer: i)
-            idsT.append(ids); rwT.append(rw)
-            let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
-            let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
-            let sT = try GPUTensor.zeros(rt, floatCount: 24)
-            copyFloats(from: scratch.cur, to: cT, count: d.nEmbd)
-            copyFloats(from: scratch.afterAttn, to: aT, count: d.nHC * d.nEmbd)
-            copyFloats(from: scratch.split, to: sT, count: 24)
-            curT.append(cT); attnT.append(aT); splitT.append(sT)
-            profile.layers += 1
+            try autoreleasepool {
+                try Task.checkCancellation()
+                let pos = posBase + j
+                let t = Date()
+                try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
+                profile.routeS += Date().timeIntervalSince(t)
+                let (ids, rw) = readRouteSelection(layer: i)
+                idsT.append(ids); rwT.append(rw)
+                let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
+                let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
+                let sT = try GPUTensor.zeros(rt, floatCount: 24)
+                copyFloats(from: scratch.cur, to: cT, count: d.nEmbd)
+                copyFloats(from: scratch.afterAttn, to: aT, count: d.nHC * d.nEmbd)
+                copyFloats(from: scratch.split, to: sT, count: 24)
+                curT.append(cT); attnT.append(aT); splitT.append(sT)
+                profile.layers += 1
+            }
         }
 
         // Phase B: group consecutive tokens while the union stays under the cap,
@@ -427,37 +444,72 @@ public final class StreamingDecoder {
         var pending: PrefillGather.Pending? = nil
         defer { pending?.join() }   // never leave a background gather running on error/cancel
         for (gi, group) in groups.enumerated() {
-            var t = Date()
-            let g: GPUTensor, u: GPUTensor, dn: GPUTensor
-            if let p = pending {
-                pending = nil
-                (g, u, dn) = try p.wait()   // residual only: the I/O ran during the previous group's FFNs
-            } else {
-                (g, u, dn) = try gather(i, group.union)   // first group: nothing to overlap yet
+            try autoreleasepool {
+                var t = Date()
+                let g: GPUTensor, u: GPUTensor, dn: GPUTensor
+                if let p = pending {
+                    pending = nil
+                    (g, u, dn) = try p.wait()   // residual only: the I/O ran during the previous group's FFNs
+                } else {
+                    (g, u, dn) = try gather(i, group.union)   // first group: nothing to overlap yet
+                }
+                profile.gatherS += Date().timeIntervalSince(t)   // EXPOSED (non-overlapped) I/O time
+                profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
+                if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
+                var posOf: [Int32: Int32] = [:]
+                for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
+                for j in group.tokens {
+                    try Task.checkCancellation()
+                    let K = idsT[j].count
+                    let remapped = idsT[j].map { posOf[$0]! }
+                    let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
+                                                     elementCount: K)
+                    writeFloats(rwT[j], into: scratch.rw)
+                    zeroDown6(from: K)
+                    t = Date()
+                    let c2 = GraphContext(rt); try c2.begin()
+                    try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                         ids: idsBuf, outHc: other[j], activeK: K,
+                                         cur: curT[j], afterAttn: attnT[j], split: splitT[j])
+                    c2.commit()
+                    profile.expertsS += Date().timeIntervalSince(t)
+                }
+                // g/u/dn drop here (pool drain) -> the group's packed union tensors are freed
             }
-            profile.gatherS += Date().timeIntervalSince(t)   // EXPOSED (non-overlapped) I/O time
-            profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
-            if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
-            var posOf: [Int32: Int32] = [:]
-            for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
-            for j in group.tokens {
-                try Task.checkCancellation()
-                let K = idsT[j].count
-                let remapped = idsT[j].map { posOf[$0]! }
-                let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
-                                                 elementCount: K)
-                writeFloats(rwT[j], into: scratch.rw)
-                zeroDown6(from: K)
-                t = Date()
-                let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                     ids: idsBuf, outHc: other[j], activeK: K,
-                                     cur: curT[j], afterAttn: attnT[j], split: splitT[j])
-                c2.commit()
-                profile.expertsS += Date().timeIntervalSince(t)
-            }
-            // g/u/dn drop here -> the group's packed union tensors are freed
         }
+        // Drop the per-token FFN inputs before returning to the caller's layer loop.
+        curT.removeAll(keepingCapacity: false)
+        attnT.removeAll(keepingCapacity: false)
+        splitT.removeAll(keepingCapacity: false)
+    }
+
+    /// Embed a whole prefill chunk in ONE command buffer: the tokens' table rows
+    /// are CPU-staged into a transient n-row table, then n embedTokenHC encodes
+    /// run back-to-back (the encoder is serial, so the shared `embd` intermediate
+    /// is safe). Numerically identical to n embedToken calls — it only removes
+    /// the n-1 per-token commit+wait round-trips (512 GPU syncs per chunk).
+    private func embedTokensBatch(_ toks: [Int], into hcs: [GPUTensor]) throws {
+        guard toks.count > 1 else {
+            if let t = toks.first { try embedToken(t, into: hcs[0]) }
+            return
+        }
+        let t = Date()
+        let rowBytes = embedRowStage.byteLength
+        let stage = try GPUTensor.zerosBytes(rt, byteLength: toks.count * rowBytes)
+        for (j, token) in toks.enumerated() {
+            precondition(token >= 0 && token < d.vocab, "embedTokensBatch: token \(token) out of vocab")
+            memcpy(stage.buffer.contents() + j * rowBytes,
+                   embedTable.buffer.contents() + embedTable.byteOffset + token * rowBytes,
+                   rowBytes)
+        }
+        let ec = GraphContext(rt)
+        try ec.begin()
+        for j in 0..<toks.count {
+            try ec.embedTokenHC(table: stage, token: j, embd: embd, hc: hcs[j],
+                                nEmbd: d.nEmbd, nVocab: toks.count, nHC: d.nHC)
+        }
+        ec.commit()
+        profile.embedS += Date().timeIntervalSince(t)
     }
 
     /// Embed one token into the HC state buffer `hc` (own command buffer).
@@ -566,7 +618,7 @@ public final class StreamingDecoder {
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
                 // Persistent staging (no per-layer alloc): c2 below is committed
                 // and waited before the next layer can overwrite this buffer.
-                slots.withUnsafeBytes {
+                _ = slots.withUnsafeBytes {
                     memcpy(slotsScratch.buffer.contents(), $0.baseAddress!, $0.count)
                 }
                 let slotsBuf = slotsScratch
@@ -690,14 +742,13 @@ public final class StreamingDecoder {
     /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:
     /// raw window rows stay 0; compressed row c gets 0 if selected, -inf if not.
     /// Ties keep the LOWEST row index (the C argmax scan picks the first best).
+    /// Selection is heap-based O(n log k), NOT a full sort: it runs per ratio-4
+    /// layer per token, and n grows with the context (~nKeys/4).
     private func applyIndexerMask(nKeys: Int, nComp: Int, nIdxComp: Int) {
         let nRaw = nKeys - max(0, nKeys - d.nSWA)
         let scores = scratch.idxScores.buffer.contents()
             .advanced(by: scratch.idxScores.byteOffset).bindMemory(to: Float.self, capacity: nIdxComp)
-        var order = Array(0..<nIdxComp)
-        order.sort { scores[$0] != scores[$1] ? scores[$0] > scores[$1] : $0 < $1 }
-        var allowed = [Bool](repeating: false, count: nIdxComp)
-        for k in 0..<min(d.indexerTopK, nIdxComp) { allowed[order[k]] = true }
+        let allowed = IndexerSelect.allowedTopK(scores: scores, count: nIdxComp, k: d.indexerTopK)
 
         let total = nRaw + nComp
         let mask = scratch.mask.buffer.contents().bindMemory(to: UInt16.self, capacity: total)
@@ -822,10 +873,6 @@ public final class StreamingDecoder {
         // Same bytes, same numerics — only the I/O path changes. A/B per machine.
         let uncachedFD: Int32? =
             ProcessInfo.processInfo.environment["DS4_EXPERT_PREAD"] == "1" ? model.uncachedFD() : nil
-        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
-                                               willNeed: willNeed, uncachedFD: uncachedFD)
-        }
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.
         let usage = ExpertUsageStats(nLayers: nLayers)
@@ -834,6 +881,28 @@ public final class StreamingDecoder {
         let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
         let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
         let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+        // DS4_EXPERT_BUNDLE=1: sidecar with each expert's gate|up|down slabs
+        // CONTIGUOUS — a miss becomes one ~7 MB sequential burst instead of
+        // three scattered ~2 MB reads (measured gather at ~49% of the SSD's
+        // parallel ceiling without it). Built once next to the model; any
+        // failure falls back to the plain GGUF reads below. Same bytes.
+        let bundleEnabled = ProcessInfo.processInfo.environment["DS4_EXPERT_BUNDLE"] == "1"
+        let bundle: ExpertBundle? = bundleEnabled
+            ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
+                                       gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
+            : nil
+        // The bundle STATE must be visible in the engine log at EVERY load —
+        // silence ("is it even on?") is the one outcome that cannot be triaged.
+        if !bundleEnabled {
+            FileHandle.standardError.write(Data("DS4 expbundle: disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF\n".utf8))
+        } else if bundle == nil {
+            FileHandle.standardError.write(Data("DS4 expbundle: NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF\n".utf8))
+        }
+        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
+            if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
+            return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
+                                                      willNeed: willNeed, uncachedFD: uncachedFD)
+        }
         // Persistent + changing experts (cacheSlots param, else env
         // DS4_EXPERT_CACHE_SLOTS; default off): per layer, an N-slot LRU pool
         // keeps hot experts resident in GPU buffers; only misses are memcpy'd
@@ -870,20 +939,29 @@ public final class StreamingDecoder {
                 }
                 return p
             }, fill: { il, id, pool, slot in
+                // Sidecar bundle first: the expert's 3 slabs are ADJACENT there,
+                // so the concurrent preads form one sequential burst per miss.
+                if let b = bundle, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
+                                                upDst: pool.up, downDst: pool.down, slot: slot) {
+                    return
+                }
                 // The 3 slabs (gate/up/down) of a missing expert are read
                 // CONCURRENTLY: with fillAll's parallelism across misses this
                 // raises the NVMe queue depth from ~misses to ~3×misses. It
                 // matters most under DS4_DENSE_STREAM, where the gather shares
                 // the disk with the dense reads and depth is what keeps it fed.
-                let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
+                // nonisolated(unsafe): i 3 job scrivono slab DISGIUNTI dello slot,
+                // model e' letto e basta, l'errore e' protetto dal lock.
+                nonisolated(unsafe) let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
                     ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
                     ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
                     ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
                 let lock = NSLock()
-                var firstError: Error? = nil
+                nonisolated(unsafe) var firstError: Error? = nil
+                nonisolated(unsafe) let modelRef = model
                 DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
                     do {
-                        try GGUFWeights.copyExpert(model, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
+                        try GGUFWeights.copyExpert(modelRef, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
                                                    into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD)
                     } catch {
                         lock.lock()

@@ -119,6 +119,12 @@ public struct LayerWeights {
     public var qBQ4 = false
     public var attnOutQ4 = false
     public var attnOutAQ4 = false
+    // DS4_SHARED_Q4 (requires DS4_DENSE_Q4): the shared-expert FFN projections
+    // requantized Q8_0 → Q4_K at load (resident) — their Q8 slabs leave the
+    // per-token dense stream entirely. Per-projection flags like the attn trio.
+    public var sharedGateQ4 = false
+    public var sharedUpQ4 = false
+    public var sharedDownQ4 = false
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -400,11 +406,29 @@ extension GraphContext {
     public func decodeSharedFFN(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                 cur: GPUTensor? = nil) throws {
         let x = cur ?? s.cur
-        // shared FFN: gate/up -> swiglu -> down
-        try matmulQ8_0(weight: w.sharedGate, x: x, out: s.sgate, inDim: d.nEmbd, outDim: d.sharedFfn)
-        try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
+        // shared FFN: gate/up -> swiglu -> down. Each projection dispatches on
+        // its own quant: Q4_K (DS4_SHARED_Q4 resident requant) runs through the
+        // validated MoE id-kernel with a single "expert" (k=1, id 0), exactly
+        // like the DS4_DENSE_Q4 attention projections.
+        if w.sharedGateQ4 {
+            try moeMatvecID(.q4_K, experts: w.sharedGate, ids: s.id0, activation: x, out: s.sgate,
+                            k: 1, inDim: d.nEmbd, outDim: d.sharedFfn, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.sharedGate, x: x, out: s.sgate, inDim: d.nEmbd, outDim: d.sharedFfn)
+        }
+        if w.sharedUpQ4 {
+            try moeMatvecID(.q4_K, experts: w.sharedUp, ids: s.id0, activation: x, out: s.sup,
+                            k: 1, inDim: d.nEmbd, outDim: d.sharedFfn, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.sharedUp, x: x, out: s.sup, inDim: d.nEmbd, outDim: d.sharedFfn)
+        }
         try swiglu(gate: s.sgate, up: s.sup, out: s.smid, n: d.sharedFfn, limit: d.swigluClamp)
-        try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
+        if w.sharedDownQ4 {
+            try moeMatvecID(.q4_K, experts: w.sharedDown, ids: s.id0, activation: s.smid, out: s.sharedOut,
+                            k: 1, inDim: d.sharedFfn, outDim: d.nEmbd, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.sharedDown, x: s.smid, out: s.sharedOut, inDim: d.sharedFfn, outDim: d.nEmbd)
+        }
     }
 
     /// The routed-MoE half of decodeExperts: matvec over the provided experts, add

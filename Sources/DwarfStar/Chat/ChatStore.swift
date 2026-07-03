@@ -20,6 +20,9 @@ struct UIMessage: Identifiable {
     /// Set on a `.tool` message that reports an isolated sub-agent run (question,
     /// answer, and a collapsible trace of its internal steps).
     var subAgent: InferenceService.SubAgentRun?
+    /// True while that sub-agent is still executing: the card shows a spinner and
+    /// the latest internal step live; flipped off when the final run replaces it.
+    var subAgentRunning: Bool = false
 }
 
 /// A text file staged in the composer: its full content is folded into the next
@@ -63,16 +66,35 @@ final class ChatStore {
     init(settings: AppSettings) {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        // Migrazione UNA TANTUM alla configurazione veloce misurata (2026-07,
+        // demo A/B sul campo: slot 16 + ring off + bundle = 2.3-2.6 tok/s
+        // contro ~1 con slot 6/ring on/contesto 302k). Applica i valori buoni
+        // ai default persistiti da vecchi esperimenti; le modifiche manuali
+        // FUTURE dell'utente restano sovrane (il flag impedisce di ripeterla).
+        // NB: dentro init i didSet non scattano — persistenza esplicita.
+        if !UserDefaults.standard.bool(forKey: "DS4FastConfig2026_07") {
+            UserDefaults.standard.set(true, forKey: "DS4FastConfig2026_07")
+            expertCacheSlots = 16
+            UserDefaults.standard.set(16, forKey: "DS4ExpertCacheSlots")
+            rawRingEnabled = false
+            UserDefaults.standard.set(false, forKey: "DS4RawRing")
+            if settings.contextSize > 32768 { settings.contextSize = 8192 }
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
         // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
         _ = setenv("DS4_Q4_CACHE_DIR", Self.q4CacheDirectory.path, 1)
+        // Stessa ragione per l'expert-bundle: il sidecar accanto al GGUF resta
+        // leggibile quando la sandbox lo consente (riuso di quello della demo,
+        // 72 GB non copiati), altrimenti la COSTRUZIONE va qui.
+        _ = setenv("DS4_BUNDLE_DIR", Self.bundleDirectory.path, 1)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -105,13 +127,17 @@ final class ChatStore {
 
     // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
     // restores matching prefixes on cold starts. Applied on the NEXT model load.
-    // ON by default (8 GB budget) so conversations are checkpointed and re-prefill
-    // is avoided across reloads; the explicit user choice is then persisted.
+    // ON by default so conversations are checkpointed and re-prefill is avoided
+    // across reloads; the explicit user choice is then persisted.
     var diskKVEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
     }
-    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192 {
-        didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
+    /// Disk-KV budget in THOUSANDS of tokens (default 1000 = 1M tokens total
+    /// across checkpoints — the live window stays `contextSize`). Tokens, not MB:
+    /// per-token checkpoint bytes depend on the model (~22 KB/token on the 61-layer
+    /// 2-bit Flash → 1M tokens ≈ 22 GB on disk), so tokens are the stable unit.
+    var diskKVBudgetKTok: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000 {
+        didSet { UserDefaults.standard.set(diskKVBudgetKTok, forKey: "DS4DiskKVBudgetKTok") }
     }
     /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
     /// instead of the full context, so the KV RAM is constant. Sets the engine env
@@ -179,6 +205,37 @@ final class ChatStore {
             _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
         }
     }
+    /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
+    /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
+    /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
+    /// MISURATO: gather 2.7 → 4.8 GB/s (79% del tetto SSD), 2.10 → 2.66 tok/s.
+    /// Stessi byte, numeriche identiche. DEFAULT ON: al load il file viene
+    /// cercato (accanto al GGUF, poi in Application Support), costruito una
+    /// tantum se assente — e SALTATO con log esplicito quando mancano i ~73 GB
+    /// liberi che il sidecar duplica su disco. Si applica al prossimo load.
+    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(expertBundleEnabled, forKey: "DS4ExpertBundle")
+            _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
+    var bundleBuildStatus: String?
+
+    /// Verifica/crea l'expert-bundle ORA, senza aspettare un load del modello.
+    /// Gira in background (una build da ~72 GB dura minuti); l'esito compare
+    /// accanto al bottone e i dettagli nel Log motore ("DS4 expbundle:").
+    func buildExpertBundleNow() {
+        guard !modelPath.isEmpty else { bundleBuildStatus = "Nessun modello selezionato."; return }
+        guard phase != .loading else { bundleBuildStatus = "Attendi la fine del load in corso."; return }
+        bundleBuildStatus = "Verifica/creazione in corso… (dettagli nel Log motore)"
+        let path = modelPath
+        Task.detached(priority: .userInitiated) {
+            let outcome = ExpertBundleTool.ensure(modelPath: path)
+            await MainActor.run { self.bundleBuildStatus = outcome }
+        }
+    }
+
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
     /// output head residente e staging dello stream (~3.3 GB con i default).
     /// I buffer Metal shared sono memoria anonima che macOS COMPRIME tra un
@@ -223,6 +280,14 @@ final class ChatStore {
     static var q4CacheDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("DwarfStar/q4-cache", isDirectory: true)
+    }
+
+    /// Dove l'app costruisce l'expert-bundle quando non può scrivere accanto al
+    /// GGUF (sandbox). ATTENZIONE: il sidecar duplica la regione esperti (~72 GB
+    /// sul Flash 2-bit) — la GUI lo dice esplicitamente nel toggle.
+    static var bundleDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("DwarfStar/expert-bundle", isDirectory: true)
     }
 
     // Tuning tab state.
@@ -476,7 +541,7 @@ final class ChatStore {
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
-        let kvBudget = diskKVBudgetMB
+        let kvBudgetTokens = diskKVBudgetKTok * 1000
         Task.detached(priority: .userInitiated) {
             defer { poller.cancel() }
             do {
@@ -484,7 +549,7 @@ final class ChatStore {
                                                contextSize: ctx,
                                                systemPrompt: nil,   // set by applyAgent below
                                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
-                await svc.setDiskKV(directory: kvDir, budgetMB: kvBudget)
+                await svc.setDiskKV(directory: kvDir, budgetTokens: kvBudgetTokens)
                 let info = await svc.modelInfo()
                 await MainActor.run {
                     self.service = svc
@@ -784,6 +849,30 @@ final class ChatStore {
                 (obj["agent"] as? String) ?? "", tools)
     }
 
+    /// Validate a `subagent_run` call before executing it: nil when well-formed,
+    /// otherwise an explanatory error the model can act on (fix and retry).
+    /// Silent fallbacks here (empty question, ignored unknown role…) would waste
+    /// a whole sub-agent run and leave the user staring at a garbage answer.
+    private static func subAgentCallProblem(_ argumentsJSON: String,
+                                            question: String, agent: String, tools: [String]) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] != nil else {
+            return #"the arguments are not a JSON object; expected {"target":"<file path or project>","question":"<self-contained task>"}"#
+        }
+        if question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "missing 'question': pass a self-contained task (the sub-agent does not see this chat)"
+        }
+        let agentId = agent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !agentId.isEmpty, !AgentRegistry.shared.all().contains(where: { $0.id == agentId }) {
+            let ids = AgentRegistry.shared.all().map(\.id).joined(separator: ", ")
+            return "unknown agent '\(agentId)'; available agent ids: \(ids) (see agents_list)"
+        }
+        if !tools.isEmpty, !tools.contains(where: { ToolRegistry.subAgentGrantable.contains($0) }) {
+            return "none of the requested tools exist or are grantable to sub-agents; grantable tools: \(ToolRegistry.subAgentGrantable.sorted().joined(separator: ", "))"
+        }
+        return nil
+    }
+
     private func appendAssistant() -> Int {
         messages.append(UIMessage(role: .assistant, text: ""))
         return messages.count - 1
@@ -795,7 +884,12 @@ final class ChatStore {
             status = ""
             refreshContextUsage()
             persistActiveSession()        // checkpoint the completed turn
-            if profileRouteEnabled { emitDecodeProfile() }
+            // Il Profilo decode va nel Log motore DOPO OGNI risposta: i contatori
+            // sono raccolti comunque, il report costa nulla, e "a quanto genera
+            // davvero l'app e dove va il tempo" deve essere leggibile dal log
+            // senza attivare niente. (profileRouteEnabled resta il gate della
+            // sola scomposizione route/attn, che aggiunge sync GPU.)
+            emitDecodeProfile()
         }
     }
 
@@ -840,12 +934,19 @@ final class ChatStore {
                 }
             }
             // The stream ended: the raw live markup was ephemeral feedback — drop it
-            // (a parsed call shows as a card; an unparsable block is surfaced as text).
-            // Also scrub any malformed tool markup the model emitted as text (degraded
-            // 2-bit output) so the final bubble shows clean prose.
+            // (a parsed call shows as a card). Also scrub any malformed tool markup
+            // the model emitted as text (degraded 2-bit output) so the final bubble
+            // shows clean prose. A tool block that streamed but never parsed into a
+            // call must NOT vanish silently: surface it as an explicit error row so
+            // the user sees the model attempted (and botched) a tool call.
             if index < messages.count {
+                let unparsed = messages[index].toolStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
                 messages[index].toolStreamText = ""
                 messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
+                if !unparsed.isEmpty, messages[index].toolCalls.isEmpty {
+                    messages.append(UIMessage(role: .tool,
+                        text: "✗ malformed tool call (not executed): \(String(unparsed.prefix(300)))"))
+                }
             }
         } catch is CancellationError {
             // User-initiated stop: keep the partial text, no error banner.
@@ -880,18 +981,58 @@ final class ChatStore {
             // context): the main KV only commits this call + the returned answer.
             if c.name == "subagent_run" {
                 let (target, question, agent, tools) = Self.subAgentArgs(c.argumentsJSON)
+                // A malformed call must fail loudly BEFORE spending a sub-agent run
+                // on it: the explanatory error goes back to the model (so it can fix
+                // the call) and into the transcript (so the failure is visible).
+                if let problem = Self.subAgentCallProblem(c.argumentsJSON, question: question,
+                                                          agent: agent, tools: tools) {
+                    messages.append(UIMessage(role: .tool, text: "✗ subagent_run not executed: \(problem)"))
+                    outputs.append(ToolOutput(callId: c.id, name: c.name,
+                                              content: "Error, sub-agent NOT run: \(problem)"))
+                    continue
+                }
                 status = "sub-agent su \(target)…"
+                // Show the run in the transcript IMMEDIATELY (a sub-agent can take
+                // minutes) and stream its internal steps into the card as they
+                // happen; the placeholder is replaced in place when it finishes.
+                let placeholder = messages.count
+                messages.append(UIMessage(role: .tool, text: "",
+                    subAgent: InferenceService.SubAgentRun(
+                        target: target.isEmpty ? "project" : target, question: question,
+                        answer: "", steps: []),
+                    subAgentRunning: true))
+                // The steps streamed so far: kept when the run errors out/stops, so
+                // the transcript shows how far it got instead of losing the trace.
+                func streamedSteps() -> [String] {
+                    placeholder < messages.count ? (messages[placeholder].subAgent?.steps ?? []) : []
+                }
                 let run: InferenceService.SubAgentRun
                 do {
-                    run = try await service.runSubAgent(target: target, question: question, agent: agent, tools: tools)
+                    run = try await service.runSubAgent(
+                        target: target, question: question, agent: agent, tools: tools,
+                        onStep: { [weak self] step in
+                            Task { @MainActor in
+                                guard let self, placeholder < self.messages.count,
+                                      self.messages[placeholder].subAgentRunning,
+                                      let sa = self.messages[placeholder].subAgent else { return }
+                                self.messages[placeholder].subAgent = InferenceService.SubAgentRun(
+                                    target: sa.target, question: sa.question,
+                                    answer: sa.answer, steps: sa.steps + [step])
+                            }
+                        })
                 } catch is CancellationError {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "(sub-agent stopped)", steps: [])
+                                                       answer: "(sub-agent stopped)", steps: streamedSteps())
                 } catch {
                     run = InferenceService.SubAgentRun(target: target, question: question,
-                                                       answer: "Sub-agent error: \(error)", steps: [])
+                                                       answer: "Sub-agent error: \(error)", steps: streamedSteps())
                 }
-                messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                if placeholder < messages.count, messages[placeholder].subAgent != nil {
+                    messages[placeholder].subAgent = run
+                    messages[placeholder].subAgentRunning = false
+                } else {
+                    messages.append(UIMessage(role: .tool, text: "", subAgent: run))
+                }
                 outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
                 continue
             }

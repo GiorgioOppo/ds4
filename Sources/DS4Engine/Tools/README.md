@@ -16,3 +16,6 @@ library they operate on.
   Network operations are intentionally excluded.
 - **`Agents.swift`** defines `AgentProfile` (system prompt, tools, and expert
   profile) and `AgentRegistry`, the shared roster read by `agents_list`.
+  Default roles: General, Coding, Code (agentic editing), Reviewer (read-only
+  code review), Debug (root-cause + minimal fix), Orchestrator (sub-agents),
+  Research (web), Math, Writing, LaTeX, Documentation.

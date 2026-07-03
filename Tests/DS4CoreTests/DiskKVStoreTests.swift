@@ -90,6 +90,26 @@ final class DiskKVStoreTests: XCTestCase {
         }
     }
 
+    /// Token budget: total stored tokens stay within budgetTokens, evicting the
+    /// lowest-score entries; an entry that alone exceeds the budget is refused.
+    func testTokenBudgetEviction() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, budgetTokens: 20, options: opts)
+        XCTAssertFalse(store.store(tokens: Array(0..<32), modelName: "m.gguf",
+                                   snapshot: snapshot(nKeys: 32)))       // alone > budget
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf",
+                                  snapshot: snapshot(nKeys: 8)))
+        XCTAssertTrue(store.store(tokens: Array(100..<108), modelName: "m.gguf",
+                                  snapshot: snapshot(nKeys: 8)))
+        // Third 8-token entry would make 24 > 20: something must be evicted.
+        XCTAssertTrue(store.store(tokens: Array(200..<208), modelName: "m.gguf",
+                                  snapshot: snapshot(nKeys: 8)))
+        let entries = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasSuffix(".kv") }
+        XCTAssertEqual(entries.count, 2, "8+8+8 tokens must not fit a 20-token budget")
+    }
+
     func testEvictionRespectsBudget() throws {
         var opts = DiskKVStore.Options(); opts.minTokens = 4
         // Budget floor is 64 MB in the store; entries here are ~KB, so exercise

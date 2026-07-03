@@ -81,9 +81,14 @@ public final class ExpertSlotCache {
             return
         }
         let lock = NSLock()
-        var firstError: Error? = nil
+        // nonisolated(unsafe): ogni fill scrive SOLO gli slab del proprio slot
+        // (contratto di `fill`), l'errore e' protetto dal lock, e la closure/
+        // pool catturati sono usati in sola lettura durante il fan-out.
+        nonisolated(unsafe) var firstError: Error? = nil
+        nonisolated(unsafe) let fillFn = fill
+        nonisolated(unsafe) let poolRef = pool
         DispatchQueue.concurrentPerform(iterations: pairs.count) { j in
-            do { try fill(layer, pairs[j].id, pool, pairs[j].slot) }
+            do { try fillFn(layer, pairs[j].id, poolRef, pairs[j].slot) }
             catch {
                 lock.lock()
                 if firstError == nil { firstError = error }
