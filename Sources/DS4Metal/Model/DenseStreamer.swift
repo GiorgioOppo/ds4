@@ -113,6 +113,10 @@ public final class DenseStreamer: @unchecked Sendable {
         // 129 independent (layer, tensor) requants saturate every core, ~6-8×
         // faster load than converting layer by layer.
         var q4Jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
+        // DS4_SHARED_Q4 (opt-in, needs q4Dense): also requantize the shared-expert
+        // FFN projections — their Q8 slabs leave the per-token stream entirely,
+        // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
+        let sharedQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_SHARED_Q4"] == "1"
         LoadProgress.shared.begin("Preparazione layer densi…", from: 0.08, to: 0.30, units: layers.count)
         for il in layers {
             var plan: [Entry] = []
@@ -121,7 +125,9 @@ public final class DenseStreamer: @unchecked Sendable {
             LoadProgress.shared.advance()
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
-                if q4Dense, f == .qB || f == .attnOut || f == .attnOutA,
+                let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
+                let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
+                if q4Dense, attnQ4Field || sharedQ4Field,
                    let info = GGUF.typeInfo(t.type), info.name == "q8_0",
                    Int(t.elements) % 256 == 0 {
                     q4Jobs.append((il: il, f: f, t: t))
@@ -203,7 +209,11 @@ public final class DenseStreamer: @unchecked Sendable {
                 switch job.f {
                 case .qB: skeleton[job.il]!.qB = q4; skeleton[job.il]!.qBQ4 = true
                 case .attnOut: skeleton[job.il]!.attnOut = q4; skeleton[job.il]!.attnOutQ4 = true
-                default: skeleton[job.il]!.attnOutA = q4; skeleton[job.il]!.attnOutAQ4 = true
+                case .attnOutA: skeleton[job.il]!.attnOutA = q4; skeleton[job.il]!.attnOutAQ4 = true
+                case .sharedGate: skeleton[job.il]!.sharedGate = q4; skeleton[job.il]!.sharedGateQ4 = true
+                case .sharedUp: skeleton[job.il]!.sharedUp = q4; skeleton[job.il]!.sharedUpQ4 = true
+                case .sharedDown: skeleton[job.il]!.sharedDown = q4; skeleton[job.il]!.sharedDownQ4 = true
+                default: break
                 }
             }
         }
