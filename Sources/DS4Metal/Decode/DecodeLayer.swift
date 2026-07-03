@@ -391,11 +391,11 @@ extension GraphContext {
                               gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                               ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                               cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                              split: GPUTensor? = nil) throws {
+                              split: GPUTensor? = nil, rw: GPUTensor? = nil) throws {
         try decodeSharedFFN(w: w, s: s, d: d, cur: cur)
         try decodeRoutedExperts(w: w, s: s, d: d, gateExp: gateExp, upExp: upExp,
                                 downExp: downExp, ids: ids, outHc: outHc, activeK: activeK,
-                                cur: cur, afterAttn: afterAttn, split: split)
+                                cur: cur, afterAttn: afterAttn, split: split, rw: rw)
     }
 
     /// The shared-expert FFN half of decodeExperts (gate/up -> swiglu -> down into
@@ -438,11 +438,15 @@ extension GraphContext {
                                     gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                                     ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                                     cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                                    split: GPUTensor? = nil) throws {
+                                    split: GPUTensor? = nil, rw: GPUTensor? = nil) throws {
         let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
         let x = cur ?? s.cur
         let resid = afterAttn ?? s.afterAttn
         let sp = split ?? s.split
+        // Route weights: per-token buffer in the batched prefill (many tokens
+        // share ONE command buffer, so the shared s.rw can't be rewritten
+        // between them); s.rw everywhere else.
+        let weights = rw ?? s.rw
         // routed MoE over the provided experts, dispatched on the PER-LAYER quant
         // (w.*Quant) — so a mixed-precision GGUF's boosted layer uses the right
         // kernel. Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when
@@ -451,13 +455,13 @@ extension GraphContext {
             && (w.gateQuant == .iq2_xxs || w.gateQuant == .q4_K)
         if pairFused {
             try moePairSwiGLU(w.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
-                              activation: x, weights: s.rw, gateScratch: s.gate6,
+                              activation: x, weights: weights, gateScratch: s.gate6,
                               upScratch: s.up6, mid: s.mid6,
                               k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
         } else {
             try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
             try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
+            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: weights, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
         }
         // down_sum6 hardcodes 6 expert slots: usable only at full k.
         let sumFused = d.fusedMoE && kk == 6

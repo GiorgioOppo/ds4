@@ -893,13 +893,14 @@ final class ChatStore {
         }
     }
 
-    /// Print the last turn's decode profile to stderr so it lands in the Log motore
-    /// (EngineLog captures fd 2), mirroring the demo's `log(dec.profile.report())`.
+    /// Print the last turn's prefill + decode profiles to stderr so they land in
+    /// the Log motore (EngineLog captures fd 2), mirroring the demo's DIAG output.
     private func emitDecodeProfile() {
         guard let service else { return }
         Task {
+            let prefill = await service.prefillProfileReport()
             let report = await service.decodeProfileReport()
-            FileHandle.standardError.write(Data(("\n" + report + "\n").utf8))
+            FileHandle.standardError.write(Data(("\n" + prefill + "\n\n" + report + "\n").utf8))
         }
     }
 

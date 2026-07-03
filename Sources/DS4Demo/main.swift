@@ -99,7 +99,7 @@ func mtpReport(_ model: GGUFModel) -> String {
 func knobReport() -> String {
     let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                  "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
-                 "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                 "DS4_PREFILL_UNION", "DS4_PREFILL_FFN_BATCH", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                  "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
@@ -251,12 +251,21 @@ do {
         // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
         // prompt tokens (amortizes the dominant weight I/O). Returns the last
         // token's logits; KV cache is populated for positions 0..N-1.
+        dec.resetProfile()   // il profilo qui sotto misura SOLO il prefill
         let pf0 = Date()
         var last = try dec.prefill(tokens: ids)
         var pos = ids.count
-        log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.1fs/token)",
-                   ids.count, Date().timeIntervalSince(pf0),
-                   Date().timeIntervalSince(pf0) / Double(max(1, ids.count))))
+        let pfS = Date().timeIntervalSince(pf0)
+        log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.2f tok/s)",
+                   ids.count, pfS, pfS > 0 ? Double(ids.count) / pfS : 0))
+        // Per-phase prefill breakdown (route/attn vs gather IO vs experts): the
+        // phases are timed by the same counters as the decode profile, reset at
+        // the prefill boundary above. gather IO is the EXPOSED (non-overlapped)
+        // wait — the pipelined group I/O that ran under the GPU doesn't show.
+        if diag {
+            log(dec.profile.report(title: "Profilo prefill"))
+            log("")
+        }
         // Decode: stream each token's bytes to stdout AS it is produced (like ds4).
         dec.resetProfile()   // profila solo la fase di decode (non il prefill)
         // Warm-up escluso dal profilo: i primi token pagano costi una-tantum

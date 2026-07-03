@@ -40,8 +40,8 @@ public struct DecodeProfile: Sendable {
 
     public init() {}
 
-    public func report() -> String {
-        guard forwards > 0 else { return "Profilo decode: nessun forward registrato." }
+    public func report(title: String = "Profilo decode") -> String {
+        guard forwards > 0 else { return "\(title): nessun forward registrato." }
         let f = Double(forwards)
         let total = embedS + routeS + gatherS + expertsS + layerOtherS + headS
         func ms(_ s: Double) -> String { String(format: "%6.1f", s / f * 1000) }
@@ -69,7 +69,7 @@ public struct DecodeProfile: Sendable {
                        + "\n     └ out  \(ms(routeOutS)) ms/token (output proj + HC + router)"
         }
         return """
-        Profilo decode — \(forwards) token, \(layers) iterazioni-layer
+        \(title) — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
           route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute\(routeSplit)
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
@@ -99,6 +99,12 @@ public final class StreamingDecoder {
     /// attn (attention + out proj + HC + router), each its own command buffer + timed.
     /// Adds a commit/wait per layer (absolute numbers inflate); read the RATIO.
     let profileRoute = ProcessInfo.processInfo.environment["DS4_PROFILE_ROUTE"] == "1"
+    /// Batched prefill phase B: encode ALL of a group's token-FFNs into ONE
+    /// command buffer (serial encoder ⇒ same dispatch order and visibility as
+    /// N separate buffers) instead of one commit+wait per token — the dominant
+    /// fixed cost at 512-token chunks (43 layers × 512 sync round-trips).
+    /// DS4_PREFILL_FFN_BATCH=0 restores the per-token path (A/B parity check).
+    let prefillFFNBatch = ProcessInfo.processInfo.environment["DS4_PREFILL_FFN_BATCH"] != "0"
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -330,6 +336,25 @@ public final class StreamingDecoder {
         return try outputHead(lastHC!)
     }
 
+    /// Reusable per-token staging for the batched prefill: ONE set per chunk,
+    /// rewritten at every layer (layer i's phase B completes before layer i+1's
+    /// phase A touches them) — instead of 3·n fresh Metal buffers per LAYER
+    /// (43 × 512 × 3 ≈ 66k allocations per chunk).
+    private struct PrefillStage {
+        let cur: [GPUTensor]     // n × nEmbd        (attn-normed FFN input)
+        let attn: [GPUTensor]    // n × nHC·nEmbd    (post-attention residual)
+        let split: [GPUTensor]   // n × 24           (HC split)
+        let ids: [GPUTensor]     // n × k Int32      (remapped ids, padded to k)
+        let rw: [GPUTensor]      // n × k Float      (route weights, 0-padded)
+        init(_ rt: MetalRuntime, n: Int, d: DSV4Dims) throws {
+            cur = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nEmbd) }
+            attn = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nHC * d.nEmbd) }
+            split = try (0..<n).map { _ in try .zeros(rt, floatCount: 24) }
+            ids = try (0..<n).map { _ in try .zerosBytes(rt, byteLength: d.k * 4) }
+            rw = try (0..<n).map { _ in try .zeros(rt, floatCount: d.k) }
+        }
+    }
+
     /// Process one prompt chunk [start, end) layer-major at absolute positions
     /// posBase+start … . Weights for each layer are loaded once and applied to all
     /// the chunk's tokens (in order). On the expert-gather path the routed-FFN
@@ -341,6 +366,8 @@ public final class StreamingDecoder {
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         try embedTokensBatch(Array(tokens[start..<end]), into: cur)
+        let stage: PrefillStage? = (expertGather != nil && n > 1)
+            ? try PrefillStage(rt, n: n, d: d) : nil
         for i in 0..<nLayers {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
@@ -350,9 +377,9 @@ public final class StreamingDecoder {
                 let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
                 if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
                 let layerRope = DSV4Shape.ropeParams(layer: i)
-                if let gather = expertGather, n > 1 {
+                if let gather = expertGather, n > 1, let stage {
                     try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
-                                           n: n, posBase: posBase + start, gather: gather)
+                                           n: n, posBase: posBase + start, gather: gather, stage: stage)
                 } else {
                     for j in 0..<n {
                         let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
@@ -390,11 +417,12 @@ public final class StreamingDecoder {
     /// ≤ min(6·tokens, 256) expert reads per layer instead of 6·tokens.
     private func batchedExpertLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                                     cur: [GPUTensor], other: [GPUTensor], n: Int, posBase: Int,
-                                    gather: @escaping (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor)) throws {
-        // Phase A: sequential routes; save per-token FFN inputs + selection.
-        var curT: [GPUTensor] = [], attnT: [GPUTensor] = [], splitT: [GPUTensor] = []
+                                    gather: @escaping (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor),
+                                    stage: PrefillStage) throws {
+        // Phase A: sequential routes; save per-token FFN inputs + selection into
+        // the chunk's reusable staging buffers (no per-layer allocations).
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
-        curT.reserveCapacity(n); attnT.reserveCapacity(n); splitT.reserveCapacity(n)
+        idsT.reserveCapacity(n); rwT.reserveCapacity(n)
         for j in 0..<n {
             try autoreleasepool {
                 try Task.checkCancellation()
@@ -404,13 +432,9 @@ public final class StreamingDecoder {
                 profile.routeS += Date().timeIntervalSince(t)
                 let (ids, rw) = readRouteSelection(layer: i)
                 idsT.append(ids); rwT.append(rw)
-                let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
-                let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
-                let sT = try GPUTensor.zeros(rt, floatCount: 24)
-                copyFloats(from: scratch.cur, to: cT, count: d.nEmbd)
-                copyFloats(from: scratch.afterAttn, to: aT, count: d.nHC * d.nEmbd)
-                copyFloats(from: scratch.split, to: sT, count: 24)
-                curT.append(cT); attnT.append(aT); splitT.append(sT)
+                copyFloats(from: scratch.cur, to: stage.cur[j], count: d.nEmbd)
+                copyFloats(from: scratch.afterAttn, to: stage.attn[j], count: d.nHC * d.nEmbd)
+                copyFloats(from: scratch.split, to: stage.split[j], count: 24)
                 profile.layers += 1
             }
         }
@@ -458,29 +482,56 @@ public final class StreamingDecoder {
                 if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
                 var posOf: [Int32: Int32] = [:]
                 for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
-                for j in group.tokens {
+                if prefillFFNBatch {
+                    // ONE command buffer for the whole group's FFNs. All the
+                    // CPU staging happens BEFORE the commit (per-token ids/rw
+                    // buffers — the shared s.rw can't be rewritten between
+                    // tokens of one buffer). Selections shorter than k
+                    // (DS4_ACTIVE_EXPERTS) are padded with slot 0 at weight 0:
+                    // SwiGLU scales the padded rows by 0, so their down
+                    // projection contributes exactly zero — same numerics.
+                    for j in group.tokens {
+                        var remapped = idsT[j].map { posOf[$0]! }
+                        var weights = rwT[j]
+                        while remapped.count < d.k { remapped.append(0); weights.append(0) }
+                        remapped.withUnsafeBytes {
+                            memcpy(stage.ids[j].buffer.contents() + stage.ids[j].byteOffset,
+                                   $0.baseAddress!, $0.count)
+                        }
+                        writeFloats(weights, into: stage.rw[j])
+                    }
                     try Task.checkCancellation()
-                    let K = idsT[j].count
-                    let remapped = idsT[j].map { posOf[$0]! }
-                    let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
-                                                     elementCount: K)
-                    writeFloats(rwT[j], into: scratch.rw)
-                    zeroDown6(from: K)
                     t = Date()
                     let c2 = GraphContext(rt); try c2.begin()
-                    try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                         ids: idsBuf, outHc: other[j], activeK: K,
-                                         cur: curT[j], afterAttn: attnT[j], split: splitT[j])
+                    for j in group.tokens {
+                        try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                             ids: stage.ids[j], outHc: other[j], activeK: d.k,
+                                             cur: stage.cur[j], afterAttn: stage.attn[j],
+                                             split: stage.split[j], rw: stage.rw[j])
+                    }
                     c2.commit()
                     profile.expertsS += Date().timeIntervalSince(t)
+                } else {
+                    for j in group.tokens {
+                        try Task.checkCancellation()
+                        let K = idsT[j].count
+                        let remapped = idsT[j].map { posOf[$0]! }
+                        let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
+                                                         elementCount: K)
+                        writeFloats(rwT[j], into: scratch.rw)
+                        zeroDown6(from: K)
+                        t = Date()
+                        let c2 = GraphContext(rt); try c2.begin()
+                        try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                             ids: idsBuf, outHc: other[j], activeK: K,
+                                             cur: stage.cur[j], afterAttn: stage.attn[j], split: stage.split[j])
+                        c2.commit()
+                        profile.expertsS += Date().timeIntervalSince(t)
+                    }
                 }
                 // g/u/dn drop here (pool drain) -> the group's packed union tensors are freed
             }
         }
-        // Drop the per-token FFN inputs before returning to the caller's layer loop.
-        curT.removeAll(keepingCapacity: false)
-        attnT.removeAll(keepingCapacity: false)
-        splitT.removeAll(keepingCapacity: false)
     }
 
     /// Embed a whole prefill chunk in ONE command buffer: the tokens' table rows

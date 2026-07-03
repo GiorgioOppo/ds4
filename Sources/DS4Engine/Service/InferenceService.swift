@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-03 expbundle-v2+log"
+    public static let engineRevision = "2026-07-03 prefill-batch+profilo"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -121,7 +121,8 @@ public actor InferenceService {
         // the app even see the env vars?" must be answerable from the log alone.
         let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                      "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
-                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION",
+                     "DS4_PREFILL_FFN_BATCH", "DS4_Q8_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
@@ -657,6 +658,10 @@ public actor InferenceService {
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
     public func resetDecodeProfile() { decoder.resetProfile() }
     public func decodeProfileReport() -> String { decoder.profile.report() }
+    /// Per-phase profile of the LAST prefill: captured at the prefill→decode
+    /// boundary (where the counters are reset for the decode profile).
+    private var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
+    public func prefillProfileReport() -> String { lastPrefillProfile }
 
     public func resetConversation(systemPrompt: String?) {
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
@@ -798,6 +803,9 @@ public actor InferenceService {
         // Dirty-until-clean: any throw below (user cancel, error) leaves the GPU
         // KV/compressor state possibly out of sync with committedIds; the flag makes
         // the NEXT generation rebuild before continuing.
+        // Clean slate for the prefill profile: everything timed from here to the
+        // prefill→decode boundary (including a KV rebuild) is prefill work.
+        decoder.resetProfile()
         let needsRebuild = kvDirty
         kvDirty = true
         if needsRebuild && !committedIds.isEmpty {
@@ -816,6 +824,9 @@ public actor InferenceService {
         // per-phase counters at the prefill→decode boundary so decodeProfileReport()
         // reflects steady-state generation. The decode loop is opaque to the UI (it
         // runs inside the stream's task), so this is the only place to reset cleanly.
+        // The prefill's own per-phase numbers are captured HERE, just before the
+        // reset would discard them (surfaced in Log motore / demo DIAG).
+        lastPrefillProfile = decoder.profile.report(title: "Profilo prefill")
         decoder.resetProfile()
         // The committed KV now ends with an open assistant turn; mark it immediately
         // so a mid-decode interruption still closes the turn on the next suffix.
