@@ -98,7 +98,7 @@ func mtpReport(_ model: GGUFModel) -> String {
 /// hanno senso solo a knob uguali).
 func knobReport() -> String {
     let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
-                 "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
+                 "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
                  "DS4_PREFILL_UNION", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_MLOCK",
@@ -335,7 +335,7 @@ do {
                     let pct = eff / diskCeilingGBs * 100
                     log(String(format: "  gather effettivo %.2f GB/s = %.0f%% del tetto SSD (%.2f GB/s) -> %@",
                                eff, pct, diskCeilingGBs,
-                               pct < 60 ? "margine: il sidecar expert-bundle può rendere"
+                               pct < 60 ? "margine: prova DS4_EXPERT_BUNDLE=1 (slab contigui)"
                                         : "vicino alla fisica del disco: puntare su hit-rate/MTP"))
                 } else {
                     log(String(format: "  gather effettivo %.2f GB/s (banda SSD non misurata)", eff))

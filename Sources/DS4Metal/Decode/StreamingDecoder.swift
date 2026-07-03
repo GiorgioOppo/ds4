@@ -873,10 +873,6 @@ public final class StreamingDecoder {
         // Same bytes, same numerics — only the I/O path changes. A/B per machine.
         let uncachedFD: Int32? =
             ProcessInfo.processInfo.environment["DS4_EXPERT_PREAD"] == "1" ? model.uncachedFD() : nil
-        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
-                                               willNeed: willNeed, uncachedFD: uncachedFD)
-        }
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.
         let usage = ExpertUsageStats(nLayers: nLayers)
@@ -885,6 +881,21 @@ public final class StreamingDecoder {
         let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
         let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
         let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+        // DS4_EXPERT_BUNDLE=1: sidecar with each expert's gate|up|down slabs
+        // CONTIGUOUS — a miss becomes one ~7 MB sequential burst instead of
+        // three scattered ~2 MB reads (measured gather at ~49% of the SSD's
+        // parallel ceiling without it). Built once next to the model; any
+        // failure falls back to the plain GGUF reads below. Same bytes.
+        let bundle: ExpertBundle? =
+            ProcessInfo.processInfo.environment["DS4_EXPERT_BUNDLE"] == "1"
+            ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
+                                       gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
+            : nil
+        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
+            if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
+            return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
+                                                      willNeed: willNeed, uncachedFD: uncachedFD)
+        }
         // Persistent + changing experts (cacheSlots param, else env
         // DS4_EXPERT_CACHE_SLOTS; default off): per layer, an N-slot LRU pool
         // keeps hot experts resident in GPU buffers; only misses are memcpy'd
@@ -921,6 +932,12 @@ public final class StreamingDecoder {
                 }
                 return p
             }, fill: { il, id, pool, slot in
+                // Sidecar bundle first: the expert's 3 slabs are ADJACENT there,
+                // so the concurrent preads form one sequential burst per miss.
+                if let b = bundle, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
+                                                upDst: pool.up, downDst: pool.down, slot: slot) {
+                    return
+                }
                 // The 3 slabs (gate/up/down) of a missing expert are read
                 // CONCURRENTLY: with fillAll's parallelism across misses this
                 // raises the NVMe queue depth from ~misses to ~3×misses. It
