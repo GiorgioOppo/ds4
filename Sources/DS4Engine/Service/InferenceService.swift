@@ -402,8 +402,12 @@ public actor InferenceService {
     /// `maxRounds` bounds the tool rounds (default 16 — a degraded model can
     /// otherwise loop on tools forever); when it runs out the sub-agent is asked
     /// to answer with what it has instead of returning empty-handed.
+    /// `maxTokens` caps ONE decode turn and includes the (discarded) reasoning
+    /// tokens: 1024 was routinely eaten by a long think before any visible
+    /// answer, which surfaced as sub-agents "cutting their replies" — hence the
+    /// 4096 default (a cap, not a target: EOS ends the turn normally).
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
-                            maxTokens: Int = 1024, maxRounds: Int = 16,
+                            maxTokens: Int = 4096, maxRounds: Int = 16,
                             onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
         let ctx = subContext(for: target, agent: agent, toolNames: tools)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
@@ -422,10 +426,18 @@ public actor InferenceService {
 
         var steps: [String] = []
         func note(_ s: String) { steps.append(s); onStep?(s) }
-        // Tool results go into the trace single-line (newlines and runs of
-        // whitespace collapsed) so the card stays readable.
-        func flat(_ s: String) -> String {
-            String(s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).prefix(160))
+        // Tool results go into the trace as a BOUNDED excerpt: the first lines are
+        // kept verbatim (a project_read step really shows the lines it read), but
+        // the step can't blow the card up — capped in lines and characters.
+        func excerpt(_ s: String) -> String {
+            let maxLines = 8, maxChars = 600
+            var lines = s.split(separator: "\n", omittingEmptySubsequences: false)
+            let dropped = max(0, lines.count - maxLines)
+            if dropped > 0 { lines = Array(lines.prefix(maxLines)) }
+            var out = lines.joined(separator: "\n")
+            if out.count > maxChars { out = String(out.prefix(maxChars)) + "…" }
+            if dropped > 0 { out += "\n… (+\(dropped) more lines)" }
+            return out
         }
         let sampling = SamplingParams()
 
@@ -465,7 +477,20 @@ public actor InferenceService {
             let turn = try decodeSubTurn(lastLogits: &lastLogits, pos: &pos, recent: &recent,
                                          sampling: sampling, maxTokens: maxTokens)
             answer = turn.visible
-            guard !turn.calls.isEmpty else { break }
+            var calls = turn.calls
+            if turn.truncated {
+                if turn.openTool {
+                    // The block never closed: any parsed call may carry half-generated
+                    // arguments — executing it could edit the wrong thing. Drop it.
+                    note("output cap (\(maxTokens) tokens) hit inside a tool call: truncated call discarded")
+                    calls = []
+                }
+                if calls.isEmpty {
+                    note("output cap (\(maxTokens) tokens) reached: answer truncated")
+                    if !answer.isEmpty { answer += "\n…[truncated at the \(maxTokens)-token output cap]" }
+                }
+            }
+            guard !calls.isEmpty else { break }
             // Budget exhausted with the model still asking for tools: force one
             // last answer from what it gathered instead of returning empty-handed.
             if round >= maxRounds {
@@ -484,10 +509,10 @@ public actor InferenceService {
             }
             round += 1
             var results = ""
-            for c in turn.calls {
+            for c in calls {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
-                note("\(c.name) \(c.argumentsJSON) → " + flat(out.content))
+                note("\(c.name) \(c.argumentsJSON) → " + excerpt(out.content))
                 results += "<tool_result>" + out.content + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
@@ -500,12 +525,16 @@ public actor InferenceService {
 
     /// Decode one assistant turn in the sub-agent context: returns the visible
     /// answer text and any tool calls. Reasoning (<think>…</think>) is discarded —
-    /// only the answer and tool calls matter for the sub-agent.
+    /// but it still CONSUMES the token budget, so callers must treat `truncated`
+    /// turns explicitly (a long think can eat the whole cap before any answer).
+    /// `truncated` = the turn ended on the cap/context, not on EOS; `openTool` =
+    /// it ended INSIDE a tool block (any parsed calls have unreliable arguments).
     private func decodeSubTurn(lastLogits: inout [Float], pos: inout Int, recent: inout [Int],
                                sampling: SamplingParams, maxTokens: Int) throws
-        -> (visible: String, calls: [ToolCall]) {
+        -> (visible: String, calls: [ToolCall], truncated: Bool, openTool: Bool) {
         var rng = sampling.seed &+ UInt64(pos)
         var inTool = false, inReasoning = false
+        var sawEos = false
         var visibleBytes: [UInt8] = []
         var toolBytes: [UInt8] = []
         let dsmlId = tok.dsmlId
@@ -517,7 +546,7 @@ public actor InferenceService {
                                       topP: sampling.topP, minP: sampling.minP,
                                       repetitionPenalty: sampling.repetitionPenalty,
                                       recent: recent[lo...], rng: &rng)
-            if Int32(next) == tok.eosId { break }
+            if Int32(next) == tok.eosId { sawEos = true; break }
             if !inTool, Int32(next) == dsmlId {
                 inTool = true; toolBytes.append(contentsOf: tok.tokenText(Int32(next)))
             } else if inTool {
@@ -537,7 +566,8 @@ public actor InferenceService {
         let visibleRaw = String(bytes: visibleBytes, encoding: .utf8) ?? ""
         let toolText = String(bytes: toolBytes, encoding: .utf8) ?? ""
         let parsed = ToolCallParser.parse(inTool ? visibleRaw + toolText : visibleRaw, markup: markup)
-        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls)
+        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls,
+                !sawEos, inTool)
     }
 
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
