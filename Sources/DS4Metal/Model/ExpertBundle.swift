@@ -134,9 +134,25 @@ public final class ExpertBundle: @unchecked Sendable {
         // Spell out WHERE we looked: "the file is there!" mysteries are always a
         // path/name mismatch, and this line settles them from the engine log.
         log("nessun bundle valido trovato in: " + candidates.joined(separator: "  |  "))
+        // ONE builder at a time per target: the Settings button and a model
+        // load must never write the same .tmp concurrently. The second caller
+        // proceeds WITHOUT a bundle (the load never fails or queues for
+        // minutes because of an optimization).
+        buildCoordLock.lock()
+        let alreadyBuilding = buildsInFlight.contains(buildPath)
+        if !alreadyBuilding { buildsInFlight.insert(buildPath) }
+        buildCoordLock.unlock()
+        if alreadyBuilding {
+            log("costruzione già in corso per: \(buildPath) — si prosegue senza bundle (riprova al prossimo load)")
+            return nil
+        }
+        defer { buildCoordLock.lock(); buildsInFlight.remove(buildPath); buildCoordLock.unlock() }
         return build(path: buildPath, model: model, srcFD: srcFD, layers: layers, nExpert: nExpert,
                      gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes)
     }
+
+    private static let buildCoordLock = NSLock()
+    private static var buildsInFlight = Set<String>()
 
     /// Validate + open an existing bundle. nil = absent or mismatched.
     private static func openExisting(path: String, modelSize: Int, layers: Range<Int>, nExpert: Int,
