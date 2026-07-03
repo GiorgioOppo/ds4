@@ -117,6 +117,18 @@ public actor InferenceService {
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
         FileHandle.standardError.write(Data("DS4 engine: revisione \(Self.engineRevision)\n".utf8))
+        // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
+        // the app even see the env vars?" must be answerable from the log alone.
+        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
+                     "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                     "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
+                     "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
+                     "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
+        let env = ProcessInfo.processInfo.environment
+        let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
+        FileHandle.standardError.write(Data("DS4 engine: knob \(knobLine)\n".utf8))
+        FileHandle.standardError.write(Data("DS4 engine: contextSize=\(contextSize) cacheSlots=\(expertCacheSlots.map(String.init) ?? "env/off")\n".utf8))
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
