@@ -401,8 +401,16 @@ public final class StreamingDecoder {
     /// Max experts gathered per group in the batched prefill (bounds the packed
     /// union tensors' transient memory: ~7 MB/expert on the 2-bit model). Env
     /// override: DS4_PREFILL_UNION. Never below d.k.
+    ///
+    /// Default 192, misurato su M1 Pro: ogni gruppo rilegge la SUA unione dal
+    /// disco (con DS4_EXPERT_PREAD il F_NOCACHE esclude la page cache), quindi
+    /// i byte/token del prefill scalano ~ union/tokens-per-gruppo. A 64 il
+    /// gather leggeva ~1.7 GB/token (≈257 esperti!) saturando l'SSD; a 192 i
+    /// gruppi coprono ~3× piu' token a parita' di unione. Costo: ~1.3 GB per
+    /// tensore packed × 2 (pipeline) di memoria transiente — su macchine
+    /// strette abbassare via env.
     private var maxUnionExperts: Int {
-        let v = ProcessInfo.processInfo.environment["DS4_PREFILL_UNION"].flatMap(Int.init) ?? 64
+        let v = ProcessInfo.processInfo.environment["DS4_PREFILL_UNION"].flatMap(Int.init) ?? 192
         return max(d.k, v)
     }
 
