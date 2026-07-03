@@ -321,7 +321,12 @@ public final class StreamingDecoder {
         if startPos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }   // fresh sequence
         var lastHC: GPUTensor?
         var start = 0
-        let step = max(1, chunk)
+        // DS4_PREFILL_CHUNK: token per chunk (default 512). Un chunk piu' largo
+        // ammortizza meglio i costi per-chunk (ogni chunk ricarica i densi di
+        // TUTTI i layer: ~6 GB con DENSE_STREAM) al prezzo di ~160 KB/token di
+        // attivazioni transienti in piu'.
+        let envChunk = ProcessInfo.processInfo.environment["DS4_PREFILL_CHUNK"].flatMap(Int.init)
+        let step = max(1, envChunk ?? chunk)
         while start < tokens.count {
             let end = min(start + step, tokens.count)
             // Drain the ObjC autorelease pool per chunk: Metal command buffers /
