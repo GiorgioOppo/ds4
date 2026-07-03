@@ -117,6 +117,9 @@ public final class ExpertBundle: @unchecked Sendable {
                 return b
             }
         }
+        // Spell out WHERE we looked: "the file is there!" mysteries are always a
+        // path/name mismatch, and this line settles them from the engine log.
+        log("nessun bundle valido trovato in: " + candidates.joined(separator: "  |  "))
         return build(path: buildPath, model: model, srcFD: srcFD, layers: layers, nExpert: nExpert,
                      gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes)
     }
