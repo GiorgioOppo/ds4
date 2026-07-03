@@ -9,8 +9,10 @@ import DS4Metal
 // real model via StreamingDecoder (per-layer load/compute/evict, 16GB-friendly).
 //
 // Usage:
-//   DS4Demo                       # Metal bring-up self-test only
-//   DS4Demo <gguf-path> [maxNew]  # + stream <maxNew> tokens (heavy I/O)
+//   DS4Demo                                # Metal bring-up self-test only
+//   DS4Demo <gguf-path> [maxNew] [prompt]  # + stream <maxNew> tokens (heavy I/O)
+//   prompt "@/path/file" = usa il CONTENUTO del file come prompt (testi lunghi,
+//   benchmark prefill; troncato a DS4_PROMPT_MAX_CHARS, default 12000).
 
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -243,10 +245,34 @@ do {
     if maxNew > 0 {
         // Real chat generation: tokenize the prompt (3rd arg) with the model's
         // tokenizer + chat template, greedy-decode, detokenize, print the answer.
-        let prompt = args.count >= 4 ? args[3] : "ciao come stai? rispondi in 1 parola"
+        var prompt = args.count >= 4 ? args[3] : "ciao come stai? rispondi in 1 parola"
+        // "@/percorso/file": il prompt e' il CONTENUTO del file — niente quoting
+        // shell per i testi lunghi (benchmark del prefill). Troncato a
+        // DS4_PROMPT_MAX_CHARS (default 12000 ≈ 3k token) per stare nel KV
+        // della demo insieme ai token generati.
+        if prompt.hasPrefix("@") {
+            let path = (String(prompt.dropFirst()) as NSString).expandingTildeInPath
+            guard var text = try? String(contentsOfFile: path, encoding: .utf8) else {
+                log("DS4Demo: impossibile leggere il file prompt '\(path)'")
+                exit(2)
+            }
+            let cap = ProcessInfo.processInfo.environment["DS4_PROMPT_MAX_CHARS"].flatMap(Int.init) ?? 12_000
+            if text.count > cap {
+                text = String(text.prefix(cap))
+                log("DS4Demo: prompt dal file \(path): troncato a \(cap) caratteri (DS4_PROMPT_MAX_CHARS per cambiare)")
+            } else {
+                log("DS4Demo: prompt dal file \(path): \(text.count) caratteri")
+            }
+            prompt = text
+        }
         let tok = try Tokenizer(model: model)
         let ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
-        log("DS4Demo: prompt '\(prompt)' -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
+        let shown = prompt.count > 120 ? String(prompt.prefix(120)) + "…" : prompt
+        log("DS4Demo: prompt '\(shown)' (\(prompt.count) car.) -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
+        if ids.count + maxNew + 1 > 4096 {
+            log("DS4Demo: ERRORE il prompt (\(ids.count) token) + \(maxNew) generati supera il KV della demo (maxKeys 4096) — abbassa DS4_PROMPT_MAX_CHARS")
+            exit(2)
+        }
         let stdout = FileHandle.standardOutput
         // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
         // prompt tokens (amortizes the dominant weight I/O). Returns the last

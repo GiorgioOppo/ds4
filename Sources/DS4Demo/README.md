@@ -31,7 +31,7 @@ swift run DS4Demo [gguf-path] [maxNew] [prompt]
 | none | *(none)* | none | Metal bring-up + GPU self-test only. No model is required. |
 | 1 | `gguf-path` | none | Path to a `.gguf` file. Opens the model, prints detected MoE quantization, and runs one forward smoke test. |
 | 2 | `maxNew` | `4` | Number of tokens to generate. `0` means smoke-test forward only, no streaming generation. |
-| 3 | `prompt` | `"ciao come stai? rispondi in 1 parola"` | User text rendered through the model chat template. |
+| 3 | `prompt` | `"ciao come stai? rispondi in 1 parola"` | User text rendered through the model chat template. `@/path/file` uses the file's CONTENT as the prompt (long texts / prefill benchmarks, no shell quoting) — truncated to `DS4_PROMPT_MAX_CHARS` chars (default `12000`, ≈3k tokens) so prompt + generated tokens fit the demo's 4096-position KV. |
 
 Arguments are positional. To pass a prompt, you must also pass `maxNew`:
 
