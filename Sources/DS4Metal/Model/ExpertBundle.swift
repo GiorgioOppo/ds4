@@ -24,6 +24,15 @@ public final class ExpertBundle: @unchecked Sendable {
     private let gateBytes: Int, upBytes: Int, downBytes: Int
     private let dataBase: Int
     private let record: Int              // aligned gate+up+down record stride
+    /// One-shot runtime PROOF in the engine log that misses are actually being
+    /// served from the sidecar — "caricato" only proves the file validated.
+    private let useLock = NSLock()
+    private var usedOnce = false
+
+    private func noteUse() {
+        useLock.lock(); let first = !usedOnce; usedOnce = true; useLock.unlock()
+        if first { Self.log("in uso: primo esperto servito dal sidecar") }
+    }
 
     private static let magic: UInt32 = 0x4245_5344   // "DSEB" little-endian
     private static let version: UInt32 = 1
@@ -265,6 +274,7 @@ public final class ExpertBundle: @unchecked Sendable {
                 lock.lock(); ok = false; lock.unlock()
             }
         }
+        if ok { noteUse() }
         return ok
     }
 
