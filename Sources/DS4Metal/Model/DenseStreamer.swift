@@ -12,8 +12,9 @@ import DS4Core
 // Unlike the routed experts, the dense weights are PERFECTLY predictable:
 // layer i+1 always follows layer i. So instead of hoping 6 GB stays cached,
 // stream them like the C engine streams layers — but with explicit pread +
-// F_NOCACHE into a two-slot staging ring, kicked one layer AHEAD so the SSD
-// read of layer i+1 overlaps the GPU compute of layer i:
+// F_NOCACHE into a staging ring, kicked ahead so the SSD read of the next
+// layer(s) overlaps the GPU compute of layer i (DS4_DENSE_AHEAD, default 1;
+// =2 keeps i+1 AND i+2 in flight so the disk never idles inside a layer):
 //
 //   GPU:  [ compute layer i   ][ compute layer i+1 ] …
 //   SSD:  [ read dense i+1    ][ read dense i+2    ] …
@@ -81,9 +82,14 @@ public final class DenseStreamer: @unchecked Sendable {
     private let layers: Range<Int>
     private var entries: [Int: [Entry]] = [:]       // layer -> read/stage plan
     private var skeleton: [Int: LayerWeights] = [:] // layer -> small-resident fields
-    private let slots: [MTLBuffer]                  // 2 staging slots
-    private var slotLayer = [-1, -1]                // slot -> layer currently staged
-    private var pending: Pending?                   // decode-thread-owned
+    /// Read-ahead depth (DS4_DENSE_AHEAD, default 1 = the classic 2-slot ring).
+    /// 2 keeps layers i+1 AND i+2 in flight while the GPU computes i: when a
+    /// layer's read finishes before its compute, the SSD starts the next one
+    /// instead of idling. Costs one extra staging slot (~max-layer bytes).
+    private let ahead: Int
+    private let slots: [MTLBuffer]                  // ahead+1 staging slots
+    private var slotLayer: [Int]                    // slot -> layer currently staged (-1 = none/being written)
+    private var pending: [Pending] = []             // decode-thread-owned (≤ ahead in flight)
 
     /// Total bytes streamed per full pass over `layers` (diagnostics).
     public private(set) var bytesPerPass = 0
@@ -201,26 +207,51 @@ public final class DenseStreamer: @unchecked Sendable {
                 }
             }
         }
-        guard let a = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared),
-              let b = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared) else {
-            throw MetalError.bufferAlloc
+        let aheadEnv = ProcessInfo.processInfo.environment["DS4_DENSE_AHEAD"].flatMap(Int.init) ?? 1
+        self.ahead = min(max(1, aheadEnv), max(1, min(3, layers.count - 1)))
+        var made: [MTLBuffer] = []
+        for _ in 0...ahead {
+            guard let b = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared) else {
+                throw MetalError.bufferAlloc
+            }
+            made.append(b)
         }
-        slots = [a, b]
+        slots = made
+        slotLayer = Array(repeating: -1, count: made.count)
         if lockResident {
             // DS4_MLOCK: the staging ring is rewritten every ~70 ms — pin it so
             // the memory compressor never touches it. Best-effort.
-            _ = mlock(a.contents(), maxSlot)
-            _ = mlock(b.contents(), maxSlot)
+            for b in made { _ = mlock(b.contents(), maxSlot) }
         }
+    }
+
+    /// The next `count` layers of the pass after `il` (wrapping to the range
+    /// start), i.e. the layers whose staging slots must not be overwritten.
+    private func upcoming(after il: Int, count: Int) -> [Int] {
+        var out: [Int] = []
+        var next = il
+        for _ in 0..<count {
+            next = next + 1 < layers.upperBound ? next + 1 : layers.lowerBound
+            if next == il { break }
+            out.append(next)
+        }
+        return out
     }
 
     /// LayerProvider entry point (DECODE thread only). Returns layer `il`'s
     /// weights with the big fields as views into a ready staging slot, then
-    /// kicks the background read of the NEXT layer into the other slot.
+    /// keeps the read-ahead pipeline `ahead` layers deep: with the default 1
+    /// this is the classic 2-slot ring (read i+1 while computing i); with
+    /// DS4_DENSE_AHEAD=2 the SSD moves on to i+2 as soon as i+1 lands instead
+    /// of idling for the rest of layer i's compute. Overwrite safety is the
+    /// same contract as before: a slot is reused only when its occupant is
+    /// neither the current layer nor one of the next `ahead` layers — and the
+    /// GPU finished every layer before the current one (runLayer waits its
+    /// command buffers before the next provider call).
     public func weights(_ il: Int) throws -> LayerWeights {
         let slot: Int
-        if let p = pending, p.layer == il {
-            pending = nil
+        if let pi = pending.firstIndex(where: { $0.layer == il }) {
+            let p = pending.remove(at: pi)
             p.sem.wait()                        // usually already signalled (read ran during layer i-1)
             if let e = p.error { throw e }
             slotLayer[p.slot] = il
@@ -228,22 +259,29 @@ public final class DenseStreamer: @unchecked Sendable {
         } else if let s = slotLayer.firstIndex(of: il) {
             slot = s                            // already staged (e.g. retry after an error)
         } else {
-            // Cold start or out-of-order request: drain any in-flight load,
-            // then read synchronously into the least-recently-used slot.
-            if let p = pending { pending = nil; p.sem.wait() }
-            slot = slotLayer[0] == il - 1 ? 1 : 0
+            // Cold start or out-of-order request: drain every in-flight load,
+            // then read synchronously into a slot we won't need imminently.
+            for p in pending {
+                p.sem.wait()
+                if p.error == nil { slotLayer[p.slot] = p.layer }
+            }
+            pending.removeAll()
+            let wanted = Set(upcoming(after: il, count: ahead))
+            slot = (0..<slots.count).first { !wanted.contains(slotLayer[$0]) } ?? 0
             try load(il, into: slot)
             slotLayer[slot] = il
         }
-        // Kick the next layer of the pass into the OTHER slot: its previous
-        // occupant's GPU work completed before this call (runLayer waits its
-        // command buffers), so the CPU can overwrite it while the GPU runs `il`.
-        let next = il + 1 < layers.upperBound ? il + 1 : layers.lowerBound
-        let other = 1 - slot
-        if next != il, slotLayer[other] != next, pending == nil {
-            let p = Pending(layer: next, slot: other)
-            slotLayer[other] = -1               // being overwritten
-            pending = p
+        // Top up the pipeline: for each of the next `ahead` layers not already
+        // staged or in flight, start a background read into a reusable slot.
+        let wanted = Set(upcoming(after: il, count: ahead) + [il])
+        for next in upcoming(after: il, count: ahead) {
+            if slotLayer.contains(next) || pending.contains(where: { $0.layer == next }) { continue }
+            guard let free = (0..<slots.count).first(where: { s in
+                s != slot && !wanted.contains(slotLayer[s]) && !pending.contains(where: { $0.slot == s })
+            }) else { break }
+            let p = Pending(layer: next, slot: free)
+            slotLayer[free] = -1                // being overwritten
+            pending.append(p)
             DispatchQueue.global(qos: .userInitiated).async {
                 do { try self.load(next, into: p.slot) } catch { p.error = error }
                 p.sem.signal()
