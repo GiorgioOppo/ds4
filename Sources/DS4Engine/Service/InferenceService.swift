@@ -166,7 +166,7 @@ public actor InferenceService {
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.
-        if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
+        if let data = Self.usageDataSeeded(modelName: modelName, agentId: "generale") {
             decoder.usage?.load(data)
         }
         // Sub-agent KV cache (separate directory from the chat disk-KV; content-
@@ -198,7 +198,7 @@ public actor InferenceService {
     public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
         saveExpertUsage()
         agentId = agent.id
-        decoder.usage?.replace(with: try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: agentId)))
+        decoder.usage?.replace(with: Self.usageDataSeeded(modelName: modelName, agentId: agentId))
         decoder.slotCache?.invalidate()
         self.tools = tools
         resetConversation(systemPrompt: agent.systemPrompt.isEmpty ? nil : agent.systemPrompt)
@@ -213,6 +213,30 @@ public actor InferenceService {
             .appendingPathComponent("DwarfStar", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("expert-usage-\(modelName)-\(agentId).json")
+    }
+
+    /// Usage profile for `agentId`, SEEDED when absent: a brand-new agent gets
+    /// the RICHEST profile saved for the same model (largest file) instead of
+    /// an empty one — the routing is mostly model-driven, so the slot-cache
+    /// warms from the first token; the agent's own history then takes over
+    /// (its file is written at every generation as before). Without this, a
+    /// fresh agent paid dozens of cold-cache turns that the demo (one big
+    /// warm usage file) never saw.
+    nonisolated static func usageDataSeeded(modelName: String, agentId: String) -> Data? {
+        if let own = try? Data(contentsOf: usageURL(modelName: modelName, agentId: agentId)) {
+            return own
+        }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar", isDirectory: true)
+        let prefix = "expert-usage-\(modelName)-"
+        let candidates = ((try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(prefix) }
+        let best = candidates.max {
+            ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                < ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        return best.flatMap { try? Data(contentsOf: $0) }
     }
 
     /// Persist the routing-frequency stats (called automatically after each
