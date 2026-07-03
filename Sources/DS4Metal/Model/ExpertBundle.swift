@@ -29,15 +29,22 @@ public final class ExpertBundle: @unchecked Sendable {
     public let path: String
     /// Runtime PROOF in the engine log that misses are actually being served
     /// from the sidecar — "caricato" only proves the file validated. Logs the
-    /// first served expert, then a heartbeat every 5000 (usage is quantifiable
-    /// from the log alone).
+    /// first served expert, then a LOGARITHMIC heartbeat (5k, 10k, 20k, 40k…):
+    /// a long prefill serves hundreds of thousands of experts and the linear
+    /// every-5000 beat flooded the log with dozens of identical lines.
     private let useLock = NSLock()
     private var served = 0
+    private var nextBeat = 5000
 
     private func noteUse() {
-        useLock.lock(); served += 1; let n = served; useLock.unlock()
+        useLock.lock()
+        served += 1
+        let n = served
+        var beat = false
+        if n >= nextBeat { beat = true; nextBeat *= 2 }
+        useLock.unlock()
         if n == 1 { Self.log("in uso: primo esperto servito dal sidecar") }
-        else if n % 5000 == 0 { Self.log("in uso: \(n) esperti serviti dal sidecar") }
+        else if beat { Self.log("in uso: \(n) esperti serviti dal sidecar") }
     }
 
     private static let magic: UInt32 = 0x4245_5344   // "DSEB" little-endian
