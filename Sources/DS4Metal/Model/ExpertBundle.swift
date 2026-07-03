@@ -86,11 +86,14 @@ public final class ExpertBundle: @unchecked Sendable {
                 }
             }
         }
+        // NOTE: uncachedFD() is the model's SHARED, memoized F_NOCACHE descriptor
+        // (closed only in the model's deinit) — it must NOT be closed here, or
+        // every later pread on it (dense streamer hashes, q4 requant, expert
+        // pread) fails at load.
         guard let srcFD = model.uncachedFD() else {
             log("descrittore F_NOCACHE non disponibile — salto")
             return nil
         }
-        defer { close(srcFD) }
         let hashes = layers.map { layerHash(fd: srcFD, model: model, layer: $0) }
         let path = model.path + ".expbundle"
         if let b = openExisting(path: path, modelSize: Int(model.size), layers: layers, nExpert: nExpert,
