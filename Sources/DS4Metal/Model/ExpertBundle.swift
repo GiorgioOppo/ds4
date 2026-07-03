@@ -189,7 +189,9 @@ public final class ExpertBundle: @unchecked Sendable {
         let totalBytes = base + layers.count * nExpert * rec
         let free = (try? FileManager.default.attributesOfFileSystem(forPath: (path as NSString).deletingLastPathComponent))?[.systemFreeSize] as? Int ?? 0
         guard free > totalBytes + (1 << 30) else {
-            log("spazio disco insufficiente (~\(totalBytes >> 30) GB richiesti) — salto")
+            // NB: file cancellati con Finder finiscono nel CESTINO e non liberano
+            // spazio finché non lo si svuota — il caso classico di questo salto.
+            log("spazio disco insufficiente (~\(totalBytes >> 30) GB richiesti, ~\(free >> 30) GB liberi — il Cestino conta!) — salto")
             return nil
         }
         log("costruzione (una tantum): \(layers.count) layer × \(nExpert) esperti, ~\(totalBytes >> 30) GB → \(path)")
