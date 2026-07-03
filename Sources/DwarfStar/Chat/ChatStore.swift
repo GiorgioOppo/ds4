@@ -108,13 +108,17 @@ final class ChatStore {
 
     // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
     // restores matching prefixes on cold starts. Applied on the NEXT model load.
-    // ON by default (8 GB budget) so conversations are checkpointed and re-prefill
-    // is avoided across reloads; the explicit user choice is then persisted.
+    // ON by default so conversations are checkpointed and re-prefill is avoided
+    // across reloads; the explicit user choice is then persisted.
     var diskKVEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
     }
-    var diskKVBudgetMB: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetMB") as? Int ?? 8192 {
-        didSet { UserDefaults.standard.set(diskKVBudgetMB, forKey: "DS4DiskKVBudgetMB") }
+    /// Disk-KV budget in THOUSANDS of tokens (default 1000 = 1M tokens total
+    /// across checkpoints — the live window stays `contextSize`). Tokens, not MB:
+    /// per-token checkpoint bytes depend on the model (~22 KB/token on the 61-layer
+    /// 2-bit Flash → 1M tokens ≈ 22 GB on disk), so tokens are the stable unit.
+    var diskKVBudgetKTok: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000 {
+        didSet { UserDefaults.standard.set(diskKVBudgetKTok, forKey: "DS4DiskKVBudgetKTok") }
     }
     /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
     /// instead of the full context, so the KV RAM is constant. Sets the engine env
@@ -479,7 +483,7 @@ final class ChatStore {
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
-        let kvBudget = diskKVBudgetMB
+        let kvBudgetTokens = diskKVBudgetKTok * 1000
         Task.detached(priority: .userInitiated) {
             defer { poller.cancel() }
             do {
@@ -487,7 +491,7 @@ final class ChatStore {
                                                contextSize: ctx,
                                                systemPrompt: nil,   // set by applyAgent below
                                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
-                await svc.setDiskKV(directory: kvDir, budgetMB: kvBudget)
+                await svc.setDiskKV(directory: kvDir, budgetTokens: kvBudgetTokens)
                 let info = await svc.modelInfo()
                 await MainActor.run {
                     self.service = svc

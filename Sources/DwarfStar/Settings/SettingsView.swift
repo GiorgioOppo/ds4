@@ -85,8 +85,8 @@ struct SettingsView: View {
                 }
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
-                    Stepper("Budget: \(store.diskKVBudgetMB) MB",
-                            value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                    Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * 0.022)) GB)",
+                            value: $store.diskKVBudgetKTok, in: 128...4096, step: 128)
                 }
                 Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {

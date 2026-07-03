@@ -30,13 +30,23 @@ public final class DiskKVStore: @unchecked Sendable {
     public let directory: URL
     public let options: Options
     private let budgetBytes: UInt64
+    /// Total TOKEN budget across all stored entries (0 = byte budget only).
+    /// Tokens are the natural unit here — "keep up to 1M tokens of checkpoints"
+    /// — and per-token bytes vary with the model, so eviction counts tokens.
+    private let budgetTokens: Int
     private let quantBits: UInt8
     private let contextSize: Int
 
     public init(directory: URL, budgetMB: Int, quantBits: UInt8, contextSize: Int,
-                options: Options = Options()) throws {
+                budgetTokens: Int = 0, options: Options = Options()) throws {
         self.directory = directory
-        self.budgetBytes = UInt64(max(64, budgetMB)) * 1_048_576
+        self.budgetTokens = max(0, budgetTokens)
+        // Token-budgeted stores derive a generous byte SAFETY cap from the token
+        // budget (~32 KB/token upper bound incl. per-entry overhead) so an
+        // unexpected entry mix still can't grow the directory without bound.
+        self.budgetBytes = budgetTokens > 0
+            ? UInt64(budgetTokens) * 32_768
+            : UInt64(max(64, budgetMB)) * 1_048_576
         self.quantBits = quantBits == 2 ? 2 : 4    // header validity wants {2,4}
         self.contextSize = contextSize
         self.options = options
@@ -131,27 +141,31 @@ public final class DiskKVStore: @unchecked Sendable {
             createdAt: now, lastUsed: now, payloadBytes: UInt64(body.count)))
         var file = Data(header); file.append(body)
         guard UInt64(file.count) <= budgetBytes else { return false }   // can never fit
+        if budgetTokens > 0, tokens.count > budgetTokens { return false }
         evictToBudget(incomingBytes: UInt64(file.count),
                       incomingTokens: tokens, incomingModel: modelName)
         do { try file.write(to: url, options: Data.WritingOptions.atomic) } catch { return false }
         return true
     }
 
-    /// Evict lowest-score entries until the directory fits `budget − incomingBytes`.
+    /// Evict lowest-score entries until the directory fits `budget − incomingBytes`
+    /// AND (when a token budget is set) `budgetTokens − incomingTokens.count`.
     /// Score = ported `KVCFile.evictionScore` ×(0.05 + 0.45·h/(h+1)) when the entry
     /// is a CONTINUED strict token-prefix of the incoming checkpoint (the C
     /// supersede-continued rule: the longer checkpoint of the same conversation
     /// replaces the shorter one under pressure). Ties evict the older lastUsed.
     func evictToBudget(incomingBytes: UInt64, incomingTokens: [Int], incomingModel: String) {
-        struct Victim { let url: URL; let size: UInt64; let lastUsed: UInt64; let score: Double }
+        struct Victim { let url: URL; let size: UInt64; let tokens: UInt64; let lastUsed: UInt64; let score: Double }
         var victims: [Victim] = []
         var total: UInt64 = 0
+        var totalTokens: UInt64 = 0
         let now = UInt64(Date().timeIntervalSince1970)
         for url in entryURLs() {
             guard let h = readHeader(url) else { continue }
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
             let sz = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
             total += sz
+            totalTokens += UInt64(h.tokens)
             var score = KVCFile.evictionScore(
                 KVCFile.Entry(hits: h.hits, tokens: h.tokens, fileSize: sz,
                               createdAt: h.createdAt, lastUsed: h.lastUsed, reason: h.reason),
@@ -164,17 +178,21 @@ public final class DiskKVStore: @unchecked Sendable {
                 let hFrac = hits > 0 ? hits / (hits + 1.0) : 0.0
                 score *= 0.05 + 0.45 * hFrac
             }
-            victims.append(Victim(url: url, size: sz, lastUsed: h.lastUsed, score: score))
+            victims.append(Victim(url: url, size: sz, tokens: UInt64(h.tokens),
+                                  lastUsed: h.lastUsed, score: score))
         }
         guard incomingBytes <= budgetBytes else { return }
         let target = budgetBytes - incomingBytes
-        guard total > target else { return }
+        let tokenTarget: UInt64 = budgetTokens > 0
+            ? UInt64(max(0, budgetTokens - incomingTokens.count)) : .max
+        guard total > target || totalTokens > tokenTarget else { return }
         let order = victims.sorted {
             $0.score != $1.score ? $0.score < $1.score : $0.lastUsed < $1.lastUsed
         }
-        for v in order where total > target {
+        for v in order where total > target || totalTokens > tokenTarget {
             try? FileManager.default.removeItem(at: v.url)
             total -= min(total, v.size)
+            totalTokens -= min(totalTokens, v.tokens)
         }
     }
 

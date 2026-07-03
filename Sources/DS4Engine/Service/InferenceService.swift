@@ -151,10 +151,13 @@ public actor InferenceService {
         if let data = try? Data(contentsOf: Self.usageURL(modelName: modelName, agentId: "generale")) {
             decoder.usage?.load(data)
         }
-        // Sub-agent KV cache (separate directory from the chat disk-KV; content-keyed).
+        // Sub-agent KV cache (separate directory from the chat disk-KV; content-
+        // keyed). Same 1M-token total budget as the chat store default: prefix
+        // snapshots for big files/projects are exactly where reuse pays most.
         let subBits: UInt8 = configuredDims.gateQuant == .iq2_xxs ? 2 : 4
         self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: modelName),
-                                      budgetMB: 8192, quantBits: subBits, contextSize: contextSize)
+                                      budgetMB: 0, quantBits: subBits, contextSize: contextSize,
+                                      budgetTokens: 1_000_000)
     }
 
     /// Directory holding the per-file / per-project sub-agent KV caches.
@@ -623,11 +626,14 @@ public actor InferenceService {
 
     /// Enable/disable the disk KV cache. `dir` nil turns it off. Takes effect on
     /// the next generation; existing checkpoints in `dir` become restorable.
-    public func setDiskKV(directory: URL?, budgetMB: Int) {
+    /// The budget is in TOKENS (total across stored checkpoints — the live
+    /// context window stays `contextSize`); bytes follow the model's per-token
+    /// checkpoint size, so tokens are the stable unit to configure.
+    public func setDiskKV(directory: URL?, budgetTokens: Int) {
         guard let directory else { diskKV = nil; return }
         let bits: UInt8 = dims.gateQuant == .iq2_xxs ? 2 : 4
-        diskKV = try? DiskKVStore(directory: directory, budgetMB: budgetMB,
-                                  quantBits: bits, contextSize: contextSize)
+        diskKV = try? DiskKVStore(directory: directory, budgetMB: 0, quantBits: bits,
+                                  contextSize: contextSize, budgetTokens: max(1, budgetTokens))
     }
 
     /// Declare the tools available to the model. Tools are baked into the first
