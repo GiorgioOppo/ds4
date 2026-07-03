@@ -109,8 +109,14 @@ public actor InferenceService {
     /// per-layer variants to configure, hence no streaming options here.
     /// `expertCacheSlots` enables the per-layer expert slot-cache (0/nil = off);
     /// the persisted usage stats pre-warm it with the hottest experts.
+    /// Engine revision stamp, printed to stderr at every init so the engine log
+    /// always says WHICH build is running ("I rebuilt but nothing changed" is
+    /// otherwise undiagnosable). Bump when engine behaviour changes materially.
+    public static let engineRevision = "2026-07-03 expbundle-v2+log"
+
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
+        FileHandle.standardError.write(Data("DS4 engine: revisione \(Self.engineRevision)\n".utf8))
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
