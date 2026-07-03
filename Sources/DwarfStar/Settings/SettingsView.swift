@@ -65,6 +65,12 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
+                Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
+                if store.expertBundleEnabled {
+                    Label("First load builds <model>.expbundle next to the GGUF: same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short.",
+                          systemImage: "externaldrive.badge.plus")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
                 Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)
                 Toggle("Q4 attention projections (LOSSY, ~+30% speed)", isOn: $store.denseQ4Enabled)

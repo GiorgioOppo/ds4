@@ -72,6 +72,7 @@ final class ChatStore {
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
         // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
@@ -184,6 +185,19 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
             _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
+        }
+    }
+    /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
+    /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
+    /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
+    /// MISURATO: gather 2.7 → 4.8 GB/s (79% del tetto SSD), 2.10 → 2.66 tok/s.
+    /// Stessi byte, numeriche identiche. OPT-IN: il primo load costruisce il
+    /// sidecar accanto al modello (duplica la regione esperti su disco, decine
+    /// di GB; saltato se lo spazio non basta). Si applica al prossimo load.
+    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(expertBundleEnabled, forKey: "DS4ExpertBundle")
+            _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
         }
     }
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
