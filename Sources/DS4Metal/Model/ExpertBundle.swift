@@ -24,6 +24,9 @@ public final class ExpertBundle: @unchecked Sendable {
     private let gateBytes: Int, upBytes: Int, downBytes: Int
     private let dataBase: Int
     private let record: Int              // aligned gate+up+down record stride
+    /// Percorso del file effettivamente aperto — la UI lo mostra all'utente
+    /// ("pronto" senza dire DOVE ha generato ore di caccia al file sbagliato).
+    public let path: String
     /// Runtime PROOF in the engine log that misses are actually being served
     /// from the sidecar — "caricato" only proves the file validated. Logs the
     /// first served expert, then a heartbeat every 5000 (usage is quantifiable
@@ -47,9 +50,9 @@ public final class ExpertBundle: @unchecked Sendable {
 
     deinit { close(fd) }
 
-    private init(fd: Int32, layers: Range<Int>, nExpert: Int,
+    private init(fd: Int32, path: String, layers: Range<Int>, nExpert: Int,
                  gateBytes: Int, upBytes: Int, downBytes: Int, dataBase: Int, record: Int) {
-        self.fd = fd; self.layers = layers; self.nExpert = nExpert
+        self.fd = fd; self.path = path; self.layers = layers; self.nExpert = nExpert
         self.gateBytes = gateBytes; self.upBytes = upBytes; self.downBytes = downBytes
         self.dataBase = dataBase; self.record = record
     }
@@ -191,7 +194,7 @@ public final class ExpertBundle: @unchecked Sendable {
             log("troncato — ricostruisco: \(path)")
             return nil
         }
-        return ExpertBundle(fd: fd, layers: layers, nExpert: nExpert,
+        return ExpertBundle(fd: fd, path: path, layers: layers, nExpert: nExpert,
                             gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes,
                             dataBase: base, record: rec)
     }

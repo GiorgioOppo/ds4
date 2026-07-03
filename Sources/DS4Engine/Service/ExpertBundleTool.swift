@@ -25,9 +25,10 @@ public enum ExpertBundleTool {
                                                   nExpert: dims.nExperts,
                                                   gateBytes: gateBytes, upBytes: upBytes,
                                                   downBytes: downBytes)
-            return bundle != nil
-                ? "Expert bundle pronto (percorso nel Log motore)."
-                : "Bundle NON creato: il Log motore riporta il motivo (spazio / permessi / modello)."
+            if let bundle {
+                return "Expert bundle pronto: \(bundle.path)"
+            }
+            return "Bundle NON creato: il Log motore riporta il motivo (spazio / permessi / modello)."
         } catch {
             return "Impossibile aprire il GGUF: \(error)"
         }
