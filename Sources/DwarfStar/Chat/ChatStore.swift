@@ -219,6 +219,23 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
         }
     }
+    /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
+    var bundleBuildStatus: String?
+
+    /// Verifica/crea l'expert-bundle ORA, senza aspettare un load del modello.
+    /// Gira in background (una build da ~72 GB dura minuti); l'esito compare
+    /// accanto al bottone e i dettagli nel Log motore ("DS4 expbundle:").
+    func buildExpertBundleNow() {
+        guard !modelPath.isEmpty else { bundleBuildStatus = "Nessun modello selezionato."; return }
+        guard phase != .loading else { bundleBuildStatus = "Attendi la fine del load in corso."; return }
+        bundleBuildStatus = "Verifica/creazione in corso… (dettagli nel Log motore)"
+        let path = modelPath
+        Task.detached(priority: .userInitiated) {
+            let outcome = ExpertBundleTool.ensure(modelPath: path)
+            await MainActor.run { self.bundleBuildStatus = outcome }
+        }
+    }
+
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
     /// output head residente e staging dello stream (~3.3 GB con i default).
     /// I buffer Metal shared sono memoria anonima che macOS COMPRIME tra un

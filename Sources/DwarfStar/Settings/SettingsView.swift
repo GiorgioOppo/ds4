@@ -80,6 +80,14 @@ struct SettingsView: View {
                         }
                         .font(.caption2)
                     }
+                    HStack(spacing: 8) {
+                        Button("Generate expert bundle now") { store.buildExpertBundleNow() }
+                            .font(.caption)
+                        if let status = store.bundleBuildStatus {
+                            Text(status).font(.caption2).foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
                 }
                 Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
                 Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)
