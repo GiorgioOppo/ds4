@@ -154,8 +154,10 @@ public final class ExpertBundle: @unchecked Sendable {
                      gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes)
     }
 
+    // Guarded by buildCoordLock (every access takes the lock first): safe in
+    // practice, hence the nonisolated(unsafe) opt-out from strict concurrency.
     private static let buildCoordLock = NSLock()
-    private static var buildsInFlight = Set<String>()
+    nonisolated(unsafe) private static var buildsInFlight = Set<String>()
 
     /// Validate + open an existing bundle. nil = absent or mismatched.
     private static func openExisting(path: String, modelSize: Int, layers: Range<Int>, nExpert: Int,
