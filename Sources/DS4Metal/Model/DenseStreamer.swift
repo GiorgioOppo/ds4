@@ -179,11 +179,18 @@ public final class DenseStreamer: @unchecked Sendable {
                                           from: 0.32, to: 0.88, units: q4Jobs.count)
                 var fresh = [GPUTensor?](repeating: nil, count: q4Jobs.count)
                 let lock = NSLock()
-                var firstError: Error?
+                // nonisolated(unsafe): ogni iterazione scrive SOLO out[i] (indici
+                // disgiunti), jobs/rt/model sono letti e basta, l'errore e'
+                // protetto dal lock.
+                nonisolated(unsafe) var firstError: Error?
+                nonisolated(unsafe) let jobs = q4Jobs
+                nonisolated(unsafe) let rtRef = rt
+                nonisolated(unsafe) let modelRef = model
                 try fresh.withUnsafeMutableBufferPointer { out in
-                    DispatchQueue.concurrentPerform(iterations: q4Jobs.count) { i in
+                    nonisolated(unsafe) let outBase = out.baseAddress!
+                    DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
                         do {
-                            out[i] = try Self.requantQ4(rt, model, fd: fd, tensor: q4Jobs[i].t)
+                            outBase[i] = try Self.requantQ4(rtRef, modelRef, fd: fd, tensor: jobs[i].t)
                             LoadProgress.shared.advance()
                         } catch {
                             lock.lock()
@@ -374,18 +381,23 @@ public final class DenseStreamer: @unchecked Sendable {
             records.append((bytes: expected, offset: Int(u64(o + 24))))
         }
         var out = [GPUTensor?](repeating: nil, count: jobs.count)
-        var failed = false
         let lock = NSLock()
+        // nonisolated(unsafe): scritture su indici DISGIUNTI (buf[i]), records
+        // e rt in sola lettura, flag di errore protetto dal lock.
+        nonisolated(unsafe) var failed = false
+        nonisolated(unsafe) let recs = records
+        nonisolated(unsafe) let rtRef = rt
         out.withUnsafeMutableBufferPointer { buf in
-            DispatchQueue.concurrentPerform(iterations: records.count) { i in
-                guard let t = try? GPUTensor.uninitializedBytes(rt, byteLength: records[i].bytes,
-                                                                elementCount: records[i].bytes),
+            nonisolated(unsafe) let bufBase = buf.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: recs.count) { i in
+                guard let t = try? GPUTensor.uninitializedBytes(rtRef, byteLength: recs[i].bytes,
+                                                                elementCount: recs[i].bytes),
                       GGUFWeights.preadFull(cfd, into: t.buffer.contents(),
-                                            bytes: records[i].bytes, offset: records[i].offset) else {
+                                            bytes: recs[i].bytes, offset: recs[i].offset) else {
                     lock.lock(); failed = true; lock.unlock()
                     return
                 }
-                buf[i] = t
+                bufBase[i] = t
                 LoadProgress.shared.advance()
             }
         }
@@ -487,9 +499,11 @@ public final class DenseStreamer: @unchecked Sendable {
         guard let plan = entries[il] else {
             throw GGUFWeights.LoadError.message("DenseStreamer: layer \(il) outside streamed range")
         }
-        let base = slots[slot].contents()
+        // nonisolated(unsafe): ogni pread scrive un range DISGIUNTO dello slot
+        // (stageOffset per-tensore); il flag di errore e' protetto dal lock.
+        nonisolated(unsafe) let base = slots[slot].contents()
         let lock = NSLock()
-        var failed = false
+        nonisolated(unsafe) var failed = false
         DispatchQueue.concurrentPerform(iterations: plan.count) { i in
             let e = plan[i]
             if !GGUFWeights.preadFull(fd, into: base + e.stageOffset, bytes: e.bytes, offset: e.fileOffset) {

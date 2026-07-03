@@ -618,7 +618,7 @@ public final class StreamingDecoder {
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
                 // Persistent staging (no per-layer alloc): c2 below is committed
                 // and waited before the next layer can overwrite this buffer.
-                slots.withUnsafeBytes {
+                _ = slots.withUnsafeBytes {
                     memcpy(slotsScratch.buffer.contents(), $0.baseAddress!, $0.count)
                 }
                 let slotsBuf = slotsScratch
@@ -950,15 +950,18 @@ public final class StreamingDecoder {
                 // raises the NVMe queue depth from ~misses to ~3×misses. It
                 // matters most under DS4_DENSE_STREAM, where the gather shares
                 // the disk with the dense reads and depth is what keeps it fed.
-                let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
+                // nonisolated(unsafe): i 3 job scrivono slab DISGIUNTI dello slot,
+                // model e' letto e basta, l'errore e' protetto dal lock.
+                nonisolated(unsafe) let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
                     ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
                     ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
                     ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
                 let lock = NSLock()
-                var firstError: Error? = nil
+                nonisolated(unsafe) var firstError: Error? = nil
+                nonisolated(unsafe) let modelRef = model
                 DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
                     do {
-                        try GGUFWeights.copyExpert(model, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
+                        try GGUFWeights.copyExpert(modelRef, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
                                                    into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD)
                     } catch {
                         lock.lock()

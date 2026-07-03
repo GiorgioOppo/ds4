@@ -286,7 +286,9 @@ public final class ExpertBundle: @unchecked Sendable {
                            slot: Int) -> Bool {
         guard layers.contains(layer), id >= 0, Int(id) < nExpert else { return false }
         let base = dataBase + ((layer - layers.lowerBound) * nExpert + Int(id)) * record
-        let jobs: [(fileOff: Int, bytes: Int, dst: GPUTensor)] = [
+        // nonisolated(unsafe): i 3 pread scrivono slab DISGIUNTI (gate/up/down
+        // del proprio slot); il flag di esito e' protetto dal lock.
+        nonisolated(unsafe) let jobs: [(fileOff: Int, bytes: Int, dst: GPUTensor)] = [
             (0, gateBytes, gateDst),
             (gateBytes, upBytes, upDst),
             (gateBytes + upBytes, downBytes, downDst)]
@@ -294,7 +296,7 @@ public final class ExpertBundle: @unchecked Sendable {
             return false
         }
         let lock = NSLock()
-        var ok = true
+        nonisolated(unsafe) var ok = true
         DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
             let j = jobs[i]
             let p = j.dst.buffer.contents().advanced(by: j.dst.byteOffset + slot * j.bytes)
@@ -318,9 +320,12 @@ public final class ExpertBundle: @unchecked Sendable {
               let u = try? GPUTensor.zerosBytes(rt, byteLength: ids.count * upBytes),
               let dn = try? GPUTensor.zerosBytes(rt, byteLength: ids.count * downBytes) else { return nil }
         let lock = NSLock()
-        var ok = true
+        // nonisolated(unsafe): ogni iterazione scrive SOLO lo slot k dei tre
+        // tensori packed; il flag di esito e' protetto dal lock.
+        nonisolated(unsafe) var ok = true
+        nonisolated(unsafe) let gRef = g, uRef = u, dnRef = dn
         DispatchQueue.concurrentPerform(iterations: ids.count) { k in
-            if !copyExpert(layer: layer, id: ids[k], gateDst: g, upDst: u, downDst: dn, slot: k) {
+            if !copyExpert(layer: layer, id: ids[k], gateDst: gRef, upDst: uRef, downDst: dnRef, slot: k) {
                 lock.lock(); ok = false; lock.unlock()
             }
         }

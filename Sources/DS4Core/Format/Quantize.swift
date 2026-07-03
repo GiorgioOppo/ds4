@@ -34,8 +34,12 @@ public enum Quantize {
     public static func quantizeQ4_K(_ x: UnsafePointer<Float>, count: Int,
                                     into dst: UnsafeMutableRawPointer) {
         let nsb = count / 256
+        // nonisolated(unsafe): every iteration reads/writes a DISJOINT 256-elem
+        // superblock (x + sb*256 → dst + sb*144) — no shared mutable state.
+        nonisolated(unsafe) let src = x
+        nonisolated(unsafe) let out = dst
         DispatchQueue.concurrentPerform(iterations: nsb) { sb in
-            quantizeSuperblockQ4_K(x + sb * 256, into: dst + sb * 144)
+            quantizeSuperblockQ4_K(src + sb * 256, into: out + sb * 144)
         }
     }
 

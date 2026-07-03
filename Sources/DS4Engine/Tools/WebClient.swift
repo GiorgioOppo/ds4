@@ -45,7 +45,9 @@ enum WebClient {
         defer { session.finishTasksAndInvalidate() }
 
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<Response, Error> = .failure(WebError.network("nessuna risposta"))
+        // nonisolated(unsafe): scritto SOLO dal completion handler, letto dal
+        // chiamante DOPO sem.wait() — la semaforo ordina i due accessi.
+        nonisolated(unsafe) var result: Result<Response, Error> = .failure(WebError.network("nessuna risposta"))
         let task = session.dataTask(with: req) { data, resp, err in
             defer { sem.signal() }
             if let err = err {

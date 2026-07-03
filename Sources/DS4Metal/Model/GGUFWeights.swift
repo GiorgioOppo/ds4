@@ -291,11 +291,15 @@ public enum GGUFWeights {
         }
         let dst = try GPUTensor.uninitializedBytes(rt, byteLength: ids.count * expertBytes,
                                                    elementCount: ids.count * expertBytes)
-        let dstBase = dst.buffer.contents()
+        // nonisolated(unsafe): each concurrent iteration writes a DISJOINT slab
+        // of dstBase (offset i*expertBytes) and reads only immutable state; the
+        // failure flag is guarded by its lock. Safe in practice — explicit
+        // opt-out from strict concurrency for the pointer/flag captures.
+        nonisolated(unsafe) let dstBase = dst.buffer.contents()
         if let fd = uncachedFD {
             let absBase = Int(t.absOffset)
             let failed = NSLock()
-            var anyFailure = false
+            nonisolated(unsafe) var anyFailure = false
             DispatchQueue.concurrentPerform(iterations: ids.count) { i in
                 if !preadFull(fd, into: dstBase + i * expertBytes, bytes: expertBytes,
                               offset: absBase + Int(ids[i]) * expertBytes) {
@@ -305,7 +309,7 @@ public enum GGUFWeights {
             if anyFailure { throw LoadError.message("gatherExperts: pread failed on \(name)") }
             return dst
         }
-        let base = model.mapBase + Int(t.absOffset)
+        nonisolated(unsafe) let base = model.mapBase + Int(t.absOffset)
         if willNeedExperts {
             for e in ids { adviseRange(base + Int(e) * expertBytes, expertBytes) }
         }
