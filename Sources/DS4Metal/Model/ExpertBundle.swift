@@ -24,14 +24,17 @@ public final class ExpertBundle: @unchecked Sendable {
     private let gateBytes: Int, upBytes: Int, downBytes: Int
     private let dataBase: Int
     private let record: Int              // aligned gate+up+down record stride
-    /// One-shot runtime PROOF in the engine log that misses are actually being
-    /// served from the sidecar — "caricato" only proves the file validated.
+    /// Runtime PROOF in the engine log that misses are actually being served
+    /// from the sidecar — "caricato" only proves the file validated. Logs the
+    /// first served expert, then a heartbeat every 5000 (usage is quantifiable
+    /// from the log alone).
     private let useLock = NSLock()
-    private var usedOnce = false
+    private var served = 0
 
     private func noteUse() {
-        useLock.lock(); let first = !usedOnce; usedOnce = true; useLock.unlock()
-        if first { Self.log("in uso: primo esperto servito dal sidecar") }
+        useLock.lock(); served += 1; let n = served; useLock.unlock()
+        if n == 1 { Self.log("in uso: primo esperto servito dal sidecar") }
+        else if n % 5000 == 0 { Self.log("in uso: \(n) esperti serviti dal sidecar") }
     }
 
     private static let magic: UInt32 = 0x4245_5344   // "DSEB" little-endian
