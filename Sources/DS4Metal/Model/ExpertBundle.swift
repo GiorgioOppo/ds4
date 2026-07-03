@@ -104,12 +104,14 @@ public final class ExpertBundle: @unchecked Sendable {
             return nil
         }
         let hashes = layers.map { layerHash(fd: srcFD, model: model, layer: $0) }
-        // Location: next to the model whenever possible — ONE copy shared by
-        // demo and app. READING tries the sibling first, then DS4_BUNDLE_DIR
-        // (Application Support, set by the app). BUILDING prefers the sibling
-        // too and uses the directory only when the model's folder is not
-        // writable (sandboxed app / read-only volume) — 72 GB must never end
-        // up duplicated in two places.
+        // Location. READING tries the sibling first (a bundle built by the
+        // demo/CLI next to the GGUF is always reused), then DS4_BUNDLE_DIR.
+        // BUILDING goes to DS4_BUNDLE_DIR whenever it is set: the app OWNS its
+        // bundle under Application Support (survives model moves, never
+        // touches the user's model folder); the demo/CLI (env unset) builds
+        // next to the model. To share ONE copy between demo and app, point
+        // the demo at the same dir: DS4_BUNDLE_DIR="$HOME/Library/Application
+        // Support/DwarfStar/expert-bundle".
         let sibling = model.path + ".expbundle"
         var candidates = [sibling]
         var buildPath = sibling
@@ -117,10 +119,7 @@ public final class ExpertBundle: @unchecked Sendable {
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             let inDir = dir + "/" + (model.path as NSString).lastPathComponent + ".expbundle"
             candidates.append(inDir)
-            let modelDir = (model.path as NSString).deletingLastPathComponent
-            if !FileManager.default.isWritableFile(atPath: modelDir) {
-                buildPath = inDir
-            }
+            buildPath = inDir
         }
         for path in candidates {
             if let b = openExisting(path: path, modelSize: Int(model.size), layers: layers, nExpert: nExpert,
