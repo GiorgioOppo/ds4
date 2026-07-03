@@ -77,6 +77,10 @@ final class ChatStore {
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
         // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
         _ = setenv("DS4_Q4_CACHE_DIR", Self.q4CacheDirectory.path, 1)
+        // Stessa ragione per l'expert-bundle: il sidecar accanto al GGUF resta
+        // leggibile quando la sandbox lo consente (riuso di quello della demo,
+        // 72 GB non copiati), altrimenti la COSTRUZIONE va qui.
+        _ = setenv("DS4_BUNDLE_DIR", Self.bundleDirectory.path, 1)
         // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
         // su 16 GB nell'app rallenta; il valore persistito di vecchie build
         // viene ripulito così non può restare incollato un ON stantio.
@@ -244,6 +248,14 @@ final class ChatStore {
     static var q4CacheDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("DwarfStar/q4-cache", isDirectory: true)
+    }
+
+    /// Dove l'app costruisce l'expert-bundle quando non può scrivere accanto al
+    /// GGUF (sandbox). ATTENZIONE: il sidecar duplica la regione esperti (~72 GB
+    /// sul Flash 2-bit) — la GUI lo dice esplicitamente nel toggle.
+    static var bundleDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("DwarfStar/expert-bundle", isDirectory: true)
     }
 
     // Tuning tab state.

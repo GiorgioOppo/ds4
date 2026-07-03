@@ -67,9 +67,19 @@ struct SettingsView: View {
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
                 Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
                 if store.expertBundleEnabled {
-                    Label("First load builds <model>.expbundle next to the GGUF: same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short.",
+                    Label("Reuses <model>.expbundle next to the GGUF when readable (e.g. built by the demo); otherwise the first load builds it under Application Support. Same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s, +27% tok/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short. Check the engine log for 'DS4 expbundle:' lines.",
                           systemImage: "externaldrive.badge.plus")
                         .font(.caption).foregroundStyle(.orange)
+                    HStack(spacing: 6) {
+                        Text("Bundle dir: \(ChatStore.bundleDirectory.path)")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([ChatStore.bundleDirectory])
+                        }
+                        .font(.caption2)
+                    }
                 }
                 Toggle("Dense-weight streaming (reads layer i+1 while computing layer i) - recommended <=16 GB", isOn: $store.denseStreamEnabled)
                 Toggle("Pin hot buffers in RAM (mlock ~3.3 GB, keeps the memory compressor away)", isOn: $store.mlockEnabled)

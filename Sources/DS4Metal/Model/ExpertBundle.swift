@@ -95,13 +95,29 @@ public final class ExpertBundle: @unchecked Sendable {
             return nil
         }
         let hashes = layers.map { layerHash(fd: srcFD, model: model, layer: $0) }
-        let path = model.path + ".expbundle"
-        if let b = openExisting(path: path, modelSize: Int(model.size), layers: layers, nExpert: nExpert,
-                                gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes) {
-            log("caricato: \(path)")
-            return b
+        // Location: next to the model by default (demo/CLI). The SANDBOXED app
+        // can neither read nor write siblings of a picker-selected file, so it
+        // sets DS4_BUNDLE_DIR (Application Support): READING tries both places
+        // (a bundle built by the demo next to the GGUF is reused when the
+        // sandbox allows it — 72 GB are NOT copied around), building goes to
+        // the directory when set.
+        let sibling = model.path + ".expbundle"
+        var candidates = [sibling]
+        var buildPath = sibling
+        if let dir = ProcessInfo.processInfo.environment["DS4_BUNDLE_DIR"], !dir.isEmpty {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let inDir = dir + "/" + (model.path as NSString).lastPathComponent + ".expbundle"
+            candidates.append(inDir)
+            buildPath = inDir
         }
-        return build(path: path, model: model, srcFD: srcFD, layers: layers, nExpert: nExpert,
+        for path in candidates {
+            if let b = openExisting(path: path, modelSize: Int(model.size), layers: layers, nExpert: nExpert,
+                                    gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes) {
+                log("caricato: \(path)")
+                return b
+            }
+        }
+        return build(path: buildPath, model: model, srcFD: srcFD, layers: layers, nExpert: nExpert,
                      gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes, hashes: hashes)
     }
 
