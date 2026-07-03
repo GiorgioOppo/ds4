@@ -340,7 +340,7 @@ public final class StreamingDecoder {
         let hcDim = d.nHC * d.nEmbd
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
-        for j in 0..<n { try embedToken(tokens[start + j], into: cur[j]) }
+        try embedTokensBatch(Array(tokens[start..<end]), into: cur)
         for i in 0..<nLayers {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
@@ -481,6 +481,35 @@ public final class StreamingDecoder {
         curT.removeAll(keepingCapacity: false)
         attnT.removeAll(keepingCapacity: false)
         splitT.removeAll(keepingCapacity: false)
+    }
+
+    /// Embed a whole prefill chunk in ONE command buffer: the tokens' table rows
+    /// are CPU-staged into a transient n-row table, then n embedTokenHC encodes
+    /// run back-to-back (the encoder is serial, so the shared `embd` intermediate
+    /// is safe). Numerically identical to n embedToken calls — it only removes
+    /// the n-1 per-token commit+wait round-trips (512 GPU syncs per chunk).
+    private func embedTokensBatch(_ toks: [Int], into hcs: [GPUTensor]) throws {
+        guard toks.count > 1 else {
+            if let t = toks.first { try embedToken(t, into: hcs[0]) }
+            return
+        }
+        let t = Date()
+        let rowBytes = embedRowStage.byteLength
+        let stage = try GPUTensor.zerosBytes(rt, byteLength: toks.count * rowBytes)
+        for (j, token) in toks.enumerated() {
+            precondition(token >= 0 && token < d.vocab, "embedTokensBatch: token \(token) out of vocab")
+            memcpy(stage.buffer.contents() + j * rowBytes,
+                   embedTable.buffer.contents() + embedTable.byteOffset + token * rowBytes,
+                   rowBytes)
+        }
+        let ec = GraphContext(rt)
+        try ec.begin()
+        for j in 0..<toks.count {
+            try ec.embedTokenHC(table: stage, token: j, embd: embd, hc: hcs[j],
+                                nEmbd: d.nEmbd, nVocab: toks.count, nHC: d.nHC)
+        }
+        ec.commit()
+        profile.embedS += Date().timeIntervalSince(t)
     }
 
     /// Embed one token into the HC state buffer `hc` (own command buffer).
@@ -713,14 +742,13 @@ public final class StreamingDecoder {
     /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:
     /// raw window rows stay 0; compressed row c gets 0 if selected, -inf if not.
     /// Ties keep the LOWEST row index (the C argmax scan picks the first best).
+    /// Selection is heap-based O(n log k), NOT a full sort: it runs per ratio-4
+    /// layer per token, and n grows with the context (~nKeys/4).
     private func applyIndexerMask(nKeys: Int, nComp: Int, nIdxComp: Int) {
         let nRaw = nKeys - max(0, nKeys - d.nSWA)
         let scores = scratch.idxScores.buffer.contents()
             .advanced(by: scratch.idxScores.byteOffset).bindMemory(to: Float.self, capacity: nIdxComp)
-        var order = Array(0..<nIdxComp)
-        order.sort { scores[$0] != scores[$1] ? scores[$0] > scores[$1] : $0 < $1 }
-        var allowed = [Bool](repeating: false, count: nIdxComp)
-        for k in 0..<min(d.indexerTopK, nIdxComp) { allowed[order[k]] = true }
+        let allowed = IndexerSelect.allowedTopK(scores: scores, count: nIdxComp, k: d.indexerTopK)
 
         let total = nRaw + nComp
         let mask = scratch.mask.buffer.contents().bindMemory(to: UInt16.self, capacity: total)
