@@ -884,7 +884,12 @@ final class ChatStore {
             status = ""
             refreshContextUsage()
             persistActiveSession()        // checkpoint the completed turn
-            if profileRouteEnabled { emitDecodeProfile() }
+            // Il Profilo decode va nel Log motore DOPO OGNI risposta: i contatori
+            // sono raccolti comunque, il report costa nulla, e "a quanto genera
+            // davvero l'app e dove va il tempo" deve essere leggibile dal log
+            // senza attivare niente. (profileRouteEnabled resta il gate della
+            // sola scomposizione route/attn, che aggiunge sync GPU.)
+            emitDecodeProfile()
         }
     }
 
