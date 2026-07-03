@@ -195,10 +195,11 @@ final class ChatStore {
     /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
     /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
     /// MISURATO: gather 2.7 → 4.8 GB/s (79% del tetto SSD), 2.10 → 2.66 tok/s.
-    /// Stessi byte, numeriche identiche. OPT-IN: il primo load costruisce il
-    /// sidecar accanto al modello (duplica la regione esperti su disco, decine
-    /// di GB; saltato se lo spazio non basta). Si applica al prossimo load.
-    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? false {
+    /// Stessi byte, numeriche identiche. DEFAULT ON: al load il file viene
+    /// cercato (accanto al GGUF, poi in Application Support), costruito una
+    /// tantum se assente — e SALTATO con log esplicito quando mancano i ~73 GB
+    /// liberi che il sidecar duplica su disco. Si applica al prossimo load.
+    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(expertBundleEnabled, forKey: "DS4ExpertBundle")
             _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
