@@ -5,6 +5,11 @@ OpenAI and Anthropic-style APIs. It does not launch a subprocess; GGUF weights
 are shared through mmap with the chat engine. Requests are processed one at a
 time.
 
+There is no model choice over HTTP: the server wraps the single engine loaded
+in Settings. `/v1/models` advertises exactly that model (the GGUF basename);
+a different `model` field in a request is logged and overridden, and every
+response reports the real loaded model.
+
 - **`ServerController.swift`** starts/stops the server, applies configuration,
   and wires disk KV.
 - **`LocalServer.swift`** implements endpoint routing for

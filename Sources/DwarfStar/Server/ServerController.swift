@@ -14,6 +14,11 @@ final class ServerController {
     let settings: AppSettings
     let store: ChatStore
     var modelPath: String { settings.modelPath }
+    /// The one model id the API serves: the loaded GGUF's basename. There is no
+    /// model choice over HTTP — it's whatever was loaded in Settings.
+    var modelId: String {
+        ((modelPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    }
 
     init(settings: AppSettings, store: ChatStore) { self.settings = settings; self.store = store }
     var host = "127.0.0.1"

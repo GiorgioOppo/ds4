@@ -39,21 +39,32 @@ final class LocalServer: @unchecked Sendable {
 
     private let engine: InferenceService
     private let modelName: String         // display name (the GGUF file)
+    /// The ONE model id the API advertises: the loaded GGUF's basename. There
+    /// is no model choice — the server wraps the single engine loaded in
+    /// Settings, so the request's "model" field is informational only.
+    private let modelId: String
     private let config: Config
     private let onLog: @Sendable (String) -> Void
     private let queue = DispatchQueue(label: "ds4.localserver", qos: .userInitiated)
     private let gate = RequestGate()
     private var listener: NWListener?
 
-    /// The model aliases the API advertises (mirrors ds4_server.c).
-    private static let aliases = ["deepseek-v4-flash", "deepseek-v4-pro"]
-
     init(engine: InferenceService, modelName: String, config: Config,
          onLog: @escaping @Sendable (String) -> Void) {
         self.engine = engine
         self.modelName = modelName
+        self.modelId = (modelName as NSString).deletingPathExtension
         self.config = config
         self.onLog = onLog
+    }
+
+    /// The engine can only serve the loaded model: a different requested id is
+    /// logged and overridden, and every response reports the REAL model.
+    private func resolveModel(_ requested: String?) -> String {
+        if let requested, requested != modelId {
+            onLog("campo model \"\(requested)\" ignorato: il motore condiviso serve \(modelId)\n")
+        }
+        return modelId
     }
 
     // MARK: Lifecycle
@@ -134,7 +145,7 @@ final class LocalServer: @unchecked Sendable {
         let modelPrefix = "/v1/models/"
         if req.method == "GET", req.path.hasPrefix(modelPrefix) {
             let id = String(req.path.dropFirst(modelPrefix.count))
-            if Self.aliases.contains(id) {
+            if id == modelId {
                 try await send(conn, Self.response(200, contentType: "application/json",
                                                    body: modelJSON(id), cors: config.cors))
                 return
@@ -169,7 +180,7 @@ final class LocalServer: @unchecked Sendable {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.httpError(400, "no messages", cors: config.cors)); return
         }
-        let model = parsed.model ?? "deepseek-v4-flash"
+        let model = resolveModel(parsed.model)
         let id = "chatcmpl-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         let created = Int(Date().timeIntervalSince1970)
         onLog("POST /v1/chat/completions (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")
@@ -267,7 +278,7 @@ final class LocalServer: @unchecked Sendable {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.anthropicError(400, "no messages", cors: config.cors)); return
         }
-        let model = parsed.model ?? "deepseek-v4-flash"
+        let model = resolveModel(parsed.model)
         let id = "msg_" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         onLog("POST /v1/messages (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")
 
@@ -392,7 +403,7 @@ final class LocalServer: @unchecked Sendable {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.httpError(400, "no prompt", cors: config.cors)); return
         }
-        let model = parsed.model ?? "deepseek-v4-flash"
+        let model = resolveModel(parsed.model)
         let id = "cmpl-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         let created = Int(Date().timeIntervalSince1970)
         onLog("POST /v1/completions (stream=\(parsed.stream))\n")
@@ -441,7 +452,7 @@ final class LocalServer: @unchecked Sendable {
         guard !parsed.turns.isEmpty else {
             try await send(conn, Self.httpError(400, "no input", cors: config.cors)); return
         }
-        let model = parsed.model ?? "deepseek-v4-flash"
+        let model = resolveModel(parsed.model)
         let created = Int(Date().timeIntervalSince1970)
         func rid(_ p: String) -> String { p + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)) }
         let respId = rid("resp_"), msgId = rid("msg_"), rsId = rid("rs_")
@@ -631,7 +642,7 @@ final class LocalServer: @unchecked Sendable {
     }
 
     private func modelsJSON() -> String {
-        "{\"object\":\"list\",\"data\":[" + Self.aliases.map { modelJSON($0) }.joined(separator: ",") + "]}"
+        "{\"object\":\"list\",\"data\":[" + modelJSON(modelId) + "]}"
     }
 
     private func modelJSON(_ id: String) -> String {

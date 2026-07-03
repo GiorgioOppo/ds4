@@ -119,7 +119,7 @@ struct ServerView: View {
         return """
         curl \(controller.endpoint)/chat/completions \\
           -H "Content-Type: application/json" \\
-        \(auth)  -d '{"model":"deepseek-v4-flash","stream":true,
+        \(auth)  -d '{"model":"\(controller.modelId)","stream":true,
                "messages":[{"role":"user","content":"Hello"}]}'
         """
     }
