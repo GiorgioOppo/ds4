@@ -66,6 +66,20 @@ final class ChatStore {
     init(settings: AppSettings) {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        // Migrazione UNA TANTUM alla configurazione veloce misurata (2026-07,
+        // demo A/B sul campo: slot 16 + ring off + bundle = 2.3-2.6 tok/s
+        // contro ~1 con slot 6/ring on/contesto 302k). Applica i valori buoni
+        // ai default persistiti da vecchi esperimenti; le modifiche manuali
+        // FUTURE dell'utente restano sovrane (il flag impedisce di ripeterla).
+        // NB: dentro init i didSet non scattano — persistenza esplicita.
+        if !UserDefaults.standard.bool(forKey: "DS4FastConfig2026_07") {
+            UserDefaults.standard.set(true, forKey: "DS4FastConfig2026_07")
+            expertCacheSlots = 16
+            UserDefaults.standard.set(16, forKey: "DS4ExpertCacheSlots")
+            rawRingEnabled = false
+            UserDefaults.standard.set(false, forKey: "DS4RawRing")
+            if settings.contextSize > 32768 { settings.contextSize = 8192 }
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
