@@ -298,13 +298,18 @@ final class ChatStore {
     /// prefill più veloce. ~5 run, alcuni minuti; la chat resta inutilizzabile
     /// nel frattempo (il motore è un actor seriale). I knob che richiedono un
     /// reload (DS4_PREFILL_MM, FFN/ROUTE_BATCH) non sono coperti.
-    func runSettingsBenchmark() {
+    /// `quick`: SOLO l'unione esperti su un prefill da 128 token (~2-3 min) —
+    /// il divario fra le unioni emerge già a decine di token, mentre il chunk
+    /// richiede prefill > 512 token per esistere e resta nella modalità
+    /// completa (che usa 512 + 1024 token, ~10 min).
+    func runSettingsBenchmark(quick: Bool = false) {
         guard let service else { benchStatus = "Carica prima il modello."; return }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
         guard !benchRunning else { return }
         benchRunning = true
         benchResults = ""
-        benchStatus = "Benchmark in corso… (~10 min, non usare la chat)"
+        benchStatus = quick ? "Benchmark rapido in corso… (~3 min, non usare la chat)"
+                            : "Benchmark in corso… (~10 min, non usare la chat)"
         Task {
             // Nested funcs non ereditano l'isolamento MainActor in Swift 6:
             // annotazione esplicita (chiamata sincrona dal Task, che eredita
@@ -314,29 +319,35 @@ final class ChatStore {
                 FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
             }
             do {
-                // 1) unione esperti, a chunk fisso 512 (un chunk pieno).
+                // 1) unione esperti, a chunk fisso 512. Il divario fra le
+                //    unioni emerge già a poche decine di token (byte/token del
+                //    gather); il rapido usa 128 token, il completo 512.
+                let unionCtx = quick ? 128 : 512
                 var bestUnion = prefillUnion
                 var bestTps = 0.0
                 _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
                 for union in [64, 192, 256] {
                     _ = setenv("DS4_PREFILL_UNION", String(union), 1)
                     benchStatus = "Benchmark union=\(union)…"
-                    let p = try await service.benchmark(contextTokens: 512, genTokens: 8)
-                    log(String(format: "union=%d chunk=512: prefill %.2f tok/s, decode %.2f tok/s",
-                               union, p.prefillTps, p.genTps))
+                    let p = try await service.benchmark(contextTokens: unionCtx, genTokens: quick ? 4 : 8)
+                    log(String(format: "union=%d (%d token): prefill %.2f tok/s, decode %.2f tok/s",
+                               union, unionCtx, p.prefillTps, p.genTps))
                     if p.prefillTps > bestTps { bestTps = p.prefillTps; bestUnion = union }
                 }
                 _ = setenv("DS4_PREFILL_UNION", String(bestUnion), 1)
-                // 2) chunk, con l'unione vincente (1024 token: 2 chunk vs 1).
-                var bestChunk = 512
-                var bestChunkTps = 0.0
-                for chunk in [512, 1024] {
-                    _ = setenv("DS4_PREFILL_CHUNK", String(chunk), 1)
-                    benchStatus = "Benchmark chunk=\(chunk)…"
-                    let p = try await service.benchmark(contextTokens: 1024, genTokens: 8)
-                    log(String(format: "union=%d chunk=%d: prefill %.2f tok/s, decode %.2f tok/s",
-                               bestUnion, chunk, p.prefillTps, p.genTps))
-                    if p.prefillTps > bestChunkTps { bestChunkTps = p.prefillTps; bestChunk = chunk }
+                // 2) chunk (solo modalità completa: sotto i 512 token un secondo
+                //    chunk non esiste — con l'unione vincente, 1024 token).
+                var bestChunk = prefillChunk
+                if !quick {
+                    var bestChunkTps = 0.0
+                    for chunk in [512, 1024] {
+                        _ = setenv("DS4_PREFILL_CHUNK", String(chunk), 1)
+                        benchStatus = "Benchmark chunk=\(chunk)…"
+                        let p = try await service.benchmark(contextTokens: 1024, genTokens: 8)
+                        log(String(format: "union=%d chunk=%d (1024 token): prefill %.2f tok/s, decode %.2f tok/s",
+                                   bestUnion, chunk, p.prefillTps, p.genTps))
+                        if p.prefillTps > bestChunkTps { bestChunkTps = p.prefillTps; bestChunk = chunk }
+                    }
                 }
                 // Applica e persisti i vincitori (i didSet rifanno i setenv).
                 prefillUnion = bestUnion

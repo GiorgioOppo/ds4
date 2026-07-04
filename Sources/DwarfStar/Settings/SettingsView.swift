@@ -58,13 +58,17 @@ struct SettingsView: View {
             }
             Section("Benchmark") {
                 HStack(spacing: 8) {
-                    Button(store.benchRunning ? "Benchmark in corso…" : "Trova i settings migliori") {
-                        store.runSettingsBenchmark()
+                    Button(store.benchRunning ? "Benchmark in corso…" : "Rapido (~3 min)") {
+                        store.runSettingsBenchmark(quick: true)
+                    }
+                    .disabled(store.benchRunning || store.phase != .ready)
+                    Button("Completo (~10 min)") {
+                        store.runSettingsBenchmark(quick: false)
                     }
                     .disabled(store.benchRunning || store.phase != .ready)
                     if store.benchRunning { ProgressView().controlSize(.small) }
                 }
-                Text("Misura sul modello caricato i knob del prefill regolabili a caldo (unione esperti 64/192/256 e chunk 512/1024) con un prompt sintetico, poi applica e salva la combinazione più veloce. ~10 minuti; la chat resta in attesa durante il benchmark. I knob che richiedono un reload (percorso matrix-matrix, batch dei route) non sono coperti.")
+                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. I knob che richiedono un reload (percorso matrix-matrix, batch dei route) non sono coperti.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = store.benchStatus {
                     Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")
