@@ -175,6 +175,17 @@ public final class StreamingDecoder {
                 usage: ExpertUsageStats? = nil,
                 prefetch: ((Int) -> Void)? = nil,
                 kvLayers: Range<Int>? = nil) throws {
+        // Il kernel del router (kernel_dsv4_router_finalize_one) ha 256 esperti
+        // e scala expert-weight 1.5 CABLATI (bitonic a 256 thread fissi): con
+        // una shape diversa — es. la "pro" a 384 esperti / scala 2.5 — gli
+        // esperti oltre il 255 non verrebbero MAI selezionati e i pesi di
+        // route sarebbero scalati male: output plausibile ma sistematicamente
+        // sbagliato. Fallire forte al load finché il kernel non è
+        // parametrizzato (audit kernel 2026-07-04, finding CERTO).
+        guard dims.nExperts == 256 else {
+            throw MetalError.unsupported(
+                "router: il kernel supporta SOLO 256 esperti (shape con \(dims.nExperts))")
+        }
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
