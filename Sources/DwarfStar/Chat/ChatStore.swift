@@ -112,6 +112,10 @@ final class ChatStore {
         UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
         _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        // Knob del prefill regolabili a caldo (persistiti dal benchmark in
+        // Settings): letti dal motore a ogni chiamata di prefill.
+        _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -262,6 +266,87 @@ final class ChatStore {
             _ = setenv("DS4_MLOCK", "1", 1)
             _ = setenv("DS4_DENSE_Q4", "1", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
+        }
+    }
+
+    /// Unione massima di esperti per gruppo nel prefill (DS4_PREFILL_UNION) e
+    /// token per chunk (DS4_PREFILL_CHUNK): gli unici knob del prefill letti a
+    /// OGNI chiamata dal motore, quindi regolabili senza ricaricare il modello.
+    /// Persistiti; il benchmark in Settings li misura e applica i migliori.
+    var prefillUnion: Int = (UserDefaults.standard.object(forKey: "DS4PrefillUnion") as? Int) ?? 192 {
+        didSet {
+            UserDefaults.standard.set(prefillUnion, forKey: "DS4PrefillUnion")
+            _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        }
+    }
+    var prefillChunk: Int = (UserDefaults.standard.object(forKey: "DS4PrefillChunk") as? Int) ?? 512 {
+        didSet {
+            UserDefaults.standard.set(prefillChunk, forKey: "DS4PrefillChunk")
+            _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+        }
+    }
+
+    // Benchmark in-app (Settings): prova le combinazioni dei knob a caldo sul
+    // motore GIÀ caricato e applica la migliore.
+    var benchRunning = false
+    var benchStatus: String?
+    var benchResults: String = ""
+
+    /// Misura DS4_PREFILL_UNION (64/192/256) e DS4_PREFILL_CHUNK (512/1024) sul
+    /// modello caricato con il benchmark sintetico del motore (prefill 512 o
+    /// 1024 token + 8 di decode), poi APPLICA e persiste la combinazione col
+    /// prefill più veloce. ~5 run, alcuni minuti; la chat resta inutilizzabile
+    /// nel frattempo (il motore è un actor seriale). I knob che richiedono un
+    /// reload (DS4_PREFILL_MM, FFN/ROUTE_BATCH) non sono coperti.
+    func runSettingsBenchmark() {
+        guard let service else { benchStatus = "Carica prima il modello."; return }
+        guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard !benchRunning else { return }
+        benchRunning = true
+        benchResults = ""
+        benchStatus = "Benchmark in corso… (~10 min, non usare la chat)"
+        Task {
+            func log(_ s: String) {
+                benchResults += s + "\n"
+                FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
+            }
+            do {
+                // 1) unione esperti, a chunk fisso 512 (un chunk pieno).
+                var bestUnion = prefillUnion
+                var bestTps = 0.0
+                _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
+                for union in [64, 192, 256] {
+                    _ = setenv("DS4_PREFILL_UNION", String(union), 1)
+                    benchStatus = "Benchmark union=\(union)…"
+                    let p = try await service.benchmark(contextTokens: 512, genTokens: 8)
+                    log(String(format: "union=%d chunk=512: prefill %.2f tok/s, decode %.2f tok/s",
+                               union, p.prefillTps, p.genTps))
+                    if p.prefillTps > bestTps { bestTps = p.prefillTps; bestUnion = union }
+                }
+                _ = setenv("DS4_PREFILL_UNION", String(bestUnion), 1)
+                // 2) chunk, con l'unione vincente (1024 token: 2 chunk vs 1).
+                var bestChunk = 512
+                var bestChunkTps = 0.0
+                for chunk in [512, 1024] {
+                    _ = setenv("DS4_PREFILL_CHUNK", String(chunk), 1)
+                    benchStatus = "Benchmark chunk=\(chunk)…"
+                    let p = try await service.benchmark(contextTokens: 1024, genTokens: 8)
+                    log(String(format: "union=%d chunk=%d: prefill %.2f tok/s, decode %.2f tok/s",
+                               bestUnion, chunk, p.prefillTps, p.genTps))
+                    if p.prefillTps > bestChunkTps { bestChunkTps = p.prefillTps; bestChunk = chunk }
+                }
+                // Applica e persisti i vincitori (i didSet rifanno i setenv).
+                prefillUnion = bestUnion
+                prefillChunk = bestChunk
+                log("MIGLIORI: union=\(bestUnion) chunk=\(bestChunk) — applicati e salvati.")
+                benchStatus = "Fatto: union=\(bestUnion), chunk=\(bestChunk) applicati."
+            } catch {
+                // Ripristina i valori persistiti dopo un errore/annullamento.
+                _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+                _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+                benchStatus = "Benchmark fallito: \(error)"
+            }
+            benchRunning = false
         }
     }
 

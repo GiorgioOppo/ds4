@@ -56,6 +56,29 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
+            Section("Benchmark") {
+                HStack(spacing: 8) {
+                    Button(store.benchRunning ? "Benchmark in corso…" : "Trova i settings migliori") {
+                        store.runSettingsBenchmark()
+                    }
+                    .disabled(store.benchRunning || store.phase != .ready)
+                    if store.benchRunning { ProgressView().controlSize(.small) }
+                }
+                Text("Misura sul modello caricato i knob del prefill regolabili a caldo (unione esperti 64/192/256 e chunk 512/1024) con un prompt sintetico, poi applica e salva la combinazione più veloce. ~10 minuti; la chat resta in attesa durante il benchmark. I knob che richiedono un reload (percorso matrix-matrix, batch dei route) non sono coperti.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let status = store.benchStatus {
+                    Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")
+                        .font(.caption)
+                }
+                if !store.benchResults.isEmpty {
+                    Text(store.benchResults)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Attivi", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                    .font(.caption)
+            }
             Section("Memory") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
