@@ -80,6 +80,16 @@ final class ChatStore {
             UserDefaults.standard.set(false, forKey: "DS4RawRing")
             if settings.contextSize > 32768 { settings.contextSize = 8192 }
         }
+        // Migrazione UNA TANTUM v2 (2026-07-04): allinea TUTTI i toggle alla
+        // configurazione della demo veloce (8 tok/s prefill / 2.5+ decode) —
+        // i valori persistiti derivano dagli esperimenti fatti in Settings
+        // (es. bundle spento per un test A/B) e restavano incollati per sempre.
+        // NB: dentro init i didSet non scattano — persistenza esplicita; i
+        // setenv qui sotto leggono già i valori allineati.
+        if !UserDefaults.standard.bool(forKey: "DS4DemoAlign2026_07_04") {
+            UserDefaults.standard.set(true, forKey: "DS4DemoAlign2026_07_04")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
@@ -219,6 +229,42 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
         }
     }
+    /// Riporta TUTTI i toggle di performance ai valori della demo veloce
+    /// misurata su M1 Pro (prefill ~8 tok/s, decode 2.5+): slot 16, ring off,
+    /// willneed+pread+dense stream+mlock+Q4+bundle ON. Usato dalla migrazione
+    /// una-tantum in init e dal bottone in Settings ("i toggle persistiti
+    /// derivano dai vecchi esperimenti e restano incollati per sempre").
+    /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
+    /// init i didSet delle stored property NON scattano.
+    func applyFastDemoDefaults(persistExplicitly: Bool = false) {
+        expertCacheSlots = 16
+        rawRingEnabled = false
+        willNeedEnabled = true
+        expertPreadEnabled = true
+        denseStreamEnabled = true
+        mlockEnabled = true
+        denseQ4Enabled = true
+        expertBundleEnabled = true
+        if persistExplicitly {
+            let d = UserDefaults.standard
+            d.set(16, forKey: "DS4ExpertCacheSlots")
+            d.set(false, forKey: "DS4RawRing")
+            d.set(true, forKey: "DS4WillNeed")
+            d.set(true, forKey: "DS4ExpertPread")
+            d.set(true, forKey: "DS4DenseStream")
+            d.set(true, forKey: "DS4MLock")
+            d.set(true, forKey: "DS4DenseQ4")
+            d.set(true, forKey: "DS4ExpertBundle")
+            _ = setenv("DS4_RAW_RING", "0", 1)
+            _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
+            _ = setenv("DS4_EXPERT_PREAD", "1", 1)
+            _ = setenv("DS4_DENSE_STREAM", "1", 1)
+            _ = setenv("DS4_MLOCK", "1", 1)
+            _ = setenv("DS4_DENSE_Q4", "1", 1)
+            _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
+        }
+    }
+
     /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
     var bundleBuildStatus: String?
 

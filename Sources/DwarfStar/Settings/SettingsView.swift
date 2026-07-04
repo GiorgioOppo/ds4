@@ -57,6 +57,11 @@ struct SettingsView: View {
                 }
             }
             Section("Memory") {
+                HStack(spacing: 8) {
+                    Button("Align to fast demo config") { store.applyFastDemoDefaults() }
+                    Text("Resets every toggle below to the measured-fast set (slots 16, pread + dense stream + mlock + Q4 + bundle ON, ring OFF). Applies on the next model load.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
                 if store.expertCacheSlots > 12 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
