@@ -306,7 +306,10 @@ final class ChatStore {
         benchResults = ""
         benchStatus = "Benchmark in corso… (~10 min, non usare la chat)"
         Task {
-            func log(_ s: String) {
+            // Nested funcs non ereditano l'isolamento MainActor in Swift 6:
+            // annotazione esplicita (chiamata sincrona dal Task, che eredita
+            // il MainActor del contesto).
+            @MainActor func log(_ s: String) {
                 benchResults += s + "\n"
                 FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
             }
