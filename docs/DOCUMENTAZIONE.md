@@ -399,6 +399,15 @@ or sessions with the same prefix can restore instead of redoing prefill. This is
 especially useful for stateless HTTP requests that resend the same conversation
 prefix.
 
+Checkpoints are moved between disk and the KV buffers in per-layer batches, in
+both directions, so a restore never materializes the whole file in RAM: each
+layer is read (F_NOCACHE), imported into the decoder, and freed before the next
+one is loaded — peak memory is one layer instead of ~3× the checkpoint size of
+the old load-everything path. Saving is symmetric: the background writer is the
+sole owner of the exported snapshot and drops each layer's buffers as soon as
+they are written, so RAM falls during the write instead of holding the full
+checkpoint until the end.
+
 ### Raw-KV Ring
 
 NSA sliding-window attention reads only the recent raw rows. `DS4_RAW_RING=1`
