@@ -321,11 +321,19 @@ public actor InferenceService {
     public struct BenchPoint: Sendable {
         public let contextTokens: Int
         public let prefillTps: Double
+        /// Media semplice (token generati / tempo totale) — sporca dei costi
+        /// una-tantum (primo token freddo, stalli).
         public let genTps: Double
+        /// 99° percentile della VELOCITÀ per-token (1/durata di ogni token,
+        /// ordinati): la velocità di regime raggiunta, robusta agli outlier
+        /// lenti. È la metrica riportata dal Bench.
+        public let genTpsP99: Double
         public let kvBytes: UInt64
-        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64) {
+        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64,
+                    genTpsP99: Double = 0) {
             self.contextTokens = contextTokens; self.prefillTps = prefillTps
             self.genTps = genTps; self.kvBytes = kvBytes
+            self.genTpsP99 = genTpsP99 > 0 ? genTpsP99 : genTps
         }
     }
 
@@ -352,20 +360,34 @@ public actor InferenceService {
         var pos = ids.count
         var rng: UInt64 = 0xD54
         var produced = 0
+        var tokenSpeeds: [Double] = []          // 1/durata di OGNI token generato
+        tokenSpeeds.reserveCapacity(genTokens)
         let g0 = Date()
         while produced < genTokens {
             try Task.checkCancellation()
             let next = Sampler.sample(lastLogits, temperature: 0.6, topK: 0, topP: 0.95, minP: 0.05, rng: &rng)
+            let t0 = Date()
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            let dt = Date().timeIntervalSince(t0)
+            if dt > 0 { tokenSpeeds.append(1.0 / dt) }
             pos += 1; produced += 1
         }
         let genDt = Date().timeIntervalSince(g0)
         kvDirty = true   // synthetic KV state — force a rebuild on the next real turn
         let kv = UInt64(DSV4Shape.nLayer) * UInt64(ctx) * UInt64(dims.headDim) * 4
+        // p99 della velocità per-token: ordina le velocità e prendi il valore
+        // al 99° percentile — il regime raggiunto, insensibile al primo token
+        // freddo e agli stalli che schiacciano la media.
+        var p99 = 0.0
+        if !tokenSpeeds.isEmpty {
+            let sorted = tokenSpeeds.sorted()
+            p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
+        }
         return BenchPoint(contextTokens: ctx,
                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
-                          kvBytes: kv)
+                          kvBytes: kv,
+                          genTpsP99: p99)
     }
 
     // MARK: - Sub-agents (isolated context, returns only the answer)
