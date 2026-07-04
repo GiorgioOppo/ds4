@@ -136,6 +136,11 @@ public final class StreamingDecoder {
     /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
     /// only the misses; the matvec runs on the pool with slot-index ids.
     public let slotCache: ExpertSlotCache?
+    /// Stride in byte fra gli slot del pool quando il layout e' INTERLEAVED
+    /// (record gate|up|down contigui, come nel bundle): passato come nb02 ai
+    /// dispatch MoE del percorso slot-cache. nil = layout storico (3 buffer
+    /// stretti, stride = dimensione del singolo slab).
+    let slotCacheStride: Int?
     /// Routing-frequency statistics (the "usage imatrix"): fed by every route,
     /// persisted by the service, and used to pre-warm the slot cache.
     public let usage: ExpertUsageStats?
@@ -183,7 +188,8 @@ public final class StreamingDecoder {
                 slotCache: ExpertSlotCache? = nil,
                 usage: ExpertUsageStats? = nil,
                 prefetch: ((Int) -> Void)? = nil,
-                kvLayers: Range<Int>? = nil) throws {
+                kvLayers: Range<Int>? = nil,
+                slotCacheStride: Int? = nil) throws {
         // Il kernel del router (kernel_dsv4_router_finalize_one) ha 256 esperti
         // e scala expert-weight 1.5 CABLATI (bitonic a 256 thread fissi): con
         // una shape diversa — es. la "pro" a 384 esperti / scala 2.5 — gli
@@ -199,6 +205,7 @@ public final class StreamingDecoder {
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         self.slotCache = slotCache
+        self.slotCacheStride = slotCacheStride
         self.usage = usage
         self.prefetch = prefetch
         let hcDim = dims.nHC * dims.nEmbd
@@ -916,7 +923,8 @@ public final class StreamingDecoder {
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
                                            upExp: pool.up, downExp: pool.down,
-                                           ids: slotsBuf, outHc: other, activeK: K)
+                                           ids: slotsBuf, outHc: other, activeK: K,
+                                           expertStride: slotCacheStride)
                 c2.commit()
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {
@@ -1221,6 +1229,9 @@ public final class StreamingDecoder {
         let envSlots = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"].flatMap(Int.init)
         let nSlots = cacheSlots ?? envSlots ?? 0
         var cache: ExpertSlotCache? = nil
+        /// Stride fra gli slot del pool quando il layout e' interleaved
+        /// (record gate|up|down) — nil = layout storico a 3 buffer stretti.
+        var slotStride: Int? = nil
         if nSlots > 0 {
             let S = max(8, nSlots)
             // Readahead every missing slab (3 matrices × N ids) BEFORE the
@@ -1237,22 +1248,56 @@ public final class StreamingDecoder {
                     }
                 }
             }
-            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: gateBytes + upBytes + downBytes, makePool: { slots in
-                let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
-                         up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
-                         down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
-                if lockResident {
-                    // DS4_MLOCK: a hit must cost zero I/O — pin the pool so the
-                    // compressor can't steal cold slots between reuses.
-                    p.gate.lockResident(); p.up.lockResident(); p.down.lockResident()
+            // Pool INTERLEAVED (default ON, DS4_POOL_INTERLEAVE=0 per il layout
+            // storico a 3 buffer): ogni slot ha gate|up|down CONTIGUI, identico
+            // al record del bundle — un miss diventa UNA pread da ~7 MB dritta
+            // nello slot (1 syscall invece di 3, I/O piu' grandi a parita' di
+            // coda). I kernel non cambiano: gate/up/down sono tre VISTE dello
+            // stesso buffer e lo stride fra esperti (nb02) e' il record.
+            let interleave = ProcessInfo.processInfo.environment["DS4_POOL_INTERLEAVE"] != "0"
+            let recordBytes = gateBytes + upBytes + downBytes
+            typealias Pool = (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
+            let makePool: (Int) throws -> Pool
+            if interleave {
+                makePool = { slots in
+                    let buf = try GPUTensor.zerosBytes(rt, byteLength: slots * recordBytes)
+                    if lockResident { buf.lockResident() }   // pin ONCE: covers all three views
+                    let up = GPUTensor(buffer: buf.buffer, byteLength: slots * recordBytes - gateBytes,
+                                       count: slots * recordBytes - gateBytes, byteOffset: gateBytes)
+                    let down = GPUTensor(buffer: buf.buffer,
+                                         byteLength: slots * recordBytes - gateBytes - upBytes,
+                                         count: slots * recordBytes - gateBytes - upBytes,
+                                         byteOffset: gateBytes + upBytes)
+                    return (gate: buf, up: up, down: down)
                 }
-                return p
-            }, fill: { il, id, pool, slot in
-                // Sidecar bundle first: the expert's 3 slabs are ADJACENT there,
-                // so the concurrent preads form one sequential burst per miss.
-                if let b = bundle, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
-                                                upDst: pool.up, downDst: pool.down, slot: slot) {
-                    return
+            } else {
+                makePool = { slots in
+                    let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
+                             up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
+                             down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
+                    if lockResident {
+                        // DS4_MLOCK: a hit must cost zero I/O — pin the pool so the
+                        // compressor can't steal cold slots between reuses.
+                        p.gate.lockResident(); p.up.lockResident(); p.down.lockResident()
+                    }
+                    return p
+                }
+            }
+            slotStride = interleave ? recordBytes : nil
+            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
+                                    fill: { il, id, pool, slot in
+                // Sidecar bundle first: layout del record == layout dello slot
+                // interleaved -> UNA pread; col layout storico restano i 3
+                // pread adiacenti (comunque un burst sequenziale).
+                if let b = bundle {
+                    if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
+                                                           slot: slot, stride: recordBytes) {
+                        return
+                    }
+                    if !interleave, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
+                                                 upDst: pool.up, downDst: pool.down, slot: slot) {
+                        return
+                    }
                 }
                 // The 3 slabs (gate/up/down) of a missing expert are read
                 // CONCURRENTLY: with fillAll's parallelism across misses this
@@ -1271,7 +1316,8 @@ public final class StreamingDecoder {
                 DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
                     do {
                         try GGUFWeights.copyExpert(modelRef, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
-                                                   into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD)
+                                                   into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD,
+                                                   slotStride: interleave ? recordBytes : nil)
                     } catch {
                         lock.lock()
                         if firstError == nil { firstError = error }
@@ -1371,7 +1417,8 @@ public final class StreamingDecoder {
                                        layerProvider: denseProvider,
                                        embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                        expertGather: gather, slotCache: cache, usage: usage,
-                                       prefetch: prefetch, kvLayers: kvLayers)
+                                       prefetch: prefetch, kvLayers: kvLayers,
+                                       slotCacheStride: slotStride)
         LoadProgress.shared.set(1.0, "Pronto")
         return dec
     }

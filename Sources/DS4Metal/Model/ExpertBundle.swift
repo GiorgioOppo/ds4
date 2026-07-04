@@ -315,6 +315,24 @@ public final class ExpertBundle: @unchecked Sendable {
         return ok
     }
 
+    /// Single-pread fill for the INTERLEAVED pool: the record layout in the
+    /// sidecar (gate|up|down contiguous) matches the pool slot layout, so a
+    /// miss is ONE ~7 MB pread straight into the slot — one syscall instead of
+    /// three, larger I/O at the same queue depth. `dst` is the pool's combined
+    /// buffer (gate view, byteOffset 0); `stride` is the slot record size.
+    public func copyExpertInterleaved(layer: Int, id: Int32,
+                                      dst: GPUTensor, slot: Int, stride: Int) -> Bool {
+        let bytes = gateBytes + upBytes + downBytes
+        guard layers.contains(layer), id >= 0, Int(id) < nExpert,
+              bytes <= stride,
+              dst.byteOffset + slot * stride + bytes <= dst.buffer.length else { return false }
+        let base = dataBase + ((layer - layers.lowerBound) * nExpert + Int(id)) * record
+        let p = dst.buffer.contents().advanced(by: dst.byteOffset + slot * stride)
+        guard GGUFWeights.preadFull(fd, into: p, bytes: bytes, offset: base) else { return false }
+        noteUse()
+        return true
+    }
+
     /// Gather the selected `ids` into three freshly packed K-expert tensors
     /// (same shape gatherLayerExperts returns) — used by the batched PREFILL
     /// path too, where each expert of the union becomes one sequential burst.

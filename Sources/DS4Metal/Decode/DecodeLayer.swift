@@ -391,11 +391,13 @@ extension GraphContext {
                               gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                               ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                               cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                              split: GPUTensor? = nil, rw: GPUTensor? = nil) throws {
+                              split: GPUTensor? = nil, rw: GPUTensor? = nil,
+                              expertStride: Int? = nil) throws {
         try decodeSharedFFN(w: w, s: s, d: d, cur: cur)
         try decodeRoutedExperts(w: w, s: s, d: d, gateExp: gateExp, upExp: upExp,
                                 downExp: downExp, ids: ids, outHc: outHc, activeK: activeK,
-                                cur: cur, afterAttn: afterAttn, split: split, rw: rw)
+                                cur: cur, afterAttn: afterAttn, split: split, rw: rw,
+                                expertStride: expertStride)
     }
 
     /// The shared-expert FFN half of decodeExperts (gate/up -> swiglu -> down into
@@ -434,11 +436,16 @@ extension GraphContext {
     /// The routed-MoE half of decodeExperts: matvec over the provided experts, add
     /// of s.sharedOut (which MUST already be encoded — decodeSharedFFN, either on
     /// this command buffer or on one already committed) and the HC expand -> outHc.
+    /// `expertStride`: byte fra un esperto e il successivo nei buffer gate/up/
+    /// down — nil = packing stretto; il pool INTERLEAVED della slot-cache passa
+    /// la dimensione del record gate|up|down (le tre viste condividono un solo
+    /// buffer, un miss è UNA pread dal bundle).
     public func decodeRoutedExperts(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                     gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                                     ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                                     cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                                    split: GPUTensor? = nil, rw: GPUTensor? = nil) throws {
+                                    split: GPUTensor? = nil, rw: GPUTensor? = nil,
+                                    expertStride: Int? = nil) throws {
         let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
         let x = cur ?? s.cur
         let resid = afterAttn ?? s.afterAttn
@@ -457,10 +464,11 @@ extension GraphContext {
             try moePairSwiGLU(w.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
                               activation: x, weights: weights, gateScratch: s.gate6,
                               upScratch: s.up6, mid: s.mid6,
-                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
+                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp,
+                              expertStride: expertStride)
         } else {
-            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
+            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false, expertStride: expertStride)
+            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false, expertStride: expertStride)
             try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: weights, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
         }
         // down_sum6 hardcodes 6 expert slots: usable only at full k.
@@ -468,9 +476,10 @@ extension GraphContext {
             && (w.downQuant == .q2_K || w.downQuant == .q4_K)
         if sumFused {
             try moeDownSum6(w.downQuant, experts: downExp, ids: ids, mid: s.mid6,
-                            out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd)
+                            out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd,
+                            expertStride: expertStride)
         } else {
-            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true, expertStride: expertStride)
             try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
         }
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
