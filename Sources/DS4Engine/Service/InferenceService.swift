@@ -942,8 +942,14 @@ public actor InferenceService {
             // system/agent prefix, 2× protected in eviction); later = "continued"
             // (superseded under pressure by longer checkpoints of the same chat).
             let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
+            let t0 = Date()
+            let snap = decoder.exportKV(nKeys: committedIds.count)
+            let snapS = Date().timeIntervalSince(t0)
             store.store(tokens: committedIds, modelName: modelName,
-                        snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
+                        snapshot: snap, reason: reason)
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 diskkv: snapshot %d token esportato in %.2fs\n",
+                committedIds.count, snapS).utf8))
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))

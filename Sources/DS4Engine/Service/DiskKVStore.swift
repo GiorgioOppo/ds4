@@ -114,11 +114,15 @@ public final class DiskKVStore: @unchecked Sendable {
         guard tokens.count >= options.minTokens, snapshot.nKeys == tokens.count else { return false }
         let url = directory.appendingPathComponent(entryName(tokens: tokens, modelName: modelName))
         guard !FileManager.default.fileExists(atPath: url.path) else { return false }
+        let t0 = Date()
 
-        var body = Data()
-        appendU32(&body, UInt32(Data(modelName.utf8).count)); body.append(Data(modelName.utf8))
-        appendU32(&body, UInt32(tokens.count))
-        for t in tokens { appendU32(&body, UInt32(truncatingIfNeeded: t)) }
+        // Small prefix (name + token ids + payload header) built in RAM; the
+        // large per-layer float slabs are STREAMED to the file below — no more
+        // whole-checkpoint Data in memory (hundreds of MB at long contexts).
+        var prefix = Data()
+        appendU32(&prefix, UInt32(Data(modelName.utf8).count)); prefix.append(Data(modelName.utf8))
+        appendU32(&prefix, UInt32(tokens.count))
+        for t in tokens { appendU32(&prefix, UInt32(truncatingIfNeeded: t)) }
         let ph = DSV4PayloadHeader(
             savedContextSize: UInt32(contextSize), prefillChunk: 512,
             rawKVCapacity: UInt32(contextSize), rawSlidingWindow: 128,
@@ -126,25 +130,74 @@ public final class DiskKVStore: @unchecked Sendable {
             layerCount: UInt32(snapshot.layers.count), rawHeadKVDim: UInt32(snapshot.headDim),
             indexerHeadDim: 128, vocabSize: 0,
             liveRawRows: UInt32(snapshot.layers.first.map { snapshot.nKeys - $0.rawStart } ?? 0))
-        body.append(contentsOf: ph.serialize())
-        for layer in snapshot.layers {
-            appendU32(&body, UInt32(layer.rawStart))
-            appendU32(&body, UInt32(layer.raw.count)); appendFloats(&body, layer.raw)
-            appendComp(&body, layer.comp)
-            appendComp(&body, layer.idx)     // NSA indexer compressor (ratio-4 layers)
-        }
+        prefix.append(contentsOf: ph.serialize())
 
+        // Exact payload size up front (same wire format as the old one-shot
+        // Data build) so header, budget checks and eviction see the true bytes.
+        func compBytes(_ c: CompSnapshot?) -> Int {
+            guard let c else { return 1 }
+            return 1 + 4 + 4 + c.stateKv.count * 4 + c.stateScore.count * 4 + 4 + c.cacheRows.count * 4
+        }
+        var payload = prefix.count
+        for layer in snapshot.layers {
+            payload += 8 + layer.raw.count * 4 + compBytes(layer.comp) + compBytes(layer.idx)
+        }
         let now = UInt64(Date().timeIntervalSince1970)
         let header = KVCFile.fillHeader(KVCFile.Header(
             quantBits: quantBits, reason: reason.rawValue, extFlags: 0, modelId: 0,
             tokens: UInt32(tokens.count), hits: 0, ctxSize: UInt32(contextSize),
-            createdAt: now, lastUsed: now, payloadBytes: UInt64(body.count)))
-        var file = Data(header); file.append(body)
-        guard UInt64(file.count) <= budgetBytes else { return false }   // can never fit
+            createdAt: now, lastUsed: now, payloadBytes: UInt64(payload)))
+        let total = UInt64(header.count + payload)
+        guard total <= budgetBytes else { return false }   // can never fit
         if budgetTokens > 0, tokens.count > budgetTokens { return false }
-        evictToBudget(incomingBytes: UInt64(file.count),
-                      incomingTokens: tokens, incomingModel: modelName)
-        do { try file.write(to: url, options: Data.WritingOptions.atomic) } catch { return false }
+        evictToBudget(incomingBytes: total, incomingTokens: tokens, incomingModel: modelName)
+
+        // Stream with F_NOCACHE: the checkpoint's dirty pages must not evict
+        // the HOT page cache (dense weights / expert bundle) — that eviction
+        // made the NEXT turn re-read everything from disk (gather bandwidth
+        // collapse in the GUI, which checkpoints; the demo doesn't). .tmp +
+        // rename keeps the entry atomic like Data(.atomic) did.
+        let tmp = url.path + ".tmp"
+        let fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+        guard fd >= 0 else { return false }
+        _ = fcntl(fd, F_NOCACHE, 1)
+        var ok = true
+        func writeAll(_ p: UnsafeRawPointer, _ n: Int) {
+            guard ok else { return }
+            var off = 0
+            while off < n {
+                let w = write(fd, p + off, n - off)
+                if w <= 0 { ok = false; return }
+                off += w
+            }
+        }
+        func writeData(_ d: Data) { d.withUnsafeBytes { writeAll($0.baseAddress!, $0.count) } }
+        func writeFloats(_ a: [Float]) { a.withUnsafeBufferPointer { writeAll($0.baseAddress!, $0.count * 4) } }
+        func writeComp(_ c: CompSnapshot?) {
+            guard let c else { var z: UInt8 = 0; writeAll(&z, 1); return }
+            var d = Data(); d.append(1)
+            appendU32(&d, UInt32(c.count)); appendU32(&d, UInt32(c.stateKv.count))
+            writeData(d)
+            writeFloats(c.stateKv); writeFloats(c.stateScore)
+            var n = Data(); appendU32(&n, UInt32(c.cacheRows.count)); writeData(n)
+            writeFloats(c.cacheRows)
+        }
+        writeData(Data(header))
+        writeData(prefix)
+        for layer in snapshot.layers {
+            var lh = Data()
+            appendU32(&lh, UInt32(layer.rawStart)); appendU32(&lh, UInt32(layer.raw.count))
+            writeData(lh)
+            writeFloats(layer.raw)
+            writeComp(layer.comp)
+            writeComp(layer.idx)     // NSA indexer compressor (ratio-4 layers)
+        }
+        close(fd)
+        if ok { ok = (rename(tmp, url.path) == 0) }
+        if !ok { unlink(tmp); return false }
+        FileHandle.standardError.write(Data(String(
+            format: "DS4 diskkv: checkpoint %d token (%.0f MB) scritto in %.2fs (F_NOCACHE)\n",
+            tokens.count, Double(total) / 1_048_576, Date().timeIntervalSince(t0)).utf8))
         return true
     }
 
