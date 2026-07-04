@@ -80,6 +80,16 @@ final class ChatStore {
             UserDefaults.standard.set(false, forKey: "DS4RawRing")
             if settings.contextSize > 32768 { settings.contextSize = 8192 }
         }
+        // Migrazione UNA TANTUM v2 (2026-07-04): allinea TUTTI i toggle alla
+        // configurazione della demo veloce (8 tok/s prefill / 2.5+ decode) —
+        // i valori persistiti derivano dagli esperimenti fatti in Settings
+        // (es. bundle spento per un test A/B) e restavano incollati per sempre.
+        // NB: dentro init i didSet non scattano — persistenza esplicita; i
+        // setenv qui sotto leggono già i valori allineati.
+        if !UserDefaults.standard.bool(forKey: "DS4DemoAlign2026_07_04") {
+            UserDefaults.standard.set(true, forKey: "DS4DemoAlign2026_07_04")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
@@ -102,6 +112,20 @@ final class ChatStore {
         UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
         _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        // Riparazione una-tantum: la prima versione del benchmark rapido
+        // poteva scegliere union=64 su una misura da 128 token troppo corta
+        // (rumore) — a scala reale 64 è il valore catastrofico. Riporta al
+        // consigliato; il benchmark corretto non lo riproporrà.
+        if !UserDefaults.standard.bool(forKey: "DS4BenchUnionFix2026_07_04"),
+           prefillUnion < 192 {
+            UserDefaults.standard.set(true, forKey: "DS4BenchUnionFix2026_07_04")
+            prefillUnion = 192
+            UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
+        }
+        // Knob del prefill regolabili a caldo (persistiti dal benchmark in
+        // Settings): letti dal motore a ogni chiamata di prefill.
+        _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -219,6 +243,140 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
         }
     }
+    /// Riporta TUTTI i toggle di performance ai valori della demo veloce
+    /// misurata su M1 Pro (prefill ~8 tok/s, decode 2.5+): slot 16, ring off,
+    /// willneed+pread+dense stream+mlock+Q4+bundle ON. Usato dalla migrazione
+    /// una-tantum in init e dal bottone in Settings ("i toggle persistiti
+    /// derivano dai vecchi esperimenti e restano incollati per sempre").
+    /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
+    /// init i didSet delle stored property NON scattano.
+    func applyFastDemoDefaults(persistExplicitly: Bool = false) {
+        expertCacheSlots = 16
+        rawRingEnabled = false
+        willNeedEnabled = true
+        expertPreadEnabled = true
+        denseStreamEnabled = true
+        mlockEnabled = true
+        denseQ4Enabled = true
+        expertBundleEnabled = true
+        if persistExplicitly {
+            let d = UserDefaults.standard
+            d.set(16, forKey: "DS4ExpertCacheSlots")
+            d.set(false, forKey: "DS4RawRing")
+            d.set(true, forKey: "DS4WillNeed")
+            d.set(true, forKey: "DS4ExpertPread")
+            d.set(true, forKey: "DS4DenseStream")
+            d.set(true, forKey: "DS4MLock")
+            d.set(true, forKey: "DS4DenseQ4")
+            d.set(true, forKey: "DS4ExpertBundle")
+            _ = setenv("DS4_RAW_RING", "0", 1)
+            _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
+            _ = setenv("DS4_EXPERT_PREAD", "1", 1)
+            _ = setenv("DS4_DENSE_STREAM", "1", 1)
+            _ = setenv("DS4_MLOCK", "1", 1)
+            _ = setenv("DS4_DENSE_Q4", "1", 1)
+            _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
+        }
+    }
+
+    /// Unione massima di esperti per gruppo nel prefill (DS4_PREFILL_UNION) e
+    /// token per chunk (DS4_PREFILL_CHUNK): gli unici knob del prefill letti a
+    /// OGNI chiamata dal motore, quindi regolabili senza ricaricare il modello.
+    /// Persistiti; il benchmark in Settings li misura e applica i migliori.
+    var prefillUnion: Int = (UserDefaults.standard.object(forKey: "DS4PrefillUnion") as? Int) ?? 192 {
+        didSet {
+            UserDefaults.standard.set(prefillUnion, forKey: "DS4PrefillUnion")
+            _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        }
+    }
+    var prefillChunk: Int = (UserDefaults.standard.object(forKey: "DS4PrefillChunk") as? Int) ?? 512 {
+        didSet {
+            UserDefaults.standard.set(prefillChunk, forKey: "DS4PrefillChunk")
+            _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+        }
+    }
+
+    // Benchmark in-app (Settings): prova le combinazioni dei knob a caldo sul
+    // motore GIÀ caricato e applica la migliore.
+    var benchRunning = false
+    var benchStatus: String?
+    var benchResults: String = ""
+
+    /// Misura DS4_PREFILL_UNION (64/192/256) e DS4_PREFILL_CHUNK (512/1024) sul
+    /// modello caricato con il benchmark sintetico del motore (prefill 512 o
+    /// 1024 token + 8 di decode), poi APPLICA e persiste la combinazione col
+    /// prefill più veloce. ~5 run, alcuni minuti; la chat resta inutilizzabile
+    /// nel frattempo (il motore è un actor seriale). I knob che richiedono un
+    /// reload (DS4_PREFILL_MM, FFN/ROUTE_BATCH) non sono coperti.
+    /// `quick`: SOLO l'unione esperti su un prefill da 128 token (~2-3 min) —
+    /// il divario fra le unioni emerge già a decine di token, mentre il chunk
+    /// richiede prefill > 512 token per esistere e resta nella modalità
+    /// completa (che usa 512 + 1024 token, ~10 min).
+    func runSettingsBenchmark(quick: Bool = false) {
+        guard let service else { benchStatus = "Carica prima il modello."; return }
+        guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard !benchRunning else { return }
+        benchRunning = true
+        benchResults = ""
+        benchStatus = quick ? "Benchmark rapido in corso… (~3 min, non usare la chat)"
+                            : "Benchmark in corso… (~10 min, non usare la chat)"
+        Task {
+            // Nested funcs non ereditano l'isolamento MainActor in Swift 6:
+            // annotazione esplicita (chiamata sincrona dal Task, che eredita
+            // il MainActor del contesto).
+            @MainActor func log(_ s: String) {
+                benchResults += s + "\n"
+                FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
+            }
+            do {
+                // 1) unione esperti, a chunk fisso 512. Il rapido (256 token)
+                //    confronta SOLO 192 e 256: a scala corta il rumore può
+                //    premiare 64, che sui prefill reali è il valore
+                //    catastrofico (misurato sul campo: ~1.7 GB/token di
+                //    riletture contro ~0.6 con 192) — il completo lo include
+                //    solo perché a 512 token la misura è affidabile.
+                let unionCtx = quick ? 256 : 512
+                var bestUnion = prefillUnion
+                var bestTps = 0.0
+                _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
+                for union in (quick ? [192, 256] : [64, 192, 256]) {
+                    _ = setenv("DS4_PREFILL_UNION", String(union), 1)
+                    benchStatus = "Benchmark union=\(union)…"
+                    let p = try await service.benchmark(contextTokens: unionCtx, genTokens: quick ? 4 : 8)
+                    log(String(format: "union=%d (%d token): prefill %.2f tok/s, decode %.2f tok/s",
+                               union, unionCtx, p.prefillTps, p.genTps))
+                    if p.prefillTps > bestTps { bestTps = p.prefillTps; bestUnion = union }
+                }
+                _ = setenv("DS4_PREFILL_UNION", String(bestUnion), 1)
+                // 2) chunk (solo modalità completa: sotto i 512 token un secondo
+                //    chunk non esiste — con l'unione vincente, 1024 token).
+                var bestChunk = prefillChunk
+                if !quick {
+                    var bestChunkTps = 0.0
+                    for chunk in [512, 1024] {
+                        _ = setenv("DS4_PREFILL_CHUNK", String(chunk), 1)
+                        benchStatus = "Benchmark chunk=\(chunk)…"
+                        let p = try await service.benchmark(contextTokens: 1024, genTokens: 8)
+                        log(String(format: "union=%d chunk=%d (1024 token): prefill %.2f tok/s, decode %.2f tok/s",
+                                   bestUnion, chunk, p.prefillTps, p.genTps))
+                        if p.prefillTps > bestChunkTps { bestChunkTps = p.prefillTps; bestChunk = chunk }
+                    }
+                }
+                // Applica e persisti i vincitori (i didSet rifanno i setenv).
+                prefillUnion = bestUnion
+                prefillChunk = bestChunk
+                log("MIGLIORI: union=\(bestUnion) chunk=\(bestChunk) — applicati e salvati.")
+                benchStatus = "Fatto: union=\(bestUnion), chunk=\(bestChunk) applicati."
+            } catch {
+                // Ripristina i valori persistiti dopo un errore/annullamento.
+                _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+                _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+                benchStatus = "Benchmark fallito: \(error)"
+            }
+            benchRunning = false
+        }
+    }
+
     /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
     var bundleBuildStatus: String?
 
@@ -413,7 +571,14 @@ final class ChatStore {
         didSet { UserDefaults.standard.set(repetitionPenalty, forKey: "DS4RepPenalty") }
     }
     private var sampling: SamplingParams {
-        SamplingParams(temperature: Float(temperature), repetitionPenalty: Float(repetitionPenalty))
+        // topK 40 (default llama.cpp): con topK=0 si campiona sull'INTERO
+        // vocabolario DeepSeek (129k token, in gran parte cinesi) e sulla coda
+        // rumorosa di un modello 2-bit basta pescare UN token cinese perché il
+        // contesto trascini tutta la risposta in cinese — visto in campo a
+        // temperature del tutto normali (0.6). Il tetto a 40 taglia quella
+        // coda senza togliere varietà; motore/server/demo restano fedeli al C.
+        SamplingParams(temperature: Float(temperature), topK: 40,
+                       repetitionPenalty: Float(repetitionPenalty))
     }
 
     // Tools.
@@ -893,13 +1058,14 @@ final class ChatStore {
         }
     }
 
-    /// Print the last turn's decode profile to stderr so it lands in the Log motore
-    /// (EngineLog captures fd 2), mirroring the demo's `log(dec.profile.report())`.
+    /// Print the last turn's prefill + decode profiles to stderr so they land in
+    /// the Log motore (EngineLog captures fd 2), mirroring the demo's DIAG output.
     private func emitDecodeProfile() {
         guard let service else { return }
         Task {
+            let prefill = await service.prefillProfileReport()
             let report = await service.decodeProfileReport()
-            FileHandle.standardError.write(Data(("\n" + report + "\n").utf8))
+            FileHandle.standardError.write(Data(("\n" + prefill + "\n\n" + report + "\n").utf8))
         }
     }
 

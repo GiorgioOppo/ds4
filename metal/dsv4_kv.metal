@@ -123,9 +123,14 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
     const int64_t n_nope = args.ne00 - args.n_rot;
 
     for (int64_t off = 0; off < n_nope; off += 64) {
+        // in_nope guard (mirrors kernel_dsv4_kv_fp8_store_f32): with
+        // n_nope % 64 != 0 the last block would otherwise include RoPE-tail
+        // elements in the amax AND quantize them in place — and past the row
+        // end on the last row. Inactive lanes contribute 0 to the max.
+        const bool in_nope = tid < 64 && (off + tid) < n_nope;
         float v = 0.0f;
         if (tid < 64) {
-            v = *((device const float *) (src_base + (off + tid)*args.nb00));
+            v = in_nope ? *((device const float *) (src_base + (off + tid)*args.nb00)) : 0.0f;
             scratch[tid] = abs(v);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -139,7 +144,7 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
 
         const float amax = max(scratch[0], 1.0e-4f);
         const float scale = exp2(ceil(log2(amax / 448.0f)));
-        if (tid < 64) {
+        if (in_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
             *((device float *) (dst_base + (off + tid)*args.nb0)) = q;
         }

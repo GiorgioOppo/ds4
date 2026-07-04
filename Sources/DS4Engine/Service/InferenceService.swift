@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-03 expbundle-v2+log"
+    public static let engineRevision = "2026-07-04 prefill-mm2"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -121,7 +121,9 @@ public actor InferenceService {
         // the app even see the env vars?" must be answerable from the log alone.
         let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                      "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
-                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION",
+                     "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_CHUNK",
+                     "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
@@ -319,11 +321,19 @@ public actor InferenceService {
     public struct BenchPoint: Sendable {
         public let contextTokens: Int
         public let prefillTps: Double
+        /// Media semplice (token generati / tempo totale) — sporca dei costi
+        /// una-tantum (primo token freddo, stalli).
         public let genTps: Double
+        /// 99° percentile della VELOCITÀ per-token (1/durata di ogni token,
+        /// ordinati): la velocità di regime raggiunta, robusta agli outlier
+        /// lenti. È la metrica riportata dal Bench.
+        public let genTpsP99: Double
         public let kvBytes: UInt64
-        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64) {
+        public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64,
+                    genTpsP99: Double = 0) {
             self.contextTokens = contextTokens; self.prefillTps = prefillTps
             self.genTps = genTps; self.kvBytes = kvBytes
+            self.genTpsP99 = genTpsP99 > 0 ? genTpsP99 : genTps
         }
     }
 
@@ -350,20 +360,34 @@ public actor InferenceService {
         var pos = ids.count
         var rng: UInt64 = 0xD54
         var produced = 0
+        var tokenSpeeds: [Double] = []          // 1/durata di OGNI token generato
+        tokenSpeeds.reserveCapacity(genTokens)
         let g0 = Date()
         while produced < genTokens {
             try Task.checkCancellation()
             let next = Sampler.sample(lastLogits, temperature: 0.6, topK: 0, topP: 0.95, minP: 0.05, rng: &rng)
+            let t0 = Date()
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            let dt = Date().timeIntervalSince(t0)
+            if dt > 0 { tokenSpeeds.append(1.0 / dt) }
             pos += 1; produced += 1
         }
         let genDt = Date().timeIntervalSince(g0)
         kvDirty = true   // synthetic KV state — force a rebuild on the next real turn
         let kv = UInt64(DSV4Shape.nLayer) * UInt64(ctx) * UInt64(dims.headDim) * 4
+        // p99 della velocità per-token: ordina le velocità e prendi il valore
+        // al 99° percentile — il regime raggiunto, insensibile al primo token
+        // freddo e agli stalli che schiacciano la media.
+        var p99 = 0.0
+        if !tokenSpeeds.isEmpty {
+            let sorted = tokenSpeeds.sorted()
+            p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
+        }
         return BenchPoint(contextTokens: ctx,
                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
-                          kvBytes: kv)
+                          kvBytes: kv,
+                          genTpsP99: p99)
     }
 
     // MARK: - Sub-agents (isolated context, returns only the answer)
@@ -657,6 +681,10 @@ public actor InferenceService {
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
     public func resetDecodeProfile() { decoder.resetProfile() }
     public func decodeProfileReport() -> String { decoder.profile.report() }
+    /// Per-phase profile of the LAST prefill: captured at the prefill→decode
+    /// boundary (where the counters are reset for the decode profile).
+    private var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
+    public func prefillProfileReport() -> String { lastPrefillProfile }
 
     public func resetConversation(systemPrompt: String?) {
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
@@ -798,6 +826,9 @@ public actor InferenceService {
         // Dirty-until-clean: any throw below (user cancel, error) leaves the GPU
         // KV/compressor state possibly out of sync with committedIds; the flag makes
         // the NEXT generation rebuild before continuing.
+        // Clean slate for the prefill profile: everything timed from here to the
+        // prefill→decode boundary (including a KV rebuild) is prefill work.
+        decoder.resetProfile()
         let needsRebuild = kvDirty
         kvDirty = true
         if needsRebuild && !committedIds.isEmpty {
@@ -816,6 +847,9 @@ public actor InferenceService {
         // per-phase counters at the prefill→decode boundary so decodeProfileReport()
         // reflects steady-state generation. The decode loop is opaque to the UI (it
         // runs inside the stream's task), so this is the only place to reset cleanly.
+        // The prefill's own per-phase numbers are captured HERE, just before the
+        // reset would discard them (surfaced in Log motore / demo DIAG).
+        lastPrefillProfile = decoder.profile.report(title: "Profilo prefill")
         decoder.resetProfile()
         // The committed KV now ends with an open assistant turn; mark it immediately
         // so a mid-decode interruption still closes the turn on the next suffix.
@@ -930,8 +964,21 @@ public actor InferenceService {
             // system/agent prefix, 2× protected in eviction); later = "continued"
             // (superseded under pressure by longer checkpoints of the same chat).
             let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
-            store.store(tokens: committedIds, modelName: modelName,
-                        snapshot: decoder.exportKV(nKeys: committedIds.count), reason: reason)
+            let t0 = Date()
+            let snap = decoder.exportKV(nKeys: committedIds.count)
+            let snapS = Date().timeIntervalSince(t0)
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 diskkv: snapshot %d token esportato in %.2fs\n",
+                committedIds.count, snapS).utf8))
+            // La SCRITTURA va fuori dal percorso critico del turno: l'ultimo
+            // token è già sullo schermo, ma prima il turno restava "aperto"
+            // finché il checkpoint non era su disco (secondi percepiti come
+            // tempo di generazione). Lo snapshot è un valore e DiskKVStore è
+            // Sendable: la scrittura F_NOCACHE prosegue in background.
+            let ids = committedIds, name = modelName
+            Task.detached(priority: .utility) {
+                store.store(tokens: ids, modelName: name, snapshot: snap, reason: reason)
+            }
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))

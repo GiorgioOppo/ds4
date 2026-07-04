@@ -9,8 +9,10 @@ import DS4Metal
 // real model via StreamingDecoder (per-layer load/compute/evict, 16GB-friendly).
 //
 // Usage:
-//   DS4Demo                       # Metal bring-up self-test only
-//   DS4Demo <gguf-path> [maxNew]  # + stream <maxNew> tokens (heavy I/O)
+//   DS4Demo                                # Metal bring-up self-test only
+//   DS4Demo <gguf-path> [maxNew] [prompt]  # + stream <maxNew> tokens (heavy I/O)
+//   prompt "@/path/file" = usa il CONTENUTO del file come prompt (testi lunghi,
+//   benchmark prefill; troncato a DS4_PROMPT_MAX_CHARS, default 12000).
 
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -99,7 +101,8 @@ func mtpReport(_ model: GGUFModel) -> String {
 func knobReport() -> String {
     let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                  "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
-                 "DS4_PREFILL_UNION", "DS4_Q8_NSG",
+                 "DS4_PREFILL_UNION", "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH",
+                 "DS4_PREFILL_CHUNK", "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
                  "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
@@ -243,20 +246,53 @@ do {
     if maxNew > 0 {
         // Real chat generation: tokenize the prompt (3rd arg) with the model's
         // tokenizer + chat template, greedy-decode, detokenize, print the answer.
-        let prompt = args.count >= 4 ? args[3] : "ciao come stai? rispondi in 1 parola"
+        var prompt = args.count >= 4 ? args[3] : "ciao come stai? rispondi in 1 parola"
+        // "@/percorso/file": il prompt e' il CONTENUTO del file — niente quoting
+        // shell per i testi lunghi (benchmark del prefill). Troncato a
+        // DS4_PROMPT_MAX_CHARS (default 12000 ≈ 3k token) per stare nel KV
+        // della demo insieme ai token generati.
+        if prompt.hasPrefix("@") {
+            let path = (String(prompt.dropFirst()) as NSString).expandingTildeInPath
+            guard var text = try? String(contentsOfFile: path, encoding: .utf8) else {
+                log("DS4Demo: impossibile leggere il file prompt '\(path)'")
+                exit(2)
+            }
+            let cap = ProcessInfo.processInfo.environment["DS4_PROMPT_MAX_CHARS"].flatMap(Int.init) ?? 12_000
+            if text.count > cap {
+                text = String(text.prefix(cap))
+                log("DS4Demo: prompt dal file \(path): troncato a \(cap) caratteri (DS4_PROMPT_MAX_CHARS per cambiare)")
+            } else {
+                log("DS4Demo: prompt dal file \(path): \(text.count) caratteri")
+            }
+            prompt = text
+        }
         let tok = try Tokenizer(model: model)
         let ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
-        log("DS4Demo: prompt '\(prompt)' -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
+        let shown = prompt.count > 120 ? String(prompt.prefix(120)) + "…" : prompt
+        log("DS4Demo: prompt '\(shown)' (\(prompt.count) car.) -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
+        if ids.count + maxNew + 1 > 4096 {
+            log("DS4Demo: ERRORE il prompt (\(ids.count) token) + \(maxNew) generati supera il KV della demo (maxKeys 4096) — abbassa DS4_PROMPT_MAX_CHARS")
+            exit(2)
+        }
         let stdout = FileHandle.standardOutput
         // Prefill: LAYER-MAJOR — load each layer's weights once and apply to all
         // prompt tokens (amortizes the dominant weight I/O). Returns the last
         // token's logits; KV cache is populated for positions 0..N-1.
+        dec.resetProfile()   // il profilo qui sotto misura SOLO il prefill
         let pf0 = Date()
         var last = try dec.prefill(tokens: ids)
         var pos = ids.count
-        log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.1fs/token)",
-                   ids.count, Date().timeIntervalSince(pf0),
-                   Date().timeIntervalSince(pf0) / Double(max(1, ids.count))))
+        let pfS = Date().timeIntervalSince(pf0)
+        log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.2f tok/s)",
+                   ids.count, pfS, pfS > 0 ? Double(ids.count) / pfS : 0))
+        // Per-phase prefill breakdown (route/attn vs gather IO vs experts): the
+        // phases are timed by the same counters as the decode profile, reset at
+        // the prefill boundary above. gather IO is the EXPOSED (non-overlapped)
+        // wait — the pipelined group I/O that ran under the GPU doesn't show.
+        if diag {
+            log(dec.profile.report(title: "Profilo prefill"))
+            log("")
+        }
         // Decode: stream each token's bytes to stdout AS it is produced (like ds4).
         dec.resetProfile()   // profila solo la fase di decode (non il prefill)
         // Warm-up escluso dal profilo: i primi token pagano costi una-tantum

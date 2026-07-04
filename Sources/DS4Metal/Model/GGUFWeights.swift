@@ -358,17 +358,21 @@ public enum GGUFWeights {
     /// (the ExpertSlotCache fill primitive; dst is a shared-storage pool tensor).
     /// With `uncachedFD` the slab is pread() DIRECT from disk (F_NOCACHE): zero
     /// page-cache footprint — see gatherExperts.
+    /// `slotStride`: byte fra uno slot e il successivo nel pool — nil = packing
+    /// stretto (expertBytes); il pool INTERLEAVED passa la dimensione del
+    /// record gate|up|down e `dst` è la vista del proprio slab (byteOffset).
     public static func copyExpert(_ model: GGUFModel, _ name: String, id: Int32,
                                   expertBytes: Int, into dst: GPUTensor, slot: Int,
-                                  uncachedFD: Int32? = nil) throws {
+                                  uncachedFD: Int32? = nil, slotStride: Int? = nil) throws {
+        let stride = slotStride ?? expertBytes
         guard let t = model.findTensor(name) else { throw LoadError.missing(name) }
         guard id >= 0, (Int(id) + 1) * expertBytes <= Int(t.bytes) else {
             throw LoadError.message("copyExpert: \(name) expert \(id) outside tensor bounds")
         }
-        guard dst.byteOffset + (slot + 1) * expertBytes <= dst.buffer.length else {
+        guard dst.byteOffset + slot * stride + expertBytes <= dst.buffer.length else {
             throw LoadError.message("copyExpert: slot \(slot) outside pool buffer")
         }
-        let dstPtr = dst.buffer.contents().advanced(by: dst.byteOffset + slot * expertBytes)
+        let dstPtr = dst.buffer.contents().advanced(by: dst.byteOffset + slot * stride)
         if let fd = uncachedFD {
             guard preadFull(fd, into: dstPtr, bytes: expertBytes,
                             offset: Int(t.absOffset) + Int(id) * expertBytes) else {

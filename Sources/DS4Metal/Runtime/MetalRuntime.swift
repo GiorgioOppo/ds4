@@ -18,6 +18,9 @@ public enum MetalError: Error, CustomStringConvertible {
     case missingKernel(String)
     case kernelRead(String)
     case bufferAlloc
+    /// A model shape the kernels cannot serve correctly (fail LOUD at load
+    /// instead of producing silently-wrong outputs).
+    case unsupported(String)
 
     public var description: String {
         switch self {
@@ -26,6 +29,7 @@ public enum MetalError: Error, CustomStringConvertible {
         case .missingKernel(let n): return "kernel function not found: \(n)"
         case .kernelRead(let p): return "could not read kernel source: \(p)"
         case .bufferAlloc: return "Metal buffer allocation failed"
+        case .unsupported(let s): return "unsupported by the Metal kernels: \(s)"
         }
     }
 }

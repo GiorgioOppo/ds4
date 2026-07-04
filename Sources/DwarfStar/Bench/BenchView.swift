@@ -118,11 +118,11 @@ struct BenchView: View {
             ForEach(controller.rows) { row in
                 LineMark(x: .value("Context", row.ctxTokens),
                          y: .value("t/s", row.genTps),
-                         series: .value("Series", "Generation"))
-                    .foregroundStyle(by: .value("Series", "Generation"))
+                         series: .value("Series", "Generation (p99)"))
+                    .foregroundStyle(by: .value("Series", "Generation (p99)"))
                 PointMark(x: .value("Context", row.ctxTokens),
                           y: .value("t/s", row.genTps))
-                    .foregroundStyle(by: .value("Series", "Generation"))
+                    .foregroundStyle(by: .value("Series", "Generation (p99)"))
             }
         }
         .chartXAxisLabel("Context Tokens")

@@ -88,6 +88,24 @@ public final class GraphContext {
 
     var encoder: MTLComputeCommandEncoder { enc! }
 
+    /// Coalesced buffer-to-buffer copies via ONE blit encoder in the middle of
+    /// the command buffer (the compute encoder is closed and reopened around
+    /// it; encoder boundaries order the copies against the surrounding
+    /// dispatches). Used by the batched prefill route phase to snapshot each
+    /// token's scratch (FFN inputs + router selection) into per-token buffers
+    /// BEFORE the next token's dispatches overwrite it — GPU-side, no commit.
+    public func blitCopies(_ copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)]) throws {
+        enc?.endEncoding()
+        guard let b = cb?.makeBlitCommandEncoder() else { throw MetalError.bufferAlloc }
+        for c in copies {
+            b.copy(from: c.src.buffer, sourceOffset: c.src.byteOffset + c.srcOff,
+                   to: c.dst.buffer, destinationOffset: c.dst.byteOffset + c.dstOff, size: c.bytes)
+        }
+        b.endEncoding()
+        guard let e = cb?.makeComputeCommandEncoder() else { throw MetalError.bufferAlloc }
+        enc = e
+    }
+
     // MARK: - tensor-ops (encode into the shared encoder; no commit)
 
     /// RMSNorm rows: out = normalize(x) [* weight]. n multiple of 4.

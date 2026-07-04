@@ -391,11 +391,13 @@ extension GraphContext {
                               gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                               ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                               cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                              split: GPUTensor? = nil) throws {
+                              split: GPUTensor? = nil, rw: GPUTensor? = nil,
+                              expertStride: Int? = nil) throws {
         try decodeSharedFFN(w: w, s: s, d: d, cur: cur)
         try decodeRoutedExperts(w: w, s: s, d: d, gateExp: gateExp, upExp: upExp,
                                 downExp: downExp, ids: ids, outHc: outHc, activeK: activeK,
-                                cur: cur, afterAttn: afterAttn, split: split)
+                                cur: cur, afterAttn: afterAttn, split: split, rw: rw,
+                                expertStride: expertStride)
     }
 
     /// The shared-expert FFN half of decodeExperts (gate/up -> swiglu -> down into
@@ -434,15 +436,24 @@ extension GraphContext {
     /// The routed-MoE half of decodeExperts: matvec over the provided experts, add
     /// of s.sharedOut (which MUST already be encoded — decodeSharedFFN, either on
     /// this command buffer or on one already committed) and the HC expand -> outHc.
+    /// `expertStride`: byte fra un esperto e il successivo nei buffer gate/up/
+    /// down — nil = packing stretto; il pool INTERLEAVED della slot-cache passa
+    /// la dimensione del record gate|up|down (le tre viste condividono un solo
+    /// buffer, un miss è UNA pread dal bundle).
     public func decodeRoutedExperts(w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                     gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
                                     ids: GPUTensor, outHc: GPUTensor, activeK: Int = -1,
                                     cur: GPUTensor? = nil, afterAttn: GPUTensor? = nil,
-                                    split: GPUTensor? = nil) throws {
+                                    split: GPUTensor? = nil, rw: GPUTensor? = nil,
+                                    expertStride: Int? = nil) throws {
         let kk = activeK < 0 ? d.k : max(1, min(activeK, d.k))
         let x = cur ?? s.cur
         let resid = afterAttn ?? s.afterAttn
         let sp = split ?? s.split
+        // Route weights: per-token buffer in the batched prefill (many tokens
+        // share ONE command buffer, so the shared s.rw can't be rewritten
+        // between them); s.rw everywhere else.
+        let weights = rw ?? s.rw
         // routed MoE over the provided experts, dispatched on the PER-LAYER quant
         // (w.*Quant) — so a mixed-precision GGUF's boosted layer uses the right
         // kernel. Fused C-release path (pair_swiglu + down_sum6, 2 dispatches) when
@@ -451,27 +462,42 @@ extension GraphContext {
             && (w.gateQuant == .iq2_xxs || w.gateQuant == .q4_K)
         if pairFused {
             try moePairSwiGLU(w.gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
-                              activation: x, weights: s.rw, gateScratch: s.gate6,
+                              activation: x, weights: weights, gateScratch: s.gate6,
                               upScratch: s.up6, mid: s.mid6,
-                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp)
+                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp,
+                              expertStride: expertStride)
         } else {
-            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false)
-            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
+            try moeMatvecID(w.gateQuant, experts: gateExp, ids: ids, activation: x, out: s.gate6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false, expertStride: expertStride)
+            try moeMatvecID(w.upQuant, experts: upExp, ids: ids, activation: x, out: s.up6, k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false, expertStride: expertStride)
+            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: weights, mid: s.mid6, width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
         }
         // down_sum6 hardcodes 6 expert slots: usable only at full k.
         let sumFused = d.fusedMoE && kk == 6
             && (w.downQuant == .q2_K || w.downQuant == .q4_K)
         if sumFused {
             try moeDownSum6(w.downQuant, experts: downExp, ids: ids, mid: s.mid6,
-                            out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd)
+                            out: s.routed, inDim: d.expertFfn, outDim: d.nEmbd,
+                            expertStride: expertStride)
         } else {
-            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true)
+            try moeMatvecID(w.downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6, k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true, expertStride: expertStride)
             try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
         }
         try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
         // HC expand post-FFN (post=split[4:8], comb=split[8:24]) -> outHc
         try hcExpand4(blockOut: s.ffnOut, residual: resid, post: sp, comb: sp,
+                      blockAdd: nil, out: outHc, nEmbd: d.nEmbd, nTokens: 1,
+                      postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+    }
+
+    /// Tail of the routed FFN for the batched-MM prefill (DS4_PREFILL_MM): the
+    /// k weighted down rows are already in s.down6 (blitted from the group's
+    /// matmul output) — sum6 + shared add + HC expand, the same dispatches the
+    /// matvec path ends with. s.sharedOut must already be encoded.
+    public func decodeRoutedTail(s: DecodeScratch, d: DSV4Dims, outHc: GPUTensor,
+                                 afterAttn: GPUTensor, split: GPUTensor) throws {
+        try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
+        try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
+        try hcExpand4(blockOut: s.ffnOut, residual: afterAttn, post: split, comb: split,
                       blockAdd: nil, out: outHc, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
     }

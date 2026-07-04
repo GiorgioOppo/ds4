@@ -42,6 +42,10 @@ struct ServerView: View {
                     .disabled(controller.isRunning)
                     Toggle("CORS (Access-Control-Allow-Origin: *)", isOn: $controller.cors)
                         .disabled(controller.isRunning)
+                    TextField("API key (optional)", text: $controller.apiKey)
+                        .disabled(controller.isRunning)
+                    Text("When set, requests must send `Authorization: Bearer <key>` (OpenAI) or `x-api-key: <key>` (Anthropic). Traffic is plaintext HTTP — keep the host on 127.0.0.1, or put TLS in front.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section {
@@ -111,10 +115,11 @@ struct ServerView: View {
     }
 
     private var curlExample: String {
-        """
+        let auth = controller.apiKey.isEmpty ? "" : "  -H \"Authorization: Bearer \(controller.apiKey)\" \\\n"
+        return """
         curl \(controller.endpoint)/chat/completions \\
           -H "Content-Type: application/json" \\
-          -d '{"model":"deepseek-v4-flash","stream":true,
+        \(auth)  -d '{"model":"\(controller.modelId)","stream":true,
                "messages":[{"role":"user","content":"Hello"}]}'
         """
     }

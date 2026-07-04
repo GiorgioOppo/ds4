@@ -618,12 +618,17 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
+        // Bounds-guarded loaders: the tables hold 256/128 entries and are fully
+        // staged by the first TWO simdgroups. Without the guards, dispatching
+        // with nsg > 2 (our wrappers use 4) wrote past the tables: shmem bytes
+        // 2048..2175 RACED the ssigns table (write/write -> sign corruption)
+        // and bytes >= 2176 were out of the allocated threadgroup memory.
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        if (pos < 256) { for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i]; }
         nval = 2;
         pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        if (pos < 128) { for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -717,12 +722,17 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
+        // Bounds-guarded loaders: the tables hold 256/128 entries and are fully
+        // staged by the first TWO simdgroups. Without the guards, dispatching
+        // with nsg > 2 (our wrappers use 4) wrote past the tables: shmem bytes
+        // 2048..2175 RACED the ssigns table (write/write -> sign corruption)
+        // and bytes >= 2176 were out of the allocated threadgroup memory.
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        if (pos < 256) { for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i]; }
         nval = 2;
         pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        if (pos < 128) { for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1063,12 +1073,16 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
     {
+        // Bounds-guarded loaders — see kernel_mul_mv_iq2_xxs_f32_impl: with
+        // nsg > 2 the unguarded loads raced the ssigns table and wrote out of
+        // the allocated threadgroup memory. This kernel runs EVERY token on
+        // iq2_xxs models (the fused gate+up pair of the routed FFN).
         int nval = 4;
         int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        if (pos < 256) { for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i]; }
         nval = 2;
         pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        if (pos < 128) { for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -4336,6 +4350,11 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Barrier BEFORE rewriting sb: other simdgroups may still be inside the
+        // previous iteration's UP mma loop, which reads sb (only simdgroup_
+        // barriers separate them). The base kernel_mul_mm_id has the same
+        // barrier before every shared write. (audit kernel 2026-07-04)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const short sx_b = (tiitg%NL1);
         const short sy_b = (tiitg/NL1)/8;
         const short ly_b = (tiitg/NL1)%8;

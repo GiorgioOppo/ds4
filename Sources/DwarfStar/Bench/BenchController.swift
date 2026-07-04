@@ -104,10 +104,13 @@ final class BenchController {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")
                     let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
+                    // Il grafico/report usano il p99 della velocità per-token:
+                    // il regime raggiunto, non la media schiacciata dal primo
+                    // token freddo (la media resta nel log per confronto).
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
-                                           genTps: p.genTps, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen %.2f t/s\n",
-                                 p.contextTokens, p.prefillTps, p.genTps))
+                                           genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
                 }
                 return nil
             } catch is CancellationError { return nil }
@@ -142,9 +145,9 @@ final class BenchController {
                     onLog("context \(c): prefill + \(gen) tokens...\n")
                     let p = try await coord.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
-                                           genTps: p.genTps, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen %.2f t/s\n",
-                                 p.contextTokens, p.prefillTps, p.genTps))
+                                           genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
                 }
                 return nil
             } catch is CancellationError { return nil }

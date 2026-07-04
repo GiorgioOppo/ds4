@@ -335,12 +335,16 @@ extension GraphContext {
     /// `kernel_mul_mv_id<...>` wrapper (same 120-byte args, same dispatch) — only
     /// the block byte-size (nb00) and nr0 differ.
     public func moeMatvecID(_ quant: MoEQuant, experts: GPUTensor, ids: GPUTensor, activation: GPUTensor,
-                            out: GPUTensor, k: Int, inDim: Int, outDim: Int, perExpertAct: Bool) throws {
+                            out: GPUTensor, k: Int, inDim: Int, outDim: Int, perExpertAct: Bool,
+                            expertStride: Int? = nil) throws {
         precondition(inDim % 256 == 0)
         let nsg = 4, nr0 = quant.nr0
         let blockBytes = quant.blockBytes
         let rowBytes = (inDim / 256) * blockBytes
-        let expertBytes = rowBytes * outDim
+        // expertStride: byte fra un esperto e il successivo nel buffer — di
+        // default il packing stretto (rowBytes*outDim); il pool INTERLEAVED
+        // della slot-cache passa la dimensione del record gate|up|down.
+        let expertBytes = expertStride ?? (rowBytes * outDim)
         let ne11 = perExpertAct ? k : 1
         let args = Self.mulMVIdArgsFull(nei0: k, nei1: 1, nbi1: UInt64(k * 4), ne00: inDim, ne01: outDim,
                                         nb00: UInt64(blockBytes), nb01: UInt64(rowBytes), nb02: UInt64(expertBytes),
@@ -374,7 +378,8 @@ extension GraphContext {
     public func moePairSwiGLU(_ quant: MoEQuant, gateExp: GPUTensor, upExp: GPUTensor,
                               ids: GPUTensor, activation: GPUTensor, weights: GPUTensor,
                               gateScratch: GPUTensor, upScratch: GPUTensor, mid: GPUTensor,
-                              k: Int, inDim: Int, outDim: Int, clamp: Float) throws {
+                              k: Int, inDim: Int, outDim: Int, clamp: Float,
+                              expertStride: Int? = nil) throws {
         let kernel: String
         switch quant {
         case .iq2_xxs: kernel = "kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32"
@@ -385,7 +390,7 @@ extension GraphContext {
         let rowBytes = (inDim / 256) * quant.blockBytes
         let args = Self.mulMVIdArgsFull(nei0: k, nei1: 1, nbi1: UInt64(k * 4), ne00: inDim, ne01: outDim,
                                         nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
-                                        nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 1,
+                                        nb02: UInt64(expertStride ?? (rowBytes * outDim)), ne10: inDim, ne11: 1,
                                         nb10: 4, nb11: UInt64(inDim * 4), nb12: UInt64(inDim * 4),
                                         ne0: outDim, nb1: UInt64(outDim * 4), nr0: Int32(nr0))
         let act = MetalRuntime.moeSwiGLUWeightArgs(width: outDim, rows: k, clampValue: clamp, midF16: false)
@@ -411,7 +416,8 @@ extension GraphContext {
     /// instead of 2): out[outDim] = Σ_e down_e · mid[e]. The kernel hardcodes 6
     /// expert slots, so it requires k == 6. Only q2_K/q4_K exist.
     public func moeDownSum6(_ quant: MoEQuant, experts: GPUTensor, ids: GPUTensor,
-                            mid: GPUTensor, out: GPUTensor, inDim: Int, outDim: Int) throws {
+                            mid: GPUTensor, out: GPUTensor, inDim: Int, outDim: Int,
+                            expertStride: Int? = nil) throws {
         let kernel: String
         switch quant {
         case .q2_K:    kernel = "kernel_mul_mv_id_q2_K_sum6_f32"
@@ -422,7 +428,7 @@ extension GraphContext {
         let rowBytes = (inDim / 256) * quant.blockBytes
         let args = Self.mulMVIdArgsFull(nei0: 6, nei1: 1, nbi1: 6 * 4, ne00: inDim, ne01: outDim,
                                         nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
-                                        nb02: UInt64(rowBytes * outDim), ne10: inDim, ne11: 6,
+                                        nb02: UInt64(expertStride ?? (rowBytes * outDim)), ne10: inDim, ne11: 6,
                                         nb10: 4, nb11: UInt64(inDim * 4), nb12: UInt64(6 * inDim * 4),
                                         ne0: outDim, nb1: UInt64(outDim * 4), nr0: Int32(nr0))
         let pso = try rt.mulMVPipeline(kernel, nsg: Int16(nsg))

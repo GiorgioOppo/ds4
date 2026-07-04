@@ -14,12 +14,19 @@ final class ServerController {
     let settings: AppSettings
     let store: ChatStore
     var modelPath: String { settings.modelPath }
+    /// The one model id the API serves: the loaded GGUF's basename. There is no
+    /// model choice over HTTP — it's whatever was loaded in Settings.
+    var modelId: String {
+        ((modelPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    }
 
     init(settings: AppSettings, store: ChatStore) { self.settings = settings; self.store = store }
     var host = "127.0.0.1"
     var port = 8000
     var maxTokens = 1024
     var cors = false
+    /// Optional shared secret (Bearer / x-api-key). Empty = no authentication.
+    var apiKey = ""
 
     // Live state.
     var log = ""
@@ -42,8 +49,10 @@ final class ServerController {
 
         let path = ProcessStream.absolutePath(modelPath)
         let name = (path as NSString).lastPathComponent
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let cfg = LocalServer.Config(host: host, port: UInt16(clamping: port),
-                                     cors: cors, maxTokens: maxTokens)
+                                     cors: cors, maxTokens: maxTokens,
+                                     apiKey: key.isEmpty ? nil : key)
 
         // Sendable log channel: the server (any thread) yields lines; we drain them
         // on the main actor (Swift 6 concurrency-safe, no @MainActor capture).
