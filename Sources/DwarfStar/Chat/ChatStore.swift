@@ -112,6 +112,16 @@ final class ChatStore {
         UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
         _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
         _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        // Riparazione una-tantum: la prima versione del benchmark rapido
+        // poteva scegliere union=64 su una misura da 128 token troppo corta
+        // (rumore) — a scala reale 64 è il valore catastrofico. Riporta al
+        // consigliato; il benchmark corretto non lo riproporrà.
+        if !UserDefaults.standard.bool(forKey: "DS4BenchUnionFix2026_07_04"),
+           prefillUnion < 192 {
+            UserDefaults.standard.set(true, forKey: "DS4BenchUnionFix2026_07_04")
+            prefillUnion = 192
+            UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
+        }
         // Knob del prefill regolabili a caldo (persistiti dal benchmark in
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
@@ -319,14 +329,17 @@ final class ChatStore {
                 FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
             }
             do {
-                // 1) unione esperti, a chunk fisso 512. Il divario fra le
-                //    unioni emerge già a poche decine di token (byte/token del
-                //    gather); il rapido usa 128 token, il completo 512.
-                let unionCtx = quick ? 128 : 512
+                // 1) unione esperti, a chunk fisso 512. Il rapido (256 token)
+                //    confronta SOLO 192 e 256: a scala corta il rumore può
+                //    premiare 64, che sui prefill reali è il valore
+                //    catastrofico (misurato sul campo: ~1.7 GB/token di
+                //    riletture contro ~0.6 con 192) — il completo lo include
+                //    solo perché a 512 token la misura è affidabile.
+                let unionCtx = quick ? 256 : 512
                 var bestUnion = prefillUnion
                 var bestTps = 0.0
                 _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
-                for union in [64, 192, 256] {
+                for union in (quick ? [192, 256] : [64, 192, 256]) {
                     _ = setenv("DS4_PREFILL_UNION", String(union), 1)
                     benchStatus = "Benchmark union=\(union)…"
                     let p = try await service.benchmark(contextTokens: unionCtx, genTokens: quick ? 4 : 8)
