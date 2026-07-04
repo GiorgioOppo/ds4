@@ -97,15 +97,15 @@ struct ModelLoadView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
-                    Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * 0.022)) GB)",
-                            value: $store.diskKVBudgetKTok, in: 128...4096, step: 128)
-                    Text("At the end of a response, the KV state is saved to disk; a new conversation or server request that starts with a known prefix restores it instead of redoing prefill. The budget counts TOTAL checkpointed tokens across conversations (the live context window is separate). Applies on the next model load.")
+                    Stepper("Budget: \(store.diskKVBudgetMB) MB",
+                            value: $store.diskKVBudgetMB, in: 512...65536, step: 512)
+                    Text("At the end of a response, the KV state is checkpointed to disk; a new conversation or server request that starts with a known prefix restores it instead of redoing prefill. The live KV during prefill/decode still uses RAM. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
-                Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
+                Toggle("Raw-KV ring: constant raw-KV RAM", isOn: $store.rawRingEnabled)
                 if store.rawRingEnabled {
-                    Text("Keeps only the attention window (128 rows) in RAM instead of the full context, making raw KV RAM independent of context length. Experimental: verify outputs after a long context. Applies on the next model load.")
-                        .font(.caption).foregroundStyle(.orange)
+                    Text("Keeps only the attention window (128 rows) in RAM instead of the full raw context. Compressed KV still grows with context length. Applies on the next model load.")
+                        .font(.caption).foregroundStyle(.tertiary)
                 }
                 Toggle("Read ahead selected experts (madvise)", isOn: $store.willNeedEnabled)
                 Text("Starts reading the 6 selected experts just before gather: reduces cold faults on low-RAM systems, no-op when hot. Advisory only; does not change outputs. Recommended ON. Applies on the next model load.")

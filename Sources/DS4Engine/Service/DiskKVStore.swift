@@ -2,8 +2,8 @@ import Foundation
 import DS4Core
 import DS4Metal
 
-/// Disk-backed KV cache, modelled on ds4_kvstore.c: completed-generation
-/// checkpoints are written to a directory keyed by their exact token prefix;
+/// Disk-backed KV checkpoint store, modelled on ds4_kvstore.c: completed-generation
+/// snapshots are written to a directory keyed by their exact token prefix;
 /// a later conversation (or a stateless HTTP request re-sending the transcript)
 /// that starts with a stored prefix RESTORES it and prefills only the rest.
 ///
@@ -51,6 +51,10 @@ public final class DiskKVStore: @unchecked Sendable {
         self.contextSize = contextSize
         self.options = options
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    public func canStore(estimatedBytes: UInt64) -> Bool {
+        estimatedBytes <= budgetBytes
     }
 
     // MARK: Lookup

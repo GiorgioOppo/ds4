@@ -10,10 +10,9 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 | `calculator` | `Calculator.swift` | Evaluates an arithmetic expression (`+ - * / % ^`, parentheses, `pi`/`e`, functions like `sqrt`, `sin`, `log`). |
 | `add`/`subtract`/`multiply` | `Add`/`Subtract`/`Multiply.swift` | Two-operand arithmetic. |
 | `web_search` | `WebSearch.swift` | Web search (DuckDuckGo, keyless); returns title/url/snippet. Override the endpoint with `DS4_SEARCH_URL` (must contain `%@`). |
-| `web_fetch` | `WebFetch.swift` | Fetches an http(s) URL and returns readable text (HTML stripped); long pages are read in chunks via `offset`. |
-| `project_tree` | `ProjectTree.swift` | Whole-project overview: directories with file counts, in one call. |
-| `project_find` | `ProjectFind.swift` | Finds files by name/path (`*` wildcard); contents are `project_search`'s job. |
-| `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project (`read` takes optional `lines` up to 400 per call; `search` accepts an optional `path` scope). |
+| `web_fetch` | `WebFetch.swift` | Fetches an http(s) URL and returns readable text (HTML stripped). |
+| `web_page_info`/`web_fetch_many` | `WebResearch.swift` | Source triage metadata and multi-page fetching for online research. |
+| `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project. |
 | `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | Writes or edits indexed text files. |
 | `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | Raw file access, including line-based reads/edits. |
 | `file_delete` | `FileDelete.swift` | Deletes one file inside the project root (never directories). |
@@ -34,7 +33,7 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 
 ## Web Tools & Safety
 
-`web_search`/`web_fetch` are the only tools that reach the network. Because they
+The `web_*` tools are the only tools that reach the network. Because they
 run on model-emitted arguments (attacker-influençable via prompt injection from
 an imported project or a fetched page), every request goes through the SSRF
 guard in `../WebClient.swift`: **http/https only**, and the host must resolve to

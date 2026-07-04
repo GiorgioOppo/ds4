@@ -227,14 +227,14 @@ public final class StreamingDecoder {
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
-        // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
+        // Raw-KV cache rows: a ring-buffer of nSWA by default, or the full context when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
         // the older rows need not stay resident — the ring cuts the raw-KV RAM from
         // O(contextSize) to a constant. The write slot, attention staging and
         // export/import all key off `rawCache.count/headDim`, so the full cache is a
-        // no-wrap special case (behaviour identical). Opt-in: validate the parity
-        // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
-        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false   // live (set from the UI toggle)
+        // no-wrap special case (behaviour identical). DS4_RAW_RING=0 keeps the legacy
+        // full raw cache for debugging/comparison.
+        let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? true   // live (set from the UI toggle)
         let rawRows = ringOn ? min(dims.nSWA, maxKeys) : maxKeys
         // lazyZeros (no memset): the raw cache is sized for the FULL context but only
         // rows 0..<pos are ever written, and attention reads only written rows (the
@@ -362,9 +362,6 @@ public final class StreamingDecoder {
         let step = max(1, envChunk ?? chunk)
         while start < tokens.count {
             let end = min(start + step, tokens.count)
-            // Drain the ObjC autorelease pool per chunk: Metal command buffers /
-            // encoders are autoreleased, and a long prefill inside one pool scope
-            // accumulates them all — transient footprint grows with the prompt.
             lastHC = try autoreleasepool {
                 try prefillRange(tokens, start: start, end: end, posBase: startPos)
             }
@@ -448,17 +445,14 @@ public final class StreamingDecoder {
         let stage: PrefillStage? = (expertGather != nil && n > 1)
             ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
         for i in 0..<nLayers {
-            // Per-layer pool drain: the layer weights and per-token command
-            // buffers are autoreleased ObjC objects — without this they pile up
-            // for the whole chunk instead of freeing at each EVICT.
             try autoreleasepool {
                 try Task.checkCancellation()
                 let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
                 if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
                 let layerRope = DSV4Shape.ropeParams(layer: i)
-                if let gather = expertGather, n > 1, let stage {
+                if let gather = expertGather, n > 1 {
                     try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
-                                           n: n, posBase: posBase + start, gather: gather, stage: stage)
+                                           n: n, posBase: posBase + start, gather: gather)
                 } else {
                     for j in 0..<n {
                         let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
@@ -469,8 +463,6 @@ public final class StreamingDecoder {
                 swap(&cur, &other)                       // w drops here -> EVICT
             }
         }
-        // Free the chunk's activation buffers now (2·n HC tensors); only the last
-        // HC state survives into the next chunk / output head.
         let last = cur[n - 1]
         cur.removeAll(keepingCapacity: false)
         other.removeAll(keepingCapacity: false)
@@ -515,78 +507,25 @@ public final class StreamingDecoder {
         // single wait. Indexer-active tokens (CPU top-k mid-route) and
         // DS4_PROFILE_ROUTE fall back to the per-token path.
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
-        idsT.reserveCapacity(n); rwT.reserveCapacity(n)
-        var j = 0
-        while j < n {
-            // Extent of the batchable run starting at j: consecutive tokens for
-            // which the indexer stays INACTIVE — its compressed-row count grows
-            // deterministically with pos, so activation is checked prospectively
-            // (extraRows) for the whole run before encoding any of it.
-            var jEnd = j
-            if prefillRouteBatch > 1 && !profileRoute {
-                var extraRows = 0
-                while jEnd < n && (jEnd - j) < prefillRouteBatch {
-                    let pos = posBase + jEnd
-                    if indexerActive(i, pos: pos, extraRows: extraRows) { break }
-                    if let idx = indexStates[i], (pos + 1) % idx.ratio == 0 { extraRows += 1 }
-                    jEnd += 1
-                }
-            }
-            if jEnd <= j {
-                // Per-token path (indexer active, or batching off).
-                try autoreleasepool {
-                    try Task.checkCancellation()
-                    let pos = posBase + j
-                    let t = Date()
-                    try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
-                    profile.routeS += Date().timeIntervalSince(t)
-                    let (ids, rw) = readRouteSelection(layer: i)
-                    idsT.append(ids); rwT.append(rw)
-                    copyFloats(from: scratch.cur, to: stage.cur[j], count: d.nEmbd)
-                    copyFloats(from: scratch.afterAttn, to: stage.attn[j], count: d.nHC * d.nEmbd)
-                    copyFloats(from: scratch.split, to: stage.split[j], count: 24)
-                    if let mm = stage.mm {
-                        memcpy(mm.curMat.buffer.contents() + mm.curMat.byteOffset + j * d.nEmbd * 4,
-                               scratch.cur.buffer.contents() + scratch.cur.byteOffset, d.nEmbd * 4)
-                    }
-                    profile.layers += 1
-                }
-                j += 1
-                continue
-            }
-            let t = Date()
+        curT.reserveCapacity(n); attnT.reserveCapacity(n); splitT.reserveCapacity(n)
+        for j in 0..<n {
             try autoreleasepool {
                 try Task.checkCancellation()
-                clearMaskIfDirty()
-                let c = GraphContext(rt); try c.begin()
-                for jj in j..<jEnd {
-                    let pos = posBase + jj
-                    try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
-                                        pos: pos, nKeys: pos + 1)
-                    // Snapshot ids/weights into stage.ids/rw too: phase B reads
-                    // them back and REWRITES both buffers (remapped + padded)
-                    // strictly after this buffer completes — no aliasing.
-                    var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
-                        (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
-                        (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
-                        (scratch.split, 0, stage.split[jj], 0, 24 * 4),
-                        (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
-                        (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
-                    ]
-                    if let mm = stage.mm {
-                        copies.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
-                    }
-                    try c.blitCopies(copies)
-                }
-                c.commit()
-            }
-            profile.routeS += Date().timeIntervalSince(t)
-            for jj in j..<jEnd {
-                let (ids, rw) = selection(sel: stage.ids[jj], weights: stage.rw[jj], layer: i)
+                let pos = posBase + j
+                let t = Date()
+                try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
+                profile.routeS += Date().timeIntervalSince(t)
+                let (ids, rw) = readRouteSelection(layer: i)
                 idsT.append(ids); rwT.append(rw)
+                let cT = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
+                let aT = try GPUTensor.zeros(rt, floatCount: d.nHC * d.nEmbd)
+                let sT = try GPUTensor.zeros(rt, floatCount: 24)
+                copyFloats(from: scratch.cur, to: cT, count: d.nEmbd)
+                copyFloats(from: scratch.afterAttn, to: aT, count: d.nHC * d.nEmbd)
+                copyFloats(from: scratch.split, to: sT, count: 24)
+                curT.append(cT); attnT.append(aT); splitT.append(sT)
                 profile.layers += 1
             }
-            j = jEnd
         }
 
         // Phase B: group consecutive tokens while the union stays under the cap,
@@ -632,137 +571,28 @@ public final class StreamingDecoder {
                 if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
                 var posOf: [Int32: Int32] = [:]
                 for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
-                // mul_mm_id path (DS4_PREFILL_MM): expert weights read once per
-                // tile for ALL the group's tokens. Requirements: Flash quants,
-                // full k DISTINCT selections per token (map0 encodes the slot
-                // as a sum over matches), dims multiple of 256, and enough
-                // tokens to amortize the matmul setup.
-                let gTok = group.tokens.count
-                let useMM = prefillMM && stage.mm != nil && gTok >= 8
-                    && w.gateQuant == .iq2_xxs && w.upQuant == .iq2_xxs && w.downQuant == .q2_K
-                    && d.k == 6 && d.nEmbd % 256 == 0 && d.expertFfn % 256 == 0
-                    && group.tokens.allSatisfy { idsT[$0].count == d.k }
-                if useMM, let mm = stage.mm {
-                    // CPU staging BEFORE the command buffer: group-local rows of
-                    // remapped (union-relative) ids + route weights.
-                    let idsPtr = (mm.idsMat.buffer.contents() + mm.idsMat.byteOffset)
-                        .bindMemory(to: Int32.self, capacity: gTok * d.k)
-                    let wPtr = (mm.wMat.buffer.contents() + mm.wMat.byteOffset)
-                        .bindMemory(to: Float.self, capacity: gTok * d.k)
-                    for (tl, j) in group.tokens.enumerated() {
-                        for s in 0..<d.k {
-                            idsPtr[tl * d.k + s] = posOf[idsT[j][s]]!
-                            wPtr[tl * d.k + s] = rwT[j][s]
-                        }
-                    }
+                for j in group.tokens {
                     try Task.checkCancellation()
+                    let K = idsT[j].count
+                    let remapped = idsT[j].map { posOf[$0]! }
+                    let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
+                                                     elementCount: K)
+                    writeFloats(rwT[j], into: scratch.rw)
+                    zeroDown6(from: K)
                     t = Date()
                     let c2 = GraphContext(rt); try c2.begin()
-                    try c2.encodeMoEMap0(ids: mm.idsMat, htpe: mm.htpe, hids: mm.hids,
-                                         nTok: gTok, kPerTok: d.k, nExperts: group.union.count)
-                    try c2.encodeMMIdPairSwiGLUIQ2(gate: g, up: u, act: mm.curMat,
-                                                   actBase: group.tokens.lowerBound * d.nEmbd * 4,
-                                                   htpe: mm.htpe, hids: mm.hids,
-                                                   mid: mm.mid, weights: mm.wMat,
-                                                   nTok: gTok, kPerTok: d.k,
-                                                   nExperts: group.union.count,
-                                                   inDim: d.nEmbd, ffnDim: d.expertFfn,
-                                                   clamp: d.swigluClamp)
-                    try c2.encodeMMIdDownQ2K(down: dn, mid: mm.mid,
-                                             htpe: mm.htpe, hids: mm.hids, out: mm.down6,
-                                             nTok: gTok, kPerTok: d.k,
-                                             nExperts: group.union.count,
-                                             ffnDim: d.expertFfn, outDim: d.nEmbd)
-                    // SHARED-expert FFN: batched too when the shared weights
-                    // are Q8_0 (gate/up mm -> rows-swiglu at unit weight ->
-                    // down mm, one matmul each for the whole group instead of
-                    // 3 matvecs per token). DS4_SHARED_Q4 residents keep the
-                    // per-token path (the id-kernel with k=1 has no mm twin).
-                    let sharedMM = !w.sharedGateQ4 && !w.sharedUpQ4 && !w.sharedDownQ4
-                    let actBase = group.tokens.lowerBound * d.nEmbd * 4
-                    if sharedMM {
-                        try c2.encodeMMDenseQ8(weight: w.sharedGate, act: mm.curMat, actBase: actBase,
-                                               out: mm.sGate, inDim: d.nEmbd, outDim: d.sharedFfn, nTok: gTok)
-                        try c2.encodeMMDenseQ8(weight: w.sharedUp, act: mm.curMat, actBase: actBase,
-                                               out: mm.sUp, inDim: d.nEmbd, outDim: d.sharedFfn, nTok: gTok)
-                        try c2.moeSwiGLUWeight(gate: mm.sGate, up: mm.sUp, weights: mm.ones,
-                                               mid: mm.sMid, width: d.sharedFfn, rows: gTok,
-                                               clampValue: d.swigluClamp)
-                        try c2.encodeMMDenseQ8(weight: w.sharedDown, act: mm.sMid, actBase: 0,
-                                               out: mm.sOut, inDim: d.sharedFfn, outDim: d.nEmbd, nTok: gTok)
-                    }
-                    // Per-token tail: blit of the token's shared row + k down
-                    // rows into the scratch, then sum6/add/HC expand (identical
-                    // dispatches to the matvec path's tail).
-                    let tokBytes = d.k * d.nEmbd * 4
-                    for (tl, j) in group.tokens.enumerated() {
-                        if sharedMM {
-                            try c2.blitCopies([
-                                (src: mm.sOut, srcOff: tl * d.nEmbd * 4,
-                                 dst: scratch.sharedOut, dstOff: 0, bytes: d.nEmbd * 4),
-                                (src: mm.down6, srcOff: tl * tokBytes,
-                                 dst: scratch.down6, dstOff: 0, bytes: tokBytes),
-                            ])
-                        } else {
-                            try c2.decodeSharedFFN(w: w, s: scratch, d: d, cur: stage.cur[j])
-                            try c2.blitCopies([(src: mm.down6, srcOff: tl * tokBytes,
-                                                dst: scratch.down6, dstOff: 0, bytes: tokBytes)])
-                        }
-                        try c2.decodeRoutedTail(s: scratch, d: d, outHc: other[j],
-                                                afterAttn: stage.attn[j], split: stage.split[j])
-                    }
+                    try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                         ids: idsBuf, outHc: other[j], activeK: K,
+                                         cur: curT[j], afterAttn: attnT[j], split: splitT[j])
                     c2.commit()
                     profile.expertsS += Date().timeIntervalSince(t)
-                } else if prefillFFNBatch {
-                    // ONE command buffer for the whole group's FFNs. All the
-                    // CPU staging happens BEFORE the commit (per-token ids/rw
-                    // buffers — the shared s.rw can't be rewritten between
-                    // tokens of one buffer). Selections shorter than k
-                    // (DS4_ACTIVE_EXPERTS) are padded with slot 0 at weight 0:
-                    // SwiGLU scales the padded rows by 0, so their down
-                    // projection contributes exactly zero — same numerics.
-                    for j in group.tokens {
-                        var remapped = idsT[j].map { posOf[$0]! }
-                        var weights = rwT[j]
-                        while remapped.count < d.k { remapped.append(0); weights.append(0) }
-                        remapped.withUnsafeBytes {
-                            memcpy(stage.ids[j].buffer.contents() + stage.ids[j].byteOffset,
-                                   $0.baseAddress!, $0.count)
-                        }
-                        writeFloats(weights, into: stage.rw[j])
-                    }
-                    try Task.checkCancellation()
-                    t = Date()
-                    let c2 = GraphContext(rt); try c2.begin()
-                    for j in group.tokens {
-                        try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                             ids: stage.ids[j], outHc: other[j], activeK: d.k,
-                                             cur: stage.cur[j], afterAttn: stage.attn[j],
-                                             split: stage.split[j], rw: stage.rw[j])
-                    }
-                    c2.commit()
-                    profile.expertsS += Date().timeIntervalSince(t)
-                } else {
-                    for j in group.tokens {
-                        try Task.checkCancellation()
-                        let K = idsT[j].count
-                        let remapped = idsT[j].map { posOf[$0]! }
-                        let idsBuf = try GPUTensor.bytes(rt, remapped.withUnsafeBytes { Array($0) },
-                                                         elementCount: K)
-                        writeFloats(rwT[j], into: scratch.rw)
-                        zeroDown6(from: K)
-                        t = Date()
-                        let c2 = GraphContext(rt); try c2.begin()
-                        try c2.decodeExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                             ids: idsBuf, outHc: other[j], activeK: K,
-                                             cur: stage.cur[j], afterAttn: stage.attn[j], split: stage.split[j])
-                        c2.commit()
-                        profile.expertsS += Date().timeIntervalSince(t)
-                    }
                 }
-                // g/u/dn drop here (pool drain) -> the group's packed union tensors are freed
+                // g/u/dn drop here -> the group's packed union tensors are freed
             }
         }
+        curT.removeAll(keepingCapacity: false)
+        attnT.removeAll(keepingCapacity: false)
+        splitT.removeAll(keepingCapacity: false)
     }
 
     /// Embed a whole prefill chunk in ONE command buffer: the tokens' table rows

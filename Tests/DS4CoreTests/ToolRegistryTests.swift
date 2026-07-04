@@ -92,8 +92,14 @@ final class ToolRegistryTests: XCTestCase {
     func testNewToolsAreDeclared() {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
         XCTAssertTrue(names.isSuperset(of: ["add", "subtract", "multiply",
-                                            "web_search", "web_fetch",
-                                            "project_tree", "project_find", "file_delete"]))
+                                            "web_page_info", "web_fetch_many"]))
+    }
+
+    func testResearchToolsValidateRequiredArguments() {
+        let info = ToolRegistry.execute(ToolCall(id: "w0", name: "web_page_info", argumentsJSON: "{}"))
+        XCTAssertTrue(info?.content.contains("missing 'url'") ?? false)
+        let many = ToolRegistry.execute(ToolCall(id: "w1", name: "web_fetch_many", argumentsJSON: "{}"))
+        XCTAssertTrue(many?.content.contains("missing 'urls'") ?? false)
     }
 
     func testSpecsForEnabledSubset() {
