@@ -413,7 +413,14 @@ final class ChatStore {
         didSet { UserDefaults.standard.set(repetitionPenalty, forKey: "DS4RepPenalty") }
     }
     private var sampling: SamplingParams {
-        SamplingParams(temperature: Float(temperature), repetitionPenalty: Float(repetitionPenalty))
+        // topK 40 (default llama.cpp): con topK=0 si campiona sull'INTERO
+        // vocabolario DeepSeek (129k token, in gran parte cinesi) e sulla coda
+        // rumorosa di un modello 2-bit basta pescare UN token cinese perché il
+        // contesto trascini tutta la risposta in cinese — visto in campo a
+        // temperature del tutto normali (0.6). Il tetto a 40 taglia quella
+        // coda senza togliere varietà; motore/server/demo restano fedeli al C.
+        SamplingParams(temperature: Float(temperature), topK: 40,
+                       repetitionPenalty: Float(repetitionPenalty))
     }
 
     // Tools.
