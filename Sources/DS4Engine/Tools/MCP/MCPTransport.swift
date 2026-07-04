@@ -141,12 +141,16 @@ final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
         }
     }
 
+    /// Locked snapshot of the writable stdin — NSLock is not usable directly in
+    /// an async function, so `send` goes through this synchronous helper.
+    private func writableStdin() -> Pipe? {
+        lock.lock(); defer { lock.unlock() }
+        guard let p = process, p.isRunning, !closed else { return nil }
+        return stdinPipe
+    }
+
     func send(_ frame: Data) async throws {
-        lock.lock()
-        let pipe = stdinPipe
-        let alive = (process?.isRunning ?? false) && !closed
-        lock.unlock()
-        guard let pipe, alive else { throw MCPTransportError.processExited }
+        guard let pipe = writableStdin() else { throw MCPTransportError.processExited }
         var line = frame
         line.append(0x0A)
         // write(contentsOf:) raises an ObjC exception on a broken pipe; the
@@ -201,6 +205,18 @@ final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
     private var sessionID: String?
     private var onMessage: (@Sendable (Data) -> Void)?
 
+    // Synchronous locked accessors: NSLock is not usable directly inside the
+    // async `send`, so every state touch goes through one of these.
+    private func currentSessionID() -> String? {
+        lock.lock(); defer { lock.unlock() }; return sessionID
+    }
+    private func setSessionID(_ id: String) {
+        lock.lock(); sessionID = id; lock.unlock()
+    }
+    private func messageHandler() -> (@Sendable (Data) -> Void)? {
+        lock.lock(); defer { lock.unlock() }; return onMessage
+    }
+
     init(urlString: String, headers: [String: String]) throws {
         guard let u = URL(string: urlString), let scheme = u.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -228,8 +244,7 @@ final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         req.setValue(MCP.protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version")
-        lock.lock(); let sid = sessionID; lock.unlock()
-        if let sid { req.setValue(sid, forHTTPHeaderField: "Mcp-Session-Id") }
+        if let sid = currentSessionID() { req.setValue(sid, forHTTPHeaderField: "Mcp-Session-Id") }
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
 
         let data: Data, resp: URLResponse
@@ -238,16 +253,14 @@ final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         guard let http = resp as? HTTPURLResponse else {
             throw MCPTransportError.network("no HTTP response")
         }
-        if let sid = http.value(forHTTPHeaderField: "Mcp-Session-Id") {
-            lock.lock(); sessionID = sid; lock.unlock()
-        }
+        if let sid = http.value(forHTTPHeaderField: "Mcp-Session-Id") { setSessionID(sid) }
         guard (200..<300).contains(http.statusCode) else {
             throw MCPTransportError.http(http.statusCode,
                                          String(data: data, encoding: .utf8) ?? "")
         }
         // 202/empty body: an accepted notification — nothing to deliver.
         guard !data.isEmpty else { return }
-        lock.lock(); let handler = onMessage; lock.unlock()
+        let handler = messageHandler()
         let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
         if contentType.contains("text/event-stream") {
             for frame in Self.sseFrames(String(data: data, encoding: .utf8) ?? "") {

@@ -267,15 +267,25 @@ public final class MCPManager: @unchecked Sendable {
 
     // MARK: Execution
 
+    /// Synchronous locked lookup: NSLock is not usable directly inside an async
+    /// function (the compiler forbids it — a suspension while holding the lock
+    /// would deadlock), so `execute` resolves the target through this helper.
+    private func target(forToolNamed name: String)
+        -> (client: MCPClient?, serverName: String, tool: String)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let target = toolIndex[name] else { return nil }
+        return (entries[target.server]?.client,
+                entries[target.server]?.config.name ?? target.server,
+                target.tool)
+    }
+
     /// Execute a model-emitted call if it targets an MCP tool; nil if the name
     /// is not an MCP tool (callers then fall back to manual entry). Transport /
     /// server errors come back as an error ToolOutput so the model can react.
     public func execute(_ call: ToolCall) async -> ToolOutput? {
-        lock.lock()
-        guard let target = toolIndex[call.name] else { lock.unlock(); return nil }
-        let client = entries[target.server]?.client
-        let serverName = entries[target.server]?.config.name ?? target.server
-        lock.unlock()
+        guard let target = target(forToolNamed: call.name) else { return nil }
+        let client = target.client
+        let serverName = target.serverName
 
         guard let client else {
             let msg = WebClient.jsonEscape("MCP server '\(serverName)' is not connected")
