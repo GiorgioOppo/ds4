@@ -178,6 +178,7 @@ server mode, distributed mode, diagnostics, and tuning panels.
 | **Chat** | Main local or distributed conversation. |
 | **Settings** | Shared model, context, execution mode, memory/I/O knobs, local load, distributed route. |
 | **Agents** | Editable roles with prompts, icons, and tool allow-lists. |
+| **MCP** | Configure external MCP servers whose tools extend the built-ins. |
 | **Project** | Imported project library and active project cache. |
 | **Tuning** | Expert slot-cache controls and usage imatrix. |
 | **Server** | OpenAI/Anthropic-compatible native HTTP server. |
@@ -276,6 +277,34 @@ training template.
 
 Tool results are inserted back into the conversation as user-side tool-result
 turns. Built-ins run automatically. Unknown tools can be answered manually.
+
+### MCP Servers
+
+The **MCP** tab connects the app, as a Model Context Protocol CLIENT, to
+external tool servers. Each configured server is either:
+
+- **stdio** — the app spawns the server (`npx`, `uvx`, or any executable) as a
+  child process and speaks newline-delimited JSON-RPC over stdin/stdout;
+- **HTTP** — Streamable-HTTP transport: JSON-RPC is POSTed to the server URL
+  (with optional headers such as an Authorization token), for remote servers or
+  local ones the sandbox cannot spawn.
+
+At connect time the app runs the `initialize` handshake and fetches
+`tools/list`. Each server tool then appears next to the built-ins — in the chat
+Tool sheet under "MCP Tools" and in every agent's tool list — under the
+namespaced name `mcp_<server>_<tool>` (e.g. `mcp_fs_read_file`). When the model
+calls one, the app forwards `tools/call` to the server and feeds the text
+result back into the conversation; server errors and timeouts come back as
+error results the model can react to. Sub-agents cannot be granted MCP tools.
+
+Configs persist across launches and can be imported/exported in the standard
+`{"mcpServers": …}` JSON shared with Claude Desktop, Cursor, and VS Code.
+Note for sandboxed (App Store) builds: stdio child processes inherit the app
+sandbox, so servers needing broad file or network access should run outside
+the app and be reached over HTTP. Dev builds (`swift run`, `make app`) are
+unsandboxed. Engine-side code lives in `Sources/DS4Engine/Tools/MCP/`
+(`MCPManager`, `MCPClient`, transports); the panel is
+`Sources/DwarfStar/Settings/MCPServersView.swift`.
 
 ### Sub-Agents
 

@@ -55,6 +55,10 @@ final class DistributedController {
     /// re-rendered in full on every send (stateless coordinator).
     private var turns: [ChatTurn] = []
     private var toolRounds = 0
+    /// Bumped by Stop / New Chat: an async tool round (MCP call in flight)
+    /// captured under an older epoch must drop its results instead of
+    /// appending to a conversation the user has ended or cleared.
+    private var chatEpoch = 0
     /// Tool-loop bound. Illimitato su richiesta (nota: ogni round distribuito
     /// ri-prefilla l'intera conversazione). Si ferma per contesto pieno o Stop.
     private var maxToolRounds: Int { .max }
@@ -188,7 +192,7 @@ final class DistributedController {
         // Immutable snapshot for the detached closure (capturing a mutable local
         // trips Swift 6 region analysis: "sending parameter risks data races").
         let sendTurns: [ChatTurn] = (agent.systemPrompt.isEmpty ? [] : [.system(agent.systemPrompt)]) + turns
-        let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.specs(enabled: Set(agent.toolNames))
+        let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.autoSpecs(enabled: Set(agent.toolNames))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
         enum Ev: Sendable { case log(String), progress(String), reasoning(String), token(String) }
@@ -250,23 +254,36 @@ final class DistributedController {
             isGenerating = false; status = ""
             return
         }
-        for c in calls {
-            let out = ToolRegistry.execute(c)
-                ?? ToolOutput(callId: c.id, name: c.name,
-                              content: #"{"error":"tool is not built in: unsupported in distributed mode"}"#)
-            messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
-            turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
+        // MCP calls make this round ASYNC (the old all-builtin round was
+        // synchronous, so Stop / New Chat could never interleave). The Task is
+        // stored in coordTask so stopGeneration() cancels it, and the epoch
+        // guard drops the round if Stop or New Chat ran during an await —
+        // otherwise a finished MCP call would append stale turns and silently
+        // resume a generation the user ended.
+        let epoch = chatEpoch
+        coordTask = Task {
+            for c in calls {
+                if MCPManager.shared.isMCPTool(named: c.name) { status = "MCP: \(c.name)…" }
+                let out = await ToolRegistry.executeAuto(c)
+                    ?? ToolOutput(callId: c.id, name: c.name,
+                                  content: #"{"error":"unknown tool: not built in and not provided by a connected MCP server"}"#)
+                guard !Task.isCancelled, epoch == chatEpoch else { return }
+                messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
+                turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
+            }
+            generateTurn()      // continue with the tool results
         }
-        generateTurn()      // continue with the tool results
     }
 
     func stopGeneration() {
+        chatEpoch += 1                    // invalidate any in-flight async tool round
         coordTask?.cancel()
         isGenerating = false
         coordLog += "[stopped] (the next question starts from scratch)\n"
     }
 
     func newChat() {
+        chatEpoch += 1                    // an in-flight tool round must not touch the fresh chat
         messages.removeAll()
         turns.removeAll()
         toolRounds = 0

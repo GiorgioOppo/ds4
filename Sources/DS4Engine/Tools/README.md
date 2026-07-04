@@ -9,6 +9,10 @@ library they operate on.
 - **`Builtins/`** contains **one file per tool** using
   `extension ToolRegistry { static let X = BuiltinTool(...) }`. Adding a tool
   means adding a file here and registering it in `builtins[]`.
+- **`MCP/`** contains the MCP (Model Context Protocol) client: config,
+  JSON-RPC protocol helpers, stdio/HTTP transports, per-server client, and
+  `MCPManager.shared`, which exposes connected servers' tools as namespaced
+  `ToolSpec`s (`mcp_<server>_<tool>`) next to the built-ins (see `MCP/README.md`).
 - **`ProjectCache.swift`** indexes imported projects and backs the `project_*`
   and `file_*` tools for read/list/search/write/edit/add/line-modify operations.
   It does not touch chat memory.

@@ -635,21 +635,19 @@ struct ToolPickerView: View {
                 .font(.caption).foregroundStyle(.secondary)
 
             Divider()
-            Text("Built-in Tools").font(.headline)
-            ForEach(store.availableTools) { tool in
-                Toggle(isOn: Binding(
-                    get: { store.enabledToolNames.contains(tool.name) },
-                    set: { on in
-                        if on { store.enabledToolNames.insert(tool.name) }
-                        else { store.enabledToolNames.remove(tool.name) }
-                        store.syncTools()
-                    })) {
-                    VStack(alignment: .leading) {
-                        Text(tool.name).font(.body.monospaced())
-                        Text(tool.description).font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Built-in Tools").font(.headline)
+                    toolToggles(store.builtinTools)
+                    if !store.mcpTools.isEmpty {
+                        Divider()
+                        Text("MCP Tools").font(.headline)
+                        Text("Exposed by the connected MCP servers (configured in the MCP panel); they run on the external server.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        toolToggles(store.mcpTools)
                     }
                 }
-                .disabled(!store.toolsEnabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Divider()
@@ -666,7 +664,28 @@ struct ToolPickerView: View {
             }
         }
         .padding()
-        .frame(minWidth: 460, minHeight: 360)
+        .frame(minWidth: 460, minHeight: 360, maxHeight: 640)
+    }
+
+    /// One enable/disable toggle per tool spec, wired to `enabledToolNames`.
+    @ViewBuilder
+    private func toolToggles(_ tools: [ToolSpec]) -> some View {
+        ForEach(tools) { tool in
+            Toggle(isOn: Binding(
+                get: { store.enabledToolNames.contains(tool.name) },
+                set: { on in
+                    if on { store.enabledToolNames.insert(tool.name) }
+                    else { store.enabledToolNames.remove(tool.name) }
+                    store.syncTools()
+                })) {
+                VStack(alignment: .leading) {
+                    Text(tool.name).font(.body.monospaced())
+                    Text(tool.description).font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+            }
+            .disabled(!store.toolsEnabled)
+        }
     }
 }
 

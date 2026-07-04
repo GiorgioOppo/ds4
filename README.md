@@ -64,6 +64,7 @@ against the upstream behavior.
 | **Chat** | Streaming markdown chat, collapsible reasoning, live tool calls, multi-turn KV reuse, text-file attachments, active project menu, near-context-full warnings, Local or Distributed mode. |
 | **Settings** | Shared model path, context size, RAM-aware execution mode, memory/I/O knobs, local model load, and distributed coordinator route. |
 | **Agents** | Role editor: system prompt, icon, tools, JSON import/export, and per-agent expert-usage profile. |
+| **MCP** | External MCP servers (stdio child process or Streamable HTTP): connection status, exposed tools, `mcpServers`-JSON import/export. |
 | **Project** | Library of imported folders with sandbox bookmarks. Project tools explore the active project without consuming chat context until a tool reads content. |
 | **Tuning** | Expert cache slots, hit-rate, per-layer routing concentration, and the usage imatrix. |
 | **Server** | Native in-process OpenAI/Anthropic-compatible HTTP server. |
@@ -91,6 +92,12 @@ Built-in DSML tools live one per file under
 Default agents are **General**, **Coding**, **Code**, **Orchestrator**,
 **Math**, **Writing**, **LaTeX**, and **Documentation**. Each agent is a system
 prompt plus a tool allow-list plus a dedicated expert-usage profile.
+
+Beyond the built-ins, the **MCP** tab connects the app to external
+[Model Context Protocol](https://modelcontextprotocol.io) servers (stdio or
+Streamable HTTP). Their tools appear next to the built-ins — in the chat Tool
+sheet and in agent tool lists — as `mcp_<server>_<tool>`, and calls are
+forwarded to the server via `tools/call` (see `Sources/DS4Engine/Tools/MCP/`).
 
 ## Quick Start
 

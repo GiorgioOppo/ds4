@@ -4,6 +4,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case chat = "Chat"
     case settings = "Settings"
     case agents = "Agents"
+    case mcp = "MCP"
     case project = "Project"
     case tuning = "Tuning"
     case server = "Server"
@@ -17,6 +18,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chat: return "bubble.left.and.bubble.right"
         case .settings: return "gearshape"
         case .agents: return "person.2"
+        case .mcp: return "puzzlepiece.extension"
         case .project: return "folder"
         case .tuning: return "slider.horizontal.3"
         case .server: return "server.rack"
@@ -32,15 +34,17 @@ enum AppSection: String, CaseIterable, Identifiable {
 struct RootView: View {
     @Bindable var store: ChatStore
     let settings: AppSettings
+    let mcp: MCPStore
     @State private var distributed: DistributedController
     @State private var server: ServerController
     @State private var bench: BenchController
     @State private var diagnostics: DiagnosticsController
     @State private var selection: AppSection? = .chat
 
-    init(store: ChatStore, settings: AppSettings) {
+    init(store: ChatStore, settings: AppSettings, mcp: MCPStore) {
         self.store = store
         self.settings = settings
+        self.mcp = mcp
         let distributed = DistributedController(settings: settings)
         _distributed = State(initialValue: distributed)
         _server = State(initialValue: ServerController(settings: settings, store: store))
@@ -64,6 +68,8 @@ struct RootView: View {
                 SettingsView(settings: settings, store: store, dist: distributed)
             case .agents:
                 AgentsView(store: store)
+            case .mcp:
+                MCPServersView(store: mcp)
             case .project:
                 ProjectView(store: store)
             case .tuning:

@@ -50,7 +50,8 @@ let package = Package(
             name: "DS4Engine",
             dependencies: ["DS4Core", "DS4Metal"],
             exclude: ["README.md", "Service/README.md", "Tools/README.md",
-                      "Tools/Builtins/README.md", "Download/README.md", "Distributed/README.md"]
+                      "Tools/Builtins/README.md", "Tools/MCP/README.md",
+                      "Download/README.md", "Distributed/README.md"]
         ),
 
         // The SwiftUI GUI app — driven by the pure-Swift engine (DS4Engine).
