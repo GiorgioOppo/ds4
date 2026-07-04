@@ -76,11 +76,14 @@ public final class DiskKVStore: @unchecked Sendable {
         var best: Hit?
         for url in entryURLs() {
             guard let scan = scanEntry(url) else { continue }
+            // Local, NOT inline: `count < contextSize, … count > (…)` would be
+            // parsed as a generic specialization `count<…>(…)` by Swift.
+            let bestCount = best?.tokens.count ?? 0
             guard scan.model == modelName,
                   scan.tokens.count >= options.minTokens,
                   scan.tokens.count < ids.count,
                   scan.tokens.count < contextSize,
-                  scan.tokens.count > (best?.tokens.count ?? 0),
+                  scan.tokens.count > bestCount,
                   ids.starts(with: scan.tokens) else { continue }
             best = Hit(tokens: scan.tokens, url: url)
         }
