@@ -458,6 +458,16 @@ the distributed conversation when the app mode is **Distributed**.
 Distributed tool calls execute on the coordinator Mac, so project tools refer to
 the coordinator's active project.
 
+Robustness (protocol v2): the coordinator validates each worker's protocol
+version at connect; every chat turn or benchmark run carries a `session` id
+that workers echo in their results, so a reply left in a socket buffer by a
+stopped turn is discarded instead of corrupting the next one. Workers validate
+every WORK frame (payload size, layer bounds, position) before running it and
+serve one turn at a time — a competing coordinator receives an explicit error.
+Stop propagates to the cluster generation task and takes effect at the next
+chunk boundary. Frames are plaintext TCP with no authentication: run
+distributed mode only on trusted networks.
+
 ### Benchmark
 
 The benchmark panel measures prefill and generation throughput at increasing

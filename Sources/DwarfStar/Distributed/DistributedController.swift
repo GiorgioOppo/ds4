@@ -227,7 +227,11 @@ final class DistributedController {
                     return .success(calls)
                 } catch { return .failure(error) }
             }
-            let result = await work.value
+            // A detached task does NOT inherit cancellation: forward Stop
+            // (coordTask.cancel) explicitly, or the cluster generation would
+            // keep running — and streaming tokens — to completion.
+            let result = await withTaskCancellationHandler { await work.value }
+                                                  onCancel: { work.cancel() }
             cont.finish()
             switch result {
             case .failure(let error):

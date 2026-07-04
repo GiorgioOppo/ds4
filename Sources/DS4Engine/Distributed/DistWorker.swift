@@ -26,6 +26,20 @@ public final class DistWorker: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ds4.dist.worker")
     private let gate = DistGate()
     private var listener: NWListener?
+    /// One TURN at a time, enforced at the session level (NOT per connection:
+    /// in forwarding mode a worker legitimately holds one connection from the
+    /// coordinator AND one from the previous worker). A pos==0 chunk ADOPTS its
+    /// session id as current; any chunk from a different session is refused
+    /// with an ERROR frame — a competing coordinator fails loudly instead of
+    /// silently resetting the active turn's KV shard.
+    private let sessionLock = NSLock()
+    private var currentSession: UInt32?
+
+    private func admit(_ work: DistWork) -> Bool {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        if work.pos == 0 { currentSession = work.session; return true }
+        return currentSession == work.session
+    }
 
     public init(config: Config, onLog: @escaping @Sendable (String) -> Void) throws {
         self.config = config
@@ -88,10 +102,30 @@ public final class DistWorker: @unchecked Sendable {
                 let (type, payload) = try await conn.readFrame()
                 guard type == .work, let work = DistWork.decode(payload) else { continue }
 
+                // Validate the chunk BEFORE touching the engine: sizes come from
+                // the network, and a mismatch would otherwise crash the process
+                // (out-of-bounds slicing / forwardSlice precondition).
+                let stateLen = engine.hcStateCount
+                let n = work.nTokens
+                guard n >= 1, work.hc.count == n * stateLen,
+                      work.layerStart >= 0, work.layerStart <= work.layerEnd,
+                      work.layerEnd < engine.nLayers, work.pos >= 0,
+                      work.pos + n <= engine.contextSize else {
+                    let msg = "invalid WORK frame: nTokens=\(work.nTokens) hc=\(work.hc.count) "
+                        + "(state \(stateLen)) layers \(work.layerStart)...\(work.layerEnd) pos \(work.pos)"
+                    onLog(msg + "\n")
+                    try await conn.sendFrame(.error, Data(msg.utf8))
+                    continue
+                }
+                guard admit(work) else {
+                    let msg = "refused WORK for session \(work.session): another turn is active on this worker"
+                    onLog(msg + "\n")
+                    try await conn.sendFrame(.error, Data(msg.utf8))
+                    continue
+                }
+
                 // Serialize compute: one chunk at a time against the shard.
                 // The chunk's hc holds nTokens states; split, run, re-concat.
-                let stateLen = engine.hcStateCount
-                let n = max(1, work.nTokens)
                 let outStates: [[Float]] = try await gate.run {
                     var hcs: [[Float]] = []
                     hcs.reserveCapacity(n)
@@ -110,14 +144,16 @@ public final class DistWorker: @unchecked Sendable {
                 if isTerminal {
                     // Terminal hop: produce logits for the chunk's LAST token if asked,
                     // else hidden states (relay) / a bare ack (forwarding flow control).
+                    // Every result ECHOES the work's session id (stale-reply guard).
                     let result: DistResult
                     if work.flags.contains(.outputLogits) {
-                        result = DistResult(kind: .logits, bits: 32, values: try engine.head(hc: outStates[n-1]))
+                        result = DistResult(session: work.session, kind: .logits, bits: 32,
+                                            values: try engine.head(hc: outStates[n-1]))
                     } else if work.route.isEmpty {
-                        result = DistResult(kind: .hidden, bits: work.hcBits,
+                        result = DistResult(session: work.session, kind: .hidden, bits: work.hcBits,
                                             values: outStates.flatMap { $0 })
                     } else {
-                        result = DistResult(kind: .ack, bits: 32, values: [])
+                        result = DistResult(session: work.session, kind: .ack, bits: 32, values: [])
                     }
                     if work.route.isEmpty {
                         try await conn.sendFrame(.result, result.encoded())     // relay: reply upstream
@@ -129,7 +165,7 @@ public final class DistWorker: @unchecked Sendable {
                     // Forward the chunk to the next hop in the route.
                     let nextIdx = work.routeIndex + 1
                     let next = work.route[nextIdx]
-                    let fwd = DistWork(pos: work.pos, nTokens: n,
+                    let fwd = DistWork(session: work.session, pos: work.pos, nTokens: n,
                                        layerStart: next.layerStart, layerEnd: next.layerEnd,
                                        flags: work.flags, hcBits: work.hcBits,
                                        route: work.route, routeIndex: nextIdx,

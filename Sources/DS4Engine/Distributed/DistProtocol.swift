@@ -14,8 +14,14 @@ import DS4Core
 /// floats; it can be transported at 32/16/8-bit width to save bandwidth.
 public enum Dist {
     /// Bump when the framing or semantics change incompatibly.
-    public static let protocolVersion: UInt32 = 1
+    /// v2: HELLO carries the version; WORK/RESULT carry a per-turn `session`
+    /// id echoed by the workers, so a result left in a TCP buffer by a
+    /// cancelled turn can never be mistaken for the next turn's reply.
+    public static let protocolVersion: UInt32 = 2
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
+    /// Sanity cap on the route length in a WORK frame (a hostile frame could
+    /// otherwise declare 4G entries and spin the decoder).
+    static let maxRouteEntries = 256
 
     public enum MsgType: UInt32, Sendable {
         case hello   = 1    // worker → coordinator on connect (slice + model identity)
@@ -61,8 +67,11 @@ public struct DistFrameHeader {
     }
 }
 
-/// HELLO payload: a worker announces its model identity and the slice it serves.
+/// HELLO payload: a worker announces its protocol version, model identity and
+/// the slice it serves. The coordinator validates the version FIRST — a mixed
+/// cluster fails with a clear error instead of garbled frames.
 public struct DistHello: Sendable {
+    public var version: UInt32
     public var modelName: String
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
@@ -71,13 +80,15 @@ public struct DistHello: Sendable {
     public var contextSize: Int
 
     public init(modelName: String, layerStart: Int, layerEnd: Int, hasOutput: Bool,
-                nLayers: Int, contextSize: Int) {
+                nLayers: Int, contextSize: Int, version: UInt32 = Dist.protocolVersion) {
+        self.version = version
         self.modelName = modelName; self.layerStart = layerStart; self.layerEnd = layerEnd
         self.hasOutput = hasOutput; self.nLayers = nLayers; self.contextSize = contextSize
     }
 
     public func encoded() -> Data {
         var d = Data()
+        d.appendLE(version)
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(UInt32(hasOutput ? 1 : 0))
         d.appendLE(UInt32(nLayers)); d.appendLE(UInt32(contextSize))
@@ -88,15 +99,16 @@ public struct DistHello: Sendable {
 
     public static func decode(_ d: Data) -> DistHello? {
         var o = d.startIndex
-        guard d.count >= 24 else { return nil }
+        guard d.count >= 28 else { return nil }
+        let ver = d.readLE(&o) as UInt32
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let ho = (d.readLE(&o) as UInt32) != 0
         let nl = Int(d.readLE(&o) as UInt32), ctx = Int(d.readLE(&o) as UInt32)
         let nameLen = Int(d.readLE(&o) as UInt32)
-        guard o + nameLen <= d.endIndex else { return nil }
+        guard nameLen >= 0, o + nameLen <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self)
         return DistHello(modelName: name, layerStart: ls, layerEnd: le, hasOutput: ho,
-                         nLayers: nl, contextSize: ctx)
+                         nLayers: nl, contextSize: ctx, version: ver)
     }
 }
 
@@ -106,6 +118,7 @@ public struct DistHello: Sendable {
 /// (worker→worker) and the terminal worker replies to `returnHost:returnPort`;
 /// when empty, each worker replies on the same connection (coordinator relay).
 public struct DistWork: Sendable {
+    public var session: UInt32        // per-turn id, echoed by workers in RESULT
     public var pos: Int               // absolute position of the FIRST token
     public var nTokens: Int           // tokens in this chunk (hc holds nTokens states)
     public var layerStart: Int
@@ -118,9 +131,10 @@ public struct DistWork: Sendable {
     public var returnPort: UInt16
     public var hc: [Float]            // nTokens * (nHC*nEmbd) floats
 
-    public init(pos: Int, nTokens: Int, layerStart: Int, layerEnd: Int, flags: Dist.WorkFlags,
-                hcBits: Int, route: [DistRouteEntry] = [], routeIndex: Int = 0,
+    public init(session: UInt32, pos: Int, nTokens: Int, layerStart: Int, layerEnd: Int,
+                flags: Dist.WorkFlags, hcBits: Int, route: [DistRouteEntry] = [], routeIndex: Int = 0,
                 returnHost: String = "", returnPort: UInt16 = 0, hc: [Float]) {
+        self.session = session
         self.pos = pos; self.nTokens = nTokens; self.layerStart = layerStart; self.layerEnd = layerEnd
         self.flags = flags; self.hcBits = hcBits; self.route = route; self.routeIndex = routeIndex
         self.returnHost = returnHost; self.returnPort = returnPort; self.hc = hc
@@ -128,6 +142,7 @@ public struct DistWork: Sendable {
 
     public func encoded() -> Data {
         var d = Data()
+        d.appendLE(session)
         d.appendLE(UInt32(bitPattern: Int32(pos)))
         d.appendLE(UInt32(nTokens))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
@@ -145,7 +160,8 @@ public struct DistWork: Sendable {
 
     public static func decode(_ d: Data) -> DistWork? {
         var o = d.startIndex
-        guard d.count >= 32 else { return nil }
+        guard d.count >= 36 else { return nil }
+        let session = d.readLE(&o) as UInt32
         let pos = Int(Int32(bitPattern: d.readLE(&o)))
         let nTokens = Int(d.readLE(&o) as UInt32)
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
@@ -153,6 +169,7 @@ public struct DistWork: Sendable {
         let bits = Int(d.readLE(&o) as UInt32)
         let routeCount = Int(d.readLE(&o) as UInt32)
         let routeIndex = Int(d.readLE(&o) as UInt32)
+        guard routeCount <= Dist.maxRouteEntries else { return nil }
         var route: [DistRouteEntry] = []
         for _ in 0..<routeCount {
             guard let e = DistRouteEntry.decode(d, &o) else { return nil }
@@ -160,29 +177,38 @@ public struct DistWork: Sendable {
         }
         guard o + 4 <= d.endIndex else { return nil }
         let rhLen = Int(d.readLE(&o) as UInt32)
-        guard o + rhLen + 8 <= d.endIndex else { return nil }
+        guard rhLen >= 0, o + rhLen + 8 <= d.endIndex else { return nil }
         let returnHost = String(decoding: d[o..<o+rhLen], as: UTF8.self); o += rhLen
         let returnPort = UInt16(clamping: d.readLE(&o) as UInt32)
         let count = Int(d.readLE(&o) as UInt32)
-        let hc = count == 0 ? [] : ActivationCodec.unpack(Data(d[o..<d.endIndex]), count: count, bits: bits)
-        return DistWork(pos: pos, nTokens: nTokens, layerStart: ls, layerEnd: le, flags: flags,
-                        hcBits: bits, route: route, routeIndex: routeIndex,
+        // Strict: a chunk whose payload does not hold EXACTLY `count` values is
+        // rejected here, so no consumer ever slices a silently-short array.
+        guard let hc = ActivationCodec.unpack(Data(d[o..<d.endIndex]), count: count, bits: bits) else {
+            return nil
+        }
+        return DistWork(session: session, pos: pos, nTokens: nTokens, layerStart: ls, layerEnd: le,
+                        flags: flags, hcBits: bits, route: route, routeIndex: routeIndex,
                         returnHost: returnHost, returnPort: returnPort, hc: hc)
     }
 }
 
-/// RESULT payload: the produced HC state (forward to the next slice) or final logits.
+/// RESULT payload: the produced HC state (forward to the next slice) or final
+/// logits. `session` echoes the WORK's session id: the coordinator discards any
+/// result from a turn it has already abandoned (Stop mid-chunk leaves the reply
+/// in a TCP buffer — without the echo it would be read as the NEXT turn's answer).
 public struct DistResult: Sendable {
+    public var session: UInt32
     public var kind: Dist.ResultKind
     public var bits: Int
     public var values: [Float]
 
-    public init(kind: Dist.ResultKind, bits: Int, values: [Float]) {
-        self.kind = kind; self.bits = bits; self.values = values
+    public init(session: UInt32, kind: Dist.ResultKind, bits: Int, values: [Float]) {
+        self.session = session; self.kind = kind; self.bits = bits; self.values = values
     }
 
     public func encoded() -> Data {
         var d = Data()
+        d.appendLE(session)
         d.appendLE(kind.rawValue)
         d.appendLE(UInt32(bits))
         d.appendLE(UInt32(values.count))
@@ -192,11 +218,15 @@ public struct DistResult: Sendable {
 
     public static func decode(_ d: Data) -> DistResult? {
         var o = d.startIndex
-        guard d.count >= 12, let kind = Dist.ResultKind(rawValue: d.readLE(&o)) else { return nil }
+        guard d.count >= 16 else { return nil }
+        let session = d.readLE(&o) as UInt32
+        guard let kind = Dist.ResultKind(rawValue: d.readLE(&o)) else { return nil }
         let bits = Int(d.readLE(&o) as UInt32)
         let count = Int(d.readLE(&o) as UInt32)
-        let values = count == 0 ? [] : ActivationCodec.unpack(Data(d[o..<d.endIndex]), count: count, bits: bits)
-        return DistResult(kind: kind, bits: bits, values: values)
+        guard let values = ActivationCodec.unpack(Data(d[o..<d.endIndex]), count: count, bits: bits) else {
+            return nil
+        }
+        return DistResult(session: session, kind: kind, bits: bits, values: values)
     }
 }
 
@@ -204,54 +234,67 @@ public struct DistResult: Sendable {
 
 /// Packs/unpacks a float activation vector at 32, 16 (float16) or 8 (per-vector
 /// scaled int8) bits. 8-bit uses a single absmax scale prepended as Float32.
+///
+/// This is the WIRE HOT PATH (an HC state is tens of thousands of floats, per
+/// chunk, per hop): everything moves as bulk buffer copies on the little-endian
+/// arm64 host — never per-element Data appends/reads. `unpack` is STRICT: it
+/// returns nil unless the payload holds exactly `count` values, so a truncated
+/// frame is rejected at decode instead of surfacing as a short array that
+/// crashes the consumer's slicing.
 public enum ActivationCodec {
     public static func pack(_ v: [Float], bits: Int) -> Data {
         switch bits {
         case 16:
-            var d = Data(capacity: v.count * 2)
-            for x in v { d.appendLE(Half.bits(x)) }
-            return d
+            var half = [UInt16](repeating: 0, count: v.count)
+            for i in v.indices { half[i] = Half.bits(v[i]) }
+            return half.withUnsafeBufferPointer { Data(buffer: $0) }
         case 8:
             let absmax = v.reduce(Float(0)) { max($0, abs($1)) }
             let scale = absmax > 0 ? absmax / 127.0 : 1
             var d = Data(capacity: 4 + v.count)
             d.appendLE(scale.bitPattern)
-            for x in v {
-                let q = Int(( x / scale).rounded())
-                d.append(UInt8(bitPattern: Int8(clamping: q)))
-            }
+            var q = [UInt8](repeating: 0, count: v.count)
+            for i in v.indices { q[i] = UInt8(bitPattern: Int8(clamping: Int((v[i] / scale).rounded()))) }
+            d.append(contentsOf: q)
             return d
         default: // 32
-            var d = Data(capacity: v.count * 4)
-            for x in v { d.appendLE(x.bitPattern) }
-            return d
+            return v.withUnsafeBufferPointer { Data(buffer: $0) }
         }
     }
 
-    public static func unpack(_ d: Data, count: Int, bits: Int) -> [Float] {
-        var o = d.startIndex
-        var out = [Float](); out.reserveCapacity(count)
+    public static func unpack(_ d: Data, count: Int, bits: Int) -> [Float]? {
+        guard count >= 0 else { return nil }
+        if count == 0 { return [] }
         switch bits {
         case 16:
-            for _ in 0..<count {
-                guard o + 2 <= d.endIndex else { break }
-                out.append(Half.float(d.readLE(&o) as UInt16))
+            guard d.count >= count * 2 else { return nil }
+            return d.withUnsafeBytes { raw -> [Float] in
+                let src = raw.baseAddress!
+                var half = [UInt16](repeating: 0, count: count)
+                half.withUnsafeMutableBytes { _ = memcpy($0.baseAddress!, src, count * 2) }
+                var out = [Float](repeating: 0, count: count)
+                for i in 0..<count { out[i] = Half.float(half[i]) }
+                return out
             }
         case 8:
-            guard o + 4 <= d.endIndex else { return out }
-            let scale = Float(bitPattern: d.readLE(&o) as UInt32)
-            for _ in 0..<count {
-                guard o < d.endIndex else { break }
-                let q = Int8(bitPattern: d[o]); o += 1
-                out.append(Float(q) * scale)
+            guard d.count >= 4 + count else { return nil }
+            return d.withUnsafeBytes { raw -> [Float] in
+                let scale = Float(bitPattern: raw.loadUnaligned(as: UInt32.self))
+                let bytes = raw.baseAddress! + 4
+                var out = [Float](repeating: 0, count: count)
+                for i in 0..<count {
+                    out[i] = Float(Int8(bitPattern: bytes.load(fromByteOffset: i, as: UInt8.self))) * scale
+                }
+                return out
             }
         default:
-            for _ in 0..<count {
-                guard o + 4 <= d.endIndex else { break }
-                out.append(Float(bitPattern: d.readLE(&o) as UInt32))
+            guard d.count >= count * 4 else { return nil }
+            return d.withUnsafeBytes { raw -> [Float] in
+                var out = [Float](repeating: 0, count: count)
+                out.withUnsafeMutableBytes { _ = memcpy($0.baseAddress!, raw.baseAddress!, count * 4) }
+                return out
             }
         }
-        return out
     }
 }
 

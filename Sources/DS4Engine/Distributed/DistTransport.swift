@@ -1,7 +1,12 @@
 import Foundation
 @preconcurrency import Network
 
-public enum DistError: Error { case badFrame, closed, badPort, sliceGap(String), modelMismatch(String) }
+public enum DistError: Error {
+    case badFrame, closed, badPort
+    case sliceGap(String), modelMismatch(String)
+    case versionMismatch(String)     // mixed builds in the cluster
+    case remote(String)              // an ERROR frame from a worker (its own words)
+}
 
 /// Async framed connection over NWConnection: every message is a `DistFrameHeader`
 /// (magic + type + length) followed by `length` payload bytes. Used by both the

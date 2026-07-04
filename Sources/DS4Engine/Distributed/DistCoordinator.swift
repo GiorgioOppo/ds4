@@ -45,6 +45,12 @@ public final class DistCoordinator: @unchecked Sendable {
     private var entries: [DistRouteEntry] = []
     private var returnListener: DistReturnListener?
     private var returnIter: AsyncStream<DistResult>.Iterator?
+    /// Per-turn session id, echoed by workers in every RESULT. A turn abandoned
+    /// mid-chunk (Stop) leaves its reply in a TCP/listener buffer; the next
+    /// turn's id differs, so the stale frame is discarded instead of being
+    /// mistaken for the new turn's first reply. Sends are serialized by the
+    /// caller (one chat turn / benchmark at a time), so a plain counter is enough.
+    private var sessionCounter: UInt32 = 0
 
     public var routeSummary: String { "\(engine.nLayers) layers · \(entries.count) workers" }
 
@@ -62,7 +68,14 @@ public final class DistCoordinator: @unchecked Sendable {
         for p in config.peers {
             let conn = try DistConnection.connect(host: p.host, port: p.port, queue: queue)
             let (type, payload) = try await conn.readFrame()
+            if type == .error {
+                throw DistError.remote(String(decoding: payload, as: UTF8.self))
+            }
             guard type == .hello, let h = DistHello.decode(payload) else { throw DistError.badFrame }
+            guard h.version == Dist.protocolVersion else {
+                throw DistError.versionMismatch(
+                    "worker \(p.host):\(p.port) speaks protocol v\(h.version), this build v\(Dist.protocolVersion) — update all nodes to the same DwarfStar build")
+            }
             if h.modelName != engine.modelName {
                 onLog("warning: worker \(p.host) has model '\(h.modelName)' != '\(engine.modelName)'\n")
             }
@@ -115,6 +128,8 @@ public final class DistCoordinator: @unchecked Sendable {
                      onReasoning: @Sendable (String) -> Void,
                      onToken: @Sendable (String) -> Void) async throws -> [ToolCall] {
         guard !entries.isEmpty else { throw DistError.closed }
+        sessionCounter &+= 1
+        let session = sessionCounter
         let ids = engine.chatPromptIds(turns: turns, tools: tools, think: think)
         guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt exceeds context") }
         onLog("prefill \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
@@ -134,7 +149,8 @@ public final class DistCoordinator: @unchecked Sendable {
                 let n = (h0.reduce(0) { $0 + $1 * $1 }).squareRoot()
                 onLog(String(format: "diag: |embed| = %.2f (hc=%d float)\n", n, h0.count))
             }
-            if let logits = try await runChunk(hcs: hcs, posBase: pos, wantLogits: end == ids.count) {
+            if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               wantLogits: end == ids.count) {
                 lastLogits = logits
             }
             pos += end - start
@@ -191,7 +207,8 @@ public final class DistCoordinator: @unchecked Sendable {
             recentIds.append(next)
             if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
             let hc = try engine.embed(token: next, pos: pos)
-            guard let logits = try await runChunk(hcs: [hc], posBase: pos, wantLogits: true) else {
+            guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
+                                                  wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
@@ -217,6 +234,8 @@ public final class DistCoordinator: @unchecked Sendable {
     /// `InferenceService.benchmark` so local and distributed numbers are comparable.
     public func benchmark(contextTokens: Int, genTokens: Int) async throws -> InferenceService.BenchPoint {
         guard !entries.isEmpty else { throw DistError.closed }
+        sessionCounter &+= 1
+        let session = sessionCounter
         let ctx = max(8, min(contextTokens, config.contextSize - genTokens - 4))
         // Synthetic prompt: BOS + tiled filler. Output quality is irrelevant for
         // timing; the per-token work (embed · slice forward · expert gather) is the same.
@@ -239,7 +258,8 @@ public final class DistCoordinator: @unchecked Sendable {
             for (k, id) in ids[start..<end].enumerated() {
                 hcs.append(try engine.embed(token: id, pos: pos + k))
             }
-            if let logits = try await runChunk(hcs: hcs, posBase: pos, wantLogits: end == ids.count) {
+            if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               wantLogits: end == ids.count) {
                 lastLogits = logits
             }
             pos += end - start
@@ -257,7 +277,8 @@ public final class DistCoordinator: @unchecked Sendable {
             try Task.checkCancellation()
             let next = engine.sample(lastLogits, params: samp, rng: &rng)
             let hc = try engine.embed(token: next, pos: pos)
-            guard let logits = try await runChunk(hcs: [hc], posBase: pos, wantLogits: true) else {
+            guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
+                                                  wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
@@ -273,33 +294,49 @@ public final class DistCoordinator: @unchecked Sendable {
     }
 
     /// One chunk through the pipeline; returns the last token's logits if `wantLogits`.
-    private func runChunk(hcs: [[Float]], posBase: Int, wantLogits: Bool) async throws -> [Float]? {
+    /// Results are matched on the `session` echo: anything from an older session
+    /// (a turn abandoned mid-chunk) is discarded and the read repeats. ERROR
+    /// frames from workers surface with the worker's own message.
+    private func runChunk(session: UInt32, hcs: [[Float]], posBase: Int,
+                          wantLogits: Bool) async throws -> [Float]? {
         var flags: Dist.WorkFlags = []
         if posBase == 0 { flags.insert(.resetSession) }
         if config.forward {
             var f = flags
             if wantLogits { f.insert(.outputLogits) }
-            let work = DistWork(pos: posBase, nTokens: hcs.count,
+            let work = DistWork(session: session, pos: posBase, nTokens: hcs.count,
                                 layerStart: entries[0].layerStart, layerEnd: entries[0].layerEnd,
                                 flags: f, hcBits: config.activationBits, route: entries, routeIndex: 0,
                                 returnHost: config.returnHost, returnPort: config.returnPort,
                                 hc: hcs.flatMap { $0 })
             try await conns[0].sendFrame(.work, work.encoded())
-            guard let res = await returnIter?.next() else { throw DistError.closed }
-            return res.kind == .logits ? res.values : nil
+            while true {
+                guard let res = await returnIter?.next() else { throw DistError.closed }
+                guard res.session == session else { continue }   // stale turn: drop
+                return res.kind == .logits ? res.values : nil
+            }
         }
         var states = hcs
         let stateLen = engine.hcStateCount
         for (i, e) in entries.enumerated() {
             var f = flags
             if i == entries.count - 1, wantLogits { f.insert(.outputLogits) }
-            let work = DistWork(pos: posBase, nTokens: states.count, layerStart: e.layerStart,
-                                layerEnd: e.layerEnd, flags: f, hcBits: config.activationBits,
+            let work = DistWork(session: session, pos: posBase, nTokens: states.count,
+                                layerStart: e.layerStart, layerEnd: e.layerEnd,
+                                flags: f, hcBits: config.activationBits,
                                 hc: states.flatMap { $0 })
             try await conns[i].sendFrame(.work, work.encoded())
-            let (type, payload) = try await conns[i].readFrame()
-            guard type == .result, let res = DistResult.decode(payload) else { throw DistError.badFrame }
+            var res: DistResult
+            repeat {
+                let (type, payload) = try await conns[i].readFrame()
+                if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
+                guard type == .result, let r = DistResult.decode(payload) else { throw DistError.badFrame }
+                res = r
+            } while res.session != session                       // stale turn: drop
             if res.kind == .logits { return res.values }
+            // The worker echoes exactly nTokens states; anything else is a bug
+            // upstream — fail the turn, never slice a short array.
+            guard res.values.count == states.count * stateLen else { throw DistError.badFrame }
             states = (0..<states.count).map { Array(res.values[$0 * stateLen..<($0 + 1) * stateLen]) }
         }
         return nil
