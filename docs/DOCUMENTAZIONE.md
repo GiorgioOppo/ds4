@@ -23,7 +23,7 @@ compliance, see [`CRITTOGRAFIA.md`](CRITTOGRAFIA.md).
 5. [SwiftUI App: `DwarfStar`](#5-swiftui-app-dwarfstar)
 6. [User Workflow](#6-user-workflow)
 7. [Automatic Configuration and Hardware Presets](#7-automatic-configuration-and-hardware-presets)
-8. [Memory and Streaming](#8-memory-and-streaming)
+8. [Memory, Streaming, and GUI Defaults](#8-memory-streaming-and-gui-defaults)
 9. [Advanced Panels](#9-advanced-panels)
 10. [Build, Run, and Package](#10-build-run-and-package)
 11. [Troubleshooting](#11-troubleshooting)
@@ -36,7 +36,7 @@ model from SSD. Only a small routed subset of the model is touched for each
 token. The project avoids the old subprocess approach: the SwiftUI app talks
 directly to the Swift engine through actors and async streams.
 
-The same engine powers:
+The same engine implementation powers:
 
 - the interactive Chat tab;
 - tool calling and isolated sub-agents;
@@ -47,8 +47,10 @@ The same engine powers:
 
 The important design constraint is that the app must behave like the CLI demo:
 same model parser, same tokenizer, same decode graph, same sampling logic, same
-streaming assumptions. The GUI should add state management and convenience, not
-a second inference implementation.
+streaming assumptions. The GUI adds state management and convenience, not a
+second inference implementation. In local GUI mode, Chat, Server, and Benchmark
+reuse the single `InferenceService` loaded in Settings so the app does not
+double resident Q4 buffers, `mlock`ed buffers, or GPU scratch on low-RAM Macs.
 
 ## 2. Layered Architecture
 
@@ -174,7 +176,7 @@ server mode, distributed mode, diagnostics, and tuning panels.
 | Tab | Role |
 |---|---|
 | **Chat** | Main local or distributed conversation. |
-| **Settings** | Shared model, context, memory knobs, local load, distributed route. |
+| **Settings** | Shared model, context, execution mode, memory/I/O knobs, local load, distributed route. |
 | **Agents** | Editable roles with prompts, icons, and tool allow-lists. |
 | **Project** | Imported project library and active project cache. |
 | **Tuning** | Expert slot-cache controls and usage imatrix. |
@@ -193,7 +195,8 @@ server mode, distributed mode, diagnostics, and tuning panels.
 - staged text-file attachments;
 - selected agent and tool settings;
 - sampling settings;
-- memory knobs such as disk KV, raw-KV ring, pread experts, resident dense;
+- memory knobs such as expert bundle, expert pread, dense streaming, Q4
+  attention projections, `mlock`, disk KV, raw-KV ring, and expert cache slots;
 - tuning information and expert usage controls;
 - live generation status and stream consumption.
 
@@ -221,20 +224,31 @@ Select a context size. The default is RAM-aware: low-RAM systems default to a
 small context because KV memory grows with context and competes with the page
 cache needed for expert streaming.
 
-Optional memory settings:
+Optional memory and I/O settings:
 
 - **Expert cache slots:** GPU-resident expert LRU budget per layer.
 - **Experts via direct pread:** bypass page cache for expert slabs.
-- **Resident dense weights:** wire dense non-expert weights into RAM.
+- **Expert bundle sidecar:** store each expert's gate/up/down slabs contiguously
+  so a cache miss is one sequential read. The sidecar duplicates the expert
+  region on disk; sandboxed builds create it under Application Support when they
+  cannot write next to the GGUF.
+- **Dense-weight streaming:** stream dense layer weights through a small staging
+  ring one layer ahead of compute. This is the preferred low-RAM alternative to
+  keeping all dense weights resident.
+- **Pin hot buffers in RAM:** best-effort `mlock()` for hot resident buffers so
+  the memory compressor does not turn every token into a slow reread.
+- **Q4 attention projections:** lossy speed path that requantizes the largest
+  attention projections to Q4_K and caches them under Application Support.
 - **Disk KV:** checkpoint KV prefixes to disk for session/server reuse.
 - **Raw-KV ring:** keep raw sliding-window KV constant-size.
 
 ### Step 2 — Load
 
 Press **Load Model**. The app opens the GGUF, initializes Metal, builds the
-decoder, configures disk KV, applies the selected agent, and switches to ready
-state. Load time depends on model size and whether resident dense weights are
-enabled.
+decoder, applies memory/I/O environment knobs, configures disk KV, applies the
+selected agent, and switches to ready state. Load time depends on model size and
+whether one-time sidecars or caches must be created, especially the expert
+bundle and Q4 dense cache.
 
 ### Step 3 — Chat
 
@@ -291,14 +305,63 @@ These presets do not change correctness; they reduce the chance of memory
 pressure. You can still raise context manually up to 1M, but KV and scratch
 memory scale with it.
 
-## 8. Memory and Streaming
+## 8. Memory, Streaming, and GUI Defaults
+
+The current GUI defaults are tuned for the measured fast path on a 16 GB Apple
+Silicon machine:
+
+| Setting | GUI default | Why |
+|---|---|---|
+| Expert cache | `16` slots/layer | Keeps hot routed experts resident when routing is concentrated. |
+| Expert pread | ON below 24 GB RAM | Bypasses page cache for expert slabs so dense weights are not evicted. |
+| Expert bundle | ON | Turns scattered expert miss reads into one contiguous burst. |
+| Dense-weight streaming | ON below 24 GB RAM | Uses a small staging ring instead of a multi-GB dense resident set. |
+| `mlock` hot buffers | ON | Avoids memory-compressor churn on hot shared Metal buffers. |
+| Q4 attention projections | ON | Lossy speed path that removes large Q8 projections from per-token SSD traffic. |
+| Disk KV | ON | Reuses known prefixes across chats, reloads, and server requests. |
+| Raw-KV ring | OFF | Available as an experiment; full KV is the conservative default. |
+
+Most of these values are persisted and apply on the next model load. The app
+performs a one-time migration from older experimental defaults to this faster
+profile; future user changes are preserved.
 
 ### Page Cache vs Wired Buffers
 
 No-copy mmap lets the OS decide what remains resident. This is excellent when
 RAM is sufficient, but on small systems expert streaming can evict dense weights.
 `DS4_EXPERT_PREAD=1` bypasses page cache for expert slabs, while
-`DS4_RESIDENT_DENSE=1` pins dense weights into wired GPU buffers.
+`DS4_DENSE_STREAM=1` streams dense layer tensors through a small staging ring.
+`DS4_RESIDENT_DENSE=1` is still available for CLI experiments and RAM-rich
+systems, but the app decides resident dense automatically from RAM and prefers
+dense streaming on low-RAM systems.
+
+### Expert Bundle
+
+`DS4_EXPERT_BUNDLE=1` uses a sidecar where every routed expert's gate, up, and
+down slabs are contiguous. Numerics do not change: the sidecar is a reordered
+copy of bytes already present in the GGUF. The tradeoff is disk space. On a
+Flash 2-bit model the sidecar can be tens of GB, so the app checks space and
+logs when creation is skipped.
+
+The Settings panel can generate the bundle immediately. In sandboxed builds, the
+app first tries to reuse a readable `<model>.expbundle` next to the GGUF; if it
+cannot write there, it builds under `Application Support/DwarfStar/expert-bundle`.
+
+### Dense Streaming, `mlock`, and Q4 Dense Cache
+
+Dense streaming reads layer `i+1` while the GPU computes layer `i`. It uses
+`pread + F_NOCACHE`, avoids page-cache churn, and takes precedence over resident
+dense weights.
+
+`DS4_MLOCK=1` pins hot buffers best-effort. This includes expert-cache pools,
+dense-stream staging, output-head resident buffers, and Q4 dense buffers. Failure
+to pin is not fatal; it only means macOS may compress or page those buffers.
+
+`DS4_DENSE_Q4=1` is a lossy speed path. It requantizes the largest Q8 attention
+projections to Q4_K, caches the result under
+`Application Support/DwarfStar/q4-cache`, and keeps the reduced buffers resident.
+Disable it when you want the closest full-Q8 behavior rather than maximum
+single-machine throughput.
 
 ### KV Cache
 
@@ -320,11 +383,23 @@ one slot costs roughly 6.9 MB per layer. Slot budgets should be tuned with the
 Tuning tab: look at hit-rate and per-layer concentration. Low hit-rate means the
 cache is not paying for its wired memory.
 
+### Route/Attention Profiling
+
+`DS4_PROFILE_ROUTE=1` splits decode route/attention into subphases such as
+compressor, Q projection, KV projection, attention, and output. It adds extra
+command-buffer synchronization, so use it to understand ratios and bottlenecks,
+not to measure absolute speed.
+
 ## 9. Advanced Panels
 
 ### Server (`ServerView` + `LocalServer`)
 
-The server is native and in-process. It exposes:
+The server is native and in-process. It exposes the single shared engine loaded
+in Settings: no subprocess, no second model copy, and no separate resident-Q4 or
+`mlock` allocation. `InferenceService` is an actor, so chat, server requests,
+and local benchmark calls are serialized safely.
+
+It exposes:
 
 - `/v1/models`
 - `/v1/chat/completions`
@@ -332,9 +407,8 @@ The server is native and in-process. It exposes:
 - `/v1/completions`
 - `/v1/messages`
 
-The server loads its own `InferenceService`, sharing mmap model pages with chat
-but owning its own KV and GPU scratch. It is single-model and processes one
-request at a time.
+Load the model in Settings before starting the server. Stopping the server only
+unbinds the listening socket; the shared chat engine stays alive.
 
 ### Distributed (`DistributedView` + `DS4Engine/Distributed/*`)
 
@@ -349,9 +423,10 @@ the coordinator's active project.
 ### Benchmark
 
 The benchmark panel measures prefill and generation throughput at increasing
-context sizes. In Local mode it loads a private engine instance with mmap-shared
-weights. In Distributed mode it reuses the connected coordinator, so it must not
-overlap a chat generation.
+context sizes. In Local mode it reuses the loaded shared engine when the chat is
+idle; the run mutates KV and is refused while generation is active. In
+Distributed mode it reuses the connected coordinator, so it must not overlap a
+distributed chat generation.
 
 ### Diagnostics
 
@@ -398,8 +473,10 @@ sign with a Developer ID and notarize.
 |---|---|---|
 | Model fails to open under the packaged app | Sandbox access missing | Choose the GGUF with **Browse** instead of typing a path. |
 | Output is nonsense | Quantization mismatch or wrong GGUF | Run `DS4_TYPES_ONLY=1 swift run DS4Demo <gguf>` and compare expected dtypes. |
-| Very slow decode on 16 GB | SSD expert streaming dominates | Try `DS4_EXPERT_PREAD=1`, lower context, smaller expert cache, or distributed mode. |
-| Resident dense makes things worse | Wired memory pressure | Turn off resident dense on 16 GB systems. |
+| Very slow decode on 16 GB | SSD expert streaming or dense rereads dominate | Use the GUI fast defaults: expert pread, dense streaming, `mlock`, Q4 attention cache, expert bundle, moderate context. |
+| First load takes a long time | Expert bundle or Q4 dense cache is being built | Watch the engine log. Later loads reuse the sidecar/cache. |
+| Expert bundle is skipped | Not enough writable disk space or sandbox cannot write next to model | Use the Settings bundle directory under Application Support or free disk space. |
+| Resident dense makes things worse | Wired memory pressure | Prefer dense streaming on 16 GB systems; resident dense is automatic in the GUI and mainly useful on RAM-rich systems or CLI A/B tests. |
 | Expert cache does not help | Routing is too uniform or cache too small | Check Tuning hit-rate and per-layer concentration; compare uniform vs usage-driven allocation. |
 | Distributed chat cannot connect | Route incomplete or workers not started | Start workers first and ensure slices cover every layer contiguously. |
 | Server works but chat slows down | Shared GPU/SSD resources | Avoid simultaneous chat and server generation on the same Mac. |
@@ -420,5 +497,9 @@ sign with a Developer ID and notarize.
 | DSML | DeepSeek tool-call markup opened by the `｜DSML｜` token. |
 | Usage imatrix | Per-layer expert routing-frequency table used for cache tuning. |
 | Slot-cache | GPU-resident LRU cache of hot experts. |
+| Expert bundle | Sidecar that stores each expert's slabs contiguously for faster miss reads. |
+| Dense streaming | Per-layer dense-weight staging path that overlaps SSD reads with compute. |
+| Q4 dense cache | Cached requantized Q4_K copies of large attention projections. |
+| `mlock` | Best-effort request to keep hot buffers resident and out of the memory compressor. |
 | Prefill | Processing prompt tokens before generation. |
 | Decode | Token-by-token generation after prefill. |

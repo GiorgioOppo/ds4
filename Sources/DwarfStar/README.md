@@ -15,11 +15,13 @@ The app is organized by **feature**, with one folder per tab or area:
 - **`Tuning/`**: expert-cache slots, hit-rate, routing concentration, and agent
   editor.
 - **`Server/`**: native in-process HTTP server compatible with OpenAI and
-  Anthropic-style endpoints.
+  Anthropic-style endpoints, exposing the shared Settings-loaded engine.
 - **`Distributed/`**: UI for worker/coordinator distributed inference.
 - **`Bench/`**: local or distributed prefill/generation benchmarks over growing
   context sizes.
 - **`Diagnostics/`**: token and chat-template dumps.
-- **`Settings/`**: global model, context, and memory settings.
+- **`Settings/`**: global model, context, execution mode, and memory/I/O
+  settings such as expert bundle, dense streaming, Q4 dense cache, disk KV, and
+  raw-KV ring.
 - **`Support/`**: cross-cutting utilities such as engine logs and process streams.
 - **`Assets.xcassets/`**: app icon assets.

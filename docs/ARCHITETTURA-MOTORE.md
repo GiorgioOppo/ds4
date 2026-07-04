@@ -90,8 +90,8 @@ There are two broad weight categories:
 
 | Category | Runtime treatment |
 |---|---|
-| Non-routed dense weights | Usually no-copy mmap views, optionally copied to resident GPU buffers with `DS4_RESIDENT_DENSE=1`. |
-| Routed expert weights | Gathered per token/layer, optionally cached in expert slots, optionally read through `pread + F_NOCACHE`. |
+| Non-routed dense weights | No-copy mmap views by default, optionally streamed through a `pread + F_NOCACHE` staging ring with `DS4_DENSE_STREAM=1`, or copied to resident GPU buffers with `DS4_RESIDENT_DENSE=1` on RAM-rich systems. |
+| Routed expert weights | Gathered per token/layer, optionally cached in expert slots, optionally read through `pread + F_NOCACHE`, optionally served from a contiguous expert-bundle sidecar. |
 
 `GGUFWeights` builds `LayerWeights` values that reference the tensors required
 by each layer. Expert tensors may remain unloaded as full tensors while still
@@ -244,6 +244,7 @@ The selected experts are the expensive SSD-streaming part. They can come from:
 
 - direct mmap gather;
 - `pread + F_NOCACHE`;
+- contiguous expert-bundle slabs;
 - expert slot-cache hit;
 - expert slot-cache fill on miss.
 
@@ -316,6 +317,42 @@ The cache is a wired-memory tradeoff. It helps only when routing is concentrated
 enough that hot experts repeat. The Tuning tab exposes hit-rate and concentration
 so this can be measured rather than guessed.
 
+### Expert Bundle Sidecar
+
+`DS4_EXPERT_BUNDLE=1` adds a disk-side optimization for cache misses. The engine
+looks for or builds a sidecar where each expert's gate, up, and down slabs are
+stored contiguously. A miss can then be satisfied by one sequential read instead
+of three scattered reads from the original GGUF tensor layout.
+
+The sidecar is not a new quantization and does not change math. It duplicates
+the expert byte region on disk, is validated against the source model, and is
+skipped when writable space is insufficient. In sandboxed app builds,
+`DS4_BUNDLE_DIR` points creation at Application Support; a readable sidecar next
+to the GGUF can still be reused.
+
+### Dense Streaming and Resident Dense Weights
+
+Dense attention/shared weights are always needed, so page-cache eviction can
+dominate low-RAM decode even when expert I/O is optimized. The engine supports
+three strategies:
+
+| Strategy | Knob | Notes |
+|---|---|---|
+| mmap/page cache | default | Minimal wired memory; best when RAM can keep hot dense pages resident. |
+| dense streaming | `DS4_DENSE_STREAM=1` | Reads each layer's dense tensors into a small staging ring one layer ahead of compute. Takes precedence over resident dense. |
+| resident dense | `DS4_RESIDENT_DENSE=1` | Copies dense weights into resident GPU buffers. Useful on RAM-rich systems, risky on 16 GB. |
+
+`DS4_DENSE_AHEAD` controls staging read-ahead depth. Larger depths can improve
+overlap but also compete with expert reads on the same SSD.
+
+### Hot-Buffer Pinning
+
+`DS4_MLOCK=1` requests best-effort `mlock()` on hot shared Metal buffers such as
+expert-cache pools, dense-stream staging, resident output head, and Q4 dense
+buffers. This is a performance guard against macOS memory-compressor churn, not
+a correctness requirement. Failure to pin is logged or ignored depending on the
+call site; decode continues.
+
 ### Split Command Buffer Pattern
 
 The streaming path is intentionally split around CPU-visible routing decisions:
@@ -373,6 +410,18 @@ simdgroups; it does not change mathematical results.
 Mixed routed expert quantization is supported per layer. Uniform models remain
 byte-identical in behavior, while out-of-class mixed layers bypass single-class
 expert cache and use correct gather/decode paths.
+
+### Q4 Dense Requantization
+
+`DS4_DENSE_Q4=1` is a deliberate lossy speed path. The engine requantizes the
+largest Q8 attention projections (`q_b`, `output_a`, `output_b`) to Q4_K,
+caches the result, and keeps the reduced buffers resident. It removes several GB
+of per-token dense traffic from the SSD path. `DS4_SHARED_Q4=1` extends the same
+idea to shared-expert FFN projections and should be treated as a separate A/B
+experiment.
+
+Because this changes weights, it is not a parity mode. Use it for throughput,
+not when comparing exact logits against a full-Q8 dense path.
 
 ## 13. Per-Layer Tensor Summary
 

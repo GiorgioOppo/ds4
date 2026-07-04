@@ -62,7 +62,7 @@ against the upstream behavior.
 | Tab | Purpose |
 |---|---|
 | **Chat** | Streaming markdown chat, collapsible reasoning, live tool calls, multi-turn KV reuse, text-file attachments, active project menu, near-context-full warnings, Local or Distributed mode. |
-| **Settings** | Shared model path, context size, memory knobs, local model load, and distributed coordinator route. |
+| **Settings** | Shared model path, context size, RAM-aware execution mode, memory/I/O knobs, local model load, and distributed coordinator route. |
 | **Agents** | Role editor: system prompt, icon, tools, JSON import/export, and per-agent expert-usage profile. |
 | **Project** | Library of imported folders with sandbox bookmarks. Project tools explore the active project without consuming chat context until a tool reads content. |
 | **Tuning** | Expert cache slots, hit-rate, per-layer routing concentration, and the usage imatrix. |
@@ -106,6 +106,11 @@ enabled, typed paths are not enough; the file picker grants a security-scoped
 bookmark that persists across launches. Press **Load Model**, then open **Chat**.
 The **Thinking** toggle enables reasoning-token handling; **Stop** cancels
 generation and the next turn rebuilds KV if needed.
+
+The current GUI defaults favor the measured fast 16 GB path: SSD streaming,
+direct expert `pread` on low-RAM systems, dense-weight streaming, best-effort
+`mlock` of hot buffers, Q4 attention-projection cache, disk KV, expert bundle,
+and a 16-slot expert cache. Most memory toggles apply on the next model load.
 
 ## HTTP Server
 
@@ -200,9 +205,11 @@ Advanced demo and engine knobs are documented in
 `DS4_TYPES_ONLY=1`, `DS4_DIAG=1`, `DS4_WARMUP=N`,
 `DS4_USAGE_FILE=<path|off>`, `DS4_ACTIVE_EXPERTS=1...6`,
 `DS4_EXPERT_CACHE_SLOTS=N`, `DS4_EXPERT_PREAD=1`,
-`DS4_RAW_RING=1`, `DS4_RESIDENT_DENSE=1`, `DS4_Q8_NSG=1...8`,
-`DS4_PREFETCH=1`, `DS4_PREFETCH_EXPERTS=N`, `DS4_FUSED_MOE=0`,
-and `DS4_PROFILE_ROUTE=1`.
+`DS4_EXPERT_BUNDLE=1`, `DS4_RAW_RING=1`, `DS4_DENSE_STREAM=1`,
+`DS4_DENSE_AHEAD=N`, `DS4_MLOCK=1`, `DS4_DENSE_Q4=1`,
+`DS4_SHARED_Q4=1`, `DS4_RESIDENT_DENSE=1`, `DS4_Q8_NSG=1...8`,
+`DS4_PREFETCH=1`, `DS4_PREFETCH_EXPERTS=N`, `DS4_FUSED_MOE=0`, and
+`DS4_PROFILE_ROUTE=1`.
 
 ## Packaging a `.app`
 
@@ -229,6 +236,8 @@ Working and verified on a MacBook Pro M1 Pro 16 GB:
 - project library;
 - tuning panel and expert cache controls;
 - disk-KV cache, default on;
+- fast low-RAM profile: direct expert pread, dense streaming, `mlock`, Q4
+  attention cache, expert bundle, and 16-slot expert cache;
 - native HTTP server, verified for OpenAI `chat/completions` and Anthropic
   `messages` streaming.
 
@@ -256,6 +265,30 @@ hot dense weights from the page cache, causing `route/attn`, embedding, and head
 weights to re-fault from SSD every token. It can improve throughput on 24/32 GB
 machines, but can hurt on 16 GB by increasing memory pressure.
 
+**Dense-weight streaming (`DS4_DENSE_STREAM`).**
+Reads dense per-layer tensors through a small `pread + F_NOCACHE` staging ring
+instead of trying to keep all dense weights resident. The read for layer `i+1`
+is kicked while layer `i` computes. This is the preferred low-RAM path and takes
+precedence over `DS4_RESIDENT_DENSE`.
+
+**Expert bundle (`DS4_EXPERT_BUNDLE`).**
+Builds or reuses a sidecar in which each expert's gate/up/down slabs are stored
+contiguously. A cache miss becomes one sequential read instead of three scattered
+reads. The bytes and numerics are unchanged, but the sidecar duplicates the
+expert region on disk and can be tens of GB.
+
+**Hot-buffer pinning (`DS4_MLOCK`).**
+Best-effort `mlock()` for hot resident buffers such as expert-cache pools,
+dense/Q4 resident buffers, output head, and dense-stream staging. It reduces
+macOS memory-compressor churn when memory pressure is high. The engine keeps
+running if pinning fails.
+
+**Q4 attention projections (`DS4_DENSE_Q4`).**
+Lossy speed path that requantizes the three largest attention projections to
+Q4_K and keeps them resident. It removes a large amount of per-token SSD
+traffic; greedy output can occasionally diverge while remaining coherent, so
+disable it when exact full-Q8 behavior matters.
+
 **Q8 matvec tuning (`DS4_Q8_NSG`, default `4`).**
 Controls simdgroups per threadgroup for dense Q8_0 matvecs. It does not change
 results; it changes occupancy and latency hiding. Sweep `2/4/6/8` on the target
@@ -263,9 +296,9 @@ Mac when tuning.
 
 **Experimental opt-ins.**
 `DS4_RAW_RING` keeps raw KV in an `nSWA` ring, reducing raw-KV memory for long
-contexts. `DS4_PREFETCH` and `DS4_PREFETCH_EXPERTS` add speculative read-ahead
-for the next layer and likely experts. Validate these with parity tests and
-on-device profiling before relying on them.
+contexts. `DS4_PREFETCH`, `DS4_PREFETCH_EXPERTS`, and `DS4_SHARED_Q4` are still
+best treated as A/B experiments. Validate them with parity tests and on-device
+profiling before relying on them.
 
 ## Known Limits
 

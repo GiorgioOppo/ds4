@@ -12,7 +12,7 @@ struct BenchView: View {
             Form {
                 Section {
                     Label(controller.mode == .local
-                          ? "Native benchmark: measures prefill and generation throughput (tokens/s) for the in-process engine at growing context sizes. Loads its own model instance; weights are mmap-shared."
+                          ? "Native benchmark: measures prefill and generation throughput (tokens/s) on the shared in-process engine loaded in Settings."
                           : "Distributed benchmark: measures prefill and generation throughput (tokens/s) on the cluster, reusing the coordinator already connected in Chat -> Distributed.",
                           systemImage: "gauge.with.dots.needle.67percent")
                         .font(.callout).foregroundStyle(.secondary)

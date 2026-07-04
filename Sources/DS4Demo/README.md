@@ -108,9 +108,9 @@ intentional exceptions.
 
 | Profile Symptom | First Knobs to Try | Reason |
 |---|---|---|
-| `expert gather` dominates and effective gather bandwidth is far below SSD ceiling | Compare default vs `DS4_WILLNEED_EXPERTS=0`, then try `DS4_EXPERT_PREAD=1` | Determines whether read-ahead helps and whether bypassing page cache stabilizes decode. |
-| `route/attn`, `embed`, or `head` stay slow after warm-up | `DS4_EXPERT_PREAD=1`, then `DS4_RESIDENT_DENSE=1` on RAM-rich systems | Likely dense-weight re-faults caused by expert streaming churn. |
-| Expert-cache hit-rate is low but routing is concentrated | `DS4_EXPERT_CACHE_SLOTS=8/12/16` | More slots may retain hot experts and reduce SSD reads. |
+| `expert gather` dominates and effective gather bandwidth is far below SSD ceiling | Compare default vs `DS4_WILLNEED_EXPERTS=0`, then try `DS4_EXPERT_PREAD=1`, then `DS4_EXPERT_BUNDLE=1` | Separates read-ahead benefit, page-cache churn, and scattered-read overhead. |
+| `route/attn`, `embed`, or `head` stay slow after warm-up | `DS4_DENSE_STREAM=1`, `DS4_MLOCK=1`, then `DS4_DENSE_Q4=1` if lossy speed is acceptable | Dense weights are likely rereading from SSD or memory-compressed buffers. Streaming + pinning reduces churn; Q4 removes large Q8 projections from the hot path. |
+| Expert-cache hit-rate is low but routing is concentrated | `DS4_EXPERT_CACHE_SLOTS=8/12/16`, with a fixed `DS4_USAGE_FILE` | More slots may retain hot experts and reduce SSD reads; a fixed usage file makes pre-warm repeatable. |
 | Expert cache is enabled but not helping | `DS4_EXPERT_CACHE_UNIFORM=1` A/B | Tests whether usage-driven redistribution is helping or whether the budget is wrong. |
 | Short runs are noisy | `DS4_WARMUP=4` and fixed `DS4_USAGE_FILE=<path>` | Separates cold costs from steady state and makes routing history repeatable. |
 | You want best single-machine throughput | sweep `DS4_Q8_NSG=2/4/6/8` | Dense Q8 scheduling optimum is SoC- and memory-pressure-specific. |
@@ -151,9 +151,12 @@ swift run DS4Demo /path/model.gguf 32 "Explain RoPE briefly."
 ### 5. Low-RAM experiment
 
 ```sh
-DS4_ACTIVE_EXPERTS=4 DS4_RAW_RING=1 DS4_EXPERT_CACHE_SLOTS=8 \
+DS4_EXPERT_PREAD=1 DS4_DENSE_STREAM=1 DS4_MLOCK=1 DS4_EXPERT_CACHE_SLOTS=16 \
   swift run DS4Demo /path/model.gguf 16
 ```
+
+Add `DS4_DENSE_Q4=1` when you accept a lossy speed path, and
+`DS4_EXPERT_BUNDLE=1` when you have enough disk space for the sidecar.
 
 ### 6. Fused vs non-fused MoE comparison
 

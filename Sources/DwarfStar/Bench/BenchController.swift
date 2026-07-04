@@ -20,9 +20,9 @@ enum BenchMode: String, CaseIterable, Identifiable {
 
 /// Native benchmark: measures prefill + generation throughput across context
 /// frontiers (replaces the removed `ds4-bench` subprocess). In **Locale** mode it
-/// loads its OWN in-process engine (weights mmap-shared with any other); in
-/// **Distribuito** mode it reuses the coordinator already connected in
-/// `DistributedController` — no second connection, no second model copy.
+/// reuses the single in-process engine loaded in Settings; in **Distribuito**
+/// mode it reuses the coordinator already connected in `DistributedController` —
+/// no second connection, no second model copy.
 @MainActor
 @Observable
 final class BenchController {
