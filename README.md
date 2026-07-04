@@ -68,7 +68,7 @@ against the upstream behavior.
 | **Project** | Library of imported folders with sandbox bookmarks. Project tools explore the active project without consuming chat context until a tool reads content. |
 | **Tuning** | Expert cache slots, hit-rate, per-layer routing concentration, and the usage imatrix. |
 | **Server** | Native in-process OpenAI/Anthropic-compatible HTTP server. |
-| **Worker** | Runs this Mac as a distributed worker that owns a contiguous layer slice. |
+| **Worker** | Runs this Mac as a distributed worker: it starts idle and the coordinator assigns its job — GGUF, settings, and layer slice. |
 | **Benchmark** | Native throughput benchmark for prefill and generation across growing context sizes, local or distributed. |
 | **Diagnostics** | Native tokenizer dump and chat-template/tool-format inspection. |
 
@@ -154,8 +154,11 @@ modelled on `ds4_distributed.c`.
   execution.
 - The HC hidden state (`nHC x nEmbd` floats, transported at 32/16/8 bit) flows
   through workers for every token.
-- Workers must be started first. The coordinator route must cover all model
-  layers contiguously: Flash has 43 layers, Pro has 61.
+- Workers start FIRST but idle (no model loaded): at connect time the
+  coordinator partitions the layers across the peer list, assigns each worker
+  its job (GGUF, context size, cache budget, layer slice — the last slice also
+  runs the output head), and waits for every worker to load and reply ready.
+  Flash has 43 layers, Pro has 61.
 
 The per-node benefit is reduced expert I/O: each worker streams roughly `1/N` of
 the routed experts, making the hot working set more likely to stay in RAM.

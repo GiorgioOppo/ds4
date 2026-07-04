@@ -182,7 +182,7 @@ server mode, distributed mode, diagnostics, and tuning panels.
 | **Project** | Imported project library and active project cache. |
 | **Tuning** | Expert slot-cache controls and usage imatrix. |
 | **Server** | OpenAI/Anthropic-compatible native HTTP server. |
-| **Worker** | Run this Mac as a distributed layer worker. |
+| **Worker** | Run this Mac as a distributed worker; the coordinator assigns GGUF, settings, and layer slice. |
 | **Benchmark** | Native throughput charting across context frontiers. |
 | **Diagnostics** | Tokenizer dump and chat-template/tool-format inspection. |
 
@@ -450,10 +450,16 @@ unbinds the listening socket; the shared chat engine stays alive.
 
 ### Distributed (`DistributedView` + `DS4Engine/Distributed/*`)
 
-Distributed mode splits layers across workers. The Worker tab starts a listener
-for one slice. Settings configures the coordinator peer list, activation bit
-width, prefill chunk size, and optional worker-to-worker forwarding. Chat renders
-the distributed conversation when the app mode is **Distributed**.
+Distributed mode splits layers across workers, and the COORDINATOR defines
+each worker's job: the Worker tab only starts an idle listener; at connect time
+the coordinator partitions the layers across the peer list (in order, last
+slice owns the output head) and sends each worker the GGUF, the context size,
+the expert-cache budget, and its slice. Each worker resolves the GGUF locally
+(the coordinator's exact path, else a same-named file next to its local GGUF
+from Settings), loads its engine, and replies ready. Settings configures the
+coordinator peer list, activation bit width, prefill chunk size, and optional
+worker-to-worker forwarding. Chat renders the distributed conversation when
+the app mode is **Distributed**.
 
 Distributed tool calls execute on the coordinator Mac, so project tools refer to
 the coordinator's active project.

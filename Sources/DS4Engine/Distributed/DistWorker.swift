@@ -1,31 +1,47 @@
 import Foundation
 @preconcurrency import Network
 
-/// A distributed WORKER: owns a contiguous layer slice and runs it on demand.
-/// On each accepted connection it announces its slice (HELLO), then serves WORK
-/// frames (run `forwardSlice`, or the output head if the coordinator flagged this
-/// as the last slice) and replies with RESULT frames. One coordinator at a time.
+/// A distributed WORKER: starts IDLE (listening, no model loaded) and lets the
+/// COORDINATOR define its whole job via ASSIGN — which gguf, context size,
+/// expert-cache budget, and which contiguous layer slice to own. On ASSIGN the
+/// worker resolves the gguf locally, loads (or reuses) its slice engine and
+/// replies READY; then it serves WORK frames (run the slice, or the output
+/// head when flagged) and answers with RESULT frames.
 public final class DistWorker: @unchecked Sendable {
     public struct Config: Sendable {
-        public var modelPath: String
         public var port: UInt16
-        public var layerStart: Int
-        public var layerEnd: Int      // inclusive
-        public var hasOutput: Bool    // also owns the output head (last slice)
-        public var contextSize: Int
-        public init(modelPath: String, port: UInt16, layerStart: Int, layerEnd: Int,
-                    hasOutput: Bool, contextSize: Int) {
-            self.modelPath = modelPath; self.port = port; self.layerStart = layerStart
-            self.layerEnd = layerEnd; self.hasOutput = hasOutput; self.contextSize = contextSize
+        /// Local gguf hint: the worker tries the coordinator's path verbatim
+        /// first, then a file with the assigned NAME next to this hint, then
+        /// the hint itself when the filename matches (per-Mac disk layouts).
+        public var localModelPath: String
+        public init(port: UInt16, localModelPath: String) {
+            self.port = port; self.localModelPath = localModelPath
         }
     }
 
     private let config: Config
-    private let engine: DistEngine
     private let onLog: @Sendable (String) -> Void
     private let queue = DispatchQueue(label: "ds4.dist.worker")
     private let gate = DistGate()
     private var listener: NWListener?
+
+    /// The coordinator-defined job this worker currently serves.
+    struct Assignment: Equatable, Sendable {
+        var resolvedModelPath: String
+        var contextSize: Int
+        var expertCacheSlots: Int
+        var layerStart: Int
+        var layerEnd: Int
+        var hasOutput: Bool
+    }
+
+    /// Engine + assignment, set by ASSIGN. Guarded by `stateLock`: WORK frames
+    /// can arrive on a different connection (forwarding) than the assigning one.
+    private let stateLock = NSLock()
+    private var engine: DistEngine?
+    private var assignment: Assignment?
+    private var loadingAssignment = false
+
     /// One TURN at a time, enforced at the session level (NOT per connection:
     /// in forwarding mode a worker legitimately holds one connection from the
     /// coordinator AND one from the previous worker). A pos==0 chunk ADOPTS its
@@ -41,13 +57,9 @@ public final class DistWorker: @unchecked Sendable {
         return currentSession == work.session
     }
 
-    public init(config: Config, onLog: @escaping @Sendable (String) -> Void) throws {
+    public init(config: Config, onLog: @escaping @Sendable (String) -> Void) {
         self.config = config
         self.onLog = onLog
-        // KV/compressor allocated ONLY for this worker's slice (the rest of the
-        // model's layers are never run here).
-        self.engine = try DistEngine(modelPath: config.modelPath, contextSize: config.contextSize,
-                                     kvLayers: config.layerStart..<(config.layerEnd + 1))
     }
 
     public func start() throws {
@@ -57,7 +69,7 @@ public final class DistWorker: @unchecked Sendable {
         let l = try NWListener(using: params, on: port)
         l.stateUpdateHandler = { [onLog, config] state in
             switch state {
-            case .ready: onLog("worker layers \(config.layerStart)...\(config.layerEnd) listening on :\(config.port)\n")
+            case .ready: onLog("worker in ascolto su :\(config.port) — in attesa dell'assegnazione dal coordinatore\n")
             case .failed(let e): onLog("worker listener failed: \(e)\n")
             default: break
             }
@@ -67,12 +79,53 @@ public final class DistWorker: @unchecked Sendable {
         listener = l
     }
 
-    public func stop() { listener?.cancel(); listener = nil }
+    public func stop() {
+        listener?.cancel(); listener = nil
+        stateLock.lock(); engine = nil; assignment = nil; stateLock.unlock()
+    }
+
+    /// Resolve the gguf named by an ASSIGN to a LOCAL file: the coordinator's
+    /// path verbatim (shared disk layouts), else a file with the same name in
+    /// the local hint's directory, else the hint itself when the name matches.
+    static func resolveModelPath(requestedPath: String, modelName: String,
+                                 localHint: String,
+                                 exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) })
+        -> String? {
+        if !requestedPath.isEmpty, exists(requestedPath) { return requestedPath }
+        if !modelName.isEmpty {
+            let sibling = ((localHint as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent(modelName)
+            if exists(sibling) { return sibling }
+            if (localHint as NSString).lastPathComponent == modelName, exists(localHint) {
+                return localHint
+            }
+        }
+        return nil
+    }
 
     private func accept(_ c: NWConnection) {
         c.start(queue: queue)
         let conn = DistConnection(c)
         Task { [weak self] in await self?.serve(conn) }
+    }
+
+    /// Snapshot for HELLO/READY: the active assignment, or the idle state.
+    private func helloPayload() -> DistHello {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if let engine, let a = assignment {
+            return DistHello(modelName: engine.modelName, layerStart: a.layerStart,
+                             layerEnd: a.layerEnd, hasOutput: a.hasOutput,
+                             nLayers: engine.nLayers, contextSize: a.contextSize)
+        }
+        return .idle(localModelName: (config.localModelPath as NSString).lastPathComponent,
+                     nLayers: DistEngine.modelLayers)
+    }
+
+    /// Current (engine, assignment) if ready to serve WORK; nil while idle/loading.
+    private func activeEngine() -> (engine: DistEngine, assignment: Assignment)? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard let engine, let assignment, !loadingAssignment else { return nil }
+        return (engine, assignment)
     }
 
     private func serve(_ conn: DistConnection) async {
@@ -93,26 +146,33 @@ public final class DistWorker: @unchecked Sendable {
         }
 
         do {
-            let hello = DistHello(modelName: engine.modelName, layerStart: config.layerStart,
-                                  layerEnd: config.layerEnd, hasOutput: config.hasOutput,
-                                  nLayers: engine.nLayers, contextSize: engine.contextSize)
-            try await conn.sendFrame(.hello, hello.encoded())
+            try await conn.sendFrame(.hello, helloPayload().encoded())
 
             while true {
                 let (type, payload) = try await conn.readFrame()
+                if type == .assign {
+                    try await handleAssign(payload, on: conn)
+                    continue
+                }
                 guard type == .work, let work = DistWork.decode(payload) else { continue }
 
+                guard let (engine, active) = activeEngine() else {
+                    let msg = "worker not ready: no assignment loaded (send ASSIGN first)"
+                    onLog(msg + "\n")
+                    try await conn.sendFrame(.error, Data(msg.utf8))
+                    continue
+                }
                 // Validate the chunk BEFORE touching the engine: sizes come from
                 // the network, and a mismatch would otherwise crash the process
-                // (out-of-bounds slicing / forwardSlice precondition).
+                // (out-of-bounds slicing) or touch KV the shard never allocated.
                 let stateLen = engine.hcStateCount
                 let n = work.nTokens
                 guard n >= 1, work.hc.count == n * stateLen,
-                      work.layerStart >= 0, work.layerStart <= work.layerEnd,
-                      work.layerEnd < engine.nLayers, work.pos >= 0,
-                      work.pos + n <= engine.contextSize else {
+                      work.layerStart == active.layerStart, work.layerEnd == active.layerEnd,
+                      work.pos >= 0, work.pos + n <= active.contextSize else {
                     let msg = "invalid WORK frame: nTokens=\(work.nTokens) hc=\(work.hc.count) "
-                        + "(state \(stateLen)) layers \(work.layerStart)...\(work.layerEnd) pos \(work.pos)"
+                        + "(state \(stateLen)) layers \(work.layerStart)...\(work.layerEnd) "
+                        + "(assigned \(active.layerStart)...\(active.layerEnd)) pos \(work.pos)"
                     onLog(msg + "\n")
                     try await conn.sendFrame(.error, Data(msg.utf8))
                     continue
@@ -130,12 +190,12 @@ public final class DistWorker: @unchecked Sendable {
                     var hcs: [[Float]] = []
                     hcs.reserveCapacity(n)
                     for i in 0..<n { hcs.append(Array(work.hc[i*stateLen..<(i+1)*stateLen])) }
-                    return try self.engine.forwardSliceBatch(hcs: hcs, posBase: work.pos,
-                                                             start: work.layerStart, end: work.layerEnd)
+                    return try engine.forwardSliceBatch(hcs: hcs, posBase: work.pos,
+                                                        start: work.layerStart, end: work.layerEnd)
                 }
-                if work.pos == 0, let inHC = (n > 0 ? Array(work.hc[0..<stateLen]) : nil),
-                   let outHC = outStates.first {
+                if work.pos == 0, let outHC = outStates.first {
                     func nrm(_ a: [Float]) -> Float { (a.reduce(0) { $0 + $1 * $1 }).squareRoot() }
+                    let inHC = Array(work.hc[0..<stateLen])
                     onLog(String(format: "diag: layer %d…%d  |in|=%.2f  |out|=%.2f\n",
                                  work.layerStart, work.layerEnd, nrm(inHC), nrm(outHC)))
                 }
@@ -178,6 +238,81 @@ public final class DistWorker: @unchecked Sendable {
         } catch {
             onLog("sessione chiusa: \(error)\n")
             conn.cancel()
+        }
+    }
+
+    /// Handle an ASSIGN: validate, resolve the gguf locally, load (or reuse)
+    /// the slice engine, reply READY — or an ERROR frame with the reason.
+    private func handleAssign(_ payload: Data, on conn: DistConnection) async throws {
+        guard let assign = DistAssign.decode(payload) else {
+            try await conn.sendFrame(.error, Data("malformed ASSIGN frame".utf8))
+            return
+        }
+        guard assign.layerStart >= 0, assign.layerStart <= assign.layerEnd,
+              assign.layerEnd < DistEngine.modelLayers, assign.contextSize > 0 else {
+            let msg = "invalid ASSIGN: layers \(assign.layerStart)...\(assign.layerEnd) "
+                + "(model has \(DistEngine.modelLayers)), context \(assign.contextSize)"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
+            return
+        }
+        guard let resolved = Self.resolveModelPath(requestedPath: assign.modelPath,
+                                                   modelName: assign.modelName,
+                                                   localHint: config.localModelPath) else {
+            let msg = "gguf '\(assign.modelName)' not found on this worker "
+                + "(tried the coordinator's path and next to '\(config.localModelPath)')"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
+            return
+        }
+        let wanted = Assignment(resolvedModelPath: resolved, contextSize: assign.contextSize,
+                                expertCacheSlots: assign.expertCacheSlots,
+                                layerStart: assign.layerStart, layerEnd: assign.layerEnd,
+                                hasOutput: assign.hasOutput)
+
+        stateLock.lock()
+        if assignment == wanted, engine != nil {
+            stateLock.unlock()
+            onLog("assegnazione invariata: layer \(wanted.layerStart)...\(wanted.layerEnd) — riuso il motore\n")
+            try await conn.sendFrame(.ready, helloPayload().encoded())
+            return
+        }
+        if loadingAssignment {
+            stateLock.unlock()
+            try await conn.sendFrame(.error, Data("worker busy loading a previous assignment".utf8))
+            return
+        }
+        loadingAssignment = true
+        engine = nil                 // free the old shard BEFORE loading the new one
+        assignment = nil
+        stateLock.unlock()
+
+        onLog("assegnazione: \(assign.modelName) · layer \(wanted.layerStart)...\(wanted.layerEnd)"
+              + (wanted.hasOutput ? " +output" : "") + " · ctx \(wanted.contextSize)"
+              + (wanted.expertCacheSlots > 0 ? " · \(wanted.expertCacheSlots) slot cache" : "")
+              + " — carico il motore…\n")
+        let t0 = Date()
+        do {
+            // Detached: the load (mmap + Metal init) runs for minutes and must
+            // not sit on this connection's task while frames could arrive.
+            let slots = wanted.expertCacheSlots
+            let loaded = try await Task.detached(priority: .userInitiated) {
+                try DistEngine(modelPath: resolved, contextSize: wanted.contextSize,
+                               expertCacheSlots: slots > 0 ? slots : nil,
+                               kvLayers: wanted.layerStart..<(wanted.layerEnd + 1))
+            }.value
+            stateLock.lock()
+            engine = loaded
+            assignment = wanted
+            loadingAssignment = false
+            stateLock.unlock()
+            onLog(String(format: "motore pronto in %.1fs\n", Date().timeIntervalSince(t0)))
+            try await conn.sendFrame(.ready, helloPayload().encoded())
+        } catch {
+            stateLock.lock(); loadingAssignment = false; stateLock.unlock()
+            let msg = "engine load failed: \(error)"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
         }
     }
 }

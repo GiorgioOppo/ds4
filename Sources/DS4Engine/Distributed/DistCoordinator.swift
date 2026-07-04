@@ -26,14 +26,38 @@ public final class DistCoordinator: @unchecked Sendable {
         public var forward: Bool
         public var returnHost: String
         public var returnPort: UInt16
+        /// Expert slot-cache budget ASSIGNed to each worker (0 = disabled).
+        public var workerCacheSlots: Int
         public init(modelPath: String, contextSize: Int, peers: [Peer], activationBits: Int,
                     prefillChunk: Int = 32, forward: Bool = false,
-                    returnHost: String = "", returnPort: UInt16 = 9099) {
+                    returnHost: String = "", returnPort: UInt16 = 9099,
+                    workerCacheSlots: Int = 0) {
             self.modelPath = modelPath; self.contextSize = contextSize
             self.peers = peers; self.activationBits = activationBits
             self.prefillChunk = max(1, prefillChunk); self.forward = forward
             self.returnHost = returnHost; self.returnPort = returnPort
+            self.workerCacheSlots = max(0, workerCacheSlots)
         }
+    }
+
+    /// Contiguous, near-equal split of `nLayers` across `workers` peers, in
+    /// peer-list order (the user controls placement by ordering the list); the
+    /// first `nLayers % workers` slices get one extra layer. The LAST slice
+    /// also runs the output head.
+    static func partition(nLayers: Int, workers: Int) throws -> [(start: Int, end: Int)] {
+        guard workers > 0 else { throw DistError.sliceGap("no workers") }
+        guard workers <= nLayers else {
+            throw DistError.sliceGap("more workers (\(workers)) than layers (\(nLayers)): remove peers")
+        }
+        let base = nLayers / workers, rem = nLayers % workers
+        var out: [(Int, Int)] = []
+        var start = 0
+        for i in 0..<workers {
+            let len = base + (i < rem ? 1 : 0)
+            out.append((start, start + len - 1))
+            start += len
+        }
+        return out
     }
 
     private let engine: DistEngine
@@ -62,10 +86,15 @@ public final class DistCoordinator: @unchecked Sendable {
 
     // MARK: Session
 
-    /// Connect to every worker, read their HELLO, assemble + validate a contiguous
-    /// route covering all layers, and (forwarding only) start the return listener.
+    /// Establish the route, with the COORDINATOR defining each worker's job:
+    /// split the layers across the peers (in list order), then per peer —
+    /// HELLO (version check) → ASSIGN (gguf + context + cache slots + slice) →
+    /// READY (worker loaded its engine). Then validate contiguous coverage and
+    /// (forwarding only) start the return listener.
     public func connect(onLog: @Sendable (String) -> Void) async throws {
-        for p in config.peers {
+        let slices = try Self.partition(nLayers: engine.nLayers, workers: config.peers.count)
+        let modelName = (config.modelPath as NSString).lastPathComponent
+        for (i, p) in config.peers.enumerated() {
             let conn = try DistConnection.connect(host: p.host, port: p.port, queue: queue)
             let (type, payload) = try await conn.readFrame()
             if type == .error {
@@ -76,18 +105,39 @@ public final class DistCoordinator: @unchecked Sendable {
                 throw DistError.versionMismatch(
                     "worker \(p.host):\(p.port) speaks protocol v\(h.version), this build v\(Dist.protocolVersion) — update all nodes to the same DwarfStar build")
             }
-            if h.modelName != engine.modelName {
-                onLog("warning: worker \(p.host) has model '\(h.modelName)' != '\(engine.modelName)'\n")
+
+            // ASSIGN this peer its slice; the worker loads (or reuses) its
+            // engine and replies READY. The last slice also runs the head.
+            let (ls, le) = slices[i]
+            let hasOutput = (i == config.peers.count - 1)
+            let assign = DistAssign(modelPath: config.modelPath, modelName: modelName,
+                                    contextSize: config.contextSize,
+                                    expertCacheSlots: config.workerCacheSlots,
+                                    layerStart: ls, layerEnd: le, hasOutput: hasOutput)
+            onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize) (loading…)\n")
+            try await conn.sendFrame(.assign, assign.encoded())
+            let (rType, rPayload) = try await conn.readFrame()
+            if rType == .error {
+                throw DistError.remote("\(p.host):\(p.port): " + String(decoding: rPayload, as: UTF8.self))
+            }
+            guard rType == .ready, let ready = DistHello.decode(rPayload), ready.assigned else {
+                throw DistError.badFrame
+            }
+            guard ready.layerStart == ls, ready.layerEnd == le, ready.hasOutput == hasOutput,
+                  ready.contextSize == config.contextSize else {
+                throw DistError.sliceGap(
+                    "worker \(p.host):\(p.port) loaded layers \(ready.layerStart)...\(ready.layerEnd) instead of \(ls)...\(le)")
+            }
+            if ready.modelName != modelName {
+                onLog("warning: worker \(p.host) loaded '\(ready.modelName)' != '\(modelName)'\n")
             }
             conns.append(conn)
-            entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: h.layerStart,
-                                          layerEnd: h.layerEnd, hasOutput: h.hasOutput))
-            onLog("route: \(p.host):\(p.port) -> layers \(h.layerStart)...\(h.layerEnd)\(h.hasOutput ? " +output" : "")\n")
+            entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: ls,
+                                          layerEnd: le, hasOutput: hasOutput))
+            onLog("route: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") pronto\n")
         }
-        // Sort by layerStart, keep conns aligned, validate contiguous full coverage.
-        let order = entries.indices.sorted { entries[$0].layerStart < entries[$1].layerStart }
-        entries = order.map { entries[$0] }
-        conns = order.map { conns[$0] }
+        // By construction the route is ordered and contiguous; keep the check
+        // as a safety net against partition bugs.
         var expected = 0
         for e in entries {
             guard e.layerStart == expected else { throw DistError.sliceGap("expected layer \(expected), found \(e.layerStart)") }

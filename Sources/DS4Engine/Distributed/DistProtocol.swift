@@ -17,17 +17,23 @@ public enum Dist {
     /// v2: HELLO carries the version; WORK/RESULT carry a per-turn `session`
     /// id echoed by the workers, so a result left in a TCP buffer by a
     /// cancelled turn can never be mistaken for the next turn's reply.
-    public static let protocolVersion: UInt32 = 2
+    /// v3: the COORDINATOR defines each worker's job. Workers start idle
+    /// (listening, no model loaded); the coordinator sends ASSIGN (gguf,
+    /// context, layer slice, cache slots) and the worker replies READY once
+    /// its engine is loaded. HELLO gained the `assigned` state.
+    public static let protocolVersion: UInt32 = 3
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
     static let maxRouteEntries = 256
 
     public enum MsgType: UInt32, Sendable {
-        case hello   = 1    // worker → coordinator on connect (slice + model identity)
+        case hello   = 1    // worker → coordinator on connect (state + model identity)
         case work    = 3    // coordinator → worker: embed/HC input for a layer slice
         case result  = 4    // worker → coordinator: HC state or logits
         case error   = 2
+        case assign  = 5    // coordinator → worker: gguf + settings + layer slice
+        case ready   = 6    // worker → coordinator: assignment loaded (HELLO payload)
     }
 
     /// Flags on a WORK message.
@@ -67,28 +73,40 @@ public struct DistFrameHeader {
     }
 }
 
-/// HELLO payload: a worker announces its protocol version, model identity and
-/// the slice it serves. The coordinator validates the version FIRST — a mixed
-/// cluster fails with a clear error instead of garbled frames.
+/// HELLO payload: a worker announces its protocol version, its state
+/// (`assigned` — an engine is loaded for a slice) and, when assigned, the model
+/// identity and slice it serves. Sent on connect and echoed as the READY
+/// payload after an ASSIGN completes. The coordinator validates the version
+/// FIRST — a mixed cluster fails with a clear error instead of garbled frames.
 public struct DistHello: Sendable {
     public var version: UInt32
-    public var modelName: String
+    public var assigned: Bool         // an engine is loaded (slice fields valid)
+    public var modelName: String      // loaded gguf (assigned) or local hint (idle)
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
     public var hasOutput: Bool        // also owns the output head
     public var nLayers: Int
-    public var contextSize: Int
+    public var contextSize: Int       // 0 while idle
 
     public init(modelName: String, layerStart: Int, layerEnd: Int, hasOutput: Bool,
-                nLayers: Int, contextSize: Int, version: UInt32 = Dist.protocolVersion) {
+                nLayers: Int, contextSize: Int, assigned: Bool = true,
+                version: UInt32 = Dist.protocolVersion) {
         self.version = version
+        self.assigned = assigned
         self.modelName = modelName; self.layerStart = layerStart; self.layerEnd = layerEnd
         self.hasOutput = hasOutput; self.nLayers = nLayers; self.contextSize = contextSize
+    }
+
+    /// An unconfigured worker waiting for an ASSIGN.
+    public static func idle(localModelName: String, nLayers: Int) -> DistHello {
+        DistHello(modelName: localModelName, layerStart: 0, layerEnd: 0, hasOutput: false,
+                  nLayers: nLayers, contextSize: 0, assigned: false)
     }
 
     public func encoded() -> Data {
         var d = Data()
         d.appendLE(version)
+        d.appendLE(UInt32(assigned ? 1 : 0))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(UInt32(hasOutput ? 1 : 0))
         d.appendLE(UInt32(nLayers)); d.appendLE(UInt32(contextSize))
@@ -99,8 +117,9 @@ public struct DistHello: Sendable {
 
     public static func decode(_ d: Data) -> DistHello? {
         var o = d.startIndex
-        guard d.count >= 28 else { return nil }
+        guard d.count >= 32 else { return nil }
         let ver = d.readLE(&o) as UInt32
+        let assigned = (d.readLE(&o) as UInt32) != 0
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let ho = (d.readLE(&o) as UInt32) != 0
         let nl = Int(d.readLE(&o) as UInt32), ctx = Int(d.readLE(&o) as UInt32)
@@ -108,7 +127,58 @@ public struct DistHello: Sendable {
         guard nameLen >= 0, o + nameLen <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self)
         return DistHello(modelName: name, layerStart: ls, layerEnd: le, hasOutput: ho,
-                         nLayers: nl, contextSize: ctx, version: ver)
+                         nLayers: nl, contextSize: ctx, assigned: assigned, version: ver)
+    }
+}
+
+/// ASSIGN payload: the coordinator defines a worker's whole job — WHICH gguf
+/// (full coordinator-side path + filename, resolved locally by the worker),
+/// the context size, the expert-cache budget, and the layer slice to own.
+/// The worker loads (or reuses) its engine and replies READY (HELLO payload).
+public struct DistAssign: Sendable {
+    public var modelPath: String      // coordinator's path (verbatim, tried first)
+    public var modelName: String      // gguf filename (fallback resolution key)
+    public var contextSize: Int
+    public var expertCacheSlots: Int  // 0 = no expert slot-cache on the worker
+    public var layerStart: Int
+    public var layerEnd: Int          // inclusive
+    public var hasOutput: Bool        // last slice: also runs the output head
+
+    public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
+                layerStart: Int, layerEnd: Int, hasOutput: Bool) {
+        self.modelPath = modelPath; self.modelName = modelName
+        self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
+        self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
+    }
+
+    public func encoded() -> Data {
+        var d = Data()
+        d.appendLE(UInt32(contextSize))
+        d.appendLE(UInt32(expertCacheSlots))
+        d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
+        d.appendLE(UInt32(hasOutput ? 1 : 0))
+        let path = Data(modelPath.utf8)
+        d.appendLE(UInt32(path.count)); d.append(path)
+        let name = Data(modelName.utf8)
+        d.appendLE(UInt32(name.count)); d.append(name)
+        return d
+    }
+
+    public static func decode(_ d: Data) -> DistAssign? {
+        var o = d.startIndex
+        guard d.count >= 28 else { return nil }
+        let ctx = Int(d.readLE(&o) as UInt32)
+        let slots = Int(d.readLE(&o) as UInt32)
+        let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
+        let ho = (d.readLE(&o) as UInt32) != 0
+        let pathLen = Int(d.readLE(&o) as UInt32)
+        guard pathLen >= 0, o + pathLen + 4 <= d.endIndex else { return nil }
+        let path = String(decoding: d[o..<o+pathLen], as: UTF8.self); o += pathLen
+        let nameLen = Int(d.readLE(&o) as UInt32)
+        guard nameLen >= 0, o + nameLen <= d.endIndex else { return nil }
+        let name = String(decoding: d[o..<o+nameLen], as: UTF8.self)
+        return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
+                          expertCacheSlots: slots, layerStart: ls, layerEnd: le, hasOutput: ho)
     }
 }
 

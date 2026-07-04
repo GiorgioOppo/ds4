@@ -24,14 +24,12 @@ final class DistributedController {
 
     init(settings: AppSettings) { self.settings = settings }
 
-    // Worker (Distribuito sidebar tab).
+    // Worker (Distribuito sidebar tab). The slice/model/context are NOT set
+    // here: the worker starts idle and the coordinator ASSIGNs its whole job
+    // (gguf, settings, layer range) at connect time.
     var port = 9100
-    var layerStart = 0
-    var layerEnd = DistEngine.modelLayers - 1
-    var hasOutput = true
     var modelLayers: Int { DistEngine.modelLayers }
     var workerRunning = false
-    var workerLoading = false
     var workerLog = ""
 
     // Coordinator (Chat tab → Distribuito).
@@ -82,7 +80,7 @@ final class DistributedController {
     private var coordLogTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
 
-    var workerSummary: String { "worker :\(port) · layers \(layerStart)...\(layerEnd)\(hasOutput ? " +output" : "")" }
+    var workerSummary: String { "worker :\(port) · job assigned by the coordinator" }
 
     /// The connected coordinator, exposed so the Benchmark panel can reuse the live
     /// route instead of opening a second connection (nil unless connected). The
@@ -96,29 +94,30 @@ final class DistributedController {
     // MARK: Worker
 
     func startWorker() {
-        guard !workerRunning, !workerLoading else { return }
-        workerLoading = true; workerLog = "Loading model (worker)...\n"
-        let cfg = DistWorker.Config(modelPath: ProcessStream.absolutePath(modelPath),
-                                    port: UInt16(clamping: port), layerStart: layerStart,
-                                    layerEnd: layerEnd, hasOutput: hasOutput, contextSize: contextSize)
+        guard !workerRunning else { return }
+        // No model load here: the worker starts IDLE and loads its engine when
+        // the coordinator sends the ASSIGN (gguf + settings + layer slice).
+        workerLog = "Worker idle: waiting for the coordinator's assignment...\n"
+        let cfg = DistWorker.Config(port: UInt16(clamping: port),
+                                    localModelPath: ProcessStream.absolutePath(modelPath))
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         workerLogTask?.cancel()
         workerLogTask = Task { [weak self] in for await s in logStream { self?.workerLog += s } }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
-        let loadTask = Task.detached { () -> DistWorker in
-            let w = try DistWorker(config: cfg, onLog: onLog)
+        let w = DistWorker(config: cfg, onLog: onLog)
+        do {
             try w.start()
-            return w
-        }
-        Task {
-            do { self.worker = try await loadTask.value; self.workerLoading = false; self.workerRunning = true }
-            catch { logCont.yield("worker start failed: \(error)\n"); self.workerLoading = false; self.workerRunning = false }
+            worker = w
+            workerRunning = true
+        } catch {
+            logCont.yield("worker start failed: \(error)\n")
+            workerRunning = false
         }
     }
 
     func stopWorker() {
         worker?.stop(); worker = nil
-        workerRunning = false; workerLoading = false
+        workerRunning = false
         workerLog += "[worker stopped]\n"
     }
 
@@ -132,12 +131,16 @@ final class DistributedController {
             coordLog += "forwarding: enter the return host (this Mac's LAN IP)\n"; return
         }
         coordLoading = true; coordLog = "Loading model (coordinator)...\n"
+        // The coordinator defines each worker's job: same gguf/context as this
+        // Mac, plus the local expert slot-cache budget (workers cache too).
+        let slots = UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int ?? 0
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
                                          forward: forwardEnabled,
                                          returnHost: returnHost.trimmingCharacters(in: .whitespaces),
-                                         returnPort: UInt16(clamping: returnPort))
+                                         returnPort: UInt16(clamping: returnPort),
+                                         workerCacheSlots: slots)
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         coordLogTask?.cancel()
         coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }

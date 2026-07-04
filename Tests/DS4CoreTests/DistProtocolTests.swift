@@ -21,6 +21,81 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.contextSize, 8192)
     }
 
+    func testIdleHelloRoundTrip() throws {
+        let idle = DistHello.idle(localModelName: "local.gguf", nLayers: 43)
+        let decoded = try XCTUnwrap(DistHello.decode(idle.encoded()))
+        XCTAssertFalse(decoded.assigned)
+        XCTAssertEqual(decoded.modelName, "local.gguf")
+        XCTAssertEqual(decoded.nLayers, 43)
+        XCTAssertEqual(decoded.contextSize, 0)
+    }
+
+    func testAssignRoundTrip() throws {
+        let assign = DistAssign(modelPath: "/Models/ds4-flash.gguf", modelName: "ds4-flash.gguf",
+                                contextSize: 8192, expertCacheSlots: 16,
+                                layerStart: 22, layerEnd: 42, hasOutput: true)
+        let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
+        XCTAssertEqual(decoded.modelPath, "/Models/ds4-flash.gguf")
+        XCTAssertEqual(decoded.modelName, "ds4-flash.gguf")
+        XCTAssertEqual(decoded.contextSize, 8192)
+        XCTAssertEqual(decoded.expertCacheSlots, 16)
+        XCTAssertEqual(decoded.layerStart, 22)
+        XCTAssertEqual(decoded.layerEnd, 42)
+        XCTAssertTrue(decoded.hasOutput)
+        // Truncated path bytes → rejected, not mis-decoded.
+        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(30)))
+    }
+
+    // MARK: Coordinator-side layer partition
+
+    func testPartitionEqualAndRemainder() throws {
+        // 43 layers on 3 workers: 15 + 14 + 14, contiguous, full coverage.
+        let p = try DistCoordinator.partition(nLayers: 43, workers: 3)
+        XCTAssertEqual(p.map { $0.start }, [0, 15, 29])
+        XCTAssertEqual(p.map { $0.end }, [14, 28, 42])
+        // Single worker: the whole model.
+        let one = try DistCoordinator.partition(nLayers: 43, workers: 1)
+        XCTAssertEqual(one.count, 1)
+        XCTAssertEqual(one[0].start, 0); XCTAssertEqual(one[0].end, 42)
+        // Even split.
+        let even = try DistCoordinator.partition(nLayers: 8, workers: 4)
+        XCTAssertEqual(even.map { $0.start }, [0, 2, 4, 6])
+        XCTAssertEqual(even.map { $0.end }, [1, 3, 5, 7])
+        // Degenerate configs fail loudly.
+        XCTAssertThrowsError(try DistCoordinator.partition(nLayers: 4, workers: 5))
+        XCTAssertThrowsError(try DistCoordinator.partition(nLayers: 4, workers: 0))
+    }
+
+    // MARK: Worker-side gguf resolution
+
+    func testResolveModelPathOrder() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dist-resolve-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let coordPath = dir.appendingPathComponent("coord/model.gguf").path
+        let localDir = dir.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: localDir, withIntermediateDirectories: true)
+        let sibling = localDir.appendingPathComponent("model.gguf").path
+        let hint = localDir.appendingPathComponent("other.gguf").path
+        FileManager.default.createFile(atPath: sibling, contents: Data("x".utf8))
+
+        // Coordinator's path missing → the same-named sibling of the local hint wins.
+        XCTAssertEqual(DistWorker.resolveModelPath(requestedPath: coordPath,
+                                                   modelName: "model.gguf", localHint: hint), sibling)
+        // Coordinator's exact path present → used verbatim.
+        XCTAssertEqual(DistWorker.resolveModelPath(requestedPath: sibling,
+                                                   modelName: "model.gguf", localHint: hint), sibling)
+        // No coordinator path: resolved by NAME in the local hint's directory.
+        XCTAssertEqual(DistWorker.resolveModelPath(requestedPath: "", modelName: "other.gguf",
+                                                   localHint: sibling,
+                                                   exists: { $0 == sibling || $0 == hint }),
+                       hint)
+        // Nothing matches → nil (the worker replies with an explicit error).
+        XCTAssertNil(DistWorker.resolveModelPath(requestedPath: coordPath,
+                                                 modelName: "missing.gguf", localHint: hint))
+    }
+
     func testWorkRoundTripWithRouteAndSession() throws {
         let route = [DistRouteEntry(host: "10.0.0.2", port: 9100, layerStart: 0, layerEnd: 20, hasOutput: false),
                      DistRouteEntry(host: "10.0.0.3", port: 9101, layerStart: 21, layerEnd: 42, hasOutput: true)]
