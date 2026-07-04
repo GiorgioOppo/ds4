@@ -395,6 +395,13 @@ public final class StreamingDecoder {
             let hids: GPUTensor      // maxUnion × n Int32
             let mid: GPUTensor       // n × k × expertFfn f16
             let down6: GPUTensor     // n × k × nEmbd f32
+            // Batched SHARED-expert FFN (Q8_0 path only): token-major gate/up/
+            // mid intermediates and the per-token shared output rows.
+            let sGate: GPUTensor     // n × sharedFfn f32
+            let sUp: GPUTensor       // n × sharedFfn f32
+            let sMid: GPUTensor      // n × sharedFfn f32
+            let sOut: GPUTensor      // n × nEmbd f32
+            let ones: GPUTensor      // n × f32 = 1 (unit route weights for the rows-swiglu)
         }
         let mm: MMBuffers?
         init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int) throws {
@@ -403,14 +410,27 @@ public final class StreamingDecoder {
             split = try (0..<n).map { _ in try .zeros(rt, floatCount: 24) }
             ids = try (0..<n).map { _ in try .zerosBytes(rt, byteLength: d.k * 4) }
             rw = try (0..<n).map { _ in try .zeros(rt, floatCount: d.k) }
-            mm = mmPath ? MMBuffers(
-                curMat: try .zeros(rt, floatCount: n * d.nEmbd),
-                idsMat: try .zerosBytes(rt, byteLength: n * d.k * 4),
-                wMat: try .zeros(rt, floatCount: n * d.k),
-                htpe: try .zerosBytes(rt, byteLength: max(1, maxUnion) * 4),
-                hids: try .zerosBytes(rt, byteLength: max(1, maxUnion) * n * 4),
-                mid: try .zerosBytes(rt, byteLength: n * d.k * d.expertFfn * 2),
-                down6: try .zeros(rt, floatCount: n * d.k * d.nEmbd)) : nil
+            if mmPath {
+                let onesBuf = try GPUTensor.zeros(rt, floatCount: n)
+                let op = (onesBuf.buffer.contents() + onesBuf.byteOffset)
+                    .bindMemory(to: Float.self, capacity: n)
+                for i in 0..<n { op[i] = 1 }
+                mm = MMBuffers(
+                    curMat: try .zeros(rt, floatCount: n * d.nEmbd),
+                    idsMat: try .zerosBytes(rt, byteLength: n * d.k * 4),
+                    wMat: try .zeros(rt, floatCount: n * d.k),
+                    htpe: try .zerosBytes(rt, byteLength: max(1, maxUnion) * 4),
+                    hids: try .zerosBytes(rt, byteLength: max(1, maxUnion) * n * 4),
+                    mid: try .zerosBytes(rt, byteLength: n * d.k * d.expertFfn * 2),
+                    down6: try .zeros(rt, floatCount: n * d.k * d.nEmbd),
+                    sGate: try .zeros(rt, floatCount: n * d.sharedFfn),
+                    sUp: try .zeros(rt, floatCount: n * d.sharedFfn),
+                    sMid: try .zeros(rt, floatCount: n * d.sharedFfn),
+                    sOut: try .zeros(rt, floatCount: n * d.nEmbd),
+                    ones: onesBuf)
+            } else {
+                mm = nil
+            }
         }
     }
 
@@ -653,14 +673,41 @@ public final class StreamingDecoder {
                                              nTok: gTok, kPerTok: d.k,
                                              nExperts: group.union.count,
                                              ffnDim: d.expertFfn, outDim: d.nEmbd)
-                    // Per-token tail: shared FFN + blit of the token's k down
-                    // rows into the scratch + sum6/add/HC expand (identical
+                    // SHARED-expert FFN: batched too when the shared weights
+                    // are Q8_0 (gate/up mm -> rows-swiglu at unit weight ->
+                    // down mm, one matmul each for the whole group instead of
+                    // 3 matvecs per token). DS4_SHARED_Q4 residents keep the
+                    // per-token path (the id-kernel with k=1 has no mm twin).
+                    let sharedMM = !w.sharedGateQ4 && !w.sharedUpQ4 && !w.sharedDownQ4
+                    let actBase = group.tokens.lowerBound * d.nEmbd * 4
+                    if sharedMM {
+                        try c2.encodeMMDenseQ8(weight: w.sharedGate, act: mm.curMat, actBase: actBase,
+                                               out: mm.sGate, inDim: d.nEmbd, outDim: d.sharedFfn, nTok: gTok)
+                        try c2.encodeMMDenseQ8(weight: w.sharedUp, act: mm.curMat, actBase: actBase,
+                                               out: mm.sUp, inDim: d.nEmbd, outDim: d.sharedFfn, nTok: gTok)
+                        try c2.moeSwiGLUWeight(gate: mm.sGate, up: mm.sUp, weights: mm.ones,
+                                               mid: mm.sMid, width: d.sharedFfn, rows: gTok,
+                                               clampValue: d.swigluClamp)
+                        try c2.encodeMMDenseQ8(weight: w.sharedDown, act: mm.sMid, actBase: 0,
+                                               out: mm.sOut, inDim: d.sharedFfn, outDim: d.nEmbd, nTok: gTok)
+                    }
+                    // Per-token tail: blit of the token's shared row + k down
+                    // rows into the scratch, then sum6/add/HC expand (identical
                     // dispatches to the matvec path's tail).
                     let tokBytes = d.k * d.nEmbd * 4
                     for (tl, j) in group.tokens.enumerated() {
-                        try c2.decodeSharedFFN(w: w, s: scratch, d: d, cur: stage.cur[j])
-                        try c2.blitCopies([(src: mm.down6, srcOff: tl * tokBytes,
-                                            dst: scratch.down6, dstOff: 0, bytes: tokBytes)])
+                        if sharedMM {
+                            try c2.blitCopies([
+                                (src: mm.sOut, srcOff: tl * d.nEmbd * 4,
+                                 dst: scratch.sharedOut, dstOff: 0, bytes: d.nEmbd * 4),
+                                (src: mm.down6, srcOff: tl * tokBytes,
+                                 dst: scratch.down6, dstOff: 0, bytes: tokBytes),
+                            ])
+                        } else {
+                            try c2.decodeSharedFFN(w: w, s: scratch, d: d, cur: stage.cur[j])
+                            try c2.blitCopies([(src: mm.down6, srcOff: tl * tokBytes,
+                                                dst: scratch.down6, dstOff: 0, bytes: tokBytes)])
+                        }
                         try c2.decodeRoutedTail(s: scratch, d: d, outHc: other[j],
                                                 afterAttn: stage.attn[j], split: stage.split[j])
                     }

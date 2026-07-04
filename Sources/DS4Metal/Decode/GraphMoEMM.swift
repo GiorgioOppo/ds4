@@ -130,6 +130,29 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 
+    /// Dense Q8_0 matmul over a token-major activation matrix (the batched
+    /// SHARED-expert FFN of the mm prefill path): out[nTok x outDim] f32 =
+    /// act[nTok x inDim] x W(Q8_0)[outDim x inDim]. Same kernel_mul_mm_q8_0_f32
+    /// the stage-A wrapper validates; weight byteOffset honored (mmap views).
+    public func encodeMMDenseQ8(weight: GPUTensor, act: GPUTensor, actBase: Int,
+                                out: GPUTensor, inDim: Int, outDim: Int, nTok: Int) throws {
+        precondition(inDim % 32 == 0)
+        let rowBytes = (inDim / 32) * 34
+        let args = MetalRuntime.mulMMArgs(inDim: inDim, outDim: outDim, nTok: nTok,
+                                          rowBytes: UInt64(rowBytes))
+        let bcOut = (outDim % 64) != 0 || (nTok % 32) != 0
+        let pso = try rt.mulMMPipeline("kernel_mul_mm_q8_0_f32", bcInp: false, bcOut: bcOut)
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)
+        e.setBuffer(act.buffer, offset: act.byteOffset + actBase, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
+        e.setThreadgroupMemoryLength(bcOut ? 8192 : 6144, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (nTok + 31) / 32, height: (outDim + 63) / 64, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
     /// Down projection over the (already weighted, f16) mid rows via
     /// kernel_mul_mm_id_q2_K_f16 -> down6 [nTok x k x outDim] f32.
     public func encodeMMIdDownQ2K(down: GPUTensor, mid: GPUTensor,
