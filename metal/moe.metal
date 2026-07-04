@@ -4350,6 +4350,11 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16(
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // Barrier BEFORE rewriting sb: other simdgroups may still be inside the
+        // previous iteration's UP mma loop, which reads sb (only simdgroup_
+        // barriers separate them). The base kernel_mul_mm_id has the same
+        // barrier before every shared write. (audit kernel 2026-07-04)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const short sx_b = (tiitg%NL1);
         const short sy_b = (tiitg/NL1)/8;
         const short ly_b = (tiitg/NL1)%8;

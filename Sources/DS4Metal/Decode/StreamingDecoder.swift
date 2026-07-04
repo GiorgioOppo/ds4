@@ -118,6 +118,15 @@ public final class StreamingDecoder {
         let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
         return max(1, v)
     }()
+    /// DS4_PREFILL_MM=1 (OPT-IN): the group's routed FFN runs through the
+    /// mul_mm_id matrix-matrix kernels (expert weights read once per tile for
+    /// ALL the group's tokens) instead of one matvec chain per token. Same
+    /// math, different accumulation order (simdgroup MMA, f16 mid) — outputs
+    /// are close but NOT bit-identical to the matvec path, hence opt-in until
+    /// validated A/B on-device. iq2_xxs gate/up + q2_K down only (the Flash
+    /// shape); groups with reduced selections (DS4_ACTIVE_EXPERTS < k) fall
+    /// back to the matvec path (map0 requires k distinct ids per token).
+    let prefillMM = ProcessInfo.processInfo.environment["DS4_PREFILL_MM"] == "1"
 
     /// Expert-cache hook: given (layer index, the 6 selected ids), gather and pack
     /// ONLY those experts' gate/up/down. When set, forward() splits each layer at
@@ -375,12 +384,33 @@ public final class StreamingDecoder {
         let split: [GPUTensor]   // n × 24           (HC split)
         let ids: [GPUTensor]     // n × k Int32      (remapped ids, padded to k)
         let rw: [GPUTensor]      // n × k Float      (route weights, 0-padded)
-        init(_ rt: MetalRuntime, n: Int, d: DSV4Dims) throws {
+        /// Extra buffers for the mul_mm_id path (DS4_PREFILL_MM), rewritten per
+        /// group: token-major activation matrix, group-local ids/weights, the
+        /// expert-major map (htpe/hids) and the mid/down6 outputs.
+        struct MMBuffers {
+            let curMat: GPUTensor    // n × nEmbd f32 (chunk-global rows)
+            let idsMat: GPUTensor    // n × k Int32   (group-local rows)
+            let wMat: GPUTensor      // n × k f32     (group-local rows)
+            let htpe: GPUTensor      // maxUnion u32
+            let hids: GPUTensor      // maxUnion × n Int32
+            let mid: GPUTensor       // n × k × expertFfn f16
+            let down6: GPUTensor     // n × k × nEmbd f32
+        }
+        let mm: MMBuffers?
+        init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int) throws {
             cur = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nEmbd) }
             attn = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nHC * d.nEmbd) }
             split = try (0..<n).map { _ in try .zeros(rt, floatCount: 24) }
             ids = try (0..<n).map { _ in try .zerosBytes(rt, byteLength: d.k * 4) }
             rw = try (0..<n).map { _ in try .zeros(rt, floatCount: d.k) }
+            mm = mmPath ? MMBuffers(
+                curMat: try .zeros(rt, floatCount: n * d.nEmbd),
+                idsMat: try .zerosBytes(rt, byteLength: n * d.k * 4),
+                wMat: try .zeros(rt, floatCount: n * d.k),
+                htpe: try .zerosBytes(rt, byteLength: max(1, maxUnion) * 4),
+                hids: try .zerosBytes(rt, byteLength: max(1, maxUnion) * n * 4),
+                mid: try .zerosBytes(rt, byteLength: n * d.k * d.expertFfn * 2),
+                down6: try .zeros(rt, floatCount: n * d.k * d.nEmbd)) : nil
         }
     }
 
@@ -396,7 +426,7 @@ public final class StreamingDecoder {
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         try embedTokensBatch(Array(tokens[start..<end]), into: cur)
         let stage: PrefillStage? = (expertGather != nil && n > 1)
-            ? try PrefillStage(rt, n: n, d: d) : nil
+            ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
         for i in 0..<nLayers {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
@@ -495,6 +525,10 @@ public final class StreamingDecoder {
                     copyFloats(from: scratch.cur, to: stage.cur[j], count: d.nEmbd)
                     copyFloats(from: scratch.afterAttn, to: stage.attn[j], count: d.nHC * d.nEmbd)
                     copyFloats(from: scratch.split, to: stage.split[j], count: 24)
+                    if let mm = stage.mm {
+                        memcpy(mm.curMat.buffer.contents() + mm.curMat.byteOffset + j * d.nEmbd * 4,
+                               scratch.cur.buffer.contents() + scratch.cur.byteOffset, d.nEmbd * 4)
+                    }
                     profile.layers += 1
                 }
                 j += 1
@@ -512,13 +546,17 @@ public final class StreamingDecoder {
                     // Snapshot ids/weights into stage.ids/rw too: phase B reads
                     // them back and REWRITES both buffers (remapped + padded)
                     // strictly after this buffer completes — no aliasing.
-                    try c.blitCopies([
-                        (src: scratch.cur, dst: stage.cur[jj], bytes: d.nEmbd * 4),
-                        (src: scratch.afterAttn, dst: stage.attn[jj], bytes: d.nHC * d.nEmbd * 4),
-                        (src: scratch.split, dst: stage.split[jj], bytes: 24 * 4),
-                        (src: scratch.selected, dst: stage.ids[jj], bytes: d.k * 4),
-                        (src: scratch.rw, dst: stage.rw[jj], bytes: d.k * 4),
-                    ])
+                    var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
+                        (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
+                        (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
+                        (scratch.split, 0, stage.split[jj], 0, 24 * 4),
+                        (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
+                        (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
+                    ]
+                    if let mm = stage.mm {
+                        copies.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
+                    }
+                    try c.blitCopies(copies)
                 }
                 c.commit()
             }
@@ -574,7 +612,61 @@ public final class StreamingDecoder {
                 if gi + 1 < groups.count { pending = bg.start(groups[gi + 1].union) }
                 var posOf: [Int32: Int32] = [:]
                 for (p, id) in group.union.enumerated() { posOf[id] = Int32(p) }
-                if prefillFFNBatch {
+                // mul_mm_id path (DS4_PREFILL_MM): expert weights read once per
+                // tile for ALL the group's tokens. Requirements: Flash quants,
+                // full k DISTINCT selections per token (map0 encodes the slot
+                // as a sum over matches), dims multiple of 256, and enough
+                // tokens to amortize the matmul setup.
+                let gTok = group.tokens.count
+                let useMM = prefillMM && stage.mm != nil && gTok >= 8
+                    && w.gateQuant == .iq2_xxs && w.upQuant == .iq2_xxs && w.downQuant == .q2_K
+                    && d.k == 6 && d.nEmbd % 256 == 0 && d.expertFfn % 256 == 0
+                    && group.tokens.allSatisfy { idsT[$0].count == d.k }
+                if useMM, let mm = stage.mm {
+                    // CPU staging BEFORE the command buffer: group-local rows of
+                    // remapped (union-relative) ids + route weights.
+                    let idsPtr = (mm.idsMat.buffer.contents() + mm.idsMat.byteOffset)
+                        .bindMemory(to: Int32.self, capacity: gTok * d.k)
+                    let wPtr = (mm.wMat.buffer.contents() + mm.wMat.byteOffset)
+                        .bindMemory(to: Float.self, capacity: gTok * d.k)
+                    for (tl, j) in group.tokens.enumerated() {
+                        for s in 0..<d.k {
+                            idsPtr[tl * d.k + s] = posOf[idsT[j][s]]!
+                            wPtr[tl * d.k + s] = rwT[j][s]
+                        }
+                    }
+                    try Task.checkCancellation()
+                    t = Date()
+                    let c2 = GraphContext(rt); try c2.begin()
+                    try c2.encodeMoEMap0(ids: mm.idsMat, htpe: mm.htpe, hids: mm.hids,
+                                         nTok: gTok, kPerTok: d.k, nExperts: group.union.count)
+                    try c2.encodeMMIdPairSwiGLUIQ2(gate: g, up: u, act: mm.curMat,
+                                                   actBase: group.tokens.lowerBound * d.nEmbd * 4,
+                                                   htpe: mm.htpe, hids: mm.hids,
+                                                   mid: mm.mid, weights: mm.wMat,
+                                                   nTok: gTok, kPerTok: d.k,
+                                                   nExperts: group.union.count,
+                                                   inDim: d.nEmbd, ffnDim: d.expertFfn,
+                                                   clamp: d.swigluClamp)
+                    try c2.encodeMMIdDownQ2K(down: dn, mid: mm.mid,
+                                             htpe: mm.htpe, hids: mm.hids, out: mm.down6,
+                                             nTok: gTok, kPerTok: d.k,
+                                             nExperts: group.union.count,
+                                             ffnDim: d.expertFfn, outDim: d.nEmbd)
+                    // Per-token tail: shared FFN + blit of the token's k down
+                    // rows into the scratch + sum6/add/HC expand (identical
+                    // dispatches to the matvec path's tail).
+                    let tokBytes = d.k * d.nEmbd * 4
+                    for (tl, j) in group.tokens.enumerated() {
+                        try c2.decodeSharedFFN(w: w, s: scratch, d: d, cur: stage.cur[j])
+                        try c2.blitCopies([(src: mm.down6, srcOff: tl * tokBytes,
+                                            dst: scratch.down6, dstOff: 0, bytes: tokBytes)])
+                        try c2.decodeRoutedTail(s: scratch, d: d, outHc: other[j],
+                                                afterAttn: stage.attn[j], split: stage.split[j])
+                    }
+                    c2.commit()
+                    profile.expertsS += Date().timeIntervalSince(t)
+                } else if prefillFFNBatch {
                     // ONE command buffer for the whole group's FFNs. All the
                     // CPU staging happens BEFORE the commit (per-token ids/rw
                     // buffers — the shared s.rw can't be rewritten between

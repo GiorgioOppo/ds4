@@ -479,4 +479,17 @@ extension GraphContext {
                       blockAdd: nil, out: outHc, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
     }
+
+    /// Tail of the routed FFN for the batched-MM prefill (DS4_PREFILL_MM): the
+    /// k weighted down rows are already in s.down6 (blitted from the group's
+    /// matmul output) — sum6 + shared add + HC expand, the same dispatches the
+    /// matvec path ends with. s.sharedOut must already be encoded.
+    public func decodeRoutedTail(s: DecodeScratch, d: DSV4Dims, outHc: GPUTensor,
+                                 afterAttn: GPUTensor, split: GPUTensor) throws {
+        try moeSum6(experts: s.down6, out: s.routed, width: d.nEmbd)
+        try add(s.sharedOut, s.routed, out: s.ffnOut, width: d.nEmbd)
+        try hcExpand4(blockOut: s.ffnOut, residual: afterAttn, post: split, comb: split,
+                      blockAdd: nil, out: outHc, nEmbd: d.nEmbd, nTokens: 1,
+                      postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+    }
 }
