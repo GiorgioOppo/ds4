@@ -346,10 +346,19 @@ struct MessageRow: View {
 /// the inline syntax, this splits the block structure SwiftUI's Text won't.
 struct MarkdownView: View {
     let text: String
+    /// Parsed ONCE per text value (in init): SwiftUI can re-evaluate `body`
+    /// several times per update, and during streaming the view is recreated
+    /// at every token — parsing there made the per-token UI cost grow with
+    /// the message length.
+    private let blocks: [Block]
+
+    init(text: String) {
+        self.text = text
+        self.blocks = Self.parse(text)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            let blocks = Self.parse(text)
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 render(block)
             }

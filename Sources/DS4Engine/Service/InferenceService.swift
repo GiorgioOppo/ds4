@@ -945,11 +945,18 @@ public actor InferenceService {
             let t0 = Date()
             let snap = decoder.exportKV(nKeys: committedIds.count)
             let snapS = Date().timeIntervalSince(t0)
-            store.store(tokens: committedIds, modelName: modelName,
-                        snapshot: snap, reason: reason)
             FileHandle.standardError.write(Data(String(
                 format: "DS4 diskkv: snapshot %d token esportato in %.2fs\n",
                 committedIds.count, snapS).utf8))
+            // La SCRITTURA va fuori dal percorso critico del turno: l'ultimo
+            // token è già sullo schermo, ma prima il turno restava "aperto"
+            // finché il checkpoint non era su disco (secondi percepiti come
+            // tempo di generazione). Lo snapshot è un valore e DiskKVStore è
+            // Sendable: la scrittura F_NOCACHE prosegue in background.
+            let ids = committedIds, name = modelName
+            Task.detached(priority: .utility) {
+                store.store(tokens: ids, modelName: name, snapshot: snap, reason: reason)
+            }
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))
