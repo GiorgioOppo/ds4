@@ -6,6 +6,8 @@
 /ds4_native
 /ds4_server_test
 /ds4_test
+/tests/test_q4k_dot
+/tests/expert_bundle_test
 /ds4flash.gguf
 /TODO.md
 /gguf/

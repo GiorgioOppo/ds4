@@ -21824,6 +21824,7 @@ struct ds4_engine {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
     ds4_ssd_memory_lock simulated_memory;
+    ds4_expert_bundle expert_bundle;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -25543,10 +25544,123 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+#ifndef DS4_NO_GPU
+/*
+ * DS4_EXPERT_BUNDLE=1: serve streaming expert-cache misses from a sidecar
+ * file (<gguf>.expbundle, or $DS4_BUNDLE_DIR) where each routed expert's
+ * gate|up|down slabs are contiguous, so a miss becomes one sequential burst
+ * instead of three reads scattered across the GGUF. Same bytes, same
+ * numerics; built one-time on the first streaming run. Any validation or
+ * build failure just leaves the plain GGUF read path in place.
+ */
+static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
+                                                     const char *model_path) {
+    const char *env = getenv("DS4_EXPERT_BUNDLE");
+    if (!env || strcmp(env, "1") != 0) return;
+    if (!ds4_gpu_streaming_expert_bundle_supported()) {
+        fprintf(stderr,
+                "ds4: DS4_EXPERT_BUNDLE is not supported by this GPU backend "
+                "yet; ignored\n");
+        return;
+    }
+
+    /* The bundle covers one contiguous run of routed layers with uniform
+     * slab sizes. Mixed-precision (boosted) layers are off the slab size
+     * class and already bypass the expert cache, so they are not bundled. */
+    uint32_t lo = UINT32_MAX;
+    uint32_t hi = 0;
+    uint32_t routed = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+            continue;
+        }
+        if (lo == UINT32_MAX) lo = il;
+        hi = il;
+        routed++;
+    }
+    if (lo == UINT32_MAX || routed != hi - lo + 1) {
+        fprintf(stderr,
+                "ds4: expert bundle needs one contiguous run of routed "
+                "layers; skipping\n");
+        return;
+    }
+
+    uint64_t gate_bytes = 0;
+    uint64_t up_bytes = 0;
+    uint64_t down_bytes = 0;
+    ds4_expert_bundle_layer *layers = xmalloc(routed * sizeof(*layers));
+    bool ok = true;
+    for (uint32_t il = lo; il <= hi; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+        const uint64_t up_row = routed_expert_row_bytes(l->ffn_up_exps);
+        const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+        if (gate_row == 0 || up_row == 0 || down_row == 0 ||
+            l->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row ||
+            l->ffn_up_exps->dim[1] > UINT64_MAX / up_row ||
+            l->ffn_down_exps->dim[1] > UINT64_MAX / down_row) {
+            ok = false;
+            break;
+        }
+        const uint64_t g = l->ffn_gate_exps->dim[1] * gate_row;
+        const uint64_t u = l->ffn_up_exps->dim[1] * up_row;
+        const uint64_t d = l->ffn_down_exps->dim[1] * down_row;
+        if (il == lo) {
+            gate_bytes = g;
+            up_bytes = u;
+            down_bytes = d;
+        }
+        if (g == 0 || g != gate_bytes || u != up_bytes || d != down_bytes ||
+            g > UINT64_MAX / DS4_N_EXPERT ||
+            l->ffn_gate_exps->bytes != g * DS4_N_EXPERT ||
+            l->ffn_up_exps->bytes != u * DS4_N_EXPERT ||
+            l->ffn_down_exps->bytes != d * DS4_N_EXPERT) {
+            fprintf(stderr,
+                    "ds4: expert bundle skipped: layer %u is off the slab "
+                    "size class (mixed-precision routed experts are not "
+                    "bundled yet)\n",
+                    il);
+            ok = false;
+            break;
+        }
+        layers[il - lo].gate_offset = l->ffn_gate_exps->abs_offset;
+        layers[il - lo].up_offset = l->ffn_up_exps->abs_offset;
+        layers[il - lo].down_offset = l->ffn_down_exps->abs_offset;
+    }
+    if (ok && gate_bytes != up_bytes) {
+        /* The streaming expert cache assumes gate and up share one slab
+         * size (up tasks are issued with the gate length); a model where
+         * they differ would never be served from the cache anyway. */
+        fprintf(stderr,
+                "ds4: expert bundle skipped: gate/up slab sizes differ\n");
+        ok = false;
+    }
+    if (ok &&
+        ds4_expert_bundle_open_or_build(&e->expert_bundle, model_path,
+                                        e->model.fd, e->model.size,
+                                        lo, routed, DS4_N_EXPERT,
+                                        gate_bytes, up_bytes, down_bytes,
+                                        layers)) {
+        if (ds4_gpu_set_streaming_expert_bundle(&e->expert_bundle, layers)) {
+            fprintf(stderr, "ds4: expert bundle active: %s\n",
+                    e->expert_bundle.path);
+        } else {
+            fprintf(stderr,
+                    "ds4: expert bundle rejected by the GPU backend; "
+                    "using plain GGUF reads\n");
+            ds4_expert_bundle_close(&e->expert_bundle);
+        }
+    }
+    free(layers);
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->expert_bundle.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
@@ -25763,6 +25877,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        if (e->ssd_streaming) {
+            ds4_engine_setup_streaming_expert_bundle(e, opt->model_path);
+        }
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
@@ -26029,6 +26146,7 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
 #endif
+    ds4_expert_bundle_close(&e->expert_bundle);
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);

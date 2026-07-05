@@ -231,7 +231,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test expert-bundle-test
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -240,5 +240,9 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
+expert-bundle-test: tests/expert_bundle_test.c ds4_ssd.c ds4_ssd.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -D_GNU_SOURCE -I. -o tests/expert_bundle_test tests/expert_bundle_test.c ds4_ssd.c -lm -pthread
+	./tests/expert_bundle_test
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot tests/expert_bundle_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
