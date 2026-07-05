@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 @testable import DS4Metal
+import DS4Core
 
 /// Stage C: smoke test of the full decodeLayer wiring on a tiny synthetic config.
 /// Confirms the composition executes end-to-end (all kernels dispatch, buffer
@@ -65,7 +66,7 @@ final class GraphDecodeLayerTests: XCTestCase {
         let ctx = GraphContext(rt)
         try ctx.begin()
         try ctx.decodeLayer(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                            nKeys: nKeys, pos: pos, outHc: outHc, rmsEps: 1e-5, hcEps: 1e-3)
+                            nKeys: nKeys, pos: pos, outHc: outHc, rmsEps: ModelDefaults.rmsEps, hcEps: ModelDefaults.hcEps)
         ctx.commit()
 
         let out = outHc.floatArray(hcDim)

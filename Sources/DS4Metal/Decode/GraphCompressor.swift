@@ -24,6 +24,14 @@ public final class CompressorState {
     public let rowScratch: GPUTensor // [headDim] emitted-row scratch
     public let packedKv: GPUTensor   // [8 x headDim] ratio-4 pool gather scratch
     public let packedScore: GPUTensor
+    // Unfused-pool scratch (decode emits pool ONE row): the window transposed to
+    // [headDim x poolRows] plus the per-dim softmax — the same graph sequence
+    // ds4_metal.m keeps for n_comp == 1 (the fused kernel reduces in a different
+    // order; see compressorPoolEnc).
+    let poolKvT: GPUTensor           // transposed kv, then the kv*softmax product
+    let poolScoreT: GPUTensor        // transposed score
+    let poolSoftmax: GPUTensor       // per-dim softmax of poolScoreT
+    var poolRows: Int { ratio == 4 ? 8 : ratio }
     public var count: Int = 0        // n_comp emitted so far
 
     public init(_ rt: MetalRuntime, ratio: Int, headDim: Int, maxComp: Int) throws {
@@ -34,6 +42,10 @@ public final class CompressorState {
         let rows = coff * ratio
         stateKv = try .zeros(rt, floatCount: rows * width)
         stateScore = try .floats(rt, [Float](repeating: -1e30, count: rows * width))
+        let poolN = (ratio == 4 ? 8 : ratio) * headDim
+        poolKvT = try .zeros(rt, floatCount: poolN)
+        poolScoreT = try .zeros(rt, floatCount: poolN)
+        poolSoftmax = try .zeros(rt, floatCount: poolN)
         // Sized to the full context (maxComp = maxKeys/ratio) but allocated
         // zero-fill-on-demand: only the rows actually emitted ([0..count], the only
         // region attention/indexer ever read) cost physical RAM. So a 1M-context
@@ -91,20 +103,101 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    /// Per-dimension softmax pool of `nRows` rows (stride `rowStride` floats) into one
-    /// `headDim` row. kernel_dsv4_softmax_pool with per-dim score stride.
-    private func softmaxPoolPerDimEnc(kv: GPUTensor, kvOff: Int, score: GPUTensor, scOff: Int,
-                                      out: GPUTensor, nRows: Int, headDim: Int, rowStride: Int) throws {
-        let args = MetalRuntime.softmaxPoolPerDimArgs(nRows: nRows, headDim: headDim, rowStride: rowStride)
-        let pso = try rt.pipeline("kernel_dsv4_softmax_pool")
+    /// Unfused one-comp pool building blocks — encode-forms of the exact helpers
+    /// the C decode uses (ds4_gpu_encode_dsv4_softmax_pool_one_comp_ggml):
+    /// transpose copy, per-row softmax, elementwise mul, per-row sum. Same
+    /// kernels, same args, same nth/grid math — bit-identical reduction order.
+
+    /// kernel_cpy_f32_f32 with a strided 3d source (ds4_gpu_encode_cpy_f32_f32_
+    /// 3d_src_strided): dst[i1*dstRowStride + i0] = src[i0*srcColStride + i1*srcRowStride].
+    private func cpy3dSrcStridedEnc(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int,
+                                    cols: Int, rows: Int,
+                                    srcColStride: Int, srcRowStride: Int) throws {
+        var b = [UInt8](repeating: 0, count: 136)
+        func i64(_ off: Int, _ v: Int64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        let srcPlane = UInt64(rows * srcRowStride), dstRow = UInt64(cols) * 4
+        let dstPlane = UInt64(rows) * dstRow
+        i64(0, Int64(cols)); i64(8, Int64(cols)); i64(16, Int64(rows)); i64(24, 1); i64(32, 1)
+        u64(40, UInt64(srcColStride)); u64(48, UInt64(srcRowStride)); u64(56, srcPlane); u64(64, srcPlane)
+        i64(72, Int64(cols)); i64(80, Int64(rows)); i64(88, 1); i64(96, 1)
+        u64(104, 4); u64(112, dstRow); u64(120, dstPlane); u64(128, dstPlane)
+        let pso = try rt.pipeline("kernel_cpy_f32_f32")
+        var nth = 32; let maxT = pso.maxTotalThreadsPerThreadgroup
+        while nth < cols && nth < maxT { nth *= 2 }
+        if nth > maxT { nth = maxT }; if nth > cols { nth = cols }; if nth == 0 { nth = 1 }
+        let colGroups = (cols + nth - 1) / nth
+        let e = encoder
+        e.setComputePipelineState(pso)
+        b.withUnsafeBytes { e.setBytes($0.baseAddress!, length: b.count, index: 0) }
+        e.setBuffer(src.buffer, offset: srcOff, index: 1)
+        e.setBuffer(dst.buffer, offset: dstOff, index: 2)
+        e.dispatchThreadgroups(MTLSize(width: colGroups * rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
+    }
+
+    /// Per-row softmax over contiguous [rows x width] f32 (ds4_gpu_encode_softmax_
+    /// f32_contiguous: scale 1, no bias/mask, _f32_4 variant when width % 4 == 0).
+    private func softmaxRowsEnc(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int,
+                                width: Int, rows: Int) throws {
+        let args = MetalRuntime.softmaxArgs(width: width, rows: rows, planes: 1)
+        let use4 = width % 4 == 0
+        let pso = try rt.pipeline(use4 ? "kernel_soft_max_f32_4" : "kernel_soft_max_f32")
+        var nth = 32
+        let cap = use4 ? width / 4 : width
+        while nth < cap && nth * rows < 256 { nth *= 2 }
+        let maxT = pso.maxTotalThreadsPerThreadgroup
+        if nth > maxT { nth = maxT }; if nth == 0 { nth = 1 }
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(kv.buffer, offset: kvOff, index: 1)
-        e.setBuffer(score.buffer, offset: scOff, index: 2)
-        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
-        e.dispatchThreadgroups(MTLSize(width: (headDim + 255) / 256, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: min(256, headDim), height: 1, depth: 1))
+        e.setBuffer(src.buffer, offset: srcOff, index: 1)
+        e.setBuffer(src.buffer, offset: srcOff, index: 2)
+        e.setBuffer(src.buffer, offset: srcOff, index: 3)
+        e.setBuffer(dst.buffer, offset: dstOff, index: 4)
+        e.setThreadgroupMemoryLength(32 * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
+    }
+
+    /// Elementwise a*b over contiguous [rows x cols] f32 (ds4_gpu_encode_bin_f32_
+    /// rows with g_mul_pipeline + make_bin_contiguous_3d_args).
+    private func mulRowsEnc(a: GPUTensor, aOff: Int, b bT: GPUTensor, bOff: Int,
+                            out: GPUTensor, outOff: Int, cols: Int, rows: Int) throws {
+        let args = MetalRuntime.binArgs(width: cols, rows: rows, rhsWidth: cols)
+        let pso = try rt.binPipeline(op: .mul)
+        var nthMax = pso.maxTotalThreadsPerThreadgroup
+        if nthMax > 256 { nthMax = 256 }
+        var nth = 1
+        while 2 * nth < cols && nth < nthMax { nth *= 2 }
+        if nth == 0 { nth = 1 }
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(a.buffer, offset: aOff, index: 1)
+        e.setBuffer(bT.buffer, offset: bOff, index: 2)
+        e.setBuffer(out.buffer, offset: outOff, index: 3)
+        e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
+    }
+
+    /// Per-row sum of contiguous [rows x width] f32 into `rows` floats
+    /// (ds4_gpu_encode_sum_rows_f32).
+    private func sumRowsEnc(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int,
+                            width: Int, rows: Int) throws {
+        let args = MetalRuntime.sumRowsArgs(width: width, rows: rows)
+        let pso = try rt.sumRowsPipeline(op: 10)   // 10 = sum
+        var nth = 32; let maxT = pso.maxTotalThreadsPerThreadgroup
+        while nth < width && nth < maxT { nth *= 2 }
+        if nth > maxT { nth = maxT }; if nth > width { nth = width }; if nth == 0 { nth = 1 }
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(src.buffer, offset: srcOff, index: 1)
+        e.setBuffer(dst.buffer, offset: dstOff, index: 2)
+        e.setThreadgroupMemoryLength(32 * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
     }
 
     /// Copy `cols` floats per row for `rows` rows from src (stride srcRowStride floats,
@@ -130,28 +223,49 @@ extension GraphContext {
     /// Compressor pool into `out` (headDim). ratio-128: pool the `ratio` single-lane
     /// rows directly. ratio-4: gather two lanes (prev rows0..3 cols0..headDim ; cur
     /// rows4..7 cols headDim..2headDim) into packed 8 x headDim then pool.
+    ///
+    /// Decode emits ONE row (n_comp == 1), so this stays the UNFUSED graph
+    /// sequence — transpose, per-dim softmax, mul, sum_rows — exactly like
+    /// ds4_gpu_encode_dsv4_softmax_pool_one_comp_ggml. The fused
+    /// kernel_dsv4_softmax_pool is mathematically equivalent but reduces in a
+    /// different order; that alone creates ~1e-6 compressor differences and
+    /// later FP8/routing flips (ds4_metal.m:14773 keeps the same boundary).
     func compressorPoolEnc(_ comp: CompressorState, out: GPUTensor) throws {
         let h = comp.headDim, ratio = comp.ratio, width = comp.width
+        let kvSrc: GPUTensor, scSrc: GPUTensor
+        let nRows = comp.poolRows, rowStride: Int
         if ratio != 4 {
-            try softmaxPoolPerDimEnc(kv: comp.stateKv, kvOff: comp.stateKv.byteOffset,
-                                     score: comp.stateScore, scOff: comp.stateScore.byteOffset,
-                                     out: out, nRows: ratio, headDim: h, rowStride: width)
-            return
+            kvSrc = comp.stateKv; scSrc = comp.stateScore; rowStride = width
+        } else {
+            // prev lane: rows 0..3, cols 0..h  (offset 0, row stride width)
+            try gatherRowsEnc(src: comp.stateKv, srcByteOffset: comp.stateKv.byteOffset, srcRowStride: width,
+                              dst: comp.packedKv, dstByteOffset: comp.packedKv.byteOffset, rows: 4, cols: h)
+            try gatherRowsEnc(src: comp.stateScore, srcByteOffset: comp.stateScore.byteOffset, srcRowStride: width,
+                              dst: comp.packedScore, dstByteOffset: comp.packedScore.byteOffset, rows: 4, cols: h)
+            // cur lane: rows 4..7, cols h..2h  (offset 4*width + h, row stride width)
+            let curOff = (4 * width + h) * 4
+            try gatherRowsEnc(src: comp.stateKv, srcByteOffset: comp.stateKv.byteOffset + curOff, srcRowStride: width,
+                              dst: comp.packedKv, dstByteOffset: comp.packedKv.byteOffset + 4 * h * 4, rows: 4, cols: h)
+            try gatherRowsEnc(src: comp.stateScore, srcByteOffset: comp.stateScore.byteOffset + curOff, srcRowStride: width,
+                              dst: comp.packedScore, dstByteOffset: comp.packedScore.byteOffset + 4 * h * 4, rows: 4, cols: h)
+            kvSrc = comp.packedKv; scSrc = comp.packedScore; rowStride = h
         }
-        // prev lane: rows 0..3, cols 0..h  (offset 0, row stride width)
-        try gatherRowsEnc(src: comp.stateKv, srcByteOffset: comp.stateKv.byteOffset, srcRowStride: width,
-                          dst: comp.packedKv, dstByteOffset: comp.packedKv.byteOffset, rows: 4, cols: h)
-        try gatherRowsEnc(src: comp.stateScore, srcByteOffset: comp.stateScore.byteOffset, srcRowStride: width,
-                          dst: comp.packedScore, dstByteOffset: comp.packedScore.byteOffset, rows: 4, cols: h)
-        // cur lane: rows 4..7, cols h..2h  (offset 4*width + h, row stride width)
-        let curOff = (4 * width + h) * 4
-        try gatherRowsEnc(src: comp.stateKv, srcByteOffset: comp.stateKv.byteOffset + curOff, srcRowStride: width,
-                          dst: comp.packedKv, dstByteOffset: comp.packedKv.byteOffset + 4 * h * 4, rows: 4, cols: h)
-        try gatherRowsEnc(src: comp.stateScore, srcByteOffset: comp.stateScore.byteOffset + curOff, srcRowStride: width,
-                          dst: comp.packedScore, dstByteOffset: comp.packedScore.byteOffset + 4 * h * 4, rows: 4, cols: h)
-        try softmaxPoolPerDimEnc(kv: comp.packedKv, kvOff: comp.packedKv.byteOffset,
-                                 score: comp.packedScore, scOff: comp.packedScore.byteOffset,
-                                 out: out, nRows: 8, headDim: h, rowStride: h)
+        // kvT[g][r] = kv[r][g]; scoreT[g][r] = score[r][g]  (contiguous [h x nRows])
+        try cpy3dSrcStridedEnc(src: kvSrc, srcOff: kvSrc.byteOffset,
+                               dst: comp.poolKvT, dstOff: comp.poolKvT.byteOffset,
+                               cols: nRows, rows: h, srcColStride: rowStride * 4, srcRowStride: 4)
+        try cpy3dSrcStridedEnc(src: scSrc, srcOff: scSrc.byteOffset,
+                               dst: comp.poolScoreT, dstOff: comp.poolScoreT.byteOffset,
+                               cols: nRows, rows: h, srcColStride: rowStride * 4, srcRowStride: 4)
+        // softmax per dim, product, per-dim sum -> out[g]
+        try softmaxRowsEnc(src: comp.poolScoreT, srcOff: comp.poolScoreT.byteOffset,
+                           dst: comp.poolSoftmax, dstOff: comp.poolSoftmax.byteOffset,
+                           width: nRows, rows: h)
+        try mulRowsEnc(a: comp.poolKvT, aOff: comp.poolKvT.byteOffset,
+                       b: comp.poolSoftmax, bOff: comp.poolSoftmax.byteOffset,
+                       out: comp.poolKvT, outOff: comp.poolKvT.byteOffset, cols: nRows, rows: h)
+        try sumRowsEnc(src: comp.poolKvT, srcOff: comp.poolKvT.byteOffset,
+                       dst: out, dstOff: out.byteOffset, width: nRows, rows: h)
     }
 
     /// ratio-4 state shift (prev<-cur). kernel_dsv4_ratio4_shift_f32.

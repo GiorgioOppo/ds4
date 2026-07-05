@@ -107,6 +107,14 @@ public struct LayerWeights {
     public var idxGate: GPUTensor?        // F16 indexer_compressor_gate [nEmbd x coff*128]
     public var idxApe: GPUTensor?         // F16 indexer_compressor_ape  [coff*128 x ratio]
     public var idxNorm: GPUTensor?        // F32 indexer_compressor_norm [128]
+    // Hash routing + selection bias (ds4.c layer_hash_selected_experts /
+    // layer_topk_selected_experts_from_probs). tid2eid is the REQUIRED token-id →
+    // expert table of the first n_hash_layer (3) layers: I32 [6 x n_vocab], row =
+    // token id. expBias (exp_probs_b.bias, F32 [nExperts]) shifts the probs for
+    // top-k SELECTION only — the route weights stay normalized on unbiased probs.
+    public var tid2eid: GPUTensor?        // I32 [6 x nVocab]
+    public var tid2eidRows = 0            // n_vocab (kernel clamps token to rows-1)
+    public var expBias: GPUTensor?        // F32 [nExperts]
     // Routed-expert quant PER LAYER. Mixed-precision GGUFs upcast some layers
     // (e.g. a few to Q4_K over an IQ2_XXS/Q2_K base via --tensor-type); the decode
     // kernels dispatch on THESE, not on the model-global DSV4Dims quant. Detected
@@ -193,23 +201,24 @@ extension GraphContext {
     /// One HC-reduce: flat=rmsNorm(curHc, hcDim); mix=matmulF32(mixerFn, flat);
     /// split=sinkhorn(mix, scale, base); embd=weightedSum(curHc, pre); cur=rmsNorm(embd, norm).
     private func hcReduce(curHc: GPUTensor, mixerFn: GPUTensor, scale: GPUTensor, base: GPUTensor,
-                          norm: GPUTensor, s: DecodeScratch, d: DSV4Dims, eps: Float) throws {
+                          norm: GPUTensor, s: DecodeScratch, d: DSV4Dims,
+                          rmsEps: Float, hcEps: Float) throws {
         let hcDim = d.nHC * d.nEmbd
-        try rmsNorm(curHc, weight: nil, out: s.flat, rows: 1, n: hcDim, eps: eps)
+        try rmsNorm(curHc, weight: nil, out: s.flat, rows: 1, n: hcDim, eps: rmsEps)
         try matmulF16(weight: mixerFn, x: s.flat, out: s.mix, inDim: hcDim, outDim: 24) // hc_attn_fn/hc_ffn_fn are F16
         try hcSplitSinkhorn(mix: s.mix, scale: scale, base: base, out: s.split, nRows: 1,
-                            sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: eps)
+                            sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: hcEps)
         try hcWeightedSum(x: curHc, weights: s.split, out: s.embd, nEmbd: d.nEmbd, nHC: d.nHC, nTokens: 1)
-        try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: eps)
+        try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: rmsEps)
     }
 
     /// Full decode layer (resident experts, one command buffer). `curHc`
     /// (nHC*nEmbd) in; result in `outHc`. rawCache holds nKeys latent rows.
     public func decodeLayer(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                             outHc: GPUTensor, rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         try decodeRoute(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp)
+                        nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps, comp: comp)
         try decodeExperts(w: w, s: s, d: d, gateExp: w.expGate, upExp: w.expUp, downExp: w.expDown,
                           ids: s.selected, outHc: outHc)
     }
@@ -221,12 +230,13 @@ extension GraphContext {
     /// and the expert-cache path (which commits here, reads s.selected, gathers
     /// the 6 experts, then runs decodeExperts).
     public func decodeRoute(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                             rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         let nComp = try decodeRoutePre(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                                       pos: pos, rmsEps: rmsEps, comp: comp, idx: nil, indexerScoring: false)
+                                       pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp, idx: nil,
+                                       indexerScoring: false)
         try decodeRouteAttn(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
-                            rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
+                            token: token, rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
     }
 
     /// Phase 1a (pre-attention): HC-reduce, attention+indexer compressor updates,
@@ -237,11 +247,11 @@ extension GraphContext {
     /// decode_one + the dense top-k mask path). Returns n_comp visible to this token.
     public func decodeRoutePre(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                rope: RopeParams, rawCache: GPUTensor, pos: Int,
-                               rmsEps: Float, comp: CompressorState?, idx: CompressorState?,
+                               rmsEps: Float, hcEps: Float, comp: CompressorState?, idx: CompressorState?,
                                indexerScoring: Bool) throws -> Int {
         // 1) HC-reduce pre-attn  (s.cur = attn_norm)
         try hcReduce(curHc: curHc, mixerFn: w.hcAttnFn, scale: w.attnScale, base: w.attnBase,
-                     norm: w.attnNorm, s: s, d: d, eps: rmsEps)
+                     norm: w.attnNorm, s: s, d: d, rmsEps: rmsEps, hcEps: hcEps)
         // 1.5) NSA attention compressor (compressed layers only): update recurrent state
         // from attn_norm and, every `ratio` tokens, emit a pooled compressed KV row.
         var nComp = 0
@@ -315,7 +325,7 @@ extension GraphContext {
     /// carrying the indexer top-K selection) -> attn out (residual: curHc) ->
     /// pre-FFN HC -> router.
     public func decodeRouteAttn(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                                rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                                rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                                 rmsEps: Float, hcEps: Float, nComp: Int, comp: CompressorState?) throws {
         // 4) attention over the raw SWA WINDOW + comp.cache[0..nComp] -> heads.
         //    Only the last nSWA raw rows are visible (C slides its raw cache at
@@ -363,7 +373,7 @@ extension GraphContext {
         encoder.pushDebugGroup("hc-router")
         // 6) HC-reduce pre-FFN (on afterAttn)
         try hcReduce(curHc: s.afterAttn, mixerFn: w.hcFfnFn, scale: w.ffnScale, base: w.ffnBase,
-                     norm: w.ffnNorm, s: s, d: d, eps: rmsEps)
+                     norm: w.ffnNorm, s: s, d: d, rmsEps: rmsEps, hcEps: hcEps)
         // 7) router: logits -> softplus -> sqrt -> top-6 -> weights.
         //    ffn_gate_inp is Q8_0 in the Q4_K model but F16 in the IQ2_XXS model.
         if d.routerF16 {
@@ -373,7 +383,14 @@ extension GraphContext {
         }
         try unary(s.logits, op: .softplus, out: s.sp, width: d.nExperts)
         try unary(s.sp, op: .sqrt, out: s.probs, width: d.nExperts)
-        try routerFinalizeTop6(probs: s.probs, selected: s.selected)
+        // Selection: hash table on the first n_hash_layer layers (row = token id),
+        // biased top-6 elsewhere; weights ALWAYS normalize the unbiased probs of
+        // the selected experts (ds4.c layer_routed_moe_one + router kernel args).
+        if w.tid2eid != nil && token < 0 {
+            throw MetalError.unsupported("hash-routed layer dispatched without a token id")
+        }
+        try routerFinalizeTop6(probs: s.probs, selected: s.selected, bias: w.expBias,
+                               hashTable: w.tid2eid, hashRows: w.tid2eidRows, token: token)
         try routerWeights(probs: s.probs, selected: s.selected, weights: s.rw)
         encoder.popDebugGroup()                       // hc-router
     }

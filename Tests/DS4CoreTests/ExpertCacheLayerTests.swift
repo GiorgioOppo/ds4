@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 @testable import DS4Metal
+import DS4Core
 
 /// Stage D (expert-cache integration): validates that the split decode layer
 /// [decodeRoute -> read the 6 selected ids -> gather only those 6 experts ->
@@ -77,7 +78,7 @@ final class ExpertCacheLayerTests: XCTestCase {
         let rawR = try GPUTensor.zeros(rt, floatCount: nKeys * d.headDim)
         let outR = try GPUTensor.zeros(rt, floatCount: hcDim)
         let cr = GraphContext(rt); try cr.begin()
-        try cr.decodeLayer(curHc: curHc, w: w, s: sR, d: d, rope: rope, rawCache: rawR, nKeys: nKeys, pos: pos, outHc: outR, rmsEps: 1e-5, hcEps: 1e-3)
+        try cr.decodeLayer(curHc: curHc, w: w, s: sR, d: d, rope: rope, rawCache: rawR, nKeys: nKeys, pos: pos, outHc: outR, rmsEps: ModelDefaults.rmsEps, hcEps: ModelDefaults.hcEps)
         cr.commit()
         let resident = outR.floatArray(hcDim)
 
@@ -86,7 +87,7 @@ final class ExpertCacheLayerTests: XCTestCase {
         let rawC = try GPUTensor.zeros(rt, floatCount: nKeys * d.headDim)
         let outC = try GPUTensor.zeros(rt, floatCount: hcDim)
         let c1 = GraphContext(rt); try c1.begin()
-        try c1.decodeRoute(curHc: curHc, w: w, s: sC, d: d, rope: rope, rawCache: rawC, nKeys: nKeys, pos: pos, rmsEps: 1e-5, hcEps: 1e-3)
+        try c1.decodeRoute(curHc: curHc, w: w, s: sC, d: d, rope: rope, rawCache: rawC, nKeys: nKeys, pos: pos, rmsEps: ModelDefaults.rmsEps, hcEps: ModelDefaults.hcEps)
         c1.commit()
         let selPtr = sC.selected.buffer.contents().bindMemory(to: Int32.self, capacity: d.k)
         let ids = Array(UnsafeBufferPointer(start: selPtr, count: d.k))

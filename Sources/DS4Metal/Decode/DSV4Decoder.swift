@@ -37,7 +37,7 @@ public final class DSV4Decoder {
 
     public init(rt: MetalRuntime, dims: DSV4Dims, rope: RopeParams, layers: [LayerWeights],
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
-                rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws {
+                rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.layers = layers
         self.embedTable = embedTable; self.out = out; self.rmsEps = rmsEps; self.hcEps = hcEps
         let hcDim = dims.nHC * dims.nEmbd
@@ -62,7 +62,7 @@ public final class DSV4Decoder {
         var cur = hcA, other = hcB
         for i in 0..<layers.count {
             try ctx.decodeLayer(curHc: cur, w: layers[i], s: scratch, d: d, rope: DSV4Shape.ropeParams(layer: i),
-                                rawCache: rawCaches[i], nKeys: nKeys, pos: pos, outHc: other,
+                                rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token, outHc: other,
                                 rmsEps: rmsEps, hcEps: hcEps)
             swap(&cur, &other)
         }

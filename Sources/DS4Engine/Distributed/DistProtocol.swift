@@ -35,7 +35,10 @@ public enum Dist {
     /// v6: derived caches travel too — the offer can include the Q4 dense
     /// requant cache (<gguf>.q4dense, ~1.4 GB beats minutes of re-requant on
     /// every worker) and ASSIGN carries the Q4 on/off decision.
-    public static let protocolVersion: UInt32 = 6
+    /// v7: WORK carries the chunk's token ids. The first n_hash_layer (3)
+    /// layers route experts by TOKEN ID (ffn_gate_tid2eid), so a shard that
+    /// covers them cannot route from the HC state alone.
+    public static let protocolVersion: UInt32 = 7
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
@@ -466,14 +469,16 @@ public struct DistWork: Sendable {
     public var returnHost: String
     public var returnPort: UInt16
     public var hc: [Float]            // nTokens * (nHC*nEmbd) floats
+    public var tokenIds: [Int32]      // v7: the chunk's token ids (hash-layer routing)
 
     public init(session: UInt32, pos: Int, nTokens: Int, layerStart: Int, layerEnd: Int,
                 flags: Dist.WorkFlags, hcBits: Int, route: [DistRouteEntry] = [], routeIndex: Int = 0,
-                returnHost: String = "", returnPort: UInt16 = 0, hc: [Float]) {
+                returnHost: String = "", returnPort: UInt16 = 0, hc: [Float], tokenIds: [Int32] = []) {
         self.session = session
         self.pos = pos; self.nTokens = nTokens; self.layerStart = layerStart; self.layerEnd = layerEnd
         self.flags = flags; self.hcBits = hcBits; self.route = route; self.routeIndex = routeIndex
         self.returnHost = returnHost; self.returnPort = returnPort; self.hc = hc
+        self.tokenIds = tokenIds
     }
 
     public func encoded() -> Data {
@@ -489,6 +494,8 @@ public struct DistWork: Sendable {
         let rh = Data(returnHost.utf8)
         d.appendLE(UInt32(rh.count)); d.append(rh)
         d.appendLE(UInt32(returnPort))
+        d.appendLE(UInt32(tokenIds.count))
+        for t in tokenIds { d.appendLE(UInt32(bitPattern: t)) }
         d.appendLE(UInt32(hc.count))
         d.append(ActivationCodec.pack(hc, bits: hcBits))
         return d
@@ -516,6 +523,14 @@ public struct DistWork: Sendable {
         guard rhLen >= 0, o + rhLen + 8 <= d.endIndex else { return nil }
         let returnHost = String(decoding: d[o..<o+rhLen], as: UTF8.self); o += rhLen
         let returnPort = UInt16(clamping: d.readLE(&o) as UInt32)
+        guard o + 4 <= d.endIndex else { return nil }
+        // v7: token ids. Either absent (0 — legacy control paths) or exactly
+        // one per token; anything else is a malformed frame.
+        let idCount = Int(d.readLE(&o) as UInt32)
+        guard idCount == 0 || idCount == nTokens, o + idCount * 4 + 4 <= d.endIndex else { return nil }
+        var tokenIds: [Int32] = []
+        tokenIds.reserveCapacity(idCount)
+        for _ in 0..<idCount { tokenIds.append(Int32(bitPattern: d.readLE(&o) as UInt32)) }
         let count = Int(d.readLE(&o) as UInt32)
         // Strict: a chunk whose payload does not hold EXACTLY `count` values is
         // rejected here, so no consumer ever slices a silently-short array.
@@ -524,7 +539,7 @@ public struct DistWork: Sendable {
         }
         return DistWork(session: session, pos: pos, nTokens: nTokens, layerStart: ls, layerEnd: le,
                         flags: flags, hcBits: bits, route: route, routeIndex: routeIndex,
-                        returnHost: returnHost, returnPort: returnPort, hc: hc)
+                        returnHost: returnHost, returnPort: returnPort, hc: hc, tokenIds: tokenIds)
     }
 }
 

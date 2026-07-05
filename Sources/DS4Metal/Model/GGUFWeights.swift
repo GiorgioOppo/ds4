@@ -52,6 +52,62 @@ public enum GGUFWeights {
         return (q("ffn_gate_exps.weight"), q("ffn_up_exps.weight"), q("ffn_down_exps.weight"), routerF16)
     }
 
+    /// Bind-time validation of the routed expert tensors, port of the C checks
+    /// the loader enforces before ever dispatching a kernel (ds4.c:3227-3231,
+    /// 3626-3631): the quant type must be one of the closed set the kernels
+    /// implement (iq2_xxs / q2_K / q4_K — exactly `MoEQuant.from`), gate and up
+    /// must share a type, and the declared dims must match the shape. Without
+    /// this an unknown type silently fell back to the q4_K kernel: garbage
+    /// logits instead of a load error.
+    public static func validateRoutedExperts(_ model: GGUFModel, dims: DSV4Dims, nLayers: Int) throws {
+        for il in 0..<nLayers {
+            let p = "blk.\(il)."
+            guard let g = model.findTensor(p + "ffn_gate_exps.weight") else { continue }   // dense layer
+            guard let u = model.findTensor(p + "ffn_up_exps.weight"),
+                  let dn = model.findTensor(p + "ffn_down_exps.weight") else {
+                throw LoadError.missing("\(p)ffn_up_exps/ffn_down_exps.weight")
+            }
+            for t in [g, u, dn] where MoEQuant.from(ggufType: t.type) == nil {
+                throw LoadError.message("\(p): expected a routed expert quant type "
+                                        + "(iq2_xxs/q2_K/q4_K), got \(t.typeName)")
+            }
+            if g.type != u.type {
+                throw LoadError.message("\(p): ffn_gate_exps and ffn_up_exps quant types differ "
+                                        + "(\(g.typeName) vs \(u.typeName))")
+            }
+            let gu: [UInt64] = [UInt64(dims.nEmbd), UInt64(dims.expertFfn), UInt64(dims.nExperts)]
+            let dd: [UInt64] = [UInt64(dims.expertFfn), UInt64(dims.nEmbd), UInt64(dims.nExperts)]
+            if g.dims != gu || u.dims != gu {
+                throw LoadError.message("\(p): routed gate/up dims \(g.dims)/\(u.dims), expected \(gu)")
+            }
+            if dn.dims != dd {
+                throw LoadError.message("\(p): routed down dims \(dn.dims), expected \(dd)")
+            }
+            // Hash routing table: REQUIRED on the first n_hash_layer layers
+            // (required_tensorf, ds4.c:4064), I32 [n_expert_used x n_vocab]
+            // (ds4.c:3637). Without it those layers would silently fall back
+            // to top-k routing — a numerics divergence, not a load error.
+            if il < DSV4Shape.nHashLayer {
+                guard let t = model.findTensor(p + "ffn_gate_tid2eid.weight") else {
+                    throw LoadError.missing("\(p)ffn_gate_tid2eid.weight (hash-routed layer)")
+                }
+                guard t.type == 26, t.dims == [UInt64(dims.k), UInt64(dims.vocab)] else {
+                    throw LoadError.message("\(p)ffn_gate_tid2eid.weight: type \(t.typeName) dims \(t.dims), "
+                                            + "expected i32 [\(dims.k), \(dims.vocab)]")
+                }
+            }
+            // Selection bias: optional, but when present it must be F32 [n_expert]
+            // (tensor_expect_optional, ds4.c:3625) — the finalize kernel reads
+            // exactly nExperts floats from it.
+            if let b = model.findTensor(p + "exp_probs_b.bias") {
+                guard b.type == 0, b.dims == [UInt64(dims.nExperts)] else {
+                    throw LoadError.message("\(p)exp_probs_b.bias: type \(b.typeName) dims \(b.dims), "
+                                            + "expected f32 [\(dims.nExperts)]")
+                }
+            }
+        }
+    }
+
     public static func layer(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int, loadExperts: Bool = true) throws -> LayerWeights {
         let p = "blk.\(il)."
         func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
@@ -77,6 +133,7 @@ public enum GGUFWeights {
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optT, small: optT)
+        try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
@@ -112,6 +169,28 @@ public enum GGUFWeights {
                 || q(p, "ffn_down_exps.weight") != cls.down { n += 1 }
         }
         return n
+    }
+
+    /// Hash routing table + router selection bias (ds4.c: ffn_gate_tid2eid is
+    /// REQUIRED on the first n_hash_layer layers, exp_probs_b.bias is optional
+    /// everywhere). Layout validated like layer_hash_selected_experts: I32,
+    /// 2 dims, dim[0] == 6 (experts per token). `mapped` puts the ~3 MB table
+    /// behind a no-copy mmap view; the tiny bias is always copied.
+    static func loadRouterExtras(_ w: inout LayerWeights, _ rt: MetalRuntime, _ model: GGUFModel,
+                                 _ il: Int, mapped: Bool) throws {
+        let p = "blk.\(il)."
+        if let t = model.findTensor(p + "ffn_gate_tid2eid.weight") {
+            guard t.type == 26, t.dims.count == 2, t.dims[0] == 6, t.dims[1] > 0 else {
+                throw LoadError.message("\(p)ffn_gate_tid2eid.weight has an unexpected layout "
+                                        + "(type \(t.typeName), dims \(t.dims))")
+            }
+            w.tid2eid = mapped ? try mappedTensor(rt, model, p + "ffn_gate_tid2eid.weight")
+                               : try tensor(rt, model, p + "ffn_gate_tid2eid.weight")
+            w.tid2eidRows = Int(t.dims[1])
+        }
+        if model.findTensor(p + "exp_probs_b.bias") != nil {
+            w.expBias = try tensor(rt, model, p + "exp_probs_b.bias")
+        }
     }
 
     /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
@@ -173,6 +252,7 @@ public enum GGUFWeights {
             compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optM, small: optT)
+        try loadRouterExtras(&w, rt, model, il, mapped: true)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
@@ -204,6 +284,9 @@ public enum GGUFWeights {
         // Indexer: only the SMALL ape/norm are loaded here; the big projections
         // are streamed (DenseStreamer fills them when the layer has them).
         try loadIndexer(&w, model, il, big: { _ in nil }, small: optT)
+        // Hash table + bias stay RESIDENT (copied): the router needs them every
+        // token and the 3-layer table is ~9 MB total — not worth streaming.
+        try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
@@ -265,6 +348,42 @@ public enum GGUFWeights {
             done += n
         }
         return true
+    }
+
+    /// DS4_PREAD_SPLIT: pread CONCORRENTI per slab nel fill diretto (F_NOCACHE)
+    /// della slot-cache. I miss del decode sono pochi per layer (~2-3 × 3 slab
+    /// ⇒ coda NVMe ~6-9 richieste), ma il disco rende il suo tetto solo a ~24
+    /// richieste in volo (il probe DS4_DIAG "random parallelo"): spezzare ogni
+    /// slab in N range DISGIUNTI letti in parallelo alza la profondità di coda
+    /// a parità di byte. 1 (default) = una pread per slab, percorso storico.
+    static let preadSplit = max(1, min(8, ProcessInfo.processInfo.environment["DS4_PREAD_SPLIT"].flatMap(Int.init) ?? 1))
+
+    /// preadFull spezzata in `parts` range disgiunti letti CONCORRENTEMENTE
+    /// (stesso fd: pread ha l'offset esplicito, niente cursore condiviso).
+    /// Confini dei range allineati a 16 KB così il F_NOCACHE non rilegge la
+    /// stessa pagina da due job. Sotto i 64 KB (o parts=1) delega a preadFull.
+    static func preadFullSplit(_ fd: Int32, into dst: UnsafeMutableRawPointer,
+                               bytes: Int, offset: Int, parts: Int) -> Bool {
+        guard parts > 1, bytes > (64 << 10) else {
+            return preadFull(fd, into: dst, bytes: bytes, offset: offset)
+        }
+        let align = 16 << 10
+        let chunk = ((bytes + parts - 1) / parts + align - 1) / align * align
+        let n = (bytes + chunk - 1) / chunk
+        // nonisolated(unsafe): ogni iterazione scrive un range DISGIUNTO di
+        // dst; il flag d'errore e' protetto dal lock (stesso pattern di
+        // gatherExperts qui sotto).
+        nonisolated(unsafe) let dstBase = dst
+        let failed = NSLock()
+        nonisolated(unsafe) var anyFailure = false
+        DispatchQueue.concurrentPerform(iterations: n) { i in
+            let off = i * chunk
+            let len = min(chunk, bytes - off)
+            if !preadFull(fd, into: dstBase + off, bytes: len, offset: offset + off) {
+                failed.lock(); anyFailure = true; failed.unlock()
+            }
+        }
+        return !anyFailure
     }
 
     /// Expert-cache: pack ONLY the `ids` selected experts of a Q4_K MoE tensor
@@ -374,8 +493,9 @@ public enum GGUFWeights {
         }
         let dstPtr = dst.buffer.contents().advanced(by: dst.byteOffset + slot * stride)
         if let fd = uncachedFD {
-            guard preadFull(fd, into: dstPtr, bytes: expertBytes,
-                            offset: Int(t.absOffset) + Int(id) * expertBytes) else {
+            guard preadFullSplit(fd, into: dstPtr, bytes: expertBytes,
+                                 offset: Int(t.absOffset) + Int(id) * expertBytes,
+                                 parts: preadSplit) else {
                 throw LoadError.message("copyExpert: pread failed on \(name) expert \(id)")
             }
             return

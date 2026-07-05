@@ -92,6 +92,13 @@ extension StreamingDecoder {
         // Full cache: physStart == rawStart and it never wraps -> identical to before.
         let rawRows = rawCaches[i].count / d.headDim
         let rows = layer.raw.count / d.headDim
+        // The lengths come from the FILE: a corrupt/truncated checkpoint must be
+        // rejected, never memcpy'd past the ring (C: "session tensor is smaller
+        // than the payload", ds4.c:23477).
+        guard layer.rawStart >= 0, rows <= rawRows,
+              layer.raw.count == rows * d.headDim else {
+            throw KVSnapshotError.shapeMismatch
+        }
         let physStart = layer.rawStart % rawRows
         if physStart + rows <= rawRows {
             writeFloatsArray(layer.raw, into: rawCaches[i], at: physStart * d.headDim)
@@ -118,9 +125,18 @@ extension StreamingDecoder {
     private func restoreComp(_ c: CompressorState?, from snap: CompSnapshot?, rowDim: Int) throws {
         guard let c else { return }
         try c.reset(rt)
-        guard let snap, snap.count * rowDim == snap.cacheRows.count else {
-            if snap != nil { throw KVSnapshotError.shapeMismatch }
-            return
+        guard let snap else { return }
+        // Every length below comes from the FILE — validate against the live
+        // tensors' capacities before any memcpy (C: raw_cap / "invalid compressed
+        // row count", ds4.c:24669/24702).
+        let coff = c.ratio == 4 ? 2 : 1
+        let stateLen = coff * c.ratio * c.width
+        guard rowDim == c.headDim,
+              snap.count >= 0, snap.count <= c.maxComp,
+              snap.count * rowDim == snap.cacheRows.count,
+              snap.stateKv.count == stateLen,
+              snap.stateScore.count == stateLen else {
+            throw KVSnapshotError.shapeMismatch
         }
         writeFloatsArray(snap.stateKv, into: c.stateKv, at: 0)
         writeFloatsArray(snap.stateScore, into: c.stateScore, at: 0)

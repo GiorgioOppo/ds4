@@ -43,9 +43,17 @@ public final class DistEngine: @unchecked Sendable {
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         onLoadLog?("tokenizer…")
         self.tok = try Tokenizer(model: model)
+        // Same load-time validation as InferenceService: metadata like the C
+        // config_validate_model, Flash-only runtime, closed expert-quant set.
+        let config = try ModelConfig(model: model)
+        guard config.shape.variant == .flash else {
+            throw ModelConfigError.unsupportedShape(
+                "\(config.shape.name): il runtime supporta solo il profilo Flash")
+        }
         var dims = DSV4Shape.dims
         let mq = GGUFWeights.detectMoEQuant(model)
         dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
+        try GGUFWeights.validateRoutedExperts(model, dims: dims, nLayers: DSV4Shape.nLayer)
         self.contextSize = contextSize
         self.nLayers = DSV4Shape.nLayer
         self.modelName = (modelPath as NSString).lastPathComponent
@@ -132,13 +140,16 @@ public final class DistEngine: @unchecked Sendable {
         try decoder.embed(token: token, pos: pos)
     }
 
-    public func forwardSlice(hc: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
-        try decoder.forwardSlice(hc: hc, pos: pos, nKeys: nKeys, start: start, end: end)
+    public func forwardSlice(hc: [Float], pos: Int, nKeys: Int, start: Int, end: Int,
+                             token: Int = -1) throws -> [Float] {
+        try decoder.forwardSlice(hc: hc, pos: pos, nKeys: nKeys, start: start, end: end, token: token)
     }
 
     /// Chunked prefill: run the slice over `hcs.count` consecutive tokens from `posBase`.
-    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
-        try decoder.forwardSliceBatch(hcs: hcs, posBase: posBase, start: start, end: end)
+    /// `tokens` (one id per state) feeds the hash-routed layers (0..2).
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int,
+                                  tokens: [Int]? = nil) throws -> [[Float]] {
+        try decoder.forwardSliceBatch(hcs: hcs, posBase: posBase, start: start, end: end, tokens: tokens)
     }
 
     public func head(hc: [Float]) throws -> [Float] {

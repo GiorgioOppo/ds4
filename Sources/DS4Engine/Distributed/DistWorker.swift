@@ -401,7 +401,9 @@ public final class DistWorker: @unchecked Sendable {
                     hcs.reserveCapacity(n)
                     for i in 0..<n { hcs.append(Array(work.hc[i*stateLen..<(i+1)*stateLen])) }
                     return try engine.forwardSliceBatch(hcs: hcs, posBase: work.pos,
-                                                        start: work.layerStart, end: work.layerEnd)
+                                                        start: work.layerStart, end: work.layerEnd,
+                                                        tokens: work.tokenIds.isEmpty ? nil
+                                                            : work.tokenIds.map(Int.init))
                 }
                 if work.pos == 0, let outHC = outStates.first {
                     func nrm(_ a: [Float]) -> Float { (a.reduce(0) { $0 + $1 * $1 }).squareRoot() }
@@ -440,7 +442,7 @@ public final class DistWorker: @unchecked Sendable {
                                        flags: work.flags, hcBits: work.hcBits,
                                        route: work.route, routeIndex: nextIdx,
                                        returnHost: work.returnHost, returnPort: work.returnPort,
-                                       hc: outStates.flatMap { $0 })
+                                       hc: outStates.flatMap { $0 }, tokenIds: work.tokenIds)
                     let c = try await outbound(next.host, next.port, expectHello: true)
                     try await c.sendFrame(.work, fwd.encoded())
                 }

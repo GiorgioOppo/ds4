@@ -135,6 +135,16 @@ public actor InferenceService {
         self.rt = try MetalRuntime()
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         self.tok = try Tokenizer(model: model)
+        // Validate the metadata like the C loader (config_validate_model) and
+        // select the declared profile. The runtime (DSV4Shape constants, router
+        // kernels, slot-cache) is wired for Flash: a valid Pro GGUF must be
+        // refused LOUDLY here, not decoded with Flash shapes into garbage.
+        let config = try ModelConfig(model: model)
+        guard config.shape.variant == .flash else {
+            throw ModelConfigError.unsupportedShape(
+                "\(config.shape.name): il runtime supporta solo il profilo Flash "
+                + "(43 layer, 256 esperti); il profilo Pro non e' ancora cablato")
+        }
         // Configure the MoE/router quant scheme from the GGUF (Q4_K+Q8 vs IQ2_XXS/Q2_K+F16).
         var configuredDims = DSV4Shape.dims
         let mq = GGUFWeights.detectMoEQuant(model)
@@ -143,6 +153,7 @@ public actor InferenceService {
         // Mixed-precision GGUFs (some routed layers upcast, e.g. to Q4_K): those
         // layers decode per-layer and bypass the single-class expert slot-cache,
         // reading experts via the mmap gather. Uniform models report 0 (no-op).
+        try GGUFWeights.validateRoutedExperts(model, dims: configuredDims, nLayers: DSV4Shape.nLayer)
         let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: DSV4Shape.nLayer)
         if mixed > 0 {
             FileHandle.standardError.write(Data(
@@ -624,7 +635,7 @@ public actor InferenceService {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
                 note("\(c.name) \(c.argumentsJSON) → " + excerpt(out.content))
-                results += "<tool_result>" + out.content + "</tool_result>"
+                results += "<tool_result>" + ChatRenderer.escapeToolResult(out.content) + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
@@ -762,7 +773,7 @@ public actor InferenceService {
     public func provideToolResults(_ outputs: [ToolOutput], thinkMode: DS4ThinkMode,
                                    sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         var suffix = openingPrefix() + "<｜User｜>"
-        for o in outputs { suffix += "<tool_result>" + o.content + "</tool_result>" }
+        for o in outputs { suffix += "<tool_result>" + ChatRenderer.escapeToolResult(o.content) + "</tool_result>" }
         suffix += assistantOpen(thinkMode)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }

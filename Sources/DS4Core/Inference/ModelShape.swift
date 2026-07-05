@@ -110,6 +110,14 @@ public struct ModelConfig: Sendable {
     public let compressRopeFreqBase: Float
     public let ropeOrigCtx: UInt64
 
+    /// Port of config_expect_f32 (ds4.c:3867): floats from the GGUF are
+    /// compared with a RELATIVE 1e-6 tolerance, not bit-exactly — f32/f64
+    /// re-encodings of the same constant must not be rejected.
+    static func f32Matches(_ got: Float, _ expected: Float) -> Bool {
+        let scale = abs(expected) > 1 ? abs(expected) : 1
+        return abs(got - expected) <= scale * 1.0e-6
+    }
+
     public init(model: GGUFModel) throws {
         func reqU32(_ key: String) throws -> UInt32 {
             guard let v = model.u32("deepseek4." + key) else { throw ModelConfigError.missing("deepseek4." + key) }
@@ -204,7 +212,7 @@ public struct ModelConfig: Sendable {
         clampOut.reserveCapacity(Int(nLayer))
         for il in 0..<Int(nLayer) {
             let got = Float(clamps[il])
-            if got != ModelDefaults.swigluClampExp {
+            if !Self.f32Matches(got, ModelDefaults.swigluClampExp) {
                 throw ModelConfigError.mismatch("swiglu_clamp_exp[\(il)]",
                                                 expected: "\(ModelDefaults.swigluClampExp)", got: "\(got)")
             }
@@ -221,33 +229,58 @@ public struct ModelConfig: Sendable {
         self.ropeOrigCtx = origCtx
 
         let freqBase = try reqF32("rope.freq_base")
-        if freqBase != ModelDefaults.ropeFreqBase {
+        if !Self.f32Matches(freqBase, ModelDefaults.ropeFreqBase) {
             throw ModelConfigError.mismatch("rope.freq_base", expected: "\(ModelDefaults.ropeFreqBase)", got: "\(freqBase)")
         }
         self.ropeFreqBase = freqBase
 
         let scaleFactor = model.f32Compat("deepseek4.rope.scaling.factor") ?? ModelDefaults.ropeScaleFactor
-        if scaleFactor != ModelDefaults.ropeScaleFactor {
+        if !Self.f32Matches(scaleFactor, ModelDefaults.ropeScaleFactor) {
             throw ModelConfigError.mismatch("rope.scaling.factor", expected: "\(ModelDefaults.ropeScaleFactor)", got: "\(scaleFactor)")
         }
         self.ropeScaleFactor = scaleFactor
 
         let betaFast = model.f32Compat("deepseek4.rope.scaling.yarn_beta_fast") ?? ModelDefaults.ropeYarnBetaFast
-        if betaFast != ModelDefaults.ropeYarnBetaFast {
+        if !Self.f32Matches(betaFast, ModelDefaults.ropeYarnBetaFast) {
             throw ModelConfigError.mismatch("rope.scaling.yarn_beta_fast", expected: "\(ModelDefaults.ropeYarnBetaFast)", got: "\(betaFast)")
         }
         self.ropeYarnBetaFast = betaFast
 
         let betaSlow = model.f32Compat("deepseek4.rope.scaling.yarn_beta_slow") ?? ModelDefaults.ropeYarnBetaSlow
-        if betaSlow != ModelDefaults.ropeYarnBetaSlow {
+        if !Self.f32Matches(betaSlow, ModelDefaults.ropeYarnBetaSlow) {
             throw ModelConfigError.mismatch("rope.scaling.yarn_beta_slow", expected: "\(ModelDefaults.ropeYarnBetaSlow)", got: "\(betaSlow)")
         }
         self.ropeYarnBetaSlow = betaSlow
 
         let compressFreq = try reqF32("attention.compress_rope_freq_base")
-        if compressFreq != ModelDefaults.compressRopeFreqBase {
+        if !Self.f32Matches(compressFreq, ModelDefaults.compressRopeFreqBase) {
             throw ModelConfigError.mismatch("attention.compress_rope_freq_base", expected: "\(ModelDefaults.compressRopeFreqBase)", got: "\(compressFreq)")
         }
         self.compressRopeFreqBase = compressFreq
+
+        // Engine-level constants the C validates at load (ds4.c:3990-3997): the
+        // declared training config must match what the engine hardcodes, or the
+        // file is refused instead of silently run with different math.
+        let ews = try reqF32("expert_weights_scale")
+        if !Self.f32Matches(ews, selected.expertWeightScale) {
+            throw ModelConfigError.mismatch("expert_weights_scale",
+                                            expected: "\(selected.expertWeightScale)", got: "\(ews)")
+        }
+        let rmsEps = try reqF32("attention.layer_norm_rms_epsilon")
+        if !Self.f32Matches(rmsEps, ModelDefaults.rmsEps) {
+            throw ModelConfigError.mismatch("attention.layer_norm_rms_epsilon",
+                                            expected: "\(ModelDefaults.rmsEps)", got: "\(rmsEps)")
+        }
+        let hcEps = try reqF32("hyper_connection.epsilon")
+        if !Self.f32Matches(hcEps, ModelDefaults.hcEps) {
+            throw ModelConfigError.mismatch("hyper_connection.epsilon",
+                                            expected: "\(ModelDefaults.hcEps)", got: "\(hcEps)")
+        }
+        guard let ewNorm = model.bool("deepseek4.expert_weights_norm") else {
+            throw ModelConfigError.missing("deepseek4.expert_weights_norm")
+        }
+        if !ewNorm {
+            throw ModelConfigError.mismatch("expert_weights_norm", expected: "true", got: "false")
+        }
     }
 }
