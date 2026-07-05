@@ -20,16 +20,18 @@ public enum DistFileHash {
 
     /// The file's SHA-256, from the cache when (size, mtime) still match, else
     /// computed by streaming the file (F_NOCACHE: hashing must not evict the
-    /// hot page cache) and cached. nil if unreadable.
+    /// hot page cache) and cached. nil if unreadable. `onLog` is called only
+    /// synchronously (non-escaping — an optional closure parameter would be
+    /// implicitly @escaping and reject the callers' non-escaping loggers).
     public static func cachedOrCompute(path: String,
-                                       onLog: (@Sendable (String) -> Void)? = nil) -> Data? {
+                                       onLog: @Sendable (String) -> Void = { _ in }) -> Data? {
         guard let (size, mtime) = stat(path) else { return nil }
         if let hit = lookup(path: path), hit.size == size, hit.mtime == mtime,
            let data = Data(hexString: hit.sha256) {
             return data
         }
-        onLog?("hash SHA-256 di \((path as NSString).lastPathComponent) "
-               + "(\(size / 1_048_576) MB, una tantum)…\n")
+        onLog("hash SHA-256 di \((path as NSString).lastPathComponent) "
+              + "(\(size / 1_048_576) MB, una tantum)…\n")
         guard let digest = compute(path: path) else { return nil }
         remember(path: path, size: size, mtime: mtime, sha256: digest)
         return digest
