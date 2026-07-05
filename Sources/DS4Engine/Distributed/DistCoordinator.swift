@@ -163,7 +163,9 @@ public final class DistCoordinator: @unchecked Sendable {
                                     useExpertBundle: config.useExpertBundle,
                                     layerStart: ls, layerEnd: le, hasOutput: hasOutput,
                                     usageJSON: usage)
-            onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize) (loading…)\n")
+            onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize)\n")
+            onLog("attendo il caricamento del motore sul worker (minuti alla prima esecuzione: "
+                  + "mmap + Metal + eventuali sidecar; progresso nel log del tab Worker)…\n")
             try await conn.sendFrame(.assign, assign.encoded())
             let (rType, rPayload) = try await conn.readFrame()
             if rType == .error {

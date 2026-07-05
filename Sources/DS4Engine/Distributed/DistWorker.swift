@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import DS4Core
 @preconcurrency import Network
 
 /// A distributed WORKER: starts IDLE (listening, no model loaded) and receives
@@ -515,6 +516,24 @@ public final class DistWorker: @unchecked Sendable {
               + (wanted.expertCacheSlots > 0 ? " · \(wanted.expertCacheSlots) slot cache" : "")
               + " — carico il motore…\n")
         let t0 = Date()
+        // The load is SILENT for minutes (mmap, Metal init, resident copies,
+        // sidecar/Q4 builds on first run): mirror LoadProgress into the worker
+        // log so "still working" and "stuck" are distinguishable at a glance.
+        LoadProgress.shared.reset()
+        let poller = Task { [onLog] in
+            var lastStage = ""
+            var lastPct = -10.0
+            while !Task.isCancelled {
+                let s = LoadProgress.shared.snapshot
+                let pct = s.fraction * 100
+                if !s.stage.isEmpty, s.stage != lastStage || pct - lastPct >= 10 {
+                    lastStage = s.stage; lastPct = pct
+                    onLog(String(format: "caricamento: %@ (%.0f%%)\n", s.stage, pct))
+                }
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+        defer { poller.cancel() }
         do {
             // Detached: the load (mmap + Metal init) runs for minutes and must
             // not sit on this connection's task while frames could arrive.
