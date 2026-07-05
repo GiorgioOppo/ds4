@@ -516,11 +516,16 @@ public final class DistWorker: @unchecked Sendable {
               + (wanted.expertCacheSlots > 0 ? " · \(wanted.expertCacheSlots) slot cache" : "")
               + " — carico il motore…\n")
         let t0 = Date()
-        // The load is SILENT for minutes (mmap, Metal init, resident copies,
-        // sidecar/Q4 builds on first run): mirror LoadProgress into the worker
-        // log so "still working" and "stuck" are distinguishable at a glance.
+        // The load is SILENT for minutes otherwise (mmap, Metal init, resident
+        // copies, sidecar/Q4 REQUANT builds on first run): mirror the phase
+        // breadcrumbs + LoadProgress into the worker log AND relay them to the
+        // coordinator as `progress` frames, so BOTH logs show what is running.
         LoadProgress.shared.reset()
-        let poller = Task { [onLog] in
+        let report: @Sendable (String) -> Void = { [onLog] text in
+            onLog("caricamento: \(text)\n")
+        }
+        let progressConn = conn
+        let poller = Task { [report] in
             var lastStage = ""
             var lastPct = -10.0
             while !Task.isCancelled {
@@ -528,7 +533,9 @@ public final class DistWorker: @unchecked Sendable {
                 let pct = s.fraction * 100
                 if !s.stage.isEmpty, s.stage != lastStage || pct - lastPct >= 10 {
                     lastStage = s.stage; lastPct = pct
-                    onLog(String(format: "caricamento: %@ (%.0f%%)\n", s.stage, pct))
+                    let text = String(format: "%@ (%.0f%%)", s.stage, pct)
+                    report(text)
+                    try? await progressConn.sendFrame(.progress, Data(text.utf8))
                 }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
@@ -537,17 +544,21 @@ public final class DistWorker: @unchecked Sendable {
         do {
             // Detached: the load (mmap + Metal init) runs for minutes and must
             // not sit on this connection's task while frames could arrive.
+            // Phase breadcrumbs cover what LoadProgress does not (Metal/mmap).
             let slots = wanted.expertCacheSlots
-            let loaded = try await Task.detached(priority: .userInitiated) {
+            let loaded = try await Task.detached(priority: .userInitiated) { [report] in
                 try DistEngine(modelPath: resolved, contextSize: wanted.contextSize,
                                expertCacheSlots: slots > 0 ? slots : nil,
-                               kvLayers: wanted.layerStart..<(wanted.layerEnd + 1))
+                               kvLayers: wanted.layerStart..<(wanted.layerEnd + 1),
+                               onLoadLog: report)
             }.value
+            poller.cancel()              // no progress frames after READY is submitted
             commitAssignment(loaded, wanted)
             applyAncillary(assign, to: loaded)
             onLog(String(format: "motore pronto in %.1fs\n", Date().timeIntervalSince(t0)))
             try await conn.sendFrame(.ready, helloPayload().encoded())
         } catch {
+            poller.cancel()
             releaseAssignmentClaim()
             let msg = "engine load failed: \(error)"
             onLog(msg + "\n")

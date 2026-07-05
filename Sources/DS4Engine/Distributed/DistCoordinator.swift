@@ -167,9 +167,22 @@ public final class DistCoordinator: @unchecked Sendable {
             onLog("attendo il caricamento del motore sul worker (minuti alla prima esecuzione: "
                   + "mmap + Metal + eventuali sidecar; progresso nel log del tab Worker)…\n")
             try await conn.sendFrame(.assign, assign.encoded())
-            let (rType, rPayload) = try await conn.readFrame()
-            if rType == .error {
-                throw DistError.remote("\(p.host):\(p.port): " + String(decoding: rPayload, as: UTF8.self))
+            // Await READY, relaying the worker's load-progress frames into
+            // THIS log (Q4 requant, sidecar builds and Metal init are minutes
+            // of silence otherwise — "stuck" and "working" must be tellable
+            // apart from the coordinator alone).
+            var rType: Dist.MsgType
+            var rPayload: Data
+            while true {
+                (rType, rPayload) = try await conn.readFrame()
+                if rType == .progress {
+                    onLog("worker \(p.host): " + String(decoding: rPayload, as: UTF8.self) + "\n")
+                    continue
+                }
+                if rType == .error {
+                    throw DistError.remote("\(p.host):\(p.port): " + String(decoding: rPayload, as: UTF8.self))
+                }
+                break
             }
             guard rType == .ready, let ready = DistHello.decode(rPayload), ready.assigned else {
                 throw DistError.badFrame
@@ -297,6 +310,7 @@ public final class DistCoordinator: @unchecked Sendable {
         while true {
             let (type, payload) = try await conn.readFrame()
             if type == .result { continue }                       // stale turn reply: drop
+            if type == .progress { continue }                     // informational only
             if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
             return (type, payload)
         }
@@ -604,12 +618,15 @@ public final class DistCoordinator: @unchecked Sendable {
                                 hc: states.flatMap { $0 })
             try await conns[i].sendFrame(.work, work.encoded())
             var res: DistResult
-            repeat {
+            while true {
                 let (type, payload) = try await conns[i].readFrame()
+                if type == .progress { continue }                // informational only
                 if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
                 guard type == .result, let r = DistResult.decode(payload) else { throw DistError.badFrame }
+                guard r.session == session else { continue }     // stale turn: drop
                 res = r
-            } while res.session != session                       // stale turn: drop
+                break
+            }
             if res.kind == .logits { return res.values }
             // The worker echoes exactly nTokens states; anything else is a bug
             // upstream — fail the turn, never slice a short array.

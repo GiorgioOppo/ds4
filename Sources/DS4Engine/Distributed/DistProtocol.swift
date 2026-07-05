@@ -59,6 +59,7 @@ public enum Dist {
         case fileChunk = 14   // coordinator → worker: sequential slab of one file
         case fileDone  = 15   // coordinator → worker: file complete (worker verifies hash)
         case fileAck   = 16   // worker → coordinator: per-file receive outcome
+        case progress  = 17   // worker → coordinator: load progress text (informational)
     }
 
     /// Flags on a WORK message.

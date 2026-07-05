@@ -31,11 +31,17 @@ public final class DistEngine: @unchecked Sendable {
 
     /// `kvLayers` restricts KV/compressor allocation to a layer range (a worker
     /// allocates only its slice's caches; a pure coordinator can pass 0..<0).
-    /// nil = full model.
+    /// nil = full model. `onLoadLog` marks each init PHASE (breadcrumbs for the
+    /// worker log: LoadProgress only covers the decoder factory, so a stall in
+    /// Metal init or mmap would otherwise be silent and undiagnosable).
     public init(modelPath: String, contextSize: Int, expertCacheSlots: Int? = nil,
-                kvLayers: Range<Int>? = nil) throws {
+                kvLayers: Range<Int>? = nil,
+                onLoadLog: (@Sendable (String) -> Void)? = nil) throws {
+        onLoadLog?("init Metal runtime (compilazione kernel)…")
         self.rt = try MetalRuntime()
+        onLoadLog?("mmap gguf…")
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
+        onLoadLog?("tokenizer…")
         self.tok = try Tokenizer(model: model)
         var dims = DSV4Shape.dims
         let mq = GGUFWeights.detectMoEQuant(model)
@@ -47,9 +53,11 @@ public final class DistEngine: @unchecked Sendable {
                               attnFactor: 1, betaFast: 32, betaSlow: 1)
         self.markup = ToolMarkup.discover(in: tok)
         self.kvQuantBits = dims.gateQuant == .iq2_xxs ? 2 : 4
+        onLoadLog?("costruzione decoder (pesi, cache, KV)…")
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(
             rt: rt, model: model, dims: dims, rope: rope, nLayers: DSV4Shape.nLayer,
             maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers)
+        onLoadLog?("decoder pronto")
     }
 
     // MARK: Usage imatrix (worker slot-cache pre-warm)
