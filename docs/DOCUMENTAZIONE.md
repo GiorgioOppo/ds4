@@ -474,6 +474,16 @@ Stop propagates to the cluster generation task and takes effect at the next
 chunk boundary. Frames are plaintext TCP with no authentication: run
 distributed mode only on trusted networks.
 
+KV continuity (protocol v4): turns no longer re-prefill the whole conversation
+every time. The coordinator reuses the in-memory prefix committed by the last
+clean turn when the re-rendered conversation extends it exactly; on a cold
+start (or when the coordinator's disk-KV setting is on) it negotiates a
+restore across all shards — each worker keeps slice-keyed disk checkpoints,
+saved after clean turns and restored only when EVERY shard holds the same
+prefix; any mismatch falls back to a cold prefill. The ASSIGN also carries the
+usage imatrix, so each worker pre-warms its expert slot-cache (and persists
+its own slice-refined profile between sessions).
+
 ### Benchmark
 
 The benchmark panel measures prefill and generation throughput at increasing

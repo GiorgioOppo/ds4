@@ -2,11 +2,13 @@ import Foundation
 import DS4Core
 
 /// The distributed COORDINATOR: owns the embedding, the sampling loop and the
-/// conversation. `connect()` establishes a persistent route to the workers
-/// (validated for full contiguous layer coverage); each `send(...)` re-renders
-/// the WHOLE conversation and runs it across the cluster, streaming the reply.
-/// Re-rendering per turn (stateless) keeps the cluster KV trivially consistent —
-/// no cross-turn rewind to coordinate over the network.
+/// conversation. `connect()` establishes a persistent route to the workers,
+/// ASSIGNING each one its job (gguf, settings, layer slice); each `send(...)`
+/// re-renders the WHOLE conversation and runs it across the cluster, streaming
+/// the reply. Re-rendering keeps correctness trivially checkable — and when
+/// the render EXACTLY extends the prefix committed by the last clean turn, the
+/// prefill covers only the suffix (in-memory reuse), else a disk restore is
+/// negotiated across the shards. Any mismatch falls back to a cold prefill.
 ///
 /// Transports: RELAY (default; coordinator round-trips each chunk through every
 /// worker) or FORWARDING (`forward:true`; workers pass the HC state worker→worker
@@ -28,15 +30,18 @@ public final class DistCoordinator: @unchecked Sendable {
         public var returnPort: UInt16
         /// Expert slot-cache budget ASSIGNed to each worker (0 = disabled).
         public var workerCacheSlots: Int
+        /// Disk-KV token budget ASSIGNed to each worker's shard (0 = disabled).
+        public var diskKVBudgetTokens: Int
         public init(modelPath: String, contextSize: Int, peers: [Peer], activationBits: Int,
                     prefillChunk: Int = 32, forward: Bool = false,
                     returnHost: String = "", returnPort: UInt16 = 9099,
-                    workerCacheSlots: Int = 0) {
+                    workerCacheSlots: Int = 0, diskKVBudgetTokens: Int = 0) {
             self.modelPath = modelPath; self.contextSize = contextSize
             self.peers = peers; self.activationBits = activationBits
             self.prefillChunk = max(1, prefillChunk); self.forward = forward
             self.returnHost = returnHost; self.returnPort = returnPort
             self.workerCacheSlots = max(0, workerCacheSlots)
+            self.diskKVBudgetTokens = max(0, diskKVBudgetTokens)
         }
     }
 
@@ -76,6 +81,16 @@ public final class DistCoordinator: @unchecked Sendable {
     /// caller (one chat turn / benchmark at a time), so a plain counter is enough.
     private var sessionCounter: UInt32 = 0
 
+    /// KV continuity across turns. `committedIds` are the tokens whose KV every
+    /// worker shard holds after the last CLEAN turn; `kvValid` mirrors the local
+    /// engine's dirty-until-clean rule (false during a turn, after Stop/error,
+    /// and around a benchmark — the NSA compressor is recurrent and cannot
+    /// rewind, so a partial turn invalidates the whole prefix).
+    private var committedIds: [Int] = []
+    private var kvValid = false
+    /// Tokens covered by the last disk checkpoint (interval gate, like local).
+    private var lastDiskStoreCount = 0
+
     public var routeSummary: String { "\(engine.nLayers) layers · \(entries.count) workers" }
 
     public init(config: Config) throws {
@@ -108,12 +123,18 @@ public final class DistCoordinator: @unchecked Sendable {
 
             // ASSIGN this peer its slice; the worker loads (or reuses) its
             // engine and replies READY. The last slice also runs the head.
+            // The usage imatrix seed pre-warms the worker's slot cache with
+            // this model's richest local profile (same seeding as local chat).
             let (ls, le) = slices[i]
             let hasOutput = (i == config.peers.count - 1)
+            let usage = InferenceService.usageDataSeeded(modelName: modelName,
+                                                         agentId: "generale") ?? Data()
             let assign = DistAssign(modelPath: config.modelPath, modelName: modelName,
                                     contextSize: config.contextSize,
                                     expertCacheSlots: config.workerCacheSlots,
-                                    layerStart: ls, layerEnd: le, hasOutput: hasOutput)
+                                    diskKVBudgetTokens: config.diskKVBudgetTokens,
+                                    layerStart: ls, layerEnd: le, hasOutput: hasOutput,
+                                    usageJSON: usage)
             onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize) (loading…)\n")
             try await conn.sendFrame(.assign, assign.encoded())
             let (rType, rPayload) = try await conn.readFrame()
@@ -160,7 +181,73 @@ public final class DistCoordinator: @unchecked Sendable {
     public func disconnect() {
         for c in conns { c.cancel() }
         conns = []; entries = []
+        committedIds = []; kvValid = false; lastDiskStoreCount = 0
         returnListener?.stop(); returnListener = nil; returnIter = nil
+    }
+
+    // MARK: Cluster KV continuity
+
+    /// Read a KV-control reply on a relay connection, skipping stale RESULT
+    /// frames an abandoned turn may have left in the socket buffer.
+    private func readControl(_ conn: DistConnection) async throws -> (Dist.MsgType, Data) {
+        while true {
+            let (type, payload) = try await conn.readFrame()
+            if type == .result { continue }                       // stale turn reply: drop
+            if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
+            return (type, payload)
+        }
+    }
+
+    /// Negotiate a disk restore for `ids`: intersect every worker's stored
+    /// prefix lengths, pick the longest ALL shards can restore, and restore it
+    /// everywhere. Returns the restored length, or nil (cold prefill — any
+    /// partially restored shard is overwritten by the pos-0 prefill).
+    private func negotiateRestore(ids: [Int], onLog: @Sendable (String) -> Void) async -> Int? {
+        do {
+            var common: Set<Int>?
+            for conn in conns {
+                try await conn.sendFrame(.kvQuery, DistKV.encodeTokens(ids))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvLengths, let lengths = DistKV.decodeLengths(payload) else { return nil }
+                common = common.map { $0.intersection(lengths) } ?? Set(lengths)
+                if common?.isEmpty == true { return nil }
+            }
+            guard let best = common?.max(), best > 0 else { return nil }
+            let prefix = Array(ids.prefix(best))
+            for (i, conn) in conns.enumerated() {
+                try await conn.sendFrame(.kvRestore, DistKV.encodeTokens(prefix))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvAck, let ack = DistKV.decodeAck(payload), ack.ok else {
+                    onLog("restore KV fallito su \(entries[i].host):\(entries[i].port) — prefill da zero\n")
+                    return nil
+                }
+            }
+            onLog("KV ripristinato da disco su \(conns.count) worker (\(best) token)\n")
+            return best
+        } catch {
+            onLog("negoziazione restore KV fallita: \(error) — prefill da zero\n")
+            return nil
+        }
+    }
+
+    /// Checkpoint the committed prefix on every worker (interval-gated by the
+    /// caller). The workers export synchronously and write in the background.
+    private func broadcastSave(ids: [Int], cold: Bool, onLog: @Sendable (String) -> Void) async {
+        do {
+            for conn in conns {
+                try await conn.sendFrame(.kvSave, DistKV.encodeSave(tokens: ids, cold: cold))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvAck, let ack = DistKV.decodeAck(payload), ack.ok else {
+                    onLog("checkpoint KV rifiutato da un worker" +
+                          ((DistKV.decodeAck(payload)?.message).map { ": \($0)" } ?? "") + "\n")
+                    return
+                }
+            }
+            lastDiskStoreCount = ids.count
+            onLog("checkpoint KV cluster: \(ids.count) token su \(conns.count) worker\n")
+        } catch {
+            onLog("checkpoint KV fallito: \(error)\n")
+        }
     }
 
     // MARK: One chat turn
@@ -182,12 +269,30 @@ public final class DistCoordinator: @unchecked Sendable {
         let session = sessionCounter
         let ids = engine.chatPromptIds(turns: turns, tools: tools, think: think)
         guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt exceeds context") }
-        onLog("prefill \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
 
-        // PREFILL the whole prompt in chunks, fresh KV (posBase 0 resets workers).
-        var pos = 0
+        // KV continuity: when the re-rendered conversation EXACTLY extends the
+        // prefix committed by the last clean turn, prefill only the suffix
+        // (the workers still hold that KV). Otherwise try a disk restore
+        // negotiated across all shards. Exact-match checks make both paths
+        // opportunistic and safe: any mismatch falls back to a cold prefill.
+        var startPos = 0
+        if kvValid, !committedIds.isEmpty, ids.count > committedIds.count,
+           ids.starts(with: committedIds) {
+            startPos = committedIds.count
+            onLog("KV riusato in memoria: \(startPos) token già nel cluster\n")
+        } else if config.diskKVBudgetTokens > 0 {
+            if let restored = await negotiateRestore(ids: ids, onLog: onLog) { startPos = restored }
+        }
+        kvValid = false                            // dirty-until-clean (like local)
+        onLog("prefill \(ids.count - startPos) di \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
+
+        // PREFILL the (remaining) prompt in chunks. The FIRST chunk carries
+        // turnStart (session adoption on the workers); posBase 0 also resets
+        // their compressor state — a mid-context start keeps/restored state.
+        var pos = startPos
         var lastLogits: [Float] = []
-        var start = 0
+        var start = startPos
+        var firstChunk = true
         while start < ids.count {
             try Task.checkCancellation()
             let end = min(start + config.prefillChunk, ids.count)
@@ -200,9 +305,10 @@ public final class DistCoordinator: @unchecked Sendable {
                 onLog(String(format: "diag: |embed| = %.2f (hc=%d float)\n", n, h0.count))
             }
             if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
-                                               wantLogits: end == ids.count) {
+                                               wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
+            firstChunk = false
             pos += end - start
             start = end
             onProgress("prefill \(pos)/\(ids.count) tokens...")
@@ -221,6 +327,7 @@ public final class DistCoordinator: @unchecked Sendable {
         // same scheme as the local InferenceService, incl. the held '<' opener).
         var rng = sampling.seed
         var produced = 0
+        var producedIds: [Int] = []              // fed tokens (KV committed on the workers)
         var inReasoning = think
         var inTool = false
         var pendingLT = false                    // a held trailing '<' (may open <｜DSML｜…)
@@ -262,6 +369,7 @@ public final class DistCoordinator: @unchecked Sendable {
                 throw DistError.badFrame
             }
             lastLogits = logits
+            producedIds.append(next)             // its KV is now committed cluster-wide
             pos += 1; produced += 1
             let elapsed = Date().timeIntervalSince(t0)
             onProgress(String(format: "%d tokens · %.2f tok/s", produced,
@@ -270,6 +378,17 @@ public final class DistCoordinator: @unchecked Sendable {
         if pendingLT, !inTool { emit("<") }
         let dt = Date().timeIntervalSince(t0)
         onLog("[\(produced) tokens · \(String(format: "%.2f", dt > 0 ? Double(produced) / dt : 0)) tok/s]\n")
+
+        // CLEAN completion: the cluster KV now holds prompt + fed tokens — the
+        // next turn can extend it in memory; checkpoint to disk interval-gated.
+        committedIds = ids + producedIds
+        kvValid = true
+        if config.diskKVBudgetTokens > 0,
+           committedIds.count >= 128,
+           committedIds.count - lastDiskStoreCount >= 256 {
+            await broadcastSave(ids: committedIds, cold: lastDiskStoreCount == 0, onLog: onLog)
+        }
+
         guard inTool else { return engine.parseToolCalls(visible).calls }
         return engine.parseToolCalls(visible + toolText).calls
     }
@@ -286,6 +405,7 @@ public final class DistCoordinator: @unchecked Sendable {
         guard !entries.isEmpty else { throw DistError.closed }
         sessionCounter &+= 1
         let session = sessionCounter
+        kvValid = false          // the run rewrites the cluster KV from pos 0
         let ctx = max(8, min(contextTokens, config.contextSize - genTokens - 4))
         // Synthetic prompt: BOS + tiled filler. Output quality is irrelevant for
         // timing; the per-token work (embed · slice forward · expert gather) is the same.
@@ -301,6 +421,7 @@ public final class DistCoordinator: @unchecked Sendable {
         var pos = 0
         var lastLogits: [Float] = []
         var start = 0
+        var firstChunk = true
         while start < ids.count {
             try Task.checkCancellation()
             let end = min(start + config.prefillChunk, ids.count)
@@ -309,9 +430,10 @@ public final class DistCoordinator: @unchecked Sendable {
                 hcs.append(try engine.embed(token: id, pos: pos + k))
             }
             if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
-                                               wantLogits: end == ids.count) {
+                                               wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
+            firstChunk = false
             pos += end - start
             start = end
         }
@@ -348,9 +470,10 @@ public final class DistCoordinator: @unchecked Sendable {
     /// (a turn abandoned mid-chunk) is discarded and the read repeats. ERROR
     /// frames from workers surface with the worker's own message.
     private func runChunk(session: UInt32, hcs: [[Float]], posBase: Int,
-                          wantLogits: Bool) async throws -> [Float]? {
+                          wantLogits: Bool, turnStart: Bool = false) async throws -> [Float]? {
         var flags: Dist.WorkFlags = []
         if posBase == 0 { flags.insert(.resetSession) }
+        if turnStart { flags.insert(.turnStart) }
         if config.forward {
             var f = flags
             if wantLogits { f.insert(.outputLogits) }

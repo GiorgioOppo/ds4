@@ -16,6 +16,24 @@ expert-cache budget, and the slice to own. The worker resolves the gguf
 locally (the coordinator's exact path, else a same-named file next to its
 local GGUF from Settings), loads — or reuses — its engine, and replies READY.
 
+KV continuity (protocol v4) removes the per-turn full re-prefill:
+
+- **In-memory prefix reuse**: the coordinator tracks the token prefix committed
+  by the last CLEAN turn; when the next re-rendered conversation extends it
+  exactly, only the suffix is prefilled (the shards still hold that KV). Any
+  mismatch, Stop, error, or benchmark falls back safely (dirty-until-clean,
+  like the local engine — the NSA compressor cannot rewind).
+- **Per-shard disk checkpoints**: with the coordinator's disk-KV setting on,
+  each worker keeps a slice-keyed `DiskKVStore` (budget from ASSIGN). After a
+  clean turn the coordinator broadcasts `kvSave` (export under the compute
+  gate, F_NOCACHE write in background); on a cold start it negotiates
+  `kvQuery`/`kvRestore`: the stored prefix lengths of every shard are
+  intersected and the longest COMMON one is restored everywhere — any shard
+  missing it fails the negotiation and the turn cold-prefills.
+- **Usage imatrix on workers**: ASSIGN carries the coordinator's richest local
+  profile for the model; the worker prefers its own slice-refined profile
+  (persisted between turns and on stop) and pre-warms its expert slot-cache.
+
 - **`DistEngine.swift`** is the per-node engine. It exposes low-level slice
   operations (`embed`, `forwardSlice`, `head`) plus tokenizer/sampling utilities
   needed by the coordinator.

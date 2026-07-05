@@ -110,6 +110,22 @@ final class DiskKVStoreTests: XCTestCase {
         XCTAssertEqual(entries.count, 2, "8+8+8 tokens must not fit a 20-token budget")
     }
 
+    /// Distributed restore negotiation: all stored strict prefixes of a query,
+    /// sorted descending; other models/diverging tokens excluded.
+    func testStoredPrefixLengths() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        XCTAssertTrue(store.store(tokens: Array(0..<16), modelName: "m.gguf", snapshot: snapshot(nKeys: 16)))
+        XCTAssertTrue(store.store(tokens: Array(500..<508), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        XCTAssertTrue(store.store(tokens: Array(0..<6), modelName: "other.gguf", snapshot: snapshot(nKeys: 6)))
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(0..<20), modelName: "m.gguf"), [16, 8])
+        // Exact-length entries are STRICT prefixes only (something must remain to prefill).
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(0..<16), modelName: "m.gguf"), [8])
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(9..<20), modelName: "m.gguf"), [])
+    }
+
     /// The streaming reader hands out ONE layer at a time in order; reassembling
     /// the stream must equal both the in-RAM parse and the original snapshot.
     func testStreamSnapshotMatchesLoad() throws {

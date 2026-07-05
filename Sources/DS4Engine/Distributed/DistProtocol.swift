@@ -21,19 +21,29 @@ public enum Dist {
     /// (listening, no model loaded); the coordinator sends ASSIGN (gguf,
     /// context, layer slice, cache slots) and the worker replies READY once
     /// its engine is loaded. HELLO gained the `assigned` state.
-    public static let protocolVersion: UInt32 = 3
+    /// v4: distributed KV continuity. ASSIGN carries the usage imatrix (slot
+    /// cache pre-warm) and a disk-KV token budget; new KV control frames let
+    /// the coordinator checkpoint/restore each worker's shard (kvQuery /
+    /// kvLengths / kvRestore / kvSave / kvAck); WORK gained `turnStart` so a
+    /// turn can begin mid-context (restored or reused prefix).
+    public static let protocolVersion: UInt32 = 4
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
     static let maxRouteEntries = 256
 
     public enum MsgType: UInt32, Sendable {
-        case hello   = 1    // worker → coordinator on connect (state + model identity)
-        case work    = 3    // coordinator → worker: embed/HC input for a layer slice
-        case result  = 4    // worker → coordinator: HC state or logits
-        case error   = 2
-        case assign  = 5    // coordinator → worker: gguf + settings + layer slice
-        case ready   = 6    // worker → coordinator: assignment loaded (HELLO payload)
+        case hello     = 1    // worker → coordinator on connect (state + model identity)
+        case work      = 3    // coordinator → worker: embed/HC input for a layer slice
+        case result    = 4    // worker → coordinator: HC state or logits
+        case error     = 2
+        case assign    = 5    // coordinator → worker: gguf + settings + layer slice
+        case ready     = 6    // worker → coordinator: assignment loaded (HELLO payload)
+        case kvQuery   = 7    // coordinator → worker: which stored prefixes of these ids?
+        case kvLengths = 8    // worker → coordinator: stored prefix lengths (may be empty)
+        case kvRestore = 9    // coordinator → worker: restore EXACTLY these tokens' checkpoint
+        case kvSave    = 10   // coordinator → worker: checkpoint your shard for these tokens
+        case kvAck     = 11   // worker → coordinator: kvRestore/kvSave outcome
     }
 
     /// Flags on a WORK message.
@@ -42,6 +52,10 @@ public enum Dist {
         public init(rawValue: UInt32) { self.rawValue = rawValue }
         public static let resetSession = WorkFlags(rawValue: 1 << 0)  // pos==0: reset compressor/KV
         public static let outputLogits = WorkFlags(rawValue: 1 << 1)  // last slice: this worker also runs the head
+        /// First chunk of a TURN (chat send or benchmark). Workers adopt the
+        /// chunk's session id here — a turn may start mid-context (pos > 0)
+        /// when the coordinator reuses or restores a KV prefix.
+        public static let turnStart = WorkFlags(rawValue: 1 << 2)
     }
 
     public enum ResultKind: UInt32, Sendable { case hidden = 0, logits = 1, ack = 2 }
@@ -133,52 +147,145 @@ public struct DistHello: Sendable {
 
 /// ASSIGN payload: the coordinator defines a worker's whole job — WHICH gguf
 /// (full coordinator-side path + filename, resolved locally by the worker),
-/// the context size, the expert-cache budget, and the layer slice to own.
+/// the context size, the expert-cache budget, the disk-KV budget, the usage
+/// imatrix to pre-warm the slot cache with, and the layer slice to own.
 /// The worker loads (or reuses) its engine and replies READY (HELLO payload).
 public struct DistAssign: Sendable {
     public var modelPath: String      // coordinator's path (verbatim, tried first)
     public var modelName: String      // gguf filename (fallback resolution key)
     public var contextSize: Int
     public var expertCacheSlots: Int  // 0 = no expert slot-cache on the worker
+    public var diskKVBudgetTokens: Int // 0 = no disk-KV checkpoints on the worker
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
     public var hasOutput: Bool        // last slice: also runs the output head
+    /// Usage-imatrix JSON (ExpertUsageStats.serialize) to seed the worker's
+    /// slot-cache pre-warm; empty = none (the worker may still have its own).
+    public var usageJSON: Data
 
     public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
-                layerStart: Int, layerEnd: Int, hasOutput: Bool) {
+                diskKVBudgetTokens: Int, layerStart: Int, layerEnd: Int, hasOutput: Bool,
+                usageJSON: Data = Data()) {
         self.modelPath = modelPath; self.modelName = modelName
         self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
+        self.diskKVBudgetTokens = diskKVBudgetTokens
         self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
+        self.usageJSON = usageJSON
     }
 
     public func encoded() -> Data {
         var d = Data()
         d.appendLE(UInt32(contextSize))
         d.appendLE(UInt32(expertCacheSlots))
+        d.appendLE(UInt32(diskKVBudgetTokens))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(UInt32(hasOutput ? 1 : 0))
         let path = Data(modelPath.utf8)
         d.appendLE(UInt32(path.count)); d.append(path)
         let name = Data(modelName.utf8)
         d.appendLE(UInt32(name.count)); d.append(name)
+        d.appendLE(UInt32(usageJSON.count)); d.append(usageJSON)
         return d
     }
 
     public static func decode(_ d: Data) -> DistAssign? {
         var o = d.startIndex
-        guard d.count >= 28 else { return nil }
+        guard d.count >= 36 else { return nil }
         let ctx = Int(d.readLE(&o) as UInt32)
         let slots = Int(d.readLE(&o) as UInt32)
+        let kvBudget = Int(d.readLE(&o) as UInt32)
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let ho = (d.readLE(&o) as UInt32) != 0
         let pathLen = Int(d.readLE(&o) as UInt32)
         guard pathLen >= 0, o + pathLen + 4 <= d.endIndex else { return nil }
         let path = String(decoding: d[o..<o+pathLen], as: UTF8.self); o += pathLen
         let nameLen = Int(d.readLE(&o) as UInt32)
-        guard nameLen >= 0, o + nameLen <= d.endIndex else { return nil }
-        let name = String(decoding: d[o..<o+nameLen], as: UTF8.self)
+        guard nameLen >= 0, o + nameLen + 4 <= d.endIndex else { return nil }
+        let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
+        let usageLen = Int(d.readLE(&o) as UInt32)
+        guard usageLen >= 0, o + usageLen <= d.endIndex else { return nil }
+        let usage = Data(d[o..<o+usageLen])
         return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
-                          expertCacheSlots: slots, layerStart: ls, layerEnd: le, hasOutput: ho)
+                          expertCacheSlots: slots, diskKVBudgetTokens: kvBudget,
+                          layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage)
+    }
+}
+
+// MARK: - KV control payloads (kvQuery / kvLengths / kvRestore / kvSave / kvAck)
+
+/// Payload helpers for the distributed disk-KV control frames. Token lists are
+/// `u32 count + count × u32`; caps mirror the rest of the protocol (a hostile
+/// count is rejected instead of allocating gigabytes).
+public enum DistKV {
+    static let maxTokens = 1_000_000
+    static let maxLengths = 4096
+
+    public static func encodeTokens(_ ids: [Int]) -> Data {
+        var d = Data(capacity: 4 + ids.count * 4)
+        d.appendLE(UInt32(ids.count))
+        for t in ids { d.appendLE(UInt32(truncatingIfNeeded: t)) }
+        return d
+    }
+
+    public static func decodeTokens(_ d: Data) -> [Int]? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        let count = Int(d.readLE(&o) as UInt32)
+        guard count >= 0, count <= maxTokens, o + count * 4 <= d.endIndex else { return nil }
+        var ids = [Int](); ids.reserveCapacity(count)
+        for _ in 0..<count { ids.append(Int(d.readLE(&o) as UInt32)) }
+        return ids
+    }
+
+    /// kvSave payload: the token prefix to checkpoint + the eviction reason
+    /// ("cold" marks a conversation's first checkpoint, 2× protected).
+    public static func encodeSave(tokens: [Int], cold: Bool) -> Data {
+        var d = Data()
+        d.appendLE(UInt32(cold ? 1 : 0))
+        d.append(encodeTokens(tokens))
+        return d
+    }
+
+    public static func decodeSave(_ d: Data) -> (tokens: [Int], cold: Bool)? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        let cold = (d.readLE(&o) as UInt32) != 0
+        guard let tokens = decodeTokens(Data(d[o..<d.endIndex])) else { return nil }
+        return (tokens, cold)
+    }
+
+    public static func encodeLengths(_ lengths: [Int]) -> Data {
+        var d = Data(capacity: 4 + lengths.count * 4)
+        d.appendLE(UInt32(lengths.count))
+        for l in lengths { d.appendLE(UInt32(truncatingIfNeeded: l)) }
+        return d
+    }
+
+    public static func decodeLengths(_ d: Data) -> [Int]? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        let count = Int(d.readLE(&o) as UInt32)
+        guard count >= 0, count <= maxLengths, o + count * 4 <= d.endIndex else { return nil }
+        var out = [Int](); out.reserveCapacity(count)
+        for _ in 0..<count { out.append(Int(d.readLE(&o) as UInt32)) }
+        return out
+    }
+
+    public static func encodeAck(ok: Bool, message: String = "") -> Data {
+        var d = Data()
+        d.appendLE(UInt32(ok ? 1 : 0))
+        let m = Data(message.utf8)
+        d.appendLE(UInt32(m.count)); d.append(m)
+        return d
+    }
+
+    public static func decodeAck(_ d: Data) -> (ok: Bool, message: String)? {
+        var o = d.startIndex
+        guard d.count >= 8 else { return nil }
+        let ok = (d.readLE(&o) as UInt32) != 0
+        let len = Int(d.readLE(&o) as UInt32)
+        guard len >= 0, o + len <= d.endIndex else { return nil }
+        return (ok, String(decoding: d[o..<o+len], as: UTF8.self))
     }
 }
 

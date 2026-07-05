@@ -90,6 +90,24 @@ public final class DiskKVStore: @unchecked Sendable {
         return best
     }
 
+    /// ALL stored entry lengths that are strict token-prefixes of `ids` (for the
+    /// distributed restore negotiation: the coordinator intersects each worker's
+    /// set and picks the longest length EVERY shard can restore). Sorted
+    /// descending; header/token scans only, no tensor bodies.
+    public func storedPrefixLengths(of ids: [Int], modelName: String) -> [Int] {
+        var lengths: [Int] = []
+        for url in entryURLs() {
+            guard let scan = scanEntry(url) else { continue }
+            guard scan.model == modelName,
+                  scan.tokens.count >= options.minTokens,
+                  scan.tokens.count < ids.count,
+                  scan.tokens.count < contextSize,
+                  ids.starts(with: scan.tokens) else { continue }
+            lengths.append(scan.tokens.count)
+        }
+        return lengths.sorted(by: >)
+    }
+
     /// Stream-restore `hit` into the decoder, ONE layer at a time: each layer's
     /// float slabs are parsed, written into the KV buffers, and released before
     /// the next layer is read — peak RAM is one layer, not the ~3× whole-file

@@ -31,19 +31,63 @@ final class DistProtocolTests: XCTestCase {
     }
 
     func testAssignRoundTrip() throws {
+        let usage = Data(#"{"layers":{"0":[1,2,3]}}"#.utf8)
         let assign = DistAssign(modelPath: "/Models/ds4-flash.gguf", modelName: "ds4-flash.gguf",
                                 contextSize: 8192, expertCacheSlots: 16,
-                                layerStart: 22, layerEnd: 42, hasOutput: true)
+                                diskKVBudgetTokens: 1_000_000,
+                                layerStart: 22, layerEnd: 42, hasOutput: true,
+                                usageJSON: usage)
         let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
         XCTAssertEqual(decoded.modelPath, "/Models/ds4-flash.gguf")
         XCTAssertEqual(decoded.modelName, "ds4-flash.gguf")
         XCTAssertEqual(decoded.contextSize, 8192)
         XCTAssertEqual(decoded.expertCacheSlots, 16)
+        XCTAssertEqual(decoded.diskKVBudgetTokens, 1_000_000)
         XCTAssertEqual(decoded.layerStart, 22)
         XCTAssertEqual(decoded.layerEnd, 42)
         XCTAssertTrue(decoded.hasOutput)
-        // Truncated path bytes → rejected, not mis-decoded.
-        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(30)))
+        XCTAssertEqual(decoded.usageJSON, usage)
+        // Empty usage stays empty; truncated frames are rejected, not mis-decoded.
+        let bare = DistAssign(modelPath: "/m.gguf", modelName: "m.gguf", contextSize: 4096,
+                              expertCacheSlots: 0, diskKVBudgetTokens: 0,
+                              layerStart: 0, layerEnd: 42, hasOutput: true)
+        XCTAssertEqual(try XCTUnwrap(DistAssign.decode(bare.encoded())).usageJSON, Data())
+        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(34)))
+        XCTAssertNil(DistAssign.decode(assign.encoded().dropLast(4)))   // usage blob truncated
+    }
+
+    // MARK: KV control payloads
+
+    func testKVTokenAndLengthPayloads() throws {
+        let ids = Array(0..<300)
+        XCTAssertEqual(try XCTUnwrap(DistKV.decodeTokens(DistKV.encodeTokens(ids))), ids)
+        XCTAssertEqual(try XCTUnwrap(DistKV.decodeTokens(DistKV.encodeTokens([]))), [])
+        XCTAssertNil(DistKV.decodeTokens(DistKV.encodeTokens(ids).dropLast(2)))   // truncated
+        // Hostile count without payload → rejected.
+        var hostile = Data(); hostile.appendLE(UInt32.max)
+        XCTAssertNil(DistKV.decodeTokens(hostile))
+
+        let lengths = [512, 256, 128]
+        XCTAssertEqual(try XCTUnwrap(DistKV.decodeLengths(DistKV.encodeLengths(lengths))), lengths)
+
+        let (savedTokens, cold) = try XCTUnwrap(DistKV.decodeSave(
+            DistKV.encodeSave(tokens: ids, cold: true)))
+        XCTAssertEqual(savedTokens, ids)
+        XCTAssertTrue(cold)
+
+        let ack = try XCTUnwrap(DistKV.decodeAck(DistKV.encodeAck(ok: false, message: "no entry")))
+        XCTAssertFalse(ack.ok)
+        XCTAssertEqual(ack.message, "no entry")
+    }
+
+    func testTurnStartFlagRoundTrip() throws {
+        let work = DistWork(session: 9, pos: 512, nTokens: 1, layerStart: 0, layerEnd: 1,
+                            flags: [.turnStart, .outputLogits], hcBits: 32,
+                            hc: (0..<32).map(Float.init))
+        let decoded = try XCTUnwrap(DistWork.decode(work.encoded()))
+        XCTAssertTrue(decoded.flags.contains(.turnStart))
+        XCTAssertTrue(decoded.flags.contains(.outputLogits))
+        XCTAssertFalse(decoded.flags.contains(.resetSession))
     }
 
     // MARK: Coordinator-side layer partition

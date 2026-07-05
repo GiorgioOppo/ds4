@@ -41,6 +41,30 @@ public final class DistWorker: @unchecked Sendable {
     private var engine: DistEngine?
     private var assignment: Assignment?
     private var loadingAssignment = false
+    /// Where this shard persists its usage imatrix (slice-keyed: counts are
+    /// collected only for the owned layers). nil until assigned.
+    private var usageFile: URL?
+
+    /// App Support home for worker-side per-shard state (usage + disk KV),
+    /// keyed by model AND slice: a checkpoint holds only the shard's layers,
+    /// so a changed slice must never see another slice's entries.
+    static func shardStateDirectory(modelName: String, layerStart: Int, layerEnd: Int) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DwarfStar/dist-worker/\(modelName)-\(layerStart)-\(layerEnd)",
+                                    isDirectory: true)
+    }
+
+    /// Persist the usage collected so far (cheap JSON; called between turns).
+    private func persistUsage() {
+        stateLock.lock()
+        let file = usageFile
+        let data = engine?.usageData()
+        stateLock.unlock()
+        guard let file, let data else { return }
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try? data.write(to: file)
+    }
 
     /// One TURN at a time, enforced at the session level (NOT per connection:
     /// in forwarding mode a worker legitimately holds one connection from the
@@ -53,7 +77,9 @@ public final class DistWorker: @unchecked Sendable {
 
     private func admit(_ work: DistWork) -> Bool {
         sessionLock.lock(); defer { sessionLock.unlock() }
-        if work.pos == 0 { currentSession = work.session; return true }
+        // turnStart (not pos==0): with KV reuse/restore a turn may begin
+        // mid-context, and it is still the legitimate start of a new turn.
+        if work.flags.contains(.turnStart) { currentSession = work.session; return true }
         return currentSession == work.session
     }
 
@@ -80,8 +106,9 @@ public final class DistWorker: @unchecked Sendable {
     }
 
     public func stop() {
+        persistUsage()               // keep what this shard learned across sessions
         listener?.cancel(); listener = nil
-        stateLock.lock(); engine = nil; assignment = nil; stateLock.unlock()
+        stateLock.lock(); engine = nil; assignment = nil; usageFile = nil; stateLock.unlock()
     }
 
     /// Resolve the gguf named by an ASSIGN to a LOCAL file: the coordinator's
@@ -154,6 +181,10 @@ public final class DistWorker: @unchecked Sendable {
                     try await handleAssign(payload, on: conn)
                     continue
                 }
+                if type == .kvQuery || type == .kvRestore || type == .kvSave {
+                    try await handleKV(type, payload, on: conn)
+                    continue
+                }
                 guard type == .work, let work = DistWork.decode(payload) else { continue }
 
                 guard let (engine, active) = activeEngine() else {
@@ -183,6 +214,9 @@ public final class DistWorker: @unchecked Sendable {
                     try await conn.sendFrame(.error, Data(msg.utf8))
                     continue
                 }
+                // A new turn boundary: persist the usage the PREVIOUS turn
+                // accumulated (cheap JSON, same cadence as the local engine).
+                if work.flags.contains(.turnStart) { persistUsage() }
 
                 // Serialize compute: one chunk at a time against the shard.
                 // The chunk's hc holds nTokens states; split, run, re-concat.
@@ -271,8 +305,9 @@ public final class DistWorker: @unchecked Sendable {
                                 hasOutput: assign.hasOutput)
 
         stateLock.lock()
-        if assignment == wanted, engine != nil {
+        if assignment == wanted, let current = engine {
             stateLock.unlock()
+            applyAncillary(assign, to: current)
             onLog("assegnazione invariata: layer \(wanted.layerStart)...\(wanted.layerEnd) — riuso il motore\n")
             try await conn.sendFrame(.ready, helloPayload().encoded())
             return
@@ -306,6 +341,7 @@ public final class DistWorker: @unchecked Sendable {
             assignment = wanted
             loadingAssignment = false
             stateLock.unlock()
+            applyAncillary(assign, to: loaded)
             onLog(String(format: "motore pronto in %.1fs\n", Date().timeIntervalSince(t0)))
             try await conn.sendFrame(.ready, helloPayload().encoded())
         } catch {
@@ -313,6 +349,77 @@ public final class DistWorker: @unchecked Sendable {
             let msg = "engine load failed: \(error)"
             onLog(msg + "\n")
             try await conn.sendFrame(.error, Data(msg.utf8))
+        }
+    }
+
+    /// Apply the parts of an ASSIGN that do NOT require a reload: the usage
+    /// imatrix (slot-cache pre-warm) and the disk-KV budget. Runs on every
+    /// ASSIGN, including the engine-reuse path.
+    private func applyAncillary(_ assign: DistAssign, to engine: DistEngine) {
+        let dir = Self.shardStateDirectory(modelName: assign.modelName,
+                                           layerStart: assign.layerStart,
+                                           layerEnd: assign.layerEnd)
+        // Usage: this shard's own refined profile wins (it already contains a
+        // coordinator seed from a previous session); else the ASSIGN's blob.
+        let file = dir.appendingPathComponent("usage.json")
+        if let own = try? Data(contentsOf: file) {
+            engine.loadUsage(own)
+            onLog("imatrix: profilo locale dello shard caricato\n")
+        } else if !assign.usageJSON.isEmpty {
+            engine.loadUsage(assign.usageJSON)
+            onLog("imatrix: profilo del coordinatore caricato (\(assign.usageJSON.count) byte)\n")
+        }
+        engine.setDiskKV(directory: assign.diskKVBudgetTokens > 0
+                             ? dir.appendingPathComponent("kv", isDirectory: true) : nil,
+                         budgetTokens: assign.diskKVBudgetTokens)
+        if assign.diskKVBudgetTokens > 0 {
+            onLog("disk KV shard: budget \(assign.diskKVBudgetTokens) token\n")
+        }
+        stateLock.lock(); usageFile = file; stateLock.unlock()
+    }
+
+    /// Serve one KV control frame: query stored prefixes, restore an exact
+    /// checkpoint, or checkpoint the current shard state.
+    private func handleKV(_ type: Dist.MsgType, _ payload: Data, on conn: DistConnection) async throws {
+        guard let (engine, _) = activeEngine() else {
+            let msg = "worker not ready: no assignment loaded"
+            switch type {
+            case .kvQuery: try await conn.sendFrame(.kvLengths, DistKV.encodeLengths([]))
+            default: try await conn.sendFrame(.kvAck, DistKV.encodeAck(ok: false, message: msg))
+            }
+            return
+        }
+        switch type {
+        case .kvQuery:
+            guard let ids = DistKV.decodeTokens(payload) else {
+                try await conn.sendFrame(.kvLengths, DistKV.encodeLengths([]))
+                return
+            }
+            try await conn.sendFrame(.kvLengths,
+                                     DistKV.encodeLengths(engine.storedPrefixLengths(of: ids)))
+        case .kvRestore:
+            guard let ids = DistKV.decodeTokens(payload) else {
+                try await conn.sendFrame(.kvAck, DistKV.encodeAck(ok: false, message: "malformed kvRestore"))
+                return
+            }
+            // Through the gate: the restore writes the shard's KV buffers and
+            // must not interleave with compute.
+            let ok = await gate.run { engine.restoreKV(tokens: ids) }
+            if ok { onLog("KV shard ripristinato da disco (\(ids.count) token)\n") }
+            try await conn.sendFrame(.kvAck, DistKV.encodeAck(
+                ok: ok, message: ok ? "" : "no checkpoint for \(ids.count) tokens"))
+        case .kvSave:
+            guard let (ids, cold) = DistKV.decodeSave(payload) else {
+                try await conn.sendFrame(.kvAck, DistKV.encodeAck(ok: false, message: "malformed kvSave"))
+                return
+            }
+            // Export under the gate (state must hold still); the disk write
+            // itself streams in the background (SnapshotBox).
+            await gate.run { engine.saveKV(tokens: ids, cold: cold) }
+            onLog("KV shard: checkpoint \(ids.count) token avviato\n")
+            try await conn.sendFrame(.kvAck, DistKV.encodeAck(ok: true))
+        default:
+            break
         }
     }
 }

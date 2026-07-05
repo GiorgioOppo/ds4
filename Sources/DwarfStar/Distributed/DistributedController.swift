@@ -57,8 +57,10 @@ final class DistributedController {
     /// captured under an older epoch must drop its results instead of
     /// appending to a conversation the user has ended or cleared.
     private var chatEpoch = 0
-    /// Tool-loop bound. Illimitato su richiesta (nota: ogni round distribuito
-    /// ri-prefilla l'intera conversazione). Si ferma per contesto pieno o Stop.
+    /// Tool-loop bound. Illimitato su richiesta. Si ferma per contesto pieno o
+    /// Stop. (I round riusano il prefisso KV del cluster quando la conversazione
+    /// ri-renderizzata lo estende esattamente — v4 — quindi un round tool non
+    /// ripaga più l'intero prefill.)
     private var maxToolRounds: Int { .max }
 
     // Agent (role): same library as the local chat, own selection. Tools run
@@ -132,15 +134,20 @@ final class DistributedController {
         }
         coordLoading = true; coordLog = "Loading model (coordinator)...\n"
         // The coordinator defines each worker's job: same gguf/context as this
-        // Mac, plus the local expert slot-cache budget (workers cache too).
+        // Mac, plus the local expert slot-cache budget and — when the local
+        // disk-KV toggle is on — a per-shard checkpoint budget (same keys as
+        // the local chat settings).
         let slots = UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int ?? 0
+        let kvOn = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true
+        let kvKTok = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
                                          forward: forwardEnabled,
                                          returnHost: returnHost.trimmingCharacters(in: .whitespaces),
                                          returnPort: UInt16(clamping: returnPort),
-                                         workerCacheSlots: slots)
+                                         workerCacheSlots: slots,
+                                         diskKVBudgetTokens: kvOn ? kvKTok * 1000 : 0)
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         coordLogTask?.cancel()
         coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }
