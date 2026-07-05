@@ -193,14 +193,15 @@ extension GraphContext {
     /// One HC-reduce: flat=rmsNorm(curHc, hcDim); mix=matmulF32(mixerFn, flat);
     /// split=sinkhorn(mix, scale, base); embd=weightedSum(curHc, pre); cur=rmsNorm(embd, norm).
     private func hcReduce(curHc: GPUTensor, mixerFn: GPUTensor, scale: GPUTensor, base: GPUTensor,
-                          norm: GPUTensor, s: DecodeScratch, d: DSV4Dims, eps: Float) throws {
+                          norm: GPUTensor, s: DecodeScratch, d: DSV4Dims,
+                          rmsEps: Float, hcEps: Float) throws {
         let hcDim = d.nHC * d.nEmbd
-        try rmsNorm(curHc, weight: nil, out: s.flat, rows: 1, n: hcDim, eps: eps)
+        try rmsNorm(curHc, weight: nil, out: s.flat, rows: 1, n: hcDim, eps: rmsEps)
         try matmulF16(weight: mixerFn, x: s.flat, out: s.mix, inDim: hcDim, outDim: 24) // hc_attn_fn/hc_ffn_fn are F16
         try hcSplitSinkhorn(mix: s.mix, scale: scale, base: base, out: s.split, nRows: 1,
-                            sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: eps)
+                            sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: hcEps)
         try hcWeightedSum(x: curHc, weights: s.split, out: s.embd, nEmbd: d.nEmbd, nHC: d.nHC, nTokens: 1)
-        try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: eps)
+        try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: rmsEps)
     }
 
     /// Full decode layer (resident experts, one command buffer). `curHc`
@@ -224,7 +225,8 @@ extension GraphContext {
                             rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
                             rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         let nComp = try decodeRoutePre(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                                       pos: pos, rmsEps: rmsEps, comp: comp, idx: nil, indexerScoring: false)
+                                       pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp, idx: nil,
+                                       indexerScoring: false)
         try decodeRouteAttn(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
                             rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
     }
@@ -237,11 +239,11 @@ extension GraphContext {
     /// decode_one + the dense top-k mask path). Returns n_comp visible to this token.
     public func decodeRoutePre(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
                                rope: RopeParams, rawCache: GPUTensor, pos: Int,
-                               rmsEps: Float, comp: CompressorState?, idx: CompressorState?,
+                               rmsEps: Float, hcEps: Float, comp: CompressorState?, idx: CompressorState?,
                                indexerScoring: Bool) throws -> Int {
         // 1) HC-reduce pre-attn  (s.cur = attn_norm)
         try hcReduce(curHc: curHc, mixerFn: w.hcAttnFn, scale: w.attnScale, base: w.attnBase,
-                     norm: w.attnNorm, s: s, d: d, eps: rmsEps)
+                     norm: w.attnNorm, s: s, d: d, rmsEps: rmsEps, hcEps: hcEps)
         // 1.5) NSA attention compressor (compressed layers only): update recurrent state
         // from attn_norm and, every `ratio` tokens, emit a pooled compressed KV row.
         var nComp = 0
@@ -363,7 +365,7 @@ extension GraphContext {
         encoder.pushDebugGroup("hc-router")
         // 6) HC-reduce pre-FFN (on afterAttn)
         try hcReduce(curHc: s.afterAttn, mixerFn: w.hcFfnFn, scale: w.ffnScale, base: w.ffnBase,
-                     norm: w.ffnNorm, s: s, d: d, eps: rmsEps)
+                     norm: w.ffnNorm, s: s, d: d, rmsEps: rmsEps, hcEps: hcEps)
         // 7) router: logits -> softplus -> sqrt -> top-6 -> weights.
         //    ffn_gate_inp is Q8_0 in the Q4_K model but F16 in the IQ2_XXS model.
         if d.routerF16 {

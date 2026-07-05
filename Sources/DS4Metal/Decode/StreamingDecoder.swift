@@ -183,7 +183,7 @@ public final class StreamingDecoder {
     public init(rt: MetalRuntime, dims: DSV4Dims, rope: RopeParams, nLayers: Int,
                 layerProvider: @escaping (Int) throws -> LayerWeights,
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
-                rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
+                rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps,
                 expertGather: ((Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor))? = nil,
                 slotCache: ExpertSlotCache? = nil,
                 usage: ExpertUsageStats? = nil,
@@ -972,7 +972,7 @@ public final class StreamingDecoder {
             // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
             let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
-                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: true)
             try c1.phase("kv")
@@ -991,7 +991,7 @@ public final class StreamingDecoder {
             clearMaskIfDirty()
             let c = GraphContext(rt); c.phaseTimes = [:]; try c.begin()
             let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
-                                             rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                             rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                              indexerScoring: false)
             try c.phase("kv")
@@ -1005,7 +1005,7 @@ public final class StreamingDecoder {
             clearMaskIfDirty()
             let c1 = GraphContext(rt); try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
-                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: false)
             try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
@@ -1048,7 +1048,7 @@ public final class StreamingDecoder {
                                  curHc: GPUTensor, pos: Int, nKeys: Int) throws {
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
-                                         rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps,
+                                         rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                          comp: compStates[i], idx: hasIdxWeights ? indexStates[i] : nil,
                                          indexerScoring: false)
         try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
@@ -1125,7 +1125,7 @@ public final class StreamingDecoder {
     /// Build a streaming decoder backed by a real GGUF model (the real Stage D
     /// path): each layer is loaded from the mmap on demand.
     public static func fromGGUF(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+                                nLayers: Int, maxKeys: Int, rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                     layerProvider: { try GGUFWeights.layer(rt, model, $0) },
@@ -1137,7 +1137,7 @@ public final class StreamingDecoder {
     /// from the mmap (6/256 ~= 40x less expert IO/RAM). Numerically identical to
     /// the resident path (validated by ExpertCacheLayerTests).
     public static func fromGGUFExpertCached(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                            nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+                                            nLayers: Int, maxKeys: Int, rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         let willNeed = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"   // default ON; opt-out with =0
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
@@ -1161,7 +1161,7 @@ public final class StreamingDecoder {
     /// experts are gathered per token. No memoization needed: the page cache serves
     /// repeated weight reads across tokens. Requires model opened metalMapping:true.
     public static func fromGGUFExpertCachedMapped(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3,
+                                                  nLayers: Int, maxKeys: Int, rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps,
                                                   cacheSlots: Int? = nil, kvLayers: Range<Int>? = nil) throws -> StreamingDecoder {
         LoadProgress.shared.set(0.02, "Apertura pesi…")
         let (embed, headMapped) = try GGUFWeights.outputHeadMapped(rt, model)
@@ -1429,7 +1429,7 @@ public final class StreamingDecoder {
     /// ids; the OS page cache caches touched experts across tokens — no per-token
     /// re-gather. Requires model opened with metalMapping:true.
     public static func fromGGUFMappedExperts(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims, rope: RopeParams,
-                                             nLayers: Int, maxKeys: Int, rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws -> StreamingDecoder {
+                                             nLayers: Int, maxKeys: Int, rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps) throws -> StreamingDecoder {
         let (embed, head) = try GGUFWeights.outputHead(rt, model)
         // Memoize per-layer weights: dense (incl. NSA compressor) are COPIED resident
         // and reused across tokens; experts are no-copy mmap. Without this the ~8GB of

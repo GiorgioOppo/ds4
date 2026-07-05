@@ -37,7 +37,7 @@ public final class DSV4Decoder {
 
     public init(rt: MetalRuntime, dims: DSV4Dims, rope: RopeParams, layers: [LayerWeights],
                 embedTable: GPUTensor, out: OutputHeadWeights, maxKeys: Int,
-                rmsEps: Float = 1e-5, hcEps: Float = 1e-3) throws {
+                rmsEps: Float = ModelDefaults.rmsEps, hcEps: Float = ModelDefaults.hcEps) throws {
         self.rt = rt; self.d = dims; self.rope = rope; self.layers = layers
         self.embedTable = embedTable; self.out = out; self.rmsEps = rmsEps; self.hcEps = hcEps
         let hcDim = dims.nHC * dims.nEmbd
