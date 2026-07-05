@@ -26,11 +26,21 @@ public enum Dist {
     /// the coordinator checkpoint/restore each worker's shard (kvQuery /
     /// kvLengths / kvRestore / kvSave / kvAck); WORK gained `turnStart` so a
     /// turn can begin mid-context (restored or reused prefix).
-    public static let protocolVersion: UInt32 = 4
+    /// v5: the coordinator DISTRIBUTES the files. Workers no longer need a
+    /// local gguf: after HELLO the coordinator sends a FILE OFFER (name, size,
+    /// sha256 for gguf + sidecar); the worker answers with what it is missing
+    /// (hash-verified against its managed store and its local files) and the
+    /// coordinator streams only those — the huge setup runs ONCE; later
+    /// connects verify hashes from cached manifests in milliseconds.
+    public static let protocolVersion: UInt32 = 5
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
     static let maxRouteEntries = 256
+    /// Cap on entries in a FILE OFFER / NEED (gguf + a handful of sidecars).
+    static let maxFileEntries = 16
+    /// File-transfer chunk payload (per fileChunk frame).
+    public static let fileChunkBytes = 4 * 1024 * 1024
 
     public enum MsgType: UInt32, Sendable {
         case hello     = 1    // worker → coordinator on connect (state + model identity)
@@ -44,6 +54,11 @@ public enum Dist {
         case kvRestore = 9    // coordinator → worker: restore EXACTLY these tokens' checkpoint
         case kvSave    = 10   // coordinator → worker: checkpoint your shard for these tokens
         case kvAck     = 11   // worker → coordinator: kvRestore/kvSave outcome
+        case fileOffer = 12   // coordinator → worker: manifest (name+size+sha256 per file)
+        case fileNeed  = 13   // worker → coordinator: offer indices it is missing
+        case fileChunk = 14   // coordinator → worker: sequential slab of one file
+        case fileDone  = 15   // coordinator → worker: file complete (worker verifies hash)
+        case fileAck   = 16   // worker → coordinator: per-file receive outcome
     }
 
     /// Flags on a WORK message.
@@ -156,6 +171,7 @@ public struct DistAssign: Sendable {
     public var contextSize: Int
     public var expertCacheSlots: Int  // 0 = no expert slot-cache on the worker
     public var diskKVBudgetTokens: Int // 0 = no disk-KV checkpoints on the worker
+    public var useExpertBundle: Bool   // worker runs with the expert-bundle sidecar
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
     public var hasOutput: Bool        // last slice: also runs the output head
@@ -164,11 +180,13 @@ public struct DistAssign: Sendable {
     public var usageJSON: Data
 
     public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
-                diskKVBudgetTokens: Int, layerStart: Int, layerEnd: Int, hasOutput: Bool,
+                diskKVBudgetTokens: Int, useExpertBundle: Bool = false,
+                layerStart: Int, layerEnd: Int, hasOutput: Bool,
                 usageJSON: Data = Data()) {
         self.modelPath = modelPath; self.modelName = modelName
         self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
         self.diskKVBudgetTokens = diskKVBudgetTokens
+        self.useExpertBundle = useExpertBundle
         self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
         self.usageJSON = usageJSON
     }
@@ -178,6 +196,7 @@ public struct DistAssign: Sendable {
         d.appendLE(UInt32(contextSize))
         d.appendLE(UInt32(expertCacheSlots))
         d.appendLE(UInt32(diskKVBudgetTokens))
+        d.appendLE(UInt32(useExpertBundle ? 1 : 0))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(UInt32(hasOutput ? 1 : 0))
         let path = Data(modelPath.utf8)
@@ -190,10 +209,11 @@ public struct DistAssign: Sendable {
 
     public static func decode(_ d: Data) -> DistAssign? {
         var o = d.startIndex
-        guard d.count >= 36 else { return nil }
+        guard d.count >= 40 else { return nil }
         let ctx = Int(d.readLE(&o) as UInt32)
         let slots = Int(d.readLE(&o) as UInt32)
         let kvBudget = Int(d.readLE(&o) as UInt32)
+        let bundle = (d.readLE(&o) as UInt32) != 0
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let ho = (d.readLE(&o) as UInt32) != 0
         let pathLen = Int(d.readLE(&o) as UInt32)
@@ -207,7 +227,138 @@ public struct DistAssign: Sendable {
         let usage = Data(d[o..<o+usageLen])
         return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
                           expertCacheSlots: slots, diskKVBudgetTokens: kvBudget,
+                          useExpertBundle: bundle,
                           layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage)
+    }
+}
+
+// MARK: - File distribution payloads (fileOffer / fileNeed / fileChunk / fileDone)
+
+/// One distributable file: the gguf itself or a derived sidecar. Identified by
+/// NAME (filename only — the worker re-sanitizes, never trusts paths), exact
+/// size, and full SHA-256 — the identity later connects verify instead of
+/// re-transferring.
+public struct DistFileEntry: Sendable, Equatable {
+    public enum Kind: UInt32, Sendable { case gguf = 0, expertBundle = 1 }
+    public var kind: Kind
+    public var name: String
+    public var size: UInt64
+    public var sha256: Data          // 32 bytes
+
+    public init(kind: Kind, name: String, size: UInt64, sha256: Data) {
+        self.kind = kind; self.name = name; self.size = size; self.sha256 = sha256
+    }
+
+    func encode(into d: inout Data) {
+        d.appendLE(kind.rawValue)
+        let n = Data(name.utf8)
+        d.appendLE(UInt32(n.count)); d.append(n)
+        d.appendLE(size)
+        d.append(sha256.prefix(32))
+    }
+
+    static func decode(_ d: Data, _ o: inout Data.Index) -> DistFileEntry? {
+        guard o + 8 <= d.endIndex, let kind = Kind(rawValue: d.readLE(&o)) else { return nil }
+        let nameLen = Int(d.readLE(&o) as UInt32)
+        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 <= d.endIndex else { return nil }
+        let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
+        let size = d.readLE(&o) as UInt64
+        let sha = Data(d[o..<o+32]); o += 32
+        return DistFileEntry(kind: kind, name: name, size: size, sha256: sha)
+    }
+}
+
+/// FILE OFFER: everything the coordinator can distribute for this assignment.
+public struct DistFileOffer: Sendable {
+    public var entries: [DistFileEntry]
+    public init(entries: [DistFileEntry]) { self.entries = entries }
+
+    public func encoded() -> Data {
+        var d = Data()
+        d.appendLE(UInt32(entries.count))
+        for e in entries { e.encode(into: &d) }
+        return d
+    }
+
+    public static func decode(_ d: Data) -> DistFileOffer? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        let count = Int(d.readLE(&o) as UInt32)
+        guard count >= 0, count <= Dist.maxFileEntries else { return nil }
+        var entries: [DistFileEntry] = []
+        for _ in 0..<count {
+            guard let e = DistFileEntry.decode(d, &o) else { return nil }
+            entries.append(e)
+        }
+        return DistFileOffer(entries: entries)
+    }
+}
+
+/// FILE NEED: the offer indices the worker is missing (empty = has everything).
+public struct DistFileNeed: Sendable {
+    public var indices: [Int]
+    public init(indices: [Int]) { self.indices = indices }
+
+    public func encoded() -> Data {
+        var d = Data()
+        d.appendLE(UInt32(indices.count))
+        for i in indices { d.appendLE(UInt32(truncatingIfNeeded: i)) }
+        return d
+    }
+
+    public static func decode(_ d: Data) -> DistFileNeed? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        let count = Int(d.readLE(&o) as UInt32)
+        guard count >= 0, count <= Dist.maxFileEntries, o + count * 4 <= d.endIndex else { return nil }
+        var out: [Int] = []
+        for _ in 0..<count { out.append(Int(d.readLE(&o) as UInt32)) }
+        return DistFileNeed(indices: out)
+    }
+}
+
+/// FILE CHUNK: one sequential slab of the file at `index` in the offer. The
+/// worker enforces `offset == bytes received so far` — no sparse writes.
+public struct DistFileChunk: Sendable {
+    public var index: Int
+    public var offset: UInt64
+    public var data: Data
+
+    public init(index: Int, offset: UInt64, data: Data) {
+        self.index = index; self.offset = offset; self.data = data
+    }
+
+    public func encoded() -> Data {
+        var d = Data(capacity: 16 + data.count)
+        d.appendLE(UInt32(index))
+        d.appendLE(offset)
+        d.appendLE(UInt32(data.count))
+        d.append(data)
+        return d
+    }
+
+    public static func decode(_ d: Data) -> DistFileChunk? {
+        var o = d.startIndex
+        guard d.count >= 16 else { return nil }
+        let index = Int(d.readLE(&o) as UInt32)
+        let offset = d.readLE(&o) as UInt64
+        let len = Int(d.readLE(&o) as UInt32)
+        guard len >= 0, len <= Dist.fileChunkBytes, o + len <= d.endIndex else { return nil }
+        return DistFileChunk(index: index, offset: offset, data: Data(d[o..<o+len]))
+    }
+}
+
+/// FILE DONE: the file at `index` is complete — the worker verifies size+hash.
+public struct DistFileDone: Sendable {
+    public var index: Int
+    public init(index: Int) { self.index = index }
+    public func encoded() -> Data {
+        var d = Data(); d.appendLE(UInt32(index)); return d
+    }
+    public static func decode(_ d: Data) -> DistFileDone? {
+        var o = d.startIndex
+        guard d.count >= 4 else { return nil }
+        return DistFileDone(index: Int(d.readLE(&o) as UInt32))
     }
 }
 
@@ -480,6 +631,7 @@ public enum ActivationCodec {
 extension Data {
     mutating func appendLE(_ v: UInt32) { var le = v.littleEndian; Swift.withUnsafeBytes(of: &le) { append(contentsOf: $0) } }
     mutating func appendLE(_ v: UInt16) { var le = v.littleEndian; Swift.withUnsafeBytes(of: &le) { append(contentsOf: $0) } }
+    mutating func appendLE(_ v: UInt64) { var le = v.littleEndian; Swift.withUnsafeBytes(of: &le) { append(contentsOf: $0) } }
 
     func readLE(_ o: inout Index) -> UInt32 {
         var r: UInt32 = 0
@@ -492,6 +644,13 @@ extension Data {
         var r: UInt16 = 0
         for i in 0..<2 { r |= UInt16(self[o + i]) << (8 * i) }
         o += 2
+        return r
+    }
+
+    func readLE(_ o: inout Index) -> UInt64 {
+        var r: UInt64 = 0
+        for i in 0..<8 { r |= UInt64(self[o + i]) << (8 * i) }
+        o += 8
         return r
     }
 }

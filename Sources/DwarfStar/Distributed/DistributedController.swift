@@ -140,6 +140,7 @@ final class DistributedController {
         let slots = UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int ?? 0
         let kvOn = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true
         let kvKTok = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000
+        let bundle = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
@@ -147,7 +148,8 @@ final class DistributedController {
                                          returnHost: returnHost.trimmingCharacters(in: .whitespaces),
                                          returnPort: UInt16(clamping: returnPort),
                                          workerCacheSlots: slots,
-                                         diskKVBudgetTokens: kvOn ? kvKTok * 1000 : 0)
+                                         diskKVBudgetTokens: kvOn ? kvKTok * 1000 : 0,
+                                         useExpertBundle: bundle)
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         coordLogTask?.cancel()
         coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }

@@ -32,16 +32,21 @@ public final class DistCoordinator: @unchecked Sendable {
         public var workerCacheSlots: Int
         /// Disk-KV token budget ASSIGNed to each worker's shard (0 = disabled).
         public var diskKVBudgetTokens: Int
+        /// Workers should use the expert-bundle sidecar (the coordinator's
+        /// bundle is offered for transfer when it exists on disk).
+        public var useExpertBundle: Bool
         public init(modelPath: String, contextSize: Int, peers: [Peer], activationBits: Int,
                     prefillChunk: Int = 32, forward: Bool = false,
                     returnHost: String = "", returnPort: UInt16 = 9099,
-                    workerCacheSlots: Int = 0, diskKVBudgetTokens: Int = 0) {
+                    workerCacheSlots: Int = 0, diskKVBudgetTokens: Int = 0,
+                    useExpertBundle: Bool = false) {
             self.modelPath = modelPath; self.contextSize = contextSize
             self.peers = peers; self.activationBits = activationBits
             self.prefillChunk = max(1, prefillChunk); self.forward = forward
             self.returnHost = returnHost; self.returnPort = returnPort
             self.workerCacheSlots = max(0, workerCacheSlots)
             self.diskKVBudgetTokens = max(0, diskKVBudgetTokens)
+            self.useExpertBundle = useExpertBundle
         }
     }
 
@@ -109,6 +114,10 @@ public final class DistCoordinator: @unchecked Sendable {
     public func connect(onLog: @Sendable (String) -> Void) async throws {
         let slices = try Self.partition(nLayers: engine.nLayers, workers: config.peers.count)
         let modelName = (config.modelPath as NSString).lastPathComponent
+        // Everything the workers need comes from HERE: build the file offer
+        // once (gguf + sidecar, identified by size + SHA-256; the hash is
+        // computed once per machine and answered from the cache afterwards).
+        let offer = try buildFileOffer(onLog: onLog)
         for (i, p) in config.peers.enumerated() {
             let conn = try DistConnection.connect(host: p.host, port: p.port, queue: queue)
             let (type, payload) = try await conn.readFrame()
@@ -119,6 +128,22 @@ public final class DistCoordinator: @unchecked Sendable {
             guard h.version == Dist.protocolVersion else {
                 throw DistError.versionMismatch(
                     "worker \(p.host):\(p.port) speaks protocol v\(h.version), this build v\(Dist.protocolVersion) — update all nodes to the same DwarfStar build")
+            }
+
+            // FILE DISTRIBUTION: offer the manifest; the worker answers with
+            // what it is missing (hash-verified locally) and only that is
+            // streamed — the huge transfer happens on the FIRST round only.
+            try await conn.sendFrame(.fileOffer, DistFileOffer(entries: offer).encoded())
+            let (nType, nPayload) = try await readControl(conn)
+            guard nType == .fileNeed, let need = DistFileNeed.decode(nPayload) else {
+                throw DistError.badFrame
+            }
+            if need.indices.isEmpty {
+                onLog("file: \(p.host):\(p.port) ha già tutto (hash verificati)\n")
+            }
+            for index in need.indices {
+                guard index >= 0, index < offer.count else { throw DistError.badFrame }
+                try await sendFile(offer[index], index: index, to: conn, peer: p, onLog: onLog)
             }
 
             // ASSIGN this peer its slice; the worker loads (or reuses) its
@@ -133,6 +158,7 @@ public final class DistCoordinator: @unchecked Sendable {
                                     contextSize: config.contextSize,
                                     expertCacheSlots: config.workerCacheSlots,
                                     diskKVBudgetTokens: config.diskKVBudgetTokens,
+                                    useExpertBundle: config.useExpertBundle,
                                     layerStart: ls, layerEnd: le, hasOutput: hasOutput,
                                     usageJSON: usage)
             onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize) (loading…)\n")
@@ -183,6 +209,80 @@ public final class DistCoordinator: @unchecked Sendable {
         conns = []; entries = []
         committedIds = []; kvValid = false; lastDiskStoreCount = 0
         returnListener?.stop(); returnListener = nil; returnIter = nil
+    }
+
+    // MARK: File distribution (the workers receive everything from here)
+
+    /// The distributable file set: the gguf, plus the expert-bundle sidecar
+    /// when enabled and present (next to the gguf, else in DS4_BUNDLE_DIR).
+    /// Hashes come from the persistent cache; the first run streams the file
+    /// once to compute them (logged — it can take minutes on a 100+ GB gguf).
+    private func buildFileOffer(onLog: @Sendable (String) -> Void) throws -> [DistFileEntry] {
+        let ggufName = (config.modelPath as NSString).lastPathComponent
+        guard let (size, _) = DistFileHash.stat(config.modelPath),
+              let sha = DistFileHash.cachedOrCompute(path: config.modelPath, onLog: onLog) else {
+            throw DistError.sliceGap("cannot read/hash the gguf at \(config.modelPath)")
+        }
+        var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha)]
+        if config.useExpertBundle {
+            var candidates = [config.modelPath + ".expbundle"]
+            if let dir = ProcessInfo.processInfo.environment["DS4_BUNDLE_DIR"], !dir.isEmpty {
+                candidates.append(dir + "/" + ggufName + ".expbundle")
+            }
+            if let bundle = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }),
+               let (bSize, _) = DistFileHash.stat(bundle),
+               let bSha = DistFileHash.cachedOrCompute(path: bundle, onLog: onLog) {
+                entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
+                                             size: bSize, sha256: bSha))
+            }
+        }
+        return entries
+    }
+
+    /// Stream one offered file to a worker: sequential 4 MB chunks (F_NOCACHE
+    /// read — the transfer must not evict the coordinator's hot page cache),
+    /// then DONE, then the worker's hash-verified ack.
+    private func sendFile(_ entry: DistFileEntry, index: Int, to conn: DistConnection,
+                          peer: Peer, onLog: @Sendable (String) -> Void) async throws {
+        let path = entry.kind == .gguf ? config.modelPath
+            : (findLocalPath(for: entry) ?? config.modelPath + ".expbundle")
+        onLog("file: invio \(entry.name) (\(entry.size / 1_048_576) MB) a \(peer.host):\(peer.port)…\n")
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw DistError.sliceGap("cannot open \(path)") }
+        defer { close(fd) }
+        _ = fcntl(fd, F_NOCACHE, 1)
+
+        var offset: UInt64 = 0
+        var buf = [UInt8](repeating: 0, count: Dist.fileChunkBytes)
+        let t0 = Date()
+        var lastLogged: UInt64 = 0
+        while offset < entry.size {
+            try Task.checkCancellation()
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, Dist.fileChunkBytes) }
+            guard n > 0 else { throw DistError.sliceGap("read failed at \(offset) of \(path)") }
+            let chunk = DistFileChunk(index: index, offset: offset, data: Data(buf[0..<n]))
+            try await conn.sendFrame(.fileChunk, chunk.encoded())
+            offset += UInt64(n)
+            if offset - lastLogged >= 1_073_741_824 {          // progress every GB
+                lastLogged = offset
+                let mbps = Double(offset) / 1_048_576 / max(0.001, Date().timeIntervalSince(t0))
+                onLog(String(format: "file: %@ %.0f%% (%.0f MB/s)\n", entry.name,
+                             Double(offset) / Double(entry.size) * 100, mbps))
+            }
+        }
+        try await conn.sendFrame(.fileDone, DistFileDone(index: index).encoded())
+        let (aType, aPayload) = try await readControl(conn)
+        guard aType == .fileAck, let ack = DistKV.decodeAck(aPayload) else { throw DistError.badFrame }
+        guard ack.ok else { throw DistError.remote("\(peer.host):\(peer.port): \(ack.message)") }
+        onLog(String(format: "file: %@ trasferito in %.0fs\n", entry.name, Date().timeIntervalSince(t0)))
+    }
+
+    private func findLocalPath(for entry: DistFileEntry) -> String? {
+        var candidates = [config.modelPath + ".expbundle"]
+        if let dir = ProcessInfo.processInfo.environment["DS4_BUNDLE_DIR"], !dir.isEmpty {
+            candidates.append(dir + "/" + (config.modelPath as NSString).lastPathComponent + ".expbundle")
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     // MARK: Cluster KV continuity

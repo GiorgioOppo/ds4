@@ -474,6 +474,16 @@ Stop propagates to the cluster generation task and takes effect at the next
 chunk boundary. Frames are plaintext TCP with no authentication: run
 distributed mode only on trusted networks.
 
+File distribution (protocol v5): workers need no local files at all. After the
+version handshake the coordinator offers a manifest — name, size, and SHA-256
+of the GGUF and (when enabled) the expert-bundle sidecar — and each worker
+requests only what it is missing, verifying against its managed store
+(`Application Support/DwarfStar/dist-models`) and hash-matching local files.
+The transfer streams in 4 MB chunks with the hash accumulated inline, so the
+enormous setup happens once: subsequent connects verify cached manifests in
+milliseconds and send nothing. The sidecar on/off decision travels in the
+ASSIGN, like every other setting.
+
 KV continuity (protocol v4): turns no longer re-prefill the whole conversation
 every time. The coordinator reuses the in-memory prefix committed by the last
 clean turn when the re-rendered conversation extends it exactly; on a cold

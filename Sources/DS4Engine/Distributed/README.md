@@ -12,9 +12,20 @@ The COORDINATOR defines each worker's job (protocol v3): workers start IDLE —
 listening, no model loaded — and at connect time the coordinator splits the
 layers across the peer list (in order; the last slice also runs the output
 head) and sends each worker an ASSIGN with the gguf, the context size, the
-expert-cache budget, and the slice to own. The worker resolves the gguf
-locally (the coordinator's exact path, else a same-named file next to its
-local GGUF from Settings), loads — or reuses — its engine, and replies READY.
+expert-cache budget, and the slice to own. The worker loads — or reuses — its
+engine and replies READY.
+
+The coordinator also DISTRIBUTES the files (protocol v5): workers need no
+local gguf. After HELLO the coordinator sends a FILE OFFER (name, size,
+SHA-256 for the gguf and, when enabled, the expert-bundle sidecar); the worker
+answers with what it is missing — checking its managed store
+(`Application Support/DwarfStar/dist-models`, manifest hashes recorded at
+reception) and hash-matching local files — and only the missing files are
+streamed (sequential 4 MB chunks, F_NOCACHE on both ends, hash accumulated
+inline and verified at DONE). The huge setup runs ONCE: later connects answer
+the offer from cached manifests in milliseconds. Hashing a coordinator-side
+gguf is also one-time (persistent size+mtime-validated hash cache). ASSIGN
+carries `useExpertBundle`, so the sidecar decision is the coordinator's too.
 
 KV continuity (protocol v4) removes the per-turn full re-prefill:
 

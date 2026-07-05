@@ -11,13 +11,13 @@ struct WorkerView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("This Mac as a worker: it listens for the coordinator, which ASSIGNS its whole job — the GGUF, the context size, and the layer slice to own. Start workers first, then connect the coordinator from Chat -> Distributed: the model loads when the assignment arrives.",
+                    Label("This Mac as a worker: it listens for the coordinator, which sends EVERYTHING — the GGUF, the sidecar, the settings, and the layer slice. The first connect transfers the files (it can take a while on a big model); afterwards SHA-256 manifests verify them instantly and nothing is re-sent.",
                           systemImage: "rectangle.3.group")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Local GGUF (fallback resolution)") {
+                Section("Local GGUF (optional, avoids the first transfer)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    Text("The worker resolves the coordinator's GGUF locally: first the coordinator's exact path, then a file with the same name next to this GGUF (from Settings).")
+                    Text("If a local file matches the coordinator's SHA-256 (this GGUF from Settings or a same-named sibling), it is used directly and nothing is transferred. Received files land in Application Support/DwarfStar/dist-models.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 

@@ -34,7 +34,7 @@ final class DistProtocolTests: XCTestCase {
         let usage = Data(#"{"layers":{"0":[1,2,3]}}"#.utf8)
         let assign = DistAssign(modelPath: "/Models/ds4-flash.gguf", modelName: "ds4-flash.gguf",
                                 contextSize: 8192, expertCacheSlots: 16,
-                                diskKVBudgetTokens: 1_000_000,
+                                diskKVBudgetTokens: 1_000_000, useExpertBundle: true,
                                 layerStart: 22, layerEnd: 42, hasOutput: true,
                                 usageJSON: usage)
         let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
@@ -43,6 +43,7 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.contextSize, 8192)
         XCTAssertEqual(decoded.expertCacheSlots, 16)
         XCTAssertEqual(decoded.diskKVBudgetTokens, 1_000_000)
+        XCTAssertTrue(decoded.useExpertBundle)
         XCTAssertEqual(decoded.layerStart, 22)
         XCTAssertEqual(decoded.layerEnd, 42)
         XCTAssertTrue(decoded.hasOutput)
@@ -52,8 +53,76 @@ final class DistProtocolTests: XCTestCase {
                               expertCacheSlots: 0, diskKVBudgetTokens: 0,
                               layerStart: 0, layerEnd: 42, hasOutput: true)
         XCTAssertEqual(try XCTUnwrap(DistAssign.decode(bare.encoded())).usageJSON, Data())
-        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(34)))
+        XCTAssertFalse(try XCTUnwrap(DistAssign.decode(bare.encoded())).useExpertBundle)
+        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(38)))
         XCTAssertNil(DistAssign.decode(assign.encoded().dropLast(4)))   // usage blob truncated
+    }
+
+    // MARK: File distribution payloads
+
+    func testFileOfferNeedChunkDoneRoundTrips() throws {
+        let sha = Data((0..<32).map { UInt8($0) })
+        let offer = DistFileOffer(entries: [
+            DistFileEntry(kind: .gguf, name: "model.gguf", size: 123_456_789_012, sha256: sha),
+            DistFileEntry(kind: .expertBundle, name: "model.gguf.expbundle",
+                          size: 42, sha256: Data(repeating: 0xAB, count: 32)),
+        ])
+        let decoded = try XCTUnwrap(DistFileOffer.decode(offer.encoded()))
+        XCTAssertEqual(decoded.entries.count, 2)
+        XCTAssertEqual(decoded.entries[0].kind, .gguf)
+        XCTAssertEqual(decoded.entries[0].name, "model.gguf")
+        XCTAssertEqual(decoded.entries[0].size, 123_456_789_012)   // > 4 GB: u64 on the wire
+        XCTAssertEqual(decoded.entries[0].sha256, sha)
+        XCTAssertEqual(decoded.entries[1].kind, .expertBundle)
+        XCTAssertNil(DistFileOffer.decode(offer.encoded().dropLast(1)))
+
+        let need = try XCTUnwrap(DistFileNeed.decode(DistFileNeed(indices: [1]).encoded()))
+        XCTAssertEqual(need.indices, [1])
+        XCTAssertEqual(try XCTUnwrap(DistFileNeed.decode(DistFileNeed(indices: []).encoded())).indices, [])
+
+        let chunk = DistFileChunk(index: 0, offset: 8_589_934_592, data: Data([1, 2, 3]))
+        let dChunk = try XCTUnwrap(DistFileChunk.decode(chunk.encoded()))
+        XCTAssertEqual(dChunk.index, 0)
+        XCTAssertEqual(dChunk.offset, 8_589_934_592)               // > 4 GB offset
+        XCTAssertEqual(dChunk.data, Data([1, 2, 3]))
+        XCTAssertNil(DistFileChunk.decode(chunk.encoded().dropLast(1)))
+
+        XCTAssertEqual(try XCTUnwrap(DistFileDone.decode(DistFileDone(index: 7).encoded())).index, 7)
+    }
+
+    func testFileStoreManifestAndSanitize() throws {
+        XCTAssertEqual(DistFileStore.sanitize("../../etc/passwd"), "passwd")
+        XCTAssertEqual(DistFileStore.sanitize("model.gguf"), "model.gguf")
+        XCTAssertEqual(DistFileStore.sanitize(".."), "file")
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dist-store-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = DistFileStore(directory: dir)
+        let sha = Data(repeating: 7, count: 32)
+        XCTAssertFalse(store.has(name: "m.gguf", size: 3, sha256: sha))
+        // remember() without the file on disk still fails `has` (size check).
+        store.remember(name: "m.gguf", size: 3, sha256: sha)
+        XCTAssertFalse(store.has(name: "m.gguf", size: 3, sha256: sha))
+        try Data([1, 2, 3]).write(to: store.url(for: "m.gguf"))
+        XCTAssertTrue(store.has(name: "m.gguf", size: 3, sha256: sha))
+        XCTAssertFalse(store.has(name: "m.gguf", size: 3, sha256: Data(repeating: 8, count: 32)))
+        XCTAssertFalse(store.has(name: "m.gguf", size: 4, sha256: sha))
+    }
+
+    func testFileHashComputeKnownVector() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dist-hash-\(UUID().uuidString).bin")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data("abc".utf8).write(to: url)
+        // SHA-256("abc") — FIPS 180 test vector.
+        XCTAssertEqual(DistFileHash.compute(path: url.path)?.hexString,
+                       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        // cachedOrCompute: same digest, and stable across a second (cached) call.
+        let first = DistFileHash.cachedOrCompute(path: url.path)
+        XCTAssertEqual(first?.hexString,
+                       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        XCTAssertEqual(DistFileHash.cachedOrCompute(path: url.path), first)
     }
 
     // MARK: KV control payloads

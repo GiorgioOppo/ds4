@@ -1,12 +1,15 @@
 import Foundation
+import CryptoKit
 @preconcurrency import Network
 
-/// A distributed WORKER: starts IDLE (listening, no model loaded) and lets the
-/// COORDINATOR define its whole job via ASSIGN — which gguf, context size,
-/// expert-cache budget, and which contiguous layer slice to own. On ASSIGN the
-/// worker resolves the gguf locally, loads (or reuses) its slice engine and
-/// replies READY; then it serves WORK frames (run the slice, or the output
-/// head when flagged) and answers with RESULT frames.
+/// A distributed WORKER: starts IDLE (listening, no model loaded) and receives
+/// EVERYTHING from the COORDINATOR — the files (gguf + sidecar, via the
+/// hash-verified FILE OFFER/transfer; the huge copy happens once, afterwards
+/// the managed-store manifest answers in milliseconds) and the job (ASSIGN:
+/// context size, cache budgets, bundle on/off, layer slice). On ASSIGN the
+/// worker loads (or reuses) its slice engine and replies READY; then it serves
+/// WORK frames (run the slice, or the output head when flagged) and answers
+/// with RESULT frames.
 public final class DistWorker: @unchecked Sendable {
     public struct Config: Sendable {
         public var port: UInt16
@@ -30,9 +33,115 @@ public final class DistWorker: @unchecked Sendable {
         var resolvedModelPath: String
         var contextSize: Int
         var expertCacheSlots: Int
+        var useExpertBundle: Bool
         var layerStart: Int
         var layerEnd: Int
         var hasOutput: Bool
+    }
+
+    /// One coordinator-streamed file being received: sequential chunks written
+    /// to a `.part` in the managed store while SHA-256 accumulates INLINE — the
+    /// final verification is a compare, never a re-read of tens of GB.
+    private final class IncomingFile {
+        enum Outcome { case success(String), failure(String) }
+        let entry: DistFileEntry
+        let index: Int
+        private let onLog: @Sendable (String) -> Void
+        private let tmpURL: URL
+        private let finalURL: URL
+        private var fd: Int32
+        private var hasher = SHA256()
+        private var received: UInt64 = 0
+        private var lastLogged: UInt64 = 0
+        private let t0 = Date()
+
+        init(entry: DistFileEntry, index: Int, onLog: @escaping @Sendable (String) -> Void) {
+            self.entry = entry; self.index = index; self.onLog = onLog
+            let store = DistFileStore.shared
+            try? FileManager.default.createDirectory(at: store.directory,
+                                                     withIntermediateDirectories: true)
+            self.finalURL = store.url(for: entry.name)
+            self.tmpURL = finalURL.appendingPathExtension("part")
+            self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+            if fd >= 0 { _ = fcntl(fd, F_NOCACHE, 1) }   // the transfer must not evict hot pages
+        }
+
+        /// Append one sequential chunk; false on disorder/overflow/IO error.
+        func append(_ chunk: DistFileChunk) -> Bool {
+            guard fd >= 0, chunk.offset == received,
+                  received + UInt64(chunk.data.count) <= entry.size else { return false }
+            let ok = chunk.data.withUnsafeBytes { buf -> Bool in
+                var off = 0
+                while off < buf.count {
+                    let w = write(fd, buf.baseAddress! + off, buf.count - off)
+                    if w <= 0 { return false }
+                    off += w
+                }
+                return true
+            }
+            guard ok else { return false }
+            chunk.data.withUnsafeBytes { hasher.update(bufferPointer: $0) }
+            received += UInt64(chunk.data.count)
+            if received - lastLogged >= 1_073_741_824 {          // progress every GB
+                lastLogged = received
+                let mbps = Double(received) / 1_048_576 / max(0.001, Date().timeIntervalSince(t0))
+                onLog(String(format: "file: %@ %.0f%% (%.0f MB/s)\n", entry.name,
+                             Double(received) / Double(entry.size) * 100, mbps))
+            }
+            return true
+        }
+
+        /// Verify size + hash, move into place, record in the store manifest.
+        func finalize() -> Outcome {
+            guard fd >= 0 else { return .failure("could not open \(tmpURL.path)") }
+            close(fd); fd = -1
+            guard received == entry.size else {
+                unlink(tmpURL.path)
+                return .failure("incomplete: \(received)/\(entry.size) bytes")
+            }
+            let digest = Data(hasher.finalize())
+            guard digest == entry.sha256 else {
+                unlink(tmpURL.path)
+                return .failure("sha256 mismatch (got \(digest.hexString.prefix(16))…)")
+            }
+            unlink(finalURL.path)
+            guard rename(tmpURL.path, finalURL.path) == 0 else {
+                unlink(tmpURL.path)
+                return .failure("rename failed: errno \(errno)")
+            }
+            DistFileStore.shared.remember(name: entry.name, size: entry.size, sha256: digest)
+            return .success(finalURL.path)
+        }
+
+        func abort() {
+            if fd >= 0 { close(fd); fd = -1 }
+            unlink(tmpURL.path)
+        }
+    }
+
+    /// Resolve one offered file WITHOUT transferring: the managed store first
+    /// (manifest hash recorded at reception), then same-named local files
+    /// (size pre-filter, then the cached-or-computed hash must match — a
+    /// matching local gguf costs one full hash the first time, then it's a
+    /// manifest lookup).
+    private func resolveOffered(_ entry: DistFileEntry) -> String? {
+        let store = DistFileStore.shared
+        if store.has(name: entry.name, size: entry.size, sha256: entry.sha256) {
+            return store.url(for: entry.name).path
+        }
+        let name = DistFileStore.sanitize(entry.name)
+        let hintDir = (config.localModelPath as NSString).deletingLastPathComponent
+        var candidates = [hintDir + "/" + name]
+        if (config.localModelPath as NSString).lastPathComponent == name {
+            candidates.append(config.localModelPath)
+        }
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            guard let (size, _) = DistFileHash.stat(path), size == entry.size else { continue }
+            if DistFileHash.cachedOrCompute(path: path, onLog: onLog) == entry.sha256 {
+                return path
+            }
+        }
+        return nil
     }
 
     /// Engine + assignment, set by ASSIGN. Guarded by `stateLock`: WORK frames
@@ -172,13 +281,77 @@ public final class DistWorker: @unchecked Sendable {
             return c
         }
 
+        // File distribution state for THIS connection: the offer's entries,
+        // where each resolved locally, and the file currently being received.
+        var offerEntries: [DistFileEntry] = []
+        var resolvedFiles: [String: String] = [:]      // sanitized name → local path
+        var incoming: IncomingFile?
+        var transferError: String?                     // first failure, reported at fileDone
+
         do {
             try await conn.sendFrame(.hello, helloPayload().encoded())
 
             while true {
                 let (type, payload) = try await conn.readFrame()
+                if type == .fileOffer {
+                    guard let offer = DistFileOffer.decode(payload) else { continue }
+                    offerEntries = offer.entries
+                    var needs: [Int] = []
+                    for (i, entry) in offer.entries.enumerated() {
+                        if let local = resolveOffered(entry) {
+                            resolvedFiles[DistFileStore.sanitize(entry.name)] = local
+                            onLog("file: \(entry.name) già presente (hash ok) — \(local)\n")
+                        } else {
+                            needs.append(i)
+                            onLog("file: \(entry.name) mancante (\(entry.size / 1_048_576) MB) — richiedo il trasferimento\n")
+                        }
+                    }
+                    try await conn.sendFrame(.fileNeed, DistFileNeed(indices: needs).encoded())
+                    continue
+                }
+                if type == .fileChunk {
+                    // Failures are remembered and reported ONCE at fileDone —
+                    // the coordinator only reads the ack there, and one bad
+                    // chunk must not pile an ack per remaining chunk.
+                    guard let chunk = DistFileChunk.decode(payload),
+                          chunk.index >= 0, chunk.index < offerEntries.count else {
+                        transferError = transferError ?? "malformed fileChunk frame"
+                        continue
+                    }
+                    if incoming == nil, chunk.offset == 0, transferError == nil {
+                        incoming = IncomingFile(entry: offerEntries[chunk.index],
+                                                index: chunk.index, onLog: onLog)
+                    }
+                    if let file = incoming, file.index == chunk.index, file.append(chunk) {
+                        continue
+                    }
+                    incoming?.abort(); incoming = nil
+                    transferError = transferError ?? "out-of-order or unexpected chunk"
+                    continue
+                }
+                if type == .fileDone {
+                    defer { transferError = nil }
+                    guard let done = DistFileDone.decode(payload),
+                          let file = incoming, file.index == done.index, transferError == nil else {
+                        incoming?.abort(); incoming = nil
+                        try await conn.sendFrame(.fileAck, DistKV.encodeAck(
+                            ok: false, message: transferError ?? "DONE without a matching transfer"))
+                        continue
+                    }
+                    incoming = nil
+                    switch file.finalize() {
+                    case .success(let path):
+                        resolvedFiles[DistFileStore.sanitize(file.entry.name)] = path
+                        onLog("file: \(file.entry.name) ricevuto e verificato\n")
+                        try await conn.sendFrame(.fileAck, DistKV.encodeAck(ok: true))
+                    case .failure(let reason):
+                        onLog("file: \(file.entry.name) SCARTATO: \(reason)\n")
+                        try await conn.sendFrame(.fileAck, DistKV.encodeAck(ok: false, message: reason))
+                    }
+                    continue
+                }
                 if type == .assign {
-                    try await handleAssign(payload, on: conn)
+                    try await handleAssign(payload, on: conn, resolvedFiles: resolvedFiles)
                     continue
                 }
                 if type == .kvQuery || type == .kvRestore || type == .kvSave {
@@ -270,14 +443,17 @@ public final class DistWorker: @unchecked Sendable {
                 }
             }
         } catch {
+            incoming?.abort()                 // drop a half-received .part file
             onLog("sessione chiusa: \(error)\n")
             conn.cancel()
         }
     }
 
-    /// Handle an ASSIGN: validate, resolve the gguf locally, load (or reuse)
-    /// the slice engine, reply READY — or an ERROR frame with the reason.
-    private func handleAssign(_ payload: Data, on conn: DistConnection) async throws {
+    /// Handle an ASSIGN: validate, resolve the gguf (files distributed by the
+    /// coordinator first, then local fallbacks), load (or reuse) the slice
+    /// engine, reply READY — or an ERROR frame with the reason.
+    private func handleAssign(_ payload: Data, on conn: DistConnection,
+                              resolvedFiles: [String: String]) async throws {
         guard let assign = DistAssign.decode(payload) else {
             try await conn.sendFrame(.error, Data("malformed ASSIGN frame".utf8))
             return
@@ -290,17 +466,31 @@ public final class DistWorker: @unchecked Sendable {
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
         }
-        guard let resolved = Self.resolveModelPath(requestedPath: assign.modelPath,
-                                                   modelName: assign.modelName,
-                                                   localHint: config.localModelPath) else {
-            let msg = "gguf '\(assign.modelName)' not found on this worker "
-                + "(tried the coordinator's path and next to '\(config.localModelPath)')"
+        // The coordinator distributes the files: whatever the OFFER resolved
+        // (received into the managed store, or hash-matched locally) wins;
+        // the plain path fallback remains for robustness.
+        let sanitizedName = DistFileStore.sanitize(assign.modelName)
+        guard let resolved = resolvedFiles[sanitizedName]
+                ?? Self.resolveModelPath(requestedPath: assign.modelPath,
+                                         modelName: assign.modelName,
+                                         localHint: config.localModelPath) else {
+            let msg = "gguf '\(assign.modelName)' not available on this worker "
+                + "(not offered/transferred, and no hash-matching local file)"
             onLog(msg + "\n")
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
         }
+        // Sidecar/bundle: coordinator-decided. The env is read at ENGINE LOAD;
+        // pointing DS4_BUNDLE_DIR at the transferred bundle's directory covers
+        // the case where the gguf resolved elsewhere (sibling rule would miss).
+        _ = setenv("DS4_EXPERT_BUNDLE", assign.useExpertBundle ? "1" : "0", 1)
+        if assign.useExpertBundle,
+           let bundlePath = resolvedFiles[sanitizedName + ".expbundle"] {
+            _ = setenv("DS4_BUNDLE_DIR", (bundlePath as NSString).deletingLastPathComponent, 1)
+        }
         let wanted = Assignment(resolvedModelPath: resolved, contextSize: assign.contextSize,
                                 expertCacheSlots: assign.expertCacheSlots,
+                                useExpertBundle: assign.useExpertBundle,
                                 layerStart: assign.layerStart, layerEnd: assign.layerEnd,
                                 hasOutput: assign.hasOutput)
 
