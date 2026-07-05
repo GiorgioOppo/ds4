@@ -494,23 +494,20 @@ public final class DistWorker: @unchecked Sendable {
                                 layerStart: assign.layerStart, layerEnd: assign.layerEnd,
                                 hasOutput: assign.hasOutput)
 
-        stateLock.lock()
-        if assignment == wanted, let current = engine {
-            stateLock.unlock()
+        // Locked state transitions live in sync helpers: NSLock is not usable
+        // directly inside an async function.
+        switch claimAssignment(wanted) {
+        case .reuse(let current):
             applyAncillary(assign, to: current)
             onLog("assegnazione invariata: layer \(wanted.layerStart)...\(wanted.layerEnd) — riuso il motore\n")
             try await conn.sendFrame(.ready, helloPayload().encoded())
             return
-        }
-        if loadingAssignment {
-            stateLock.unlock()
+        case .busy:
             try await conn.sendFrame(.error, Data("worker busy loading a previous assignment".utf8))
             return
+        case .load:
+            break                    // old shard freed, `loadingAssignment` claimed
         }
-        loadingAssignment = true
-        engine = nil                 // free the old shard BEFORE loading the new one
-        assignment = nil
-        stateLock.unlock()
 
         onLog("assegnazione: \(assign.modelName) · layer \(wanted.layerStart)...\(wanted.layerEnd)"
               + (wanted.hasOutput ? " +output" : "") + " · ctx \(wanted.contextSize)"
@@ -526,20 +523,46 @@ public final class DistWorker: @unchecked Sendable {
                                expertCacheSlots: slots > 0 ? slots : nil,
                                kvLayers: wanted.layerStart..<(wanted.layerEnd + 1))
             }.value
-            stateLock.lock()
-            engine = loaded
-            assignment = wanted
-            loadingAssignment = false
-            stateLock.unlock()
+            commitAssignment(loaded, wanted)
             applyAncillary(assign, to: loaded)
             onLog(String(format: "motore pronto in %.1fs\n", Date().timeIntervalSince(t0)))
             try await conn.sendFrame(.ready, helloPayload().encoded())
         } catch {
-            stateLock.lock(); loadingAssignment = false; stateLock.unlock()
+            releaseAssignmentClaim()
             let msg = "engine load failed: \(error)"
             onLog(msg + "\n")
             try await conn.sendFrame(.error, Data(msg.utf8))
         }
+    }
+
+    // Synchronous locked state transitions for handleAssign (the compiler
+    // forbids direct NSLock use in async bodies — a suspension while holding
+    // the lock would deadlock).
+
+    private enum AssignmentClaim { case reuse(DistEngine), busy, load }
+
+    /// Reuse the loaded engine, report busy, or claim the load slot (freeing
+    /// the old shard FIRST so its memory is gone before the new one arrives).
+    private func claimAssignment(_ wanted: Assignment) -> AssignmentClaim {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if assignment == wanted, let current = engine { return .reuse(current) }
+        if loadingAssignment { return .busy }
+        loadingAssignment = true
+        engine = nil
+        assignment = nil
+        return .load
+    }
+
+    private func commitAssignment(_ loaded: DistEngine, _ wanted: Assignment) {
+        stateLock.lock()
+        engine = loaded
+        assignment = wanted
+        loadingAssignment = false
+        stateLock.unlock()
+    }
+
+    private func releaseAssignmentClaim() {
+        stateLock.lock(); loadingAssignment = false; stateLock.unlock()
     }
 
     /// Apply the parts of an ASSIGN that do NOT require a reload: the usage
