@@ -47,7 +47,7 @@ final class DiskKVStoreTests: XCTestCase {
         // Query extends `long` → the 16-token entry wins over the 8-token one.
         let hit = try XCTUnwrap(store.findLongestPrefix(of: Array(0..<20), modelName: "m.gguf"))
         XCTAssertEqual(hit.tokens, long)
-        XCTAssertEqual(hit.snapshot, snapshot(nKeys: 16))
+        XCTAssertEqual(store.loadSnapshot(hit.url), snapshot(nKeys: 16))
 
         // Exact-length query (no remainder to prefill) must NOT match that entry.
         let hit2 = try XCTUnwrap(store.findLongestPrefix(of: long, modelName: "m.gguf"))
@@ -108,6 +108,97 @@ final class DiskKVStoreTests: XCTestCase {
         let entries = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasSuffix(".kv") }
         XCTAssertEqual(entries.count, 2, "8+8+8 tokens must not fit a 20-token budget")
+    }
+
+    /// Distributed restore negotiation: all stored strict prefixes of a query,
+    /// sorted descending; other models/diverging tokens excluded.
+    func testStoredPrefixLengths() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        XCTAssertTrue(store.store(tokens: Array(0..<16), modelName: "m.gguf", snapshot: snapshot(nKeys: 16)))
+        XCTAssertTrue(store.store(tokens: Array(500..<508), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        XCTAssertTrue(store.store(tokens: Array(0..<6), modelName: "other.gguf", snapshot: snapshot(nKeys: 6)))
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(0..<20), modelName: "m.gguf"), [16, 8])
+        // Exact-length entries are STRICT prefixes only (something must remain to prefill).
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(0..<16), modelName: "m.gguf"), [8])
+        XCTAssertEqual(store.storedPrefixLengths(of: Array(9..<20), modelName: "m.gguf"), [])
+    }
+
+    /// The streaming reader hands out ONE layer at a time in order; reassembling
+    /// the stream must equal both the in-RAM parse and the original snapshot.
+    func testStreamSnapshotMatchesLoad() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        let original = snapshot(nKeys: 12)
+        XCTAssertTrue(store.store(tokens: Array(0..<12), modelName: "m.gguf", snapshot: original))
+        let hit = try XCTUnwrap(store.findLongestPrefix(of: Array(0..<20), modelName: "m.gguf"))
+
+        var meta: (nKeys: Int, headDim: Int, layerCount: Int)?
+        var indices: [Int] = []
+        var layers: [KVLayerSnapshot] = []
+        try store.streamSnapshot(hit.url,
+                                 onMeta: { meta = ($0, $1, $2) },
+                                 onLayer: { i, layer in indices.append(i); layers.append(layer) })
+        XCTAssertEqual(meta?.nKeys, 12)
+        XCTAssertEqual(meta?.headDim, 8)
+        XCTAssertEqual(meta?.layerCount, 3)
+        XCTAssertEqual(indices, [0, 1, 2])
+        XCTAssertEqual(KVSnapshot(nKeys: 12, headDim: 8, layers: layers), original)
+        XCTAssertEqual(store.loadSnapshot(hit.url), original)
+    }
+
+    /// A throwing onMeta (the decoder's shape gate) aborts BEFORE any tensor
+    /// body is parsed: no layer callbacks, error propagated, entry untouched.
+    func testStreamAbortsOnMetaMismatch() throws {
+        struct Mismatch: Error {}
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        let hit = try XCTUnwrap(store.findLongestPrefix(of: Array(0..<20), modelName: "m.gguf"))
+        var layerCalls = 0
+        XCTAssertThrowsError(try store.streamSnapshot(hit.url,
+                                                      onMeta: { _, _, _ in throw Mismatch() },
+                                                      onLayer: { _, _ in layerCalls += 1 })) {
+            XCTAssertTrue($0 is Mismatch)
+        }
+        XCTAssertEqual(layerCalls, 0)
+        XCTAssertNotNil(store.loadSnapshot(hit.url), "aborted stream must not damage the entry")
+    }
+
+    /// A truncated body surfaces as StreamError.corrupt (the restore path then
+    /// discards the entry, like the C loader).
+    func testStreamThrowsOnTruncatedEntry() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf", snapshot: snapshot(nKeys: 8)))
+        let hit = try XCTUnwrap(store.findLongestPrefix(of: Array(0..<20), modelName: "m.gguf"))
+        let full = try Data(contentsOf: hit.url)
+        try full.prefix(full.count - 16).write(to: hit.url)   // chop the tail
+        XCTAssertThrowsError(try store.streamSnapshot(hit.url, onMeta: { _, _, _ in },
+                                                      onLayer: { _, _ in })) {
+            XCTAssertTrue($0 is DiskKVStore.StreamError)
+        }
+        XCTAssertNil(store.loadSnapshot(hit.url))
+    }
+
+    /// SnapshotBox: single-take ownership; the boxed store writes the same entry
+    /// as the by-value path, and a second store from the emptied box is refused.
+    func testSnapshotBoxStore() throws {
+        var opts = DiskKVStore.Options(); opts.minTokens = 4
+        let store = try DiskKVStore(directory: dir, budgetMB: 64, quantBits: 2,
+                                    contextSize: 8192, options: opts)
+        let original = snapshot(nKeys: 8)
+        let box = DiskKVStore.SnapshotBox(original)
+        XCTAssertTrue(store.store(tokens: Array(0..<8), modelName: "m.gguf", box: box))
+        let hit = try XCTUnwrap(store.findLongestPrefix(of: Array(0..<9), modelName: "m.gguf"))
+        XCTAssertEqual(store.loadSnapshot(hit.url), original)
+        // The box was emptied by take(): a reuse cannot silently write garbage.
+        XCTAssertFalse(store.store(tokens: Array(100..<108), modelName: "m.gguf", box: box))
     }
 
     func testEvictionRespectsBudget() throws {

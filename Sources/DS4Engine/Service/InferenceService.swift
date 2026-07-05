@@ -559,14 +559,17 @@ public actor InferenceService {
             note("target too large to preload (\(oversized) tokens vs context \(contextSize)): chunked-read mode")
         }
         var pos = 0
-        if let snap = subKV?.snapshot(forTokens: prefixIds, modelName: modelName) {
-            try decoder.importKV(snap); pos = prefixIds.count
+        if let subKV, subKV.restore(forTokens: prefixIds, modelName: modelName, into: decoder) {
+            // Streamed layer-by-layer from disk (peak RAM = one layer).
+            pos = prefixIds.count
             note("KV \"\(ctx.label)\" reused (\(pos) tokens)")
         } else {
             note("prefill \"\(ctx.label)\" (\(prefixIds.count) tokens)…")
             _ = try decoder.prefill(tokens: prefixIds, startPos: 0); pos = prefixIds.count
+            // SnapshotBox: the writer owns the export and frees each layer as
+            // it lands on disk instead of holding the whole snapshot.
             subKV?.store(tokens: prefixIds, modelName: modelName,
-                         snapshot: decoder.exportKV(nKeys: pos), reason: .cold)
+                         box: .init(decoder.exportKV(nKeys: pos)), reason: .cold)
             note("KV \"\(ctx.label)\" created (\(pos) tokens)")
         }
         note("tool: " + (ctx.toolNames.isEmpty ? "(none)" : ctx.toolNames.joined(separator: ", ")))
@@ -807,13 +810,19 @@ public actor InferenceService {
         if committedIds.isEmpty, !kvDirty, let store = diskKV,
            let hit = store.findLongestPrefix(of: suffixIds, modelName: modelName) {
             continuation.yield(.progress("ripristino KV da disco (\(hit.tokens.count) token)…"))
-            do {
-                try decoder.importKV(hit.snapshot)
+            // Streaming restore: one layer at a time from file to KV buffers,
+            // each batch freed after import (peak RAM = one layer, F_NOCACHE).
+            let t0 = Date()
+            if store.restore(hit, into: decoder) {
                 committedIds = hit.tokens
                 suffixIds.removeFirst(hit.tokens.count)
                 lastDiskStoreCount = hit.tokens.count
-            } catch {
+                FileHandle.standardError.write(Data(String(
+                    format: "DS4 diskkv: ripristino streaming %d token in %.2fs (F_NOCACHE, per-layer)\n",
+                    hit.tokens.count, Date().timeIntervalSince(t0)).utf8))
+            } else {
                 committedIds = []          // fall back to a cold prefill
+                kvDirty = true             // a partial import may have touched the KV
             }
         }
 
@@ -965,7 +974,10 @@ public actor InferenceService {
             // (superseded under pressure by longer checkpoints of the same chat).
             let reason: KVCFile.Reason = lastDiskStoreCount == 0 ? .cold : .continued
             let t0 = Date()
-            let snap = decoder.exportKV(nKeys: committedIds.count)
+            // Il Box è l'UNICO proprietario dello snapshot: il writer svuota
+            // ogni layer appena scritto, così la RAM scende DURANTE la
+            // scrittura invece di tenere l'intero checkpoint fino alla fine.
+            let box = DiskKVStore.SnapshotBox(decoder.exportKV(nKeys: committedIds.count))
             let snapS = Date().timeIntervalSince(t0)
             FileHandle.standardError.write(Data(String(
                 format: "DS4 diskkv: snapshot %d token esportato in %.2fs\n",
@@ -973,11 +985,11 @@ public actor InferenceService {
             // La SCRITTURA va fuori dal percorso critico del turno: l'ultimo
             // token è già sullo schermo, ma prima il turno restava "aperto"
             // finché il checkpoint non era su disco (secondi percepiti come
-            // tempo di generazione). Lo snapshot è un valore e DiskKVStore è
-            // Sendable: la scrittura F_NOCACHE prosegue in background.
+            // tempo di generazione). DiskKVStore è Sendable: la scrittura
+            // F_NOCACHE prosegue in background.
             let ids = committedIds, name = modelName
             Task.detached(priority: .utility) {
-                store.store(tokens: ids, modelName: name, snapshot: snap, reason: reason)
+                store.store(tokens: ids, modelName: name, box: box, reason: reason)
             }
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }

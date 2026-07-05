@@ -11,23 +11,19 @@ struct WorkerView: View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Label("This Mac as a worker: owns a layer slice and listens for the coordinator. Start workers first, then connect the coordinator from Chat -> Distributed.",
+                    Label("This Mac as a worker: it listens for the coordinator, which sends EVERYTHING — the GGUF, the sidecar, the settings, and the layer slice. The first connect transfers the files (it can take a while on a big model); afterwards SHA-256 manifests verify them instantly and nothing is re-sent.",
                           systemImage: "rectangle.3.group")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("Model (from Settings)") {
+                Section("Local GGUF (optional, avoids the first transfer)") {
                     LabeledContent("GGUF", value: (controller.modelPath as NSString).lastPathComponent)
-                    LabeledContent("Context", value: "\(controller.contextSize) tokens")
+                    Text("If a local file matches the coordinator's SHA-256 (this GGUF from Settings or a same-named sibling), it is used directly and nothing is transferred. Received files land in Application Support/DwarfStar/dist-models.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("Worker - \(controller.modelLayers)-layer model (0...\(controller.modelLayers - 1))") {
+                Section("Worker - \(controller.modelLayers)-layer model") {
                     TextField("Port", value: $controller.port, format: .number.grouping(.never))
-                    Stepper("First layer: \(controller.layerStart)", value: $controller.layerStart,
-                            in: 0...(controller.modelLayers - 1))
-                    Stepper("Last layer: \(controller.layerEnd)", value: $controller.layerEnd,
-                            in: controller.layerStart...(controller.modelLayers - 1))
-                    Toggle("Owns the output head (last slice)", isOn: $controller.hasOutput)
-                    Text("The worker route must cover all \(controller.modelLayers) layers contiguously. On one Mac: one worker 0...\(controller.modelLayers - 1) with the output head.")
+                    Text("Layer slice, context, and cache budget are chosen by the coordinator and shown in the log when the assignment arrives.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .disabled(controller.workerRunning)
@@ -40,9 +36,6 @@ struct WorkerView: View {
                             }
                             Label(controller.workerSummary, systemImage: "dot.radiowaves.left.and.right")
                                 .foregroundStyle(.green).font(.callout)
-                        } else if controller.workerLoading {
-                            ProgressView().controlSize(.small)
-                            Text("Loading...").font(.callout).foregroundStyle(.secondary)
                         } else {
                             Button { controller.startWorker() } label: {
                                 Label("Start Worker", systemImage: "play.fill")

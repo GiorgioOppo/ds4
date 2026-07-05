@@ -24,14 +24,12 @@ final class DistributedController {
 
     init(settings: AppSettings) { self.settings = settings }
 
-    // Worker (Distribuito sidebar tab).
+    // Worker (Distribuito sidebar tab). The slice/model/context are NOT set
+    // here: the worker starts idle and the coordinator ASSIGNs its whole job
+    // (gguf, settings, layer range) at connect time.
     var port = 9100
-    var layerStart = 0
-    var layerEnd = DistEngine.modelLayers - 1
-    var hasOutput = true
     var modelLayers: Int { DistEngine.modelLayers }
     var workerRunning = false
-    var workerLoading = false
     var workerLog = ""
 
     // Coordinator (Chat tab → Distribuito).
@@ -55,8 +53,14 @@ final class DistributedController {
     /// re-rendered in full on every send (stateless coordinator).
     private var turns: [ChatTurn] = []
     private var toolRounds = 0
-    /// Tool-loop bound. Illimitato su richiesta (nota: ogni round distribuito
-    /// ri-prefilla l'intera conversazione). Si ferma per contesto pieno o Stop.
+    /// Bumped by Stop / New Chat: an async tool round (MCP call in flight)
+    /// captured under an older epoch must drop its results instead of
+    /// appending to a conversation the user has ended or cleared.
+    private var chatEpoch = 0
+    /// Tool-loop bound. Illimitato su richiesta. Si ferma per contesto pieno o
+    /// Stop. (I round riusano il prefisso KV del cluster quando la conversazione
+    /// ri-renderizzata lo estende esattamente — v4 — quindi un round tool non
+    /// ripaga più l'intero prefill.)
     private var maxToolRounds: Int { .max }
 
     // Agent (role): same library as the local chat, own selection. Tools run
@@ -78,7 +82,7 @@ final class DistributedController {
     private var coordLogTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
 
-    var workerSummary: String { "worker :\(port) · layers \(layerStart)...\(layerEnd)\(hasOutput ? " +output" : "")" }
+    var workerSummary: String { "worker :\(port) · job assigned by the coordinator" }
 
     /// The connected coordinator, exposed so the Benchmark panel can reuse the live
     /// route instead of opening a second connection (nil unless connected). The
@@ -92,29 +96,30 @@ final class DistributedController {
     // MARK: Worker
 
     func startWorker() {
-        guard !workerRunning, !workerLoading else { return }
-        workerLoading = true; workerLog = "Loading model (worker)...\n"
-        let cfg = DistWorker.Config(modelPath: ProcessStream.absolutePath(modelPath),
-                                    port: UInt16(clamping: port), layerStart: layerStart,
-                                    layerEnd: layerEnd, hasOutput: hasOutput, contextSize: contextSize)
+        guard !workerRunning else { return }
+        // No model load here: the worker starts IDLE and loads its engine when
+        // the coordinator sends the ASSIGN (gguf + settings + layer slice).
+        workerLog = "Worker idle: waiting for the coordinator's assignment...\n"
+        let cfg = DistWorker.Config(port: UInt16(clamping: port),
+                                    localModelPath: ProcessStream.absolutePath(modelPath))
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         workerLogTask?.cancel()
         workerLogTask = Task { [weak self] in for await s in logStream { self?.workerLog += s } }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
-        let loadTask = Task.detached { () -> DistWorker in
-            let w = try DistWorker(config: cfg, onLog: onLog)
+        let w = DistWorker(config: cfg, onLog: onLog)
+        do {
             try w.start()
-            return w
-        }
-        Task {
-            do { self.worker = try await loadTask.value; self.workerLoading = false; self.workerRunning = true }
-            catch { logCont.yield("worker start failed: \(error)\n"); self.workerLoading = false; self.workerRunning = false }
+            worker = w
+            workerRunning = true
+        } catch {
+            logCont.yield("worker start failed: \(error)\n")
+            workerRunning = false
         }
     }
 
     func stopWorker() {
         worker?.stop(); worker = nil
-        workerRunning = false; workerLoading = false
+        workerRunning = false
         workerLog += "[worker stopped]\n"
     }
 
@@ -128,12 +133,24 @@ final class DistributedController {
             coordLog += "forwarding: enter the return host (this Mac's LAN IP)\n"; return
         }
         coordLoading = true; coordLog = "Loading model (coordinator)...\n"
+        // The coordinator defines each worker's job: same gguf/context as this
+        // Mac, plus the local expert slot-cache budget and — when the local
+        // disk-KV toggle is on — a per-shard checkpoint budget (same keys as
+        // the local chat settings).
+        let slots = UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int ?? 0
+        let kvOn = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true
+        let kvKTok = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000
+        let bundle = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true
+        let q4 = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? true
         let cfg = DistCoordinator.Config(modelPath: ProcessStream.absolutePath(modelPath),
                                          contextSize: contextSize, peers: peers,
                                          activationBits: activationBits, prefillChunk: prefillChunk,
                                          forward: forwardEnabled,
                                          returnHost: returnHost.trimmingCharacters(in: .whitespaces),
-                                         returnPort: UInt16(clamping: returnPort))
+                                         returnPort: UInt16(clamping: returnPort),
+                                         workerCacheSlots: slots,
+                                         diskKVBudgetTokens: kvOn ? kvKTok * 1000 : 0,
+                                         useExpertBundle: bundle, useDenseQ4: q4)
         let (logStream, logCont) = AsyncStream<String>.makeStream()
         coordLogTask?.cancel()
         coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }
@@ -188,7 +205,7 @@ final class DistributedController {
         // Immutable snapshot for the detached closure (capturing a mutable local
         // trips Swift 6 region analysis: "sending parameter risks data races").
         let sendTurns: [ChatTurn] = (agent.systemPrompt.isEmpty ? [] : [.system(agent.systemPrompt)]) + turns
-        let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.specs(enabled: Set(agent.toolNames))
+        let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.autoSpecs(enabled: Set(agent.toolNames))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
         enum Ev: Sendable { case log(String), progress(String), reasoning(String), token(String) }
@@ -223,7 +240,11 @@ final class DistributedController {
                     return .success(calls)
                 } catch { return .failure(error) }
             }
-            let result = await work.value
+            // A detached task does NOT inherit cancellation: forward Stop
+            // (coordTask.cancel) explicitly, or the cluster generation would
+            // keep running — and streaming tokens — to completion.
+            let result = await withTaskCancellationHandler { await work.value }
+                                                  onCancel: { work.cancel() }
             cont.finish()
             switch result {
             case .failure(let error):
@@ -250,23 +271,36 @@ final class DistributedController {
             isGenerating = false; status = ""
             return
         }
-        for c in calls {
-            let out = ToolRegistry.execute(c)
-                ?? ToolOutput(callId: c.id, name: c.name,
-                              content: #"{"error":"tool is not built in: unsupported in distributed mode"}"#)
-            messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
-            turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
+        // MCP calls make this round ASYNC (the old all-builtin round was
+        // synchronous, so Stop / New Chat could never interleave). The Task is
+        // stored in coordTask so stopGeneration() cancels it, and the epoch
+        // guard drops the round if Stop or New Chat ran during an await —
+        // otherwise a finished MCP call would append stale turns and silently
+        // resume a generation the user ended.
+        let epoch = chatEpoch
+        coordTask = Task {
+            for c in calls {
+                if MCPManager.shared.isMCPTool(named: c.name) { status = "MCP: \(c.name)…" }
+                let out = await ToolRegistry.executeAuto(c)
+                    ?? ToolOutput(callId: c.id, name: c.name,
+                                  content: #"{"error":"unknown tool: not built in and not provided by a connected MCP server"}"#)
+                guard !Task.isCancelled, epoch == chatEpoch else { return }
+                messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
+                turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
+            }
+            generateTurn()      // continue with the tool results
         }
-        generateTurn()      // continue with the tool results
     }
 
     func stopGeneration() {
+        chatEpoch += 1                    // invalidate any in-flight async tool round
         coordTask?.cancel()
         isGenerating = false
         coordLog += "[stopped] (the next question starts from scratch)\n"
     }
 
     func newChat() {
+        chatEpoch += 1                    // an in-flight tool round must not touch the fresh chat
         messages.removeAll()
         turns.removeAll()
         toolRounds = 0

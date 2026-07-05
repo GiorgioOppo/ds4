@@ -66,6 +66,18 @@ final class ChatStore {
     init(settings: AppSettings) {
         self.settings = settings
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        // MCP servers connect asynchronously: when one (dis)connects, bump the
+        // observable mirror (so pickers listing MCP tools re-render) and re-push
+        // the declared tools to the engine (specs exist only while connected —
+        // without this, an agent with mcp_* tools active at launch would never
+        // expose them to the model).
+        MCPManager.shared.addChangeHandler { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.mcpVersion = MCPManager.shared.version
+                self.syncTools()
+            }
+        }
         // Migrazione UNA TANTUM alla configurazione veloce misurata (2026-07,
         // demo A/B sul campo: slot 16 + ring off + bundle = 2.3-2.6 tok/s
         // contro ~1 con slot 6/ring on/contesto 302k). Applica i valori buoni
@@ -541,7 +553,7 @@ final class ChatStore {
         let agent = resolvedAgent()
         toolsEnabled = !agent.toolNames.isEmpty
         enabledToolNames = Set(agent.toolNames)
-        let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
+        let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
         Task {
             await service.setAgent(agent, tools: tools)
             await service.setCompactTools(compactTools)
@@ -646,7 +658,15 @@ final class ChatStore {
     var loadedModelPath: String? { isReady ? modelPath : nil }
 
     var isReady: Bool { if case .ready = phase { return true } else { return false } }
-    var availableTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
+    /// Everything togglable in pickers/agents: built-ins + connected MCP tools.
+    var availableTools: [ToolSpec] { builtinTools + mcpTools }
+    var builtinTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
+    /// Reading `mcpVersion` here registers the SwiftUI dependency: MCPManager is
+    /// a plain singleton, so views listing MCP tools re-render only because the
+    /// change handler (see init) bumps this observable mirror.
+    var mcpTools: [ToolSpec] { _ = mcpVersion; return MCPManager.shared.toolSpecs() }
+    /// Observable mirror of MCPManager.version (bumped by the change handler).
+    var mcpVersion = 0
 
     private var bookmarkRestored = false
 
@@ -729,9 +749,11 @@ final class ChatStore {
     }
 
     /// Push the current tool selection to the engine (call after toggling tools).
+    /// Also re-run when an MCP server (dis)connects: the declared set includes
+    /// MCP specs, which exist only while their server is connected.
     func syncTools() {
         guard let service else { return }
-        let tools = toolsEnabled ? ToolRegistry.specs(enabled: enabledToolNames) : []
+        let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
         let compact = compactTools
         Task { await service.setTools(tools); await service.setCompactTools(compact) }
     }
@@ -1032,6 +1054,13 @@ final class ChatStore {
             let ids = AgentRegistry.shared.all().map(\.id).joined(separator: ", ")
             return "unknown agent '\(agentId)'; available agent ids: \(ids) (see agents_list)"
         }
+        // MCP tools run app-side against external servers; the sub-agent loop is
+        // engine-side and would silently drop them — fail loudly instead so the
+        // model retries with built-ins (or the user learns why it can't work).
+        let mcpRequested = tools.filter { MCPManager.shared.isMCPTool(named: $0) }
+        if !mcpRequested.isEmpty {
+            return "MCP tools cannot be granted to sub-agents: \(mcpRequested.joined(separator: ", ")); retry with built-in tools only"
+        }
         if !tools.isEmpty, !tools.contains(where: { ToolRegistry.subAgentGrantable.contains($0) }) {
             return "none of the requested tools exist or are grantable to sub-agents; grantable tools: \(ToolRegistry.subAgentGrantable.sorted().joined(separator: ", "))"
         }
@@ -1202,12 +1231,19 @@ final class ChatStore {
                 outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
                 continue
             }
-            if let out = ToolRegistry.execute(c) {
+            // Built-ins run synchronously; MCP tools go async to their server
+            // (a failure — server gone, timeout — comes back as an error output
+            // the model can react to).
+            if MCPManager.shared.isMCPTool(named: c.name) { status = "MCP: \(c.name)…" }
+            if let out = await ToolRegistry.executeAuto(c) {
                 outputs.append(out)
                 messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
-            } else {
-                manual.append(c)
+                // Stop pressed during the (long) MCP await: show the result but
+                // do NOT spawn a continuation — the user asked this turn to end.
+                if Task.isCancelled { return false }
+                continue
             }
+            manual.append(c)
         }
 
         if !manual.isEmpty {

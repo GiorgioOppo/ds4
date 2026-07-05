@@ -71,6 +71,24 @@ public enum ToolRegistry {
         return ToolOutput(callId: call.id, name: call.name, content: tool.run(call.argumentsJSON))
     }
 
+    // MARK: - Auto-executable tools (built-ins + connected MCP servers)
+
+    /// Every auto-executable tool source in one dispatch: built-ins first, then
+    /// the connected MCP servers. Nil only if NO source knows the name (the UI
+    /// then falls back to manual entry). All tool loops — chat, distributed —
+    /// should call this instead of hand-rolling the cascade.
+    public static func executeAuto(_ call: ToolCall) async -> ToolOutput? {
+        if let out = execute(call) { return out }
+        return await MCPManager.shared.execute(call)
+    }
+
+    /// The specs to declare to the model for a tool-name selection: built-ins
+    /// plus whatever the connected MCP servers currently expose. Callers should
+    /// re-declare (via MCPManager.addChangeHandler) when servers (dis)connect.
+    public static func autoSpecs(enabled names: Set<String>) -> [ToolSpec] {
+        specs(enabled: names) + MCPManager.shared.specs(enabled: names)
+    }
+
     // MARK: - Shared argument-parsing helpers (used by the tool files in Builtins/)
 
     static func stringArg(_ json: String, _ key: String) -> String? {

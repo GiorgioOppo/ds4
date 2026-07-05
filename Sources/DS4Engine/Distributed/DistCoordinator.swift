@@ -2,11 +2,13 @@ import Foundation
 import DS4Core
 
 /// The distributed COORDINATOR: owns the embedding, the sampling loop and the
-/// conversation. `connect()` establishes a persistent route to the workers
-/// (validated for full contiguous layer coverage); each `send(...)` re-renders
-/// the WHOLE conversation and runs it across the cluster, streaming the reply.
-/// Re-rendering per turn (stateless) keeps the cluster KV trivially consistent —
-/// no cross-turn rewind to coordinate over the network.
+/// conversation. `connect()` establishes a persistent route to the workers,
+/// ASSIGNING each one its job (gguf, settings, layer slice); each `send(...)`
+/// re-renders the WHOLE conversation and runs it across the cluster, streaming
+/// the reply. Re-rendering keeps correctness trivially checkable — and when
+/// the render EXACTLY extends the prefix committed by the last clean turn, the
+/// prefill covers only the suffix (in-memory reuse), else a disk restore is
+/// negotiated across the shards. Any mismatch falls back to a cold prefill.
 ///
 /// Transports: RELAY (default; coordinator round-trips each chunk through every
 /// worker) or FORWARDING (`forward:true`; workers pass the HC state worker→worker
@@ -26,14 +28,50 @@ public final class DistCoordinator: @unchecked Sendable {
         public var forward: Bool
         public var returnHost: String
         public var returnPort: UInt16
+        /// Expert slot-cache budget ASSIGNed to each worker (0 = disabled).
+        public var workerCacheSlots: Int
+        /// Disk-KV token budget ASSIGNed to each worker's shard (0 = disabled).
+        public var diskKVBudgetTokens: Int
+        /// Workers should use the expert-bundle sidecar (the coordinator's
+        /// bundle is offered for transfer when it exists on disk).
+        public var useExpertBundle: Bool
+        /// Workers should use the Q4 dense requant; the coordinator's cache
+        /// file is offered so no worker pays the minutes-long requant again.
+        public var useDenseQ4: Bool
         public init(modelPath: String, contextSize: Int, peers: [Peer], activationBits: Int,
                     prefillChunk: Int = 32, forward: Bool = false,
-                    returnHost: String = "", returnPort: UInt16 = 9099) {
+                    returnHost: String = "", returnPort: UInt16 = 9099,
+                    workerCacheSlots: Int = 0, diskKVBudgetTokens: Int = 0,
+                    useExpertBundle: Bool = false, useDenseQ4: Bool = false) {
             self.modelPath = modelPath; self.contextSize = contextSize
             self.peers = peers; self.activationBits = activationBits
             self.prefillChunk = max(1, prefillChunk); self.forward = forward
             self.returnHost = returnHost; self.returnPort = returnPort
+            self.workerCacheSlots = max(0, workerCacheSlots)
+            self.diskKVBudgetTokens = max(0, diskKVBudgetTokens)
+            self.useExpertBundle = useExpertBundle
+            self.useDenseQ4 = useDenseQ4
         }
+    }
+
+    /// Contiguous, near-equal split of `nLayers` across `workers` peers, in
+    /// peer-list order (the user controls placement by ordering the list); the
+    /// first `nLayers % workers` slices get one extra layer. The LAST slice
+    /// also runs the output head.
+    static func partition(nLayers: Int, workers: Int) throws -> [(start: Int, end: Int)] {
+        guard workers > 0 else { throw DistError.sliceGap("no workers") }
+        guard workers <= nLayers else {
+            throw DistError.sliceGap("more workers (\(workers)) than layers (\(nLayers)): remove peers")
+        }
+        let base = nLayers / workers, rem = nLayers % workers
+        var out: [(Int, Int)] = []
+        var start = 0
+        for i in 0..<workers {
+            let len = base + (i < rem ? 1 : 0)
+            out.append((start, start + len - 1))
+            start += len
+        }
+        return out
     }
 
     private let engine: DistEngine
@@ -45,6 +83,22 @@ public final class DistCoordinator: @unchecked Sendable {
     private var entries: [DistRouteEntry] = []
     private var returnListener: DistReturnListener?
     private var returnIter: AsyncStream<DistResult>.Iterator?
+    /// Per-turn session id, echoed by workers in every RESULT. A turn abandoned
+    /// mid-chunk (Stop) leaves its reply in a TCP/listener buffer; the next
+    /// turn's id differs, so the stale frame is discarded instead of being
+    /// mistaken for the new turn's first reply. Sends are serialized by the
+    /// caller (one chat turn / benchmark at a time), so a plain counter is enough.
+    private var sessionCounter: UInt32 = 0
+
+    /// KV continuity across turns. `committedIds` are the tokens whose KV every
+    /// worker shard holds after the last CLEAN turn; `kvValid` mirrors the local
+    /// engine's dirty-until-clean rule (false during a turn, after Stop/error,
+    /// and around a benchmark — the NSA compressor is recurrent and cannot
+    /// rewind, so a partial turn invalidates the whole prefix).
+    private var committedIds: [Int] = []
+    private var kvValid = false
+    /// Tokens covered by the last disk checkpoint (interval gate, like local).
+    private var lastDiskStoreCount = 0
 
     public var routeSummary: String { "\(engine.nLayers) layers · \(entries.count) workers" }
 
@@ -56,25 +110,103 @@ public final class DistCoordinator: @unchecked Sendable {
 
     // MARK: Session
 
-    /// Connect to every worker, read their HELLO, assemble + validate a contiguous
-    /// route covering all layers, and (forwarding only) start the return listener.
-    public func connect(onLog: @Sendable (String) -> Void) async throws {
-        for p in config.peers {
-            let conn = try DistConnection.connect(host: p.host, port: p.port, queue: queue)
+    /// Establish the route, with the COORDINATOR defining each worker's job:
+    /// split the layers across the peers (in list order), then per peer —
+    /// HELLO (version check) → ASSIGN (gguf + context + cache slots + slice) →
+    /// READY (worker loaded its engine). Then validate contiguous coverage and
+    /// (forwarding only) start the return listener.
+    public func connect(onLog: @escaping @Sendable (String) -> Void) async throws {
+        let slices = try Self.partition(nLayers: engine.nLayers, workers: config.peers.count)
+        let modelName = (config.modelPath as NSString).lastPathComponent
+        // Everything the workers need comes from HERE: build the file offer
+        // once (gguf + sidecar, identified by size + SHA-256; the hash is
+        // computed once per machine and answered from the cache afterwards).
+        let offer = try buildFileOffer(onLog: onLog)
+        for (i, p) in config.peers.enumerated() {
+            onLog("connessione a \(p.host):\(p.port)…\n")
+            let conn = try await DistConnection.connect(host: p.host, port: p.port,
+                                                        queue: queue, onState: onLog)
             let (type, payload) = try await conn.readFrame()
+            if type == .error {
+                throw DistError.remote(String(decoding: payload, as: UTF8.self))
+            }
             guard type == .hello, let h = DistHello.decode(payload) else { throw DistError.badFrame }
-            if h.modelName != engine.modelName {
-                onLog("warning: worker \(p.host) has model '\(h.modelName)' != '\(engine.modelName)'\n")
+            guard h.version == Dist.protocolVersion else {
+                throw DistError.versionMismatch(
+                    "worker \(p.host):\(p.port) speaks protocol v\(h.version), this build v\(Dist.protocolVersion) — update all nodes to the same DwarfStar build")
+            }
+
+            // FILE DISTRIBUTION: offer the manifest; the worker answers with
+            // what it is missing (hash-verified locally) and only that is
+            // streamed — the huge transfer happens on the FIRST round only.
+            try await conn.sendFrame(.fileOffer, DistFileOffer(entries: offer).encoded())
+            let (nType, nPayload) = try await readControl(conn)
+            guard nType == .fileNeed, let need = DistFileNeed.decode(nPayload) else {
+                throw DistError.badFrame
+            }
+            if need.indices.isEmpty {
+                onLog("file: \(p.host):\(p.port) ha già tutto (hash verificati)\n")
+            }
+            for index in need.indices {
+                guard index >= 0, index < offer.count else { throw DistError.badFrame }
+                try await sendFile(offer[index], index: index, to: conn, peer: p, onLog: onLog)
+            }
+
+            // ASSIGN this peer its slice; the worker loads (or reuses) its
+            // engine and replies READY. The last slice also runs the head.
+            // The usage imatrix seed pre-warms the worker's slot cache with
+            // this model's richest local profile (same seeding as local chat).
+            let (ls, le) = slices[i]
+            let hasOutput = (i == config.peers.count - 1)
+            let usage = InferenceService.usageDataSeeded(modelName: modelName,
+                                                         agentId: "generale") ?? Data()
+            let assign = DistAssign(modelPath: config.modelPath, modelName: modelName,
+                                    contextSize: config.contextSize,
+                                    expertCacheSlots: config.workerCacheSlots,
+                                    diskKVBudgetTokens: config.diskKVBudgetTokens,
+                                    useExpertBundle: config.useExpertBundle,
+                                    useDenseQ4: config.useDenseQ4,
+                                    layerStart: ls, layerEnd: le, hasOutput: hasOutput,
+                                    usageJSON: usage)
+            onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize)\n")
+            onLog("attendo il caricamento del motore sul worker (minuti alla prima esecuzione: "
+                  + "mmap + Metal + eventuali sidecar; progresso nel log del tab Worker)…\n")
+            try await conn.sendFrame(.assign, assign.encoded())
+            // Await READY, relaying the worker's load-progress frames into
+            // THIS log (Q4 requant, sidecar builds and Metal init are minutes
+            // of silence otherwise — "stuck" and "working" must be tellable
+            // apart from the coordinator alone).
+            var rType: Dist.MsgType
+            var rPayload: Data
+            while true {
+                (rType, rPayload) = try await conn.readFrame()
+                if rType == .progress {
+                    onLog("worker \(p.host): " + String(decoding: rPayload, as: UTF8.self) + "\n")
+                    continue
+                }
+                if rType == .error {
+                    throw DistError.remote("\(p.host):\(p.port): " + String(decoding: rPayload, as: UTF8.self))
+                }
+                break
+            }
+            guard rType == .ready, let ready = DistHello.decode(rPayload), ready.assigned else {
+                throw DistError.badFrame
+            }
+            guard ready.layerStart == ls, ready.layerEnd == le, ready.hasOutput == hasOutput,
+                  ready.contextSize == config.contextSize else {
+                throw DistError.sliceGap(
+                    "worker \(p.host):\(p.port) loaded layers \(ready.layerStart)...\(ready.layerEnd) instead of \(ls)...\(le)")
+            }
+            if ready.modelName != modelName {
+                onLog("warning: worker \(p.host) loaded '\(ready.modelName)' != '\(modelName)'\n")
             }
             conns.append(conn)
-            entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: h.layerStart,
-                                          layerEnd: h.layerEnd, hasOutput: h.hasOutput))
-            onLog("route: \(p.host):\(p.port) -> layers \(h.layerStart)...\(h.layerEnd)\(h.hasOutput ? " +output" : "")\n")
+            entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: ls,
+                                          layerEnd: le, hasOutput: hasOutput))
+            onLog("route: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") pronto\n")
         }
-        // Sort by layerStart, keep conns aligned, validate contiguous full coverage.
-        let order = entries.indices.sorted { entries[$0].layerStart < entries[$1].layerStart }
-        entries = order.map { entries[$0] }
-        conns = order.map { conns[$0] }
+        // By construction the route is ordered and contiguous; keep the check
+        // as a safety net against partition bugs.
         var expected = 0
         for e in entries {
             guard e.layerStart == expected else { throw DistError.sliceGap("expected layer \(expected), found \(e.layerStart)") }
@@ -97,7 +229,162 @@ public final class DistCoordinator: @unchecked Sendable {
     public func disconnect() {
         for c in conns { c.cancel() }
         conns = []; entries = []
+        committedIds = []; kvValid = false; lastDiskStoreCount = 0
         returnListener?.stop(); returnListener = nil; returnIter = nil
+    }
+
+    // MARK: File distribution (the workers receive everything from here)
+
+    /// The distributable file set: the gguf, plus the expert-bundle sidecar
+    /// when enabled and present (next to the gguf, else in DS4_BUNDLE_DIR).
+    /// Hashes come from the persistent cache; the first run streams the file
+    /// once to compute them (logged — it can take minutes on a 100+ GB gguf).
+    private func buildFileOffer(onLog: @Sendable (String) -> Void) throws -> [DistFileEntry] {
+        let ggufName = (config.modelPath as NSString).lastPathComponent
+        guard let (size, _) = DistFileHash.stat(config.modelPath),
+              let sha = DistFileHash.cachedOrCompute(path: config.modelPath, onLog: onLog) else {
+            throw DistError.sliceGap("cannot read/hash the gguf at \(config.modelPath)")
+        }
+        var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha)]
+        if config.useExpertBundle,
+           let bundle = findLocalPath(kind: .expertBundle),
+           let (bSize, _) = DistFileHash.stat(bundle),
+           let bSha = DistFileHash.cachedOrCompute(path: bundle, onLog: onLog) {
+            entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
+                                         size: bSize, sha256: bSha))
+        }
+        // The Q4 requant cache is derived and deterministic: ~1.4 GB on the
+        // wire beats minutes of re-requant on every worker.
+        if config.useDenseQ4,
+           let q4 = findLocalPath(kind: .q4Dense),
+           let (qSize, _) = DistFileHash.stat(q4),
+           let qSha = DistFileHash.cachedOrCompute(path: q4, onLog: onLog) {
+            entries.append(DistFileEntry(kind: .q4Dense, name: ggufName + ".q4dense",
+                                         size: qSize, sha256: qSha))
+        }
+        return entries
+    }
+
+    /// Stream one offered file to a worker: sequential 4 MB chunks (F_NOCACHE
+    /// read — the transfer must not evict the coordinator's hot page cache),
+    /// then DONE, then the worker's hash-verified ack.
+    private func sendFile(_ entry: DistFileEntry, index: Int, to conn: DistConnection,
+                          peer: Peer, onLog: @Sendable (String) -> Void) async throws {
+        guard let path = entry.kind == .gguf ? config.modelPath : findLocalPath(kind: entry.kind) else {
+            throw DistError.sliceGap("offered file \(entry.name) no longer found locally")
+        }
+        onLog("file: invio \(entry.name) (\(entry.size / 1_048_576) MB) a \(peer.host):\(peer.port)…\n")
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw DistError.sliceGap("cannot open \(path)") }
+        defer { close(fd) }
+        _ = fcntl(fd, F_NOCACHE, 1)
+
+        var offset: UInt64 = 0
+        var buf = [UInt8](repeating: 0, count: Dist.fileChunkBytes)
+        let t0 = Date()
+        var lastLogged: UInt64 = 0
+        while offset < entry.size {
+            try Task.checkCancellation()
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, Dist.fileChunkBytes) }
+            guard n > 0 else { throw DistError.sliceGap("read failed at \(offset) of \(path)") }
+            let chunk = DistFileChunk(index: index, offset: offset, data: Data(buf[0..<n]))
+            try await conn.sendFrame(.fileChunk, chunk.encoded())
+            offset += UInt64(n)
+            if offset - lastLogged >= 1_073_741_824 {          // progress every GB
+                lastLogged = offset
+                let mbps = Double(offset) / 1_048_576 / max(0.001, Date().timeIntervalSince(t0))
+                onLog(String(format: "file: %@ %.0f%% (%.0f MB/s)\n", entry.name,
+                             Double(offset) / Double(entry.size) * 100, mbps))
+            }
+        }
+        try await conn.sendFrame(.fileDone, DistFileDone(index: index).encoded())
+        let (aType, aPayload) = try await readControl(conn)
+        guard aType == .fileAck, let ack = DistKV.decodeAck(aPayload) else { throw DistError.badFrame }
+        guard ack.ok else { throw DistError.remote("\(peer.host):\(peer.port): \(ack.message)") }
+        onLog(String(format: "file: %@ trasferito in %.0fs\n", entry.name, Date().timeIntervalSince(t0)))
+    }
+
+    /// Where a derived file lives on the coordinator: next to the gguf, else
+    /// in the app-owned cache directory (same lookup order as the engine).
+    private func findLocalPath(kind: DistFileEntry.Kind) -> String? {
+        let name = (config.modelPath as NSString).lastPathComponent
+        let (ext, dirEnv): (String, String)
+        switch kind {
+        case .expertBundle: (ext, dirEnv) = (".expbundle", "DS4_BUNDLE_DIR")
+        case .q4Dense:      (ext, dirEnv) = (".q4dense", "DS4_Q4_CACHE_DIR")
+        case .gguf:         return config.modelPath
+        }
+        var candidates = [config.modelPath + ext]
+        if let dir = ProcessInfo.processInfo.environment[dirEnv], !dir.isEmpty {
+            candidates.append(dir + "/" + name + ext)
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    // MARK: Cluster KV continuity
+
+    /// Read a KV-control reply on a relay connection, skipping stale RESULT
+    /// frames an abandoned turn may have left in the socket buffer.
+    private func readControl(_ conn: DistConnection) async throws -> (Dist.MsgType, Data) {
+        while true {
+            let (type, payload) = try await conn.readFrame()
+            if type == .result { continue }                       // stale turn reply: drop
+            if type == .progress { continue }                     // informational only
+            if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
+            return (type, payload)
+        }
+    }
+
+    /// Negotiate a disk restore for `ids`: intersect every worker's stored
+    /// prefix lengths, pick the longest ALL shards can restore, and restore it
+    /// everywhere. Returns the restored length, or nil (cold prefill — any
+    /// partially restored shard is overwritten by the pos-0 prefill).
+    private func negotiateRestore(ids: [Int], onLog: @Sendable (String) -> Void) async -> Int? {
+        do {
+            var common: Set<Int>?
+            for conn in conns {
+                try await conn.sendFrame(.kvQuery, DistKV.encodeTokens(ids))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvLengths, let lengths = DistKV.decodeLengths(payload) else { return nil }
+                common = common.map { $0.intersection(lengths) } ?? Set(lengths)
+                if common?.isEmpty == true { return nil }
+            }
+            guard let best = common?.max(), best > 0 else { return nil }
+            let prefix = Array(ids.prefix(best))
+            for (i, conn) in conns.enumerated() {
+                try await conn.sendFrame(.kvRestore, DistKV.encodeTokens(prefix))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvAck, let ack = DistKV.decodeAck(payload), ack.ok else {
+                    onLog("restore KV fallito su \(entries[i].host):\(entries[i].port) — prefill da zero\n")
+                    return nil
+                }
+            }
+            onLog("KV ripristinato da disco su \(conns.count) worker (\(best) token)\n")
+            return best
+        } catch {
+            onLog("negoziazione restore KV fallita: \(error) — prefill da zero\n")
+            return nil
+        }
+    }
+
+    /// Checkpoint the committed prefix on every worker (interval-gated by the
+    /// caller). The workers export synchronously and write in the background.
+    private func broadcastSave(ids: [Int], cold: Bool, onLog: @Sendable (String) -> Void) async {
+        do {
+            for conn in conns {
+                try await conn.sendFrame(.kvSave, DistKV.encodeSave(tokens: ids, cold: cold))
+                let (type, payload) = try await readControl(conn)
+                guard type == .kvAck, let ack = DistKV.decodeAck(payload), ack.ok else {
+                    onLog("checkpoint KV rifiutato da un worker" +
+                          ((DistKV.decodeAck(payload)?.message).map { ": \($0)" } ?? "") + "\n")
+                    return
+                }
+            }
+            lastDiskStoreCount = ids.count
+            onLog("checkpoint KV cluster: \(ids.count) token su \(conns.count) worker\n")
+        } catch {
+            onLog("checkpoint KV fallito: \(error)\n")
+        }
     }
 
     // MARK: One chat turn
@@ -115,14 +402,34 @@ public final class DistCoordinator: @unchecked Sendable {
                      onReasoning: @Sendable (String) -> Void,
                      onToken: @Sendable (String) -> Void) async throws -> [ToolCall] {
         guard !entries.isEmpty else { throw DistError.closed }
+        sessionCounter &+= 1
+        let session = sessionCounter
         let ids = engine.chatPromptIds(turns: turns, tools: tools, think: think)
         guard ids.count < config.contextSize else { throw DistError.sliceGap("prompt exceeds context") }
-        onLog("prefill \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
 
-        // PREFILL the whole prompt in chunks, fresh KV (posBase 0 resets workers).
-        var pos = 0
+        // KV continuity: when the re-rendered conversation EXACTLY extends the
+        // prefix committed by the last clean turn, prefill only the suffix
+        // (the workers still hold that KV). Otherwise try a disk restore
+        // negotiated across all shards. Exact-match checks make both paths
+        // opportunistic and safe: any mismatch falls back to a cold prefill.
+        var startPos = 0
+        if kvValid, !committedIds.isEmpty, ids.count > committedIds.count,
+           ids.starts(with: committedIds) {
+            startPos = committedIds.count
+            onLog("KV riusato in memoria: \(startPos) token già nel cluster\n")
+        } else if config.diskKVBudgetTokens > 0 {
+            if let restored = await negotiateRestore(ids: ids, onLog: onLog) { startPos = restored }
+        }
+        kvValid = false                            // dirty-until-clean (like local)
+        onLog("prefill \(ids.count - startPos) di \(ids.count) tokens (chunk \(config.prefillChunk))...\n")
+
+        // PREFILL the (remaining) prompt in chunks. The FIRST chunk carries
+        // turnStart (session adoption on the workers); posBase 0 also resets
+        // their compressor state — a mid-context start keeps/restored state.
+        var pos = startPos
         var lastLogits: [Float] = []
-        var start = 0
+        var start = startPos
+        var firstChunk = true
         while start < ids.count {
             try Task.checkCancellation()
             let end = min(start + config.prefillChunk, ids.count)
@@ -134,9 +441,11 @@ public final class DistCoordinator: @unchecked Sendable {
                 let n = (h0.reduce(0) { $0 + $1 * $1 }).squareRoot()
                 onLog(String(format: "diag: |embed| = %.2f (hc=%d float)\n", n, h0.count))
             }
-            if let logits = try await runChunk(hcs: hcs, posBase: pos, wantLogits: end == ids.count) {
+            if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
+            firstChunk = false
             pos += end - start
             start = end
             onProgress("prefill \(pos)/\(ids.count) tokens...")
@@ -155,6 +464,7 @@ public final class DistCoordinator: @unchecked Sendable {
         // same scheme as the local InferenceService, incl. the held '<' opener).
         var rng = sampling.seed
         var produced = 0
+        var producedIds: [Int] = []              // fed tokens (KV committed on the workers)
         var inReasoning = think
         var inTool = false
         var pendingLT = false                    // a held trailing '<' (may open <｜DSML｜…)
@@ -191,10 +501,12 @@ public final class DistCoordinator: @unchecked Sendable {
             recentIds.append(next)
             if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
             let hc = try engine.embed(token: next, pos: pos)
-            guard let logits = try await runChunk(hcs: [hc], posBase: pos, wantLogits: true) else {
+            guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
+                                                  wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
+            producedIds.append(next)             // its KV is now committed cluster-wide
             pos += 1; produced += 1
             let elapsed = Date().timeIntervalSince(t0)
             onProgress(String(format: "%d tokens · %.2f tok/s", produced,
@@ -203,6 +515,17 @@ public final class DistCoordinator: @unchecked Sendable {
         if pendingLT, !inTool { emit("<") }
         let dt = Date().timeIntervalSince(t0)
         onLog("[\(produced) tokens · \(String(format: "%.2f", dt > 0 ? Double(produced) / dt : 0)) tok/s]\n")
+
+        // CLEAN completion: the cluster KV now holds prompt + fed tokens — the
+        // next turn can extend it in memory; checkpoint to disk interval-gated.
+        committedIds = ids + producedIds
+        kvValid = true
+        if config.diskKVBudgetTokens > 0,
+           committedIds.count >= 128,
+           committedIds.count - lastDiskStoreCount >= 256 {
+            await broadcastSave(ids: committedIds, cold: lastDiskStoreCount == 0, onLog: onLog)
+        }
+
         guard inTool else { return engine.parseToolCalls(visible).calls }
         return engine.parseToolCalls(visible + toolText).calls
     }
@@ -217,6 +540,9 @@ public final class DistCoordinator: @unchecked Sendable {
     /// `InferenceService.benchmark` so local and distributed numbers are comparable.
     public func benchmark(contextTokens: Int, genTokens: Int) async throws -> InferenceService.BenchPoint {
         guard !entries.isEmpty else { throw DistError.closed }
+        sessionCounter &+= 1
+        let session = sessionCounter
+        kvValid = false          // the run rewrites the cluster KV from pos 0
         let ctx = max(8, min(contextTokens, config.contextSize - genTokens - 4))
         // Synthetic prompt: BOS + tiled filler. Output quality is irrelevant for
         // timing; the per-token work (embed · slice forward · expert gather) is the same.
@@ -232,6 +558,7 @@ public final class DistCoordinator: @unchecked Sendable {
         var pos = 0
         var lastLogits: [Float] = []
         var start = 0
+        var firstChunk = true
         while start < ids.count {
             try Task.checkCancellation()
             let end = min(start + config.prefillChunk, ids.count)
@@ -239,9 +566,11 @@ public final class DistCoordinator: @unchecked Sendable {
             for (k, id) in ids[start..<end].enumerated() {
                 hcs.append(try engine.embed(token: id, pos: pos + k))
             }
-            if let logits = try await runChunk(hcs: hcs, posBase: pos, wantLogits: end == ids.count) {
+            if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
+            firstChunk = false
             pos += end - start
             start = end
         }
@@ -257,7 +586,8 @@ public final class DistCoordinator: @unchecked Sendable {
             try Task.checkCancellation()
             let next = engine.sample(lastLogits, params: samp, rng: &rng)
             let hc = try engine.embed(token: next, pos: pos)
-            guard let logits = try await runChunk(hcs: [hc], posBase: pos, wantLogits: true) else {
+            guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
+                                                  wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
@@ -273,33 +603,53 @@ public final class DistCoordinator: @unchecked Sendable {
     }
 
     /// One chunk through the pipeline; returns the last token's logits if `wantLogits`.
-    private func runChunk(hcs: [[Float]], posBase: Int, wantLogits: Bool) async throws -> [Float]? {
+    /// Results are matched on the `session` echo: anything from an older session
+    /// (a turn abandoned mid-chunk) is discarded and the read repeats. ERROR
+    /// frames from workers surface with the worker's own message.
+    private func runChunk(session: UInt32, hcs: [[Float]], posBase: Int,
+                          wantLogits: Bool, turnStart: Bool = false) async throws -> [Float]? {
         var flags: Dist.WorkFlags = []
         if posBase == 0 { flags.insert(.resetSession) }
+        if turnStart { flags.insert(.turnStart) }
         if config.forward {
             var f = flags
             if wantLogits { f.insert(.outputLogits) }
-            let work = DistWork(pos: posBase, nTokens: hcs.count,
+            let work = DistWork(session: session, pos: posBase, nTokens: hcs.count,
                                 layerStart: entries[0].layerStart, layerEnd: entries[0].layerEnd,
                                 flags: f, hcBits: config.activationBits, route: entries, routeIndex: 0,
                                 returnHost: config.returnHost, returnPort: config.returnPort,
                                 hc: hcs.flatMap { $0 })
             try await conns[0].sendFrame(.work, work.encoded())
-            guard let res = await returnIter?.next() else { throw DistError.closed }
-            return res.kind == .logits ? res.values : nil
+            while true {
+                guard let res = await returnIter?.next() else { throw DistError.closed }
+                guard res.session == session else { continue }   // stale turn: drop
+                return res.kind == .logits ? res.values : nil
+            }
         }
         var states = hcs
         let stateLen = engine.hcStateCount
         for (i, e) in entries.enumerated() {
             var f = flags
             if i == entries.count - 1, wantLogits { f.insert(.outputLogits) }
-            let work = DistWork(pos: posBase, nTokens: states.count, layerStart: e.layerStart,
-                                layerEnd: e.layerEnd, flags: f, hcBits: config.activationBits,
+            let work = DistWork(session: session, pos: posBase, nTokens: states.count,
+                                layerStart: e.layerStart, layerEnd: e.layerEnd,
+                                flags: f, hcBits: config.activationBits,
                                 hc: states.flatMap { $0 })
             try await conns[i].sendFrame(.work, work.encoded())
-            let (type, payload) = try await conns[i].readFrame()
-            guard type == .result, let res = DistResult.decode(payload) else { throw DistError.badFrame }
+            var res: DistResult
+            while true {
+                let (type, payload) = try await conns[i].readFrame()
+                if type == .progress { continue }                // informational only
+                if type == .error { throw DistError.remote(String(decoding: payload, as: UTF8.self)) }
+                guard type == .result, let r = DistResult.decode(payload) else { throw DistError.badFrame }
+                guard r.session == session else { continue }     // stale turn: drop
+                res = r
+                break
+            }
             if res.kind == .logits { return res.values }
+            // The worker echoes exactly nTokens states; anything else is a bug
+            // upstream — fail the turn, never slice a short array.
+            guard res.values.count == states.count * stateLen else { throw DistError.badFrame }
             states = (0..<states.count).map { Array(res.values[$0 * stateLen..<($0 + 1) * stateLen]) }
         }
         return nil

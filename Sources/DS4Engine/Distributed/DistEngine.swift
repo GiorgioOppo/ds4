@@ -24,14 +24,24 @@ public final class DistEngine: @unchecked Sendable {
     private let tok: Tokenizer
     private let decoder: StreamingDecoder
     private let markup: ToolMarkup
+    /// Checkpoint header quant tag (same rule as InferenceService.setDiskKV).
+    private let kvQuantBits: UInt8
+    /// Worker-side disk KV for this shard (enabled by the coordinator's ASSIGN).
+    private var diskKV: DiskKVStore?
 
     /// `kvLayers` restricts KV/compressor allocation to a layer range (a worker
     /// allocates only its slice's caches; a pure coordinator can pass 0..<0).
-    /// nil = full model.
+    /// nil = full model. `onLoadLog` marks each init PHASE (breadcrumbs for the
+    /// worker log: LoadProgress only covers the decoder factory, so a stall in
+    /// Metal init or mmap would otherwise be silent and undiagnosable).
     public init(modelPath: String, contextSize: Int, expertCacheSlots: Int? = nil,
-                kvLayers: Range<Int>? = nil) throws {
+                kvLayers: Range<Int>? = nil,
+                onLoadLog: (@Sendable (String) -> Void)? = nil) throws {
+        onLoadLog?("init Metal runtime (compilazione kernel)…")
         self.rt = try MetalRuntime()
+        onLoadLog?("mmap gguf…")
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
+        onLoadLog?("tokenizer…")
         self.tok = try Tokenizer(model: model)
         var dims = DSV4Shape.dims
         let mq = GGUFWeights.detectMoEQuant(model)
@@ -42,9 +52,56 @@ public final class DistEngine: @unchecked Sendable {
         let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
                               attnFactor: 1, betaFast: 32, betaSlow: 1)
         self.markup = ToolMarkup.discover(in: tok)
+        self.kvQuantBits = dims.gateQuant == .iq2_xxs ? 2 : 4
+        onLoadLog?("costruzione decoder (pesi, cache, KV)…")
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(
             rt: rt, model: model, dims: dims, rope: rope, nLayers: DSV4Shape.nLayer,
             maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers)
+        onLoadLog?("decoder pronto")
+    }
+
+    // MARK: Usage imatrix (worker slot-cache pre-warm)
+
+    /// Load a usage profile (ExpertUsageStats JSON): the slot cache pre-warms
+    /// with the historically hottest experts on first use.
+    public func loadUsage(_ data: Data) { decoder.usage?.load(data) }
+
+    /// Serialized usage collected so far (nil when the decoder tracks none).
+    public func usageData() -> Data? { decoder.usage?.serialize() }
+
+    // MARK: Worker-side disk KV (shard checkpoints, driven by the coordinator)
+
+    /// Enable/disable shard checkpoints. Budget in TOKENS; nil directory = off.
+    public func setDiskKV(directory: URL?, budgetTokens: Int) {
+        guard let directory, budgetTokens > 0 else { diskKV = nil; return }
+        diskKV = try? DiskKVStore(directory: directory, budgetMB: 0, quantBits: kvQuantBits,
+                                  contextSize: contextSize, budgetTokens: budgetTokens)
+    }
+
+    /// Stored checkpoint lengths that are strict prefixes of `ids` (for the
+    /// coordinator's restore negotiation). Empty when disk KV is off.
+    public func storedPrefixLengths(of ids: [Int]) -> [Int] {
+        diskKV?.storedPrefixLengths(of: ids, modelName: modelName) ?? []
+    }
+
+    /// Restore the shard checkpoint stored for EXACTLY `tokens` (streamed one
+    /// layer at a time into the shard's KV buffers). false when absent/corrupt.
+    public func restoreKV(tokens: [Int]) -> Bool {
+        guard let diskKV else { return false }
+        return diskKV.restore(forTokens: tokens, modelName: modelName, into: decoder)
+    }
+
+    /// Checkpoint the shard for `tokens`: the KV export happens synchronously
+    /// (the state must not move underneath it); the F_NOCACHE write streams in
+    /// the background from a uniquely-owned box (layers freed as written).
+    public func saveKV(tokens: [Int], cold: Bool) {
+        guard let diskKV, !tokens.isEmpty else { return }
+        let box = DiskKVStore.SnapshotBox(decoder.exportKV(nKeys: tokens.count))
+        let name = modelName
+        Task.detached(priority: .utility) {
+            diskKV.store(tokens: tokens, modelName: name, box: box,
+                         reason: cold ? .cold : .continued)
+        }
     }
 
     public var thinkStartId: Int { Int(tok.thinkStartId) }

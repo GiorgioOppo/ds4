@@ -69,27 +69,39 @@ extension StreamingDecoder {
     /// caller can continue prefilling from `snapshot.nKeys`. Call only between
     /// generations.
     public func importKV(_ s: KVSnapshot) throws {
-        guard s.headDim == d.headDim, s.layers.count == nLayers, s.nKeys <= maxKeys else {
+        try beginImportKV(nKeys: s.nKeys, headDim: s.headDim, layerCount: s.layers.count)
+        for i in 0..<nLayers { try importKVLayer(s.layers[i], at: i) }
+    }
+
+    /// Shape gate for a STREAMED restore (disk KV): callers that parse a
+    /// checkpoint one layer at a time validate here BEFORE reading any tensor
+    /// body, then feed each layer to `importKVLayer` and release it — peak RAM
+    /// is one layer's slabs, not the whole checkpoint.
+    public func beginImportKV(nKeys: Int, headDim: Int, layerCount: Int) throws {
+        guard headDim == d.headDim, layerCount == nLayers, nKeys <= maxKeys else {
             throw KVSnapshotError.shapeMismatch
         }
-        for i in 0..<nLayers {
-            guard kvRange.contains(i) else { continue }
-            let layer = s.layers[i]
-            // Re-rotate the chronological window back into the (possibly ring) raw cache.
-            // Full cache: physStart == rawStart and it never wraps -> identical to before.
-            let rawRows = rawCaches[i].count / d.headDim
-            let rows = layer.raw.count / d.headDim
-            let physStart = layer.rawStart % rawRows
-            if physStart + rows <= rawRows {
-                writeFloatsArray(layer.raw, into: rawCaches[i], at: physStart * d.headDim)
-            } else {
-                let seg1 = (rawRows - physStart) * d.headDim
-                writeFloatsArray(Array(layer.raw[0..<seg1]), into: rawCaches[i], at: physStart * d.headDim)
-                writeFloatsArray(Array(layer.raw[seg1...]), into: rawCaches[i], at: 0)
-            }
-            try restoreComp(compStates[i], from: layer.comp, rowDim: d.headDim)
-            try restoreComp(indexStates[i], from: layer.idx, rowDim: d.nIndexerHeadDim)
+    }
+
+    /// Restore ONE layer (raw window + compressors). Layers outside the
+    /// allocated `kvRange` (distributed slices) are skipped, mirroring importKV.
+    public func importKVLayer(_ layer: KVLayerSnapshot, at i: Int) throws {
+        guard i >= 0, i < nLayers else { throw KVSnapshotError.shapeMismatch }
+        guard kvRange.contains(i) else { return }
+        // Re-rotate the chronological window back into the (possibly ring) raw cache.
+        // Full cache: physStart == rawStart and it never wraps -> identical to before.
+        let rawRows = rawCaches[i].count / d.headDim
+        let rows = layer.raw.count / d.headDim
+        let physStart = layer.rawStart % rawRows
+        if physStart + rows <= rawRows {
+            writeFloatsArray(layer.raw, into: rawCaches[i], at: physStart * d.headDim)
+        } else {
+            let seg1 = (rawRows - physStart) * d.headDim
+            writeFloatsArray(Array(layer.raw[0..<seg1]), into: rawCaches[i], at: physStart * d.headDim)
+            writeFloatsArray(Array(layer.raw[seg1...]), into: rawCaches[i], at: 0)
         }
+        try restoreComp(compStates[i], from: layer.comp, rowDim: d.headDim)
+        try restoreComp(indexStates[i], from: layer.idx, rowDim: d.nIndexerHeadDim)
     }
 
     /// Read one compressor's full state (recurrent accumulators + emitted rows).

@@ -178,10 +178,11 @@ server mode, distributed mode, diagnostics, and tuning panels.
 | **Chat** | Main local or distributed conversation. |
 | **Settings** | Shared model, context, execution mode, memory/I/O knobs, local load, distributed route. |
 | **Agents** | Editable roles with prompts, icons, and tool allow-lists. |
+| **MCP** | Configure external MCP servers whose tools extend the built-ins. |
 | **Project** | Imported project library and active project cache. |
 | **Tuning** | Expert slot-cache controls and usage imatrix. |
 | **Server** | OpenAI/Anthropic-compatible native HTTP server. |
-| **Worker** | Run this Mac as a distributed layer worker. |
+| **Worker** | Run this Mac as a distributed worker; the coordinator assigns GGUF, settings, and layer slice. |
 | **Benchmark** | Native throughput charting across context frontiers. |
 | **Diagnostics** | Tokenizer dump and chat-template/tool-format inspection. |
 
@@ -277,6 +278,34 @@ training template.
 Tool results are inserted back into the conversation as user-side tool-result
 turns. Built-ins run automatically. Unknown tools can be answered manually.
 
+### MCP Servers
+
+The **MCP** tab connects the app, as a Model Context Protocol CLIENT, to
+external tool servers. Each configured server is either:
+
+- **stdio** — the app spawns the server (`npx`, `uvx`, or any executable) as a
+  child process and speaks newline-delimited JSON-RPC over stdin/stdout;
+- **HTTP** — Streamable-HTTP transport: JSON-RPC is POSTed to the server URL
+  (with optional headers such as an Authorization token), for remote servers or
+  local ones the sandbox cannot spawn.
+
+At connect time the app runs the `initialize` handshake and fetches
+`tools/list`. Each server tool then appears next to the built-ins — in the chat
+Tool sheet under "MCP Tools" and in every agent's tool list — under the
+namespaced name `mcp_<server>_<tool>` (e.g. `mcp_fs_read_file`). When the model
+calls one, the app forwards `tools/call` to the server and feeds the text
+result back into the conversation; server errors and timeouts come back as
+error results the model can react to. Sub-agents cannot be granted MCP tools.
+
+Configs persist across launches and can be imported/exported in the standard
+`{"mcpServers": …}` JSON shared with Claude Desktop, Cursor, and VS Code.
+Note for sandboxed (App Store) builds: stdio child processes inherit the app
+sandbox, so servers needing broad file or network access should run outside
+the app and be reached over HTTP. Dev builds (`swift run`, `make app`) are
+unsandboxed. Engine-side code lives in `Sources/DS4Engine/Tools/MCP/`
+(`MCPManager`, `MCPClient`, transports); the panel is
+`Sources/DwarfStar/Settings/MCPServersView.swift`.
+
 ### Sub-Agents
 
 `subagent_run` delegates a focused question to an isolated decoder context. The
@@ -370,6 +399,15 @@ or sessions with the same prefix can restore instead of redoing prefill. This is
 especially useful for stateless HTTP requests that resend the same conversation
 prefix.
 
+Checkpoints are moved between disk and the KV buffers in per-layer batches, in
+both directions, so a restore never materializes the whole file in RAM: each
+layer is read (F_NOCACHE), imported into the decoder, and freed before the next
+one is loaded — peak memory is one layer instead of ~3× the checkpoint size of
+the old load-everything path. Saving is symmetric: the background writer is the
+sole owner of the exported snapshot and drops each layer's buffers as soon as
+they are written, so RAM falls during the write instead of holding the full
+checkpoint until the end.
+
 ### Raw-KV Ring
 
 NSA sliding-window attention reads only the recent raw rows. `DS4_RAW_RING=1`
@@ -412,13 +450,50 @@ unbinds the listening socket; the shared chat engine stays alive.
 
 ### Distributed (`DistributedView` + `DS4Engine/Distributed/*`)
 
-Distributed mode splits layers across workers. The Worker tab starts a listener
-for one slice. Settings configures the coordinator peer list, activation bit
-width, prefill chunk size, and optional worker-to-worker forwarding. Chat renders
-the distributed conversation when the app mode is **Distributed**.
+Distributed mode splits layers across workers, and the COORDINATOR defines
+each worker's job: the Worker tab only starts an idle listener; at connect time
+the coordinator partitions the layers across the peer list (in order, last
+slice owns the output head) and sends each worker the GGUF, the context size,
+the expert-cache budget, and its slice. Each worker resolves the GGUF locally
+(the coordinator's exact path, else a same-named file next to its local GGUF
+from Settings), loads its engine, and replies ready. Settings configures the
+coordinator peer list, activation bit width, prefill chunk size, and optional
+worker-to-worker forwarding. Chat renders the distributed conversation when
+the app mode is **Distributed**.
 
 Distributed tool calls execute on the coordinator Mac, so project tools refer to
 the coordinator's active project.
+
+Robustness (protocol v2): the coordinator validates each worker's protocol
+version at connect; every chat turn or benchmark run carries a `session` id
+that workers echo in their results, so a reply left in a socket buffer by a
+stopped turn is discarded instead of corrupting the next one. Workers validate
+every WORK frame (payload size, layer bounds, position) before running it and
+serve one turn at a time — a competing coordinator receives an explicit error.
+Stop propagates to the cluster generation task and takes effect at the next
+chunk boundary. Frames are plaintext TCP with no authentication: run
+distributed mode only on trusted networks.
+
+File distribution (protocol v5): workers need no local files at all. After the
+version handshake the coordinator offers a manifest — name, size, and SHA-256
+of the GGUF and (when enabled) the expert-bundle sidecar and the Q4 requant
+cache (derived files travel instead of being rebuilt on every worker) — and each worker
+requests only what it is missing, verifying against its managed store
+(`Application Support/DwarfStar/dist-models`) and hash-matching local files.
+The transfer streams in 4 MB chunks with the hash accumulated inline, so the
+enormous setup happens once: subsequent connects verify cached manifests in
+milliseconds and send nothing. The sidecar on/off decision travels in the
+ASSIGN, like every other setting.
+
+KV continuity (protocol v4): turns no longer re-prefill the whole conversation
+every time. The coordinator reuses the in-memory prefix committed by the last
+clean turn when the re-rendered conversation extends it exactly; on a cold
+start (or when the coordinator's disk-KV setting is on) it negotiates a
+restore across all shards — each worker keeps slice-keyed disk checkpoints,
+saved after clean turns and restored only when EVERY shard holds the same
+prefix; any mismatch falls back to a cold prefill. The ASSIGN also carries the
+usage imatrix, so each worker pre-warms its expert slot-cache (and persists
+its own slice-refined profile between sessions).
 
 ### Benchmark
 
