@@ -267,6 +267,42 @@ public enum GGUFWeights {
         return true
     }
 
+    /// DS4_PREAD_SPLIT: pread CONCORRENTI per slab nel fill diretto (F_NOCACHE)
+    /// della slot-cache. I miss del decode sono pochi per layer (~2-3 × 3 slab
+    /// ⇒ coda NVMe ~6-9 richieste), ma il disco rende il suo tetto solo a ~24
+    /// richieste in volo (il probe DS4_DIAG "random parallelo"): spezzare ogni
+    /// slab in N range DISGIUNTI letti in parallelo alza la profondità di coda
+    /// a parità di byte. 1 (default) = una pread per slab, percorso storico.
+    static let preadSplit = max(1, min(8, ProcessInfo.processInfo.environment["DS4_PREAD_SPLIT"].flatMap(Int.init) ?? 1))
+
+    /// preadFull spezzata in `parts` range disgiunti letti CONCORRENTEMENTE
+    /// (stesso fd: pread ha l'offset esplicito, niente cursore condiviso).
+    /// Confini dei range allineati a 16 KB così il F_NOCACHE non rilegge la
+    /// stessa pagina da due job. Sotto i 64 KB (o parts=1) delega a preadFull.
+    static func preadFullSplit(_ fd: Int32, into dst: UnsafeMutableRawPointer,
+                               bytes: Int, offset: Int, parts: Int) -> Bool {
+        guard parts > 1, bytes > (64 << 10) else {
+            return preadFull(fd, into: dst, bytes: bytes, offset: offset)
+        }
+        let align = 16 << 10
+        let chunk = ((bytes + parts - 1) / parts + align - 1) / align * align
+        let n = (bytes + chunk - 1) / chunk
+        // nonisolated(unsafe): ogni iterazione scrive un range DISGIUNTO di
+        // dst; il flag d'errore e' protetto dal lock (stesso pattern di
+        // gatherExperts qui sotto).
+        nonisolated(unsafe) let dstBase = dst
+        let failed = NSLock()
+        nonisolated(unsafe) var anyFailure = false
+        DispatchQueue.concurrentPerform(iterations: n) { i in
+            let off = i * chunk
+            let len = min(chunk, bytes - off)
+            if !preadFull(fd, into: dstBase + off, bytes: len, offset: offset + off) {
+                failed.lock(); anyFailure = true; failed.unlock()
+            }
+        }
+        return !anyFailure
+    }
+
     /// Expert-cache: pack ONLY the `ids` selected experts of a Q4_K MoE tensor
     /// (ffn_*_exps, layout [inDim, outRows, nExpert]) from the mmap into a small
     /// K-expert buffer, so streaming loads ~K/256 of the expert weight per layer.
@@ -374,8 +410,9 @@ public enum GGUFWeights {
         }
         let dstPtr = dst.buffer.contents().advanced(by: dst.byteOffset + slot * stride)
         if let fd = uncachedFD {
-            guard preadFull(fd, into: dstPtr, bytes: expertBytes,
-                            offset: Int(t.absOffset) + Int(id) * expertBytes) else {
+            guard preadFullSplit(fd, into: dstPtr, bytes: expertBytes,
+                                 offset: Int(t.absOffset) + Int(id) * expertBytes,
+                                 parts: preadSplit) else {
                 throw LoadError.message("copyExpert: pread failed on \(name) expert \(id)")
             }
             return

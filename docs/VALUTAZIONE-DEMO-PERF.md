@@ -161,6 +161,8 @@ convertito con i tensori `nextn`/`mtp`.
 |---|---|---|---|---|---|
 | base (slots 16, stream, mlock) | **2110 ms/tok (0.47 tok/s)** | 1685 ms (80%), 617 MB/tok @ **0.38 GB/s = 7% del tetto** | 216 ms | 190 ms | 19 ms |
 | + `DENSE_Q4` + `SHARED_Q4` | **880 ms/tok (1.14 tok/s)** | 662 ms (75%), 636 MB/tok @ **1.01 GB/s = 18% del tetto** | 116 ms | 94 ms | 7 ms |
+| + `DS4_EXPERT_PREAD` | **455 ms/tok (2.20 tok/s)** | 225 ms (49%), 635 MB/tok @ **2.97 GB/s = 53% del tetto** | 126 ms | 96 ms | 8 ms |
+| + `EXPERT_BUNDLE` | *non testato*: build saltata per spazio disco (~72 GB richiesti, 46 liberi) — run ≈ identico al precedente (443 ms, 3.10 GB/s = 57%) | | | | |
 
 Cache esperti: 63–65% hit (94 miss/token ≈ 650 MB letti); concentrazione
 top-16 ~0.3–0.5 per layer, allocazione usage-driven attiva.
@@ -172,22 +174,33 @@ Lettura delle misure:
   (617 vs 636 MB/token) — è passato da 1685 a 662 ms/token. Il dense stream
   contendeva il disco al gather; toglierlo ha quasi triplicato la banda
   effettiva del gather. Conferma sperimentale della leva 4 (§6).
-- **Il collo ora è tutto nel gather: 75% del token a SOLO il 18% del tetto
-  SSD.** Non è la fisica del disco: sono i 3 pread sparsi da ~2 MB per miss
-  e il riempimento della page cache. I rimedi già pronti sono
-  `DS4_EXPERT_PREAD=1` (F_NOCACHE, niente churn di page cache) e
-  `DS4_EXPERT_BUNDLE=1` (slab contigui: 1 pread da ~7 MB per miss). Se la
-  banda del gather salisse a ~3 GB/s, il gather scenderebbe a ~210 ms/token
-  → totale ~430 ms/token ≈ **2.3 tok/s** senza toccare qualità né codice.
-- Il prefill su prompt corti resta dominato dal gather dell'unione
-  (~870 MB/token, non ammortizzabile su 13 token): va rimisurato con un
-  prompt @file da ~3k token prima di trarre conclusioni.
+- **`EXPERT_PREAD` vale un altro 1.9×** (1.14 → 2.20 tok/s): il miss non è
+  più un memcpy dal mmap a colpi di page fault da 16 KB, ma una pread
+  F_NOCACHE dell'intero slab. La banda del gather è salita da 1.01 a
+  2.97 GB/s, e il prefill da 1085 a 480 ms/token (il gather dell'unione era
+  la stessa patologia). La proiezione di §6 (~2.3 tok/s) è stata centrata.
+- Il profilo route/attn split (run separato, senza cache/Q4 — leggere i
+  rapporti): `q` 27% e `out` 24% dominano, flash-attn 9% ⇒ sono proprio i
+  tensori che `DENSE_Q4` rende residenti; sul percorso Q4 non c'è più molto
+  da spremere lì.
+- **Cumulato: 0.47 → 2.20 tok/s (4.7×) con soli knob.** Il gather resta il
+  49% del token a ~53-57% del tetto: coda NVMe ~6-9 richieste (2-3 miss ×
+  3 slab per layer) contro le ~24 a cui il disco rende il tetto.
 
 ## 8. Prossimo passo
 
-1. A/B `DS4_EXPERT_PREAD=1` (costo zero) e poi `+DS4_EXPERT_BUNDLE=1` (il
-   primo run costruisce il sidecar: decine di GB su disco, build una tantum)
-   sulla config Q4. Obiettivo: banda gather ≥ 50% del tetto.
-2. Se il gather si avvicina al tetto, le leve restanti sono hit-rate (slot,
-   RAM permettendo) e MTP — che con QUESTO GGUF non è possibile: serve una
-   conversione che preservi i pesi `nextn`/`mtp`.
+1. **`DS4_PREAD_SPLIT=2/3/4`** (nuovo knob, in questo branch): spezza ogni
+   slab del fill in N pread concorrenti — alza la coda a parità di byte.
+   A/B sulla config Q4+PREAD; obiettivo gather ≥ 75% del tetto (~-100
+   ms/token ⇒ ~2.8 tok/s).
+2. **`DS4_EXPERT_BUNDLE=1`** resta da testare davvero: servono ~72 GB
+   liberi (svuotare il Cestino — il log lo dice). Alternativa alla 1 con
+   letture contigue invece che più profonde.
+3. Hit-rate: A/B `DS4_EXPERT_CACHE_SLOTS=20` (≈ +1.2 GB wired — controllare
+   lo swap: se la macchina inizia a paginare, peggiora tutto).
+4. Prefill: ora `experts` è il 36-38% — vale l'A/B `DS4_PREFILL_MM=1` su un
+   prompt @file da ~3k token.
+5. Oltre il gather: a 2.2 tok/s route/attn+experts (compute) sono già il
+   49%. Il salto successivo resta il decode multi-token (MTP con un GGUF
+   convertito coi pesi `nextn`, o self-speculative con draft a
+   `ACTIVE_EXPERTS=2` e verifica batch stile prefill).
