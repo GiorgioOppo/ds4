@@ -19,6 +19,7 @@ public enum DSV4Shape {
     public static let nExpert = 256
     public static let nExpertUsed = 6        // k
     public static let nExpertShared = 1
+    public static let nHashLayer = 3         // layers routed by ffn_gate_tid2eid
     public static let nFFExp = 2048          // expert ffn dim
     public static let nHC = 4
     public static let nHCSinkhornIter = 20   // NOTE: 20, not 1

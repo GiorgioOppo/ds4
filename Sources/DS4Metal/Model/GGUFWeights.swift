@@ -83,6 +83,28 @@ public enum GGUFWeights {
             if dn.dims != dd {
                 throw LoadError.message("\(p): routed down dims \(dn.dims), expected \(dd)")
             }
+            // Hash routing table: REQUIRED on the first n_hash_layer layers
+            // (required_tensorf, ds4.c:4064), I32 [n_expert_used x n_vocab]
+            // (ds4.c:3637). Without it those layers would silently fall back
+            // to top-k routing — a numerics divergence, not a load error.
+            if il < DSV4Shape.nHashLayer {
+                guard let t = model.findTensor(p + "ffn_gate_tid2eid.weight") else {
+                    throw LoadError.missing("\(p)ffn_gate_tid2eid.weight (hash-routed layer)")
+                }
+                guard t.type == 26, t.dims == [UInt64(dims.k), UInt64(dims.vocab)] else {
+                    throw LoadError.message("\(p)ffn_gate_tid2eid.weight: type \(t.typeName) dims \(t.dims), "
+                                            + "expected i32 [\(dims.k), \(dims.vocab)]")
+                }
+            }
+            // Selection bias: optional, but when present it must be F32 [n_expert]
+            // (tensor_expect_optional, ds4.c:3625) — the finalize kernel reads
+            // exactly nExperts floats from it.
+            if let b = model.findTensor(p + "exp_probs_b.bias") {
+                guard b.type == 0, b.dims == [UInt64(dims.nExperts)] else {
+                    throw LoadError.message("\(p)exp_probs_b.bias: type \(b.typeName) dims \(b.dims), "
+                                            + "expected f32 [\(dims.nExperts)]")
+                }
+            }
         }
     }
 

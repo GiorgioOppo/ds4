@@ -61,7 +61,7 @@ final class GraphRouterTests: XCTestCase {
     /// experts_from_probs).
     func testRouterBiasAffectsSelectionOnly() throws {
         let rt = try makeRuntime()
-        // Flat probs + a bias that promotes experts 250..255 over everyone.
+        // Ramp probs (unbiased top-6 = 250..255) + a bias that promotes 0..5.
         let probs = [Float](repeating: 0.5, count: 256).enumerated().map { i, p in p + Float(i) * 1e-4 }
         var bias = [Float](repeating: 0, count: 256)
         for i in 0..<6 { bias[i] = 10 }   // push experts 0..5 to the top
