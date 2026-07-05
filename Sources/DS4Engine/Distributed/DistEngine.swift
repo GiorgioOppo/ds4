@@ -132,13 +132,16 @@ public final class DistEngine: @unchecked Sendable {
         try decoder.embed(token: token, pos: pos)
     }
 
-    public func forwardSlice(hc: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
-        try decoder.forwardSlice(hc: hc, pos: pos, nKeys: nKeys, start: start, end: end)
+    public func forwardSlice(hc: [Float], pos: Int, nKeys: Int, start: Int, end: Int,
+                             token: Int = -1) throws -> [Float] {
+        try decoder.forwardSlice(hc: hc, pos: pos, nKeys: nKeys, start: start, end: end, token: token)
     }
 
     /// Chunked prefill: run the slice over `hcs.count` consecutive tokens from `posBase`.
-    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
-        try decoder.forwardSliceBatch(hcs: hcs, posBase: posBase, start: start, end: end)
+    /// `tokens` (one id per state) feeds the hash-routed layers (0..2).
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int,
+                                  tokens: [Int]? = nil) throws -> [[Float]] {
+        try decoder.forwardSliceBatch(hcs: hcs, posBase: posBase, start: start, end: end, tokens: tokens)
     }
 
     public func head(hc: [Float]) throws -> [Float] {

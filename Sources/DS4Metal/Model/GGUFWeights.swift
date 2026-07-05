@@ -77,6 +77,7 @@ public enum GGUFWeights {
             compKv: try optT("attn_compressor_kv.weight"), compGate: try optT("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optT, small: optT)
+        try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
@@ -112,6 +113,28 @@ public enum GGUFWeights {
                 || q(p, "ffn_down_exps.weight") != cls.down { n += 1 }
         }
         return n
+    }
+
+    /// Hash routing table + router selection bias (ds4.c: ffn_gate_tid2eid is
+    /// REQUIRED on the first n_hash_layer layers, exp_probs_b.bias is optional
+    /// everywhere). Layout validated like layer_hash_selected_experts: I32,
+    /// 2 dims, dim[0] == 6 (experts per token). `mapped` puts the ~3 MB table
+    /// behind a no-copy mmap view; the tiny bias is always copied.
+    static func loadRouterExtras(_ w: inout LayerWeights, _ rt: MetalRuntime, _ model: GGUFModel,
+                                 _ il: Int, mapped: Bool) throws {
+        let p = "blk.\(il)."
+        if let t = model.findTensor(p + "ffn_gate_tid2eid.weight") {
+            guard t.type == 26, t.dims.count == 2, t.dims[0] == 6, t.dims[1] > 0 else {
+                throw LoadError.message("\(p)ffn_gate_tid2eid.weight has an unexpected layout "
+                                        + "(type \(t.typeName), dims \(t.dims))")
+            }
+            w.tid2eid = mapped ? try mappedTensor(rt, model, p + "ffn_gate_tid2eid.weight")
+                               : try tensor(rt, model, p + "ffn_gate_tid2eid.weight")
+            w.tid2eidRows = Int(t.dims[1])
+        }
+        if model.findTensor(p + "exp_probs_b.bias") != nil {
+            w.expBias = try tensor(rt, model, p + "exp_probs_b.bias")
+        }
     }
 
     /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
@@ -173,6 +196,7 @@ public enum GGUFWeights {
             compKv: try optM("attn_compressor_kv.weight"), compGate: try optM("attn_compressor_gate.weight"),
             compApe: try optT("attn_compressor_ape.weight"), compNorm: try optT("attn_compressor_norm.weight"))
         try loadIndexer(&w, model, il, big: optM, small: optT)
+        try loadRouterExtras(&w, rt, model, il, mapped: true)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }
@@ -204,6 +228,9 @@ public enum GGUFWeights {
         // Indexer: only the SMALL ape/norm are loaded here; the big projections
         // are streamed (DenseStreamer fills them when the layer has them).
         try loadIndexer(&w, model, il, big: { _ in nil }, small: optT)
+        // Hash table + bias stay RESIDENT (copied): the router needs them every
+        // token and the 3-layer table is ~9 MB total — not worth streaming.
+        try loadRouterExtras(&w, rt, model, il, mapped: false)
         setExpertQuant(&w, model, il)   // per-layer routed-expert quant (mixed-precision)
         return w
     }

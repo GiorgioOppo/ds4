@@ -273,7 +273,7 @@ public final class StreamingDecoder {
             let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
             if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
             try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys)
+                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
             swap(&cur, &other)
             // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
         }
@@ -301,7 +301,8 @@ public final class StreamingDecoder {
     /// Worker: run layers `start...end` over an incoming HC state at absolute `pos`,
     /// returning the produced HC state to forward to the next slice. Resets only this
     /// slice's recurrent compressor state on a fresh sequence (pos == 0).
-    public func forwardSlice(hc hcIn: [Float], pos: Int, nKeys: Int, start: Int, end: Int) throws -> [Float] {
+    public func forwardSlice(hc hcIn: [Float], pos: Int, nKeys: Int, start: Int, end: Int,
+                             token: Int = -1) throws -> [Float] {
         precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
         if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
         writeFloats(hcIn, into: hcA)
@@ -310,7 +311,7 @@ public final class StreamingDecoder {
             let w = try layerProvider(i)
             if i + 1 <= end { prefetch?(i + 1) }
             try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys)
+                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
             swap(&cur, &other)
         }
         profile.forwards += 1
@@ -321,12 +322,14 @@ public final class StreamingDecoder {
     /// tokens' HC states starting at absolute `posBase`. Token-outer (numerically
     /// identical to consecutive forwardSlice calls); amortizes the NETWORK round
     /// trip over the chunk — one WORK/RESULT per chunk instead of per token.
-    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int) throws -> [[Float]] {
+    public func forwardSliceBatch(hcs: [[Float]], posBase: Int, start: Int, end: Int,
+                                  tokens: [Int]? = nil) throws -> [[Float]] {
         var out: [[Float]] = []
         out.reserveCapacity(hcs.count)
         for (i, hc) in hcs.enumerated() {
             let pos = posBase + i
-            out.append(try forwardSlice(hc: hc, pos: pos, nKeys: pos + 1, start: start, end: end))
+            out.append(try forwardSlice(hc: hc, pos: pos, nKeys: pos + 1, start: start, end: end,
+                                        token: tokens.map { $0[i] } ?? -1))
         }
         return out
     }
@@ -451,7 +454,8 @@ public final class StreamingDecoder {
         let hcDim = d.nHC * d.nEmbd
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
-        try embedTokensBatch(Array(tokens[start..<end]), into: cur)
+        let chunkTokens = Array(tokens[start..<end])
+        try embedTokensBatch(chunkTokens, into: cur)
         let stage: PrefillStage? = (expertGather != nil && n > 1)
             ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
         for i in 0..<nLayers {
@@ -465,12 +469,13 @@ public final class StreamingDecoder {
                 let layerRope = DSV4Shape.ropeParams(layer: i)
                 if let gather = expertGather, n > 1, let stage {
                     try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
-                                           n: n, posBase: posBase + start, gather: gather, stage: stage)
+                                           n: n, posBase: posBase + start, tokens: chunkTokens,
+                                           gather: gather, stage: stage)
                 } else {
                     for j in 0..<n {
                         let pos = posBase + start + j     // attends KV[0..pos] (incl. earlier chunks/turns)
                         try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
-                                     pos: pos, nKeys: pos + 1)
+                                     pos: pos, nKeys: pos + 1, token: chunkTokens[j])
                     }
                 }
                 swap(&cur, &other)                       // w drops here -> EVICT
@@ -511,6 +516,7 @@ public final class StreamingDecoder {
     /// ≤ min(6·tokens, 256) expert reads per layer instead of 6·tokens.
     private func batchedExpertLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                                     cur: [GPUTensor], other: [GPUTensor], n: Int, posBase: Int,
+                                    tokens: [Int],
                                     gather: @escaping (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor),
                                     stage: PrefillStage) throws {
         // Phase A: routes. Attention is causal WITHIN the layer (token j attends
@@ -545,7 +551,8 @@ public final class StreamingDecoder {
                     try Task.checkCancellation()
                     let pos = posBase + j
                     let t = Date()
-                    try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1)
+                    try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1,
+                                    token: tokens[j])
                     profile.routeS += Date().timeIntervalSince(t)
                     let (ids, rw) = readRouteSelection(layer: i)
                     idsT.append(ids); rwT.append(rw)
@@ -569,7 +576,7 @@ public final class StreamingDecoder {
                 for jj in j..<jEnd {
                     let pos = posBase + jj
                     try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
-                                        pos: pos, nKeys: pos + 1)
+                                        pos: pos, nKeys: pos + 1, token: tokens[jj])
                     // Snapshot ids/weights into stage.ids/rw too: phase B reads
                     // them back and REWRITES both buffers (remapped + padded)
                     // strictly after this buffer completes — no aliasing.
@@ -872,11 +879,11 @@ public final class StreamingDecoder {
     /// KV[i][pos], updates compStates[i]. Shared by `forward` (decode) and the
     /// layer-major `prefill` — identical numerics either way.
     private func runLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
-                          cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int) throws {
+                          cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
         if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
             let K = ids.count
@@ -946,7 +953,7 @@ public final class StreamingDecoder {
             }
         } else {
             let t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys)
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
             let lc = GraphContext(rt); try lc.begin()
             try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
                                  downExp: w.expDown, ids: scratch.selected, outHc: other)
@@ -963,7 +970,7 @@ public final class StreamingDecoder {
     /// the C "dense top-k mask" path (indexer_allowed_decode_one). Otherwise a
     /// single command buffer, numerically identical to the pre-indexer code.
     private func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
-                             curHc: GPUTensor, pos: Int, nKeys: Int) throws {
+                             curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
         let idx = indexStates[i]
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxWeights && indexerActive(i, pos: pos)
@@ -980,7 +987,7 @@ public final class StreamingDecoder {
             applyIndexerMask(nKeys: nKeys, nComp: nComp, nIdxComp: idx.count)
             let c2 = GraphContext(rt); if profileRoute { c2.phaseTimes = [:] }; try c2.begin()
             try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
             try c2.phase("out")
             c2.commit()
@@ -996,7 +1003,7 @@ public final class StreamingDecoder {
                                              indexerScoring: false)
             try c.phase("kv")
             try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                  nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                  nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                                   nComp: nComp, comp: compStates[i])
             try c.phase("out")
             c.commit()
@@ -1009,7 +1016,7 @@ public final class StreamingDecoder {
                                               comp: compStates[i], idx: hasIdxWeights ? idx : nil,
                                               indexerScoring: false)
             try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                                   nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                   nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
             c1.commit()
         }
@@ -1045,14 +1052,14 @@ public final class StreamingDecoder {
     /// profiling is off (both need CPU work mid-route). Same two encodes, same
     /// order as the per-token non-indexer path in encodeRoute.
     private func encodeRouteInto(_ c: GraphContext, _ i: Int, w: LayerWeights, layerRope: RopeParams,
-                                 curHc: GPUTensor, pos: Int, nKeys: Int) throws {
+                                 curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
         let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
         let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                          rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
                                          comp: compStates[i], idx: hasIdxWeights ? indexStates[i] : nil,
                                          indexerScoring: false)
         try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
-                              nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                              nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                               nComp: nComp, comp: compStates[i])
     }
 

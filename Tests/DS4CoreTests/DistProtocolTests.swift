@@ -221,8 +221,10 @@ final class DistProtocolTests: XCTestCase {
         let hc: [Float] = (0..<96).map { Float($0) * 0.25 - 8 }
         let work = DistWork(session: 7, pos: 128, nTokens: 3, layerStart: 0, layerEnd: 20,
                             flags: [.outputLogits], hcBits: 32, route: route, routeIndex: 1,
-                            returnHost: "10.0.0.1", returnPort: 9099, hc: hc)
+                            returnHost: "10.0.0.1", returnPort: 9099, hc: hc,
+                            tokenIds: [11, 22, 33])
         let decoded = try XCTUnwrap(DistWork.decode(work.encoded()))
+        XCTAssertEqual(decoded.tokenIds, [11, 22, 33])
         XCTAssertEqual(decoded.session, 7)
         XCTAssertEqual(decoded.pos, 128)
         XCTAssertEqual(decoded.nTokens, 3)
@@ -252,6 +254,14 @@ final class DistProtocolTests: XCTestCase {
     }
 
     // MARK: Strictness (truncated payloads must be REJECTED, not shortened)
+
+    func testWorkTokenIdCountMismatchIsRejected() throws {
+        // v7: tokenIds must be absent (0) or exactly one per token.
+        let work = DistWork(session: 1, pos: 0, nTokens: 2, layerStart: 0, layerEnd: 1,
+                            flags: [], hcBits: 32, hc: (0..<64).map(Float.init),
+                            tokenIds: [5])
+        XCTAssertNil(DistWork.decode(work.encoded()))
+    }
 
     func testTruncatedWorkPayloadIsRejected() throws {
         let work = DistWork(session: 1, pos: 0, nTokens: 2, layerStart: 0, layerEnd: 1,

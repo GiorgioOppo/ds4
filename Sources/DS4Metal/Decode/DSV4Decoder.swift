@@ -62,7 +62,7 @@ public final class DSV4Decoder {
         var cur = hcA, other = hcB
         for i in 0..<layers.count {
             try ctx.decodeLayer(curHc: cur, w: layers[i], s: scratch, d: d, rope: DSV4Shape.ropeParams(layer: i),
-                                rawCache: rawCaches[i], nKeys: nKeys, pos: pos, outHc: other,
+                                rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token, outHc: other,
                                 rmsEps: rmsEps, hcEps: hcEps)
             swap(&cur, &other)
         }

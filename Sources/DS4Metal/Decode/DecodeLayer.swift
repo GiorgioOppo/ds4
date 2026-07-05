@@ -107,6 +107,14 @@ public struct LayerWeights {
     public var idxGate: GPUTensor?        // F16 indexer_compressor_gate [nEmbd x coff*128]
     public var idxApe: GPUTensor?         // F16 indexer_compressor_ape  [coff*128 x ratio]
     public var idxNorm: GPUTensor?        // F32 indexer_compressor_norm [128]
+    // Hash routing + selection bias (ds4.c layer_hash_selected_experts /
+    // layer_topk_selected_experts_from_probs). tid2eid is the REQUIRED token-id →
+    // expert table of the first n_hash_layer (3) layers: I32 [6 x n_vocab], row =
+    // token id. expBias (exp_probs_b.bias, F32 [nExperts]) shifts the probs for
+    // top-k SELECTION only — the route weights stay normalized on unbiased probs.
+    public var tid2eid: GPUTensor?        // I32 [6 x nVocab]
+    public var tid2eidRows = 0            // n_vocab (kernel clamps token to rows-1)
+    public var expBias: GPUTensor?        // F32 [nExperts]
     // Routed-expert quant PER LAYER. Mixed-precision GGUFs upcast some layers
     // (e.g. a few to Q4_K over an IQ2_XXS/Q2_K base via --tensor-type); the decode
     // kernels dispatch on THESE, not on the model-global DSV4Dims quant. Detected
@@ -207,10 +215,10 @@ extension GraphContext {
     /// Full decode layer (resident experts, one command buffer). `curHc`
     /// (nHC*nEmbd) in; result in `outHc`. rawCache holds nKeys latent rows.
     public func decodeLayer(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                             outHc: GPUTensor, rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         try decodeRoute(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
-                        nKeys: nKeys, pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp)
+                        nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps, comp: comp)
         try decodeExperts(w: w, s: s, d: d, gateExp: w.expGate, upExp: w.expUp, downExp: w.expDown,
                           ids: s.selected, outHc: outHc)
     }
@@ -222,13 +230,13 @@ extension GraphContext {
     /// and the expert-cache path (which commits here, reads s.selected, gathers
     /// the 6 experts, then runs decodeExperts).
     public func decodeRoute(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                            rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                             rmsEps: Float, hcEps: Float, comp: CompressorState? = nil) throws {
         let nComp = try decodeRoutePre(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache,
                                        pos: pos, rmsEps: rmsEps, hcEps: hcEps, comp: comp, idx: nil,
                                        indexerScoring: false)
         try decodeRouteAttn(curHc: curHc, w: w, s: s, d: d, rope: rope, rawCache: rawCache, nKeys: nKeys, pos: pos,
-                            rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
+                            token: token, rmsEps: rmsEps, hcEps: hcEps, nComp: nComp, comp: comp)
     }
 
     /// Phase 1a (pre-attention): HC-reduce, attention+indexer compressor updates,
@@ -317,7 +325,7 @@ extension GraphContext {
     /// carrying the indexer top-K selection) -> attn out (residual: curHc) ->
     /// pre-FFN HC -> router.
     public func decodeRouteAttn(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
-                                rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                                rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int, token: Int = -1,
                                 rmsEps: Float, hcEps: Float, nComp: Int, comp: CompressorState?) throws {
         // 4) attention over the raw SWA WINDOW + comp.cache[0..nComp] -> heads.
         //    Only the last nSWA raw rows are visible (C slides its raw cache at
@@ -375,7 +383,14 @@ extension GraphContext {
         }
         try unary(s.logits, op: .softplus, out: s.sp, width: d.nExperts)
         try unary(s.sp, op: .sqrt, out: s.probs, width: d.nExperts)
-        try routerFinalizeTop6(probs: s.probs, selected: s.selected)
+        // Selection: hash table on the first n_hash_layer layers (row = token id),
+        // biased top-6 elsewhere; weights ALWAYS normalize the unbiased probs of
+        // the selected experts (ds4.c layer_routed_moe_one + router kernel args).
+        if w.tid2eid != nil && token < 0 {
+            throw MetalError.unsupported("hash-routed layer dispatched without a token id")
+        }
+        try routerFinalizeTop6(probs: s.probs, selected: s.selected, bias: w.expBias,
+                               hashTable: w.tid2eid, hashRows: w.tid2eidRows, token: token)
         try routerWeights(probs: s.probs, selected: s.selected, weights: s.rw)
         encoder.popDebugGroup()                       // hc-router
     }

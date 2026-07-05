@@ -442,6 +442,7 @@ public final class DistCoordinator: @unchecked Sendable {
                 onLog(String(format: "diag: |embed| = %.2f (hc=%d float)\n", n, h0.count))
             }
             if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               tokens: Array(ids[start..<end]),
                                                wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
@@ -502,7 +503,7 @@ public final class DistCoordinator: @unchecked Sendable {
             if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
             let hc = try engine.embed(token: next, pos: pos)
             guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
-                                                  wantLogits: true) else {
+                                                  tokens: [next], wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
@@ -567,6 +568,7 @@ public final class DistCoordinator: @unchecked Sendable {
                 hcs.append(try engine.embed(token: id, pos: pos + k))
             }
             if let logits = try await runChunk(session: session, hcs: hcs, posBase: pos,
+                                               tokens: Array(ids[start..<end]),
                                                wantLogits: end == ids.count, turnStart: firstChunk) {
                 lastLogits = logits
             }
@@ -587,7 +589,7 @@ public final class DistCoordinator: @unchecked Sendable {
             let next = engine.sample(lastLogits, params: samp, rng: &rng)
             let hc = try engine.embed(token: next, pos: pos)
             guard let logits = try await runChunk(session: session, hcs: [hc], posBase: pos,
-                                                  wantLogits: true) else {
+                                                  tokens: [next], wantLogits: true) else {
                 throw DistError.badFrame
             }
             lastLogits = logits
@@ -606,7 +608,7 @@ public final class DistCoordinator: @unchecked Sendable {
     /// Results are matched on the `session` echo: anything from an older session
     /// (a turn abandoned mid-chunk) is discarded and the read repeats. ERROR
     /// frames from workers surface with the worker's own message.
-    private func runChunk(session: UInt32, hcs: [[Float]], posBase: Int,
+    private func runChunk(session: UInt32, hcs: [[Float]], posBase: Int, tokens: [Int],
                           wantLogits: Bool, turnStart: Bool = false) async throws -> [Float]? {
         var flags: Dist.WorkFlags = []
         if posBase == 0 { flags.insert(.resetSession) }
@@ -618,7 +620,7 @@ public final class DistCoordinator: @unchecked Sendable {
                                 layerStart: entries[0].layerStart, layerEnd: entries[0].layerEnd,
                                 flags: f, hcBits: config.activationBits, route: entries, routeIndex: 0,
                                 returnHost: config.returnHost, returnPort: config.returnPort,
-                                hc: hcs.flatMap { $0 })
+                                hc: hcs.flatMap { $0 }, tokenIds: tokens.map(Int32.init))
             try await conns[0].sendFrame(.work, work.encoded())
             while true {
                 guard let res = await returnIter?.next() else { throw DistError.closed }
@@ -634,7 +636,7 @@ public final class DistCoordinator: @unchecked Sendable {
             let work = DistWork(session: session, pos: posBase, nTokens: states.count,
                                 layerStart: e.layerStart, layerEnd: e.layerEnd,
                                 flags: f, hcBits: config.activationBits,
-                                hc: states.flatMap { $0 })
+                                hc: states.flatMap { $0 }, tokenIds: tokens.map(Int32.init))
             try await conns[i].sendFrame(.work, work.encoded())
             var res: DistResult
             while true {
