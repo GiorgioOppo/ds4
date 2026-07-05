@@ -6,6 +6,7 @@ public enum DistError: Error {
     case sliceGap(String), modelMismatch(String)
     case versionMismatch(String)     // mixed builds in the cluster
     case remote(String)              // an ERROR frame from a worker (its own words)
+    case unreachable(String)         // TCP never became ready (fail-fast diagnosis)
 }
 
 /// Async framed connection over NWConnection: every message is a `DistFrameHeader`
@@ -16,12 +17,77 @@ public final class DistConnection: @unchecked Sendable {
 
     public init(_ conn: NWConnection) { self.conn = conn }
 
-    /// Open an outbound connection to a worker and start it on `queue`.
-    public static func connect(host: String, port: UInt16, queue: DispatchQueue) throws -> DistConnection {
+    /// Open an outbound connection and WAIT until TCP is ready, failing fast
+    /// with a diagnosable error instead of letting the first read hang for the
+    /// OS timeout (~60–75 s of silence, then a cryptic POSIX 60). Intermediate
+    /// `.waiting` states (connection refused, no route, firewall silence) are
+    /// surfaced live through `onState`; cancelling the task cancels the attempt.
+    public static func connect(host: String, port: UInt16, queue: DispatchQueue,
+                               readyTimeout: TimeInterval = 15,
+                               onState: @escaping @Sendable (String) -> Void = { _ in })
+        async throws -> DistConnection {
         guard let p = NWEndpoint.Port(rawValue: port) else { throw DistError.badPort }
         let c = NWConnection(host: NWEndpoint.Host(host), port: p, using: .tcp)
         let dc = DistConnection(c)
-        c.start(queue: queue)
+
+        /// One-shot continuation guard + last `.waiting` reason. All mutations
+        /// happen in SYNC closures (connection queue / timeout queue).
+        final class Gate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            private var waiting = ""
+            func lastWaiting() -> String { lock.lock(); defer { lock.unlock() }; return waiting }
+            func noteWaiting(_ s: String) { lock.lock(); waiting = s; lock.unlock() }
+            func once(_ body: () -> Void) {
+                lock.lock(); defer { lock.unlock() }
+                guard !done else { return }
+                done = true
+                body()
+            }
+        }
+        let gate = Gate()
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                // Handler installed BEFORE start(): no state change can be missed.
+                c.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        c.stateUpdateHandler = nil
+                        gate.once { cont.resume() }
+                    case .failed(let error):
+                        gate.once { cont.resume(throwing: DistError.unreachable(
+                            "\(host):\(port) — \(error)")) }
+                    case .cancelled:
+                        gate.once { cont.resume(throwing: CancellationError()) }
+                    case .waiting(let error):
+                        // Not fatal yet (the OS keeps retrying) but it IS the
+                        // diagnosis: refused = port/worker down; timeout/silence
+                        // = firewall or Local-Network permission.
+                        gate.noteWaiting("\(error)")
+                        onState("connessione a \(host):\(port) in attesa: \(error)\n")
+                    default:
+                        break
+                    }
+                }
+                c.start(queue: queue)
+                queue.asyncAfter(deadline: .now() + readyTimeout) {
+                    gate.once {
+                        let waiting = gate.lastWaiting()
+                        cont.resume(throwing: DistError.unreachable(
+                            "\(host):\(port) non raggiungibile dopo \(Int(readyTimeout))s"
+                            + (waiting.isEmpty ? "" : " (ultimo stato: \(waiting))")
+                            + " — verifica: worker avviato e 'in ascolto'; firewall macOS sul Mac worker"
+                            + " (consenti le connessioni in entrata a DwarfStar); permesso 'Rete locale'"
+                            + " su entrambi i Mac (Impostazioni → Privacy e sicurezza → Rete locale);"
+                            + " IP e porta (test: nc -vz \(host) \(port))"))
+                        c.cancel()
+                    }
+                }
+            }
+        } onCancel: {
+            c.cancel()   // → .failed on the connection queue → continuation resumes
+        }
         return dc
     }
 

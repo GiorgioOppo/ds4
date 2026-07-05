@@ -111,7 +111,7 @@ public final class DistCoordinator: @unchecked Sendable {
     /// HELLO (version check) → ASSIGN (gguf + context + cache slots + slice) →
     /// READY (worker loaded its engine). Then validate contiguous coverage and
     /// (forwarding only) start the return listener.
-    public func connect(onLog: @Sendable (String) -> Void) async throws {
+    public func connect(onLog: @escaping @Sendable (String) -> Void) async throws {
         let slices = try Self.partition(nLayers: engine.nLayers, workers: config.peers.count)
         let modelName = (config.modelPath as NSString).lastPathComponent
         // Everything the workers need comes from HERE: build the file offer
@@ -119,7 +119,9 @@ public final class DistCoordinator: @unchecked Sendable {
         // computed once per machine and answered from the cache afterwards).
         let offer = try buildFileOffer(onLog: onLog)
         for (i, p) in config.peers.enumerated() {
-            let conn = try DistConnection.connect(host: p.host, port: p.port, queue: queue)
+            onLog("connessione a \(p.host):\(p.port)…\n")
+            let conn = try await DistConnection.connect(host: p.host, port: p.port,
+                                                        queue: queue, onState: onLog)
             let (type, payload) = try await conn.readFrame()
             if type == .error {
                 throw DistError.remote(String(decoding: payload, as: UTF8.self))

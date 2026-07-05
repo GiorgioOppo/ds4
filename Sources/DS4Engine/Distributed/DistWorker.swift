@@ -275,7 +275,8 @@ public final class DistWorker: @unchecked Sendable {
         func outbound(_ host: String, _ port: UInt16, expectHello: Bool) async throws -> DistConnection {
             let key = "\(host):\(port)"
             if let c = downstream[key] { return c }
-            let c = try DistConnection.connect(host: host, port: port, queue: queue)
+            let c = try await DistConnection.connect(host: host, port: port, queue: queue,
+                                                     readyTimeout: 10, onState: onLog)
             if expectHello { _ = try await c.readFrame() }
             downstream[key] = c
             return c
