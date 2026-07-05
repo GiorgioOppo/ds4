@@ -149,10 +149,45 @@ il pool interleaved ha già portato il miss a 1 pread da ~7 MB; il bundle
 sidecar copre il caso "gather < 60% del tetto"; l'output head residente +
 mlock ha già eliminato i 235 ms del compressore.
 
-## 7. Stato e prossimo passo
+## 7. Misure reali (2026-07-05, M1 Pro 16 GB, Flash IQ2XXS)
 
-Analisi statica aggiornata al 2026-07-05 (branch
-`claude/demo-performance-eval-jeooyp`). I numeri assoluti vanno riconfermati
-sul Mac con il runbook §5 — in particolare il rapporto gather/tetto SSD e
-l'effetto di `DS4_DENSE_Q4` sul totale — prima di investire sulla leva 1
-(MTP), che è l'unica con potenziale di salto oltre i ~2.5 tok/s.
+Runbook §5 eseguito su prompt da 13 token, 48 generati, regime = 44 token.
+Tetto SSD misurato: **5.25–5.69 GB/s** (random parallelo); command buffer
+vuoto **~21 µs** → la sincronizzazione vale ~3 ms/token (non è una leva).
+**Il GGUF in uso NON contiene pesi MTP** → la leva 1 (§6) richiede un file
+convertito con i tensori `nextn`/`mtp`.
+
+| Config | Decode regime | gather IO | route/attn | experts | head |
+|---|---|---|---|---|---|
+| base (slots 16, stream, mlock) | **2110 ms/tok (0.47 tok/s)** | 1685 ms (80%), 617 MB/tok @ **0.38 GB/s = 7% del tetto** | 216 ms | 190 ms | 19 ms |
+| + `DENSE_Q4` + `SHARED_Q4` | **880 ms/tok (1.14 tok/s)** | 662 ms (75%), 636 MB/tok @ **1.01 GB/s = 18% del tetto** | 116 ms | 94 ms | 7 ms |
+
+Cache esperti: 63–65% hit (94 miss/token ≈ 650 MB letti); concentrazione
+top-16 ~0.3–0.5 per layer, allocazione usage-driven attiva.
+
+Lettura delle misure:
+
+- **Q4 residente vale 2.4×** da solo (0.47 → 1.14 tok/s). Non solo per i
+  ~90+95 ms tolti a route/attn+experts: il gather — a byte QUASI IDENTICI
+  (617 vs 636 MB/token) — è passato da 1685 a 662 ms/token. Il dense stream
+  contendeva il disco al gather; toglierlo ha quasi triplicato la banda
+  effettiva del gather. Conferma sperimentale della leva 4 (§6).
+- **Il collo ora è tutto nel gather: 75% del token a SOLO il 18% del tetto
+  SSD.** Non è la fisica del disco: sono i 3 pread sparsi da ~2 MB per miss
+  e il riempimento della page cache. I rimedi già pronti sono
+  `DS4_EXPERT_PREAD=1` (F_NOCACHE, niente churn di page cache) e
+  `DS4_EXPERT_BUNDLE=1` (slab contigui: 1 pread da ~7 MB per miss). Se la
+  banda del gather salisse a ~3 GB/s, il gather scenderebbe a ~210 ms/token
+  → totale ~430 ms/token ≈ **2.3 tok/s** senza toccare qualità né codice.
+- Il prefill su prompt corti resta dominato dal gather dell'unione
+  (~870 MB/token, non ammortizzabile su 13 token): va rimisurato con un
+  prompt @file da ~3k token prima di trarre conclusioni.
+
+## 8. Prossimo passo
+
+1. A/B `DS4_EXPERT_PREAD=1` (costo zero) e poi `+DS4_EXPERT_BUNDLE=1` (il
+   primo run costruisce il sidecar: decine di GB su disco, build una tantum)
+   sulla config Q4. Obiettivo: banda gather ≥ 50% del tetto.
+2. Se il gather si avvicina al tetto, le leve restanti sono hit-rate (slot,
+   RAM permettendo) e MTP — che con QUESTO GGUF non è possibile: serve una
+   conversione che preservi i pesi `nextn`/`mtp`.
