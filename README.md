@@ -251,6 +251,13 @@ in place and `expert bundle in use` once misses are actually served from it.
 The file format is shared with the DwarfStar Swift port, so a bundle built by
 either implementation is reused by the other.
 
+Measured on an M1 Pro with 16 GiB of RAM (2-bit Flash imatrix GGUF, auto
+cache budget of 193 experts, `--ssd-streaming-cold`, page cache purged, 200
+greedy tokens): decode went from 3.06 to 3.34 tokens/s (+9%) with the sidecar
+serving every miss. That configuration is nearly all misses, so it isolates
+the per-miss read improvement; machines where decode is less I/O-bound will
+see a smaller end-to-end delta.
+
 ### Practical SSD streaming examples
 
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
