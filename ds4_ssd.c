@@ -2,11 +2,14 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -178,4 +181,452 @@ void ds4_ssd_memory_lock_release(ds4_ssd_memory_lock *lock) {
     munmap(lock->ptr, (size_t)lock->bytes);
     lock->ptr = NULL;
     lock->bytes = 0;
+}
+
+/* =========================================================================
+ * SSD streaming expert-bundle sidecar ("DSEB" version 1).
+ * =========================================================================
+ *
+ * See ds4_ssd.h for the format. The layout constants below must not change:
+ * they keep the file byte-compatible with the DwarfStar Swift port, so one
+ * bundle on disk serves both implementations.
+ */
+
+#define DS4_EXPERT_BUNDLE_MAGIC   0x42455344u   /* "DSEB" little-endian */
+#define DS4_EXPERT_BUNDLE_VERSION 1u
+#define DS4_EXPERT_BUNDLE_ALIGN   4096ull
+#define DS4_EXPERT_BUNDLE_SUFFIX  ".expbundle"
+
+static uint64_t expert_bundle_align_up(uint64_t v) {
+    return (v + DS4_EXPERT_BUNDLE_ALIGN - 1) /
+           DS4_EXPERT_BUNDLE_ALIGN * DS4_EXPERT_BUNDLE_ALIGN;
+}
+
+static uint64_t expert_bundle_header_bytes(uint32_t layer_count) {
+    return 56ull + (uint64_t)layer_count * 8ull;
+}
+
+static void expert_bundle_put_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void expert_bundle_put_u64(uint8_t *p, uint64_t v) {
+    expert_bundle_put_u32(p, (uint32_t)v);
+    expert_bundle_put_u32(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint32_t expert_bundle_get_u32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t expert_bundle_get_u64(const uint8_t *p) {
+    return (uint64_t)expert_bundle_get_u32(p) |
+           ((uint64_t)expert_bundle_get_u32(p + 4) << 32);
+}
+
+static bool expert_bundle_pread_full(int      fd,
+                                     void    *dst,
+                                     uint64_t bytes,
+                                     uint64_t offset) {
+    uint8_t *p = dst;
+    uint64_t pos = 0;
+    while (pos < bytes) {
+        ssize_t n;
+        do {
+            n = pread(fd, p + pos, (size_t)(bytes - pos), (off_t)(offset + pos));
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0) return false;
+        pos += (uint64_t)n;
+    }
+    return true;
+}
+
+static bool expert_bundle_write_full(int fd, const void *src, uint64_t bytes) {
+    const uint8_t *p = src;
+    uint64_t pos = 0;
+    while (pos < bytes) {
+        ssize_t n;
+        do {
+            n = write(fd, p + pos, (size_t)(bytes - pos));
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0) return false;
+        pos += (uint64_t)n;
+    }
+    return true;
+}
+
+/*
+ * FNV-1a over the first 4 KiB of a layer's gate-experts tensor in the model
+ * file: the bundle must match the MODEL BYTES, not just its size and shape.
+ */
+static bool expert_bundle_layer_hash(int       model_fd,
+                                     uint64_t  gate_offset,
+                                     uint64_t  gate_tensor_bytes,
+                                     uint64_t *hash_out) {
+    uint8_t buf[4096];
+    uint64_t n = gate_tensor_bytes < sizeof(buf) ? gate_tensor_bytes : sizeof(buf);
+    if (n == 0 ||
+        !expert_bundle_pread_full(model_fd, buf, n, gate_offset)) {
+        return false;
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < n; i++) {
+        h = (h ^ buf[i]) * 0x100000001b3ull;
+    }
+    *hash_out = h;
+    return true;
+}
+
+static void expert_bundle_disable(ds4_expert_bundle *b) {
+    memset(b, 0, sizeof(*b));
+    b->fd = -1;
+}
+
+uint64_t ds4_expert_bundle_record_offset(const ds4_expert_bundle *b,
+                                         uint32_t                 layer,
+                                         uint32_t                 expert) {
+    return b->data_base +
+           ((uint64_t)(layer - b->layer_lo) * b->n_expert + expert) * b->record;
+}
+
+/* Validate and open an existing bundle file. false = absent or mismatched. */
+static bool expert_bundle_open_existing(ds4_expert_bundle *b,
+                                        const char        *path,
+                                        uint64_t           model_size,
+                                        uint32_t           layer_lo,
+                                        uint32_t           layer_count,
+                                        uint32_t           n_expert,
+                                        uint64_t           gate_bytes,
+                                        uint64_t           up_bytes,
+                                        uint64_t           down_bytes,
+                                        const uint64_t    *hashes) {
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+#ifdef __APPLE__
+    (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+    const uint64_t hb = expert_bundle_header_bytes(layer_count);
+    uint8_t *head = malloc((size_t)hb);
+    if (!head || !expert_bundle_pread_full(fd, head, hb, 0)) {
+        free(head);
+        close(fd);
+        return false;
+    }
+    if (expert_bundle_get_u32(head) != DS4_EXPERT_BUNDLE_MAGIC ||
+        expert_bundle_get_u32(head + 4) != DS4_EXPERT_BUNDLE_VERSION ||
+        expert_bundle_get_u64(head + 8) != model_size ||
+        expert_bundle_get_u32(head + 16) != layer_lo ||
+        expert_bundle_get_u32(head + 20) != layer_count ||
+        expert_bundle_get_u32(head + 24) != n_expert ||
+        expert_bundle_get_u64(head + 32) != gate_bytes ||
+        expert_bundle_get_u64(head + 40) != up_bytes ||
+        expert_bundle_get_u64(head + 48) != down_bytes) {
+        free(head);
+        close(fd);
+        fprintf(stderr,
+                "ds4: expert bundle incompatible (header/model changed): %s\n",
+                path);
+        return false;
+    }
+    for (uint32_t i = 0; i < layer_count; i++) {
+        if (expert_bundle_get_u64(head + 56 + (uint64_t)i * 8) != hashes[i]) {
+            free(head);
+            close(fd);
+            fprintf(stderr,
+                    "ds4: expert bundle incompatible (layer %u changed): %s\n",
+                    layer_lo + i,
+                    path);
+            return false;
+        }
+    }
+    free(head);
+
+    const uint64_t record =
+        expert_bundle_align_up(gate_bytes + up_bytes + down_bytes);
+    const uint64_t data_base = expert_bundle_align_up(hb);
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        (uint64_t)st.st_size <
+            data_base + (uint64_t)layer_count * n_expert * record) {
+        close(fd);
+        fprintf(stderr, "ds4: expert bundle truncated: %s\n", path);
+        return false;
+    }
+
+    b->fd = fd;
+    b->layer_lo = layer_lo;
+    b->layer_count = layer_count;
+    b->n_expert = n_expert;
+    b->gate_bytes = gate_bytes;
+    b->up_bytes = up_bytes;
+    b->down_bytes = down_bytes;
+    b->data_base = data_base;
+    b->record = record;
+    snprintf(b->path, sizeof(b->path), "%s", path);
+    return true;
+}
+
+/*
+ * One-time build: stream every expert's three slabs from the GGUF into
+ * contiguous records (.tmp + rename, so torn files are impossible). Refuses
+ * when free disk space is short. Source reads are sequential WITHIN each
+ * tensor (expert e then e+1), so the build runs near sequential speed.
+ */
+static bool expert_bundle_build(const char                    *path,
+                                int                            model_fd,
+                                uint64_t                       model_size,
+                                uint32_t                       layer_lo,
+                                uint32_t                       layer_count,
+                                uint32_t                       n_expert,
+                                uint64_t                       gate_bytes,
+                                uint64_t                       up_bytes,
+                                uint64_t                       down_bytes,
+                                const ds4_expert_bundle_layer *layers,
+                                const uint64_t                *hashes) {
+    const uint64_t hb = expert_bundle_header_bytes(layer_count);
+    const uint64_t data_base = expert_bundle_align_up(hb);
+    const uint64_t record =
+        expert_bundle_align_up(gate_bytes + up_bytes + down_bytes);
+    const uint64_t n_records = (uint64_t)layer_count * n_expert;
+    if (record == 0 || n_records > UINT64_MAX / record ||
+        data_base > UINT64_MAX - n_records * record) {
+        return false;
+    }
+    const uint64_t total_bytes = data_base + n_records * record;
+
+    char dir[sizeof(((ds4_expert_bundle *)0)->path)];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+    struct statvfs vfs;
+    uint64_t free_bytes = 0;
+    if (statvfs(dir, &vfs) == 0) {
+        free_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    }
+    if (free_bytes <= total_bytes + DS4_GIB) {
+        fprintf(stderr,
+                "ds4: expert bundle needs ~%.1f GiB free but only %.1f GiB "
+                "are available in %s; skipping (the Trash counts!)\n",
+                (double)total_bytes / (double)DS4_GIB,
+                (double)free_bytes / (double)DS4_GIB,
+                dir);
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: expert bundle build (one-time): %u layers x %u experts, "
+            "~%.1f GiB -> %s\n",
+            layer_count,
+            n_expert,
+            (double)total_bytes / (double)DS4_GIB,
+            path);
+
+    char tmp[sizeof(((ds4_expert_bundle *)0)->path)];
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) {
+        return false;
+    }
+    const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: expert bundle write failed (%s): %s\n",
+                strerror(errno), tmp);
+        return false;
+    }
+
+    uint8_t *head = NULL;
+    uint8_t *rec = NULL;
+    head = calloc(1, (size_t)data_base);
+    if (!head) goto cleanup;
+    expert_bundle_put_u32(head, DS4_EXPERT_BUNDLE_MAGIC);
+    expert_bundle_put_u32(head + 4, DS4_EXPERT_BUNDLE_VERSION);
+    expert_bundle_put_u64(head + 8, model_size);
+    expert_bundle_put_u32(head + 16, layer_lo);
+    expert_bundle_put_u32(head + 20, layer_count);
+    expert_bundle_put_u32(head + 24, n_expert);
+    expert_bundle_put_u32(head + 28, 0);
+    expert_bundle_put_u64(head + 32, gate_bytes);
+    expert_bundle_put_u64(head + 40, up_bytes);
+    expert_bundle_put_u64(head + 48, down_bytes);
+    for (uint32_t i = 0; i < layer_count; i++) {
+        expert_bundle_put_u64(head + 56 + (uint64_t)i * 8, hashes[i]);
+    }
+    if (!expert_bundle_write_full(fd, head, data_base)) goto cleanup;
+
+    if (posix_memalign((void **)&rec,
+                       (size_t)DS4_EXPERT_BUNDLE_ALIGN,
+                       (size_t)record) != 0) {
+        rec = NULL;
+        goto cleanup;
+    }
+    memset(rec, 0, (size_t)record);   /* record padding stays zero */
+    for (uint32_t il = 0; il < layer_count; il++) {
+        const ds4_expert_bundle_layer *l = &layers[il];
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (!expert_bundle_pread_full(model_fd, rec,
+                                          gate_bytes,
+                                          l->gate_offset + (uint64_t)e * gate_bytes) ||
+                !expert_bundle_pread_full(model_fd, rec + gate_bytes,
+                                          up_bytes,
+                                          l->up_offset + (uint64_t)e * up_bytes) ||
+                !expert_bundle_pread_full(model_fd, rec + gate_bytes + up_bytes,
+                                          down_bytes,
+                                          l->down_offset + (uint64_t)e * down_bytes)) {
+                fprintf(stderr,
+                        "ds4: expert bundle source read failed "
+                        "(layer %u expert %u)\n",
+                        layer_lo + il, e);
+                goto cleanup;
+            }
+            if (!expert_bundle_write_full(fd, rec, record)) {
+                fprintf(stderr, "ds4: expert bundle write failed: %s\n",
+                        strerror(errno));
+                goto cleanup;
+            }
+        }
+        if ((il + 1) % 8 == 0 || il + 1 == layer_count) {
+            fprintf(stderr, "ds4: expert bundle build: layer %u/%u\n",
+                    il + 1, layer_count);
+        }
+    }
+    const bool synced = fsync(fd) == 0;
+    if (!synced || close(fd) != 0) {
+        fprintf(stderr, "ds4: expert bundle flush failed: %s\n",
+                strerror(errno));
+        if (!synced) close(fd);
+        free(head);
+        free(rec);
+        unlink(tmp);
+        return false;
+    }
+    free(head);
+    free(rec);
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "ds4: expert bundle rename failed (%s): %s\n",
+                strerror(errno), path);
+        unlink(tmp);
+        return false;
+    }
+    fprintf(stderr, "ds4: expert bundle written (~%.1f GiB): %s\n",
+            (double)total_bytes / (double)DS4_GIB, path);
+    return true;
+
+cleanup:
+    free(head);
+    free(rec);
+    close(fd);
+    unlink(tmp);
+    return false;
+}
+
+bool ds4_expert_bundle_open_or_build(ds4_expert_bundle             *b,
+                                     const char                    *model_path,
+                                     int                            model_fd,
+                                     uint64_t                       model_size,
+                                     uint32_t                       layer_lo,
+                                     uint32_t                       layer_count,
+                                     uint32_t                       n_expert,
+                                     uint64_t                       gate_bytes,
+                                     uint64_t                       up_bytes,
+                                     uint64_t                       down_bytes,
+                                     const ds4_expert_bundle_layer *layers) {
+    if (!b) return false;
+    expert_bundle_disable(b);
+    if (!model_path || model_fd < 0 || !layers ||
+        layer_count == 0 || n_expert == 0 ||
+        gate_bytes == 0 || up_bytes == 0 || down_bytes == 0 ||
+        gate_bytes > UINT64_MAX - up_bytes ||
+        gate_bytes + up_bytes > UINT64_MAX - down_bytes) {
+        return false;
+    }
+
+    uint64_t *hashes = malloc((size_t)layer_count * sizeof(*hashes));
+    if (!hashes) return false;
+    for (uint32_t i = 0; i < layer_count; i++) {
+        if (n_expert > UINT64_MAX / gate_bytes ||
+            !expert_bundle_layer_hash(model_fd,
+                                      layers[i].gate_offset,
+                                      (uint64_t)n_expert * gate_bytes,
+                                      &hashes[i])) {
+            fprintf(stderr,
+                    "ds4: expert bundle model fingerprint read failed "
+                    "(layer %u); skipping\n",
+                    layer_lo + i);
+            free(hashes);
+            return false;
+        }
+    }
+
+    /*
+     * Location: READING tries the sibling first (a bundle built next to the
+     * GGUF is always reused), then $DS4_BUNDLE_DIR. BUILDING goes to
+     * $DS4_BUNDLE_DIR whenever it is set, so a read-only model directory
+     * never blocks the sidecar.
+     */
+    char sibling[sizeof(b->path)];
+    char in_dir[sizeof(b->path)];
+    const char *candidates[2];
+    uint32_t n_candidates = 0;
+    const char *build_path = NULL;
+    if ((size_t)snprintf(sibling, sizeof(sibling), "%s%s",
+                         model_path, DS4_EXPERT_BUNDLE_SUFFIX) <
+        sizeof(sibling)) {
+        candidates[n_candidates++] = sibling;
+        build_path = sibling;
+    }
+    const char *env_dir = getenv("DS4_BUNDLE_DIR");
+    if (env_dir && env_dir[0]) {
+        (void)mkdir(env_dir, 0755);
+        const char *base = strrchr(model_path, '/');
+        base = base ? base + 1 : model_path;
+        if ((size_t)snprintf(in_dir, sizeof(in_dir), "%s/%s%s",
+                             env_dir, base, DS4_EXPERT_BUNDLE_SUFFIX) <
+            sizeof(in_dir)) {
+            candidates[n_candidates++] = in_dir;
+            build_path = in_dir;
+        }
+    }
+    if (n_candidates == 0 || !build_path) {
+        free(hashes);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_candidates; i++) {
+        if (expert_bundle_open_existing(b, candidates[i], model_size,
+                                        layer_lo, layer_count, n_expert,
+                                        gate_bytes, up_bytes, down_bytes,
+                                        hashes)) {
+            fprintf(stderr, "ds4: expert bundle loaded: %s\n", b->path);
+            free(hashes);
+            return true;
+        }
+    }
+
+    if (!expert_bundle_build(build_path, model_fd, model_size,
+                             layer_lo, layer_count, n_expert,
+                             gate_bytes, up_bytes, down_bytes,
+                             layers, hashes) ||
+        !expert_bundle_open_existing(b, build_path, model_size,
+                                     layer_lo, layer_count, n_expert,
+                                     gate_bytes, up_bytes, down_bytes,
+                                     hashes)) {
+        free(hashes);
+        expert_bundle_disable(b);
+        return false;
+    }
+    free(hashes);
+    return true;
+}
+
+void ds4_expert_bundle_close(ds4_expert_bundle *b) {
+    if (!b) return;
+    if (b->fd >= 0) close(b->fd);
+    expert_bundle_disable(b);
 }

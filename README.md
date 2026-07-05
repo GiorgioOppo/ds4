@@ -215,6 +215,40 @@ then uses the rest for routed experts. Leave the hot expert preload enabled for
 normal use; use `--ssd-streaming-cold` and `--ssd-streaming-preload-experts N`
 only for measurements.
 
+### Expert bundle sidecar
+
+In the GGUF an expert's gate, up, and down slabs live in three different
+tensors, so every cache miss is three reads scattered across the file. With
+`DS4_EXPERT_BUNDLE=1` the engine builds (once) and then reuses a sidecar file
+next to the model, `<gguf>.expbundle`, where each routed expert's three slabs
+are contiguous: a miss becomes one sequential burst. Same bytes, same
+numerics; only the on-disk layout changes.
+
+```sh
+DS4_EXPERT_BUNDLE=1 ./ds4 -m ./ds4flash.gguf --ssd-streaming
+```
+
+Things to know before enabling it:
+
+* The first run copies the whole expert region of the model, which takes a
+  few minutes and duplicates it on disk (tens of GB for the Flash GGUFs).
+  The build is skipped when free space is short, and any validation failure
+  falls back silently to plain GGUF reads.
+* Set `DS4_BUNDLE_DIR=/path/dir` to build and look up bundles in a separate
+  directory (useful when the model directory is read-only). A valid sidecar
+  next to the GGUF is always preferred for reading.
+* The sidecar is fingerprinted against the model bytes and rebuilt
+  automatically when the GGUF changes. Mixed-precision (boosted) models are
+  not bundled: their off-class layers bypass the expert cache anyway.
+* Metal only for now; CUDA and ROCm builds ignore the variable. Distributed
+  workers that load different layer slices of the same GGUF each want their
+  own `DS4_BUNDLE_DIR`, since the bundle covers the loaded layer range.
+
+The startup log prints `expert bundle loaded`/`written` when the sidecar is
+in place and `expert bundle in use` once misses are actually served from it.
+The file format is shared with the DwarfStar Swift port, so a bundle built by
+either implementation is reused by the other.
+
 ### Practical SSD streaming examples
 
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:

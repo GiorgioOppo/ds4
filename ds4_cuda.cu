@@ -3243,6 +3243,41 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             0);
 }
 
+/* The expert-bundle sidecar is Metal-only for now: the CUDA streaming path
+ * reads experts through its own staging/O_DIRECT machinery. Callers probe
+ * _supported() before building the sidecar, so returning 0 keeps the plain
+ * GGUF read path. */
+extern "C" int ds4_gpu_streaming_expert_bundle_supported(void) {
+    return 0;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_bundle(
+        int             fd,
+        uint32_t        layer_lo,
+        uint32_t        layer_count,
+        uint32_t        n_expert,
+        uint64_t        gate_expert_bytes,
+        uint64_t        up_expert_bytes,
+        uint64_t        down_expert_bytes,
+        uint64_t        data_base,
+        uint64_t        record_stride,
+        const uint64_t *gate_offsets,
+        const uint64_t *up_offsets,
+        const uint64_t *down_offsets) {
+    (void)fd;
+    (void)layer_lo;
+    (void)layer_count;
+    (void)n_expert;
+    (void)gate_expert_bytes;
+    (void)up_expert_bytes;
+    (void)down_expert_bytes;
+    (void)data_base;
+    (void)record_stride;
+    (void)gate_offsets;
+    (void)up_offsets;
+    (void)down_offsets;
+}
+
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *expert_ids,
