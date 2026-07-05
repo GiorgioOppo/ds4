@@ -32,7 +32,10 @@ public enum Dist {
     /// (hash-verified against its managed store and its local files) and the
     /// coordinator streams only those — the huge setup runs ONCE; later
     /// connects verify hashes from cached manifests in milliseconds.
-    public static let protocolVersion: UInt32 = 5
+    /// v6: derived caches travel too — the offer can include the Q4 dense
+    /// requant cache (<gguf>.q4dense, ~1.4 GB beats minutes of re-requant on
+    /// every worker) and ASSIGN carries the Q4 on/off decision.
+    public static let protocolVersion: UInt32 = 6
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
@@ -173,6 +176,7 @@ public struct DistAssign: Sendable {
     public var expertCacheSlots: Int  // 0 = no expert slot-cache on the worker
     public var diskKVBudgetTokens: Int // 0 = no disk-KV checkpoints on the worker
     public var useExpertBundle: Bool   // worker runs with the expert-bundle sidecar
+    public var useDenseQ4: Bool        // worker uses the Q4 dense requant (cache offered)
     public var layerStart: Int
     public var layerEnd: Int          // inclusive
     public var hasOutput: Bool        // last slice: also runs the output head
@@ -181,13 +185,14 @@ public struct DistAssign: Sendable {
     public var usageJSON: Data
 
     public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
-                diskKVBudgetTokens: Int, useExpertBundle: Bool = false,
+                diskKVBudgetTokens: Int, useExpertBundle: Bool = false, useDenseQ4: Bool = false,
                 layerStart: Int, layerEnd: Int, hasOutput: Bool,
                 usageJSON: Data = Data()) {
         self.modelPath = modelPath; self.modelName = modelName
         self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
         self.diskKVBudgetTokens = diskKVBudgetTokens
         self.useExpertBundle = useExpertBundle
+        self.useDenseQ4 = useDenseQ4
         self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
         self.usageJSON = usageJSON
     }
@@ -198,6 +203,7 @@ public struct DistAssign: Sendable {
         d.appendLE(UInt32(expertCacheSlots))
         d.appendLE(UInt32(diskKVBudgetTokens))
         d.appendLE(UInt32(useExpertBundle ? 1 : 0))
+        d.appendLE(UInt32(useDenseQ4 ? 1 : 0))
         d.appendLE(UInt32(layerStart)); d.appendLE(UInt32(layerEnd))
         d.appendLE(UInt32(hasOutput ? 1 : 0))
         let path = Data(modelPath.utf8)
@@ -210,11 +216,12 @@ public struct DistAssign: Sendable {
 
     public static func decode(_ d: Data) -> DistAssign? {
         var o = d.startIndex
-        guard d.count >= 40 else { return nil }
+        guard d.count >= 44 else { return nil }
         let ctx = Int(d.readLE(&o) as UInt32)
         let slots = Int(d.readLE(&o) as UInt32)
         let kvBudget = Int(d.readLE(&o) as UInt32)
         let bundle = (d.readLE(&o) as UInt32) != 0
+        let q4 = (d.readLE(&o) as UInt32) != 0
         let ls = Int(d.readLE(&o) as UInt32), le = Int(d.readLE(&o) as UInt32)
         let ho = (d.readLE(&o) as UInt32) != 0
         let pathLen = Int(d.readLE(&o) as UInt32)
@@ -228,7 +235,7 @@ public struct DistAssign: Sendable {
         let usage = Data(d[o..<o+usageLen])
         return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
                           expertCacheSlots: slots, diskKVBudgetTokens: kvBudget,
-                          useExpertBundle: bundle,
+                          useExpertBundle: bundle, useDenseQ4: q4,
                           layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage)
     }
 }
@@ -240,7 +247,7 @@ public struct DistAssign: Sendable {
 /// size, and full SHA-256 — the identity later connects verify instead of
 /// re-transferring.
 public struct DistFileEntry: Sendable, Equatable {
-    public enum Kind: UInt32, Sendable { case gguf = 0, expertBundle = 1 }
+    public enum Kind: UInt32, Sendable { case gguf = 0, expertBundle = 1, q4Dense = 2 }
     public var kind: Kind
     public var name: String
     public var size: UInt64

@@ -15,9 +15,11 @@ head) and sends each worker an ASSIGN with the gguf, the context size, the
 expert-cache budget, and the slice to own. The worker loads — or reuses — its
 engine and replies READY.
 
-The coordinator also DISTRIBUTES the files (protocol v5): workers need no
+The coordinator also DISTRIBUTES the files (protocol v5/v6): workers need no
 local gguf. After HELLO the coordinator sends a FILE OFFER (name, size,
-SHA-256 for the gguf and, when enabled, the expert-bundle sidecar); the worker
+SHA-256 for the gguf and, when enabled, the expert-bundle sidecar and the Q4
+dense requant cache — derived, deterministic files: ~1.4 GB on the wire beats
+minutes of re-requant on every worker); the worker
 answers with what it is missing — checking its managed store
 (`Application Support/DwarfStar/dist-models`, manifest hashes recorded at
 reception) and hash-matching local files — and only the missing files are
@@ -25,7 +27,9 @@ streamed (sequential 4 MB chunks, F_NOCACHE on both ends, hash accumulated
 inline and verified at DONE). The huge setup runs ONCE: later connects answer
 the offer from cached manifests in milliseconds. Hashing a coordinator-side
 gguf is also one-time (persistent size+mtime-validated hash cache). ASSIGN
-carries `useExpertBundle`, so the sidecar decision is the coordinator's too.
+carries `useExpertBundle` and `useDenseQ4`, so the sidecar and requant
+decisions are the coordinator's too (the worker points DS4_BUNDLE_DIR /
+DS4_Q4_CACHE_DIR at the transferred files before loading its engine).
 
 KV continuity (protocol v4) removes the per-turn full re-prefill:
 

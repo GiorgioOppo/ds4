@@ -35,11 +35,14 @@ public final class DistCoordinator: @unchecked Sendable {
         /// Workers should use the expert-bundle sidecar (the coordinator's
         /// bundle is offered for transfer when it exists on disk).
         public var useExpertBundle: Bool
+        /// Workers should use the Q4 dense requant; the coordinator's cache
+        /// file is offered so no worker pays the minutes-long requant again.
+        public var useDenseQ4: Bool
         public init(modelPath: String, contextSize: Int, peers: [Peer], activationBits: Int,
                     prefillChunk: Int = 32, forward: Bool = false,
                     returnHost: String = "", returnPort: UInt16 = 9099,
                     workerCacheSlots: Int = 0, diskKVBudgetTokens: Int = 0,
-                    useExpertBundle: Bool = false) {
+                    useExpertBundle: Bool = false, useDenseQ4: Bool = false) {
             self.modelPath = modelPath; self.contextSize = contextSize
             self.peers = peers; self.activationBits = activationBits
             self.prefillChunk = max(1, prefillChunk); self.forward = forward
@@ -47,6 +50,7 @@ public final class DistCoordinator: @unchecked Sendable {
             self.workerCacheSlots = max(0, workerCacheSlots)
             self.diskKVBudgetTokens = max(0, diskKVBudgetTokens)
             self.useExpertBundle = useExpertBundle
+            self.useDenseQ4 = useDenseQ4
         }
     }
 
@@ -161,6 +165,7 @@ public final class DistCoordinator: @unchecked Sendable {
                                     expertCacheSlots: config.workerCacheSlots,
                                     diskKVBudgetTokens: config.diskKVBudgetTokens,
                                     useExpertBundle: config.useExpertBundle,
+                                    useDenseQ4: config.useDenseQ4,
                                     layerStart: ls, layerEnd: le, hasOutput: hasOutput,
                                     usageJSON: usage)
             onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize)\n")
@@ -241,17 +246,21 @@ public final class DistCoordinator: @unchecked Sendable {
             throw DistError.sliceGap("cannot read/hash the gguf at \(config.modelPath)")
         }
         var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha)]
-        if config.useExpertBundle {
-            var candidates = [config.modelPath + ".expbundle"]
-            if let dir = ProcessInfo.processInfo.environment["DS4_BUNDLE_DIR"], !dir.isEmpty {
-                candidates.append(dir + "/" + ggufName + ".expbundle")
-            }
-            if let bundle = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }),
-               let (bSize, _) = DistFileHash.stat(bundle),
-               let bSha = DistFileHash.cachedOrCompute(path: bundle, onLog: onLog) {
-                entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
-                                             size: bSize, sha256: bSha))
-            }
+        if config.useExpertBundle,
+           let bundle = findLocalPath(kind: .expertBundle),
+           let (bSize, _) = DistFileHash.stat(bundle),
+           let bSha = DistFileHash.cachedOrCompute(path: bundle, onLog: onLog) {
+            entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
+                                         size: bSize, sha256: bSha))
+        }
+        // The Q4 requant cache is derived and deterministic: ~1.4 GB on the
+        // wire beats minutes of re-requant on every worker.
+        if config.useDenseQ4,
+           let q4 = findLocalPath(kind: .q4Dense),
+           let (qSize, _) = DistFileHash.stat(q4),
+           let qSha = DistFileHash.cachedOrCompute(path: q4, onLog: onLog) {
+            entries.append(DistFileEntry(kind: .q4Dense, name: ggufName + ".q4dense",
+                                         size: qSize, sha256: qSha))
         }
         return entries
     }
@@ -261,8 +270,9 @@ public final class DistCoordinator: @unchecked Sendable {
     /// then DONE, then the worker's hash-verified ack.
     private func sendFile(_ entry: DistFileEntry, index: Int, to conn: DistConnection,
                           peer: Peer, onLog: @Sendable (String) -> Void) async throws {
-        let path = entry.kind == .gguf ? config.modelPath
-            : (findLocalPath(for: entry) ?? config.modelPath + ".expbundle")
+        guard let path = entry.kind == .gguf ? config.modelPath : findLocalPath(kind: entry.kind) else {
+            throw DistError.sliceGap("offered file \(entry.name) no longer found locally")
+        }
         onLog("file: invio \(entry.name) (\(entry.size / 1_048_576) MB) a \(peer.host):\(peer.port)…\n")
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw DistError.sliceGap("cannot open \(path)") }
@@ -294,10 +304,19 @@ public final class DistCoordinator: @unchecked Sendable {
         onLog(String(format: "file: %@ trasferito in %.0fs\n", entry.name, Date().timeIntervalSince(t0)))
     }
 
-    private func findLocalPath(for entry: DistFileEntry) -> String? {
-        var candidates = [config.modelPath + ".expbundle"]
-        if let dir = ProcessInfo.processInfo.environment["DS4_BUNDLE_DIR"], !dir.isEmpty {
-            candidates.append(dir + "/" + (config.modelPath as NSString).lastPathComponent + ".expbundle")
+    /// Where a derived file lives on the coordinator: next to the gguf, else
+    /// in the app-owned cache directory (same lookup order as the engine).
+    private func findLocalPath(kind: DistFileEntry.Kind) -> String? {
+        let name = (config.modelPath as NSString).lastPathComponent
+        let (ext, dirEnv): (String, String)
+        switch kind {
+        case .expertBundle: (ext, dirEnv) = (".expbundle", "DS4_BUNDLE_DIR")
+        case .q4Dense:      (ext, dirEnv) = (".q4dense", "DS4_Q4_CACHE_DIR")
+        case .gguf:         return config.modelPath
+        }
+        var candidates = [config.modelPath + ext]
+        if let dir = ProcessInfo.processInfo.environment[dirEnv], !dir.isEmpty {
+            candidates.append(dir + "/" + name + ext)
         }
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }

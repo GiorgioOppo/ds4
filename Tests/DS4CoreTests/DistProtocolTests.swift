@@ -35,6 +35,7 @@ final class DistProtocolTests: XCTestCase {
         let assign = DistAssign(modelPath: "/Models/ds4-flash.gguf", modelName: "ds4-flash.gguf",
                                 contextSize: 8192, expertCacheSlots: 16,
                                 diskKVBudgetTokens: 1_000_000, useExpertBundle: true,
+                                useDenseQ4: true,
                                 layerStart: 22, layerEnd: 42, hasOutput: true,
                                 usageJSON: usage)
         let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
@@ -44,6 +45,7 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.expertCacheSlots, 16)
         XCTAssertEqual(decoded.diskKVBudgetTokens, 1_000_000)
         XCTAssertTrue(decoded.useExpertBundle)
+        XCTAssertTrue(decoded.useDenseQ4)
         XCTAssertEqual(decoded.layerStart, 22)
         XCTAssertEqual(decoded.layerEnd, 42)
         XCTAssertTrue(decoded.hasOutput)
@@ -54,7 +56,8 @@ final class DistProtocolTests: XCTestCase {
                               layerStart: 0, layerEnd: 42, hasOutput: true)
         XCTAssertEqual(try XCTUnwrap(DistAssign.decode(bare.encoded())).usageJSON, Data())
         XCTAssertFalse(try XCTUnwrap(DistAssign.decode(bare.encoded())).useExpertBundle)
-        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(38)))
+        XCTAssertFalse(try XCTUnwrap(DistAssign.decode(bare.encoded())).useDenseQ4)
+        XCTAssertNil(DistAssign.decode(assign.encoded().prefix(42)))
         XCTAssertNil(DistAssign.decode(assign.encoded().dropLast(4)))   // usage blob truncated
     }
 
@@ -66,14 +69,17 @@ final class DistProtocolTests: XCTestCase {
             DistFileEntry(kind: .gguf, name: "model.gguf", size: 123_456_789_012, sha256: sha),
             DistFileEntry(kind: .expertBundle, name: "model.gguf.expbundle",
                           size: 42, sha256: Data(repeating: 0xAB, count: 32)),
+            DistFileEntry(kind: .q4Dense, name: "model.gguf.q4dense",
+                          size: 1_400_000_000, sha256: Data(repeating: 0xCD, count: 32)),
         ])
         let decoded = try XCTUnwrap(DistFileOffer.decode(offer.encoded()))
-        XCTAssertEqual(decoded.entries.count, 2)
+        XCTAssertEqual(decoded.entries.count, 3)
         XCTAssertEqual(decoded.entries[0].kind, .gguf)
         XCTAssertEqual(decoded.entries[0].name, "model.gguf")
         XCTAssertEqual(decoded.entries[0].size, 123_456_789_012)   // > 4 GB: u64 on the wire
         XCTAssertEqual(decoded.entries[0].sha256, sha)
         XCTAssertEqual(decoded.entries[1].kind, .expertBundle)
+        XCTAssertEqual(decoded.entries[2].kind, .q4Dense)
         XCTAssertNil(DistFileOffer.decode(offer.encoded().dropLast(1)))
 
         let need = try XCTUnwrap(DistFileNeed.decode(DistFileNeed(indices: [1]).encoded()))

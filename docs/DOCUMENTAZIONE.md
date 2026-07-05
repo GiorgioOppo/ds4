@@ -476,7 +476,8 @@ distributed mode only on trusted networks.
 
 File distribution (protocol v5): workers need no local files at all. After the
 version handshake the coordinator offers a manifest — name, size, and SHA-256
-of the GGUF and (when enabled) the expert-bundle sidecar — and each worker
+of the GGUF and (when enabled) the expert-bundle sidecar and the Q4 requant
+cache (derived files travel instead of being rebuilt on every worker) — and each worker
 requests only what it is missing, verifying against its managed store
 (`Application Support/DwarfStar/dist-models`) and hash-matching local files.
 The transfer streams in 4 MB chunks with the hash accumulated inline, so the

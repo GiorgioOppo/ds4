@@ -35,6 +35,7 @@ public final class DistWorker: @unchecked Sendable {
         var contextSize: Int
         var expertCacheSlots: Int
         var useExpertBundle: Bool
+        var useDenseQ4: Bool
         var layerStart: Int
         var layerEnd: Int
         var hasOutput: Bool
@@ -482,17 +483,26 @@ public final class DistWorker: @unchecked Sendable {
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
         }
-        // Sidecar/bundle: coordinator-decided. The env is read at ENGINE LOAD;
-        // pointing DS4_BUNDLE_DIR at the transferred bundle's directory covers
-        // the case where the gguf resolved elsewhere (sibling rule would miss).
+        // Sidecar/derived caches: coordinator-decided. The env is read at
+        // ENGINE LOAD; pointing the cache-dir vars at the transferred files'
+        // directory covers the case where the gguf resolved elsewhere (the
+        // sibling rule would miss them).
         _ = setenv("DS4_EXPERT_BUNDLE", assign.useExpertBundle ? "1" : "0", 1)
         if assign.useExpertBundle,
            let bundlePath = resolvedFiles[sanitizedName + ".expbundle"] {
             _ = setenv("DS4_BUNDLE_DIR", (bundlePath as NSString).deletingLastPathComponent, 1)
         }
+        _ = setenv("DS4_DENSE_Q4", assign.useDenseQ4 ? "1" : "0", 1)
+        if assign.useDenseQ4,
+           let q4Path = resolvedFiles[sanitizedName + ".q4dense"] {
+            // The coordinator's requant cache: loaded in ~0.5 s instead of
+            // re-requantizing for minutes on this worker.
+            _ = setenv("DS4_Q4_CACHE_DIR", (q4Path as NSString).deletingLastPathComponent, 1)
+        }
         let wanted = Assignment(resolvedModelPath: resolved, contextSize: assign.contextSize,
                                 expertCacheSlots: assign.expertCacheSlots,
                                 useExpertBundle: assign.useExpertBundle,
+                                useDenseQ4: assign.useDenseQ4,
                                 layerStart: assign.layerStart, layerEnd: assign.layerEnd,
                                 hasOutput: assign.hasOutput)
 
