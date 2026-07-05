@@ -624,7 +624,7 @@ public actor InferenceService {
                 let out = ToolRegistry.execute(c)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
                 note("\(c.name) \(c.argumentsJSON) → " + excerpt(out.content))
-                results += "<tool_result>" + out.content + "</tool_result>"
+                results += "<tool_result>" + ChatRenderer.escapeToolResult(out.content) + "</tool_result>"
             }
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
@@ -762,7 +762,7 @@ public actor InferenceService {
     public func provideToolResults(_ outputs: [ToolOutput], thinkMode: DS4ThinkMode,
                                    sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         var suffix = openingPrefix() + "<｜User｜>"
-        for o in outputs { suffix += "<tool_result>" + o.content + "</tool_result>" }
+        for o in outputs { suffix += "<tool_result>" + ChatRenderer.escapeToolResult(o.content) + "</tool_result>" }
         suffix += assistantOpen(thinkMode)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }

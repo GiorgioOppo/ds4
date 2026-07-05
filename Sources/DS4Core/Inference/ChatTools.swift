@@ -180,7 +180,7 @@ public enum ChatRenderer {
                 pendingAssistant = true; pendingToolResult = false
             case .toolResult(_, _, let content):
                 if !pendingToolResult { out += userTag }
-                out += "<tool_result>" + content + "</tool_result>"
+                out += "<tool_result>" + escapeToolResult(content) + "</tool_result>"
                 pendingAssistant = true; pendingToolResult = true
             case .assistant(let text, let calls):
                 if pendingAssistant {
@@ -197,6 +197,15 @@ public enum ChatRenderer {
             out += assistantTag + (think.enabled ? thinkOpen : thinkClose)
         }
         return out
+    }
+
+    /// Tool output is plain data inside <tool_result>…</tool_result>. Preserve
+    /// literal '<', '>' and '&' (shell output and file snippets stay intact) but
+    /// escape the exact closing sentinel, so a malicious or accidental payload
+    /// cannot terminate the wrapper early and inject control tokens into the
+    /// prompt (C: bpe_tokenize_tool_result_text, ds4.c:22388).
+    public static func escapeToolResult(_ content: String) -> String {
+        content.replacingOccurrences(of: "</tool_result>", with: "&lt;/tool_result>")
     }
 
     /// Render assistant-emitted tool calls into the DSML block (for history).
