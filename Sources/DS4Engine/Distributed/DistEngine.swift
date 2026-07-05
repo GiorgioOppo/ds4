@@ -43,9 +43,17 @@ public final class DistEngine: @unchecked Sendable {
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         onLoadLog?("tokenizer…")
         self.tok = try Tokenizer(model: model)
+        // Same load-time validation as InferenceService: metadata like the C
+        // config_validate_model, Flash-only runtime, closed expert-quant set.
+        let config = try ModelConfig(model: model)
+        guard config.shape.variant == .flash else {
+            throw ModelConfigError.unsupportedShape(
+                "\(config.shape.name): il runtime supporta solo il profilo Flash")
+        }
         var dims = DSV4Shape.dims
         let mq = GGUFWeights.detectMoEQuant(model)
         dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
+        try GGUFWeights.validateRoutedExperts(model, dims: dims, nLayers: DSV4Shape.nLayer)
         self.contextSize = contextSize
         self.nLayers = DSV4Shape.nLayer
         self.modelName = (modelPath as NSString).lastPathComponent

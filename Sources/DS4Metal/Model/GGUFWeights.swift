@@ -52,6 +52,40 @@ public enum GGUFWeights {
         return (q("ffn_gate_exps.weight"), q("ffn_up_exps.weight"), q("ffn_down_exps.weight"), routerF16)
     }
 
+    /// Bind-time validation of the routed expert tensors, port of the C checks
+    /// the loader enforces before ever dispatching a kernel (ds4.c:3227-3231,
+    /// 3626-3631): the quant type must be one of the closed set the kernels
+    /// implement (iq2_xxs / q2_K / q4_K — exactly `MoEQuant.from`), gate and up
+    /// must share a type, and the declared dims must match the shape. Without
+    /// this an unknown type silently fell back to the q4_K kernel: garbage
+    /// logits instead of a load error.
+    public static func validateRoutedExperts(_ model: GGUFModel, dims: DSV4Dims, nLayers: Int) throws {
+        for il in 0..<nLayers {
+            let p = "blk.\(il)."
+            guard let g = model.findTensor(p + "ffn_gate_exps.weight") else { continue }   // dense layer
+            guard let u = model.findTensor(p + "ffn_up_exps.weight"),
+                  let dn = model.findTensor(p + "ffn_down_exps.weight") else {
+                throw LoadError.missing("\(p)ffn_up_exps/ffn_down_exps.weight")
+            }
+            for t in [g, u, dn] where MoEQuant.from(ggufType: t.type) == nil {
+                throw LoadError.message("\(p): expected a routed expert quant type "
+                                        + "(iq2_xxs/q2_K/q4_K), got \(t.typeName)")
+            }
+            if g.type != u.type {
+                throw LoadError.message("\(p): ffn_gate_exps and ffn_up_exps quant types differ "
+                                        + "(\(g.typeName) vs \(u.typeName))")
+            }
+            let gu: [UInt64] = [UInt64(dims.nEmbd), UInt64(dims.expertFfn), UInt64(dims.nExperts)]
+            let dd: [UInt64] = [UInt64(dims.expertFfn), UInt64(dims.nEmbd), UInt64(dims.nExperts)]
+            if g.dims != gu || u.dims != gu {
+                throw LoadError.message("\(p): routed gate/up dims \(g.dims)/\(u.dims), expected \(gu)")
+            }
+            if dn.dims != dd {
+                throw LoadError.message("\(p): routed down dims \(dn.dims), expected \(dd)")
+            }
+        }
+    }
+
     public static func layer(_ rt: MetalRuntime, _ model: GGUFModel, _ il: Int, loadExperts: Bool = true) throws -> LayerWeights {
         let p = "blk.\(il)."
         func T(_ s: String) throws -> GPUTensor { try tensor(rt, model, p + s) }
