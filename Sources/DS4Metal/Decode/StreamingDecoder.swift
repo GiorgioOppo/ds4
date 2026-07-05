@@ -1035,15 +1035,35 @@ public final class StreamingDecoder {
         if let pt = b?.phaseTimes { add(pt) }
     }
 
+    /// Decode sparse threshold: the C Metal decode keeps attention DENSE over all
+    /// compressed rows until n_comp exceeds this, because around the ~2K frontier
+    /// the sparse path's score/top-k setup dominates the smaller attention scan
+    /// (metal_graph_decode_indexer_sparse_threshold, default 1024). It changes
+    /// only WHICH implementation consumes the compressed rows — the 512-row
+    /// indexer selection (indexerTopK) is a separate, lower bound. Same env
+    /// override and allowed values as the C.
+    static let indexerSparseThreshold: Int = {
+        let allowed: Set<Int> = [64, 128, 256, 512, 1024, 2048, 4096]
+        if let s = ProcessInfo.processInfo.environment["DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD"],
+           let v = Int(s.trimmingCharacters(in: .whitespaces)), allowed.contains(v) {
+            return v
+        }
+        return 1024
+    }()
+
     /// Will the indexer restrict this token's compressed rows on layer `i`?
     /// (prospective count: the compressor may emit one more row for this token.)
     /// `extraRows` = rows the tokens BEFORE this one in a not-yet-encoded batch
     /// will emit — the batched route phase checks activation prospectively for
     /// the whole run before encoding any of it.
+    /// C condition (ds4.c:15246): layer_n_comp > sparse_threshold AND
+    /// layer_n_index_comp > DS4_N_INDEXER_TOP_K. On ratio-4 layers the attention
+    /// and indexer compressors emit in lockstep, so one prospective count serves
+    /// both comparisons.
     private func indexerActive(_ i: Int, pos: Int, extraRows: Int = 0) -> Bool {
         guard let idx = indexStates[i] else { return false }
         let prospective = idx.count + extraRows + (((pos + 1) % idx.ratio) == 0 ? 1 : 0)
-        return prospective > d.indexerTopK
+        return prospective > Self.indexerSparseThreshold && prospective > d.indexerTopK
     }
 
     /// Encode ONE token's full route (pre + attention) into `c` WITHOUT
