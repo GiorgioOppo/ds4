@@ -25590,9 +25590,6 @@ static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
     uint64_t up_bytes = 0;
     uint64_t down_bytes = 0;
     ds4_expert_bundle_layer *layers = xmalloc(routed * sizeof(*layers));
-    uint64_t *gate_offs = xmalloc(routed * sizeof(*gate_offs));
-    uint64_t *up_offs = xmalloc(routed * sizeof(*up_offs));
-    uint64_t *down_offs = xmalloc(routed * sizeof(*down_offs));
     bool ok = true;
     for (uint32_t il = lo; il <= hi; il++) {
         const ds4_layer_weights *l = &e->weights.layer[il];
@@ -25630,9 +25627,6 @@ static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
         layers[il - lo].gate_offset = l->ffn_gate_exps->abs_offset;
         layers[il - lo].up_offset = l->ffn_up_exps->abs_offset;
         layers[il - lo].down_offset = l->ffn_down_exps->abs_offset;
-        gate_offs[il - lo] = l->ffn_gate_exps->abs_offset;
-        up_offs[il - lo] = l->ffn_up_exps->abs_offset;
-        down_offs[il - lo] = l->ffn_down_exps->abs_offset;
     }
     if (ok && gate_bytes != up_bytes) {
         /* The streaming expert cache assumes gate and up share one slab
@@ -25648,19 +25642,17 @@ static void ds4_engine_setup_streaming_expert_bundle(ds4_engine *e,
                                         lo, routed, DS4_N_EXPERT,
                                         gate_bytes, up_bytes, down_bytes,
                                         layers)) {
-        ds4_gpu_set_streaming_expert_bundle(e->expert_bundle.fd,
-                                            lo, routed, DS4_N_EXPERT,
-                                            gate_bytes, up_bytes, down_bytes,
-                                            e->expert_bundle.data_base,
-                                            e->expert_bundle.record,
-                                            gate_offs, up_offs, down_offs);
-        fprintf(stderr, "ds4: expert bundle active: %s\n",
-                e->expert_bundle.path);
+        if (ds4_gpu_set_streaming_expert_bundle(&e->expert_bundle, layers)) {
+            fprintf(stderr, "ds4: expert bundle active: %s\n",
+                    e->expert_bundle.path);
+        } else {
+            fprintf(stderr,
+                    "ds4: expert bundle rejected by the GPU backend; "
+                    "using plain GGUF reads\n");
+            ds4_expert_bundle_close(&e->expert_bundle);
+        }
     }
     free(layers);
-    free(gate_offs);
-    free(up_offs);
-    free(down_offs);
 }
 #endif
 

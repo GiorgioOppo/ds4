@@ -451,25 +451,18 @@ static uint32_t g_stream_expert_cache_free_slots[DS4_METAL_STREAM_EXPERT_CACHE_M
 static uint32_t g_stream_expert_cache_free_slot_count;
 static uint8_t g_stream_expert_cache_slab_slot_locked[DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES];
 static uint64_t g_stream_expert_cache_slab_slot_bytes;
-/* SSD streaming expert-bundle sidecar state (DS4_EXPERT_BUNDLE=1); the
- * geometry is set once at engine open before any pread worker runs, so only
- * the served counter is touched concurrently. See the remap helpers next to
- * the expert pread pool. */
-static int g_stream_expert_bundle_fd = -1;
-static uint32_t g_stream_expert_bundle_layer_count;
-static uint32_t g_stream_expert_bundle_n_expert;
-static uint64_t g_stream_expert_bundle_gate_bytes;
-static uint64_t g_stream_expert_bundle_up_bytes;
-static uint64_t g_stream_expert_bundle_down_bytes;
-static uint64_t g_stream_expert_bundle_data_base;
-static uint64_t g_stream_expert_bundle_record;
-static uint64_t
-    g_stream_expert_bundle_gate_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static uint64_t
-    g_stream_expert_bundle_up_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static uint64_t
-    g_stream_expert_bundle_down_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* SSD streaming expert-bundle sidecar state (DS4_EXPERT_BUNDLE=1): the
+ * validated geometry from ds4_expert_bundle_open_or_build plus the bundled
+ * layers' model-file tensor offsets. Set once at engine open before any
+ * pread worker runs, so only the served/fallback counters are touched
+ * concurrently. See the remap helpers next to the expert pread pool. */
+static ds4_expert_bundle g_stream_expert_bundle = { .fd = -1 };
+static ds4_expert_bundle_layer
+    g_stream_expert_bundle_layers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_bundle_served;
+static int g_stream_expert_bundle_fallback_warned;
+static int ds4_gpu_stream_expert_bundle_remap(uint64_t offset, uint64_t len,
+                                              uint64_t *bundle_offset);
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -6711,7 +6704,7 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_stream_expert_pread_pool_shutdown();
         /* The sidecar fd is owned by the engine (ds4_expert_bundle_close);
          * the backend only borrows it, so drop the reference here. */
-        g_stream_expert_bundle_fd = -1;
+        g_stream_expert_bundle.fd = -1;
         ds4_gpu_stream_expert_cache_clear_all(1);
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
@@ -7681,12 +7674,23 @@ static int ds4_gpu_stream_expert_readahead_enabled(void) {
 }
 
 static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len) {
-    if (!ds4_gpu_stream_expert_readahead_enabled() || g_model_fd < 0 || len == 0) {
+    if (!ds4_gpu_stream_expert_readahead_enabled() || len == 0) {
         return;
     }
+    /* Hint the file the following pread will actually touch: expert-slab
+     * ranges served by the bundle sidecar are advised on the bundle fd at
+     * the remapped offset, everything else on the model fd. */
+    int fd = g_model_fd;
+    uint64_t start = offset;
+    uint64_t bundle_offset = 0;
+    if (ds4_gpu_stream_expert_bundle_remap(offset, len, &bundle_offset)) {
+        fd = g_stream_expert_bundle.fd;
+        start = bundle_offset;
+    }
+    if (fd < 0) return;
 
 #if defined(F_RDADVISE)
-    uint64_t pos = offset;
+    uint64_t pos = start;
     uint64_t rem = len;
     while (rem > 0) {
         const uint64_t chunk64 =
@@ -7696,13 +7700,13 @@ static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len)
         struct radvisory ra;
         ra.ra_offset = (off_t)pos;
         ra.ra_count = (int)chunk64;
-        (void)fcntl(g_model_fd, F_RDADVISE, &ra);
+        (void)fcntl(fd, F_RDADVISE, &ra);
 
         pos += chunk64;
         rem -= chunk64;
     }
 #else
-    (void)offset;
+    (void)start;
     (void)len;
 #endif
 }
@@ -7728,56 +7732,39 @@ int ds4_gpu_streaming_expert_bundle_supported(void) {
     return 1;
 }
 
-void ds4_gpu_set_streaming_expert_bundle(
-        int             fd,
-        uint32_t        layer_lo,
-        uint32_t        layer_count,
-        uint32_t        n_expert,
-        uint64_t        gate_expert_bytes,
-        uint64_t        up_expert_bytes,
-        uint64_t        down_expert_bytes,
-        uint64_t        data_base,
-        uint64_t        record_stride,
-        const uint64_t *gate_offsets,
-        const uint64_t *up_offsets,
-        const uint64_t *down_offsets) {
-    (void)layer_lo;   /* records are indexed by position within the arrays */
-    g_stream_expert_bundle_fd = -1;
+int ds4_gpu_set_streaming_expert_bundle(
+        const ds4_expert_bundle       *bundle,
+        const ds4_expert_bundle_layer *layers) {
+    g_stream_expert_bundle.fd = -1;
     g_stream_expert_bundle_served = 0;
-    if (fd < 0) return;
-    if (layer_count == 0 ||
-        layer_count > DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
-        n_expert == 0 ||
-        gate_expert_bytes == 0 ||
-        up_expert_bytes == 0 ||
-        down_expert_bytes == 0 ||
-        gate_expert_bytes > UINT64_MAX / n_expert ||
-        up_expert_bytes > UINT64_MAX / n_expert ||
-        down_expert_bytes > UINT64_MAX / n_expert ||
-        gate_expert_bytes > UINT64_MAX - up_expert_bytes ||
-        gate_expert_bytes + up_expert_bytes >
-            UINT64_MAX - down_expert_bytes ||
-        record_stride <
-            gate_expert_bytes + up_expert_bytes + down_expert_bytes ||
-        !gate_offsets || !up_offsets || !down_offsets) {
+    g_stream_expert_bundle_fallback_warned = 0;
+    if (!bundle || bundle->fd < 0 || !layers) return 0;
+    if (bundle->layer_count == 0 ||
+        bundle->layer_count > DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        bundle->n_expert == 0 ||
+        bundle->gate_bytes == 0 ||
+        bundle->up_bytes == 0 ||
+        bundle->down_bytes == 0 ||
+        bundle->gate_bytes > UINT64_MAX / bundle->n_expert ||
+        bundle->up_bytes > UINT64_MAX / bundle->n_expert ||
+        bundle->down_bytes > UINT64_MAX / bundle->n_expert ||
+        bundle->gate_bytes > UINT64_MAX - bundle->up_bytes ||
+        bundle->gate_bytes + bundle->up_bytes >
+            UINT64_MAX - bundle->down_bytes ||
+        bundle->record <
+            bundle->gate_bytes + bundle->up_bytes + bundle->down_bytes) {
         fprintf(stderr,
                 "ds4: Metal streaming expert bundle rejected (invalid geometry)\n");
-        return;
+        return 0;
     }
-    memcpy(g_stream_expert_bundle_gate_offsets, gate_offsets,
-           (size_t)layer_count * sizeof(gate_offsets[0]));
-    memcpy(g_stream_expert_bundle_up_offsets, up_offsets,
-           (size_t)layer_count * sizeof(up_offsets[0]));
-    memcpy(g_stream_expert_bundle_down_offsets, down_offsets,
-           (size_t)layer_count * sizeof(down_offsets[0]));
-    g_stream_expert_bundle_layer_count = layer_count;
-    g_stream_expert_bundle_n_expert = n_expert;
-    g_stream_expert_bundle_gate_bytes = gate_expert_bytes;
-    g_stream_expert_bundle_up_bytes = up_expert_bytes;
-    g_stream_expert_bundle_down_bytes = down_expert_bytes;
-    g_stream_expert_bundle_data_base = data_base;
-    g_stream_expert_bundle_record = record_stride;
-    g_stream_expert_bundle_fd = fd;
+    memcpy(g_stream_expert_bundle_layers, layers,
+           (size_t)bundle->layer_count * sizeof(layers[0]));
+    /* Publish the fd last so a worker can never observe half-set geometry. */
+    ds4_expert_bundle staged = *bundle;
+    staged.fd = -1;
+    g_stream_expert_bundle = staged;
+    g_stream_expert_bundle.fd = bundle->fd;
+    return 1;
 }
 
 static int ds4_gpu_stream_expert_bundle_slab_expert(
@@ -7788,7 +7775,7 @@ static int ds4_gpu_stream_expert_bundle_slab_expert(
         uint64_t *expert_out) {
     if (len != slab_bytes || offset < tensor_offset) return 0;
     const uint64_t rel = offset - tensor_offset;
-    if (rel >= slab_bytes * g_stream_expert_bundle_n_expert ||
+    if (rel >= slab_bytes * g_stream_expert_bundle.n_expert ||
         rel % slab_bytes != 0) {
         return 0;
     }
@@ -7800,34 +7787,29 @@ static int ds4_gpu_stream_expert_bundle_remap(
         uint64_t  offset,
         uint64_t  len,
         uint64_t *bundle_offset) {
-    if (g_stream_expert_bundle_fd < 0) return 0;
-    for (uint32_t l = 0; l < g_stream_expert_bundle_layer_count; l++) {
-        uint64_t expert = 0;
-        uint64_t slab_base;
-        if (ds4_gpu_stream_expert_bundle_slab_expert(
-                offset, len,
-                g_stream_expert_bundle_gate_offsets[l],
-                g_stream_expert_bundle_gate_bytes, &expert)) {
-            slab_base = 0;
-        } else if (ds4_gpu_stream_expert_bundle_slab_expert(
-                offset, len,
-                g_stream_expert_bundle_up_offsets[l],
-                g_stream_expert_bundle_up_bytes, &expert)) {
-            slab_base = g_stream_expert_bundle_gate_bytes;
-        } else if (ds4_gpu_stream_expert_bundle_slab_expert(
-                offset, len,
-                g_stream_expert_bundle_down_offsets[l],
-                g_stream_expert_bundle_down_bytes, &expert)) {
-            slab_base = g_stream_expert_bundle_gate_bytes +
-                        g_stream_expert_bundle_up_bytes;
-        } else {
-            continue;
+    const ds4_expert_bundle *b = &g_stream_expert_bundle;
+    if (b->fd < 0) return 0;
+    for (uint32_t l = 0; l < b->layer_count; l++) {
+        const ds4_expert_bundle_layer *lay = &g_stream_expert_bundle_layers[l];
+        const uint64_t slab_offsets[3] =
+            { lay->gate_offset, lay->up_offset, lay->down_offset };
+        const uint64_t slab_bytes[3] =
+            { b->gate_bytes, b->up_bytes, b->down_bytes };
+        uint64_t slab_base = 0;
+        for (uint32_t s = 0; s < 3; s++) {
+            uint64_t expert = 0;
+            if (ds4_gpu_stream_expert_bundle_slab_expert(offset, len,
+                                                         slab_offsets[s],
+                                                         slab_bytes[s],
+                                                         &expert)) {
+                *bundle_offset =
+                    ds4_expert_bundle_record_offset(b, b->layer_lo + l,
+                                                    (uint32_t)expert) +
+                    slab_base;
+                return 1;
+            }
+            slab_base += slab_bytes[s];
         }
-        *bundle_offset = g_stream_expert_bundle_data_base +
-                         ((uint64_t)l * g_stream_expert_bundle_n_expert +
-                          expert) * g_stream_expert_bundle_record +
-                         slab_base;
-        return 1;
     }
     return 0;
 }
@@ -7939,7 +7921,8 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
-static int ds4_gpu_stream_expert_pread_into(
+static int ds4_gpu_stream_expert_pread_fd(
+        int       fd,
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
@@ -7947,16 +7930,11 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    uint64_t src_offset = offset;
-    const int from_bundle =
-        ds4_gpu_stream_expert_bundle_remap(offset, len, &src_offset);
-    const int fd = from_bundle ? g_stream_expert_bundle_fd : g_model_fd;
-    if (!from_bundle) src_offset = offset;
     if (fd < 0 ||
         !dst ||
         len == 0 ||
-        src_offset > (uint64_t)LLONG_MAX ||
-        len > (uint64_t)LLONG_MAX - src_offset) {
+        offset > (uint64_t)LLONG_MAX ||
+        len > (uint64_t)LLONG_MAX - offset) {
         return 0;
     }
 
@@ -7968,7 +7946,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(fd, dst + pos, want, (off_t)(src_offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
@@ -7979,17 +7957,45 @@ static int ds4_gpu_stream_expert_pread_into(
     const double dt = ds4_gpu_now_ms() - t0;
     if (read_bytes) *read_bytes = pos;
     if (ms_out) *ms_out = dt;
-    if (!ok || pos != len) {
-        fprintf(stderr,
-                "ds4: Metal streaming expert explicit pread%s failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
-                from_bundle ? " (bundle)" : "",
-                ds4_gpu_gib(src_offset),
-                ds4_gpu_mib(len),
-                ds4_gpu_mib(pos));
-        return 0;
+    return ok && pos == len;
+}
+
+static int ds4_gpu_stream_expert_pread_into(
+        uint64_t  offset,
+        uint64_t  len,
+        uint8_t  *dst,
+        uint64_t *read_bytes,
+        double   *ms_out) {
+    uint64_t bundle_offset = 0;
+    if (ds4_gpu_stream_expert_bundle_remap(offset, len, &bundle_offset)) {
+        if (ds4_gpu_stream_expert_pread_fd(g_stream_expert_bundle.fd,
+                                           bundle_offset, len, dst,
+                                           read_bytes, ms_out)) {
+            ds4_gpu_stream_expert_bundle_note_served();
+            return 1;
+        }
+        /* The sidecar must never break inference: retry the same slab from
+         * the always-available model file. Log the first fallback only --
+         * a truncated/unplugged bundle would otherwise flood the log. */
+        if (!__atomic_exchange_n(&g_stream_expert_bundle_fallback_warned, 1,
+                                 __ATOMIC_RELAXED)) {
+            fprintf(stderr,
+                    "ds4: expert bundle read failed (offset=%.2f GiB in %s); "
+                    "falling back to model-file reads for failing slabs\n",
+                    ds4_gpu_gib(bundle_offset),
+                    g_stream_expert_bundle.path);
+        }
     }
-    if (from_bundle) ds4_gpu_stream_expert_bundle_note_served();
-    return 1;
+    if (ds4_gpu_stream_expert_pread_fd(g_model_fd, offset, len, dst,
+                                       read_bytes, ms_out)) {
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
+            ds4_gpu_gib(offset),
+            ds4_gpu_mib(len),
+            ds4_gpu_mib(read_bytes ? *read_bytes : 0));
+    return 0;
 }
 
 static void *ds4_gpu_stream_expert_pread_worker(void *arg) {

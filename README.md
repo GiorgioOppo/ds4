@@ -236,7 +236,9 @@ Things to know before enabling it:
   falls back silently to plain GGUF reads.
 * Set `DS4_BUNDLE_DIR=/path/dir` to build and look up bundles in a separate
   directory (useful when the model directory is read-only). A valid sidecar
-  next to the GGUF is always preferred for reading.
+  next to the GGUF is always preferred for reading. Bundles in the directory
+  are keyed by the model file name, so use distinct directories for
+  different models that share a name.
 * The sidecar is fingerprinted against the model bytes and rebuilt
   automatically when the GGUF changes. Mixed-precision (boosted) models are
   not bundled: their off-class layers bypass the expert cache anyway.

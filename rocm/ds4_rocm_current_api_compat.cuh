@@ -341,31 +341,12 @@ extern "C" int ds4_gpu_streaming_expert_bundle_supported(void) {
     return 0;
 }
 
-extern "C" void ds4_gpu_set_streaming_expert_bundle(
-        int             fd,
-        uint32_t        layer_lo,
-        uint32_t        layer_count,
-        uint32_t        n_expert,
-        uint64_t        gate_expert_bytes,
-        uint64_t        up_expert_bytes,
-        uint64_t        down_expert_bytes,
-        uint64_t        data_base,
-        uint64_t        record_stride,
-        const uint64_t *gate_offsets,
-        const uint64_t *up_offsets,
-        const uint64_t *down_offsets) {
-    (void)fd;
-    (void)layer_lo;
-    (void)layer_count;
-    (void)n_expert;
-    (void)gate_expert_bytes;
-    (void)up_expert_bytes;
-    (void)down_expert_bytes;
-    (void)data_base;
-    (void)record_stride;
-    (void)gate_offsets;
-    (void)up_offsets;
-    (void)down_offsets;
+extern "C" int ds4_gpu_set_streaming_expert_bundle(
+        const ds4_expert_bundle       *bundle,
+        const ds4_expert_bundle_layer *layers) {
+    (void)bundle;
+    (void)layers;
+    return 0;
 }
 
 extern "C" int ds4_gpu_routed_moe_set_selected_override(

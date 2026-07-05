@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_ssd.h"   /* ds4_expert_bundle, ds4_expert_bundle_layer */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -128,25 +130,18 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         uint32_t                           n_experts);
 /* SSD streaming expert-bundle sidecar (DS4_EXPERT_BUNDLE=1): the backend
  * serves streaming-cache misses from the repacked contiguous records instead
- * of three reads scattered across the GGUF. fd < 0 (or any invalid geometry)
- * disables the sidecar. The per-layer offset arrays carry layer_count
- * entries with the model-file offsets of each bundled layer's expert
- * tensors; the backend copies them. Backends without sidecar support must
- * still define both symbols: _supported() returns 0 and _set() is a no-op. */
+ * of three reads scattered across the GGUF. `bundle` is the validated
+ * geometry from ds4_expert_bundle_open_or_build (the backend copies it and
+ * borrows the fd; the engine keeps ownership); `layers` carries
+ * bundle->layer_count entries with the model-file offsets of each bundled
+ * layer's expert tensors. Returns 1 when the sidecar is accepted and will
+ * serve reads; 0 rejects it (NULL/closed/invalid geometry) and leaves the
+ * plain GGUF read path in place. Backends without sidecar support must
+ * still define both symbols: _supported() and _set() return 0. */
 int ds4_gpu_streaming_expert_bundle_supported(void);
-void ds4_gpu_set_streaming_expert_bundle(
-        int             fd,
-        uint32_t        layer_lo,
-        uint32_t        layer_count,
-        uint32_t        n_expert,
-        uint64_t        gate_expert_bytes,
-        uint64_t        up_expert_bytes,
-        uint64_t        down_expert_bytes,
-        uint64_t        data_base,
-        uint64_t        record_stride,
-        const uint64_t *gate_offsets,
-        const uint64_t *up_offsets,
-        const uint64_t *down_offsets);
+int ds4_gpu_set_streaming_expert_bundle(
+        const ds4_expert_bundle       *bundle,
+        const ds4_expert_bundle_layer *layers);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================

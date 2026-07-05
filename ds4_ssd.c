@@ -350,10 +350,13 @@ static bool expert_bundle_open_existing(ds4_expert_bundle *b,
     const uint64_t record =
         expert_bundle_align_up(gate_bytes + up_bytes + down_bytes);
     const uint64_t data_base = expert_bundle_align_up(hb);
+    const uint64_t n_records = (uint64_t)layer_count * n_expert;
     struct stat st;
-    if (fstat(fd, &st) != 0 ||
-        (uint64_t)st.st_size <
-            data_base + (uint64_t)layer_count * n_expert * record) {
+    if (record == 0 ||
+        n_records > UINT64_MAX / record ||
+        data_base > UINT64_MAX - n_records * record ||
+        fstat(fd, &st) != 0 ||
+        (uint64_t)st.st_size < data_base + n_records * record) {
         close(fd);
         fprintf(stderr, "ds4: expert bundle truncated: %s\n", path);
         return false;
@@ -408,19 +411,32 @@ static bool expert_bundle_build(const char                    *path,
     } else {
         snprintf(dir, sizeof(dir), ".");
     }
-    struct statvfs vfs;
-    uint64_t free_bytes = 0;
-    if (statvfs(dir, &vfs) == 0) {
-        free_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    /* A file already at the target failed validation (or we would have
+     * opened it), so it only wastes the space the rebuild needs. */
+    struct stat old_st;
+    if (stat(path, &old_st) == 0) {
+        fprintf(stderr, "ds4: expert bundle removing incompatible file: %s\n",
+                path);
+        (void)unlink(path);
     }
-    if (free_bytes <= total_bytes + DS4_GIB) {
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) == 0) {
+        const uint64_t free_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+        if (free_bytes <= total_bytes + DS4_GIB) {
+            fprintf(stderr,
+                    "ds4: expert bundle needs ~%.1f GiB free but only %.1f GiB "
+                    "are available in %s; skipping (the Trash counts!)\n",
+                    (double)total_bytes / (double)DS4_GIB,
+                    (double)free_bytes / (double)DS4_GIB,
+                    dir);
+            return false;
+        }
+    } else {
+        /* Some network/FUSE mounts cannot answer; unknown is not "full". */
         fprintf(stderr,
-                "ds4: expert bundle needs ~%.1f GiB free but only %.1f GiB "
-                "are available in %s; skipping (the Trash counts!)\n",
-                (double)total_bytes / (double)DS4_GIB,
-                (double)free_bytes / (double)DS4_GIB,
-                dir);
-        return false;
+                "ds4: expert bundle free-space check unavailable for %s (%s); "
+                "proceeding\n",
+                dir, strerror(errno));
     }
     fprintf(stderr,
             "ds4: expert bundle build (one-time): %u layers x %u experts, "
@@ -430,8 +446,12 @@ static bool expert_bundle_build(const char                    *path,
             (double)total_bytes / (double)DS4_GIB,
             path);
 
+    /* Per-process temp name: two concurrent builders (e.g. distributed
+     * workers sharing a model directory) must never interleave writes into
+     * one file; the loser of the final rename just wasted its build. */
     char tmp[sizeof(((ds4_expert_bundle *)0)->path)];
-    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp)) {
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path,
+                         (int)getpid()) >= sizeof(tmp)) {
         return false;
     }
     const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
