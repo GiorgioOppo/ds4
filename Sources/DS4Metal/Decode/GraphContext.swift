@@ -27,15 +27,28 @@ public final class GraphContext {
     /// sums across exactly NSG of them; the threadgroup-memory size (NW*NR0*4) and the
     /// grid width ((outDim+NR0-1)/NR0) are both independent of NSG. So any value in
     /// 1...8 produces identical results — only occupancy / DRAM-latency hiding changes.
-    /// Exposed because the optimal NSG is hardware-specific (M1 Pro vs M2/M3) and can
-    /// only be found by sweeping on-device; we can't benchmark here. Read once.
-    static let q8NSG: Int16 = {
+    /// Exposed because the optimal NSG is hardware-specific (M1 Pro vs M5 Max have
+    /// very different core counts) and can only be found by sweeping on-device.
+    ///
+    /// Re-read from the env at every DECODER creation (StreamingDecoder.init calls
+    /// `refreshQ8NSG`), NOT at every dispatch: a model reload — e.g. the Settings
+    /// auto-tune — can sweep it without restarting the process, while the hot
+    /// encode path keeps a plain read (ProcessInfo.environment allocates a fresh
+    /// dictionary per call — far too costly per-matvec).
+    /// nonisolated(unsafe): written only single-threaded at decoder creation,
+    /// before any decode thread encodes; readers see a stable value per load.
+    nonisolated(unsafe) static var q8NSG: Int16 = GraphContext.readQ8NSG()
+
+    static func readQ8NSG() -> Int16 {
         if let v = ProcessInfo.processInfo.environment["DS4_Q8_NSG"].flatMap(Int.init),
            v >= 1, v <= 8 {
             return Int16(v)
         }
         return 4
-    }()
+    }
+
+    /// Re-arm `q8NSG` from the live environment (called on decoder creation).
+    static func refreshQ8NSG() { q8NSG = readQ8NSG() }
 
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
