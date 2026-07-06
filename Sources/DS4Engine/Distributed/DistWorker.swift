@@ -169,9 +169,35 @@ public final class DistWorker: @unchecked Sendable {
         }
     }
 
-    /// v8: quanto del `.part` locale (trasferimento interrotto, anche di una
-    /// sessione passata) è FIDATO. Convalida i blocchi INTERI con la catena di
-    /// hash dell'offerta — chain[k] = SHA256(chain[k-1] ‖ SHA256(blocco k)),
+    /// v8, passo 1: verifica del FILE INTERO. Un `.part` che copre già tutta
+    /// la size (trasferimento caduto proprio sul finale, o DONE mai arrivato)
+    /// si convalida con la SHA-256 dell'intero file e si PROMUOVE sul posto —
+    /// zero byte ritrasferiti, zero round-trip. Solo se l'hash intero non
+    /// torna (o il .part è più corto) si passa alla verifica per blocchi
+    /// (resumePoint) per trovare fin dove il trasferimento era arrivato.
+    private func promoteCompletePart(_ entry: DistFileEntry,
+                                     onLog: @Sendable (String) -> Void) -> String? {
+        let store = DistFileStore.shared
+        let finalURL = store.url(for: entry.name)
+        let partURL = finalURL.appendingPathExtension("part")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: partURL.path),
+              let partSize = (attrs[.size] as? NSNumber)?.uint64Value,
+              partSize == entry.size else { return nil }
+        onLog("file: \(entry.name) — .part completo, verifico l'hash dell'intero file…\n")
+        guard let digest = DistFileHash.compute(path: partURL.path), digest == entry.sha256 else {
+            onLog("file: \(entry.name) — hash intero NON corrisponde: cerco l'ultimo blocco buono\n")
+            return nil
+        }
+        unlink(finalURL.path)
+        guard rename(partURL.path, finalURL.path) == 0 else { return nil }
+        store.remember(name: entry.name, size: entry.size, sha256: digest)
+        onLog("file: \(entry.name) — verificato e promosso senza ritrasferimento\n")
+        return finalURL.path
+    }
+
+    /// v8, passo 2: quanto del `.part` locale (trasferimento interrotto, anche
+    /// di una sessione passata) è FIDATO. Convalida i blocchi INTERI con la
+    /// catena di hash dell'offerta — chain[k] = SHA256(chain[k-1] ‖ SHA256(blocco k)),
     /// ogni anello impegna tutto il prefisso — tronca il file al primo blocco
     /// che non torna e restituisce l'offset di ripresa (multiplo del
     /// checkpoint; 0 = nulla da salvare). La coda parziale oltre l'ultimo
@@ -411,11 +437,14 @@ public final class DistWorker: @unchecked Sendable {
                         if let local = resolveOffered(entry) {
                             resolvedFiles[DistFileStore.sanitize(entry.name)] = local
                             onLog("file: \(entry.name) già presente (hash ok) — \(local)\n")
+                        } else if let promoted = promoteCompletePart(entry, onLog: onLog) {
+                            // v8 passo 1: .part a size piena e hash INTERO valido
+                            // → promosso sul posto, niente da trasferire.
+                            resolvedFiles[DistFileStore.sanitize(entry.name)] = promoted
                         } else {
-                            // v8: un .part di un trasferimento interrotto (anche
-                            // di una sessione passata) viene convalidato con la
-                            // catena di checkpoint e la ricezione riprende dal
-                            // primo blocco non verificato.
+                            // v8 passo 2: hash intero fallito o .part parziale —
+                            // la catena di checkpoint dice fin dove il
+                            // trasferimento era arrivato e si riprende da lì.
                             let resume = resumePoint(entry, onLog: onLog)
                             needs.append(i)
                             offsets.append(resume)
