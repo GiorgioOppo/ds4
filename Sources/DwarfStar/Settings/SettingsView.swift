@@ -71,9 +71,13 @@ struct SettingsView: View {
                         store.runSettingsBenchmark(quick: false)
                     }
                     .disabled(store.benchRunning || store.phase != .ready)
+                    Button("Auto-tune macchina (~15-25 min)") {
+                        store.runAutoTune()
+                    }
+                    .disabled(store.benchRunning || store.phase != .ready)
                     if store.benchRunning { ProgressView().controlSize(.small) }
                 }
-                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. I knob che richiedono un reload (percorso matrix-matrix, batch dei route) non sono coperti.")
+                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = store.benchStatus {
                     Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")

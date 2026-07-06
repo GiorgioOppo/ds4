@@ -444,6 +444,148 @@ final class ChatStore {
         }
     }
 
+    // MARK: Auto-tune per-macchina (M1/M2/…/base/Pro/Max: RAM e SSD diversi)
+
+    /// Nome del chip (es. "Apple M1 Pro") per il referto dell'auto-tune.
+    nonisolated static func chipName() -> String {
+        var size = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        guard size > 0 else { return "Apple Silicon" }
+        var buf = [CChar](repeating: 0, count: size)
+        sysctlbyname("machdep.cpu.brand_string", &buf, &size, nil, 0)
+        return String(cString: buf).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Trova i migliori knob di CARICAMENTO per QUESTA macchina — slot della
+    /// cache esperti, dense-ahead, async FFN, expert look-ahead — con una
+    /// coordinate descent: un reload del modello per candidato (quei knob sono
+    /// letti alla creazione del decoder), misurato con un decode breve.
+    ///
+    /// - Candidati RAM-gated (una base M1 da 16 GB non prova mai 32 slot; una
+    ///   Max da 96 GB sì), in ordine crescente di RAM: al primo COLLASSO da
+    ///   pressione di memoria i candidati più grossi si saltano.
+    /// - Metrica: genTpsP99 (velocità di regime), ma un candidato conta solo
+    ///   se STABILE — media/p99 ≥ 0.72. Il collasso da swap ha la firma
+    ///   opposta (p99 alto raggiunto presto, media che crolla token dopo
+    ///   token): è esattamente ciò che distingue "più slot = più hit" da
+    ///   "più slot = spirale di swap" (misurato: 24 slot su 16 GB → 1.55 GB/s).
+    /// - Un candidato vince solo con un margine >2% (anti-rumore): a parità
+    ///   resta il valore persistito.
+    /// I vincitori sono applicati e PERSISTITI (didSet → UserDefaults+setenv);
+    /// il referto resta in `benchResults` e nel log motore.
+    func runAutoTune() {
+        guard service != nil else { benchStatus = "Carica prima il modello."; return }
+        guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard !benchRunning else { return }
+        benchRunning = true
+        benchResults = ""
+        benchStatus = "Auto-tune in corso… (~15-25 min, non usare la chat)"
+        Task {
+            @MainActor func log(_ s: String) {
+                benchResults += s + "\n"
+                FileHandle.standardError.write(Data(("DS4 autotune: " + s + "\n").utf8))
+            }
+            let ramGB = Int(ProcessInfo.processInfo.physicalMemory >> 30)
+            let chip = Self.chipName()
+            log("Auto-tune su \(chip), \(ramGB) GB RAM — un reload del modello per configurazione.")
+
+            /// Reload col set di knob corrente e misura: prefill corto (il
+            /// prefill ha il suo benchmark) + 28 token di decode.
+            @MainActor func measure(_ label: String) async throws -> (score: Double, note: String) {
+                benchStatus = "Auto-tune: \(label) — reload…"
+                service = nil                      // libera la RAM wired PRIMA del nuovo load
+                load()
+                while phase == .loading { try await Task.sleep(nanoseconds: 500_000_000) }
+                guard phase == .ready, let svc = service else {
+                    throw NSError(domain: "DS4AutoTune", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "reload fallito (\(label))"])
+                }
+                try await Task.sleep(nanoseconds: 2_000_000_000)   // assestamento memoria
+                benchStatus = "Auto-tune: \(label) — misura…"
+                let p = try await svc.benchmark(contextTokens: 96, genTokens: 28)
+                let ratio = p.genTpsP99 > 0 ? p.genTps / p.genTpsP99 : 1
+                let stable = ratio >= 0.72
+                let score = stable ? p.genTpsP99 : 0
+                let note = String(format: "%@: %.2f tok/s regime (media %.2f, stabilità %.0f%%)%@",
+                                  label, p.genTpsP99, p.genTps, ratio * 100,
+                                  stable ? "" : "  ← COLLASSO (pressione memoria)")
+                log(note)
+                return (score, note)
+            }
+
+            // Snapshot per il ripristino su errore: un reload fallito a metà
+            // sweep non deve lasciare persistito il candidato perdente.
+            let snapSlots = expertCacheSlots, snapAhead = denseAhead
+            let snapAsync = asyncFFNEnabled, snapLook = expertLookahead
+            do {
+                var best = try await measure("baseline slot=\(expertCacheSlots) ahead=\(denseAhead) " +
+                                             "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead)").score
+                guard best > 0 else {
+                    throw NSError(domain: "DS4AutoTune", code: 2, userInfo: [
+                        NSLocalizedDescriptionKey: "la baseline è instabile: liberare RAM (chiudere app) e riprovare"])
+                }
+
+                // 1) Slot cache esperti — il knob più importante e più rischioso.
+                let slotCands: [Int] = ramGB >= 96 ? [16, 24, 32, 48]
+                                     : ramGB >= 48 ? [16, 24, 32]
+                                     : ramGB >= 24 ? [12, 16, 24]
+                                     : [12, 16, 20]
+                for cand in slotCands where cand != expertCacheSlots {
+                    let saved = expertCacheSlots
+                    expertCacheSlots = cand
+                    let r = try await measure("slot=\(cand)")
+                    if r.score > best * 1.02 { best = r.score }
+                    else {
+                        expertCacheSlots = saved
+                        if r.score == 0 && cand > saved { break }   // collasso: niente candidati più grossi
+                    }
+                }
+
+                // 2) Dense-ahead (profondità dello staging ring: 1-3 slot extra).
+                for cand in [1, 2, 3] where cand != denseAhead {
+                    let saved = denseAhead
+                    denseAhead = cand
+                    let r = try await measure("ahead=\(cand)")
+                    if r.score > best * 1.02 { best = r.score } else { denseAhead = saved }
+                }
+
+                // 3) FFN asincrona (misurata +10% su M1 Pro, ma va verificata per macchina).
+                do {
+                    let saved = asyncFFNEnabled
+                    asyncFFNEnabled = !saved
+                    let r = try await measure("asyncFFN=\(asyncFFNEnabled ? 1 : 0)")
+                    if r.score > best * 1.02 { best = r.score } else { asyncFFNEnabled = saved }
+                }
+
+                // 4) Expert look-ahead speculativo (0 = solo layer hash, esatto).
+                for cand in [4, 8] where cand != expertLookahead {
+                    let saved = expertLookahead
+                    expertLookahead = cand
+                    let r = try await measure("look=\(cand)")
+                    if r.score > best * 1.02 { best = r.score } else { expertLookahead = saved }
+                }
+
+                // Reload finale con i vincitori (le proprietà sono già persistite).
+                _ = try await measure("finale slot=\(expertCacheSlots) ahead=\(denseAhead) " +
+                                      "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead)")
+                let summary = "slot=\(expertCacheSlots) ahead=\(denseAhead) " +
+                              "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead)"
+                log("MIGLIORI per \(chip)/\(ramGB)GB: \(summary) — applicati e salvati.")
+                UserDefaults.standard.set("\(summary) @ \(Date().formatted())",
+                                          forKey: "DS4AutoTune-\(chip)-\(ramGB)")
+                benchStatus = "Auto-tune completato: \(summary)"
+            } catch {
+                expertCacheSlots = snapSlots; denseAhead = snapAhead
+                asyncFFNEnabled = snapAsync; expertLookahead = snapLook
+                benchStatus = "Auto-tune fallito: \(error.localizedDescription)"
+                log("INTERROTTO: \(error.localizedDescription) — knob ripristinati ai valori di partenza; " +
+                    "se il modello è scarico, ricaricalo dalle Settings.")
+                if phase != .loading && phase != .ready { load() }
+            }
+            benchRunning = false
+        }
+    }
+
     /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
     var bundleBuildStatus: String?
 
