@@ -791,14 +791,36 @@ public actor InferenceService {
     /// where each request carries the whole conversation (no server-side history).
     public func complete(turns: [ChatTurn], tools: [ToolSpec], thinkMode: DS4ThinkMode,
                          sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
-        resetConversation(systemPrompt: nil)
         self.tools = tools
         let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
                                          markup: markup, compactTools: compactTools)
-        return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+        let ids = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        // CONTINUITÀ KV per il server STATELESS (Xcode & co. ri-inviano
+        // l'intero transcript a ogni richiesta, system prompt di migliaia di
+        // token incluso): se i token ESTENDONO esattamente quelli già
+        // committati, prefilla SOLO il suffisso — da minuti a secondi dal
+        // secondo scambio in poi. Qualunque mismatch (chat GUI interlacciata
+        // sullo stesso motore, transcript diverso, stato sporco) ricade nel
+        // reset di sempre: prefill freddo, correttezza invariata.
+        if !kvDirty, !committedIds.isEmpty, ids.count > committedIds.count,
+           ids.starts(with: committedIds) {
+            FileHandle.standardError.write(Data(
+                "DS4 server: KV riusato in memoria (\(committedIds.count) token già caldi)\n".utf8))
+            return run(suffixIds: Array(ids.dropFirst(committedIds.count)),
+                       think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+        }
+        resetConversation(systemPrompt: nil)
+        self.tools = tools
+        return run(suffixIds: ids, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
     private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
+                     maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+        run(suffixIds: tok.tokenizeRenderedChat(suffix).map { Int($0) },
+            think: think, sampling: sampling, maxTokens: maxTokens)
+    }
+
+    private func run(suffixIds: [Int], think: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
             // .userInitiated: this is the task that actually runs the (synchronous,
@@ -807,7 +829,7 @@ public actor InferenceService {
             // sub-agents) may not — pin it so the decode never runs at a throttled QoS.
             let task = Task(priority: .userInitiated) {
                 do {
-                    try self.generate(suffix: suffix, think: think, sampling: sampling,
+                    try self.generate(suffixIds: suffixIds, think: think, sampling: sampling,
                                       maxTokens: maxTokens, continuation: continuation)
                     continuation.finish()
                 } catch {
@@ -818,9 +840,9 @@ public actor InferenceService {
         }
     }
 
-    private func generate(suffix: String, think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
+    private func generate(suffixIds initialSuffixIds: [Int], think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
                           continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
-        var suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        var suffixIds = initialSuffixIds
 
         // Disk KV (ds4_kvstore model): on a COLD start, restore the longest stored
         // checkpoint that is an exact token prefix of this prompt and prefill only

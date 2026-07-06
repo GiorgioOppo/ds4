@@ -116,6 +116,12 @@ final class LocalServer: @unchecked Sendable {
             // client went away mid-response (SSE disconnects land here) — the
             // broken `for try await` already cancelled the generation via
             // onTermination; nothing useful can be sent on a dead socket.
+        } catch let e as InferenceError {
+            // Errore SEMANTICO (es. prompt oltre il contesto): il client deve
+            // leggere il motivo — un 503 anonimo fa sembrare rotto il server
+            // quando il problema è la richiesta.
+            onLog("errore richiesta: \(e)\n")
+            try? await send(conn, Self.httpError(400, "\(e)", cors: config.cors))
         } catch {
             onLog("errore richiesta: \(error)\n")
             try? await send(conn, Self.httpError(503, "internal error", cors: config.cors))
@@ -270,7 +276,14 @@ final class LocalServer: @unchecked Sendable {
                     toolCallCount = calls.count
                     for c in calls { onLog("← tool call: \(c.name)(\(preview(c.argumentsJSON, max: 100)))\n") }
                     try await send(conn, chunk("{\"tool_calls\":\(toolCallsJSON(calls))}", finish: "null"))
-                case .toolStream, .progress:
+                case .progress(let p):
+                    // Il PREFILL può durare minuti (transcript intero al primo
+                    // giro): senza queste righe il log tace e sembra un hang.
+                    if !p.isEmpty, Date().timeIntervalSince(lastNote) >= 2 {
+                        lastNote = Date()
+                        onLog("· \(p)\n")
+                    }
+                case .toolStream:
                     break
                 }
             }
