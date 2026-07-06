@@ -191,6 +191,17 @@ public final class StreamingDecoder {
     /// (~43 allocations/token). Safe to reuse: the routed command buffer that
     /// reads it is committed AND waited before the next layer overwrites it.
     let slotsScratch: GPUTensor
+    /// Second slot-staging buffer: with the ASYNC routed-FFN commit the next
+    /// layer's CPU memcpy must not overwrite the ids the in-flight command
+    /// buffer is still reading — layers alternate A/B by parity.
+    let slotsScratchB: GPUTensor
+    /// The last layer's routed-FFN command buffer, committed WITHOUT a CPU wait
+    /// (DS4_ASYNC_FFN, default ON): the next layer's route commit+wait lands on
+    /// the same in-order queue, so the GPU stays fed while the CPU encodes —
+    /// the per-layer bubble (encode time x 43) disappears. Explicitly waited at
+    /// end of token (before the output head / readHC) and on every error path.
+    private var inflightFFN: GraphContext?
+    let asyncFFN = ProcessInfo.processInfo.environment["DS4_ASYNC_FFN"] != "0"
     /// One embedding-table ROW (F16, nEmbd × 2 B), CPU-staged per token.
     /// Binding the full multi-hundred-MB no-copy table to a command buffer
     /// makes Metal wire the WHOLE mapping every token — on tight-RAM machines
@@ -255,6 +266,7 @@ public final class StreamingDecoder {
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        slotsScratchB = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
         // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
@@ -294,20 +306,29 @@ public final class StreamingDecoder {
         kickLookahead(after: -1, token: token)
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
-        for i in 0..<nLayers {
-            // Per-layer pool drain, like the prefill loops: the command buffers/
-            // encoders are autoreleased ObjC objects — without this a LONG
-            // generation (hundreds of tokens x ~3 cb/layer) accumulates them
-            // for the whole turn instead of freeing at each layer.
-            try autoreleasepool {
-                let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
-                if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
-                try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                             cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-                swap(&cur, &other)
-                // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+        do {
+            for i in 0..<nLayers {
+                // Per-layer pool drain, like the prefill loops: the command buffers/
+                // encoders are autoreleased ObjC objects — without this a LONG
+                // generation (hundreds of tokens x ~3 cb/layer) accumulates them
+                // for the whole turn instead of freeing at each layer.
+                try autoreleasepool {
+                    let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
+                    if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
+                    try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                                 cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                    swap(&cur, &other)
+                    // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+                }
             }
+        } catch {
+            drainFFN()   // never leave the routed FFN in flight on a torn-down token
+            throw error
         }
+        // Join the last layer's async FFN: the output head's own commit+wait
+        // would cover the GPU ordering, but exportKV/readHC and error paths
+        // must find NOTHING in flight — one explicit drain keeps the invariant.
+        drainFFN()
         profile.forwards += 1
         return try outputHead(cur)
     }
@@ -339,15 +360,21 @@ public final class StreamingDecoder {
         writeFloats(hcIn, into: hcA)
         kickLookahead(after: start - 1, token: token)
         var cur = hcA, other = hcB
-        for i in start...end {
-            try autoreleasepool {   // per-layer drain (see forward)
-                let w = try layerProvider(i)
-                if i + 1 <= end { prefetch?(i + 1) }
-                try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                             cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-                swap(&cur, &other)
+        do {
+            for i in start...end {
+                try autoreleasepool {   // per-layer drain (see forward)
+                    let w = try layerProvider(i)
+                    if i + 1 <= end { prefetch?(i + 1) }
+                    try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                                 cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                    swap(&cur, &other)
+                }
             }
+        } catch {
+            drainFFN()
+            throw error
         }
+        drainFFN()   // readHC reads `cur` CPU-side: the async FFN must be complete
         profile.forwards += 1
         return readHC(cur)
     }
@@ -909,6 +936,28 @@ public final class StreamingDecoder {
         for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
     }
 
+    /// Commit a routed-FFN command buffer. Async by default (DS4_ASYNC_FFN):
+    /// the next layer's route commit+wait is on the same in-order queue, so
+    /// correctness is by queue order and the CPU encode overlaps this buffer's
+    /// GPU execution. DS4_PROFILE_ROUTE keeps the synchronous wait (accurate
+    /// per-phase attribution beats the overlap when profiling).
+    private func commitFFN(_ c: GraphContext) {
+        if asyncFFN && !profileRoute {
+            c.commitAsync()
+            inflightFFN = c
+        } else {
+            c.commit()
+        }
+    }
+
+    /// Join the in-flight routed FFN (end of token, and every error path): the
+    /// caller is about to read GPU results CPU-side (output head readback,
+    /// readHC, KV export) or to tear down/rebuild state.
+    private func drainFFN() {
+        inflightFFN?.waitCompleted()
+        inflightFFN = nil
+    }
+
     /// Speculative look-ahead: prefill layer i+1's slot pool while the GPU
     /// computes layer i (its own gather just finished, so the SSD is idle until
     /// the next layer's demand fill). The id list is resolved on the DECODE
@@ -975,12 +1024,13 @@ public final class StreamingDecoder {
                 profile.expertMisses += cache.misses - m0
                 profile.expertPrefilled += cache.prefilled - p0
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
-                // Persistent staging (no per-layer alloc): c2 below is committed
-                // and waited before the next layer can overwrite this buffer.
+                // Persistent staging (no per-layer alloc), A/B by layer parity:
+                // with the async FFN the PREVIOUS layer's command buffer may
+                // still be reading its ids buffer while this layer stages its own.
+                let slotsBuf = (i & 1) == 0 ? slotsScratch : slotsScratchB
                 _ = slots.withUnsafeBytes {
-                    memcpy(slotsScratch.buffer.contents(), $0.baseAddress!, $0.count)
+                    memcpy(slotsBuf.buffer.contents(), $0.baseAddress!, $0.count)
                 }
-                let slotsBuf = slotsScratch
                 t = Date()
                 c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
@@ -988,7 +1038,7 @@ public final class StreamingDecoder {
                                            upExp: pool.up, downExp: pool.down,
                                            ids: slotsBuf, outHc: other, activeK: K,
                                            expertStride: slotCacheStride)
-                c2.commit()
+                commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {
                 // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
@@ -1004,7 +1054,7 @@ public final class StreamingDecoder {
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
                                            ids: idsPacked, outHc: other, activeK: K)
-                c2.commit()
+                commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             }
         } else {
@@ -1013,7 +1063,7 @@ public final class StreamingDecoder {
             let lc = GraphContext(rt); try lc.begin()
             try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
                                  downExp: w.expDown, ids: scratch.selected, outHc: other)
-            lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
+            commitFFN(lc)                    // COMPUTE (cb retains w's buffers until completed)
             profile.layerOtherS += Date().timeIntervalSince(t)
         }
         profile.layers += 1
