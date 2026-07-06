@@ -183,6 +183,20 @@ final class LocalServer: @unchecked Sendable {
 
     // MARK: /v1/chat/completions
 
+    // MARK: Log ricco (pannello Server): cosa arriva, cosa generiamo, cosa esce
+
+    /// Una riga di anteprima: newline collassate, troncata con ellissi.
+    private func preview(_ s: String, max n: Int = 140) -> String {
+        let flat = s.replacingOccurrences(of: "\n", with: "⏎")
+        return flat.count <= n ? flat : String(flat.prefix(n)) + "…"
+    }
+
+    /// L'ultimo messaggio utente della conversazione (per il log della richiesta).
+    private static func lastUserText(_ turns: [ChatTurn]) -> String? {
+        for t in turns.reversed() { if case .user(let s) = t { return s } }
+        return nil
+    }
+
     private func handleChat(_ conn: NWConnection, body: Data) async throws {
         guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
             try await send(conn, Self.httpError(400, "invalid JSON body", cors: config.cors)); return
@@ -194,7 +208,11 @@ final class LocalServer: @unchecked Sendable {
         let model = resolveModel(parsed.model)
         let id = "chatcmpl-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         let created = Int(Date().timeIntervalSince1970)
-        onLog("POST /v1/chat/completions (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")
+        onLog("POST /v1/chat/completions (\(parsed.turns.count) msg · stream=\(parsed.stream) · "
+              + "maxTok=\(parsed.maxTokens) · tools=\(parsed.tools.count) · body \(body.count) B)\n")
+        if let u = Self.lastUserText(parsed.turns) {
+            onLog("→ user: \"\(preview(u))\"\n")
+        }
 
         // Serialize: only one generation runs against the single-model engine.
         await gate.acquire()
@@ -222,25 +240,50 @@ final class LocalServer: @unchecked Sendable {
         try await send(conn, chunk("{\"role\":\"assistant\"}", finish: "null"))
 
         var finish = "stop"
+        // Contatori per il log: quanto stiamo generando, a che ritmo, e una
+        // coda della risposta per l'anteprima a fine stream.
+        let t0 = Date()
+        var textChars = 0, reasonChars = 0, toolCallCount = 0
+        var tail = ""
+        var lastNote = Date()
+        func note() {
+            guard Date().timeIntervalSince(lastNote) >= 2 else { return }
+            lastNote = Date()
+            let dt = Date().timeIntervalSince(t0)
+            onLog(String(format: "… generazione: %d char testo (+%d reasoning) · %.1fs\n",
+                         textChars, reasonChars, dt))
+        }
         do {
             for try await event in stream {
                 switch event {
                 case .reasoning(let r):
+                    reasonChars += r.count
                     try await send(conn, chunk("{\"reasoning_content\":\(jsonString(r))}", finish: "null"))
+                    note()
                 case .text(let t):
+                    textChars += t.count
+                    tail = String((tail + t).suffix(200))
                     try await send(conn, chunk("{\"content\":\(jsonString(t))}", finish: "null"))
+                    note()
                 case .toolCall(let calls):
                     finish = "tool_calls"
+                    toolCallCount = calls.count
+                    for c in calls { onLog("← tool call: \(c.name)(\(preview(c.argumentsJSON, max: 100)))\n") }
                     try await send(conn, chunk("{\"tool_calls\":\(toolCallsJSON(calls))}", finish: "null"))
                 case .toolStream, .progress:
                     break
                 }
             }
         } catch is CancellationError {
-            // client disconnected or generation stopped — close cleanly
+            finish = "stop"
+            onLog("← client disconnesso a metà stream (generazione fermata)\n")
         }
         try await send(conn, chunk("{}", finish: "\"\(finish)\""))
         try await send(conn, Data("data: [DONE]\n\n".utf8))
+        let dt = Date().timeIntervalSince(t0)
+        onLog(String(format: "← SSE chiuso: finish=%@ · %d char testo (+%d reasoning, %d tool call) · %.1fs\n",
+                     finish, textChars, reasonChars, toolCallCount, dt))
+        if !tail.isEmpty { onLog("← coda risposta: \"…\(preview(tail, max: 200))\"\n") }
     }
 
     /// Non-streaming: collect the full reply into one chat.completion body.
@@ -248,6 +291,7 @@ final class LocalServer: @unchecked Sendable {
                             id: String, model: String, created: Int) async throws {
         var content = "", reasoning = "", finish = "stop"
         var calls: [ToolCall] = []
+        let t0 = Date()
         do {
             for try await event in stream {
                 switch event {
@@ -258,6 +302,11 @@ final class LocalServer: @unchecked Sendable {
                 }
             }
         } catch is CancellationError {}
+        let dt = Date().timeIntervalSince(t0)
+        onLog(String(format: "← risposta (non-stream): finish=%@ · %d char testo (+%d reasoning, %d tool call) · %.1fs\n",
+                     finish, content.count, reasoning.count, calls.count, dt))
+        for c in calls { onLog("← tool call: \(c.name)(\(preview(c.argumentsJSON, max: 100)))\n") }
+        if !content.isEmpty { onLog("← anteprima: \"\(preview(content, max: 200))\"\n") }
 
         var message: [String: Any] = ["role": "assistant", "content": content]
         if !reasoning.isEmpty { message["reasoning_content"] = reasoning }
