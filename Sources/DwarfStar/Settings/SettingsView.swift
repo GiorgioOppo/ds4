@@ -89,7 +89,16 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Attivi", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                LabeledContent("Attivi (prefill)", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                    .font(.caption)
+                // Il set di CARICAMENTO scelto dall'auto-tune: slot e look-ahead
+                // hanno i loro stepper (si aggiornano da soli), ma dense-ahead,
+                // async FFN e q8nsg non hanno un controllo — senza questa riga
+                // il valore applicato sarebbe visibile solo nel referto.
+                LabeledContent("Attivi (load)",
+                               value: "slot \(store.expertCacheSlots) · ahead \(store.denseAhead) · " +
+                                      "asyncFFN \(store.asyncFFNEnabled ? "on" : "off") · " +
+                                      "look \(store.expertLookahead) · q8nsg \(store.q8NSG)")
                     .font(.caption)
             }
             Section("Memory") {
