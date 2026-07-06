@@ -70,8 +70,8 @@ public enum DistFileHash {
 
     /// One streaming pass → (whole-file SHA-256, chained checkpoint digests).
     /// Chain: b_k = SHA256(bytes of block k, fileCheckpointBytes each);
-    /// chain[0] = b_0, chain[k] = SHA256(chain[k-1] ‖ b_k) — every entry
-    /// commits to the entire prefix ("hash concatenati").
+    /// chain[0] = SHA256(b_0), chain[k] = SHA256(chain[k-1] ‖ b_k) — every
+    /// entry commits to the entire prefix ("hash concatenati").
     static func computeWithChain(path: String) -> (sha: Data, chain: [Data])? {
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { return nil }

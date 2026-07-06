@@ -222,6 +222,26 @@ public final class DistCoordinator: @unchecked Sendable {
         onLog("connessione a \(p.host):\(p.port)…\n")
         let conn = try await DistConnection.connect(host: p.host, port: p.port,
                                                     queue: queue, onState: onLog)
+        // Cancellazione del task group (un altro peer ha esaurito i retry):
+        // readFrame/sendFrame NON sono cancellation-aware — senza questo
+        // handler un fratello bloccato sull'attesa del READY (minuti di load)
+        // terrebbe in ostaggio il gruppo, e se poi RIUSCISSE la sua
+        // connessione verrebbe scartata senza mai essere chiusa.
+        // conn.cancel() fa completare la receive pendente con errore → il
+        // do/catch qui sotto chiude e rilancia.
+        return try await withTaskCancellationHandler {
+            try await setupPeerBody(p, conn: conn, slice: slice, hasOutput: hasOutput,
+                                    offer: offer, modelName: modelName, onLog: onLog)
+        } onCancel: {
+            conn.cancel()
+        }
+    }
+
+    private func setupPeerBody(_ p: Peer, conn: DistConnection,
+                               slice: (start: Int, end: Int), hasOutput: Bool,
+                               offer: [DistFileEntry], modelName: String,
+                               onLog: @escaping @Sendable (String) -> Void) async throws
+        -> (DistConnection, DistRouteEntry) {
         do {
             let (type, payload) = try await conn.readFrame()
             if type == .error {
@@ -396,7 +416,10 @@ public final class DistCoordinator: @unchecked Sendable {
         try await conn.sendFrame(.fileDone, DistFileDone(index: index).encoded())
         let (aType, aPayload) = try await readControl(conn)
         guard aType == .fileAck, let ack = DistKV.decodeAck(aPayload) else { throw DistError.badFrame }
-        guard ack.ok else { throw DistError.remote("\(peer.host):\(peer.port): \(ack.message)") }
+        // Nack del trasferimento: RITENTABILE (transferFailed, non remote) —
+        // il tentativo successivo rinegozia dalla catena di checkpoint e
+        // ritrasmette solo il mancante.
+        guard ack.ok else { throw DistError.transferFailed("\(peer.host):\(peer.port): \(ack.message)") }
         onLog(String(format: "file: %@ trasferito in %.0fs\n", entry.name, Date().timeIntervalSince(t0)))
     }
 

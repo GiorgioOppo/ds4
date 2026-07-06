@@ -82,10 +82,17 @@ public final class DistWorker: @unchecked Sendable {
                     onLog("file: \(entry.name) — riprendo dal checkpoint a \(resumeFrom / 1_048_576) MB\n")
                 }
                 if !primed {
+                    // MAI ributtare il .part con O_TRUNC qui: il coordinatore
+                    // sta già trasmettendo da `resumeFrom` (promesso nel
+                    // fileNeed), quindi "ricominciare da zero" non può comunque
+                    // riuscire e brucerebbe GB di progresso convalidato per un
+                    // singhiozzo di IO locale. fd = -1: gli append falliscono,
+                    // il DONE fa nack (transferFailed, RITENTABILE lato
+                    // coordinatore) e il tentativo successivo rinegozia dalla
+                    // catena di checkpoint con il .part intatto.
                     if fd >= 0 { close(fd) }
-                    hasher = SHA256()
-                    onLog("file: \(entry.name) — ripresa non possibile, ricomincio da zero\n")
-                    self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+                    self.fd = -1
+                    onLog("file: \(entry.name) — ripresa non riuscita (IO locale): tentativo annullato, .part conservato\n")
                 }
             } else {
                 self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
@@ -152,8 +159,9 @@ public final class DistWorker: @unchecked Sendable {
             }
             unlink(finalURL.path)
             guard rename(tmpURL.path, finalURL.path) == 0 else {
-                unlink(tmpURL.path)
-                return .failure("rename failed: errno \(errno)")
+                // Il .part è COMPLETO e verificato: si conserva — alla prossima
+                // offerta la verifica dell'hash intero lo promuove sul posto.
+                return .failure("rename failed: errno \(errno) (.part conservato)")
             }
             DistFileStore.shared.remember(name: entry.name, size: entry.size, sha256: digest)
             return .success(finalURL.path)
@@ -282,6 +290,9 @@ public final class DistWorker: @unchecked Sendable {
     private var engine: DistEngine?
     private var assignment: Assignment?
     private var loadingAssignment = false
+    /// L'assegnazione del load in corso (v8): un retry del coordinatore con la
+    /// STESSA assegnazione si aggancia al load invece di ricevere "busy".
+    private var pendingAssignment: Assignment?
     /// Where this shard persists its usage imatrix (slice-keyed: counts are
     /// collected only for the owned layers). nil until assigned.
     private var usageFile: URL?
@@ -429,6 +440,12 @@ public final class DistWorker: @unchecked Sendable {
                 let (type, payload) = try await conn.readFrame()
                 if type == .fileOffer {
                     guard let offer = DistFileOffer.decode(payload) else { continue }
+                    // Una nuova offerta azzera lo stato di trasferimento della
+                    // connessione: un incoming/errore rimasti da un'offerta
+                    // precedente non devono interferire (e l'incoming va
+                    // sospeso PRIMA che resumePoint tronchi il suo .part).
+                    incoming?.suspend(); incoming = nil
+                    transferError = nil
                     offerEntries = offer.entries
                     var needs: [Int] = []
                     var offsets: [UInt64] = []
@@ -676,7 +693,32 @@ public final class DistWorker: @unchecked Sendable {
 
         // Locked state transitions live in sync helpers: NSLock is not usable
         // directly inside an async function.
-        switch claimAssignment(wanted) {
+        var claim = claimAssignment(wanted)
+        if case .inFlight = claim {
+            // v8 retry: la connessione che ha chiesto QUESTO stesso load è
+            // caduta e il coordinatore ha riconnesso. Il load prosegue per
+            // conto suo: aggancialo — rilancia il progresso e attendi l'esito
+            // invece di rispondere "busy" (che il coordinatore tratta come
+            // fatale e affosserebbe la route per un blip di rete).
+            onLog("assegnazione identica già in caricamento — mi aggancio al load in corso\n")
+            let deadline = Date().addingTimeInterval(45 * 60)
+            joinLoop: while Date() < deadline {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                let s = LoadProgress.shared.snapshot
+                if !s.stage.isEmpty {
+                    try? await conn.sendFrame(.progress,
+                                              Data(String(format: "%@ (%.0f%%)", s.stage, s.fraction * 100).utf8))
+                }
+                claim = claimAssignment(wanted)
+                if case .inFlight = claim { continue }
+                break joinLoop           // reuse (commit), load (il vecchio è fallito: slot nostro) o busy
+            }
+            if case .inFlight = claim {
+                try await conn.sendFrame(.error, Data("load in corso da troppo tempo (timeout join)".utf8))
+                return
+            }
+        }
+        switch claim {
         case .reuse(let current):
             applyAncillary(assign, to: current)
             onLog("assegnazione invariata: layer \(wanted.layerStart)...\(wanted.layerEnd) — riuso il motore\n")
@@ -685,6 +727,8 @@ public final class DistWorker: @unchecked Sendable {
         case .busy:
             try await conn.sendFrame(.error, Data("worker busy loading a previous assignment".utf8))
             return
+        case .inFlight:
+            return                   // impossibile: gestito sopra (timeout incluso)
         case .load:
             break                    // old shard freed, `loadingAssignment` claimed
         }
@@ -748,15 +792,24 @@ public final class DistWorker: @unchecked Sendable {
     // forbids direct NSLock use in async bodies — a suspension while holding
     // the lock would deadlock).
 
-    private enum AssignmentClaim { case reuse(DistEngine), busy, load }
+    private enum AssignmentClaim { case reuse(DistEngine), busy, inFlight, load }
 
-    /// Reuse the loaded engine, report busy, or claim the load slot (freeing
-    /// the old shard FIRST so its memory is gone before the new one arrives).
+    /// Reuse the loaded engine, report busy, join an identical in-flight load,
+    /// or claim the load slot (freeing the old shard FIRST so its memory is
+    /// gone before the new one arrives).
     private func claimAssignment(_ wanted: Assignment) -> AssignmentClaim {
         stateLock.lock(); defer { stateLock.unlock() }
         if assignment == wanted, let current = engine { return .reuse(current) }
-        if loadingAssignment { return .busy }
+        if loadingAssignment {
+            // v8 retry: se la STESSA assegnazione è già in caricamento (la
+            // connessione che l'ha chiesta è caduta a metà load, il retry del
+            // coordinatore riconnette), il nuovo tentativo si AGGANCIA al load
+            // in corso invece di ricevere "busy" — un blip di rete durante i
+            // minuti del load non deve affossare la route.
+            return pendingAssignment == wanted ? .inFlight : .busy
+        }
         loadingAssignment = true
+        pendingAssignment = wanted
         engine = nil
         assignment = nil
         return .load
@@ -767,11 +820,12 @@ public final class DistWorker: @unchecked Sendable {
         engine = loaded
         assignment = wanted
         loadingAssignment = false
+        pendingAssignment = nil
         stateLock.unlock()
     }
 
     private func releaseAssignmentClaim() {
-        stateLock.lock(); loadingAssignment = false; stateLock.unlock()
+        stateLock.lock(); loadingAssignment = false; pendingAssignment = nil; stateLock.unlock()
     }
 
     /// Apply the parts of an ASSIGN that do NOT require a reload: the usage

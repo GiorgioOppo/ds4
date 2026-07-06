@@ -267,8 +267,9 @@ public struct DistFileEntry: Sendable, Equatable {
     public var name: String
     public var size: UInt64
     public var sha256: Data          // 32 bytes
-    /// v8 chained checkpoint hashes, one per fileCheckpointBytes block:
-    /// chain[0] = SHA256(block 0); chain[k] = SHA256(chain[k-1] ‖ SHA256(block k)).
+    /// v8 chained checkpoint hashes, one per fileCheckpointBytes block, with
+    /// b_k = SHA256(raw bytes of block k):
+    /// chain[0] = SHA256(b_0); chain[k] = SHA256(chain[k-1] ‖ b_k).
     /// Each entry commits to the WHOLE prefix, so a `.part` file from a broken
     /// transfer is verifiable block-by-block and the resume point is the last
     /// matching checkpoint — a corrupt middle block can never be resumed over.
