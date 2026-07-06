@@ -197,6 +197,17 @@ public final class StreamingDecoder {
     /// buffer would suffice — the parity keeps the invariant local instead of
     /// depending on the route-wait ordering, and costs 24 bytes.
     let slotsScratchB: GPUTensor
+    /// EXPERT PARALLELISM (coordinatore verticale): quando impostata, la FFN
+    /// routed è calcolata dai worker remoti — (layer, id selezionati, pesi di
+    /// route, attivazione nEmbd) → somma pesata nEmbd. Chiamata SINCRONA dal
+    /// decode thread (la latenza di rete è coperta dalla FFN condivisa
+    /// asincrona, come lo era il gather SSD). nil = percorso locale.
+    public var remoteExperts: (@Sendable (Int, [Int32], [Float], [Float]) throws -> [Float])?
+    /// Tensori di consegna della somma remota, a PARITÀ di layer alternata:
+    /// il c2 asincrono del layer precedente può ancora leggere il suo mentre
+    /// la CPU scrive quello del layer corrente (stesso schema di slotsScratch).
+    let remotePartialA: GPUTensor
+    let remotePartialB: GPUTensor
     /// The last layer's routed-FFN command buffer, committed WITHOUT a CPU wait
     /// (DS4_ASYNC_FFN, default ON): the next layer's route commit+wait lands on
     /// the same in-order queue, so the GPU stays fed while the CPU encodes —
@@ -273,6 +284,8 @@ public final class StreamingDecoder {
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         slotsScratchB = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        remotePartialA = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
+        remotePartialB = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
         // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
@@ -309,7 +322,7 @@ public final class StreamingDecoder {
         if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
         // Layer 0's expert I/O can start NOW: the token id is known before any
         // GPU work (hash layer -> exact ids), so its fill overlaps embed+route(0).
-        kickLookahead(after: -1, token: token)
+        if remoteExperts == nil { kickLookahead(after: -1, token: token) }
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         do {
@@ -364,7 +377,7 @@ public final class StreamingDecoder {
         precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
         if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
         writeFloats(hcIn, into: hcA)
-        kickLookahead(after: start - 1, token: token)
+        if remoteExperts == nil { kickLookahead(after: start - 1, token: token) }
         var cur = hcA, other = hcB
         do {
             for i in start...end {
@@ -998,8 +1011,49 @@ public final class StreamingDecoder {
         // Its I/O shares the SSD with this layer's own gather, but the disk's
         // parallel ceiling is well above the demand queue depth and the demand
         // path preempts on contention for the same layer's lock.
-        kickLookahead(after: i, token: token)
-        if let gather = expertGather {
+        if remoteExperts == nil { kickLookahead(after: i, token: token) }
+        if let remote = remoteExperts {
+            // EXPERT PARALLELISM (coordinatore VERTICALE, Fase C): la FFN
+            // routed è calcolata DAI WORKER — qui route/attention/selezione
+            // come in locale, poi scatter/gather di rete al posto del gather
+            // SSD. La FFN condivisa (c1, asincrona) copre la latenza di rete
+            // come copriva quella del disco.
+            var t = Date()
+            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            profile.routeS += Date().timeIntervalSince(t)
+            let (ids, rw) = readRouteSelection(layer: i)
+            let c1 = GraphContext(rt); try c1.begin()
+            try c1.decodeSharedFFN(w: w, s: scratch, d: d)
+            c1.commitAsync()
+            // Attivazione (s.cur, finale dopo il route committato) → CPU.
+            let nE = d.nEmbd
+            let curPtr = (scratch.cur.buffer.contents() + scratch.cur.byteOffset)
+                .bindMemory(to: Float.self, capacity: nE)
+            let activation = Array(UnsafeBufferPointer(start: curPtr, count: nE))
+            t = Date()
+            let partialSum: [Float]
+            do { partialSum = try remote(i, ids, rw, activation) }
+            catch { c1.waitCompleted(); throw error }
+            guard partialSum.count == nE else {
+                c1.waitCompleted()
+                throw MetalError.unsupported("remoteExperts: somma parziale di taglia \(partialSum.count) ≠ \(nE)")
+            }
+            profile.gatherS += Date().timeIntervalSince(t)
+            // Upload nel tensore a PARITÀ alternata: il c2 asincrono del layer
+            // precedente può ancora leggere il SUO tensore (stesso schema di
+            // slotsScratch); i cb più vecchi sono già completati per l'ordine
+            // in-order della queue (il route di i-1 è stato atteso).
+            let target = (i & 1) == 0 ? remotePartialA : remotePartialB
+            _ = partialSum.withUnsafeBytes {
+                memcpy(target.buffer.contents() + target.byteOffset, $0.baseAddress!, nE * 4)
+            }
+            t = Date()
+            c1.waitCompleted()   // s.sharedOut pronto (di solito già finito)
+            let c2 = GraphContext(rt); try c2.begin()
+            try c2.decodeRemoteTail(s: scratch, d: d, partial: target, outHc: other)
+            commitFFN(c2)
+            profile.expertsS += Date().timeIntervalSince(t)
+        } else if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
             try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)

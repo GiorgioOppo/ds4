@@ -239,6 +239,12 @@ struct SettingsView: View {
                     TextField("Return port", value: $dist.returnPort, format: .number.grouping(.never))
                         .frame(width: 100)
                 }
+                Toggle("Vertical split (expert parallelism)", isOn: $dist.verticalEnabled)
+                if dist.verticalEnabled {
+                    Label("Workers own EXPERT shards (all layers); the dense backbone (attention/KV/head) runs on THIS Mac. ~41 network round-trips per token: requires a wired link (Thunderbolt bridge or direct Ethernet, RTT < 1 ms) — on Wi-Fi it is slower than the pipeline by design. Chat is not wired yet: use the vertical benchmark below after connecting.",
+                          systemImage: "arrow.triangle.branch")
+                        .font(.caption).foregroundStyle(.orange)
+                }
             }
             .disabled(dist.coordLoading)
             Section {
@@ -264,8 +270,15 @@ struct SettingsView: View {
                         Label("Disconnect", systemImage: "xmark.circle")
                     }
                 }
-                Text("The Chat tab now runs on the cluster.")
-                    .font(.caption).foregroundStyle(.tertiary)
+                if dist.verticalEnabled {
+                    Button("Benchmark verticale (96+28 token)") { dist.runVerticalBenchmark() }
+                        .disabled(dist.benchmarkActive)
+                    Text("Vertical route: expert shards remote, dense backbone local. Result in the coordinator log.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                } else {
+                    Text("The Chat tab now runs on the cluster.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
             }
         }
     }

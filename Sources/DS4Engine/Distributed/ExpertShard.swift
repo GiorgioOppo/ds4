@@ -21,6 +21,9 @@ public final class ExpertShardEngine: @unchecked Sendable {
     private let idsPacked: GPUTensor      // 0..<k rimappati (gli slab del gather sono impacchettati)
     private let partialOut: GPUTensor     // nEmbd f32
     private let preadFD: Int32?           // DS4_EXPERT_PREAD: gather via F_NOCACHE
+    /// Quant dei tensori esperti PER LAYER (mixed-precision): il dispatch dei
+    /// kernel deve seguire il layer, non il globale del primo layer routed.
+    private let layerQuants: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)]
     public let nLayers: Int
     /// mask[e] = questo shard possiede l'esperto e (per tutti i layer routed).
     public let mask: [Bool]
@@ -48,6 +51,21 @@ public final class ExpertShardEngine: @unchecked Sendable {
         try GGUFWeights.validateRoutedExperts(model, dims: d, nLayers: DSV4Shape.nLayer)
         self.dims = d
         self.nLayers = DSV4Shape.nLayer
+        // Quant PER-LAYER (GGUF mixed-precision, "boosted layer"): il percorso
+        // locale dispatcha su w.*Quant per layer — usare il globale del primo
+        // layer routed decodificherebbe gli slab di un layer boosted col
+        // kernel sbagliato: garbage finito e SILENZIOSO. Stessa mappatura di
+        // GGUFWeights.setExpertQuant; fallback al globale sui layer densi.
+        var lq: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)] = []
+        lq.reserveCapacity(DSV4Shape.nLayer)
+        for il in 0..<DSV4Shape.nLayer {
+            let p = "blk.\(il)."
+            let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap { MoEQuant.from(ggufType: $0.type) } ?? d.gateQuant
+            let u = model.findTensor(p + "ffn_up_exps.weight").flatMap { MoEQuant.from(ggufType: $0.type) } ?? d.upQuant
+            let dn = model.findTensor(p + "ffn_down_exps.weight").flatMap { MoEQuant.from(ggufType: $0.type) } ?? d.downQuant
+            lq.append((gate: g, up: u, down: dn))
+        }
+        self.layerQuants = lq
         var m = [Bool](repeating: false, count: d.nExperts)
         for e in 0..<min(d.nExperts, expertMask.count * 8) {
             let byte = expertMask[expertMask.startIndex + e / 8]
@@ -76,11 +94,16 @@ public final class ExpertShardEngine: @unchecked Sendable {
             throw GGUFWeights.LoadError.message("expertWork: layer \(req.layer) fuori range")
         }
         guard !req.ids.isEmpty, req.ids.count <= dims.k,
-              req.weights.count == req.ids.count,
-              req.ids.allSatisfy({ $0 >= 0 && Int($0) < dims.nExperts && mask[Int($0)] }) else {
-            throw GGUFWeights.LoadError.message("expertWork: id non posseduti da questo shard")
+              req.weights.count == req.ids.count else {
+            throw GGUFWeights.LoadError.message(
+                "expertWork: k=\(req.ids.count) fuori range o pesi disallineati (\(req.weights.count))")
+        }
+        guard req.ids.allSatisfy({ $0 >= 0 && Int($0) < dims.nExperts && mask[Int($0)] }),
+              Set(req.ids).count == req.ids.count else {
+            throw GGUFWeights.LoadError.message("expertWork: id non posseduti da questo shard o duplicati")
         }
         let k = req.ids.count
+        let quant = layerQuants[req.layer]
         // Attivazione → s.cur (f32; f16 di rete convertita CPU-side).
         let curPtr = scratch.cur.buffer.contents().advanced(by: scratch.cur.byteOffset)
         if req.bits == 32 {
@@ -92,11 +115,14 @@ public final class ExpertShardEngine: @unchecked Sendable {
             guard req.activation.count == nE * 2 else {
                 throw GGUFWeights.LoadError.message("expertWork: attivazione f16 di taglia errata")
             }
-            req.activation.withUnsafeBytes { raw in
-                let src = raw.bindMemory(to: Float16.self)
-                let dst = curPtr.bindMemory(to: Float.self, capacity: nE)
-                for i in 0..<nE { dst[i] = Float(src[i]) }
+            // Staging con memcpy: una Data di rete può essere una slice NON
+            // allineata — bindMemory(to: Float16) su base disallineata è UB.
+            var halves = [Float16](repeating: 0, count: nE)
+            _ = halves.withUnsafeMutableBytes { dst in
+                req.activation.withUnsafeBytes { src in memcpy(dst.baseAddress!, src.baseAddress!, nE * 2) }
             }
+            let dst = curPtr.bindMemory(to: Float.self, capacity: nE)
+            for i in 0..<nE { dst[i] = Float(halves[i]) }
         }
         // Pesi di route → s.rw (le righe oltre k restano 0: gli slot inerti
         // del percorso fuso non contribuiscono).
@@ -112,7 +138,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
         // diversi — una riga stantia di una richiesta a k più alto
         // avvelenerebbe la somma).
         let sumFused = dims.fusedMoE && k == 6
-            && (dims.downQuant == .q2_K || dims.downQuant == .q4_K)
+            && (quant.down == .q2_K || quant.down == .q4_K)
         if !sumFused && k < 6 {
             let d6 = scratch.down6.buffer.contents().advanced(by: scratch.down6.byteOffset)
             memset(d6 + k * nE * 4, 0, (6 - k) * nE * 4)
@@ -120,11 +146,16 @@ public final class ExpertShardEngine: @unchecked Sendable {
         let c = GraphContext(rt)
         try c.begin()
         try c.decodeExpertPartial(s: scratch, d: dims,
-                                  gateQuant: dims.gateQuant, upQuant: dims.upQuant,
-                                  downQuant: dims.downQuant,
+                                  gateQuant: quant.gate, upQuant: quant.up,
+                                  downQuant: quant.down,
                                   gateExp: g, upExp: u, downExp: dn,
                                   ids: idsPacked, k: k, out: partialOut)
         c.commit()
+        // Un fault GPU (es. slab fuori misura) completa "con errore" lasciando
+        // partialOut stantio: fallire FORTE invece di serializzare spazzatura.
+        if let err = c.lastError {
+            throw GGUFWeights.LoadError.message("expertWork: command buffer fallito (\(err))")
+        }
         // Somma parziale → payload (f32 o f16, come la richiesta).
         let outPtr = partialOut.buffer.contents().advanced(by: partialOut.byteOffset)
             .bindMemory(to: Float.self, capacity: nE)

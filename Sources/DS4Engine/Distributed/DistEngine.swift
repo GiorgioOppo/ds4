@@ -77,6 +77,58 @@ public final class DistEngine: @unchecked Sendable {
     /// Serialized usage collected so far (nil when the decoder tracks none).
     public func usageData() -> Data? { decoder.usage?.serialize() }
 
+    // MARK: Verticale (expert parallelism, Fase C)
+
+    /// Instrada la FFN routed sui worker remoti: (layer, id, pesi, attivazione)
+    /// → somma parziale già ridotta. nil = percorso locale. Impostare PRIMA di
+    /// qualunque decode.
+    public func setRemoteExperts(_ f: (@Sendable (Int, [Int32], [Float], [Float]) throws -> [Float])?) {
+        decoder.remoteExperts = f
+    }
+
+    /// Benchmark del motore verticale (backbone locale + esperti remoti):
+    /// identico a InferenceService.benchmark — prompt sintetico, prefill, poi
+    /// genTokens di decode con velocità per-token. Da chiamare FUORI dal main
+    /// actor e fuori dal cooperative pool (il decode blocca sul round-trip di
+    /// rete): Task.detached.
+    public func benchmarkVertical(contextTokens: Int, genTokens: Int) throws -> InferenceService.BenchPoint {
+        let ctx = max(8, min(contextTokens, contextSize - genTokens - 4))
+        var ids: [Int] = [Int(tok.bosId)]
+        let filler = tok.tokenizeRenderedChat("The quick brown fox jumps over the lazy dog. ").map { Int($0) }
+        let pad = filler.isEmpty ? [Int(tok.eosId)] : filler
+        var i = 0
+        while ids.count < ctx { ids.append(pad[i % pad.count]); i += 1 }
+        ids = Array(ids.prefix(ctx))
+        let t0 = Date()
+        var lastLogits = try decoder.prefill(tokens: ids, startPos: 0)
+        let prefillDt = Date().timeIntervalSince(t0)
+        var pos = ids.count
+        var rng: UInt64 = 0xD54
+        var produced = 0
+        var tokenSpeeds: [Double] = []
+        let g0 = Date()
+        while produced < genTokens {
+            try Task.checkCancellation()
+            let next = Sampler.sample(lastLogits, temperature: 0.6, topK: 0, topP: 0.95, minP: 0.05, rng: &rng)
+            let t = Date()
+            lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
+            let dt = Date().timeIntervalSince(t)
+            if dt > 0 { tokenSpeeds.append(1.0 / dt) }
+            pos += 1; produced += 1
+        }
+        let genDt = Date().timeIntervalSince(g0)
+        var p99 = 0.0
+        if !tokenSpeeds.isEmpty {
+            let sorted = tokenSpeeds.sorted()
+            p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
+        }
+        let kv = UInt64(DSV4Shape.nLayer) * UInt64(ctx) * UInt64(DSV4Shape.dims.headDim) * 4
+        return InferenceService.BenchPoint(contextTokens: ctx,
+                                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
+                                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
+                                           kvBytes: kv, genTpsP99: p99, genSpeeds: tokenSpeeds)
+    }
+
     // MARK: Worker-side disk KV (shard checkpoints, driven by the coordinator)
 
     /// Enable/disable shard checkpoints. Budget in TOKENS; nil directory = off.

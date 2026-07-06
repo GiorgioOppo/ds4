@@ -568,6 +568,18 @@ extension GraphContext {
         }
     }
 
+    /// Coda del layer per l'expert parallelism (coordinatore VERTICALE, Fase C):
+    /// la somma pesata degli esperti routed arriva DALLA RETE (già ridotta tra
+    /// i worker) in `partial` — restano l'add della FFN condivisa (s.sharedOut,
+    /// già encodata) e l'HC expand, identici al percorso locale.
+    public func decodeRemoteTail(s: DecodeScratch, d: DSV4Dims, partial: GPUTensor,
+                                 outHc: GPUTensor) throws {
+        try add(s.sharedOut, partial, out: s.ffnOut, width: d.nEmbd)
+        try hcExpand4(blockOut: s.ffnOut, residual: s.afterAttn, post: s.split, comb: s.split,
+                      blockAdd: nil, out: outHc, nEmbd: d.nEmbd, nTokens: 1,
+                      postByteOffset: 4 * 4, combByteOffset: 8 * 4)
+    }
+
     /// Tail of the routed FFN for the batched-MM prefill (DS4_PREFILL_MM): the
     /// k weighted down rows are already in s.down6 (blitted from the group's
     /// matmul output) — sum6 + shared add + HC expand, the same dispatches the

@@ -50,7 +50,13 @@ public enum Dist {
     /// dense streaming/mlock/pread — measured 0.37 tok/s against the same
     /// hardware's 2.7 local. The coordinator's measured configuration IS the
     /// job definition: the worker applies it before loading its engine.
-    public static let protocolVersion: UInt32 = 9
+    /// v10: EXPERT PARALLELISM (scissione verticale, Fase B/C). Nuovi frame
+    /// expertAssign/expertWork/expertSum: i worker possono servire shard di
+    /// ESPERTI (mask sui 256, tutti i layer) e il coordinatore può montare la
+    /// route verticale (backbone denso locale + FFN routed remota). Il bump
+    /// evita il mix: un worker più vecchio ignorerebbe l'expertAssign e il
+    /// coordinatore resterebbe in attesa del READY per sempre.
+    public static let protocolVersion: UInt32 = 10
 
     /// The env knobs an ASSIGN may carry and a worker will apply (v9). A
     /// WHITELIST on both sides: the wire must never gain the power to set
@@ -784,7 +790,11 @@ public struct DistExpertAssign: Sendable {
         d.appendLE(UInt32(name.count)); d.append(name)
         d.appendLE(UInt32(expertCacheSlots))
         d.appendLE(UInt32(useExpertBundle ? 1 : 0))
-        d.append(expertMask.prefix(32))
+        // ESATTAMENTE 32 byte sul filo: una mask corta scalerebbe i campi
+        // successivi (usageLen letto dentro la mask) — pad a zero, mai meno.
+        var mask32 = expertMask.prefix(32)
+        if mask32.count < 32 { mask32.append(Data(repeating: 0, count: 32 - mask32.count)) }
+        d.append(mask32)
         d.appendLE(UInt32(usageJSON.count)); d.append(usageJSON)
         d.appendLE(UInt32(envKnobs.count))
         for (k, v) in envKnobs {
@@ -853,7 +863,9 @@ public struct DistExpertWork: Sendable {
         d.appendLE(UInt32(bits))
         d.appendLE(UInt32(ids.count))
         for i in ids { d.appendLE(UInt32(bitPattern: i)) }
-        for w in weights.prefix(ids.count) { d.appendLE(w.bitPattern) }
+        // Il decoder legge SEMPRE ids.count pesi: un chiamante disallineato
+        // produrrebbe un frame che sfasa actLen — pad a zero, mai meno.
+        for j in 0..<ids.count { d.appendLE(j < weights.count ? weights[j].bitPattern : Float(0).bitPattern) }
         d.appendLE(UInt32(activation.count)); d.append(activation)
         return d
     }

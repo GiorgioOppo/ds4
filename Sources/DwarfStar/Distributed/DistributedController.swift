@@ -156,16 +156,51 @@ final class DistributedController {
         coordLogTask = Task { [weak self] in for await s in logStream { self?.coordLog += s } }
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
 
+        let vertical = verticalEnabled
         coordTask = Task {
             do {
                 let coord = try await Task.detached { try DistCoordinator(config: cfg) }.value
-                try await coord.connect(onLog: onLog)
+                if vertical {
+                    try await coord.connectVertical(onLog: onLog)
+                } else {
+                    try await coord.connect(onLog: onLog)
+                }
                 self.coordinator = coord
                 self.coordLoading = false; self.connected = true
             } catch {
                 logCont.yield("connection failed: \(error)\n")
                 self.coordLoading = false; self.connected = false
             }
+        }
+    }
+
+    // MARK: Verticale (expert parallelism, Fase C)
+
+    /// Scissione VERTICALE: i worker ricevono shard di ESPERTI (mask sui 256)
+    /// e il backbone denso (route/attention/KV/head) gira su QUESTO Mac.
+    /// Prerequisito misurato: RTT < 1 ms tra i nodi (Thunderbolt/Ethernet
+    /// diretta) — su Wi-Fi i ~41 round-trip per token costano più del guadagno.
+    var verticalEnabled: Bool = UserDefaults.standard.bool(forKey: "DS4DistVertical") {
+        didSet { UserDefaults.standard.set(verticalEnabled, forKey: "DS4DistVertical") }
+    }
+
+    /// Benchmark della route verticale (prompt sintetico 96 + 28 di decode);
+    /// il decode blocca sui round-trip di rete, quindi gira detached.
+    func runVerticalBenchmark() {
+        guard connected, let coord = coordinator, !benchmarkActive else { return }
+        benchmarkActive = true
+        coordLog += "benchmark verticale (96 prefill + 28 decode)…\n"
+        Task {
+            do {
+                let p = try await Task.detached {
+                    try coord.verticalBenchmark(contextTokens: 96, genTokens: 28)
+                }.value
+                self.coordLog += String(format: "verticale: prefill %.2f tok/s · decode regime %.2f tok/s (media %.2f)\n",
+                                        p.prefillTps, p.genTpsP99, p.genTps)
+            } catch {
+                self.coordLog += "benchmark verticale fallito: \(error)\n"
+            }
+            self.benchmarkActive = false
         }
     }
 

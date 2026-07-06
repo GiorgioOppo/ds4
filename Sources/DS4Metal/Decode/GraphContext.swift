@@ -75,11 +75,18 @@ public final class GraphContext {
         phaseStart = Date()
     }
 
+    /// Errore dell'ULTIMO command buffer committato (nil = ok). Un fault GPU
+    /// completa il cb "con errore" senza alcun throw: i chiamanti che
+    /// serializzano il risultato altrove (expert shard verticale) devono
+    /// controllarlo dopo commit() — altrimenti spedirebbero byte stantii.
+    public private(set) var lastError: Error?
+
     /// Flush: end encoding, commit, wait. After this the GPUTensor outputs are readable.
     public func commit() {
         enc?.endEncoding()
         cb?.commit()
         cb?.waitUntilCompleted()
+        lastError = cb?.error
         enc = nil; cb = nil
     }
 
