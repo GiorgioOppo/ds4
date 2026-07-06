@@ -1717,6 +1717,117 @@ public final class StreamingDecoder {
                                     embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                     expertGather: nil)   // single-cb decodeLayer with real ids
     }
+
+    // MARK: Stack di gather per lo SHARD VERTICALE (expert parallelism, D2)
+
+    /// Assembla per un consumatore ESTERNO (l'expert shard del worker
+    /// verticale, modulo DS4Engine) la stessa terna del motore locale:
+    /// gather con bundle sidecar, slot-cache LRU con pool interleaved e fill
+    /// a pread concorrenti, pre-warm e allocazione per-layer dalla usage
+    /// imatrix. DUPLICA volutamente l'assemblaggio della factory locale
+    /// invece di rifattorizzarla (zero rischio di regressione sul percorso
+    /// caldo); stessa semantica degli stessi env: DS4_EXPERT_BUNDLE,
+    /// DS4_EXPERT_PREAD, DS4_WILLNEED_EXPERTS, DS4_POOL_INTERLEAVE,
+    /// DS4_EXPERT_CACHE_UNIFORM (MLOCK via `lockResident`).
+    public static func makeExpertGatherStack(rt: MetalRuntime, model: GGUFModel, dims: DSV4Dims,
+                                             nLayers: Int, slots: Int, usage: ExpertUsageStats,
+                                             lockResident: Bool)
+        -> (gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor),
+            cache: ExpertSlotCache?, stride: Int?) {
+        let env = ProcessInfo.processInfo.environment
+        let willNeed = env["DS4_WILLNEED_EXPERTS"] != "0"
+        let uncachedFD = env["DS4_EXPERT_PREAD"] == "1" ? model.uncachedFD() : nil
+        let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
+        let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
+        let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+        let bundleEnabled = env["DS4_EXPERT_BUNDLE"] == "1"
+        let bundle: ExpertBundle? = bundleEnabled
+            ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
+                                       gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
+            : nil
+        let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
+            if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
+            return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
+                                                      willNeed: willNeed, uncachedFD: uncachedFD)
+        }
+        guard slots > 0 else { return (gather, nil, nil) }
+        let S = max(8, slots)
+        var fillPrefetch: ((Int, [Int32]) -> Void)? = nil
+        if uncachedFD == nil {
+            fillPrefetch = { il, ids in
+                for id in ids {
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: gateBytes)
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
+                    GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
+                }
+            }
+        }
+        let interleave = env["DS4_POOL_INTERLEAVE"] != "0"
+        let recordBytes = gateBytes + upBytes + downBytes
+        typealias Pool = (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
+        let makePool: (Int) throws -> Pool
+        if interleave {
+            makePool = { nSlots in
+                let buf = try GPUTensor.zerosBytes(rt, byteLength: nSlots * recordBytes)
+                if lockResident { buf.lockResident() }
+                let up = GPUTensor(buffer: buf.buffer, byteLength: nSlots * recordBytes - gateBytes,
+                                   count: nSlots * recordBytes - gateBytes, byteOffset: gateBytes)
+                let down = GPUTensor(buffer: buf.buffer,
+                                     byteLength: nSlots * recordBytes - gateBytes - upBytes,
+                                     count: nSlots * recordBytes - gateBytes - upBytes,
+                                     byteOffset: gateBytes + upBytes)
+                return (gate: buf, up: up, down: down)
+            }
+        } else {
+            makePool = { nSlots in
+                let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: nSlots * gateBytes),
+                         up: try GPUTensor.zerosBytes(rt, byteLength: nSlots * upBytes),
+                         down: try GPUTensor.zerosBytes(rt, byteLength: nSlots * downBytes))
+                if lockResident { p.gate.lockResident(); p.up.lockResident(); p.down.lockResident() }
+                return p
+            }
+        }
+        let cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
+                                    fill: { il, id, pool, slot in
+            if let b = bundle {
+                if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
+                                                       slot: slot, stride: recordBytes) {
+                    return
+                }
+                if !interleave, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
+                                             upDst: pool.up, downDst: pool.down, slot: slot) {
+                    return
+                }
+            }
+            nonisolated(unsafe) let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
+                ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
+                ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
+                ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
+            let lock = NSLock()
+            nonisolated(unsafe) var firstError: Error? = nil
+            nonisolated(unsafe) let modelRef = model
+            DispatchQueue.concurrentPerform(iterations: jobs.count) { j in
+                do {
+                    try GGUFWeights.copyExpert(modelRef, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
+                                               into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD,
+                                               slotStride: interleave ? recordBytes : nil)
+                } catch {
+                    lock.lock()
+                    if firstError == nil { firstError = error }
+                    lock.unlock()
+                }
+            }
+            if let e = firstError { throw e }
+        }, prefetch: fillPrefetch,
+           warm: { il in
+            usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
+        },
+           slotsFor: { il in
+            if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" { return S }
+            return usage.slotAllocation(base: S)?[il] ?? S
+        })
+        return (gather, cache, interleave ? recordBytes : nil)
+    }
 }
 
 /// Loads each layer's weights once and reuses them across tokens (weights are

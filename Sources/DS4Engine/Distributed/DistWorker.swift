@@ -920,8 +920,12 @@ public final class DistWorker: @unchecked Sendable {
         do {
             let report: @Sendable (String) -> Void = { [onLog] t in onLog("caricamento shard: \(t)\n") }
             let maskData = assign.expertMask
+            let slots = assign.expertCacheSlots
+            let usageJSON = assign.usageJSON
             let shard = try await Task.detached(priority: .userInitiated) {
-                try ExpertShardEngine(modelPath: resolved, expertMask: maskData, onLoadLog: report)
+                try ExpertShardEngine(modelPath: resolved, expertMask: maskData,
+                                      expertCacheSlots: slots, usageJSON: usageJSON,
+                                      onLoadLog: report)
             }.value
             commitShard(shard)
             onLog("expert-shard pronto: \(shard.ownedCount)/256 esperti\n")

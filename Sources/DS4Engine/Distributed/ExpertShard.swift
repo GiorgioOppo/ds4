@@ -20,8 +20,15 @@ public final class ExpertShardEngine: @unchecked Sendable {
     private let scratch: DecodeScratch
     private let idsPacked: GPUTensor      // 0..<k rimappati (gli slab del gather sono impacchettati)
     private let partialOut: GPUTensor     // nEmbd f32
-    private let preadFD: Int32?           // DS4_EXPERT_PREAD: gather via F_NOCACHE
-    private let willNeedHints: Bool       // DS4_WILLNEED_EXPERTS (default ON)
+    /// D2: la stessa terna del motore locale — gather (bundle sidecar) +
+    /// slot-cache LRU + stride del pool interleaved. La cache tiene caldi gli
+    /// esperti POSSEDUTI: lo shard non ha KV né backbone, quindi può
+    /// permettersi più slot per layer di quanti ne abbia il locale.
+    private let gatherFn: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor)
+    private let slotCache: ExpertSlotCache?
+    private let slotStride: Int?
+    private let usage: ExpertUsageStats
+    private let slotsStage: GPUTensor     // id di slot per il matvec sul pool
     /// Quant dei tensori esperti PER LAYER (mixed-precision): il dispatch dei
     /// kernel deve seguire il layer, non il globale del primo layer routed.
     private let layerQuants: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)]
@@ -34,6 +41,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
     private let lock = NSLock()
 
     public init(modelPath: String, expertMask: Data,
+                expertCacheSlots: Int = 0, usageJSON: Data = Data(),
                 onLoadLog: (@Sendable (String) -> Void)? = nil) throws {
         onLoadLog?("init Metal runtime (compilazione kernel)…")
         self.rt = try MetalRuntime()
@@ -81,12 +89,22 @@ public final class ExpertShardEngine: @unchecked Sendable {
         self.idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(d.k)).withUnsafeBytes { Array($0) },
                                              elementCount: d.k)
         self.partialOut = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
-        self.preadFD = ProcessInfo.processInfo.environment["DS4_EXPERT_PREAD"] == "1"
-            ? model.uncachedFD() : nil
-        // Stessa semantica del motore locale: hint di readahead ON di default,
-        // DS4_WILLNEED_EXPERTS=0 li spegne (baseline di misura).
-        self.willNeedHints = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"
-        onLoadLog?("shard pronto: \(ownedCount)/\(d.nExperts) esperti")
+        // D2: bundle + slot-cache + pre-warm dalla usage imatrix — la stessa
+        // terna del motore locale, assemblata dal helper condiviso.
+        let stats = ExpertUsageStats(nLayers: DSV4Shape.nLayer)
+        if !usageJSON.isEmpty { stats.load(usageJSON) }
+        self.usage = stats
+        let mlock = ProcessInfo.processInfo.environment["DS4_MLOCK"] == "1"
+        let stack = StreamingDecoder.makeExpertGatherStack(rt: rt, model: model, dims: d,
+                                                           nLayers: DSV4Shape.nLayer,
+                                                           slots: expertCacheSlots, usage: stats,
+                                                           lockResident: mlock)
+        self.gatherFn = stack.gather
+        self.slotCache = stack.cache
+        self.slotStride = stack.stride
+        self.slotsStage = try GPUTensor.zerosBytes(rt, byteLength: d.k * 4)
+        onLoadLog?("shard pronto: \(ownedCount)/\(d.nExperts) esperti"
+                   + (stack.cache != nil ? " · cache \(max(8, expertCacheSlots)) slot/layer" : " · cache OFF"))
     }
 
     /// Somma parziale pesata per una richiesta `expertWork`. Sincrona (gather
@@ -133,10 +151,31 @@ public final class ExpertShardEngine: @unchecked Sendable {
         // Pesi di route (gli slot oltre k restano 0: gli slot inerti del
         // percorso fuso non contribuiscono).
         scratch.writeRouteWeights(req.weights, padTo: dims.k)
-        // Gather dei SUOI esperti: slab impacchettati, id rimappati 0..<k.
-        let (g, u, dn) = try GGUFWeights.gatherLayerExperts(rt, model, req.layer, ids: req.ids,
-                                                            dims: dims, willNeed: willNeedHints,
-                                                            uncachedFD: preadFD)
+        // Usage: il routing reale visto dallo shard alimenta pre-warm e
+        // allocazione per-layer (stessa imatrix del locale).
+        usage.record(layer: req.layer, ids: req.ids)
+        // Esperti: slot-cache (hit = zero I/O) quando il layer è nella classe
+        // di quant globale (la cache è mono-classe, come nel locale); i layer
+        // mixed-precision e la cache spenta passano dal gather (bundle/mmap).
+        let gExp: GPUTensor, uExp: GPUTensor, dExp: GPUTensor
+        let idsTensor: GPUTensor
+        let stride: Int?
+        let onClass = quant.gate == dims.gateQuant && quant.up == dims.upQuant
+            && quant.down == dims.downQuant
+        if let cache = slotCache, onClass {
+            let (pool, slots) = try cache.acquire(layer: req.layer, ids: req.ids)
+            _ = slots.withUnsafeBytes {
+                memcpy(slotsStage.buffer.contents() + slotsStage.byteOffset, $0.baseAddress!, $0.count)
+            }
+            gExp = pool.gate; uExp = pool.up; dExp = pool.down
+            idsTensor = slotsStage
+            stride = slotStride
+        } else {
+            let (g, u, dn) = try gatherFn(req.layer, req.ids)
+            gExp = g; uExp = u; dExp = dn
+            idsTensor = idsPacked
+            stride = nil
+        }
         // moe_sum6 somma SEMPRE 6 righe: con k<6 sul percorso non fuso le
         // righe k..<6 di down6 vanno azzerate (richieste diverse hanno k
         // diversi — una riga stantia di una richiesta a k più alto
@@ -149,8 +188,9 @@ public final class ExpertShardEngine: @unchecked Sendable {
         try c.decodeExpertPartial(s: scratch, d: dims,
                                   gateQuant: quant.gate, upQuant: quant.up,
                                   downQuant: quant.down,
-                                  gateExp: g, upExp: u, downExp: dn,
-                                  ids: idsPacked, k: k, out: partialOut)
+                                  gateExp: gExp, upExp: uExp, downExp: dExp,
+                                  ids: idsTensor, k: k, out: partialOut,
+                                  expertStride: stride)
         c.commit()
         // Un fault GPU (es. slab fuori misura) completa "con errore" lasciando
         // partialOut stantio: fallire FORTE invece di serializzare spazzatura.
