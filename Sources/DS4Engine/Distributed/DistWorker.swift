@@ -293,6 +293,25 @@ public final class DistWorker: @unchecked Sendable {
     /// L'assegnazione del load in corso (v8): un retry del coordinatore con la
     /// STESSA assegnazione si aggancia al load invece di ricevere "busy".
     private var pendingAssignment: Assignment?
+    /// Expert parallelism (Fase B): lo shard verticale di esperti, alternativo
+    /// all'assegnazione a layer (un worker fa l'uno o l'altro).
+    private var expertShard: ExpertShardEngine?
+    private var loadingShard = false
+
+    private func currentShard() -> ExpertShardEngine? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return expertShard
+    }
+    private func claimShardLoad() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if loadingShard { return false }
+        loadingShard = true
+        expertShard = nil            // libera il vecchio shard PRIMA del nuovo load
+        return true
+    }
+    private func commitShard(_ s: ExpertShardEngine?) {
+        stateLock.lock(); expertShard = s; loadingShard = false; stateLock.unlock()
+    }
     /// Where this shard persists its usage imatrix (slice-keyed: counts are
     /// collected only for the owned layers). nil until assigned.
     private var usageFile: URL?
@@ -536,6 +555,31 @@ public final class DistWorker: @unchecked Sendable {
                 }
                 if type == .assign {
                     try await handleAssign(payload, on: conn, resolvedFiles: resolvedFiles)
+                    continue
+                }
+                if type == .expertAssign {
+                    try await handleExpertAssign(payload, on: conn, resolvedFiles: resolvedFiles)
+                    continue
+                }
+                if type == .expertWork {
+                    guard let req = DistExpertWork.decode(payload) else {
+                        try await conn.sendFrame(.error, Data("malformed EXPERT WORK frame".utf8))
+                        continue
+                    }
+                    guard let shard = currentShard() else {
+                        try await conn.sendFrame(.error,
+                                                 Data("worker not ready: no expert shard loaded (send EXPERT ASSIGN first)".utf8))
+                        continue
+                    }
+                    do {
+                        // Sincrona (gather SSD + un cb GPU, ~ms): una richiesta
+                        // alla volta per connessione — il parallelismo del
+                        // verticale è TRA i worker.
+                        let sum = try shard.partial(req)
+                        try await conn.sendFrame(.expertSum, sum.encoded())
+                    } catch {
+                        try await conn.sendFrame(.error, Data("expertWork(seq \(req.seq)): \(error)".utf8))
+                    }
                     continue
                 }
                 if type == .kvQuery || type == .kvRestore || type == .kvSave {
@@ -838,6 +882,55 @@ public final class DistWorker: @unchecked Sendable {
 
     private func releaseAssignmentClaim() {
         stateLock.lock(); loadingAssignment = false; pendingAssignment = nil; stateLock.unlock()
+    }
+
+    /// EXPERT ASSIGN (Fase B, scissione verticale): carica lo shard di esperti
+    /// definito dalla mask. Alternativo all'assegnazione a layer; il modello
+    /// arriva dalla stessa distribuzione file v8 (offer/need/resume).
+    private func handleExpertAssign(_ payload: Data, on conn: DistConnection,
+                                    resolvedFiles: [String: String]) async throws {
+        guard let assign = DistExpertAssign.decode(payload) else {
+            try await conn.sendFrame(.error, Data("malformed EXPERT ASSIGN frame".utf8))
+            return
+        }
+        let sanitizedName = DistFileStore.sanitize(assign.modelName)
+        guard let resolved = resolvedFiles[sanitizedName]
+                ?? Self.resolveModelPath(requestedPath: "", modelName: assign.modelName,
+                                         localHint: config.localModelPath) else {
+            let msg = "gguf '\(assign.modelName)' not available on this worker"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
+            return
+        }
+        // Knob di performance del coordinatore (stessa whitelist di handleAssign).
+        let allowedKnobs = Set(Dist.perfKnobKeys)
+        for (k, v) in assign.envKnobs where allowedKnobs.contains(k) && v.count <= 256 {
+            _ = setenv(k, v, 1)
+        }
+        _ = setenv("DS4_EXPERT_BUNDLE", assign.useExpertBundle ? "1" : "0", 1)
+        if assign.useExpertBundle,
+           let bundlePath = resolvedFiles[sanitizedName + ".expbundle"] {
+            _ = setenv("DS4_BUNDLE_DIR", (bundlePath as NSString).deletingLastPathComponent, 1)
+        }
+        guard claimShardLoad() else {
+            try await conn.sendFrame(.error, Data("worker busy loading an expert shard".utf8))
+            return
+        }
+        onLog("expert-shard: \(assign.modelName) — carico lo shard…\n")
+        do {
+            let report: @Sendable (String) -> Void = { [onLog] t in onLog("caricamento shard: \(t)\n") }
+            let maskData = assign.expertMask
+            let shard = try await Task.detached(priority: .userInitiated) {
+                try ExpertShardEngine(modelPath: resolved, expertMask: maskData, onLoadLog: report)
+            }.value
+            commitShard(shard)
+            onLog("expert-shard pronto: \(shard.ownedCount)/256 esperti\n")
+            try await conn.sendFrame(.ready, helloPayload().encoded())
+        } catch {
+            commitShard(nil)
+            onLog("expert-shard: load fallito (\(error))\n")
+            try await conn.sendFrame(.error, Data("expert shard load failed: \(error)".utf8))
+        }
     }
 
     /// Apply the parts of an ASSIGN that do NOT require a reload: the usage

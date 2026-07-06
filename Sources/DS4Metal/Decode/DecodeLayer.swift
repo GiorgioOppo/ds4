@@ -523,6 +523,51 @@ extension GraphContext {
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
     }
 
+    /// Expert parallelism (worker shard VERTICALE, Fase B): SOLO la somma
+    /// pesata degli esperti forniti — la stessa sequenza di dispatch di
+    /// decodeRoutedExperts fino a s.routed, SENZA shared-add né HC expand
+    /// (vivono sul coordinatore). I quant arrivano espliciti (lo shard non
+    /// carica LayerWeights). Input: s.cur (attivazione), s.rw (pesi di route,
+    /// k valori). ATTENZIONE: quando il percorso non fuso è attivo (k < 6),
+    /// moe_sum6 somma SEMPRE 6 righe — il chiamante DEVE aver azzerato le
+    /// righe k..<6 di s.down6 prima di encodare.
+    public func decodeExpertPartial(s: DecodeScratch, d: DSV4Dims,
+                                    gateQuant: MoEQuant, upQuant: MoEQuant, downQuant: MoEQuant,
+                                    gateExp: GPUTensor, upExp: GPUTensor, downExp: GPUTensor,
+                                    ids: GPUTensor, k: Int, out: GPUTensor,
+                                    expertStride: Int? = nil) throws {
+        let kk = max(1, min(k, d.k))
+        let pairFused = d.fusedMoE && gateQuant == upQuant
+            && (gateQuant == .iq2_xxs || gateQuant == .q4_K)
+        if pairFused {
+            try moePairSwiGLU(gateQuant, gateExp: gateExp, upExp: upExp, ids: ids,
+                              activation: s.cur, weights: s.rw, gateScratch: s.gate6,
+                              upScratch: s.up6, mid: s.mid6,
+                              k: kk, inDim: d.nEmbd, outDim: d.expertFfn, clamp: d.swigluClamp,
+                              expertStride: expertStride)
+        } else {
+            try moeMatvecID(gateQuant, experts: gateExp, ids: ids, activation: s.cur, out: s.gate6,
+                            k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false,
+                            expertStride: expertStride)
+            try moeMatvecID(upQuant, experts: upExp, ids: ids, activation: s.cur, out: s.up6,
+                            k: kk, inDim: d.nEmbd, outDim: d.expertFfn, perExpertAct: false,
+                            expertStride: expertStride)
+            try moeSwiGLUWeight(gate: s.gate6, up: s.up6, weights: s.rw, mid: s.mid6,
+                                width: d.expertFfn, rows: kk, clampValue: d.swigluClamp)
+        }
+        let sumFused = d.fusedMoE && kk == 6 && (downQuant == .q2_K || downQuant == .q4_K)
+        if sumFused {
+            try moeDownSum6(downQuant, experts: downExp, ids: ids, mid: s.mid6,
+                            out: out, inDim: d.expertFfn, outDim: d.nEmbd,
+                            expertStride: expertStride)
+        } else {
+            try moeMatvecID(downQuant, experts: downExp, ids: ids, activation: s.mid6, out: s.down6,
+                            k: kk, inDim: d.expertFfn, outDim: d.nEmbd, perExpertAct: true,
+                            expertStride: expertStride)
+            try moeSum6(experts: s.down6, out: out, width: d.nEmbd)
+        }
+    }
+
     /// Tail of the routed FFN for the batched-MM prefill (DS4_PREFILL_MM): the
     /// k weighted down rows are already in s.down6 (blitted from the group's
     /// matmul output) — sum6 + shared add + HC expand, the same dispatches the
