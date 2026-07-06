@@ -241,7 +241,7 @@ struct SettingsView: View {
                 }
                 Toggle("Vertical split (expert parallelism)", isOn: $dist.verticalEnabled)
                 if dist.verticalEnabled {
-                    Label("Workers own EXPERT shards (all layers); the dense backbone (attention/KV/head) runs on THIS Mac. ~41 network round-trips per token: requires a wired link (Thunderbolt bridge or direct Ethernet, RTT < 1 ms) — on Wi-Fi it is slower than the pipeline by design. Chat is not wired yet: use the vertical benchmark below after connecting.",
+                    Label("Workers own EXPERT shards (all layers); the dense backbone (attention/KV/head) runs on THIS Mac. ~41 network round-trips per token: requires a wired link (Thunderbolt bridge or direct Ethernet, RTT < 1 ms) — on Wi-Fi it is slower than the pipeline by design. Chat and the vertical benchmark both run on this route once connected.",
                           systemImage: "arrow.triangle.branch")
                         .font(.caption).foregroundStyle(.orange)
                 }

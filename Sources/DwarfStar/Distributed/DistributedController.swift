@@ -262,16 +262,24 @@ final class DistributedController {
         let onReasoning: @Sendable (String) -> Void = { cont.yield(.reasoning($0)) }
         let onToken: @Sendable (String) -> Void = { cont.yield(.token($0)) }
 
+        let vertical = verticalEnabled
         coordTask = Task {
             // Explicit capture list: only Sendable copies cross into the detached
             // task (no main-actor state in the closure's region).
             let work = Task.detached { [coord, sendTurns, tools, wantThink, maxT, samp,
                                         onLog, onProgress, onReasoning, onToken] () -> Result<[ToolCall], Error> in
                 do {
-                    let calls = try await coord.send(turns: sendTurns, tools: tools, think: wantThink,
-                                                     maxTokens: maxT, sampling: samp,
-                                                     onLog: onLog, onProgress: onProgress,
-                                                     onReasoning: onReasoning, onToken: onToken)
+                    // Verticale: stesso contratto, decode sul backbone locale
+                    // (la FFN routed viaggia sui worker dentro ogni forward).
+                    let calls = vertical
+                        ? try await coord.sendVertical(turns: sendTurns, tools: tools, think: wantThink,
+                                                       maxTokens: maxT, sampling: samp,
+                                                       onLog: onLog, onProgress: onProgress,
+                                                       onReasoning: onReasoning, onToken: onToken)
+                        : try await coord.send(turns: sendTurns, tools: tools, think: wantThink,
+                                               maxTokens: maxT, sampling: samp,
+                                               onLog: onLog, onProgress: onProgress,
+                                               onReasoning: onReasoning, onToken: onToken)
                     return .success(calls)
                 } catch { return .failure(error) }
             }

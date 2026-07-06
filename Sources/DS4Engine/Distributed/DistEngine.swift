@@ -86,6 +86,16 @@ public final class DistEngine: @unchecked Sendable {
         decoder.remoteExperts = f
     }
 
+    /// Prefill/forward diretti del decoder (route verticale: il backbone è
+    /// QUESTO motore). BLOCCANTI sui round-trip di rete quando remoteExperts
+    /// è impostata — chiamare via Task.detached, mai sul cooperative pool.
+    public func verticalPrefill(tokens: [Int], startPos: Int) throws -> [Float] {
+        try decoder.prefill(tokens: tokens, startPos: startPos)
+    }
+    public func verticalForward(token: Int, pos: Int) throws -> [Float] {
+        try decoder.forward(token: token, pos: pos, nKeys: pos + 1)
+    }
+
     /// Benchmark del motore verticale (backbone locale + esperti remoti):
     /// identico a InferenceService.benchmark — prompt sintetico, prefill, poi
     /// genTokens di decode con velocità per-token. Da chiamare FUORI dal main
