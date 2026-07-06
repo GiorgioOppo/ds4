@@ -45,7 +45,27 @@ public enum Dist {
     /// against the chain, truncates to the last good checkpoint and answers
     /// FILE NEED with a per-file RESUME OFFSET. The coordinator streams from
     /// there and retries a broken peer setup up to 3 times before failing.
-    public static let protocolVersion: UInt32 = 8
+    /// v9: ASSIGN carries the coordinator's PERFORMANCE KNOBS (DS4_* env,
+    /// whitelisted). A worker with factory defaults ran the engine without
+    /// dense streaming/mlock/pread — measured 0.37 tok/s against the same
+    /// hardware's 2.7 local. The coordinator's measured configuration IS the
+    /// job definition: the worker applies it before loading its engine.
+    public static let protocolVersion: UInt32 = 9
+
+    /// The env knobs an ASSIGN may carry and a worker will apply (v9). A
+    /// WHITELIST on both sides: the wire must never gain the power to set
+    /// arbitrary environment on a worker. All performance-only — none of
+    /// these can change the numerics of the shard (DS4_DENSE_Q4, the one
+    /// lossy knob, travels as a typed field and its cache as a file).
+    public static let perfKnobKeys: [String] = [
+        "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_MLOCK",
+        "DS4_EXPERT_PREAD", "DS4_PREAD_SPLIT", "DS4_WILLNEED_EXPERTS",
+        "DS4_ASYNC_FFN", "DS4_EXPERT_LOOKAHEAD", "DS4_Q8_NSG",
+        "DS4_LAZY_IDX", "DS4_RESIDENT_COMP", "DS4_FUSED_HC", "DS4_FUSED_MOE",
+        "DS4_RAW_RING", "DS4_EXPERT_CACHE_UNIFORM", "DS4_POOL_INTERLEAVE",
+        "DS4_PREFILL_UNION", "DS4_PREFILL_CHUNK", "DS4_PREFILL_FFN_BATCH",
+        "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_MM",
+    ]
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
@@ -198,11 +218,16 @@ public struct DistAssign: Sendable {
     /// Usage-imatrix JSON (ExpertUsageStats.serialize) to seed the worker's
     /// slot-cache pre-warm; empty = none (the worker may still have its own).
     public var usageJSON: Data
+    /// v9: the coordinator's PERFORMANCE env (whitelisted, Dist.perfKnobKeys).
+    /// The worker applies these before loading its engine, so a shard runs
+    /// with the coordinator's measured configuration instead of whatever the
+    /// worker app's local defaults happen to be.
+    public var envKnobs: [(key: String, value: String)]
 
     public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
                 diskKVBudgetTokens: Int, useExpertBundle: Bool = false, useDenseQ4: Bool = false,
                 layerStart: Int, layerEnd: Int, hasOutput: Bool,
-                usageJSON: Data = Data()) {
+                usageJSON: Data = Data(), envKnobs: [(key: String, value: String)] = []) {
         self.modelPath = modelPath; self.modelName = modelName
         self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
         self.diskKVBudgetTokens = diskKVBudgetTokens
@@ -210,6 +235,7 @@ public struct DistAssign: Sendable {
         self.useDenseQ4 = useDenseQ4
         self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
         self.usageJSON = usageJSON
+        self.envKnobs = envKnobs
     }
 
     public func encoded() -> Data {
@@ -226,12 +252,18 @@ public struct DistAssign: Sendable {
         let name = Data(modelName.utf8)
         d.appendLE(UInt32(name.count)); d.append(name)
         d.appendLE(UInt32(usageJSON.count)); d.append(usageJSON)
+        d.appendLE(UInt32(envKnobs.count))
+        for (k, v) in envKnobs {
+            let kd = Data(k.utf8), vd = Data(v.utf8)
+            d.appendLE(UInt32(kd.count)); d.append(kd)
+            d.appendLE(UInt32(vd.count)); d.append(vd)
+        }
         return d
     }
 
     public static func decode(_ d: Data) -> DistAssign? {
         var o = d.startIndex
-        guard d.count >= 44 else { return nil }
+        guard d.count >= 48 else { return nil }
         let ctx = Int(d.readLE(&o) as UInt32)
         let slots = Int(d.readLE(&o) as UInt32)
         let kvBudget = Int(d.readLE(&o) as UInt32)
@@ -246,12 +278,27 @@ public struct DistAssign: Sendable {
         guard nameLen >= 0, o + nameLen + 4 <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
         let usageLen = Int(d.readLE(&o) as UInt32)
-        guard usageLen >= 0, o + usageLen <= d.endIndex else { return nil }
-        let usage = Data(d[o..<o+usageLen])
+        guard usageLen >= 0, o + usageLen + 4 <= d.endIndex else { return nil }
+        let usage = Data(d[o..<o+usageLen]); o += usageLen
+        let knobCount = Int(d.readLE(&o) as UInt32)
+        guard knobCount >= 0, knobCount <= 64 else { return nil }
+        var knobs: [(key: String, value: String)] = []
+        knobs.reserveCapacity(knobCount)
+        for _ in 0..<knobCount {
+            guard o + 4 <= d.endIndex else { return nil }
+            let kLen = Int(d.readLE(&o) as UInt32)
+            guard kLen > 0, kLen <= 256, o + kLen + 4 <= d.endIndex else { return nil }
+            let k = String(decoding: d[o..<o+kLen], as: UTF8.self); o += kLen
+            let vLen = Int(d.readLE(&o) as UInt32)
+            guard vLen >= 0, vLen <= 256, o + vLen <= d.endIndex else { return nil }
+            let v = String(decoding: d[o..<o+vLen], as: UTF8.self); o += vLen
+            knobs.append((key: k, value: v))
+        }
         return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
                           expertCacheSlots: slots, diskKVBudgetTokens: kvBudget,
                           useExpertBundle: bundle, useDenseQ4: q4,
-                          layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage)
+                          layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage,
+                          envKnobs: knobs)
     }
 }
 

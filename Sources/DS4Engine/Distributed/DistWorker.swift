@@ -668,6 +668,18 @@ public final class DistWorker: @unchecked Sendable {
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
         }
+        // v9: i knob di PERFORMANCE del coordinatore, applicati PRIMA del
+        // load (l'env è letto alla creazione del motore). Doppia whitelist:
+        // il filo non deve mai poter impostare variabili arbitrarie qui.
+        let allowedKnobs = Set(Dist.perfKnobKeys)
+        var appliedKnobs: [String] = []
+        for (k, v) in assign.envKnobs where allowedKnobs.contains(k) && v.count <= 256 {
+            _ = setenv(k, v, 1)
+            appliedKnobs.append("\(k)=\(v)")
+        }
+        if !appliedKnobs.isEmpty {
+            onLog("knob dal coordinatore: " + appliedKnobs.joined(separator: " ") + "\n")
+        }
         // Sidecar/derived caches: coordinator-decided. The env is read at
         // ENGINE LOAD; pointing the cache-dir vars at the transferred files'
         // directory covers the case where the gguf resolved elsewhere (the

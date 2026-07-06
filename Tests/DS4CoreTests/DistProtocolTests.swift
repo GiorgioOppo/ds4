@@ -37,7 +37,9 @@ final class DistProtocolTests: XCTestCase {
                                 diskKVBudgetTokens: 1_000_000, useExpertBundle: true,
                                 useDenseQ4: true,
                                 layerStart: 22, layerEnd: 42, hasOutput: true,
-                                usageJSON: usage)
+                                usageJSON: usage,
+                                envKnobs: [(key: "DS4_DENSE_STREAM", value: "1"),
+                                           (key: "DS4_DENSE_AHEAD", value: "2")])
         let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
         XCTAssertEqual(decoded.modelPath, "/Models/ds4-flash.gguf")
         XCTAssertEqual(decoded.modelName, "ds4-flash.gguf")
@@ -50,6 +52,12 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.layerEnd, 42)
         XCTAssertTrue(decoded.hasOutput)
         XCTAssertEqual(decoded.usageJSON, usage)
+        // v9: i knob di performance viaggiano nell'ASSIGN.
+        XCTAssertEqual(decoded.envKnobs.count, 2)
+        XCTAssertEqual(decoded.envKnobs[0].key, "DS4_DENSE_STREAM")
+        XCTAssertEqual(decoded.envKnobs[0].value, "1")
+        XCTAssertEqual(decoded.envKnobs[1].key, "DS4_DENSE_AHEAD")
+        XCTAssertEqual(decoded.envKnobs[1].value, "2")
         // Empty usage stays empty; truncated frames are rejected, not mis-decoded.
         let bare = DistAssign(modelPath: "/m.gguf", modelName: "m.gguf", contextSize: 4096,
                               expertCacheSlots: 0, diskKVBudgetTokens: 0,

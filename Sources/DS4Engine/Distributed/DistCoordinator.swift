@@ -278,6 +278,14 @@ public final class DistCoordinator: @unchecked Sendable {
             let (ls, le) = (slice.start, slice.end)
             let usage = InferenceService.usageDataSeeded(modelName: modelName,
                                                          agentId: "generale") ?? Data()
+            // v9: il worker eredita i knob di PERFORMANCE del coordinatore
+            // (whitelist Dist.perfKnobKeys). Senza, uno shard con i default di
+            // fabbrica girava senza dense stream/mlock/pread: 0.37 tok/s
+            // misurati contro i 2.7 dello stesso hardware configurato.
+            let env = ProcessInfo.processInfo.environment
+            let knobs: [(key: String, value: String)] = Dist.perfKnobKeys.compactMap { k in
+                env[k].map { (key: k, value: $0) }
+            }
             let assign = DistAssign(modelPath: config.modelPath, modelName: modelName,
                                     contextSize: config.contextSize,
                                     expertCacheSlots: config.workerCacheSlots,
@@ -285,7 +293,7 @@ public final class DistCoordinator: @unchecked Sendable {
                                     useExpertBundle: config.useExpertBundle,
                                     useDenseQ4: config.useDenseQ4,
                                     layerStart: ls, layerEnd: le, hasOutput: hasOutput,
-                                    usageJSON: usage)
+                                    usageJSON: usage, envKnobs: knobs)
             onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize)\n")
             onLog("attendo il caricamento del motore sul worker \(p.host) (minuti alla prima esecuzione: "
                   + "mmap + Metal + eventuali sidecar; progresso nel log del tab Worker)…\n")
