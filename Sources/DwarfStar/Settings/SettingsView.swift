@@ -49,6 +49,11 @@ struct SettingsView: View {
                     TextField("GGUF model", text: $settings.modelPath)
                     Button("Browse") { if let p = ModelPicker.pickGGUF() { settings.modelPath = p } }
                 }
+                Button("Grant Model Folder Access…") {
+                    _ = ModelPicker.pickModelFolder(near: settings.modelPath)
+                }
+                Text("Sandboxed builds can read ONLY the picked .gguf: sidecar caches next to it (\u{201C}.q4dense\u{201D}, \u{201C}.expbundle\u{201D}, e.g. built by the demo) are invisible, so the app re-creates them inside its container (slow first load, gigabytes duplicated, or a failed write when disk is short). Granting the model's folder reuses them directly — recommended once per model folder.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Stepper("Context: \(settings.contextSize) tokens",
                         value: $settings.contextSize, in: 1024...1_000_000, step: 1024)
                 if let warning = MemoryInfo.loadWarning(modelPath: settings.modelPath) {

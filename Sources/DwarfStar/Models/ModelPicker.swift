@@ -50,6 +50,55 @@ enum ModelPicker {
         return nil
     }
 
+    // MARK: Model-FOLDER grant (sandbox sibling caches)
+    //
+    // The file grant above covers ONLY the picked .gguf: its sidecar caches
+    // (<model>.q4dense, <model>.expbundle — typically built by the demo/CLI
+    // next to the model) stay unreadable under the sandbox, so the app
+    // requantizes from scratch and rebuilds the bundle INSIDE its container
+    // (gigabytes of duplication, or a skipped bundle when disk is short).
+    // Granting the model's FOLDER makes the siblings readable and the engine
+    // reuses them as-is.
+    private static let dirBookmarkKey = "ds4.modelDirBookmark"
+
+    /// Ask the user to grant read access to the model's folder. Returns true
+    /// on grant; persists a security-scoped bookmark for later launches.
+    static func pickModelFolder(near modelPath: String?) -> Bool {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.title = "Grant Access to the Model's Folder"
+        panel.prompt = "Grant"
+        panel.message = "Select the folder that contains the GGUF: existing sidecar caches (\u{201C}.q4dense\u{201D}, \u{201C}.expbundle\u{201D}) become reusable and nothing is rebuilt inside the app container."
+        if let p = modelPath, !p.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (p as NSString).deletingLastPathComponent,
+                                     isDirectory: true)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+        _ = url.startAccessingSecurityScopedResource()
+        if let data = try? url.bookmarkData(options: .withSecurityScope,
+                                            includingResourceValuesForKeys: nil, relativeTo: nil) {
+            UserDefaults.standard.set(data, forKey: dirBookmarkKey)
+        }
+        return true
+    }
+
+    /// Re-arm the folder grant on launch (no-op without a stored bookmark).
+    /// Access is held for the app session, like the model file's.
+    static func restoreFolderBookmark() {
+        guard let data = UserDefaults.standard.data(forKey: dirBookmarkKey) else { return }
+        var stale = false
+        if let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+                              relativeTo: nil, bookmarkDataIsStale: &stale),
+           url.startAccessingSecurityScopedResource() {
+            if stale, let d = try? url.bookmarkData(options: .withSecurityScope,
+                                                    includingResourceValuesForKeys: nil, relativeTo: nil) {
+                UserDefaults.standard.set(d, forKey: dirBookmarkKey)
+            }
+        }
+    }
+
     private static func saveBookmark(_ url: URL) {
         if let data = try? url.bookmarkData(options: .withSecurityScope,
                                             includingResourceValuesForKeys: nil, relativeTo: nil) {

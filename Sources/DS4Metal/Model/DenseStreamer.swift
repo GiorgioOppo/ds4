@@ -226,7 +226,11 @@ public final class DenseStreamer: @unchecked Sendable {
             let sibling = model.path + ".q4dense"
             var cachePath = sibling
             if let dir = ProcessInfo.processInfo.environment["DS4_Q4_CACHE_DIR"], !dir.isEmpty {
-                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                // Loud failure: if this silently failed, every later write
+                // would fail with an unhelpful "permessi/percorso?" and every
+                // launch would re-pay the requant.
+                do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+                catch { Self.logQ4("creazione cartella cache FALLITA (\(error.localizedDescription)): \(dir)") }
                 cachePath = dir + "/" + (model.path as NSString).lastPathComponent + ".q4dense"
             }
             var converted: [GPUTensor]
@@ -499,10 +503,21 @@ public final class DenseStreamer: @unchecked Sendable {
             offsets.append(offset)
             offset += (tensors[i].byteLength + align - 1) / align * align
         }
+        // `offset` is now the full file size: refuse to start on a near-full
+        // disk (a torn 1.4 GB write helps nobody) with a log that names the
+        // real cause — the classic case is the app container's volume filled
+        // by other caches, and "il Cestino conta" (Finder deletes don't free
+        // space until emptied).
+        let dir = (path as NSString).deletingLastPathComponent
+        let free = (try? FileManager.default.attributesOfFileSystem(forPath: dir))?[.systemFreeSize] as? Int ?? 0
+        guard free > offset + (1 << 28) else {
+            logQ4("spazio disco insufficiente (~\(offset >> 20) MB richiesti, ~\(free >> 20) MB liberi — il Cestino conta!) — cache non scritta: \(path)")
+            return
+        }
         let tmp = path + ".tmp"
         guard FileManager.default.createFile(atPath: tmp, contents: nil),
               let fh = FileHandle(forWritingAtPath: tmp) else {
-            logQ4("SCRITTURA FALLITA (permessi/percorso?): \(tmp)")
+            logQ4("SCRITTURA FALLITA (cartella \(FileManager.default.fileExists(atPath: dir) ? "presente" : "ASSENTE"), ~\(free >> 20) MB liberi): \(tmp)")
             return
         }
         do {

@@ -731,6 +731,9 @@ final class ChatStore {
         guard !bookmarkRestored else { return }
         bookmarkRestored = true
         if let path = ModelPicker.restoreBookmark() { modelPath = path }
+        // Folder grant (sandbox): re-arm access to the model's directory so the
+        // sidecar caches next to the GGUF stay readable across launches.
+        ModelPicker.restoreFolderBookmark()
     }
 
     /// Scan the configured directories for GGUF files.
