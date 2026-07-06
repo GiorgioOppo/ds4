@@ -119,6 +119,7 @@ final class ChatStore {
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
+        _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
         _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
@@ -192,6 +193,17 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(denseAhead, forKey: "DS4DenseAhead")
             _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)
+        }
+    }
+    /// Pipeline asincrona del FFN routed (DS4_ASYNC_FFN): certificata da A/B
+    /// (+10%, 335 vs 374 ms/token, output identico token-per-token — la
+    /// correttezza e' garantita dalla coda Metal in-order). Default ON;
+    /// persistito senza UI: e' il paracadute per debug (=false ripristina il
+    /// percorso storico coi wait sincroni). Si applica al prossimo load.
+    var asyncFFNEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4AsyncFFN") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(asyncFFNEnabled, forKey: "DS4AsyncFFN")
+            _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)
         }
     }
 
@@ -307,6 +319,7 @@ final class ChatStore {
         expertBundleEnabled = true
         expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
+        asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         if persistExplicitly {
             let d = UserDefaults.standard
             d.set(16, forKey: "DS4ExpertCacheSlots")
@@ -319,6 +332,7 @@ final class ChatStore {
             d.set(true, forKey: "DS4ExpertBundle")
             d.set(0, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
+            d.set(true, forKey: "DS4AsyncFFN")
             _ = setenv("DS4_RAW_RING", "0", 1)
             _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
             _ = setenv("DS4_EXPERT_PREAD", "1", 1)
@@ -328,6 +342,7 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)
+            _ = setenv("DS4_ASYNC_FFN", "1", 1)
         }
     }
 
