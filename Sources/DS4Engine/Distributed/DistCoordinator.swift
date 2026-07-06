@@ -172,14 +172,52 @@ public final class DistCoordinator: @unchecked Sendable {
               + (config.forward ? " · worker-to-worker forwarding" : " · relay") + "\n")
     }
 
-    /// Setup completo di UN peer: connessione → HELLO (versione) → offerta e
-    /// trasferimento dei file mancanti → ASSIGN dello slice → attesa READY.
-    /// Non tocca lo stato condiviso (conns/entries: li aggiorna il chiamante,
-    /// in ordine di route) — pensato per girare in PARALLELO su tutti i peer.
-    /// In errore la connessione viene chiusa prima di rilanciare.
+    /// Setup di un peer con RETRY: un disturbo di rete a metà trasferimento
+    /// (o del load) non affossa la route al primo colpo — si riconnette e
+    /// riprova fino a 3 volte. Il progresso NON si perde: il worker tiene il
+    /// suo `.part`, lo convalida con la catena di checkpoint dell'offer e
+    /// chiede di riprendere dall'ultimo blocco buono (v8), quindi ogni
+    /// tentativo ritrasmette al massimo 256 MB. Gli errori SEMANTICI
+    /// (versione, slice sbagliato, errore riportato dal worker) non si
+    /// ritentano: rifarebbero la stessa fine.
     private func setupPeer(_ p: Peer, slice: (start: Int, end: Int), hasOutput: Bool,
                            offer: [DistFileEntry], modelName: String,
                            onLog: @escaping @Sendable (String) -> Void) async throws
+        -> (DistConnection, DistRouteEntry) {
+        let maxAttempts = 3
+        var lastError: Error = DistError.badFrame
+        for attempt in 1...maxAttempts {
+            do {
+                return try await setupPeerOnce(p, slice: slice, hasOutput: hasOutput,
+                                               offer: offer, modelName: modelName, onLog: onLog)
+            } catch let e as DistError {
+                switch e {
+                case .versionMismatch, .sliceGap, .remote: throw e   // semantico: non ritentare
+                default: lastError = e
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error                                    // trasporto: ritentabile
+            }
+            guard attempt < maxAttempts else { break }
+            onLog("peer \(p.host):\(p.port): tentativo \(attempt)/\(maxAttempts) fallito (\(lastError)) "
+                  + "— riprovo tra 2s dall'ultimo checkpoint trasferito…\n")
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        onLog("peer \(p.host):\(p.port): setup fallito dopo \(maxAttempts) tentativi\n")
+        throw lastError
+    }
+
+    /// UN tentativo di setup: connessione → HELLO (versione) → offerta e
+    /// trasferimento dei file mancanti (dagli offset di resume dichiarati dal
+    /// worker) → ASSIGN dello slice → attesa READY. Non tocca lo stato
+    /// condiviso (conns/entries: li aggiorna il chiamante, in ordine di
+    /// route) — pensato per girare in PARALLELO su tutti i peer. In errore la
+    /// connessione viene chiusa prima di rilanciare.
+    private func setupPeerOnce(_ p: Peer, slice: (start: Int, end: Int), hasOutput: Bool,
+                               offer: [DistFileEntry], modelName: String,
+                               onLog: @escaping @Sendable (String) -> Void) async throws
         -> (DistConnection, DistRouteEntry) {
         onLog("connessione a \(p.host):\(p.port)…\n")
         let conn = try await DistConnection.connect(host: p.host, port: p.port,
@@ -206,9 +244,11 @@ public final class DistCoordinator: @unchecked Sendable {
             if need.indices.isEmpty {
                 onLog("file: \(p.host):\(p.port) ha già tutto (hash verificati)\n")
             }
-            for index in need.indices {
+            for (j, index) in need.indices.enumerated() {
                 guard index >= 0, index < offer.count else { throw DistError.badFrame }
-                try await sendFile(offer[index], index: index, to: conn, peer: p, onLog: onLog)
+                let resume = j < need.offsets.count ? need.offsets[j] : 0
+                try await sendFile(offer[index], index: index, to: conn, peer: p,
+                                   from: resume, onLog: onLog)
             }
 
             // ASSIGN this peer its slice; the worker loads (or reuses) its
@@ -282,26 +322,29 @@ public final class DistCoordinator: @unchecked Sendable {
     /// once to compute them (logged — it can take minutes on a 100+ GB gguf).
     private func buildFileOffer(onLog: @Sendable (String) -> Void) throws -> [DistFileEntry] {
         let ggufName = (config.modelPath as NSString).lastPathComponent
+        // v8: la catena di checkpoint viaggia nell'offer (32 B ogni 256 MB —
+        // ~9 KB per il gguf) e permette ai worker di riprendere un `.part`
+        // interrotto dal l'ultimo blocco verificato, anche tra sessioni.
         guard let (size, _) = DistFileHash.stat(config.modelPath),
-              let sha = DistFileHash.cachedOrCompute(path: config.modelPath, onLog: onLog) else {
+              let (sha, chain) = DistFileHash.cachedOrComputeWithChain(path: config.modelPath, onLog: onLog) else {
             throw DistError.sliceGap("cannot read/hash the gguf at \(config.modelPath)")
         }
-        var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha)]
+        var entries = [DistFileEntry(kind: .gguf, name: ggufName, size: size, sha256: sha, chain: chain)]
         if config.useExpertBundle,
            let bundle = findLocalPath(kind: .expertBundle),
            let (bSize, _) = DistFileHash.stat(bundle),
-           let bSha = DistFileHash.cachedOrCompute(path: bundle, onLog: onLog) {
+           let (bSha, bChain) = DistFileHash.cachedOrComputeWithChain(path: bundle, onLog: onLog) {
             entries.append(DistFileEntry(kind: .expertBundle, name: ggufName + ".expbundle",
-                                         size: bSize, sha256: bSha))
+                                         size: bSize, sha256: bSha, chain: bChain))
         }
         // The Q4 requant cache is derived and deterministic: ~1.4 GB on the
         // wire beats minutes of re-requant on every worker.
         if config.useDenseQ4,
            let q4 = findLocalPath(kind: .q4Dense),
            let (qSize, _) = DistFileHash.stat(q4),
-           let qSha = DistFileHash.cachedOrCompute(path: q4, onLog: onLog) {
+           let (qSha, qChain) = DistFileHash.cachedOrComputeWithChain(path: q4, onLog: onLog) {
             entries.append(DistFileEntry(kind: .q4Dense, name: ggufName + ".q4dense",
-                                         size: qSize, sha256: qSha))
+                                         size: qSize, sha256: qSha, chain: qChain))
         }
         return entries
     }
@@ -310,20 +353,32 @@ public final class DistCoordinator: @unchecked Sendable {
     /// read — the transfer must not evict the coordinator's hot page cache),
     /// then DONE, then the worker's hash-verified ack.
     private func sendFile(_ entry: DistFileEntry, index: Int, to conn: DistConnection,
-                          peer: Peer, onLog: @Sendable (String) -> Void) async throws {
+                          peer: Peer, from resumeOffset: UInt64 = 0,
+                          onLog: @Sendable (String) -> Void) async throws {
         guard let path = entry.kind == .gguf ? config.modelPath : findLocalPath(kind: entry.kind) else {
             throw DistError.sliceGap("offered file \(entry.name) no longer found locally")
         }
-        onLog("file: invio \(entry.name) (\(entry.size / 1_048_576) MB) a \(peer.host):\(peer.port)…\n")
+        // v8 resume: il worker ha convalidato il suo .part con la catena di
+        // checkpoint e chiede di ripartire da un confine di blocco.
+        let start = min(resumeOffset, entry.size)
+        if start > 0 {
+            onLog("file: riprendo \(entry.name) dal blocco verificato a \(start / 1_048_576) MB "
+                  + "(\((entry.size - start) / 1_048_576) MB restanti) → \(peer.host):\(peer.port)\n")
+        } else {
+            onLog("file: invio \(entry.name) (\(entry.size / 1_048_576) MB) a \(peer.host):\(peer.port)…\n")
+        }
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw DistError.sliceGap("cannot open \(path)") }
         defer { close(fd) }
         _ = fcntl(fd, F_NOCACHE, 1)
+        guard lseek(fd, off_t(start), SEEK_SET) == off_t(start) else {
+            throw DistError.sliceGap("seek to \(start) failed on \(path)")
+        }
 
-        var offset: UInt64 = 0
+        var offset: UInt64 = start
         var buf = [UInt8](repeating: 0, count: Dist.fileChunkBytes)
         let t0 = Date()
-        var lastLogged: UInt64 = 0
+        var lastLogged: UInt64 = start
         while offset < entry.size {
             try Task.checkCancellation()
             let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, Dist.fileChunkBytes) }
@@ -333,7 +388,7 @@ public final class DistCoordinator: @unchecked Sendable {
             offset += UInt64(n)
             if offset - lastLogged >= 1_073_741_824 {          // progress every GB
                 lastLogged = offset
-                let mbps = Double(offset) / 1_048_576 / max(0.001, Date().timeIntervalSince(t0))
+                let mbps = Double(offset - start) / 1_048_576 / max(0.001, Date().timeIntervalSince(t0))
                 onLog(String(format: "file: %@ %.0f%% (%.0f MB/s)\n", entry.name,
                              Double(offset) / Double(entry.size) * 100, mbps))
             }

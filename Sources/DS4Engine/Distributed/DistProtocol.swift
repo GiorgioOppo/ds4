@@ -38,7 +38,14 @@ public enum Dist {
     /// v7: WORK carries the chunk's token ids. The first n_hash_layer (3)
     /// layers route experts by TOKEN ID (ffn_gate_tid2eid), so a shard that
     /// covers them cannot route from the HC state alone.
-    public static let protocolVersion: UInt32 = 7
+    /// v8: RESUMABLE transfers. The offer carries a CHAINED-HASH checkpoint
+    /// list per file (one SHA-256 every fileCheckpointBytes, each folded over
+    /// the previous — chain[k] commits to the whole prefix); the worker keeps
+    /// its `.part` across disconnects AND sessions, validates it block-by-block
+    /// against the chain, truncates to the last good checkpoint and answers
+    /// FILE NEED with a per-file RESUME OFFSET. The coordinator streams from
+    /// there and retries a broken peer setup up to 3 times before failing.
+    public static let protocolVersion: UInt32 = 8
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
@@ -47,6 +54,11 @@ public enum Dist {
     static let maxFileEntries = 16
     /// File-transfer chunk payload (per fileChunk frame).
     public static let fileChunkBytes = 4 * 1024 * 1024
+    /// Checkpoint granularity of the chained-hash list (v8 resumable
+    /// transfers): one 32-byte digest every 256 MB — a 70 GB gguf carries
+    /// ~280 digests (~9 KB) in the offer, and at most 256 MB are re-sent
+    /// after an interruption. MUST be a multiple of fileChunkBytes.
+    public static let fileCheckpointBytes: UInt64 = 256 * 1024 * 1024
 
     public enum MsgType: UInt32, Sendable {
         case hello     = 1    // worker → coordinator on connect (state + model identity)
@@ -255,9 +267,16 @@ public struct DistFileEntry: Sendable, Equatable {
     public var name: String
     public var size: UInt64
     public var sha256: Data          // 32 bytes
+    /// v8 chained checkpoint hashes, one per fileCheckpointBytes block:
+    /// chain[0] = SHA256(block 0); chain[k] = SHA256(chain[k-1] ‖ SHA256(block k)).
+    /// Each entry commits to the WHOLE prefix, so a `.part` file from a broken
+    /// transfer is verifiable block-by-block and the resume point is the last
+    /// matching checkpoint — a corrupt middle block can never be resumed over.
+    public var chain: [Data]
 
-    public init(kind: Kind, name: String, size: UInt64, sha256: Data) {
+    public init(kind: Kind, name: String, size: UInt64, sha256: Data, chain: [Data] = []) {
         self.kind = kind; self.name = name; self.size = size; self.sha256 = sha256
+        self.chain = chain
     }
 
     func encode(into d: inout Data) {
@@ -266,16 +285,24 @@ public struct DistFileEntry: Sendable, Equatable {
         d.appendLE(UInt32(n.count)); d.append(n)
         d.appendLE(size)
         d.append(sha256.prefix(32))
+        d.appendLE(UInt32(chain.count))
+        for c in chain { d.append(c.prefix(32)) }
     }
 
     static func decode(_ d: Data, _ o: inout Data.Index) -> DistFileEntry? {
         guard o + 8 <= d.endIndex, let kind = Kind(rawValue: d.readLE(&o)) else { return nil }
         let nameLen = Int(d.readLE(&o) as UInt32)
-        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 <= d.endIndex else { return nil }
+        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 + 4 <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
         let size = d.readLE(&o) as UInt64
         let sha = Data(d[o..<o+32]); o += 32
-        return DistFileEntry(kind: kind, name: name, size: size, sha256: sha)
+        let chainCount = Int(d.readLE(&o) as UInt32)
+        // Sanity: la catena è ceil(size/checkpoint) — cap largo contro frame ostili.
+        guard chainCount >= 0, chainCount <= 1 << 20, o + chainCount * 32 <= d.endIndex else { return nil }
+        var chain: [Data] = []
+        chain.reserveCapacity(chainCount)
+        for _ in 0..<chainCount { chain.append(Data(d[o..<o+32])); o += 32 }
+        return DistFileEntry(kind: kind, name: name, size: size, sha256: sha, chain: chain)
     }
 }
 
@@ -308,12 +335,23 @@ public struct DistFileOffer: Sendable {
 /// FILE NEED: the offer indices the worker is missing (empty = has everything).
 public struct DistFileNeed: Sendable {
     public var indices: [Int]
-    public init(indices: [Int]) { self.indices = indices }
+    /// v8: per-index RESUME offset (0 = from scratch). Always a multiple of
+    /// Dist.fileCheckpointBytes: the worker truncated its `.part` to the last
+    /// checkpoint whose chained hash matched the offer's.
+    public var offsets: [UInt64]
+
+    public init(indices: [Int], offsets: [UInt64]? = nil) {
+        self.indices = indices
+        self.offsets = offsets ?? [UInt64](repeating: 0, count: indices.count)
+    }
 
     public func encoded() -> Data {
         var d = Data()
         d.appendLE(UInt32(indices.count))
-        for i in indices { d.appendLE(UInt32(truncatingIfNeeded: i)) }
+        for (j, i) in indices.enumerated() {
+            d.appendLE(UInt32(truncatingIfNeeded: i))
+            d.appendLE(j < offsets.count ? offsets[j] : 0)
+        }
         return d
     }
 
@@ -321,10 +359,14 @@ public struct DistFileNeed: Sendable {
         var o = d.startIndex
         guard d.count >= 4 else { return nil }
         let count = Int(d.readLE(&o) as UInt32)
-        guard count >= 0, count <= Dist.maxFileEntries, o + count * 4 <= d.endIndex else { return nil }
-        var out: [Int] = []
-        for _ in 0..<count { out.append(Int(d.readLE(&o) as UInt32)) }
-        return DistFileNeed(indices: out)
+        guard count >= 0, count <= Dist.maxFileEntries, o + count * 12 <= d.endIndex else { return nil }
+        var indices: [Int] = []
+        var offsets: [UInt64] = []
+        for _ in 0..<count {
+            indices.append(Int(d.readLE(&o) as UInt32))
+            offsets.append(d.readLE(&o) as UInt64)
+        }
+        return DistFileNeed(indices: indices, offsets: offsets)
     }
 }
 

@@ -57,15 +57,58 @@ public final class DistWorker: @unchecked Sendable {
         private var lastLogged: UInt64 = 0
         private let t0 = Date()
 
-        init(entry: DistFileEntry, index: Int, onLog: @escaping @Sendable (String) -> Void) {
+        /// `resumeFrom`: riprende un `.part` esistente da un confine di blocco
+        /// GIÀ CONVALIDATO dal chiamante con la catena di checkpoint (v8). Il
+        /// file viene troncato lì, l'hash dell'intero file viene RI-PRIMATO
+        /// rileggendo il prefisso (la SHA-256 finale deve coprire tutti i
+        /// byte), e la ricezione continua da quell'offset. Con 0 (o su
+        /// qualunque errore di ripresa) si riparte da zero.
+        init(entry: DistFileEntry, index: Int, resumeFrom: UInt64 = 0,
+             onLog: @escaping @Sendable (String) -> Void) {
             self.entry = entry; self.index = index; self.onLog = onLog
             let store = DistFileStore.shared
             try? FileManager.default.createDirectory(at: store.directory,
                                                      withIntermediateDirectories: true)
             self.finalURL = store.url(for: entry.name)
             self.tmpURL = finalURL.appendingPathExtension("part")
-            self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+            if resumeFrom > 0 {
+                self.fd = open(tmpURL.path, O_WRONLY, 0o644)
+                var primed = false
+                if fd >= 0, ftruncate(fd, off_t(resumeFrom)) == 0,
+                   lseek(fd, off_t(resumeFrom), SEEK_SET) == off_t(resumeFrom),
+                   Self.prime(hasher: &hasher, path: tmpURL.path, upTo: resumeFrom) {
+                    received = resumeFrom
+                    primed = true
+                    onLog("file: \(entry.name) — riprendo dal checkpoint a \(resumeFrom / 1_048_576) MB\n")
+                }
+                if !primed {
+                    if fd >= 0 { close(fd) }
+                    hasher = SHA256()
+                    onLog("file: \(entry.name) — ripresa non possibile, ricomincio da zero\n")
+                    self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+                }
+            } else {
+                self.fd = open(tmpURL.path, O_CREAT | O_TRUNC | O_WRONLY, 0o644)
+            }
             if fd >= 0 { _ = fcntl(fd, F_NOCACHE, 1) }   // the transfer must not evict hot pages
+        }
+
+        /// Rileggi il prefisso [0, upTo) dentro `hasher` (8 MB per read).
+        private static func prime(hasher: inout SHA256, path: String, upTo: UInt64) -> Bool {
+            let rfd = open(path, O_RDONLY)
+            guard rfd >= 0 else { return false }
+            defer { close(rfd) }
+            _ = fcntl(rfd, F_NOCACHE, 1)
+            var remaining = upTo
+            var buf = [UInt8](repeating: 0, count: 8 * 1024 * 1024)
+            while remaining > 0 {
+                let want = Int(min(UInt64(buf.count), remaining))
+                let n = buf.withUnsafeMutableBytes { read(rfd, $0.baseAddress, want) }
+                guard n > 0 else { return false }
+                buf.withUnsafeBytes { hasher.update(bufferPointer: UnsafeRawBufferPointer(rebasing: $0[0..<n])) }
+                remaining -= UInt64(n)
+            }
+            return true
         }
 
         /// Append one sequential chunk; false on disorder/overflow/IO error.
@@ -97,14 +140,15 @@ public final class DistWorker: @unchecked Sendable {
         func finalize() -> Outcome {
             guard fd >= 0 else { return .failure("could not open \(tmpURL.path)") }
             close(fd); fd = -1
+            // v8: il .part resta su disco anche in fallimento — la prossima
+            // offerta lo convalida con la catena di checkpoint e riprende dal
+            // prefisso buono invece di ritrasferire tutto.
             guard received == entry.size else {
-                unlink(tmpURL.path)
-                return .failure("incomplete: \(received)/\(entry.size) bytes")
+                return .failure("incomplete: \(received)/\(entry.size) bytes (.part conservato per la ripresa)")
             }
             let digest = Data(hasher.finalize())
             guard digest == entry.sha256 else {
-                unlink(tmpURL.path)
-                return .failure("sha256 mismatch (got \(digest.hexString.prefix(16))…)")
+                return .failure("sha256 mismatch (got \(digest.hexString.prefix(16))…) (.part conservato per la ripresa)")
             }
             unlink(finalURL.path)
             guard rename(tmpURL.path, finalURL.path) == 0 else {
@@ -115,10 +159,70 @@ public final class DistWorker: @unchecked Sendable {
             return .success(finalURL.path)
         }
 
-        func abort() {
+        /// Chiudi TENENDO il `.part` (v8): alla prossima offerta — anche in
+        /// una sessione futura — la catena di checkpoint convalida il prefisso
+        /// buono e la ricezione riprende da lì invece che da zero. Anche un
+        /// contenuto sospetto (chunk fuori ordine, hash finale sbagliato) si
+        /// conserva: sarà la verifica a catena a decidere cosa salvare.
+        func suspend() {
             if fd >= 0 { close(fd); fd = -1 }
-            unlink(tmpURL.path)
         }
+    }
+
+    /// v8: quanto del `.part` locale (trasferimento interrotto, anche di una
+    /// sessione passata) è FIDATO. Convalida i blocchi INTERI con la catena di
+    /// hash dell'offerta — chain[k] = SHA256(chain[k-1] ‖ SHA256(blocco k)),
+    /// ogni anello impegna tutto il prefisso — tronca il file al primo blocco
+    /// che non torna e restituisce l'offset di ripresa (multiplo del
+    /// checkpoint; 0 = nulla da salvare). La coda parziale oltre l'ultimo
+    /// checkpoint non è verificabile e si ritrasferisce.
+    private func resumePoint(_ entry: DistFileEntry, onLog: @Sendable (String) -> Void) -> UInt64 {
+        guard !entry.chain.isEmpty else { return 0 }
+        let partPath = DistFileStore.shared.url(for: entry.name).appendingPathExtension("part").path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: partPath),
+              let partSize = (attrs[.size] as? NSNumber)?.uint64Value, partSize > 0 else { return 0 }
+        let cp = Dist.fileCheckpointBytes
+        let fullBlocks = Int(min(partSize / cp, UInt64(entry.chain.count)))
+        var good = 0
+        if fullBlocks > 0 {
+            let fd = open(partPath, O_RDONLY)
+            guard fd >= 0 else { return 0 }
+            defer { close(fd) }
+            _ = fcntl(fd, F_NOCACHE, 1)
+            var prev: Data?
+            var buf = [UInt8](repeating: 0, count: 8 * 1024 * 1024)
+            outer: for k in 0..<fullBlocks {
+                var blockHasher = SHA256()
+                var remaining = cp
+                while remaining > 0 {
+                    let want = Int(min(UInt64(buf.count), remaining))
+                    let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, want) }
+                    guard n > 0 else { break outer }
+                    buf.withUnsafeBytes {
+                        blockHasher.update(bufferPointer: UnsafeRawBufferPointer(rebasing: $0[0..<n]))
+                    }
+                    remaining -= UInt64(n)
+                }
+                var link = SHA256()
+                if let p = prev { link.update(data: p) }
+                link.update(data: Data(blockHasher.finalize()))
+                let digest = Data(link.finalize())
+                guard digest == entry.chain[k] else {
+                    onLog("file: \(entry.name) — blocco \(k) non verificato, scarto la coda\n")
+                    break
+                }
+                prev = digest
+                good = k + 1
+            }
+        }
+        let resume = UInt64(good) * cp
+        // Tronca ORA la parte non verificata: il fileNeed promette esattamente
+        // questo offset e la ricezione (IncomingFile) riparte da lì.
+        if resume < partSize {
+            let wfd = open(partPath, O_WRONLY)
+            if wfd >= 0 { _ = ftruncate(wfd, off_t(resume)); close(wfd) }
+        }
+        return min(resume, entry.size)
     }
 
     /// Resolve one offered file WITHOUT transferring: the managed store first
@@ -289,6 +393,7 @@ public final class DistWorker: @unchecked Sendable {
         var offerEntries: [DistFileEntry] = []
         var resolvedFiles: [String: String] = [:]      // sanitized name → local path
         var incoming: IncomingFile?
+        var pendingResume: [Int: UInt64] = [:]         // v8: offer index → offset di ripresa promesso
         var transferError: String?                     // first failure, reported at fileDone
 
         do {
@@ -300,16 +405,29 @@ public final class DistWorker: @unchecked Sendable {
                     guard let offer = DistFileOffer.decode(payload) else { continue }
                     offerEntries = offer.entries
                     var needs: [Int] = []
+                    var offsets: [UInt64] = []
+                    pendingResume.removeAll()
                     for (i, entry) in offer.entries.enumerated() {
                         if let local = resolveOffered(entry) {
                             resolvedFiles[DistFileStore.sanitize(entry.name)] = local
                             onLog("file: \(entry.name) già presente (hash ok) — \(local)\n")
                         } else {
+                            // v8: un .part di un trasferimento interrotto (anche
+                            // di una sessione passata) viene convalidato con la
+                            // catena di checkpoint e la ricezione riprende dal
+                            // primo blocco non verificato.
+                            let resume = resumePoint(entry, onLog: onLog)
                             needs.append(i)
-                            onLog("file: \(entry.name) mancante (\(entry.size / 1_048_576) MB) — richiedo il trasferimento\n")
+                            offsets.append(resume)
+                            pendingResume[i] = resume
+                            if resume > 0 {
+                                onLog("file: \(entry.name) parziale — riprendo da \(resume / 1_048_576) di \(entry.size / 1_048_576) MB\n")
+                            } else {
+                                onLog("file: \(entry.name) mancante (\(entry.size / 1_048_576) MB) — richiedo il trasferimento\n")
+                            }
                         }
                     }
-                    try await conn.sendFrame(.fileNeed, DistFileNeed(indices: needs).encoded())
+                    try await conn.sendFrame(.fileNeed, DistFileNeed(indices: needs, offsets: offsets).encoded())
                     continue
                 }
                 if type == .fileChunk {
@@ -321,22 +439,39 @@ public final class DistWorker: @unchecked Sendable {
                         transferError = transferError ?? "malformed fileChunk frame"
                         continue
                     }
-                    if incoming == nil, chunk.offset == 0, transferError == nil {
+                    // Il primo chunk di un file deve arrivare ESATTAMENTE
+                    // all'offset di ripresa dichiarato nel fileNeed (0 senza .part).
+                    if incoming == nil, transferError == nil,
+                       chunk.offset == (pendingResume[chunk.index] ?? 0) {
                         incoming = IncomingFile(entry: offerEntries[chunk.index],
-                                                index: chunk.index, onLog: onLog)
+                                                index: chunk.index,
+                                                resumeFrom: pendingResume[chunk.index] ?? 0,
+                                                onLog: onLog)
                     }
                     if let file = incoming, file.index == chunk.index, file.append(chunk) {
                         continue
                     }
-                    incoming?.abort(); incoming = nil
+                    incoming?.suspend(); incoming = nil
                     transferError = transferError ?? "out-of-order or unexpected chunk"
                     continue
                 }
                 if type == .fileDone {
                     defer { transferError = nil }
+                    // v8, caso limite: il .part copriva GIÀ tutto il file (catena
+                    // verificata) → il coordinatore non manda alcun chunk e il
+                    // DONE arriva senza un IncomingFile: crealo qui a offset
+                    // pieno, così finalize() ne verifica hash e lo promuove.
+                    if incoming == nil, transferError == nil,
+                       let done = DistFileDone.decode(payload),
+                       done.index >= 0, done.index < offerEntries.count,
+                       let resume = pendingResume[done.index],
+                       resume == offerEntries[done.index].size {
+                        incoming = IncomingFile(entry: offerEntries[done.index], index: done.index,
+                                                resumeFrom: resume, onLog: onLog)
+                    }
                     guard let done = DistFileDone.decode(payload),
                           let file = incoming, file.index == done.index, transferError == nil else {
-                        incoming?.abort(); incoming = nil
+                        incoming?.suspend(); incoming = nil
                         try await conn.sendFrame(.fileAck, DistKV.encodeAck(
                             ok: false, message: transferError ?? "DONE without a matching transfer"))
                         continue
@@ -448,7 +583,9 @@ public final class DistWorker: @unchecked Sendable {
                 }
             }
         } catch {
-            incoming?.abort()                 // drop a half-received .part file
+            incoming?.suspend()               // KEEP the half-received .part: the
+                                              // next offer resumes it via the
+                                              // checkpoint chain (v8)
             onLog("sessione chiusa: \(error)\n")
             conn.cancel()
         }
