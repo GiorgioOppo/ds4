@@ -103,10 +103,19 @@ public final class DenseStreamer: @unchecked Sendable {
     /// relevance scoring (DecodeLayer step 3.5), which the caller has proven
     /// can never activate at this context size — so streaming them is pure
     /// wasted SSD bandwidth (~360 MB/token on Flash). The indexer COMPRESSOR
-    /// pair (indexer_compressor_kv/gate) keeps streaming: its recurrent state
-    /// updates every token and must stay coherent (KV snapshots export it).
+    /// pair (indexer_compressor_kv/gate) keeps streaming (unless `residentComp`
+    /// pins it): its recurrent state updates every token and must stay
+    /// coherent (KV snapshots export it).
+    ///
+    /// `residentComp`: load the four NSA compressor projections
+    /// (attn_compressor_kv/gate + indexer_compressor_kv/gate) into RESIDENT
+    /// buffers ONCE instead of re-streaming them every token. They are small
+    /// per layer (F16, ~20 MB on a ratio-4 layer) but exist on 41 of 43 layers
+    /// — ~0.6 GB/token of SSD stream traded for ~0.6 GB of resident RAM.
+    /// Same bytes → identical numerics.
     public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false,
-                q4Dense: Bool = false, skipIndexerScoring: Bool = false) throws {
+                q4Dense: Bool = false, skipIndexerScoring: Bool = false,
+                residentComp: Bool = false) throws {
         guard let fd = model.uncachedFD() else {
             throw GGUFWeights.LoadError.message("DenseStreamer: cannot open F_NOCACHE descriptor")
         }
@@ -129,6 +138,9 @@ public final class DenseStreamer: @unchecked Sendable {
         // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
         let sharedQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_SHARED_Q4"] == "1"
         var scoringSkipped = 0                  // bytes/pass NOT staged (diagnostics)
+        // DS4_RESIDENT_COMP: NSA compressor projections diverted to resident
+        // buffers (loaded once after the plan is built, like the Q4 jobs).
+        var compJobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
         LoadProgress.shared.begin("Preparazione layer densi…", from: 0.08, to: 0.30, units: layers.count)
         for il in layers {
             var plan: [Entry] = []
@@ -141,6 +153,10 @@ public final class DenseStreamer: @unchecked Sendable {
                     // Not staged: w.idxQB/idxProj stay nil and the decoder's
                     // scoring gate (hasIdxScoring) keeps the top-K path off.
                     scoringSkipped += Int(t.bytes)
+                    continue
+                }
+                if residentComp, f == .compKv || f == .compGate || f == .idxKv || f == .idxGate {
+                    compJobs.append((il: il, f: f, t: t))
                     continue
                 }
                 let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
@@ -164,6 +180,37 @@ public final class DenseStreamer: @unchecked Sendable {
             FileHandle.standardError.write(Data(
                 ("DS4 dense-stream: indexer top-k mai attivo a questo contesto — " +
                  "salto lo staging di indexer.attn_q_b/proj (\(scoringSkipped / (1 << 20)) MB/token in meno dal disco)\n").utf8))
+        }
+        if !compJobs.isEmpty {
+            // One synchronous pread per projection (~0.6 GB total ≈ 0.1-0.2 s
+            // at load): small enough not to need the Q4 jobs' parallelism or a
+            // sidecar cache — the bytes are copied VERBATIM, no conversion.
+            LoadProgress.shared.set(0.31, "Compressori NSA residenti…")
+            var residentBytes = 0
+            for job in compJobs {
+                let bytes = Int(job.t.bytes)
+                guard let buf = rt.device.makeBuffer(length: bytes, options: .storageModeShared) else {
+                    throw MetalError.bufferAlloc
+                }
+                guard GGUFWeights.preadFull(fd, into: buf.contents(), bytes: bytes,
+                                            offset: Int(job.t.absOffset)) else {
+                    throw GGUFWeights.LoadError.message(
+                        "DenseStreamer: pread failed on blk.\(job.il).\(job.f.tensorName)")
+                }
+                if lockResident { _ = mlock(buf.contents(), bytes) }
+                let tensor = GPUTensor(buffer: buf, byteLength: bytes, count: bytes, byteOffset: 0)
+                switch job.f {
+                case .compKv: skeleton[job.il]!.compKv = tensor
+                case .compGate: skeleton[job.il]!.compGate = tensor
+                case .idxKv: skeleton[job.il]!.idxKv = tensor
+                case .idxGate: skeleton[job.il]!.idxGate = tensor
+                default: break
+                }
+                residentBytes += bytes
+            }
+            FileHandle.standardError.write(Data(
+                ("DS4 dense-stream: proiezioni compressori NSA residenti — " +
+                 "\(residentBytes / (1 << 20)) MB wired, altrettanti MB/token in meno dal disco\n").utf8))
         }
         if !q4Jobs.isEmpty {
             // Requant CACHE: the converted Q4 tensors are persisted next to the

@@ -1614,9 +1614,15 @@ public final class StreamingDecoder {
             // work. "0" restores the always-stage behaviour for A/B.
             let lazyIdx = ProcessInfo.processInfo.environment["DS4_LAZY_IDX"] != "0"
                 && !indexerCanEverActivate(maxKeys: maxKeys, topK: dims.indexerTopK)
+            // DS4_RESIDENT_COMP (default ON): the four NSA compressor
+            // projections stop streaming and live in ~0.6 GB of resident RAM —
+            // they're read EVERY token on 41 of 43 layers, the single densest
+            // repeat-read in the stream. Same bytes → identical numerics.
+            // "0" restores full streaming (tight-RAM fallback / A/B).
+            let residentComp = ProcessInfo.processInfo.environment["DS4_RESIDENT_COMP"] != "0"
             let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers,
                                              lockResident: lockResident, q4Dense: q4Dense,
-                                             skipIndexerScoring: lazyIdx)
+                                             skipIndexerScoring: lazyIdx, residentComp: residentComp)
             denseProvider = { try streamer.weights($0) }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
