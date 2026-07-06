@@ -98,8 +98,15 @@ public final class DenseStreamer: @unchecked Sendable {
     /// Total bytes streamed per full pass over `layers` (diagnostics).
     public private(set) var bytesPerPass = 0
 
+    /// `skipIndexerScoring`: don't stage the indexer SCORING projections
+    /// (indexer.attn_q_b + indexer.proj). They are read ONLY by the top-K
+    /// relevance scoring (DecodeLayer step 3.5), which the caller has proven
+    /// can never activate at this context size — so streaming them is pure
+    /// wasted SSD bandwidth (~360 MB/token on Flash). The indexer COMPRESSOR
+    /// pair (indexer_compressor_kv/gate) keeps streaming: its recurrent state
+    /// updates every token and must stay coherent (KV snapshots export it).
     public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false,
-                q4Dense: Bool = false) throws {
+                q4Dense: Bool = false, skipIndexerScoring: Bool = false) throws {
         guard let fd = model.uncachedFD() else {
             throw GGUFWeights.LoadError.message("DenseStreamer: cannot open F_NOCACHE descriptor")
         }
@@ -121,6 +128,7 @@ public final class DenseStreamer: @unchecked Sendable {
         // FFN projections — their Q8 slabs leave the per-token stream entirely,
         // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
         let sharedQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_SHARED_Q4"] == "1"
+        var scoringSkipped = 0                  // bytes/pass NOT staged (diagnostics)
         LoadProgress.shared.begin("Preparazione layer densi…", from: 0.08, to: 0.30, units: layers.count)
         for il in layers {
             var plan: [Entry] = []
@@ -129,6 +137,10 @@ public final class DenseStreamer: @unchecked Sendable {
             LoadProgress.shared.advance()
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
+                if skipIndexerScoring, f == .idxQB || f == .idxProj {
+                    scoringSkipped += Int(t.bytes)
+                    continue                    // leaves w.idxQB/idxProj nil — the
+                }                               // decoder's scoring gate handles it
                 let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
                 let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
                 if q4Dense, attnQ4Field || sharedQ4Field,
@@ -145,6 +157,11 @@ public final class DenseStreamer: @unchecked Sendable {
             skeleton[il] = w
             bytesPerPass += plan.reduce(0) { $0 + $1.bytes }
             maxSlot = max(maxSlot, off)
+        }
+        if scoringSkipped > 0 {
+            FileHandle.standardError.write(Data(
+                ("DS4 dense-stream: indexer top-k mai attivo a questo contesto — " +
+                 "salto lo staging di indexer.attn_q_b/proj (\(scoringSkipped / (1 << 20)) MB/token in meno dal disco)\n").utf8))
         }
         if !q4Jobs.isEmpty {
             // Requant CACHE: the converted Q4 tensors are persisted next to the

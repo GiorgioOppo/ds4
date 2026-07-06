@@ -1089,15 +1089,24 @@ public final class StreamingDecoder {
     private func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                              curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
         let idx = indexStates[i]
-        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
-        let active = hasIdxWeights && indexerActive(i, pos: pos)
+        // The indexer carries TWO independent weight sets. The compressor pair
+        // (idxKv/idxGate) feeds the recurrent STATE update: it runs every token
+        // and its cache must stay coherent (KV snapshots export it, and a later
+        // activation reads all past rows). attn_q_b/proj are read ONLY by the
+        // top-K SCORING. With the lazy staging (DenseStreamer skipIndexerScoring)
+        // the scoring pair may not be staged at all, so the two gates SPLIT:
+        // the state keeps updating on the compressor pair alone, while the
+        // active path additionally requires the scoring pair.
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil
+        let hasIdxScoring = hasIdxState && w.idxQB != nil && w.idxProj != nil
+        let active = hasIdxScoring && indexerActive(i, pos: pos)
         if active, let idx {
             // Indexer layers always split (CPU top-k sits between pre and attn). The
             // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
             let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              comp: compStates[i], idx: hasIdxState ? idx : nil,
                                               indexerScoring: true)
             try c1.phase("kv")
             c1.commit()
@@ -1116,7 +1125,7 @@ public final class StreamingDecoder {
             let c = GraphContext(rt); c.phaseTimes = [:]; try c.begin()
             let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                             comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                             comp: compStates[i], idx: hasIdxState ? idx : nil,
                                              indexerScoring: false)
             try c.phase("kv")
             try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
@@ -1130,7 +1139,7 @@ public final class StreamingDecoder {
             let c1 = GraphContext(rt); try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              comp: compStates[i], idx: hasIdxState ? idx : nil,
                                               indexerScoring: false)
             try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
@@ -1168,6 +1177,20 @@ public final class StreamingDecoder {
         return 1024
     }()
 
+    /// Static proof that the indexer top-K can NEVER activate in this session:
+    /// the densest indexer layers (ratio 4) emit at most maxKeys/4 compressed
+    /// rows over the whole context, and activation needs a prospective count
+    /// STRICTLY greater than both the sparse threshold and the top-K. When the
+    /// bound can't be exceeded, the scoring projections (indexer.attn_q_b +
+    /// indexer.proj, ~360 MB/token on Flash) are dead weight in the dense
+    /// stream and staging them is skipped at load. Recomputed on every load
+    /// from the live maxKeys/threshold, so a larger context or a lower
+    /// DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD re-enables the staging.
+    static func indexerCanEverActivate(maxKeys: Int, topK: Int) -> Bool {
+        let maxProspective = maxKeys / 4
+        return maxProspective > indexerSparseThreshold && maxProspective > topK
+    }
+
     /// Will the indexer restrict this token's compressed rows on layer `i`?
     /// (prospective count: the compressor may emit one more row for this token.)
     /// `extraRows` = rows the tokens BEFORE this one in a not-yet-encoded batch
@@ -1190,11 +1213,11 @@ public final class StreamingDecoder {
     /// order as the per-token non-indexer path in encodeRoute.
     private func encodeRouteInto(_ c: GraphContext, _ i: Int, w: LayerWeights, layerRope: RopeParams,
                                  curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
-        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil    // state-only gate (see encodeRoute)
         let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                          rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                         comp: compStates[i], idx: hasIdxWeights ? indexStates[i] : nil,
-                                         indexerScoring: false)
+                                         comp: compStates[i], idx: hasIdxState ? indexStates[i] : nil,
+                                         indexerScoring: false)  // caller guarantees no scoring here
         try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                               nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                               nComp: nComp, comp: compStates[i])
@@ -1583,8 +1606,17 @@ public final class StreamingDecoder {
             // read at RAM speed, and ~3 GB/token OFF the SSD stream. LOSSY on
             // those two tensors (Q8→Q4 requant) — opt-in, A/B the output.
             let q4Dense = ProcessInfo.processInfo.environment["DS4_DENSE_Q4"] == "1"
+            // DS4_LAZY_IDX (default ON): skip staging the indexer SCORING
+            // projections when the top-K selection provably can't activate at
+            // this context size — they'd stream ~360 MB/token to never be read.
+            // The indexer compressor pair keeps streaming (recurrent state must
+            // stay coherent). LOSSLESS: the skip only drops never-executed
+            // work. "0" restores the always-stage behaviour for A/B.
+            let lazyIdx = ProcessInfo.processInfo.environment["DS4_LAZY_IDX"] != "0"
+                && !indexerCanEverActivate(maxKeys: maxKeys, topK: dims.indexerTopK)
             let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers,
-                                             lockResident: lockResident, q4Dense: q4Dense)
+                                             lockResident: lockResident, q4Dense: q4Dense,
+                                             skipIndexerScoring: lazyIdx)
             denseProvider = { try streamer.weights($0) }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
