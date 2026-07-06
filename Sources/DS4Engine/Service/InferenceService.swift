@@ -891,7 +891,28 @@ public actor InferenceService {
         // Prefill ONLY the new suffix; positions 0..startPos-1 are reused from the KV.
         continuation.yield(.progress(startPos == 0 ? "prefill \(suffixIds.count) token…"
                                                    : "prefill +\(suffixIds.count) token (riuso KV)…"))
-        var lastLogits = try decoder.prefill(tokens: suffixIds, startPos: startPos)
+        // A BLOCCHI con progresso: un system prompt di migliaia di token
+        // (Xcode & co.) costa minuti a ~0.3 s/token — senza avanzamento il
+        // primo turno è indistinguibile da un hang. La granularità è la
+        // STESSA del chunking interno del decoder (DS4_PREFILL_CHUNK): il
+        // batching dell'unione esperti per blocco non cambia, zero costi.
+        let pfChunk = max(64, ProcessInfo.processInfo.environment["DS4_PREFILL_CHUNK"].flatMap(Int.init) ?? 512)
+        var lastLogits: [Float] = []
+        var pfDone = 0
+        let pfT0 = Date()
+        while pfDone < suffixIds.count {
+            try Task.checkCancellation()
+            let end = min(pfDone + pfChunk, suffixIds.count)
+            lastLogits = try decoder.prefill(tokens: Array(suffixIds[pfDone..<end]),
+                                             startPos: startPos + pfDone)
+            pfDone = end
+            if pfDone < suffixIds.count {
+                let dt = Date().timeIntervalSince(pfT0)
+                let tps = dt > 0 ? Double(pfDone) / dt : 0
+                continuation.yield(.progress(String(format: "prefill %d/%d token · %.1f tok/s…",
+                                                    pfDone, suffixIds.count, tps)))
+            }
+        }
         committedIds.append(contentsOf: suffixIds)
         // Profile the DECODE only (not the prefill), matching DS4Demo: reset the
         // per-phase counters at the prefill→decode boundary so decodeProfileReport()
