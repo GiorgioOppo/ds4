@@ -104,31 +104,31 @@ public final class ExpertShardEngine: @unchecked Sendable {
         }
         let k = req.ids.count
         let quant = layerQuants[req.layer]
-        // Attivazione → s.cur (f32; f16 di rete convertita CPU-side).
-        let curPtr = scratch.cur.buffer.contents().advanced(by: scratch.cur.byteOffset)
+        // Attivazione → s.cur (f32; f16 di rete convertita CPU-side, sempre
+        // via memcpy staging: una Data di rete può essere una slice non
+        // allineata).
+        var act = [Float](repeating: 0, count: nE)
         if req.bits == 32 {
             guard req.activation.count == nE * 4 else {
                 throw GGUFWeights.LoadError.message("expertWork: attivazione f32 di taglia errata")
             }
-            req.activation.withUnsafeBytes { _ = memcpy(curPtr, $0.baseAddress!, nE * 4) }
+            _ = act.withUnsafeMutableBytes { dst in
+                req.activation.withUnsafeBytes { src in memcpy(dst.baseAddress!, src.baseAddress!, nE * 4) }
+            }
         } else {
             guard req.activation.count == nE * 2 else {
                 throw GGUFWeights.LoadError.message("expertWork: attivazione f16 di taglia errata")
             }
-            // Staging con memcpy: una Data di rete può essere una slice NON
-            // allineata — bindMemory(to: Float16) su base disallineata è UB.
             var halves = [Float16](repeating: 0, count: nE)
             _ = halves.withUnsafeMutableBytes { dst in
                 req.activation.withUnsafeBytes { src in memcpy(dst.baseAddress!, src.baseAddress!, nE * 2) }
             }
-            let dst = curPtr.bindMemory(to: Float.self, capacity: nE)
-            for i in 0..<nE { dst[i] = Float(halves[i]) }
+            for i in 0..<nE { act[i] = Float(halves[i]) }
         }
-        // Pesi di route → s.rw (le righe oltre k restano 0: gli slot inerti
-        // del percorso fuso non contribuiscono).
-        let rwPtr = scratch.rw.buffer.contents().advanced(by: scratch.rw.byteOffset)
-            .bindMemory(to: Float.self, capacity: dims.k)
-        for i in 0..<dims.k { rwPtr[i] = i < k ? req.weights[i] : 0 }
+        scratch.writeCurActivation(act)
+        // Pesi di route (gli slot oltre k restano 0: gli slot inerti del
+        // percorso fuso non contribuiscono).
+        scratch.writeRouteWeights(req.weights, padTo: dims.k)
         // Gather dei SUOI esperti: slab impacchettati, id rimappati 0..<k.
         let (g, u, dn) = try GGUFWeights.gatherLayerExperts(rt, model, req.layer, ids: req.ids,
                                                             dims: dims, willNeed: true,
@@ -139,10 +139,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
         // avvelenerebbe la somma).
         let sumFused = dims.fusedMoE && k == 6
             && (quant.down == .q2_K || quant.down == .q4_K)
-        if !sumFused && k < 6 {
-            let d6 = scratch.down6.buffer.contents().advanced(by: scratch.down6.byteOffset)
-            memset(d6 + k * nE * 4, 0, (6 - k) * nE * 4)
-        }
+        if !sumFused { scratch.zeroDown6Rows(fromRow: k, nEmbd: nE) }
         let c = GraphContext(rt)
         try c.begin()
         try c.decodeExpertPartial(s: scratch, d: dims,

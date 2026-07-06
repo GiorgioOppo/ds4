@@ -159,6 +159,31 @@ public struct LayerWeights {
 
 /// Reusable scratch GPUTensors for one decode layer (allocate once, reuse across layers).
 public final class DecodeScratch {
+    // MARK: Accessi CPU per l'expert shard VERTICALE (modulo DS4Engine): i
+    // campi restano interni al modulo — lo shard scrive i suoi input e azzera
+    // le righe inerti senza esporre l'intero scratch.
+
+    /// Scrive l'attivazione (nEmbd f32) in `cur` — l'input dei matvec esperti.
+    public func writeCurActivation(_ values: [Float]) {
+        let p = cur.buffer.contents().advanced(by: cur.byteOffset)
+        _ = values.withUnsafeBytes { memcpy(p, $0.baseAddress!, $0.count) }
+    }
+
+    /// Scrive i pesi di route: `values` nei primi slot, zero fino a `padTo`
+    /// (gli slot inerti del percorso fuso non devono contribuire).
+    public func writeRouteWeights(_ values: [Float], padTo k: Int) {
+        let p = (rw.buffer.contents() + rw.byteOffset).bindMemory(to: Float.self, capacity: k)
+        for i in 0..<k { p[i] = i < values.count ? values[i] : 0 }
+    }
+
+    /// Azzera le righe [fromRow, 6) di down6: moe_sum6 somma SEMPRE 6 righe e
+    /// con k variabile per richiesta una riga stantia avvelenerebbe la somma.
+    public func zeroDown6Rows(fromRow k: Int, nEmbd: Int) {
+        guard k < 6 else { return }
+        let p = down6.buffer.contents().advanced(by: down6.byteOffset)
+        memset(p + k * nEmbd * 4, 0, (6 - k) * nEmbd * 4)
+    }
+
     let flat, mix, split, embd, cur: GPUTensor
     let qr, qrNorm, q, kvRaw, kv: GPUTensor
     let kvF16, mask, sinks, pad, tmp, heads, blockOut: GPUTensor
