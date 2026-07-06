@@ -32,7 +32,7 @@ Main files by runtime weight:
 
 ## Known latent hazards (kernel audit 2026-07-04)
 
-Full low-level audit of all 20 kernel files against the Swift dispatch
+Full low-level audit of all 19 kernel files against the Swift dispatch
 wrappers. Two live bugs were FIXED (iq2_xxs shared-table loader racing/OOB
 with nsg=4 — hit every token on iq2_xxs models; fp8_kv_quantize missing the
 in_nope guard for n_nope % 64 != 0) and one hard guard added (the router

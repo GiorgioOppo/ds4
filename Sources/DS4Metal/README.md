@@ -6,8 +6,9 @@ path, and links `Metal.framework`. It depends on `DS4Core`.
 
 - **`Runtime/`**: `MetalRuntime` for device/pipeline setup, `GPUTensor` for
   shared-memory buffers, and generated embedded kernel sources.
-- **`Model/`**: compiled model shape (`DSV4Shape`) and GGUF-backed weight loading
-  (`GGUFWeights`) with no-copy mmap access and expert gathering.
+- **`Model/`**: compiled model shape (`DSV4Shape`), GGUF-backed weight loading
+  (`GGUFWeights`) with no-copy mmap access and expert gathering, dense-weight
+  streaming (`DenseStreamer`), and the contiguous expert sidecar (`ExpertBundle`).
 - **`Decode/`**: `StreamingDecoder`, forward/prefill/slice execution, decode graph,
   KV cache, raw window plus NSA compressor, expert slot cache, and KV snapshots.
 - **`Kernels/`**: one Swift wrapper per Metal kernel, covering MoE matvec,
