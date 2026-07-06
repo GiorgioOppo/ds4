@@ -12,7 +12,10 @@ Chat view model and UI.
   near-context-full warnings, applies memory settings such as expert cache,
   expert pread, expert bundle, dense streaming, `mlock`, Q4 dense cache, disk KV,
   and raw-KV ring, and manages **multiple persistent chats**. The active chat
-  lives in `messages`; inactive chats are stored on disk.
+  lives in `messages`; inactive chats are stored on disk. It also owns the
+  sampling and prefill knobs (`DS4Temperature`, `DS4RepPenalty`,
+  `DS4PrefillUnion`, `DS4PrefillChunk`); all keys and defaults are listed in
+  the root [Configuration Reference](../../../README.md#configuration-reference).
 - **`ChatSession.swift`** defines the `Codable` chat model, including metadata and
   transcript entries as `StoredMessage`. `ChatSessionStore` persists one JSON
   file per chat under `Application Support/DwarfStar/chats`.
@@ -20,9 +23,14 @@ Chat view model and UI.
   sections, tool calls/results, sub-agent events, and attachment chips.
 - **`ChatListView.swift`** is the saved-chat popover for switching, renaming,
   deleting, and creating chats.
-- **`ChatTabView.swift`** wraps the tab header and project/agent/tool menus.
-- **`ContentView.swift`** handles model loading/onboarding and the embedded
-  settings section.
+- **`ChatTabView.swift`** switches the Chat tab by engine mode and phase: the
+  local `ChatView` when ready, a loading/onboarding placeholder otherwise, and
+  `CoordinatorChatView` in Distributed mode. The header with the
+  project/agent/tool menus lives in `ChatView`.
+- **`ContentView.swift`** contains `ModelLoadView`, the pre-load configuration
+  form (model selection, memory settings, context, agent, system prompt).
+  Neither view is referenced by the current UI — `RootView`/`ChatTabView` and
+  the Settings tab took over this flow, so the file is a removal candidate.
 
 ## Reopening A Chat
 

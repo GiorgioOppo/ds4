@@ -31,3 +31,7 @@ request must send `Authorization: Bearer <key>` (OpenAI style) or
 HTTP traffic is plaintext. The intended default is `127.0.0.1`; if you expose it
 beyond loopback, put it behind TLS — the API key guards against other local
 processes, not against network eavesdropping.
+
+Panel defaults: host `127.0.0.1`, port `8000`, max tokens `1024`, CORS off, no
+API key. See the root
+[Configuration Reference](../../../README.md#configuration-reference).

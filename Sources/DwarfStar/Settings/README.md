@@ -21,4 +21,5 @@ expert cache slots, direct expert `pread`, expert-bundle sidecar, dense-weight
 streaming, best-effort `mlock`, Q4 attention-projection cache, disk KV plus
 budget, and raw-KV ring. Most defaults are RAM-aware; the current low-RAM path
 prefers streaming and pinned hot buffers over keeping every dense weight
-resident.
+resident. Every setting's UserDefaults key and default value is documented in
+the root [Configuration Reference](../../../README.md#configuration-reference).

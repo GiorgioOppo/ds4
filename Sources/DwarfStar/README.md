@@ -2,7 +2,10 @@
 
 The SwiftUI macOS app for Apple Silicon. It is driven by `DS4Engine`; a sidebar
 selects the main panels. Model path and context length are configured once in
-**Settings** through `AppSettings`, then inherited by every controller.
+**Settings** through `AppSettings`, then inherited by every controller. Every
+persisted setting (UserDefaults key, default value, engine environment
+variable) is documented in the root
+[Configuration Reference](../../README.md#configuration-reference).
 
 The app is organized by **feature**, with one folder per tab or area:
 
