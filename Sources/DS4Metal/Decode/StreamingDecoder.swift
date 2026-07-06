@@ -188,12 +188,14 @@ public final class StreamingDecoder {
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
     /// Persistent staging for the decode slot-cache ids: rewritten every layer
     /// instead of allocating a fresh 24-byte MTLBuffer per layer per token
-    /// (~43 allocations/token). Safe to reuse: the routed command buffer that
-    /// reads it is committed AND waited before the next layer overwrites it.
+    /// (~43 allocations/token). Safe to reuse even with the ASYNC routed FFN:
+    /// the memcpy happens after this layer's route commit+wait, which
+    /// queue-orders after (= joins) every previous FFN command buffer.
     let slotsScratch: GPUTensor
-    /// Second slot-staging buffer: with the ASYNC routed-FFN commit the next
-    /// layer's CPU memcpy must not overwrite the ids the in-flight command
-    /// buffer is still reading — layers alternate A/B by parity.
+    /// Second staging buffer, alternated by layer parity. DEFENSIVE: today at
+    /// most ONE routed-FFN cb is ever in flight (see slotsScratch), so a single
+    /// buffer would suffice — the parity keeps the invariant local instead of
+    /// depending on the route-wait ordering, and costs 24 bytes.
     let slotsScratchB: GPUTensor
     /// The last layer's routed-FFN command buffer, committed WITHOUT a CPU wait
     /// (DS4_ASYNC_FFN, default ON): the next layer's route commit+wait lands on
@@ -431,16 +433,25 @@ public final class StreamingDecoder {
         // attivazioni transienti in piu'.
         let envChunk = ProcessInfo.processInfo.environment["DS4_PREFILL_CHUNK"].flatMap(Int.init)
         let step = max(1, envChunk ?? chunk)
-        while start < tokens.count {
-            let end = min(start + step, tokens.count)
-            // Drain the ObjC autorelease pool per chunk: Metal command buffers /
-            // encoders are autoreleased, and a long prefill inside one pool scope
-            // accumulates them all — transient footprint grows with the prompt.
-            lastHC = try autoreleasepool {
-                try prefillRange(tokens, start: start, end: end, posBase: startPos)
+        do {
+            while start < tokens.count {
+                let end = min(start + step, tokens.count)
+                // Drain the ObjC autorelease pool per chunk: Metal command buffers /
+                // encoders are autoreleased, and a long prefill inside one pool scope
+                // accumulates them all — transient footprint grows with the prompt.
+                lastHC = try autoreleasepool {
+                    try prefillRange(tokens, start: start, end: end, posBase: startPos)
+                }
+                start = end
             }
-            start = end
+        } catch {
+            // The per-token path (n==1 chunks) commits its routed FFN async: a
+            // cancellation/gather error must never escape with a cb in flight
+            // over state the caller will tear down (same invariant as forward).
+            drainFFN()
+            throw error
         }
+        drainFFN()   // don't hand a stale in-flight handle past the prefill
         profile.forwards += tokens.count
         return try outputHead(lastHC!)
     }

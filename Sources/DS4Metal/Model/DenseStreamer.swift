@@ -23,11 +23,15 @@ import DS4Core
 // zero page-cache footprint (F_NOCACHE). Same bytes → identical numerics.
 //
 // Concurrency contract: `weights(_:)` is called from the DECODE thread only
-// (the layerProvider), one layer at a time; by the time layer i's provider is
-// called, runLayer(i-1) has committed AND waited all its command buffers, so
-// the slot holding layer i-1 is GPU-free and can be overwritten with i+1.
-// The background loader touches only the file descriptor and the target slot,
-// and hands completion back through a semaphore (happens-before for the bytes).
+// (the layerProvider), one layer at a time. With the ASYNC routed FFN
+// (DS4_ASYNC_FFN) layer i-1's FFN command buffer may still be in flight when
+// layer i's provider refills a slot — that is safe because the routed FFN
+// reads NO streamed dense slab (experts pool + scratch only; the shared-FFN
+// cb that does read the staged slabs is waited inside its own runLayer, and
+// the route cb commits synchronously). If the routed FFN ever gains a dense
+// read, this contract must be revisited. The background loader touches only
+// the file descriptor and the target slot, and hands completion back through
+// a semaphore (happens-before for the bytes).
 public final class DenseStreamer: @unchecked Sendable {
     /// The LayerWeights fields that are streamed (the "big" set of
     /// layerMappedDense; the small norm/scale tensors live in the skeleton).
@@ -260,11 +264,10 @@ public final class DenseStreamer: @unchecked Sendable {
     /// keeps the read-ahead pipeline `ahead` layers deep: with the default 1
     /// this is the classic 2-slot ring (read i+1 while computing i); with
     /// DS4_DENSE_AHEAD=2 the SSD moves on to i+2 as soon as i+1 lands instead
-    /// of idling for the rest of layer i's compute. Overwrite safety is the
-    /// same contract as before: a slot is reused only when its occupant is
-    /// neither the current layer nor one of the next `ahead` layers — and the
-    /// GPU finished every layer before the current one (runLayer waits its
-    /// command buffers before the next provider call).
+    /// of idling for the rest of layer i's compute. Overwrite safety: a slot is
+    /// reused only when its occupant is neither the current layer nor one of
+    /// the next `ahead` layers; the only async cb that can still be in flight
+    /// here (the routed FFN) reads no staged slab — see the class contract.
     public func weights(_ il: Int) throws -> LayerWeights {
         let slot: Int
         if let pi = pending.firstIndex(where: { $0.layer == il }) {
