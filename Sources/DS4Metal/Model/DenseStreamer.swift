@@ -138,9 +138,11 @@ public final class DenseStreamer: @unchecked Sendable {
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
                 if skipIndexerScoring, f == .idxQB || f == .idxProj {
+                    // Not staged: w.idxQB/idxProj stay nil and the decoder's
+                    // scoring gate (hasIdxScoring) keeps the top-K path off.
                     scoringSkipped += Int(t.bytes)
-                    continue                    // leaves w.idxQB/idxProj nil — the
-                }                               // decoder's scoring gate handles it
+                    continue
+                }
                 let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
                 let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
                 if q4Dense, attnQ4Field || sharedQ4Field,
