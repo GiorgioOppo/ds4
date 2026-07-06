@@ -284,6 +284,9 @@ public final class StreamingDecoder {
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
         if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
+        // Layer 0's expert I/O can start NOW: the token id is known before any
+        // GPU work (hash layer -> exact ids), so its fill overlaps embed+route(0).
+        kickLookahead(after: -1, token: token)
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
@@ -323,6 +326,7 @@ public final class StreamingDecoder {
         precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
         if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
         writeFloats(hcIn, into: hcA)
+        kickLookahead(after: start - 1, token: token)
         var cur = hcA, other = hcB
         for i in start...end {
             let w = try layerProvider(i)
@@ -911,6 +915,13 @@ public final class StreamingDecoder {
     /// layer-major `prefill` — identical numerics either way.
     private func runLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                           cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
+        // Kick the NEXT layer's look-ahead at the START of this one: the fill
+        // window becomes the whole layer (route + attention + FFN, ~2x the
+        // post-gather window) instead of the few ms before the next acquire.
+        // Its I/O shares the SSD with this layer's own gather, but the disk's
+        // parallel ceiling is well above the demand queue depth and the demand
+        // path preempts on contention for the same layer's lock.
+        kickLookahead(after: i, token: token)
         if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
@@ -945,7 +956,6 @@ public final class StreamingDecoder {
                 catch { c1.waitCompleted(); throw error }
                 let (pool, slots) = acquired
                 profile.gatherS += Date().timeIntervalSince(t)
-                kickLookahead(after: i, token: token)
                 // Deltas, not cumulative totals: the cache counts since load,
                 // the profile since resetProfile().
                 profile.expertHits += cache.hits - h0
@@ -976,7 +986,6 @@ public final class StreamingDecoder {
                 let (g, u, dn) = gathered
                 profile.gatherS += Date().timeIntervalSince(t)
                 profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
-                kickLookahead(after: i, token: token)
                 t = Date()
                 c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
