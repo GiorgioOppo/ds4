@@ -41,6 +41,11 @@ public struct DecodeProfile: Sendable {
 
     public init() {}
 
+    /// Engine-side seconds accounted by the per-phase counters (what report()
+    /// calls "totale"). Wall-clock minus this = time spent OUTSIDE the engine
+    /// (sampler, streaming, UI) — the GUI logs that split per turn.
+    public var totalS: Double { embedS + routeS + gatherS + expertsS + layerOtherS + headS }
+
     public func report(title: String = "Profilo decode") -> String {
         guard forwards > 0 else { return "\(title): nessun forward registrato." }
         let f = Double(forwards)

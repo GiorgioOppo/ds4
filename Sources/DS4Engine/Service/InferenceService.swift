@@ -914,14 +914,18 @@ public actor InferenceService {
 
         var produced = 0
         let genStart = Date()
+        var sampleS = 0.0                          // CPU sampler (full-vocab sort at temp>0)
+        var lastProgress = Date(timeIntervalSince1970: 0)
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
             // Penalize the recently produced tokens to break repeat-loop collapse.
             let lo = max(0, committedIds.count - sampling.repeatLastN)
+            let tSample = Date()
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
                                       topP: sampling.topP, minP: sampling.minP,
                                       repetitionPenalty: sampling.repetitionPenalty,
                                       recent: committedIds[lo...], rng: &rng)
+            sampleS += Date().timeIntervalSince(tSample)
             if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
                 // A held opener '<' belongs to the tool block, not the visible text:
@@ -953,11 +957,31 @@ public actor InferenceService {
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
             committedIds.append(next)           // the generated token is now in the KV
             pos += 1
-            let elapsed = Date().timeIntervalSince(genStart)
-            continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
-                                                 elapsed > 0 ? Double(produced) / elapsed : 0)))
+            // THROTTLED progress (max ~4/s): every yield is a MainActor hop + a
+            // SwiftUI invalidation in the GUI — per-token it costs main-thread
+            // time that competes with the decode's own CPU work.
+            let now = Date()
+            if now.timeIntervalSince(lastProgress) >= 0.25 {
+                lastProgress = now
+                let elapsed = now.timeIntervalSince(genStart)
+                continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
+                                                     elapsed > 0 ? Double(produced) / elapsed : 0)))
+            }
         }
         flush(inReasoning)
+        // Attribution of the turn's wall clock: engine (per-phase profile),
+        // sampler (CPU, full-vocab sort when temp>0 — the demo's greedy path
+        // costs ~0), rest = streaming/tokenizer/actor/UI backpressure. This is
+        // the number that answers "why is the GUI slower than the demo".
+        if produced > 0 {
+            let wall = Date().timeIntervalSince(genStart)
+            let engine = decoder.profile.totalS
+            let per = 1000.0 / Double(produced)
+            let other = max(0, wall - engine - sampleS)
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f\n",
+                produced, wall, wall * per, engine * per, sampleS * per, other * per).utf8))
+        }
 
         // Extract any tool calls from the generated output.
         var calls: [ToolCall] = []
