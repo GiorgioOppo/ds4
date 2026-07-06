@@ -86,7 +86,7 @@ struct SettingsView: View {
             Section("Memory") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
-                    Text("Resets every toggle below to the measured-fast set (slots 16, pread + dense stream + mlock + Q4 + bundle ON, ring OFF). Applies on the next model load.")
+                    Text("Resets every toggle below to the measured-fast set (slots 16, pread + dense stream + mlock + Q4 + bundle ON, dense-ahead 2, look-ahead 0, ring OFF). Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
