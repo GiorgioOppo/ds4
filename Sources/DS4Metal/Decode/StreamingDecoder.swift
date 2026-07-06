@@ -295,12 +295,18 @@ public final class StreamingDecoder {
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
         for i in 0..<nLayers {
-            let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
-            if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
-            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-            swap(&cur, &other)
-            // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+            // Per-layer pool drain, like the prefill loops: the command buffers/
+            // encoders are autoreleased ObjC objects — without this a LONG
+            // generation (hundreds of tokens x ~3 cb/layer) accumulates them
+            // for the whole turn instead of freeing at each layer.
+            try autoreleasepool {
+                let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
+                if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
+                try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                             cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                swap(&cur, &other)
+                // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+            }
         }
         profile.forwards += 1
         return try outputHead(cur)
@@ -334,11 +340,13 @@ public final class StreamingDecoder {
         kickLookahead(after: start - 1, token: token)
         var cur = hcA, other = hcB
         for i in start...end {
-            let w = try layerProvider(i)
-            if i + 1 <= end { prefetch?(i + 1) }
-            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-            swap(&cur, &other)
+            try autoreleasepool {   // per-layer drain (see forward)
+                let w = try layerProvider(i)
+                if i + 1 <= end { prefetch?(i + 1) }
+                try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                             cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                swap(&cur, &other)
+            }
         }
         profile.forwards += 1
         return readHC(cur)
