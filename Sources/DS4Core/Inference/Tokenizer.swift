@@ -109,11 +109,16 @@ public final class Tokenizer {
 
     private let tokenToId: [[UInt8]: Int32]
     private let mergeRank: [[UInt8]: Int32]
-    /// Literal special tokens recognized when tokenizing already-rendered chat,
-    /// sorted longest-first so the longest token wins at any position. Built from
-    /// every CONTROL/USER_DEFINED vocab entry (so tool-call markup tokenizes as
-    /// single ids), falling back to the seven named specials.
-    private let specials: [(bytes: [UInt8], id: Int32)]
+    /// Literal special tokens recognized when tokenizing already-rendered chat.
+    /// Built from every CONTROL/USER_DEFINED vocab entry (so tool-call markup
+    /// tokenizes as single ids), plus the seven named specials, indexed by FIRST
+    /// byte (256 bucket, longest-first dentro il bucket): la scansione del
+    /// rendered chat salta in O(1) i byte che non possono aprire nessun token
+    /// speciale. Senza questo indice ogni byte del transcript confrontava TUTTI
+    /// gli speciali (con un'allocazione per confronto): su un transcript Xcode
+    /// da decine di KB erano secondi di CPU spesi in silenzio tra l'arrivo
+    /// della richiesta e l'inizio del prefill.
+    private let specialsByFirstByte: [[(bytes: [UInt8], id: Int32)]]
 
     public enum TokError: Error { case missingTable(String), missingSpecial(String) }
 
@@ -176,7 +181,9 @@ public final class Tokenizer {
         for n in named where !seen.contains(n.id) { sp.append(n); seen.insert(n.id) }
         // Longest-first: at each position the longest matching special wins.
         sp.sort { $0.bytes.count > $1.bytes.count }
-        self.specials = sp
+        var byFirst = [[(bytes: [UInt8], id: Int32)]](repeating: [], count: 256)
+        for s in sp { byFirst[Int(s.bytes[0])].append(s) }   // sp è già longest-first
+        self.specialsByFirstByte = byFirst
     }
 
     /// Look up the id of an arbitrary special/normal token by its exact bytes
@@ -336,14 +343,19 @@ public final class Tokenizer {
         var p = 0
         let len = t.count
         outer: while p < len {
-            for sp in specials {
-                let n = sp.bytes.count
-                if p + n <= len && Array(t[p..<p+n]) == sp.bytes {
-                    tokenizeSpan(t[span..<p], into: &out)
-                    out.append(sp.id)
-                    p += n
-                    span = p
-                    continue outer
+            // Solo i byte che aprono almeno uno speciale pagano il confronto;
+            // il confronto stesso è sulla slice, senza allocare copie.
+            let candidates = specialsByFirstByte[Int(t[p])]
+            if !candidates.isEmpty {
+                for sp in candidates {
+                    let n = sp.bytes.count
+                    if p + n <= len && t[p..<p+n].elementsEqual(sp.bytes) {
+                        tokenizeSpan(t[span..<p], into: &out)
+                        out.append(sp.id)
+                        p += n
+                        span = p
+                        continue outer
+                    }
                 }
             }
             p += 1

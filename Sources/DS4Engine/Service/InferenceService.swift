@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-06 fase2a fused-hc"
+    public static let engineRevision = "2026-07-06 tokenizer-index + timing server"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -792,9 +792,19 @@ public actor InferenceService {
     public func complete(turns: [ChatTurn], tools: [ToolSpec], thinkMode: DS4ThinkMode,
                          sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         self.tools = tools
+        // Render + tokenizzazione dell'INTERO transcript: è lavoro sincrono
+        // sull'actor PRIMA che parta il prefill — se è lento è "tempo morto"
+        // invisibile per il client, quindi lo misuriamo e lo denunciamo.
+        let tPrep = Date()
         let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
                                          markup: markup, compactTools: compactTools)
         let ids = tok.tokenizeRenderedChat(suffix).map { Int($0) }
+        let prepS = Date().timeIntervalSince(tPrep)
+        if prepS > 0.25 {
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 server: render+tokenizzazione %d char → %d token in %.2fs\n",
+                suffix.count, ids.count, prepS).utf8))
+        }
         // CONTINUITÀ KV per il server STATELESS (Xcode & co. ri-inviano
         // l'intero transcript a ogni richiesta, system prompt di migliaia di
         // token incluso): se i token ESTENDONO esattamente quelli già

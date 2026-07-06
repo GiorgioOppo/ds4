@@ -203,6 +203,34 @@ final class LocalServer: @unchecked Sendable {
         return nil
     }
 
+    /// Acquisisce il gate MISURANDO l'attesa: se il motore è occupato (altra
+    /// richiesta o turno chat in corso) la richiesta resta in coda in silenzio —
+    /// senza questa riga il tempo di coda sembra un hang del server.
+    private func acquireGate() async {
+        let t0 = Date()
+        await gate.acquire()
+        let dt = Date().timeIntervalSince(t0)
+        if dt > 0.5 {
+            onLog(String(format: "… richiesta rimasta in coda %.1fs (motore occupato)\n", dt))
+        }
+    }
+
+    /// Chiama `engine.complete` misurando quanto costa PRIMA che parta la
+    /// generazione: hop sull'actor (che può essere occupato da un turno chat,
+    /// fuori dal gate) + render + tokenizzazione dell'intero transcript.
+    private func startCompletion(turns: [ChatTurn], tools: [ToolSpec], think: DS4ThinkMode,
+                                 sampling: SamplingParams, maxTokens: Int) async
+        -> AsyncThrowingStream<GenEvent, Error> {
+        let t0 = Date()
+        let stream = await engine.complete(turns: turns, tools: tools, thinkMode: think,
+                                           sampling: sampling, maxTokens: maxTokens)
+        let dt = Date().timeIntervalSince(t0)
+        if dt > 0.5 {
+            onLog(String(format: "· preparazione prompt %.1fs (render+tokenizzazione, attesa motore inclusa)\n", dt))
+        }
+        return stream
+    }
+
     private func handleChat(_ conn: NWConnection, body: Data) async throws {
         guard let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
             try await send(conn, Self.httpError(400, "invalid JSON body", cors: config.cors)); return
@@ -221,12 +249,12 @@ final class LocalServer: @unchecked Sendable {
         }
 
         // Serialize: only one generation runs against the single-model engine.
-        await gate.acquire()
+        await acquireGate()
         defer { Task { await gate.release() } }
 
-        let stream = await engine.complete(turns: parsed.turns, tools: parsed.tools,
-                                            thinkMode: parsed.think, sampling: parsed.sampling,
-                                            maxTokens: parsed.maxTokens)
+        let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
+                                           think: parsed.think, sampling: parsed.sampling,
+                                           maxTokens: parsed.maxTokens)
         if parsed.stream {
             try await streamChat(conn, stream: stream, id: id, model: model, created: created)
         } else {
@@ -251,7 +279,11 @@ final class LocalServer: @unchecked Sendable {
         let t0 = Date()
         var textChars = 0, reasonChars = 0, toolCallCount = 0
         var tail = ""
-        var lastNote = Date()
+        // distantPast: la PRIMA riga di progresso ("prefill N token…",
+        // "ripristino KV…") deve uscire subito — con Date() veniva soppressa
+        // dal throttle e con chunk da 512 token la prima riga visibile
+        // arrivava dopo minuti: prefill in corso ma log muto = "tempo morto".
+        var lastNote = Date.distantPast
         func note() {
             guard Date().timeIntervalSince(lastNote) >= 2 else { return }
             lastNote = Date()
@@ -355,12 +387,12 @@ final class LocalServer: @unchecked Sendable {
         let id = "msg_" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         onLog("POST /v1/messages (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")
 
-        await gate.acquire()
+        await acquireGate()
         defer { Task { await gate.release() } }
 
-        let stream = await engine.complete(turns: parsed.turns, tools: parsed.tools,
-                                            thinkMode: parsed.think, sampling: parsed.sampling,
-                                            maxTokens: parsed.maxTokens)
+        let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
+                                           think: parsed.think, sampling: parsed.sampling,
+                                           maxTokens: parsed.maxTokens)
         if parsed.stream {
             try await streamAnthropic(conn, stream: stream, id: id, model: model)
         } else {
@@ -481,12 +513,12 @@ final class LocalServer: @unchecked Sendable {
         let created = Int(Date().timeIntervalSince1970)
         onLog("POST /v1/completions (stream=\(parsed.stream))\n")
 
-        await gate.acquire()
+        await acquireGate()
         defer { Task { await gate.release() } }
 
-        let stream = await engine.complete(turns: parsed.turns, tools: [],
-                                            thinkMode: parsed.think, sampling: parsed.sampling,
-                                            maxTokens: parsed.maxTokens)
+        let stream = await startCompletion(turns: parsed.turns, tools: [],
+                                           think: parsed.think, sampling: parsed.sampling,
+                                           maxTokens: parsed.maxTokens)
         let m = jsonString(model)
         if parsed.stream {
             try await send(conn, Data(Self.sseHeader(cors: config.cors).utf8))
@@ -531,12 +563,12 @@ final class LocalServer: @unchecked Sendable {
         let respId = rid("resp_"), msgId = rid("msg_"), rsId = rid("rs_")
         onLog("POST /v1/responses (\(parsed.turns.count) item, stream=\(parsed.stream))\n")
 
-        await gate.acquire()
+        await acquireGate()
         defer { Task { await gate.release() } }
 
-        let stream = await engine.complete(turns: parsed.turns, tools: parsed.tools,
-                                            thinkMode: parsed.think, sampling: parsed.sampling,
-                                            maxTokens: parsed.maxTokens)
+        let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
+                                           think: parsed.think, sampling: parsed.sampling,
+                                           maxTokens: parsed.maxTokens)
         if parsed.stream {
             try await streamResponses(conn, stream: stream, model: model, created: created,
                                       respId: respId, msgId: msgId, rsId: rsId)
