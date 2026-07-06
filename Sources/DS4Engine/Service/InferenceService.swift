@@ -341,11 +341,17 @@ public actor InferenceService {
         /// lenti. È la metrica riportata dal Bench.
         public let genTpsP99: Double
         public let kvBytes: UInt64
+        /// Velocità per-token IN ORDINE DI GENERAZIONE (1/durata di ciascuno):
+        /// distingue la partenza fredda (primi token lenti, poi regime — normale
+        /// dopo un reload) dal degrado progressivo da pressione di memoria
+        /// (coda più lenta della testa) — media e p99 da soli non li separano.
+        public let genSpeeds: [Double]
         public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64,
-                    genTpsP99: Double = 0) {
+                    genTpsP99: Double = 0, genSpeeds: [Double] = []) {
             self.contextTokens = contextTokens; self.prefillTps = prefillTps
             self.genTps = genTps; self.kvBytes = kvBytes
             self.genTpsP99 = genTpsP99 > 0 ? genTpsP99 : genTps
+            self.genSpeeds = genSpeeds
         }
     }
 
@@ -399,7 +405,8 @@ public actor InferenceService {
                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
                           kvBytes: kv,
-                          genTpsP99: p99)
+                          genTpsP99: p99,
+                          genSpeeds: tokenSpeeds)
     }
 
     // MARK: - Sub-agents (isolated context, returns only the answer)

@@ -235,6 +235,10 @@ public final class StreamingDecoder {
             throw MetalError.unsupported(
                 "router: il kernel supporta SOLO 256 esperti (shape con \(dims.nExperts))")
         }
+        // DS4_Q8_NSG: riletto QUI (non a ogni dispatch) così un reload del
+        // modello — es. l'auto-tune delle Settings — può fare lo sweep senza
+        // riavviare il processo.
+        GraphContext.refreshQ8NSG()
         self.rt = rt; self.d = dims; self.rope = rope; self.nLayers = nLayers
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather

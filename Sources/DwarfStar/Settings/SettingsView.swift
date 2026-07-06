@@ -49,6 +49,11 @@ struct SettingsView: View {
                     TextField("GGUF model", text: $settings.modelPath)
                     Button("Browse") { if let p = ModelPicker.pickGGUF() { settings.modelPath = p } }
                 }
+                Button("Grant Model Folder Access…") {
+                    _ = ModelPicker.pickModelFolder(near: settings.modelPath)
+                }
+                Text("Sandboxed builds can read ONLY the picked .gguf: sidecar caches next to it (\u{201C}.q4dense\u{201D}, \u{201C}.expbundle\u{201D}, e.g. built by the demo) are invisible, so the app re-creates them inside its container (slow first load, gigabytes duplicated, or a failed write when disk is short). Granting the model's folder reuses them directly — recommended once per model folder.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Stepper("Context: \(settings.contextSize) tokens",
                         value: $settings.contextSize, in: 1024...1_000_000, step: 1024)
                 if let warning = MemoryInfo.loadWarning(modelPath: settings.modelPath) {
@@ -66,9 +71,13 @@ struct SettingsView: View {
                         store.runSettingsBenchmark(quick: false)
                     }
                     .disabled(store.benchRunning || store.phase != .ready)
+                    Button("Auto-tune macchina (~15-25 min)") {
+                        store.runAutoTune()
+                    }
+                    .disabled(store.benchRunning || store.phase != .ready)
                     if store.benchRunning { ProgressView().controlSize(.small) }
                 }
-                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. I knob che richiedono un reload (percorso matrix-matrix, batch dei route) non sono coperti.")
+                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = store.benchStatus {
                     Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")
@@ -80,7 +89,16 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Attivi", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                LabeledContent("Attivi (prefill)", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                    .font(.caption)
+                // Il set di CARICAMENTO scelto dall'auto-tune: slot e look-ahead
+                // hanno i loro stepper (si aggiornano da soli), ma dense-ahead,
+                // async FFN e q8nsg non hanno un controllo — senza questa riga
+                // il valore applicato sarebbe visibile solo nel referto.
+                LabeledContent("Attivi (load)",
+                               value: "slot \(store.expertCacheSlots) · ahead \(store.denseAhead) · " +
+                                      "asyncFFN \(store.asyncFFNEnabled ? "on" : "off") · " +
+                                      "look \(store.expertLookahead) · q8nsg \(store.q8NSG)")
                     .font(.caption)
             }
             Section("Memory") {

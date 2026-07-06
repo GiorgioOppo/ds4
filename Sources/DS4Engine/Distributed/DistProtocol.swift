@@ -38,7 +38,34 @@ public enum Dist {
     /// v7: WORK carries the chunk's token ids. The first n_hash_layer (3)
     /// layers route experts by TOKEN ID (ffn_gate_tid2eid), so a shard that
     /// covers them cannot route from the HC state alone.
-    public static let protocolVersion: UInt32 = 7
+    /// v8: RESUMABLE transfers. The offer carries a CHAINED-HASH checkpoint
+    /// list per file (one SHA-256 every fileCheckpointBytes, each folded over
+    /// the previous — chain[k] commits to the whole prefix); the worker keeps
+    /// its `.part` across disconnects AND sessions, validates it block-by-block
+    /// against the chain, truncates to the last good checkpoint and answers
+    /// FILE NEED with a per-file RESUME OFFSET. The coordinator streams from
+    /// there and retries a broken peer setup up to 3 times before failing.
+    /// v9: ASSIGN carries the coordinator's PERFORMANCE KNOBS (DS4_* env,
+    /// whitelisted). A worker with factory defaults ran the engine without
+    /// dense streaming/mlock/pread — measured 0.37 tok/s against the same
+    /// hardware's 2.7 local. The coordinator's measured configuration IS the
+    /// job definition: the worker applies it before loading its engine.
+    public static let protocolVersion: UInt32 = 9
+
+    /// The env knobs an ASSIGN may carry and a worker will apply (v9). A
+    /// WHITELIST on both sides: the wire must never gain the power to set
+    /// arbitrary environment on a worker. All performance-only — none of
+    /// these can change the numerics of the shard (DS4_DENSE_Q4, the one
+    /// lossy knob, travels as a typed field and its cache as a file).
+    public static let perfKnobKeys: [String] = [
+        "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_MLOCK",
+        "DS4_EXPERT_PREAD", "DS4_PREAD_SPLIT", "DS4_WILLNEED_EXPERTS",
+        "DS4_ASYNC_FFN", "DS4_EXPERT_LOOKAHEAD", "DS4_Q8_NSG",
+        "DS4_LAZY_IDX", "DS4_RESIDENT_COMP", "DS4_FUSED_HC", "DS4_FUSED_MOE",
+        "DS4_RAW_RING", "DS4_EXPERT_CACHE_UNIFORM", "DS4_POOL_INTERLEAVE",
+        "DS4_PREFILL_UNION", "DS4_PREFILL_CHUNK", "DS4_PREFILL_FFN_BATCH",
+        "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_MM",
+    ]
     static let magic: UInt32 = 0x44_53_34_44   // "DS4D"
     /// Sanity cap on the route length in a WORK frame (a hostile frame could
     /// otherwise declare 4G entries and spin the decoder).
@@ -47,6 +74,11 @@ public enum Dist {
     static let maxFileEntries = 16
     /// File-transfer chunk payload (per fileChunk frame).
     public static let fileChunkBytes = 4 * 1024 * 1024
+    /// Checkpoint granularity of the chained-hash list (v8 resumable
+    /// transfers): one 32-byte digest every 256 MB — a 70 GB gguf carries
+    /// ~280 digests (~9 KB) in the offer, and at most 256 MB are re-sent
+    /// after an interruption. MUST be a multiple of fileChunkBytes.
+    public static let fileCheckpointBytes: UInt64 = 256 * 1024 * 1024
 
     public enum MsgType: UInt32, Sendable {
         case hello     = 1    // worker → coordinator on connect (state + model identity)
@@ -186,11 +218,16 @@ public struct DistAssign: Sendable {
     /// Usage-imatrix JSON (ExpertUsageStats.serialize) to seed the worker's
     /// slot-cache pre-warm; empty = none (the worker may still have its own).
     public var usageJSON: Data
+    /// v9: the coordinator's PERFORMANCE env (whitelisted, Dist.perfKnobKeys).
+    /// The worker applies these before loading its engine, so a shard runs
+    /// with the coordinator's measured configuration instead of whatever the
+    /// worker app's local defaults happen to be.
+    public var envKnobs: [(key: String, value: String)]
 
     public init(modelPath: String, modelName: String, contextSize: Int, expertCacheSlots: Int,
                 diskKVBudgetTokens: Int, useExpertBundle: Bool = false, useDenseQ4: Bool = false,
                 layerStart: Int, layerEnd: Int, hasOutput: Bool,
-                usageJSON: Data = Data()) {
+                usageJSON: Data = Data(), envKnobs: [(key: String, value: String)] = []) {
         self.modelPath = modelPath; self.modelName = modelName
         self.contextSize = contextSize; self.expertCacheSlots = expertCacheSlots
         self.diskKVBudgetTokens = diskKVBudgetTokens
@@ -198,6 +235,7 @@ public struct DistAssign: Sendable {
         self.useDenseQ4 = useDenseQ4
         self.layerStart = layerStart; self.layerEnd = layerEnd; self.hasOutput = hasOutput
         self.usageJSON = usageJSON
+        self.envKnobs = envKnobs
     }
 
     public func encoded() -> Data {
@@ -214,12 +252,18 @@ public struct DistAssign: Sendable {
         let name = Data(modelName.utf8)
         d.appendLE(UInt32(name.count)); d.append(name)
         d.appendLE(UInt32(usageJSON.count)); d.append(usageJSON)
+        d.appendLE(UInt32(envKnobs.count))
+        for (k, v) in envKnobs {
+            let kd = Data(k.utf8), vd = Data(v.utf8)
+            d.appendLE(UInt32(kd.count)); d.append(kd)
+            d.appendLE(UInt32(vd.count)); d.append(vd)
+        }
         return d
     }
 
     public static func decode(_ d: Data) -> DistAssign? {
         var o = d.startIndex
-        guard d.count >= 44 else { return nil }
+        guard d.count >= 48 else { return nil }
         let ctx = Int(d.readLE(&o) as UInt32)
         let slots = Int(d.readLE(&o) as UInt32)
         let kvBudget = Int(d.readLE(&o) as UInt32)
@@ -234,12 +278,27 @@ public struct DistAssign: Sendable {
         guard nameLen >= 0, o + nameLen + 4 <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
         let usageLen = Int(d.readLE(&o) as UInt32)
-        guard usageLen >= 0, o + usageLen <= d.endIndex else { return nil }
-        let usage = Data(d[o..<o+usageLen])
+        guard usageLen >= 0, o + usageLen + 4 <= d.endIndex else { return nil }
+        let usage = Data(d[o..<o+usageLen]); o += usageLen
+        let knobCount = Int(d.readLE(&o) as UInt32)
+        guard knobCount >= 0, knobCount <= 64 else { return nil }
+        var knobs: [(key: String, value: String)] = []
+        knobs.reserveCapacity(knobCount)
+        for _ in 0..<knobCount {
+            guard o + 4 <= d.endIndex else { return nil }
+            let kLen = Int(d.readLE(&o) as UInt32)
+            guard kLen > 0, kLen <= 256, o + kLen + 4 <= d.endIndex else { return nil }
+            let k = String(decoding: d[o..<o+kLen], as: UTF8.self); o += kLen
+            let vLen = Int(d.readLE(&o) as UInt32)
+            guard vLen >= 0, vLen <= 256, o + vLen <= d.endIndex else { return nil }
+            let v = String(decoding: d[o..<o+vLen], as: UTF8.self); o += vLen
+            knobs.append((key: k, value: v))
+        }
         return DistAssign(modelPath: path, modelName: name, contextSize: ctx,
                           expertCacheSlots: slots, diskKVBudgetTokens: kvBudget,
                           useExpertBundle: bundle, useDenseQ4: q4,
-                          layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage)
+                          layerStart: ls, layerEnd: le, hasOutput: ho, usageJSON: usage,
+                          envKnobs: knobs)
     }
 }
 
@@ -255,9 +314,17 @@ public struct DistFileEntry: Sendable, Equatable {
     public var name: String
     public var size: UInt64
     public var sha256: Data          // 32 bytes
+    /// v8 chained checkpoint hashes, one per fileCheckpointBytes block, with
+    /// b_k = SHA256(raw bytes of block k):
+    /// chain[0] = SHA256(b_0); chain[k] = SHA256(chain[k-1] ‖ b_k).
+    /// Each entry commits to the WHOLE prefix, so a `.part` file from a broken
+    /// transfer is verifiable block-by-block and the resume point is the last
+    /// matching checkpoint — a corrupt middle block can never be resumed over.
+    public var chain: [Data]
 
-    public init(kind: Kind, name: String, size: UInt64, sha256: Data) {
+    public init(kind: Kind, name: String, size: UInt64, sha256: Data, chain: [Data] = []) {
         self.kind = kind; self.name = name; self.size = size; self.sha256 = sha256
+        self.chain = chain
     }
 
     func encode(into d: inout Data) {
@@ -266,16 +333,24 @@ public struct DistFileEntry: Sendable, Equatable {
         d.appendLE(UInt32(n.count)); d.append(n)
         d.appendLE(size)
         d.append(sha256.prefix(32))
+        d.appendLE(UInt32(chain.count))
+        for c in chain { d.append(c.prefix(32)) }
     }
 
     static func decode(_ d: Data, _ o: inout Data.Index) -> DistFileEntry? {
         guard o + 8 <= d.endIndex, let kind = Kind(rawValue: d.readLE(&o)) else { return nil }
         let nameLen = Int(d.readLE(&o) as UInt32)
-        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 <= d.endIndex else { return nil }
+        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 + 4 <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
         let size = d.readLE(&o) as UInt64
         let sha = Data(d[o..<o+32]); o += 32
-        return DistFileEntry(kind: kind, name: name, size: size, sha256: sha)
+        let chainCount = Int(d.readLE(&o) as UInt32)
+        // Sanity: la catena è ceil(size/checkpoint) — cap largo contro frame ostili.
+        guard chainCount >= 0, chainCount <= 1 << 20, o + chainCount * 32 <= d.endIndex else { return nil }
+        var chain: [Data] = []
+        chain.reserveCapacity(chainCount)
+        for _ in 0..<chainCount { chain.append(Data(d[o..<o+32])); o += 32 }
+        return DistFileEntry(kind: kind, name: name, size: size, sha256: sha, chain: chain)
     }
 }
 
@@ -308,12 +383,23 @@ public struct DistFileOffer: Sendable {
 /// FILE NEED: the offer indices the worker is missing (empty = has everything).
 public struct DistFileNeed: Sendable {
     public var indices: [Int]
-    public init(indices: [Int]) { self.indices = indices }
+    /// v8: per-index RESUME offset (0 = from scratch). Always a multiple of
+    /// Dist.fileCheckpointBytes: the worker truncated its `.part` to the last
+    /// checkpoint whose chained hash matched the offer's.
+    public var offsets: [UInt64]
+
+    public init(indices: [Int], offsets: [UInt64]? = nil) {
+        self.indices = indices
+        self.offsets = offsets ?? [UInt64](repeating: 0, count: indices.count)
+    }
 
     public func encoded() -> Data {
         var d = Data()
         d.appendLE(UInt32(indices.count))
-        for i in indices { d.appendLE(UInt32(truncatingIfNeeded: i)) }
+        for (j, i) in indices.enumerated() {
+            d.appendLE(UInt32(truncatingIfNeeded: i))
+            d.appendLE(j < offsets.count ? offsets[j] : 0)
+        }
         return d
     }
 
@@ -321,10 +407,14 @@ public struct DistFileNeed: Sendable {
         var o = d.startIndex
         guard d.count >= 4 else { return nil }
         let count = Int(d.readLE(&o) as UInt32)
-        guard count >= 0, count <= Dist.maxFileEntries, o + count * 4 <= d.endIndex else { return nil }
-        var out: [Int] = []
-        for _ in 0..<count { out.append(Int(d.readLE(&o) as UInt32)) }
-        return DistFileNeed(indices: out)
+        guard count >= 0, count <= Dist.maxFileEntries, o + count * 12 <= d.endIndex else { return nil }
+        var indices: [Int] = []
+        var offsets: [UInt64] = []
+        for _ in 0..<count {
+            indices.append(Int(d.readLE(&o) as UInt32))
+            offsets.append(d.readLE(&o) as UInt64)
+        }
+        return DistFileNeed(indices: indices, offsets: offsets)
     }
 }
 

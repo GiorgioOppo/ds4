@@ -127,6 +127,19 @@ struct BenchView: View {
         }
         .chartXAxisLabel("Context Tokens")
         .chartYAxisLabel("Tokens/second")
+        // Fine-grained scale: the A/B differences that matter are 0.05-0.3 t/s,
+        // invisible on the default auto-stride. Gridline every 0.1 t/s (faint),
+        // labelled line every 0.5 to keep the axis readable.
+        .chartYAxis {
+            AxisMarks(values: .stride(by: 0.1)) {
+                AxisGridLine().foregroundStyle(.quaternary)
+            }
+            AxisMarks(values: .stride(by: 0.5)) {
+                AxisGridLine()
+                AxisTick()
+                AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(1)))
+            }
+        }
         .chartLegend(position: .top)
     }
 }

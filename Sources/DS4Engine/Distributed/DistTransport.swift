@@ -7,6 +7,11 @@ public enum DistError: Error {
     case versionMismatch(String)     // mixed builds in the cluster
     case remote(String)              // an ERROR frame from a worker (its own words)
     case unreachable(String)         // TCP never became ready (fail-fast diagnosis)
+    /// A file-transfer nack (fileAck ok=false). RETRYABLE, unlike `remote`:
+    /// the v8 resume machinery (checkpoint chain + kept .part) is built so a
+    /// re-attempt renegotiates from the last good block — a transient receive
+    /// failure must not permanently fail the route (setupPeer retries it).
+    case transferFailed(String)
 }
 
 /// Async framed connection over NWConnection: every message is a `DistFrameHeader`

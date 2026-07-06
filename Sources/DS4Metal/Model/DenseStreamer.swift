@@ -226,25 +226,49 @@ public final class DenseStreamer: @unchecked Sendable {
             let sibling = model.path + ".q4dense"
             var cachePath = sibling
             if let dir = ProcessInfo.processInfo.environment["DS4_Q4_CACHE_DIR"], !dir.isEmpty {
-                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                // Loud failure: if this silently failed, every later write
+                // would fail with an unhelpful "permessi/percorso?" and every
+                // launch would re-pay the requant.
+                do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+                catch { Self.logQ4("creazione cartella cache FALLITA (\(error.localizedDescription)): \(dir)") }
                 cachePath = dir + "/" + (model.path as NSString).lastPathComponent + ".q4dense"
             }
-            var converted: [GPUTensor]
+            // Distributed SLICE (layer range ≠ full model): reads are served by
+            // the FULL cache too (loadQ4Cache matches records by key), but a
+            // slice requant must never overwrite the full cache with a subset —
+            // the next full run would reject it and re-requant everything, in
+            // ping-pong. Slice writes go to a per-range name.
+            let partial = layers.lowerBound > 0 ||
+                model.findTensor("blk.\(layers.upperBound).attn_q_a.weight") != nil
+            let sliceSuffix = ".L\(layers.lowerBound)-\(layers.upperBound - 1)"
+            let writeCachePath = partial ? cachePath + sliceSuffix : cachePath
+            var readCandidates = [cachePath]
+            if partial { readCandidates.append(cachePath + sliceSuffix) }
+            if cachePath != sibling {
+                readCandidates.append(sibling)
+                if partial { readCandidates.append(sibling + sliceSuffix) }
+            }
+            var converted: [GPUTensor]?
+            var loadedFrom: String?
             // Content fingerprints of the source tensors (first 4 KB each): the
             // cache must match the MODEL BYTES, not just its size and layout.
             let hashes = q4Jobs.map { Self.sourceHash(fd: fd, tensor: $0.t) }
             LoadProgress.shared.begin("Lettura cache Q4…", from: 0.32, to: 0.92, units: q4Jobs.count)
-            if let cached = Self.loadQ4Cache(rt, path: cachePath, modelSize: Int(model.size),
-                                             jobs: q4Jobs, hashes: hashes) {
-                converted = cached
-            } else if cachePath != sibling,
-                      let cached = Self.loadQ4Cache(rt, path: sibling, modelSize: Int(model.size),
-                                                    jobs: q4Jobs, hashes: hashes) {
-                converted = cached
+            for cand in readCandidates {
+                if let cached = Self.loadQ4Cache(rt, path: cand, modelSize: Int(model.size),
+                                                 jobs: q4Jobs, hashes: hashes) {
+                    converted = cached; loadedFrom = cand; break
+                }
+            }
+            if let cached = converted, let src = loadedFrom, src != cachePath, !partial {
+                // Promotion into the primary location (demo cache → app dir):
+                // FULL caches only — a slice copy under the primary name would
+                // be exactly the overwrite this block exists to prevent.
                 LoadProgress.shared.set(0.92, "Copia cache Q4…")
                 Self.writeQ4Cache(path: cachePath, modelSize: Int(model.size), jobs: q4Jobs,
                                   tensors: cached, hashes: hashes)
-            } else {
+            }
+            if converted == nil {
                 LoadProgress.shared.begin("Riquantizzazione Q4 (solo il primo avvio)…",
                                           from: 0.32, to: 0.88, units: q4Jobs.count)
                 var fresh = [GPUTensor?](repeating: nil, count: q4Jobs.count)
@@ -270,18 +294,22 @@ public final class DenseStreamer: @unchecked Sendable {
                     }
                     if let e = firstError { throw e }
                 }
-                converted = try fresh.enumerated().map { i, t in
+                let freshConverted = try fresh.enumerated().map { i, t -> GPUTensor in
                     guard let t else {
                         throw GGUFWeights.LoadError.message("DenseStreamer: requant failed on layer \(q4Jobs[i].il)")
                     }
                     return t
                 }
+                converted = freshConverted
                 LoadProgress.shared.set(0.90, "Scrittura cache Q4…")
-                Self.writeQ4Cache(path: cachePath, modelSize: Int(model.size), jobs: q4Jobs,
-                                  tensors: converted, hashes: hashes)
+                Self.writeQ4Cache(path: writeCachePath, modelSize: Int(model.size), jobs: q4Jobs,
+                                  tensors: freshConverted, hashes: hashes)
+            }
+            guard let q4Tensors = converted else {
+                throw GGUFWeights.LoadError.message("DenseStreamer: cache Q4 non disponibile dopo il load")
             }
             for (i, job) in q4Jobs.enumerated() {
-                let q4 = converted[i]
+                let q4 = q4Tensors[i]
                 if lockResident { q4.lockResident() }
                 switch job.f {
                 case .qB: skeleton[job.il]!.qB = q4; skeleton[job.il]!.qBQ4 = true
@@ -422,32 +450,53 @@ public final class DenseStreamer: @unchecked Sendable {
         }
         defer { close(cfd) }
         _ = fcntl(cfd, F_NOCACHE, 1)
-        let headBytes = 20 + jobs.count * 32
-        var head = [UInt8](repeating: 0, count: headBytes)
+        var fixed = [UInt8](repeating: 0, count: 20)
+        let okFixed = fixed.withUnsafeMutableBytes {
+            GGUFWeights.preadFull(cfd, into: $0.baseAddress!, bytes: 20, offset: 0)
+        }
+        guard okFixed else {
+            logQ4("header illeggibile — riquantizzo: \(path)")
+            return nil
+        }
+        func fu32(_ o: Int) -> UInt32 { fixed.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
+        func fu64(_ o: Int) -> UInt64 { fixed.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt64.self) } }
+        // The cache may hold a SUPERSET of the jobs: a distributed worker's
+        // layer SLICE must reuse the full-model cache built by the coordinator
+        // or the demo (the exact-count check used to reject it → minutes of
+        // re-requant on every worker). Records are matched by (layer, field)
+        // KEY, not by position; bytes and source hash must still agree.
+        let cacheCount = Int(fu32(16))
+        guard fu32(0) == q4CacheMagic, fu32(4) == q4CacheVersion,
+              fu64(8) == UInt64(modelSize), cacheCount >= jobs.count, cacheCount <= 8192 else {
+            logQ4("incompatibile (versione/modello/estensione diversi) — riquantizzo: \(path)")
+            return nil
+        }
+        var head = [UInt8](repeating: 0, count: cacheCount * 32)
         let okHead = head.withUnsafeMutableBytes {
-            GGUFWeights.preadFull(cfd, into: $0.baseAddress!, bytes: headBytes, offset: 0)
+            GGUFWeights.preadFull(cfd, into: $0.baseAddress!, bytes: cacheCount * 32, offset: 20)
         }
         guard okHead else {
-            logQ4("header illeggibile — riquantizzo: \(path)")
+            logQ4("tabella record illeggibile — riquantizzo: \(path)")
             return nil
         }
         func u32(_ o: Int) -> UInt32 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
         func u64(_ o: Int) -> UInt64 { head.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt64.self) } }
-        guard u32(0) == q4CacheMagic, u32(4) == q4CacheVersion,
-              u64(8) == UInt64(modelSize), u32(16) == UInt32(jobs.count) else {
-            logQ4("incompatibile (versione/modello diversi) — riquantizzo: \(path)")
-            return nil
+        var index: [UInt64: (bytes: UInt64, hash: UInt64, offset: Int)] = [:]
+        index.reserveCapacity(cacheCount)
+        for i in 0..<cacheCount {
+            let o = i * 32
+            index[UInt64(u32(o)) << 32 | UInt64(u32(o + 4))] =
+                (bytes: u64(o + 8), hash: u64(o + 16), offset: Int(u64(o + 24)))
         }
         var records: [(bytes: Int, offset: Int)] = []
         for (i, job) in jobs.enumerated() {
-            let o = 20 + i * 32
             let expected = Int(job.t.elements) / 256 * 144
-            guard u32(o) == UInt32(job.il), u32(o + 4) == UInt32(job.f.rawValue),
-                  u64(o + 8) == UInt64(expected), u64(o + 16) == hashes[i] else {
-                logQ4("incompatibile (tensore \(job.t.name) diverso) — riquantizzo: \(path)")
+            guard let r = index[UInt64(job.il) << 32 | UInt64(job.f.rawValue)],
+                  r.bytes == UInt64(expected), r.hash == hashes[i] else {
+                logQ4("incompatibile (tensore \(job.t.name) assente/diverso) — riquantizzo: \(path)")
                 return nil
             }
-            records.append((bytes: expected, offset: Int(u64(o + 24))))
+            records.append((bytes: expected, offset: r.offset))
         }
         var out = [GPUTensor?](repeating: nil, count: jobs.count)
         let lock = NSLock()
@@ -474,7 +523,7 @@ public final class DenseStreamer: @unchecked Sendable {
             logQ4("lettura fallita — riquantizzo: \(path)")
             return nil
         }
-        logQ4("caricata (\(jobs.count) tensori): \(path)")
+        logQ4("caricata (\(jobs.count)\(cacheCount > jobs.count ? " di \(cacheCount)" : "") tensori): \(path)")
         return out.map { $0! }
     }
 
@@ -499,10 +548,21 @@ public final class DenseStreamer: @unchecked Sendable {
             offsets.append(offset)
             offset += (tensors[i].byteLength + align - 1) / align * align
         }
+        // `offset` is now the full file size: refuse to start on a near-full
+        // disk (a torn 1.4 GB write helps nobody) with a log that names the
+        // real cause — the classic case is the app container's volume filled
+        // by other caches, and "il Cestino conta" (Finder deletes don't free
+        // space until emptied).
+        let dir = (path as NSString).deletingLastPathComponent
+        let free = (try? FileManager.default.attributesOfFileSystem(forPath: dir))?[.systemFreeSize] as? Int ?? 0
+        guard free > offset + (1 << 28) else {
+            logQ4("spazio disco insufficiente (~\(offset >> 20) MB richiesti, ~\(free >> 20) MB liberi — il Cestino conta!) — cache non scritta: \(path)")
+            return
+        }
         let tmp = path + ".tmp"
         guard FileManager.default.createFile(atPath: tmp, contents: nil),
               let fh = FileHandle(forWritingAtPath: tmp) else {
-            logQ4("SCRITTURA FALLITA (permessi/percorso?): \(tmp)")
+            logQ4("SCRITTURA FALLITA (cartella \(FileManager.default.fileExists(atPath: dir) ? "presente" : "ASSENTE"), ~\(free >> 20) MB liberi): \(tmp)")
             return
         }
         do {

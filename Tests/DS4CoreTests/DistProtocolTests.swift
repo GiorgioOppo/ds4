@@ -37,7 +37,9 @@ final class DistProtocolTests: XCTestCase {
                                 diskKVBudgetTokens: 1_000_000, useExpertBundle: true,
                                 useDenseQ4: true,
                                 layerStart: 22, layerEnd: 42, hasOutput: true,
-                                usageJSON: usage)
+                                usageJSON: usage,
+                                envKnobs: [(key: "DS4_DENSE_STREAM", value: "1"),
+                                           (key: "DS4_DENSE_AHEAD", value: "2")])
         let decoded = try XCTUnwrap(DistAssign.decode(assign.encoded()))
         XCTAssertEqual(decoded.modelPath, "/Models/ds4-flash.gguf")
         XCTAssertEqual(decoded.modelName, "ds4-flash.gguf")
@@ -50,6 +52,12 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.layerEnd, 42)
         XCTAssertTrue(decoded.hasOutput)
         XCTAssertEqual(decoded.usageJSON, usage)
+        // v9: i knob di performance viaggiano nell'ASSIGN.
+        XCTAssertEqual(decoded.envKnobs.count, 2)
+        XCTAssertEqual(decoded.envKnobs[0].key, "DS4_DENSE_STREAM")
+        XCTAssertEqual(decoded.envKnobs[0].value, "1")
+        XCTAssertEqual(decoded.envKnobs[1].key, "DS4_DENSE_AHEAD")
+        XCTAssertEqual(decoded.envKnobs[1].value, "2")
         // Empty usage stays empty; truncated frames are rejected, not mis-decoded.
         let bare = DistAssign(modelPath: "/m.gguf", modelName: "m.gguf", contextSize: 4096,
                               expertCacheSlots: 0, diskKVBudgetTokens: 0,
@@ -65,8 +73,11 @@ final class DistProtocolTests: XCTestCase {
 
     func testFileOfferNeedChunkDoneRoundTrips() throws {
         let sha = Data((0..<32).map { UInt8($0) })
+        // v8: la catena di checkpoint viaggia nell'entry (32 B per blocco).
+        let chain = [Data(repeating: 0x11, count: 32), Data(repeating: 0x22, count: 32)]
         let offer = DistFileOffer(entries: [
-            DistFileEntry(kind: .gguf, name: "model.gguf", size: 123_456_789_012, sha256: sha),
+            DistFileEntry(kind: .gguf, name: "model.gguf", size: 123_456_789_012, sha256: sha,
+                          chain: chain),
             DistFileEntry(kind: .expertBundle, name: "model.gguf.expbundle",
                           size: 42, sha256: Data(repeating: 0xAB, count: 32)),
             DistFileEntry(kind: .q4Dense, name: "model.gguf.q4dense",
@@ -78,13 +89,21 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.entries[0].name, "model.gguf")
         XCTAssertEqual(decoded.entries[0].size, 123_456_789_012)   // > 4 GB: u64 on the wire
         XCTAssertEqual(decoded.entries[0].sha256, sha)
+        XCTAssertEqual(decoded.entries[0].chain, chain)            // v8 round-trip
         XCTAssertEqual(decoded.entries[1].kind, .expertBundle)
+        XCTAssertEqual(decoded.entries[1].chain, [])               // senza catena resta vuota
         XCTAssertEqual(decoded.entries[2].kind, .q4Dense)
         XCTAssertNil(DistFileOffer.decode(offer.encoded().dropLast(1)))
 
         let need = try XCTUnwrap(DistFileNeed.decode(DistFileNeed(indices: [1]).encoded()))
         XCTAssertEqual(need.indices, [1])
+        XCTAssertEqual(need.offsets, [0])                          // default: da zero
         XCTAssertEqual(try XCTUnwrap(DistFileNeed.decode(DistFileNeed(indices: []).encoded())).indices, [])
+        // v8: gli offset di ripresa viaggiano accanto agli indici (u64 > 4 GB).
+        let resume = try XCTUnwrap(DistFileNeed.decode(
+            DistFileNeed(indices: [0, 2], offsets: [8_589_934_592, 0]).encoded()))
+        XCTAssertEqual(resume.indices, [0, 2])
+        XCTAssertEqual(resume.offsets, [8_589_934_592, 0])
 
         let chunk = DistFileChunk(index: 0, offset: 8_589_934_592, data: Data([1, 2, 3]))
         let dChunk = try XCTUnwrap(DistFileChunk.decode(chunk.encoded()))
