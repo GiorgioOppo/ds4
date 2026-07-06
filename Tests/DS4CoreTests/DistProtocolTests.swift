@@ -69,6 +69,53 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertNil(DistAssign.decode(assign.encoded().dropLast(4)))   // usage blob truncated
     }
 
+    // MARK: Expert parallelism payloads (Fase A — non ancora attivi sul filo)
+
+    func testExpertParallelismRoundTrips() throws {
+        // Assign: mask esplicita a 256 bit + knob + usage.
+        var mask = Data(repeating: 0, count: 32)
+        mask[0] = 0b1010_1010                       // esperti dispari 1,3,5,7
+        mask[31] = 0b1000_0000                      // esperto 255
+        let assign = DistExpertAssign(modelName: "ds4-flash.gguf", expertCacheSlots: 24,
+                                      useExpertBundle: true, expertMask: mask,
+                                      envKnobs: [(key: "DS4_EXPERT_PREAD", value: "1")],
+                                      usageJSON: Data(#"{"l":1}"#.utf8))
+        let dAssign = try XCTUnwrap(DistExpertAssign.decode(assign.encoded()))
+        XCTAssertEqual(dAssign.modelName, "ds4-flash.gguf")
+        XCTAssertEqual(dAssign.expertCacheSlots, 24)
+        XCTAssertTrue(dAssign.useExpertBundle)
+        XCTAssertEqual(dAssign.expertMask, mask)
+        XCTAssertEqual(dAssign.envKnobs.count, 1)
+        XCTAssertEqual(dAssign.envKnobs[0].key, "DS4_EXPERT_PREAD")
+        XCTAssertEqual(dAssign.usageJSON, Data(#"{"l":1}"#.utf8))
+        XCTAssertNil(DistExpertAssign.decode(assign.encoded().dropLast(1)))
+
+        // Work: id posseduti + pesi + attivazione (f16), seq per il matching.
+        let act = Data((0..<64).map { UInt8($0) })
+        let work = DistExpertWork(seq: 7, layer: 12, ids: [3, 250, 17],
+                                  weights: [0.5, 0.25, 0.125], activation: act, bits: 16)
+        let dWork = try XCTUnwrap(DistExpertWork.decode(work.encoded()))
+        XCTAssertEqual(dWork.seq, 7)
+        XCTAssertEqual(dWork.layer, 12)
+        XCTAssertEqual(dWork.ids, [3, 250, 17])
+        XCTAssertEqual(dWork.weights, [0.5, 0.25, 0.125])
+        XCTAssertEqual(dWork.activation, act)
+        XCTAssertEqual(dWork.bits, 16)
+        XCTAssertNil(DistExpertWork.decode(work.encoded().dropLast(1)))
+        // bits deve essere 16 o 32; k fuori da 1...8 rifiutato.
+        XCTAssertNil(DistExpertWork.decode(
+            DistExpertWork(seq: 1, layer: 0, ids: [1], weights: [1], activation: Data(), bits: 8).encoded()))
+
+        // Sum: somma parziale, stesso seq.
+        let sum = DistExpertSum(seq: 7, layer: 12, partial: act, bits: 32)
+        let dSum = try XCTUnwrap(DistExpertSum.decode(sum.encoded()))
+        XCTAssertEqual(dSum.seq, 7)
+        XCTAssertEqual(dSum.layer, 12)
+        XCTAssertEqual(dSum.partial, act)
+        XCTAssertEqual(dSum.bits, 32)
+        XCTAssertNil(DistExpertSum.decode(sum.encoded().dropLast(1)))
+    }
+
     // MARK: File distribution payloads
 
     func testFileOfferNeedChunkDoneRoundTrips() throws {
