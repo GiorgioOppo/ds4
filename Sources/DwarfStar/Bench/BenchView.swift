@@ -137,7 +137,7 @@ struct BenchView: View {
             AxisMarks(values: .stride(by: 0.5)) {
                 AxisGridLine()
                 AxisTick()
-                AxisValueLabel(format: .number.precision(.fractionLength(1)))
+                AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(1)))
             }
         }
         .chartLegend(position: .top)
