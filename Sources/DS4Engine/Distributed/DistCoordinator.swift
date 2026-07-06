@@ -122,10 +122,69 @@ public final class DistCoordinator: @unchecked Sendable {
         // once (gguf + sidecar, identified by size + SHA-256; the hash is
         // computed once per machine and answered from the cache afterwards).
         let offer = try buildFileOffer(onLog: onLog)
-        for (i, p) in config.peers.enumerated() {
-            onLog("connessione a \(p.host):\(p.port)…\n")
-            let conn = try await DistConnection.connect(host: p.host, port: p.port,
-                                                        queue: queue, onState: onLog)
+        // Setup dei peer IN PARALLELO: trasferimento file e caricamento del
+        // motore di ogni worker procedono INSIEME, non uno alla volta — il
+        // tempo di attivazione della route passa da Σ(setup dei worker) a
+        // max(setup). Con i file già distribuiti (dal secondo avvio) N worker
+        // si preparano nel tempo di UNO; a freddo i trasferimenti condividono
+        // la banda del coordinatore, ma il load (mmap, Metal, requant) di un
+        // worker si sovrappone comunque al transfer degli altri. L'ordine
+        // della route resta quello della lista peer (raccolta per indice); le
+        // righe di log si intrecciano, ma ogni messaggio porta già l'host.
+        var results = [(conn: DistConnection, entry: DistRouteEntry)?](repeating: nil,
+                                                                       count: config.peers.count)
+        try await withThrowingTaskGroup(of: (Int, DistConnection, DistRouteEntry).self) { group in
+            for (i, p) in config.peers.enumerated() {
+                let slice = slices[i]
+                let hasOutput = (i == config.peers.count - 1)
+                group.addTask { [self] in
+                    let (conn, entry) = try await setupPeer(p, slice: slice, hasOutput: hasOutput,
+                                                            offer: offer, modelName: modelName,
+                                                            onLog: onLog)
+                    return (i, conn, entry)
+                }
+            }
+            for try await (i, conn, entry) in group { results[i] = (conn, entry) }
+        }
+        for r in results {
+            guard let r else { throw DistError.badFrame }  // impossibile: gruppo completo o throw
+            conns.append(r.conn)
+            entries.append(r.entry)
+        }
+        // By construction the route is ordered and contiguous; keep the check
+        // as a safety net against partition bugs.
+        var expected = 0
+        for e in entries {
+            guard e.layerStart == expected else { throw DistError.sliceGap("expected layer \(expected), found \(e.layerStart)") }
+            expected = e.layerEnd + 1
+        }
+        guard expected == engine.nLayers else {
+            throw DistError.sliceGap("coverage \(expected)/\(engine.nLayers) layers: the route must cover 0...\(engine.nLayers - 1) contiguously (missing from \(expected) onward)")
+        }
+        if config.forward {
+            let l = DistReturnListener()
+            try l.start(port: config.returnPort)
+            returnListener = l
+            returnIter = l.results.makeAsyncIterator()
+            onLog("return listener on :\(config.returnPort)\n")
+        }
+        onLog("route complete: \(engine.nLayers) layers on \(entries.count) workers"
+              + (config.forward ? " · worker-to-worker forwarding" : " · relay") + "\n")
+    }
+
+    /// Setup completo di UN peer: connessione → HELLO (versione) → offerta e
+    /// trasferimento dei file mancanti → ASSIGN dello slice → attesa READY.
+    /// Non tocca lo stato condiviso (conns/entries: li aggiorna il chiamante,
+    /// in ordine di route) — pensato per girare in PARALLELO su tutti i peer.
+    /// In errore la connessione viene chiusa prima di rilanciare.
+    private func setupPeer(_ p: Peer, slice: (start: Int, end: Int), hasOutput: Bool,
+                           offer: [DistFileEntry], modelName: String,
+                           onLog: @escaping @Sendable (String) -> Void) async throws
+        -> (DistConnection, DistRouteEntry) {
+        onLog("connessione a \(p.host):\(p.port)…\n")
+        let conn = try await DistConnection.connect(host: p.host, port: p.port,
+                                                    queue: queue, onState: onLog)
+        do {
             let (type, payload) = try await conn.readFrame()
             if type == .error {
                 throw DistError.remote(String(decoding: payload, as: UTF8.self))
@@ -156,8 +215,7 @@ public final class DistCoordinator: @unchecked Sendable {
             // engine and replies READY. The last slice also runs the head.
             // The usage imatrix seed pre-warms the worker's slot cache with
             // this model's richest local profile (same seeding as local chat).
-            let (ls, le) = slices[i]
-            let hasOutput = (i == config.peers.count - 1)
+            let (ls, le) = (slice.start, slice.end)
             let usage = InferenceService.usageDataSeeded(modelName: modelName,
                                                          agentId: "generale") ?? Data()
             let assign = DistAssign(modelPath: config.modelPath, modelName: modelName,
@@ -169,7 +227,7 @@ public final class DistCoordinator: @unchecked Sendable {
                                     layerStart: ls, layerEnd: le, hasOutput: hasOutput,
                                     usageJSON: usage)
             onLog("assign: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") · \(modelName) · ctx \(config.contextSize)\n")
-            onLog("attendo il caricamento del motore sul worker (minuti alla prima esecuzione: "
+            onLog("attendo il caricamento del motore sul worker \(p.host) (minuti alla prima esecuzione: "
                   + "mmap + Metal + eventuali sidecar; progresso nel log del tab Worker)…\n")
             try await conn.sendFrame(.assign, assign.encoded())
             // Await READY, relaying the worker's load-progress frames into
@@ -200,30 +258,13 @@ public final class DistCoordinator: @unchecked Sendable {
             if ready.modelName != modelName {
                 onLog("warning: worker \(p.host) loaded '\(ready.modelName)' != '\(modelName)'\n")
             }
-            conns.append(conn)
-            entries.append(DistRouteEntry(host: p.host, port: p.port, layerStart: ls,
-                                          layerEnd: le, hasOutput: hasOutput))
             onLog("route: \(p.host):\(p.port) -> layers \(ls)...\(le)\(hasOutput ? " +output" : "") pronto\n")
+            return (conn, DistRouteEntry(host: p.host, port: p.port, layerStart: ls,
+                                         layerEnd: le, hasOutput: hasOutput))
+        } catch {
+            conn.cancel()
+            throw error
         }
-        // By construction the route is ordered and contiguous; keep the check
-        // as a safety net against partition bugs.
-        var expected = 0
-        for e in entries {
-            guard e.layerStart == expected else { throw DistError.sliceGap("expected layer \(expected), found \(e.layerStart)") }
-            expected = e.layerEnd + 1
-        }
-        guard expected == engine.nLayers else {
-            throw DistError.sliceGap("coverage \(expected)/\(engine.nLayers) layers: the route must cover 0...\(engine.nLayers - 1) contiguously (missing from \(expected) onward)")
-        }
-        if config.forward {
-            let l = DistReturnListener()
-            try l.start(port: config.returnPort)
-            returnListener = l
-            returnIter = l.results.makeAsyncIterator()
-            onLog("return listener on :\(config.returnPort)\n")
-        }
-        onLog("route complete: \(engine.nLayers) layers on \(entries.count) workers"
-              + (config.forward ? " · worker-to-worker forwarding" : " · relay") + "\n")
     }
 
     public func disconnect() {
