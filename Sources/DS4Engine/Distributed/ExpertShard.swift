@@ -21,6 +21,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
     private let idsPacked: GPUTensor      // 0..<k rimappati (gli slab del gather sono impacchettati)
     private let partialOut: GPUTensor     // nEmbd f32
     private let preadFD: Int32?           // DS4_EXPERT_PREAD: gather via F_NOCACHE
+    private let willNeedHints: Bool       // DS4_WILLNEED_EXPERTS (default ON)
     /// Quant dei tensori esperti PER LAYER (mixed-precision): il dispatch dei
     /// kernel deve seguire il layer, non il globale del primo layer routed.
     private let layerQuants: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)]
@@ -82,6 +83,9 @@ public final class ExpertShardEngine: @unchecked Sendable {
         self.partialOut = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
         self.preadFD = ProcessInfo.processInfo.environment["DS4_EXPERT_PREAD"] == "1"
             ? model.uncachedFD() : nil
+        // Stessa semantica del motore locale: hint di readahead ON di default,
+        // DS4_WILLNEED_EXPERTS=0 li spegne (baseline di misura).
+        self.willNeedHints = ProcessInfo.processInfo.environment["DS4_WILLNEED_EXPERTS"] != "0"
         onLoadLog?("shard pronto: \(ownedCount)/\(d.nExperts) esperti")
     }
 
@@ -131,7 +135,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
         scratch.writeRouteWeights(req.weights, padTo: dims.k)
         // Gather dei SUOI esperti: slab impacchettati, id rimappati 0..<k.
         let (g, u, dn) = try GGUFWeights.gatherLayerExperts(rt, model, req.layer, ids: req.ids,
-                                                            dims: dims, willNeed: true,
+                                                            dims: dims, willNeed: willNeedHints,
                                                             uncachedFD: preadFD)
         // moe_sum6 somma SEMPRE 6 righe: con k<6 sul percorso non fuso le
         // righe k..<6 di down6 vanno azzerate (richieste diverse hanno k
