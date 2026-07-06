@@ -5,28 +5,42 @@ import Foundation
 /// selections during real use, persisted across sessions, and used to pre-warm
 /// the expert slot-cache with the historically hottest experts ("persistent"
 /// experts always in RAM; the LRU handles the "changing" ones).
-public final class ExpertUsageStats {
-    private(set) var counts: [[Int32: Int]]   // per layer: expert id -> times routed
-    public private(set) var totalRoutes = 0
+///
+/// THREAD-SAFE: `record` runs on the decode thread while the slot-cache's
+/// speculative look-ahead reads `top`/`slotAllocation` from a background
+/// queue (pool creation included) — every access goes through one lock.
+/// The lock is uncontended in practice (short critical sections).
+public final class ExpertUsageStats: @unchecked Sendable {
+    private var counts: [[Int32: Int]]        // per layer: expert id -> times routed
+    private var _totalRoutes = 0
+    private let lock = NSLock()
+
+    public var totalRoutes: Int { lock.lock(); defer { lock.unlock() }; return _totalRoutes }
 
     public init(nLayers: Int) {
         counts = Array(repeating: [:], count: nLayers)
     }
 
     public func record(layer: Int, ids: [Int32]) {
+        lock.lock(); defer { lock.unlock() }
         guard layer >= 0, layer < counts.count else { return }
-        for id in ids { counts[layer][id, default: 0] += 1 }
-        totalRoutes += ids.count
+        // Ids are validated (≥ 0) so a corrupt readback can never poison the
+        // profile — a bad id persisted here would break the cache pre-warm
+        // (GGUFWeights.copyExpert throws on out-of-range) on every later run.
+        for id in ids where id >= 0 { counts[layer][id, default: 0] += 1 }
+        _totalRoutes += ids.count
     }
 
     /// Total routed picks recorded for a layer (0 = no data / dense layer).
     public func routes(layer: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
         guard layer >= 0, layer < counts.count else { return 0 }
         return counts[layer].values.reduce(0, +)
     }
 
     /// The historically hottest experts of a layer (descending by count).
     public func top(layer: Int, n: Int) -> [Int32] {
+        lock.lock(); defer { lock.unlock() }
         guard layer >= 0, layer < counts.count else { return [] }
         return counts[layer].sorted { $0.value > $1.value }.prefix(n).map(\.key)
     }
@@ -35,6 +49,7 @@ public final class ExpertUsageStats {
     /// (1.0 = perfectly concentrated, n/256 ≈ uniform). The honest signal for
     /// whether expert caching can pay on this workload.
     public func concentration(layer: Int, n: Int) -> Double {
+        lock.lock(); defer { lock.unlock() }
         guard layer >= 0, layer < counts.count else { return 0 }
         let total = counts[layer].values.reduce(0, +)
         guard total > 0 else { return 0 }
@@ -55,9 +70,10 @@ public final class ExpertUsageStats {
     /// active layer on average) — the caller falls back to the uniform `base`.
     /// Layers with no data are absent from the result (caller default applies).
     public func slotAllocation(base: Int, floor: Int = 8, cap: Int = 64) -> [Int: Int]? {
+        lock.lock(); defer { lock.unlock() }
         let active = counts.indices.filter { !counts[$0].isEmpty }
         guard !active.isEmpty, base > floor else { return nil }
-        guard totalRoutes >= 256 * active.count else { return nil }   // ≥ ~43 tokens of history
+        guard _totalRoutes >= 256 * active.count else { return nil }   // ≥ ~43 tokens of history
         let capped = max(floor, cap)
         var alloc: [Int: Int] = [:]
         // Marginal gains: (layer, share of the layer's routes captured by its
@@ -84,6 +100,7 @@ public final class ExpertUsageStats {
     // MARK: Persistence — compact JSON [[ [id, count], … ] × nLayers].
 
     public func serialize() -> Data? {
+        lock.lock(); defer { lock.unlock() }
         let arr = counts.map { layer in
             layer.map { [Int($0.key), $0.value] }.sorted { $0[1] > $1[1] }
         }
@@ -92,23 +109,38 @@ public final class ExpertUsageStats {
 
     /// Merge persisted counts into the live ones (additive).
     public func load(_ data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        loadLocked(data)
+    }
+
+    private func loadLocked(_ data: Data) {
         guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[[Int]]] else { return }
         for (il, layer) in arr.enumerated() where il < counts.count {
+            // A corrupt/foreign profile must degrade to "entry ignored" (like the
+            // C hotlist loader), never trap (Int32(truncating)) or poison the
+            // warm set with out-of-range ids that break pool creation.
             for pair in layer where pair.count == 2 {
-                counts[il][Int32(pair[0]), default: 0] += pair[1]
-                totalRoutes += pair[1]
+                guard let id = Int32(exactly: pair[0]), id >= 0, pair[1] > 0 else { continue }
+                counts[il][id, default: 0] += pair[1]
+                _totalRoutes += pair[1]
             }
         }
     }
 
     public func reset() {
+        lock.lock(); defer { lock.unlock() }
+        resetLocked()
+    }
+
+    private func resetLocked() {
         for i in counts.indices { counts[i] = [:] }
-        totalRoutes = 0
+        _totalRoutes = 0
     }
 
     /// Swap in another profile (agent switch): clear and load `data` if present.
     public func replace(with data: Data?) {
-        reset()
-        if let data { load(data) }
+        lock.lock(); defer { lock.unlock() }
+        resetLocked()
+        if let data { loadLocked(data) }
     }
 }

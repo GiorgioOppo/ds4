@@ -36,6 +36,7 @@ public struct DecodeProfile: Sendable {
     public var layers = 0         // total per-layer iterations
     public var expertHits = 0     // expert slot-cache hits (persistent experts)
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
+    public var expertPrefilled = 0  // slabs filled by the look-ahead (I/O hidden under compute)
     public var gatherBytes = 0    // expert bytes copied from the mmap (EXPERT I/O volume)
 
     public init() {}
@@ -50,7 +51,8 @@ public struct DecodeProfile: Sendable {
         var cacheLine = ""
         if expertHits + expertMisses > 0 {
             let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
-            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
+            let ahead = expertPrefilled > 0 ? " — \(expertPrefilled) slab da look-ahead" : ""
+            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)\(ahead)"
         }
         // Effective gather bandwidth: how fast the expert slabs actually leave the
         // SSD/page cache. Compare against the raw sequential bandwidth of the disk
@@ -149,6 +151,19 @@ public final class StreamingDecoder {
     /// queue, so the next layer's SSD I/O overlaps the current layer's compute.
     /// nil = off (resident paths don't need it). Cannot affect numerics.
     let prefetch: ((Int) -> Void)?
+    /// Expert look-ahead (the C engine's overlap, adapted to the slot cache):
+    /// `lookahead(layer, token)` returns the expert ids to PREFILL into that
+    /// layer's pool — EXACT for the hash-routed layers (tid2eid row is known
+    /// from the token id alone), usage-prior top-N for the others (speculative,
+    /// DS4_EXPERT_LOOKAHEAD). runLayer(i) kicks prefill(i+1) on `lookaheadQ`
+    /// right after its own gather, so the next layer's expert I/O runs in the
+    /// SSD-idle window while the GPU computes layer i. Cannot affect numerics:
+    /// the pool holds the same bytes either way; a wrong guess is just an
+    /// unused slot. nil = off.
+    let lookahead: ((_ layer: Int, _ token: Int) -> [Int32])?
+    /// Serial queue for the speculative prefills (one layer ahead at a time —
+    /// a backlog would just re-touch already-resident ids and skip).
+    private let lookaheadQ = DispatchQueue(label: "ds4.expert-lookahead", qos: .userInitiated)
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
@@ -188,6 +203,7 @@ public final class StreamingDecoder {
                 slotCache: ExpertSlotCache? = nil,
                 usage: ExpertUsageStats? = nil,
                 prefetch: ((Int) -> Void)? = nil,
+                lookahead: ((_ layer: Int, _ token: Int) -> [Int32])? = nil,
                 kvLayers: Range<Int>? = nil,
                 slotCacheStride: Int? = nil) throws {
         // Il kernel del router (kernel_dsv4_router_finalize_one) ha 256 esperti
@@ -208,6 +224,7 @@ public final class StreamingDecoder {
         self.slotCacheStride = slotCacheStride
         self.usage = usage
         self.prefetch = prefetch
+        self.lookahead = lookahead
         let hcDim = dims.nHC * dims.nEmbd
         // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
         // (a worker never runs the other layers — dummy 1-float buffers there).
@@ -875,6 +892,20 @@ public final class StreamingDecoder {
         for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
     }
 
+    /// Speculative look-ahead: prefill layer i+1's slot pool while the GPU
+    /// computes layer i (its own gather just finished, so the SSD is idle until
+    /// the next layer's demand fill). The id list is resolved on the DECODE
+    /// thread (usage prior / tid2eid mmap read — cheap); only the I/O moves to
+    /// the background queue. Decode-only: the batched prefill has its own
+    /// union pipeline.
+    private func kickLookahead(after i: Int, token: Int) {
+        guard let lookahead, let cache = slotCache, i + 1 < nLayers else { return }
+        let next = i + 1
+        let ids = lookahead(next, token)
+        guard !ids.isEmpty else { return }
+        lookaheadQ.async { cache.prefill(layer: next, ids: ids) }
+    }
+
     /// One decode layer for one token: `cur` (HC in) -> `other` (HC out). Writes
     /// KV[i][pos], updates compStates[i]. Shared by `forward` (decode) and the
     /// layer-major `prefill` — identical numerics either way.
@@ -908,16 +939,18 @@ public final class StreamingDecoder {
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.
                 t = Date()
-                let h0 = cache.hits, m0 = cache.misses
+                let h0 = cache.hits, m0 = cache.misses, p0 = cache.prefilled
                 let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
                 do { acquired = try cache.acquire(layer: i, ids: ids) }
                 catch { c1.waitCompleted(); throw error }
                 let (pool, slots) = acquired
                 profile.gatherS += Date().timeIntervalSince(t)
+                kickLookahead(after: i, token: token)
                 // Deltas, not cumulative totals: the cache counts since load,
                 // the profile since resetProfile().
                 profile.expertHits += cache.hits - h0
                 profile.expertMisses += cache.misses - m0
+                profile.expertPrefilled += cache.prefilled - p0
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
                 // Persistent staging (no per-layer alloc): c2 below is committed
                 // and waited before the next layer can overwrite this buffer.
@@ -943,6 +976,7 @@ public final class StreamingDecoder {
                 let (g, u, dn) = gathered
                 profile.gatherS += Date().timeIntervalSince(t)
                 profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
+                kickLookahead(after: i, token: token)
                 t = Date()
                 c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
@@ -1352,7 +1386,12 @@ public final class StreamingDecoder {
                     }
                 }
                 if let e = firstError { throw e }
-            }, prefetch: fillPrefetch, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
+            }, prefetch: fillPrefetch,
+               warm: { il in   // acquire trims to the pool's size; the range filter makes a
+                               // corrupt profile degrade to "entry ignored", never a pool
+                               // whose creation throws forever (copyExpert bounds-check)
+                usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
+            },
                slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
                 // layers) but more slots where the routing concentrates, fewer
@@ -1363,6 +1402,37 @@ public final class StreamingDecoder {
                 if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" { return S }
                 return usage.slotAllocation(base: S)?[il] ?? S
             })
+        }
+        // Expert look-ahead (kickLookahead): EXACT tid2eid ids for the hash
+        // layers — their selection depends only on the token id, so their
+        // expert I/O can always run under the previous layer's compute (the
+        // C engine's begin_selected_load trick) — and usage-prior top-N for
+        // the other layers (speculative: a wrong guess wastes idle-window
+        // bandwidth only; opt-in with DS4_EXPERT_LOOKAHEAD=N, try 6..12).
+        // Ids resolve on the decode thread; mixed-precision layers (outside
+        // the slot cache's size class) are excluded.
+        var offClass = Set<Int>()
+        for il in 0..<nLayers {
+            let pfx = "blk.\(il)."
+            guard model.findTensor(pfx + "ffn_gate_exps.weight") != nil else {
+                offClass.insert(il); continue
+            }
+            func q(_ n: String) -> MoEQuant? {
+                model.findTensor(pfx + n).flatMap { MoEQuant.from(ggufType: $0.type) }
+            }
+            if q("ffn_gate_exps.weight") != dims.gateQuant || q("ffn_up_exps.weight") != dims.upQuant
+                || q("ffn_down_exps.weight") != dims.downQuant {
+                offClass.insert(il)
+            }
+        }
+        let lookN = ProcessInfo.processInfo.environment["DS4_EXPERT_LOOKAHEAD"].flatMap(Int.init) ?? 0
+        let lookahead: ((Int, Int) -> [Int32])? = cache == nil ? nil : { il, token in
+            if offClass.contains(il) { return [] }
+            if token >= 0, let exact = GGUFWeights.hashSelectedIds(model, il, token: token) {
+                return exact.filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
+            }
+            guard lookN > 0 else { return [] }
+            return usage.top(layer: il, n: lookN).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
         }
         // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
         // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
@@ -1444,7 +1514,7 @@ public final class StreamingDecoder {
                                        layerProvider: denseProvider,
                                        embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                        expertGather: gather, slotCache: cache, usage: usage,
-                                       prefetch: prefetch, kvLayers: kvLayers,
+                                       prefetch: prefetch, lookahead: lookahead, kvLayers: kvLayers,
                                        slotCacheStride: slotStride)
         LoadProgress.shared.set(1.0, "Pronto")
         return dec

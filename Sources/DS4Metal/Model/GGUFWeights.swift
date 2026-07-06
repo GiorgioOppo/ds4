@@ -193,6 +193,20 @@ public enum GGUFWeights {
         }
     }
 
+    /// CPU-side hash-layer expert selection (layer_hash_selected_experts): row
+    /// min(token, rows-1) of blk.<il>.ffn_gate_tid2eid.weight, read straight
+    /// from the mmap. This is what makes the hash layers' expert I/O
+    /// PREFETCHABLE: their selection depends only on the token id, known before
+    /// any GPU work. nil on non-hash layers (tensor absent) or bad layout.
+    public static func hashSelectedIds(_ model: GGUFModel, _ il: Int, token: Int) -> [Int32]? {
+        guard token >= 0,
+              let t = model.findTensor("blk.\(il).ffn_gate_tid2eid.weight"),
+              t.type == 26, t.dims.count == 2, t.dims[0] == 6, t.dims[1] > 0 else { return nil }
+        let row = min(token, Int(t.dims[1]) - 1)
+        let base = model.mapBase + Int(t.absOffset) + row * 6 * 4
+        return (0..<6).map { base.loadUnaligned(fromByteOffset: $0 * 4, as: Int32.self) }
+    }
+
     /// NSA indexer tensors (DSA; present only on ratio-4 layers — all optional).
     /// `big` loads the two large projections + compressor kv/gate (mmap no-copy on
     /// the streaming path, copy otherwise); `small` the tiny APE/norm.
