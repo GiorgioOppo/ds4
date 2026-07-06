@@ -58,4 +58,58 @@ final class ExpertCacheTests: XCTestCase {
             XCTAssertEqual(gpuFull[i], gpuPacked[i], "packed vs full expert \(i)")
         }
     }
+
+    private final class Flag: @unchecked Sendable { var on = false }
+
+    /// ExpertSlotCache look-ahead: prefill(ids) fills the pool off the decode
+    /// path (counted as `prefilled`, not misses); the demand acquire then
+    /// reports HITS with the prefilled bytes in the right slots. A prefill
+    /// error is swallowed — the batch's slots stay free and the demand
+    /// acquire refills them (and reports the miss).
+    func testSlotCachePrefillMakesHits() throws {
+        let rt = try makeRuntime()
+        let expertBytes = 64
+        let fail = Flag()
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: expertBytes * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes))
+            },
+            fill: { layer, id, pool, slot in
+                if fail.on { throw GGUFWeights.LoadError.message("synthetic fill failure") }
+                let p = pool.gate.buffer.contents()
+                    .advanced(by: pool.gate.byteOffset + slot * expertBytes)
+                p.storeBytes(of: Int32(layer * 1000) + id, as: Int32.self)
+            })
+        let ids: [Int32] = [11, 22, 33, 44, 55, 66]
+        // Pool creation (and its warm fill) is a DEMAND-path job: a prefill
+        // before any acquire on the layer is a no-op.
+        cache.prefill(layer: 3, ids: ids)
+        XCTAssertEqual(cache.prefilled, 0)
+        _ = try cache.acquire(layer: 3, ids: [99])       // creates the pool (1 miss)
+        XCTAssertEqual(cache.misses, 1)
+        cache.prefill(layer: 3, ids: ids)
+        XCTAssertEqual(cache.prefilled, 6)
+        let (pool, slots) = try cache.acquire(layer: 3, ids: ids)
+        XCTAssertEqual(cache.hits, 6)                    // all prefilled -> all hits
+        XCTAssertEqual(cache.misses, 1)                  // unchanged
+        for (j, id) in ids.enumerated() {
+            let p = pool.gate.buffer.contents()
+                .advanced(by: pool.gate.byteOffset + Int(slots[j]) * expertBytes)
+            XCTAssertEqual(p.load(as: Int32.self), 3000 + id, "slot content for expert \(id)")
+        }
+        // Failing prefill: swallowed, slots left free, demand acquire refills.
+        _ = try cache.acquire(layer: 4, ids: [1])        // creates layer 4's pool (1 miss)
+        fail.on = true
+        cache.prefill(layer: 4, ids: [7])                // fill throws -> batch abandoned
+        fail.on = false
+        XCTAssertEqual(cache.prefilled, 6)               // nothing added
+        let (pool4, s4) = try cache.acquire(layer: 4, ids: [7])
+        XCTAssertEqual(cache.misses, 3)                  // demand refilled expert 7
+        let p4 = pool4.gate.buffer.contents()
+            .advanced(by: pool4.gate.byteOffset + Int(s4[0]) * expertBytes)
+        XCTAssertEqual(p4.load(as: Int32.self), 4007)
+    }
 }

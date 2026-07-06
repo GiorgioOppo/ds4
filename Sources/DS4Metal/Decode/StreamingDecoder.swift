@@ -36,9 +36,15 @@ public struct DecodeProfile: Sendable {
     public var layers = 0         // total per-layer iterations
     public var expertHits = 0     // expert slot-cache hits (persistent experts)
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
+    public var expertPrefilled = 0  // slabs filled by the look-ahead (I/O hidden under compute)
     public var gatherBytes = 0    // expert bytes copied from the mmap (EXPERT I/O volume)
 
     public init() {}
+
+    /// Engine-side seconds accounted by the per-phase counters (what report()
+    /// calls "totale"). Wall-clock minus this = time spent OUTSIDE the engine
+    /// (sampler, streaming, UI) — the GUI logs that split per turn.
+    public var totalS: Double { embedS + routeS + gatherS + expertsS + layerOtherS + headS }
 
     public func report(title: String = "Profilo decode") -> String {
         guard forwards > 0 else { return "\(title): nessun forward registrato." }
@@ -50,7 +56,8 @@ public struct DecodeProfile: Sendable {
         var cacheLine = ""
         if expertHits + expertMisses > 0 {
             let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
-            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)"
+            let ahead = expertPrefilled > 0 ? " — \(expertPrefilled) slab da look-ahead" : ""
+            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)\(ahead)"
         }
         // Effective gather bandwidth: how fast the expert slabs actually leave the
         // SSD/page cache. Compare against the raw sequential bandwidth of the disk
@@ -149,6 +156,19 @@ public final class StreamingDecoder {
     /// queue, so the next layer's SSD I/O overlaps the current layer's compute.
     /// nil = off (resident paths don't need it). Cannot affect numerics.
     let prefetch: ((Int) -> Void)?
+    /// Expert look-ahead (the C engine's overlap, adapted to the slot cache):
+    /// `lookahead(layer, token)` returns the expert ids to PREFILL into that
+    /// layer's pool — EXACT for the hash-routed layers (tid2eid row is known
+    /// from the token id alone), usage-prior top-N for the others (speculative,
+    /// DS4_EXPERT_LOOKAHEAD). runLayer(i) kicks prefill(i+1) on `lookaheadQ`
+    /// right after its own gather, so the next layer's expert I/O runs in the
+    /// SSD-idle window while the GPU computes layer i. Cannot affect numerics:
+    /// the pool holds the same bytes either way; a wrong guess is just an
+    /// unused slot. nil = off.
+    let lookahead: ((_ layer: Int, _ token: Int) -> [Int32])?
+    /// Serial queue for the speculative prefills (one layer ahead at a time —
+    /// a backlog would just re-touch already-resident ids and skip).
+    private let lookaheadQ = DispatchQueue(label: "ds4.expert-lookahead", qos: .userInitiated)
 
     let scratch: DecodeScratch
     let rawCaches: [GPUTensor]
@@ -168,9 +188,22 @@ public final class StreamingDecoder {
     let idsPacked: GPUTensor   // [0,1,...,k-1] for the packed-experts matvec
     /// Persistent staging for the decode slot-cache ids: rewritten every layer
     /// instead of allocating a fresh 24-byte MTLBuffer per layer per token
-    /// (~43 allocations/token). Safe to reuse: the routed command buffer that
-    /// reads it is committed AND waited before the next layer overwrites it.
+    /// (~43 allocations/token). Safe to reuse even with the ASYNC routed FFN:
+    /// the memcpy happens after this layer's route commit+wait, which
+    /// queue-orders after (= joins) every previous FFN command buffer.
     let slotsScratch: GPUTensor
+    /// Second staging buffer, alternated by layer parity. DEFENSIVE: today at
+    /// most ONE routed-FFN cb is ever in flight (see slotsScratch), so a single
+    /// buffer would suffice — the parity keeps the invariant local instead of
+    /// depending on the route-wait ordering, and costs 24 bytes.
+    let slotsScratchB: GPUTensor
+    /// The last layer's routed-FFN command buffer, committed WITHOUT a CPU wait
+    /// (DS4_ASYNC_FFN, default ON): the next layer's route commit+wait lands on
+    /// the same in-order queue, so the GPU stays fed while the CPU encodes —
+    /// the per-layer bubble (encode time x 43) disappears. Explicitly waited at
+    /// end of token (before the output head / readHC) and on every error path.
+    private var inflightFFN: GraphContext?
+    let asyncFFN = ProcessInfo.processInfo.environment["DS4_ASYNC_FFN"] != "0"
     /// One embedding-table ROW (F16, nEmbd × 2 B), CPU-staged per token.
     /// Binding the full multi-hundred-MB no-copy table to a command buffer
     /// makes Metal wire the WHOLE mapping every token — on tight-RAM machines
@@ -188,6 +221,7 @@ public final class StreamingDecoder {
                 slotCache: ExpertSlotCache? = nil,
                 usage: ExpertUsageStats? = nil,
                 prefetch: ((Int) -> Void)? = nil,
+                lookahead: ((_ layer: Int, _ token: Int) -> [Int32])? = nil,
                 kvLayers: Range<Int>? = nil,
                 slotCacheStride: Int? = nil) throws {
         // Il kernel del router (kernel_dsv4_router_finalize_one) ha 256 esperti
@@ -208,6 +242,7 @@ public final class StreamingDecoder {
         self.slotCacheStride = slotCacheStride
         self.usage = usage
         self.prefetch = prefetch
+        self.lookahead = lookahead
         let hcDim = dims.nHC * dims.nEmbd
         // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
         // (a worker never runs the other layers — dummy 1-float buffers there).
@@ -233,6 +268,7 @@ public final class StreamingDecoder {
         scratch = try DecodeScratch(rt, dims, maxKeys: maxKeys + maxComp)
         idsPacked = try GPUTensor.bytes(rt, Array(0..<Int32(dims.k)).withUnsafeBytes { Array($0) }, elementCount: dims.k)
         slotsScratch = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
+        slotsScratchB = try GPUTensor.zerosBytes(rt, byteLength: dims.k * 4)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
         // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
         // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
@@ -267,16 +303,34 @@ public final class StreamingDecoder {
     public func forward(token: Int, pos: Int, nKeys: Int) throws -> [Float] {
         // Fresh sequence: reset the recurrent compressor state (score=-inf, count=0).
         if pos == 0 { for c in compStates { try c?.reset(rt) }; for c in indexStates { try c?.reset(rt) } }
+        // Layer 0's expert I/O can start NOW: the token id is known before any
+        // GPU work (hash layer -> exact ids), so its fill overlaps embed+route(0).
+        kickLookahead(after: -1, token: token)
         try embedToken(token, into: hcA)
         var cur = hcA, other = hcB
-        for i in 0..<nLayers {
-            let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
-            if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
-            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-            swap(&cur, &other)
-            // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+        do {
+            for i in 0..<nLayers {
+                // Per-layer pool drain, like the prefill loops: the command buffers/
+                // encoders are autoreleased ObjC objects — without this a LONG
+                // generation (hundreds of tokens x ~3 cb/layer) accumulates them
+                // for the whole turn instead of freeing at each layer.
+                try autoreleasepool {
+                    let w = try layerProvider(i)        // LOAD layer i (dense; experts on demand if cached)
+                    if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
+                    try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                                 cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                    swap(&cur, &other)
+                    // w (and any gathered experts) drop here -> Metal buffers freed (EVICT)
+                }
+            }
+        } catch {
+            drainFFN()   // never leave the routed FFN in flight on a torn-down token
+            throw error
         }
+        // Join the last layer's async FFN: the output head's own commit+wait
+        // would cover the GPU ordering, but exportKV/readHC and error paths
+        // must find NOTHING in flight — one explicit drain keeps the invariant.
+        drainFFN()
         profile.forwards += 1
         return try outputHead(cur)
     }
@@ -306,14 +360,23 @@ public final class StreamingDecoder {
         precondition(start >= 0 && end < nLayers && start <= end, "invalid layer slice \(start)...\(end)")
         if pos == 0 { for i in start...end { try compStates[i]?.reset(rt); try indexStates[i]?.reset(rt) } }
         writeFloats(hcIn, into: hcA)
+        kickLookahead(after: start - 1, token: token)
         var cur = hcA, other = hcB
-        for i in start...end {
-            let w = try layerProvider(i)
-            if i + 1 <= end { prefetch?(i + 1) }
-            try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
-                         cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
-            swap(&cur, &other)
+        do {
+            for i in start...end {
+                try autoreleasepool {   // per-layer drain (see forward)
+                    let w = try layerProvider(i)
+                    if i + 1 <= end { prefetch?(i + 1) }
+                    try runLayer(i, w: w, layerRope: DSV4Shape.ropeParams(layer: i),
+                                 cur: cur, other: other, pos: pos, nKeys: nKeys, token: token)
+                    swap(&cur, &other)
+                }
+            }
+        } catch {
+            drainFFN()
+            throw error
         }
+        drainFFN()   // readHC reads `cur` CPU-side: the async FFN must be complete
         profile.forwards += 1
         return readHC(cur)
     }
@@ -370,16 +433,25 @@ public final class StreamingDecoder {
         // attivazioni transienti in piu'.
         let envChunk = ProcessInfo.processInfo.environment["DS4_PREFILL_CHUNK"].flatMap(Int.init)
         let step = max(1, envChunk ?? chunk)
-        while start < tokens.count {
-            let end = min(start + step, tokens.count)
-            // Drain the ObjC autorelease pool per chunk: Metal command buffers /
-            // encoders are autoreleased, and a long prefill inside one pool scope
-            // accumulates them all — transient footprint grows with the prompt.
-            lastHC = try autoreleasepool {
-                try prefillRange(tokens, start: start, end: end, posBase: startPos)
+        do {
+            while start < tokens.count {
+                let end = min(start + step, tokens.count)
+                // Drain the ObjC autorelease pool per chunk: Metal command buffers /
+                // encoders are autoreleased, and a long prefill inside one pool scope
+                // accumulates them all — transient footprint grows with the prompt.
+                lastHC = try autoreleasepool {
+                    try prefillRange(tokens, start: start, end: end, posBase: startPos)
+                }
+                start = end
             }
-            start = end
+        } catch {
+            // The per-token path (n==1 chunks) commits its routed FFN async: a
+            // cancellation/gather error must never escape with a cb in flight
+            // over state the caller will tear down (same invariant as forward).
+            drainFFN()
+            throw error
         }
+        drainFFN()   // don't hand a stale in-flight handle past the prefill
         profile.forwards += tokens.count
         return try outputHead(lastHC!)
     }
@@ -875,11 +947,54 @@ public final class StreamingDecoder {
         for r in K..<d.k { for c in 0..<d.nEmbd { dptr[r * d.nEmbd + c] = 0 } }
     }
 
+    /// Commit a routed-FFN command buffer. Async by default (DS4_ASYNC_FFN):
+    /// the next layer's route commit+wait is on the same in-order queue, so
+    /// correctness is by queue order and the CPU encode overlaps this buffer's
+    /// GPU execution. DS4_PROFILE_ROUTE keeps the synchronous wait (accurate
+    /// per-phase attribution beats the overlap when profiling).
+    private func commitFFN(_ c: GraphContext) {
+        if asyncFFN && !profileRoute {
+            c.commitAsync()
+            inflightFFN = c
+        } else {
+            c.commit()
+        }
+    }
+
+    /// Join the in-flight routed FFN (end of token, and every error path): the
+    /// caller is about to read GPU results CPU-side (output head readback,
+    /// readHC, KV export) or to tear down/rebuild state.
+    private func drainFFN() {
+        inflightFFN?.waitCompleted()
+        inflightFFN = nil
+    }
+
+    /// Speculative look-ahead: prefill layer i+1's slot pool while the GPU
+    /// computes layer i (its own gather just finished, so the SSD is idle until
+    /// the next layer's demand fill). The id list is resolved on the DECODE
+    /// thread (usage prior / tid2eid mmap read — cheap); only the I/O moves to
+    /// the background queue. Decode-only: the batched prefill has its own
+    /// union pipeline.
+    private func kickLookahead(after i: Int, token: Int) {
+        guard let lookahead, let cache = slotCache, i + 1 < nLayers else { return }
+        let next = i + 1
+        let ids = lookahead(next, token)
+        guard !ids.isEmpty else { return }
+        lookaheadQ.async { cache.prefill(layer: next, ids: ids) }
+    }
+
     /// One decode layer for one token: `cur` (HC in) -> `other` (HC out). Writes
     /// KV[i][pos], updates compStates[i]. Shared by `forward` (decode) and the
     /// layer-major `prefill` — identical numerics either way.
     private func runLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                           cur: GPUTensor, other: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
+        // Kick the NEXT layer's look-ahead at the START of this one: the fill
+        // window becomes the whole layer (route + attention + FFN, ~2x the
+        // post-gather window) instead of the few ms before the next acquire.
+        // Its I/O shares the SSD with this layer's own gather, but the disk's
+        // parallel ceiling is well above the demand queue depth and the demand
+        // path preempts on contention for the same layer's lock.
+        kickLookahead(after: i, token: token)
         if let gather = expertGather {
             // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
             var t = Date()
@@ -908,7 +1023,7 @@ public final class StreamingDecoder {
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.
                 t = Date()
-                let h0 = cache.hits, m0 = cache.misses
+                let h0 = cache.hits, m0 = cache.misses, p0 = cache.prefilled
                 let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
                 do { acquired = try cache.acquire(layer: i, ids: ids) }
                 catch { c1.waitCompleted(); throw error }
@@ -918,13 +1033,15 @@ public final class StreamingDecoder {
                 // the profile since resetProfile().
                 profile.expertHits += cache.hits - h0
                 profile.expertMisses += cache.misses - m0
+                profile.expertPrefilled += cache.prefilled - p0
                 profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
-                // Persistent staging (no per-layer alloc): c2 below is committed
-                // and waited before the next layer can overwrite this buffer.
+                // Persistent staging (no per-layer alloc), A/B by layer parity:
+                // with the async FFN the PREVIOUS layer's command buffer may
+                // still be reading its ids buffer while this layer stages its own.
+                let slotsBuf = (i & 1) == 0 ? slotsScratch : slotsScratchB
                 _ = slots.withUnsafeBytes {
-                    memcpy(slotsScratch.buffer.contents(), $0.baseAddress!, $0.count)
+                    memcpy(slotsBuf.buffer.contents(), $0.baseAddress!, $0.count)
                 }
-                let slotsBuf = slotsScratch
                 t = Date()
                 c1.waitCompleted()   // s.sharedOut ready (usually already done)
                 let c2 = GraphContext(rt); try c2.begin()
@@ -932,7 +1049,7 @@ public final class StreamingDecoder {
                                            upExp: pool.up, downExp: pool.down,
                                            ids: slotsBuf, outHc: other, activeK: K,
                                            expertStride: slotCacheStride)
-                c2.commit()
+                commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {
                 // Gather ONLY the selected experts (EXPERT I/O from the mmap), then phase 2.
@@ -948,7 +1065,7 @@ public final class StreamingDecoder {
                 let c2 = GraphContext(rt); try c2.begin()
                 try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
                                            ids: idsPacked, outHc: other, activeK: K)
-                c2.commit()
+                commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             }
         } else {
@@ -957,7 +1074,7 @@ public final class StreamingDecoder {
             let lc = GraphContext(rt); try lc.begin()
             try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
                                  downExp: w.expDown, ids: scratch.selected, outHc: other)
-            lc.commit()                      // COMPUTE (GPU finishes before w is dropped)
+            commitFFN(lc)                    // COMPUTE (cb retains w's buffers until completed)
             profile.layerOtherS += Date().timeIntervalSince(t)
         }
         profile.layers += 1
@@ -972,15 +1089,24 @@ public final class StreamingDecoder {
     private func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
                              curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
         let idx = indexStates[i]
-        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
-        let active = hasIdxWeights && indexerActive(i, pos: pos)
+        // The indexer carries TWO independent weight sets. The compressor pair
+        // (idxKv/idxGate) feeds the recurrent STATE update: it runs every token
+        // and its cache must stay coherent (KV snapshots export it, and a later
+        // activation reads all past rows). attn_q_b/proj are read ONLY by the
+        // top-K SCORING. With the lazy staging (DenseStreamer skipIndexerScoring)
+        // the scoring pair may not be staged at all, so the two gates SPLIT:
+        // the state keeps updating on the compressor pair alone, while the
+        // active path additionally requires the scoring pair.
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil
+        let hasIdxScoring = hasIdxState && w.idxQB != nil && w.idxProj != nil
+        let active = hasIdxScoring && indexerActive(i, pos: pos)
         if active, let idx {
             // Indexer layers always split (CPU top-k sits between pre and attn). The
             // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
             let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              comp: compStates[i], idx: hasIdxState ? idx : nil,
                                               indexerScoring: true)
             try c1.phase("kv")
             c1.commit()
@@ -999,7 +1125,7 @@ public final class StreamingDecoder {
             let c = GraphContext(rt); c.phaseTimes = [:]; try c.begin()
             let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                              rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                             comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                             comp: compStates[i], idx: hasIdxState ? idx : nil,
                                              indexerScoring: false)
             try c.phase("kv")
             try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
@@ -1013,7 +1139,7 @@ public final class StreamingDecoder {
             let c1 = GraphContext(rt); try c1.begin()
             let nComp = try c1.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                               rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                              comp: compStates[i], idx: hasIdxWeights ? idx : nil,
+                                              comp: compStates[i], idx: hasIdxState ? idx : nil,
                                               indexerScoring: false)
             try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
@@ -1051,6 +1177,20 @@ public final class StreamingDecoder {
         return 1024
     }()
 
+    /// Static proof that the indexer top-K can NEVER activate in this session:
+    /// the densest indexer layers (ratio 4) emit at most maxKeys/4 compressed
+    /// rows over the whole context, and activation needs a prospective count
+    /// STRICTLY greater than both the sparse threshold and the top-K. When the
+    /// bound can't be exceeded, the scoring projections (indexer.attn_q_b +
+    /// indexer.proj, ~360 MB/token on Flash) are dead weight in the dense
+    /// stream and staging them is skipped at load. Recomputed on every load
+    /// from the live maxKeys/threshold, so a larger context or a lower
+    /// DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD re-enables the staging.
+    static func indexerCanEverActivate(maxKeys: Int, topK: Int) -> Bool {
+        let maxProspective = maxKeys / 4
+        return maxProspective > indexerSparseThreshold && maxProspective > topK
+    }
+
     /// Will the indexer restrict this token's compressed rows on layer `i`?
     /// (prospective count: the compressor may emit one more row for this token.)
     /// `extraRows` = rows the tokens BEFORE this one in a not-yet-encoded batch
@@ -1073,11 +1213,11 @@ public final class StreamingDecoder {
     /// order as the per-token non-indexer path in encodeRoute.
     private func encodeRouteInto(_ c: GraphContext, _ i: Int, w: LayerWeights, layerRope: RopeParams,
                                  curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
-        let hasIdxWeights = w.idxKv != nil && w.idxQB != nil && w.idxProj != nil
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil    // state-only gate (see encodeRoute)
         let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
                                          rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
-                                         comp: compStates[i], idx: hasIdxWeights ? indexStates[i] : nil,
-                                         indexerScoring: false)
+                                         comp: compStates[i], idx: hasIdxState ? indexStates[i] : nil,
+                                         indexerScoring: false)  // caller guarantees no scoring here
         try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                               nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                               nComp: nComp, comp: compStates[i])
@@ -1352,7 +1492,12 @@ public final class StreamingDecoder {
                     }
                 }
                 if let e = firstError { throw e }
-            }, prefetch: fillPrefetch, warm: { il in usage.top(layer: il, n: 128) },   // acquire trims to the pool's size
+            }, prefetch: fillPrefetch,
+               warm: { il in   // acquire trims to the pool's size; the range filter makes a
+                               // corrupt profile degrade to "entry ignored", never a pool
+                               // whose creation throws forever (copyExpert bounds-check)
+                usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
+            },
                slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
                 // layers) but more slots where the routing concentrates, fewer
@@ -1363,6 +1508,37 @@ public final class StreamingDecoder {
                 if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" { return S }
                 return usage.slotAllocation(base: S)?[il] ?? S
             })
+        }
+        // Expert look-ahead (kickLookahead): EXACT tid2eid ids for the hash
+        // layers — their selection depends only on the token id, so their
+        // expert I/O can always run under the previous layer's compute (the
+        // C engine's begin_selected_load trick) — and usage-prior top-N for
+        // the other layers (speculative: a wrong guess wastes idle-window
+        // bandwidth only; opt-in with DS4_EXPERT_LOOKAHEAD=N, try 6..12).
+        // Ids resolve on the decode thread; mixed-precision layers (outside
+        // the slot cache's size class) are excluded.
+        var offClass = Set<Int>()
+        for il in 0..<nLayers {
+            let pfx = "blk.\(il)."
+            guard model.findTensor(pfx + "ffn_gate_exps.weight") != nil else {
+                offClass.insert(il); continue
+            }
+            func q(_ n: String) -> MoEQuant? {
+                model.findTensor(pfx + n).flatMap { MoEQuant.from(ggufType: $0.type) }
+            }
+            if q("ffn_gate_exps.weight") != dims.gateQuant || q("ffn_up_exps.weight") != dims.upQuant
+                || q("ffn_down_exps.weight") != dims.downQuant {
+                offClass.insert(il)
+            }
+        }
+        let lookN = ProcessInfo.processInfo.environment["DS4_EXPERT_LOOKAHEAD"].flatMap(Int.init) ?? 0
+        let lookahead: ((Int, Int) -> [Int32])? = cache == nil ? nil : { il, token in
+            if offClass.contains(il) { return [] }
+            if token >= 0, let exact = GGUFWeights.hashSelectedIds(model, il, token: token) {
+                return exact.filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
+            }
+            guard lookN > 0 else { return [] }
+            return usage.top(layer: il, n: lookN).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
         }
         // Read-ahead: overlap the NEXT layer's SSD I/O with the current layer's
         // compute. DEFAULT OFF: on the I/O-bound streaming path speculative reads
@@ -1430,8 +1606,23 @@ public final class StreamingDecoder {
             // read at RAM speed, and ~3 GB/token OFF the SSD stream. LOSSY on
             // those two tensors (Q8→Q4 requant) — opt-in, A/B the output.
             let q4Dense = ProcessInfo.processInfo.environment["DS4_DENSE_Q4"] == "1"
+            // DS4_LAZY_IDX (default ON): skip staging the indexer SCORING
+            // projections when the top-K selection provably can't activate at
+            // this context size — they'd stream ~360 MB/token to never be read.
+            // The indexer compressor pair keeps streaming (recurrent state must
+            // stay coherent). LOSSLESS: the skip only drops never-executed
+            // work. "0" restores the always-stage behaviour for A/B.
+            let lazyIdx = ProcessInfo.processInfo.environment["DS4_LAZY_IDX"] != "0"
+                && !indexerCanEverActivate(maxKeys: maxKeys, topK: dims.indexerTopK)
+            // DS4_RESIDENT_COMP (default ON): the four NSA compressor
+            // projections stop streaming and live in ~0.6 GB of resident RAM —
+            // they're read EVERY token on 41 of 43 layers, the single densest
+            // repeat-read in the stream. Same bytes → identical numerics.
+            // "0" restores full streaming (tight-RAM fallback / A/B).
+            let residentComp = ProcessInfo.processInfo.environment["DS4_RESIDENT_COMP"] != "0"
             let streamer = try DenseStreamer(rt: rt, model: model, layers: kvLayers ?? 0..<nLayers,
-                                             lockResident: lockResident, q4Dense: q4Dense)
+                                             lockResident: lockResident, q4Dense: q4Dense,
+                                             skipIndexerScoring: lazyIdx, residentComp: residentComp)
             denseProvider = { try streamer.weights($0) }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
@@ -1444,7 +1635,7 @@ public final class StreamingDecoder {
                                        layerProvider: denseProvider,
                                        embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                        expertGather: gather, slotCache: cache, usage: usage,
-                                       prefetch: prefetch, kvLayers: kvLayers,
+                                       prefetch: prefetch, lookahead: lookahead, kvLayers: kvLayers,
                                        slotCacheStride: slotStride)
         LoadProgress.shared.set(1.0, "Pronto")
         return dec

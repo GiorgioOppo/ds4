@@ -23,11 +23,15 @@ import DS4Core
 // zero page-cache footprint (F_NOCACHE). Same bytes → identical numerics.
 //
 // Concurrency contract: `weights(_:)` is called from the DECODE thread only
-// (the layerProvider), one layer at a time; by the time layer i's provider is
-// called, runLayer(i-1) has committed AND waited all its command buffers, so
-// the slot holding layer i-1 is GPU-free and can be overwritten with i+1.
-// The background loader touches only the file descriptor and the target slot,
-// and hands completion back through a semaphore (happens-before for the bytes).
+// (the layerProvider), one layer at a time. With the ASYNC routed FFN
+// (DS4_ASYNC_FFN) layer i-1's FFN command buffer may still be in flight when
+// layer i's provider refills a slot — that is safe because the routed FFN
+// reads NO streamed dense slab (experts pool + scratch only; the shared-FFN
+// cb that does read the staged slabs is waited inside its own runLayer, and
+// the route cb commits synchronously). If the routed FFN ever gains a dense
+// read, this contract must be revisited. The background loader touches only
+// the file descriptor and the target slot, and hands completion back through
+// a semaphore (happens-before for the bytes).
 public final class DenseStreamer: @unchecked Sendable {
     /// The LayerWeights fields that are streamed (the "big" set of
     /// layerMappedDense; the small norm/scale tensors live in the skeleton).
@@ -94,8 +98,24 @@ public final class DenseStreamer: @unchecked Sendable {
     /// Total bytes streamed per full pass over `layers` (diagnostics).
     public private(set) var bytesPerPass = 0
 
+    /// `skipIndexerScoring`: don't stage the indexer SCORING projections
+    /// (indexer.attn_q_b + indexer.proj). They are read ONLY by the top-K
+    /// relevance scoring (DecodeLayer step 3.5), which the caller has proven
+    /// can never activate at this context size — so streaming them is pure
+    /// wasted SSD bandwidth (~360 MB/token on Flash). The indexer COMPRESSOR
+    /// pair (indexer_compressor_kv/gate) keeps streaming (unless `residentComp`
+    /// pins it): its recurrent state updates every token and must stay
+    /// coherent (KV snapshots export it).
+    ///
+    /// `residentComp`: load the four NSA compressor projections
+    /// (attn_compressor_kv/gate + indexer_compressor_kv/gate) into RESIDENT
+    /// buffers ONCE instead of re-streaming them every token. They are small
+    /// per layer (F16, ~20 MB on a ratio-4 layer) but exist on 41 of 43 layers
+    /// — ~0.6 GB/token of SSD stream traded for ~0.6 GB of resident RAM.
+    /// Same bytes → identical numerics.
     public init(rt: MetalRuntime, model: GGUFModel, layers: Range<Int>, lockResident: Bool = false,
-                q4Dense: Bool = false) throws {
+                q4Dense: Bool = false, skipIndexerScoring: Bool = false,
+                residentComp: Bool = false) throws {
         guard let fd = model.uncachedFD() else {
             throw GGUFWeights.LoadError.message("DenseStreamer: cannot open F_NOCACHE descriptor")
         }
@@ -117,6 +137,10 @@ public final class DenseStreamer: @unchecked Sendable {
         // FFN projections — their Q8 slabs leave the per-token stream entirely,
         // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
         let sharedQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_SHARED_Q4"] == "1"
+        var scoringSkipped = 0                  // bytes/pass NOT staged (diagnostics)
+        // DS4_RESIDENT_COMP: NSA compressor projections diverted to resident
+        // buffers (loaded once after the plan is built, like the Q4 jobs).
+        var compJobs: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
         LoadProgress.shared.begin("Preparazione layer densi…", from: 0.08, to: 0.30, units: layers.count)
         for il in layers {
             var plan: [Entry] = []
@@ -125,6 +149,16 @@ public final class DenseStreamer: @unchecked Sendable {
             LoadProgress.shared.advance()
             for f in Field.allCases {
                 guard let t = model.findTensor("blk.\(il).\(f.tensorName)") else { continue }
+                if skipIndexerScoring, f == .idxQB || f == .idxProj {
+                    // Not staged: w.idxQB/idxProj stay nil and the decoder's
+                    // scoring gate (hasIdxScoring) keeps the top-K path off.
+                    scoringSkipped += Int(t.bytes)
+                    continue
+                }
+                if residentComp, f == .compKv || f == .compGate || f == .idxKv || f == .idxGate {
+                    compJobs.append((il: il, f: f, t: t))
+                    continue
+                }
                 let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
                 let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
                 if q4Dense, attnQ4Field || sharedQ4Field,
@@ -141,6 +175,42 @@ public final class DenseStreamer: @unchecked Sendable {
             skeleton[il] = w
             bytesPerPass += plan.reduce(0) { $0 + $1.bytes }
             maxSlot = max(maxSlot, off)
+        }
+        if scoringSkipped > 0 {
+            FileHandle.standardError.write(Data(
+                ("DS4 dense-stream: indexer top-k mai attivo a questo contesto — " +
+                 "salto lo staging di indexer.attn_q_b/proj (\(scoringSkipped / (1 << 20)) MB/token in meno dal disco)\n").utf8))
+        }
+        if !compJobs.isEmpty {
+            // One synchronous pread per projection (~0.6 GB total ≈ 0.1-0.2 s
+            // at load): small enough not to need the Q4 jobs' parallelism or a
+            // sidecar cache — the bytes are copied VERBATIM, no conversion.
+            LoadProgress.shared.set(0.31, "Compressori NSA residenti…")
+            var residentBytes = 0
+            for job in compJobs {
+                let bytes = Int(job.t.bytes)
+                guard let buf = rt.device.makeBuffer(length: bytes, options: .storageModeShared) else {
+                    throw MetalError.bufferAlloc
+                }
+                guard GGUFWeights.preadFull(fd, into: buf.contents(), bytes: bytes,
+                                            offset: Int(job.t.absOffset)) else {
+                    throw GGUFWeights.LoadError.message(
+                        "DenseStreamer: pread failed on blk.\(job.il).\(job.f.tensorName)")
+                }
+                if lockResident { _ = mlock(buf.contents(), bytes) }
+                let tensor = GPUTensor(buffer: buf, byteLength: bytes, count: bytes, byteOffset: 0)
+                switch job.f {
+                case .compKv: skeleton[job.il]!.compKv = tensor
+                case .compGate: skeleton[job.il]!.compGate = tensor
+                case .idxKv: skeleton[job.il]!.idxKv = tensor
+                case .idxGate: skeleton[job.il]!.idxGate = tensor
+                default: break
+                }
+                residentBytes += bytes
+            }
+            FileHandle.standardError.write(Data(
+                ("DS4 dense-stream: proiezioni compressori NSA residenti — " +
+                 "\(residentBytes / (1 << 20)) MB wired, altrettanti MB/token in meno dal disco\n").utf8))
         }
         if !q4Jobs.isEmpty {
             // Requant CACHE: the converted Q4 tensors are persisted next to the
@@ -260,11 +330,10 @@ public final class DenseStreamer: @unchecked Sendable {
     /// keeps the read-ahead pipeline `ahead` layers deep: with the default 1
     /// this is the classic 2-slot ring (read i+1 while computing i); with
     /// DS4_DENSE_AHEAD=2 the SSD moves on to i+2 as soon as i+1 lands instead
-    /// of idling for the rest of layer i's compute. Overwrite safety is the
-    /// same contract as before: a slot is reused only when its occupant is
-    /// neither the current layer nor one of the next `ahead` layers — and the
-    /// GPU finished every layer before the current one (runLayer waits its
-    /// command buffers before the next provider call).
+    /// of idling for the rest of layer i's compute. Overwrite safety: a slot is
+    /// reused only when its occupant is neither the current layer nor one of
+    /// the next `ahead` layers; the only async cb that can still be in flight
+    /// here (the routed FFN) reads no staged slab — see the class contract.
     public func weights(_ il: Int) throws -> LayerWeights {
         let slot: Int
         if let pi = pending.firstIndex(where: { $0.layer == il }) {

@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-04 prefill-mm2"
+    public static let engineRevision = "2026-07-06 fase2a fused-hc"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -121,11 +121,12 @@ public actor InferenceService {
         // the app even see the env vars?" must be answerable from the log alone.
         let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
                      "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
-                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_PREFILL_UNION",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN", "DS4_PREFILL_UNION",
                      "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_CHUNK",
                      "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
+                     "DS4_LAZY_IDX", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
         let env = ProcessInfo.processInfo.environment
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
@@ -914,14 +915,19 @@ public actor InferenceService {
 
         var produced = 0
         let genStart = Date()
+        var sampleS = 0.0                          // CPU sampler (full-vocab sort at temp>0)
+        var lastProgress = Date(timeIntervalSince1970: 0)
+        var regimeStart: Date?                     // timestamp after token 4 (demo's REGIME cut)
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
             // Penalize the recently produced tokens to break repeat-loop collapse.
             let lo = max(0, committedIds.count - sampling.repeatLastN)
+            let tSample = Date()
             let next = Sampler.sample(lastLogits, temperature: sampling.temperature, topK: sampling.topK,
                                       topP: sampling.topP, minP: sampling.minP,
                                       repetitionPenalty: sampling.repetitionPenalty,
                                       recent: committedIds[lo...], rng: &rng)
+            sampleS += Date().timeIntervalSince(tSample)
             if Int32(next) == tok.eosId { break }   // eos closes the turn; not forwarded (next suffix re-adds it)
             if !inTool, Int32(next) == dsmlId {
                 // A held opener '<' belongs to the tool block, not the visible text:
@@ -953,11 +959,44 @@ public actor InferenceService {
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
             committedIds.append(next)           // the generated token is now in the KV
             pos += 1
-            let elapsed = Date().timeIntervalSince(genStart)
-            continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
-                                                 elapsed > 0 ? Double(produced) / elapsed : 0)))
+            // THROTTLED progress (max ~4/s): every yield is a MainActor hop + a
+            // SwiftUI invalidation in the GUI — per-token it costs main-thread
+            // time that competes with the decode's own CPU work.
+            let now = Date()
+            if produced == 4 && regimeStart == nil { regimeStart = now }   // demo's REGIME cut
+            if now.timeIntervalSince(lastProgress) >= 0.25 {
+                lastProgress = now
+                let elapsed = now.timeIntervalSince(genStart)
+                let ms = elapsed / Double(produced) * 1000
+                continuation.yield(.progress(String(format: "%d token · %.2f tok/s · %.0f ms/token",
+                                                     produced,
+                                                     elapsed > 0 ? Double(produced) / elapsed : 0, ms)))
+            }
         }
         flush(inReasoning)
+        // Attribution of the turn's wall clock: engine (per-phase profile),
+        // sampler (CPU, full-vocab sort when temp>0 — the demo's greedy path
+        // costs ~0), rest = streaming/tokenizer/actor/UI backpressure. This is
+        // the number that answers "why is the GUI slower than the demo".
+        if produced > 0 {
+            let end = Date()
+            let wall = end.timeIntervalSince(genStart)
+            let engine = decoder.profile.totalS
+            let per = 1000.0 / Double(produced)
+            let other = max(0, wall - engine - sampleS)
+            // Regime = dal token 5 (stesso taglio della demo): scarta il warm-up
+            // (cache fredda, wiring) che sporca la media cumulativa sui turni corti.
+            var regime = ""
+            if let r = regimeStart, produced > 4 {
+                let rWall = end.timeIntervalSince(r)
+                let rTok = Double(produced - 4)
+                regime = String(format: " — regime %.2f tok/s (%.0f ms/token)",
+                                rTok / max(rWall, 0.001), rWall / rTok * 1000)
+            }
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f%@\n",
+                produced, wall, wall * per, engine * per, sampleS * per, other * per, regime).utf8))
+        }
 
         // Extract any tool calls from the generated output.
         var calls: [ToolCall] = []

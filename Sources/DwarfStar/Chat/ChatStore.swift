@@ -102,12 +102,24 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4DemoAlign2026_07_04")
             applyFastDemoDefaults(persistExplicitly: true)
         }
+        // Migrazione UNA TANTUM v3 (2026-07-06): allinea alla configurazione
+        // MISURATA della sessione di tuning (matrice completa di A/B in demo):
+        // slot 16, dense-ahead 2, look-ahead 0 (speculativo neutro, hash layers
+        // sempre attivi), niente SHARED_Q4. I valori sperimentali persistiti
+        // (slot 12, look-ahead 4) derivavano dai test intermedi.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_06") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_06")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
+        _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
+        _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
         _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
@@ -159,6 +171,40 @@ final class ChatStore {
     /// punto dolce scende a 12.
     var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 16 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
+    }
+    /// Look-ahead speculativo della slot-cache (DS4_EXPERT_LOOKAHEAD): mentre il
+    /// layer i calcola, il pool del layer i+1 viene PREriempito con i top-N
+    /// esperti del prior d'uso (I/O reale nella finestra in cui l'SSD è idle;
+    /// il demand ha priorità — un prefill in corso cede il passo entro ~2 slab).
+    /// I layer hash 0-2 sono SEMPRE prefetchati esatti (selezione nota dal token
+    /// id), indipendentemente da questo valore. 0 = solo hash. Si applica al
+    /// prossimo caricamento del modello. Speculativo: A/B per macchina.
+    var expertLookahead: Int = (UserDefaults.standard.object(forKey: "DS4ExpertLookahead") as? Int) ?? 0 {
+        didSet {
+            UserDefaults.standard.set(expertLookahead, forKey: "DS4ExpertLookahead")
+            _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)
+        }
+    }
+    /// Profondita' del ring di staging del dense stream (DS4_DENSE_AHEAD):
+    /// 2 = legge un layer piu' avanti, +1,5% misurato su M1 Pro (costo ~150 MB
+    /// di staging). Nessun toggle in GUI: e' il default misurato; regolabile
+    /// via UserDefaults per esperimenti. Si applica al prossimo load.
+    var denseAhead: Int = (UserDefaults.standard.object(forKey: "DS4DenseAhead") as? Int) ?? 2 {
+        didSet {
+            UserDefaults.standard.set(denseAhead, forKey: "DS4DenseAhead")
+            _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)
+        }
+    }
+    /// Pipeline asincrona del FFN routed (DS4_ASYNC_FFN): certificata da A/B
+    /// (+10%, 335 vs 374 ms/token, output identico token-per-token — la
+    /// correttezza e' garantita dalla coda Metal in-order). Default ON;
+    /// persistito senza UI: e' il paracadute per debug (=false ripristina il
+    /// percorso storico coi wait sincroni). Si applica al prossimo load.
+    var asyncFFNEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4AsyncFFN") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(asyncFFNEnabled, forKey: "DS4AsyncFFN")
+            _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)
+        }
     }
 
     // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
@@ -271,6 +317,9 @@ final class ChatStore {
         mlockEnabled = true
         denseQ4Enabled = true
         expertBundleEnabled = true
+        expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
+        denseAhead = 2             // staging un layer avanti: +1,5% misurato
+        asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         if persistExplicitly {
             let d = UserDefaults.standard
             d.set(16, forKey: "DS4ExpertCacheSlots")
@@ -281,6 +330,9 @@ final class ChatStore {
             d.set(true, forKey: "DS4MLock")
             d.set(true, forKey: "DS4DenseQ4")
             d.set(true, forKey: "DS4ExpertBundle")
+            d.set(0, forKey: "DS4ExpertLookahead")
+            d.set(2, forKey: "DS4DenseAhead")
+            d.set(true, forKey: "DS4AsyncFFN")
             _ = setenv("DS4_RAW_RING", "0", 1)
             _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
             _ = setenv("DS4_EXPERT_PREAD", "1", 1)
@@ -288,6 +340,9 @@ final class ChatStore {
             _ = setenv("DS4_MLOCK", "1", 1)
             _ = setenv("DS4_DENSE_Q4", "1", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
+            _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
+            _ = setenv("DS4_DENSE_AHEAD", "2", 1)
+            _ = setenv("DS4_ASYNC_FFN", "1", 1)
         }
     }
 

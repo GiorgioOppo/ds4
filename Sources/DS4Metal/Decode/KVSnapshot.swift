@@ -131,8 +131,13 @@ extension StreamingDecoder {
         // row count", ds4.c:24669/24702).
         let coff = c.ratio == 4 ? 2 : 1
         let stateLen = coff * c.ratio * c.width
+        // Bound on the EMISSION SCHEDULE (1 row per `ratio` positions over at
+        // most maxKeys positions), not on the allocation (maxComp carries +8
+        // rows of slack): a corrupt checkpoint must never restore a row count
+        // no legitimate run can reach — the lazy indexer-scoring skip PROVES
+        // "top-K never activates" from exactly this bound.
         guard rowDim == c.headDim,
-              snap.count >= 0, snap.count <= c.maxComp,
+              snap.count >= 0, snap.count <= maxKeys / c.ratio,
               snap.count * rowDim == snap.cacheRows.count,
               snap.stateKv.count == stateLen,
               snap.stateScore.count == stateLen else {

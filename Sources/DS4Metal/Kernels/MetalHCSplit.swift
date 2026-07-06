@@ -39,6 +39,33 @@ extension MetalRuntime {
         return Array(UnsafeBufferPointer(start: p, count: nRows * mixHc))
     }
 
+    /// 104-byte ds4_metal_args_dsv4_hc_split_weighted_sum_norm (natural C
+    /// alignment: i64 @0, i32+i32 @8, i64 @16, i64 @24, 8×u64 @32, f32 @96,
+    /// f32 @100). Strides assume the decode layout: mix/split nRows x 24 F32
+    /// contiguous, x [nRows][4][nEmbd] F32 contiguous, embd/norm rows nEmbd F32.
+    static func hcSplitWeightedSumNormArgs(nEmbd: Int, nHc: Int, sinkhornIters: Int,
+                                           nRows: Int, eps: Float, normEps: Float) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: 104)
+        func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        func i64(_ off: Int, _ v: Int64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        func f32(_ off: Int, _ v: Float) { withUnsafeBytes(of: v.bitPattern.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        let mixHc = 2 * nHc + nHc * nHc                     // 24
+        i64(0, Int64(nEmbd))
+        i32(8, Int32(nHc)); i32(12, Int32(sinkhornIters))
+        i64(16, Int64(nRows)); i64(24, Int64(mixHc))
+        u64(32, UInt64(mixHc) * 4)                          // nb_mix1  (mix row)
+        u64(40, UInt64(mixHc) * 4)                          // nb_split1 (split row)
+        u64(48, 4)                                          // nb_x0 (F32 elem)
+        u64(56, UInt64(nEmbd) * 4)                          // nb_x1 (HC channel)
+        u64(64, UInt64(nHc * nEmbd) * 4)                    // nb_x2 (token row)
+        u64(72, 4)                                          // nb0 (embd elem)
+        u64(80, UInt64(nEmbd) * 4)                          // nb1 (embd row)
+        u64(88, UInt64(nEmbd) * 4)                          // nb_norm1 (norm row)
+        f32(96, eps); f32(100, normEps)
+        return b
+    }
+
     /// 48-byte ds4_gpu_hc_split_args.
     static func hcSplitArgs(nHc: Int, sinkhornIters: Int, nRows: Int, mixHc: Int, eps: Float) -> [UInt8] {
         var b = [UInt8](repeating: 0, count: 48)

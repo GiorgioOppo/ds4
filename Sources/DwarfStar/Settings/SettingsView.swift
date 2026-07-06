@@ -86,7 +86,7 @@ struct SettingsView: View {
             Section("Memory") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
-                    Text("Resets every toggle below to the measured-fast set (slots 16, pread + dense stream + mlock + Q4 + bundle ON, ring OFF). Applies on the next model load.")
+                    Text("Resets every toggle below to the measured-fast set (slots 16, pread + dense stream + mlock + Q4 + bundle ON, dense-ahead 2, look-ahead 0, ring OFF). Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
@@ -96,6 +96,10 @@ struct SettingsView: View {
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
+                Stepper("Expert look-ahead: \(store.expertLookahead == 0 ? "hash layers only" : "\(store.expertLookahead) speculative/layer")",
+                        value: $store.expertLookahead, in: 0...12, step: 2)
+                Text("Prefills the NEXT layer's cache slots while the current one computes: exact for the hash layers (always on), top-N from the usage prior when > 0. Speculative I/O runs in the SSD-idle window and yields to the real gather; a wrong guess only wastes idle bandwidth. Applies on the next model load — A/B the tok/s.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
                 Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
                 if store.expertBundleEnabled {

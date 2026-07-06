@@ -34,6 +34,12 @@ public struct DSV4Dims {
     /// path: 2 dispatches instead of 5) when the quant scheme supports them.
     /// DS4_FUSED_MOE=0 disables for A/B comparison.
     public var fusedMoE: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_MOE"] != "0"
+    /// Use the fused HC-reduce tail (split+collapse+RMSNorm in one dispatch,
+    /// kernel_dsv4_hc_split_weighted_sum_norm4 — the C decode release path)
+    /// instead of the three separate dispatches. Runs twice per layer, so this
+    /// saves ~170 dispatches/token. Same math; only the RMSNorm reduction
+    /// order differs (±1 ulp class). DS4_FUSED_HC=0 restores the unfused path.
+    public var fusedHC: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_HC"] != "0"
     /// Raw-KV sliding window (C: DS4_N_SWA, GGUF `attention.sliding_window` = 128).
     /// Attention sees only the LAST nSWA raw rows; older context is visible only
     /// through the NSA-compressed rows — matching the trained NSA semantics (the C
@@ -206,10 +212,21 @@ extension GraphContext {
         let hcDim = d.nHC * d.nEmbd
         try rmsNorm(curHc, weight: nil, out: s.flat, rows: 1, n: hcDim, eps: rmsEps)
         try matmulF16(weight: mixerFn, x: s.flat, out: s.mix, inDim: hcDim, outDim: 24) // hc_attn_fn/hc_ffn_fn are F16
-        try hcSplitSinkhorn(mix: s.mix, scale: scale, base: base, out: s.split, nRows: 1,
-                            sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: hcEps)
-        try hcWeightedSum(x: curHc, weights: s.split, out: s.embd, nEmbd: d.nEmbd, nHC: d.nHC, nTokens: 1)
-        try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: rmsEps)
+        if d.fusedHC && d.nHC == 4 {
+            // C decode release path: split + collapse + norm in one dispatch.
+            // Writes the same three outputs (s.split / s.embd / s.cur) as the
+            // unfused triple below — downstream consumers see no difference.
+            try hcSplitWeightedSumNorm4(mix: s.mix, scale: scale, base: base, x: curHc,
+                                        split: s.split, embd: s.embd, normWeight: norm,
+                                        normOut: s.cur, nEmbd: d.nEmbd, nRows: 1,
+                                        sinkhornIters: DSV4Shape.nHCSinkhornIter,
+                                        eps: hcEps, normEps: rmsEps)
+        } else {
+            try hcSplitSinkhorn(mix: s.mix, scale: scale, base: base, out: s.split, nRows: 1,
+                                sinkhornIters: DSV4Shape.nHCSinkhornIter, eps: hcEps)
+            try hcWeightedSum(x: curHc, weights: s.split, out: s.embd, nEmbd: d.nEmbd, nHC: d.nHC, nTokens: 1)
+            try rmsNorm(s.embd, weight: norm, out: s.cur, rows: 1, n: d.nEmbd, eps: rmsEps)
+        }
     }
 
     /// Full decode layer (resident experts, one command buffer). `curHc`
