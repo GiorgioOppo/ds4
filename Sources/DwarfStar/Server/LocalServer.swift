@@ -137,6 +137,15 @@ final class LocalServer: @unchecked Sendable {
                 return
             }
         }
+        // Probe dei client "locally hosted" (Xcode Intelligence, ecc.): la
+        // base URL e /health devono rispondere 200, non 404 — alcuni client
+        // scartano il provider al primo probe fallito.
+        if req.method == "GET", req.path == "/" || req.path == "/health" {
+            try await send(conn, Self.response(200, contentType: "application/json",
+                                               body: "{\"status\":\"ok\",\"server\":\"dwarfstar\",\"model\":\(jsonString(modelId))}",
+                                               cors: config.cors))
+            return
+        }
         if req.method == "GET", req.path == "/v1/models" {
             try await send(conn, Self.response(200, contentType: "application/json",
                                                body: modelsJSON(), cors: config.cors))
@@ -144,12 +153,14 @@ final class LocalServer: @unchecked Sendable {
         }
         let modelPrefix = "/v1/models/"
         if req.method == "GET", req.path.hasPrefix(modelPrefix) {
+            // Qualunque id: il motore condiviso serve UN solo modello — un id
+            // diverso (Xcode può normalizzare/troncare il nome) viene loggato
+            // e risolto su quello caricato, come nel body delle completions.
             let id = String(req.path.dropFirst(modelPrefix.count))
-            if id == modelId {
-                try await send(conn, Self.response(200, contentType: "application/json",
-                                                   body: modelJSON(id), cors: config.cors))
-                return
-            }
+            try await send(conn, Self.response(200, contentType: "application/json",
+                                               body: modelJSON(resolveModel(id.isEmpty ? nil : id)),
+                                               cors: config.cors))
+            return
         }
         if req.method == "POST", req.path == "/v1/chat/completions" {
             try await handleChat(conn, body: req.body)

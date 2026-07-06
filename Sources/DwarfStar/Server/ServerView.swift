@@ -77,11 +77,17 @@ struct ServerView: View {
                 }
 
                 Section("Supported Endpoints") {
+                    endpointRow("GET", "/health · /", "probe (Xcode & co.)")
                     endpointRow("GET", "/v1/models", "model list")
+                    endpointRow("GET", "/v1/models/{id}", "one model (any id → loaded model)")
                     endpointRow("POST", "/v1/chat/completions", "OpenAI chat (stream + non)")
                     endpointRow("POST", "/v1/responses", "OpenAI Responses (stream + non)")
                     endpointRow("POST", "/v1/messages", "Anthropic Messages (stream + non)")
                     endpointRow("POST", "/v1/completions", "OpenAI legacy completion")
+                }
+                Section("Xcode Intelligence") {
+                    Text("Xcode ▸ Settings ▸ Intelligence ▸ Add a Model Provider ▸ Locally hosted: host 127.0.0.1 e la porta qui sopra (URL base http://127.0.0.1:<porta>). Xcode scopre il modello via /v1/models e chatta su /v1/chat/completions in streaming. Se imposti una API key nel server, in Xcode scegli il provider \"Internet hosted\" OpenAI-compatibile per poterla inserire.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
