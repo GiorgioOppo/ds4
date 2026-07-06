@@ -27,8 +27,9 @@ public final class ExpertUsageStats: @unchecked Sendable {
         // Ids are validated (≥ 0) so a corrupt readback can never poison the
         // profile — a bad id persisted here would break the cache pre-warm
         // (GGUFWeights.copyExpert throws on out-of-range) on every later run.
-        for id in ids where id >= 0 { counts[layer][id, default: 0] += 1 }
-        _totalRoutes += ids.count
+        var valid = 0
+        for id in ids where id >= 0 { counts[layer][id, default: 0] += 1; valid += 1 }
+        _totalRoutes += valid
     }
 
     /// Total routed picks recorded for a layer (0 = no data / dense layer).

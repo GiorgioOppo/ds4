@@ -96,6 +96,10 @@ struct SettingsView: View {
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
+                Stepper("Expert look-ahead: \(store.expertLookahead == 0 ? "hash layers only" : "\(store.expertLookahead) speculative/layer")",
+                        value: $store.expertLookahead, in: 0...12, step: 2)
+                Text("Prefills the NEXT layer's cache slots while the current one computes: exact for the hash layers (always on), top-N from the usage prior when > 0. Speculative I/O runs in the SSD-idle window and yields to the real gather; a wrong guess only wastes idle bandwidth. Applies on the next model load — A/B the tok/s.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
                 Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
                 if store.expertBundleEnabled {
