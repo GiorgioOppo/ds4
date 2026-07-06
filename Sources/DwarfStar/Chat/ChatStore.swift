@@ -505,8 +505,13 @@ final class ChatStore {
             /// Reload col set di knob corrente e misura: prefill corto (il
             /// prefill ha il suo benchmark) + 28 token di decode.
             @MainActor func measure(_ label: String) async throws -> (score: Double, note: String) {
-                benchStatus = "Auto-tune: \(label) — reload…"
+                benchStatus = "Auto-tune: \(label) — teardown…"
                 service = nil                      // libera la RAM wired PRIMA del nuovo load
+                // Il teardown di ~GB di buffer wired/mlock non è istantaneo:
+                // caricare subito sopra fa girare i primi token del benchmark
+                // in piena pressione di memoria (falso collasso, misurato).
+                try await Task.sleep(nanoseconds: 4_000_000_000)
+                benchStatus = "Auto-tune: \(label) — reload…"
                 load()
                 while phase == .loading { try await Task.sleep(nanoseconds: 500_000_000) }
                 guard phase == .ready, let svc = service else {
@@ -514,14 +519,29 @@ final class ChatStore {
                                   userInfo: [NSLocalizedDescriptionKey: "reload fallito (\(label))"])
                 }
                 try await Task.sleep(nanoseconds: 2_000_000_000)   // assestamento memoria
+                // Warmup NON misurato (pool esperti, ring denso, transitorio
+                // post-load) — l'equivalente del "REGIME dal token 5" della demo.
+                benchStatus = "Auto-tune: \(label) — warmup…"
+                _ = try await svc.benchmark(contextTokens: 16, genTokens: 4)
                 benchStatus = "Auto-tune: \(label) — misura…"
                 let p = try await svc.benchmark(contextTokens: 96, genTokens: 28)
-                let ratio = p.genTpsP99 > 0 ? p.genTps / p.genTpsP99 : 1
-                let stable = ratio >= 0.72
+                // Stabilità dal PROFILO temporale, non da media/p99: la spirale
+                // di swap ha la CODA più lenta della TESTA (degrado progressivo,
+                // misurato con 24 slot su 16 GB); una partenza fredda ha la
+                // firma opposta e non deve squalificare la configurazione.
+                func median(_ a: [Double]) -> Double {
+                    guard !a.isEmpty else { return 0 }
+                    return a.sorted()[a.count / 2]
+                }
+                let speeds = p.genSpeeds.count > 12 ? Array(p.genSpeeds.dropFirst(4)) : p.genSpeeds
+                let head = median(Array(speeds.prefix(speeds.count / 2)))
+                let tail = median(Array(speeds.suffix(speeds.count / 2)))
+                let ratio = head > 0 ? tail / head : 1
+                let stable = ratio >= 0.75
                 let score = stable ? p.genTpsP99 : 0
-                let note = String(format: "%@: %.2f tok/s regime (media %.2f, stabilità %.0f%%)%@",
+                let note = String(format: "%@: %.2f tok/s regime (media %.2f, coda/testa %.0f%%)%@",
                                   label, p.genTpsP99, p.genTps, ratio * 100,
-                                  stable ? "" : "  ← COLLASSO (pressione memoria)")
+                                  stable ? "" : "  ← COLLASSO PROGRESSIVO (pressione memoria)")
                 log(note)
                 return (score, note)
             }
@@ -532,11 +552,20 @@ final class ChatStore {
             let snapAsync = asyncFFNEnabled, snapLook = expertLookahead
             let snapNSG = q8NSG
             do {
-                var best = try await measure("baseline slot=\(expertCacheSlots) ahead=\(denseAhead) " +
-                                             "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) q8nsg=\(q8NSG)").score
+                let baseLabel = "baseline slot=\(expertCacheSlots) ahead=\(denseAhead) " +
+                                "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) q8nsg=\(q8NSG)"
+                var best = try await measure(baseLabel).score
+                if best == 0 {
+                    // Un solo retry: il primo giro paga il transitorio peggiore
+                    // (teardown del motore della chat + primo reload).
+                    log("baseline instabile — riprovo una volta dopo l'assestamento…")
+                    try await Task.sleep(nanoseconds: 8_000_000_000)
+                    best = try await measure(baseLabel + " (retry)").score
+                }
                 guard best > 0 else {
                     throw NSError(domain: "DS4AutoTune", code: 2, userInfo: [
-                        NSLocalizedDescriptionKey: "la baseline è instabile: liberare RAM (chiudere app) e riprovare"])
+                        NSLocalizedDescriptionKey: "la baseline è instabile anche al retry: " +
+                        "liberare RAM (chiudere le altre app) e riprovare"])
                 }
 
                 // 1) Slot cache esperti — il knob più importante e più rischioso.
