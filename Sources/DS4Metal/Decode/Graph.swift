@@ -239,6 +239,11 @@ extension GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        // NOTE: this encoder honors byteOffset on EVERY tensor; the unfused
+        // siblings (hcSplitSinkhorn/hcWeightedSum/rmsNorm) bind at offset 0
+        // and rely on scale/base/norm being copied resident. If those small
+        // weights ever become no-copy mmap views, the unfused A/B arm breaks
+        // first — keep them copied or fix those encoders too.
         e.setBuffer(mix.buffer, offset: mix.byteOffset, index: 1)
         e.setBuffer(scale.buffer, offset: scale.byteOffset, index: 2)
         e.setBuffer(base.buffer, offset: base.byteOffset, index: 3)
