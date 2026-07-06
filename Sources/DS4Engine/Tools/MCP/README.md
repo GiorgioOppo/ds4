@@ -5,7 +5,10 @@ servers and exposes their tools to the model next to the built-ins.
 
 - **`MCPConfig.swift`** — `MCPServerConfig` (name + transport + enabled) and the
   `{"mcpServers": …}` JSON interchange used by Claude Desktop / Cursor / VS
-  Code, so configs can be imported and exported verbatim.
+  Code (`command`/`args`/`env` for stdio servers, `url`/`headers` for HTTP
+  ones), so configs can be imported and exported verbatim. The format is also
+  documented in the root
+  [Configuration Reference](../../../../README.md#configuration-reference).
 - **`MCPProtocol.swift`** — pure JSON-RPC 2.0 / MCP frame helpers: build
   `initialize` / `tools/list` / `tools/call` requests, classify incoming frames,
   parse tool lists into `MCPToolInfo`, and flatten call results (text content,

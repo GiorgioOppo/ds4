@@ -6,10 +6,11 @@ runtime. It depends on `DS4Core` and `DS4Metal` and has no external links.
 
 - **`Service/`**: `InferenceService`, which turns prompts into streamed events,
   reuses KV across turns, runs the tool loop, manages isolated sub-agents, exposes
-  benchmarks, and integrates disk KV. Also contains `DiskKVStore` and
-  diagnostics helpers.
+  benchmarks, and integrates disk KV. Also contains `DiskKVStore`,
+  `ExpertBundleTool`, and diagnostics helpers.
 - **`Tools/`**: `ToolRegistry`, one file per built-in tool under `Builtins/`,
-  `ProjectCache`, `GitTool`, and agent profiles/registry.
+  the MCP client under `MCP/`, `ProjectCache`, `GitTool`, the SSRF-guarded
+  `WebClient`, and agent profiles/registry.
 - **`Download/`**: `ModelDownloader`, a native resumable GGUF downloader for
   Hugging Face with SHA-256 integrity verification.
 - **`Distributed/`**: distributed inference coordinator/worker protocol,

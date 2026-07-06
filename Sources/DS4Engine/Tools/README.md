@@ -16,6 +16,9 @@ library they operate on.
 - **`ProjectCache.swift`** indexes imported projects and backs the `project_*`
   and `file_*` tools for read/list/search/write/edit/add/line-modify operations.
   It does not touch chat memory.
+- **`WebClient.swift`** is the shared SSRF-guarded HTTP client behind
+  `web_search`/`web_fetch`: http/https only, public hosts only, size- and
+  time-capped responses (see `Builtins/README.md`).
 - **`GitTool.swift`** runs whitelisted local git subcommands in the project root.
   Network operations are intentionally excluded.
 - **`Agents.swift`** defines `AgentProfile` (system prompt, tools, and expert

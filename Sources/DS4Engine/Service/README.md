@@ -16,6 +16,10 @@ Inference service and persistence.
   store writes from a uniquely-owned `SnapshotBox` whose layers are dropped as
   they reach the disk. Both fds use F_NOCACHE so checkpoint bytes never
   displace the hot page cache.
+- **`ExpertBundleTool.swift`** builds/verifies the expert-bundle sidecar for a
+  GGUF on demand (the Settings button in the GUI) without loading the engine:
+  it opens the model (mmap + metadata only) and calls `ExpertBundle.openOrBuild`
+  with the same paths as the load (sibling read → `DS4_BUNDLE_DIR`).
 - **`Diagnostics.swift`** dumps tokens and chat-template rendering through the
   native tokenizer, without subprocesses.
 

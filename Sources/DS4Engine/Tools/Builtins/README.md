@@ -21,6 +21,9 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 | `agents_list` | `AgentsList.swift` | Lists available roles and tools for orchestration. |
 | `subagent_search`/`run` | `Subagent*.swift` | Delegates work to isolated sub-agents; `run` is executed by the engine. |
 
+`DS4_SEARCH_URL` and the other environment variables are documented in the root
+[Configuration Reference](../../../../README.md#configuration-reference).
+
 ## Adding A Tool
 
 1. Create `Builtins/NewTool.swift` with the `ToolRegistry` extension.

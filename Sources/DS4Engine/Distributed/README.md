@@ -31,6 +31,19 @@ carries `useExpertBundle` and `useDenseQ4`, so the sidecar and requant
 decisions are the coordinator's too (the worker points DS4_BUNDLE_DIR /
 DS4_Q4_CACHE_DIR at the transferred files before loading its engine).
 
+Transfers are RESUMABLE (protocol v8): the offer carries a chained-hash
+checkpoint list per file (one 32-byte SHA-256 every 256 MB, each folded over
+the previous); the worker keeps its `.part` across disconnects and sessions,
+validates it block-by-block against the chain, and answers with a per-file
+resume offset — at most 256 MB are re-sent after an interruption. WORK frames
+also carry the chunk's token ids (v7: the first hash layers route experts by
+token id), and ASSIGN carries the coordinator's whitelisted DS4_* performance
+knobs (v9: the coordinator's measured configuration is part of the job
+definition). The current wire version is `Dist.protocolVersion` = 9, checked
+for strict equality at connect. Ports, the distributed GUI settings, and the
+DS4_* env knobs are listed in the root
+[Configuration Reference](../../../README.md#configuration-reference).
+
 KV continuity (protocol v4) removes the per-turn full re-prefill:
 
 - **In-memory prefix reuse**: the coordinator tracks the token prefix committed
