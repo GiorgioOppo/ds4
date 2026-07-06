@@ -916,6 +916,7 @@ public actor InferenceService {
         let genStart = Date()
         var sampleS = 0.0                          // CPU sampler (full-vocab sort at temp>0)
         var lastProgress = Date(timeIntervalSince1970: 0)
+        var regimeStart: Date?                     // timestamp after token 4 (demo's REGIME cut)
         while produced < maxTokens && pos < contextSize {
             try Task.checkCancellation()
             // Penalize the recently produced tokens to break repeat-loop collapse.
@@ -961,11 +962,14 @@ public actor InferenceService {
             // SwiftUI invalidation in the GUI — per-token it costs main-thread
             // time that competes with the decode's own CPU work.
             let now = Date()
+            if produced == 4 && regimeStart == nil { regimeStart = now }   // demo's REGIME cut
             if now.timeIntervalSince(lastProgress) >= 0.25 {
                 lastProgress = now
                 let elapsed = now.timeIntervalSince(genStart)
-                continuation.yield(.progress(String(format: "%d token · %.2f tok/s", produced,
-                                                     elapsed > 0 ? Double(produced) / elapsed : 0)))
+                let ms = elapsed / Double(produced) * 1000
+                continuation.yield(.progress(String(format: "%d token · %.2f tok/s · %.0f ms/token",
+                                                     produced,
+                                                     elapsed > 0 ? Double(produced) / elapsed : 0, ms)))
             }
         }
         flush(inReasoning)
@@ -974,13 +978,23 @@ public actor InferenceService {
         // costs ~0), rest = streaming/tokenizer/actor/UI backpressure. This is
         // the number that answers "why is the GUI slower than the demo".
         if produced > 0 {
-            let wall = Date().timeIntervalSince(genStart)
+            let end = Date()
+            let wall = end.timeIntervalSince(genStart)
             let engine = decoder.profile.totalS
             let per = 1000.0 / Double(produced)
             let other = max(0, wall - engine - sampleS)
+            // Regime = dal token 5 (stesso taglio della demo): scarta il warm-up
+            // (cache fredda, wiring) che sporca la media cumulativa sui turni corti.
+            var regime = ""
+            if let r = regimeStart, produced > 4 {
+                let rWall = end.timeIntervalSince(r)
+                let rTok = Double(produced - 4)
+                regime = String(format: " — regime %.2f tok/s (%.0f ms/token)",
+                                rTok / max(rWall, 0.001), rWall / rTok * 1000)
+            }
             FileHandle.standardError.write(Data(String(
-                format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f\n",
-                produced, wall, wall * per, engine * per, sampleS * per, other * per).utf8))
+                format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f%@\n",
+                produced, wall, wall * per, engine * per, sampleS * per, other * per, regime).utf8))
         }
 
         // Extract any tool calls from the generated output.
