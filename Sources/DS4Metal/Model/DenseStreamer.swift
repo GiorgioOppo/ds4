@@ -307,6 +307,19 @@ public final class DenseStreamer: @unchecked Sendable {
                                "ORE invece di minuti. Compila in Release (`make app` oppure Xcode con " +
                                "configurazione Release) per pagarla una volta sola in pochi minuti.")
                 }
+                // PREFLIGHT di scrittura: crea SUBITO il file cache (header
+                // valido, zero record) prima di pagare la conversione. Se la
+                // scrittura non è possibile (permessi, spazio, percorso) lo si
+                // scopre ORA con il motivo nel log — non dopo minuti/ore di
+                // CPU; e il file visibile in cartella è la prova che i
+                // checkpoint hanno dove atterrare.
+                if Self.writeQ4Cache(path: writeCachePath, modelSize: Int(model.size),
+                                     jobs: [], tensors: [], hashes: []) {
+                    Self.logQ4("preflight: file cache creato subito, i checkpoint lo riempiranno: \(writeCachePath)")
+                } else {
+                    Self.logQ4("preflight FALLITO (motivo nella riga sopra): la cache NON potrà essere " +
+                               "salvata — il requant procede solo in memoria e si ripeterà al prossimo avvio")
+                }
                 let lock = NSLock()
                 // nonisolated(unsafe): ogni iterazione scrive SOLO out[i] (indici
                 // disgiunti), jobs/rt/model sono letti e basta, l'errore e'
@@ -531,8 +544,14 @@ public final class DenseStreamer: @unchecked Sendable {
         // the tensors that actually changed.
         let cacheCount = Int(fu32(16))
         guard fu32(0) == q4CacheMagic, fu32(4) == q4CacheVersion,
-              fu64(8) == UInt64(modelSize), cacheCount >= 1, cacheCount <= 8192 else {
+              fu64(8) == UInt64(modelSize), cacheCount >= 0, cacheCount <= 8192 else {
             logQ4("incompatibile (versione/modello/estensione diversi) — riquantizzo: \(path)")
+            return nil
+        }
+        if cacheCount == 0 {
+            // Solo il preflight di un requant interrotto subito dopo l'avvio:
+            // header valido, nessun tensore ancora scritto.
+            logQ4("vuota (preflight, nessun checkpoint ancora) — riquantizzo: \(path)")
             return nil
         }
         var head = [UInt8](repeating: 0, count: cacheCount * 32)
@@ -606,9 +625,12 @@ public final class DenseStreamer: @unchecked Sendable {
     /// the next load simply requantizes again). Written to a .tmp sibling and
     /// renamed into place, so a crash mid-write can never leave a torn cache
     /// under the real name (and a concurrent reader sees old-or-new, never half).
+    /// Returns true on success — the requant preflight writes an EMPTY cache
+    /// (zero record) up front to prove the path is writable before any work.
+    @discardableResult
     private static func writeQ4Cache(path: String, modelSize: Int,
                                      jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)],
-                                     tensors: [GPUTensor], hashes: [UInt64]) {
+                                     tensors: [GPUTensor], hashes: [UInt64]) -> Bool {
         let align = 4096
         let headBytes = 20 + jobs.count * 32
         var offset = (headBytes + align - 1) / align * align
@@ -632,13 +654,13 @@ public final class DenseStreamer: @unchecked Sendable {
         let free = (try? FileManager.default.attributesOfFileSystem(forPath: dir))?[.systemFreeSize] as? Int ?? 0
         guard free > offset + (1 << 28) else {
             logQ4("spazio disco insufficiente (~\(offset >> 20) MB richiesti, ~\(free >> 20) MB liberi — il Cestino conta!) — cache non scritta: \(path)")
-            return
+            return false
         }
         let tmp = path + ".tmp"
         guard FileManager.default.createFile(atPath: tmp, contents: nil),
               let fh = FileHandle(forWritingAtPath: tmp) else {
             logQ4("SCRITTURA FALLITA (cartella \(FileManager.default.fileExists(atPath: dir) ? "presente" : "ASSENTE"), ~\(free >> 20) MB liberi): \(tmp)")
-            return
+            return false
         }
         do {
             try fh.write(contentsOf: head)
@@ -651,10 +673,12 @@ public final class DenseStreamer: @unchecked Sendable {
             try? FileManager.default.removeItem(atPath: path)
             try FileManager.default.moveItem(atPath: tmp, toPath: path)
             logQ4("scritta (\(tensors.count) tensori, \(offset / 1_048_576) MB): \(path)")
+            return true
         } catch {
             try? fh.close()
             logQ4("SCRITTURA FALLITA (\(error)) — file rimosso: \(tmp)")
             try? FileManager.default.removeItem(atPath: tmp)   // never leave a torn cache
+            return false
         }
     }
 

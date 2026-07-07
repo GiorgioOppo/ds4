@@ -614,9 +614,13 @@ and should be treated as a separate A/B experiment.
 
 The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`,
 ~1.4 GB): the first load pays the requant once, every later load preads the
-cache back in well under a second. The requant runs in batches and
-**checkpoints the partial cache to disk between batches** (same format, fewer
-records): a first load interrupted mid-requant (force quit, crash, reboot)
+cache back in well under a second. The requant **creates the cache file
+empty up front** (valid header, zero records — a write preflight: permission,
+path or disk-space problems surface in the log *before* any conversion work,
+and the file's presence proves checkpoints have somewhere to land), then runs
+in batches and **checkpoints the partial cache to disk between batches** (same
+format, fewer records): a first load interrupted mid-requant (force quit,
+crash, reboot)
 resumes from the completed tensors instead of restarting from zero, and the
 load bar advances per **MB of source converted** rather than per tensor, so a
 long conversion is visibly progressing instead of looking hung. Validation is
