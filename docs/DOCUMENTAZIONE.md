@@ -104,6 +104,19 @@ of experts for each token and layer. The default active count is 6. Reducing the
 active expert count with `DS4_ACTIVE_EXPERTS` lowers I/O but changes model
 quality and should be treated as a degraded mode or diagnostic experiment.
 
+The first three layers are hash-routed: expert selection comes from the token id
+through the `ffn_gate_tid2eid` table, exactly like the C reference, not from the
+hidden state. This matters for expert prefetching (the selection is known before
+compute) and for distributed shards that cover those layers.
+
+At load the engine validates GGUF metadata the same way the C loader does
+(a port of `config_validate_model`) and selects the declared profile. The local
+runtime is wired for the Flash profile (43 layers, 256 experts); a valid Pro
+GGUF is refused with an explicit error instead of being decoded with Flash
+shapes into garbage. Numerics also follow the C reference: the RMSNorm and
+Hyper-Connection epsilons default to `1e-6`, matching `DS4_DEFAULT_RMS_EPS`
+and `DS4_DEFAULT_HC_EPS` in `ds4.c`.
+
 ### KV Reuse
 
 Conversations are append-only. The service tracks exactly which token ids have
@@ -162,8 +175,9 @@ greater than zero.
 13. Greedy-decode tokens, stream bytes to `stdout`, and log timings to `stderr`.
 14. Save usage imatrix and print the decode profile.
 
-See `Sources/DS4Demo/README.md` for the full list of environment variables and
-diagnostic examples.
+See `Sources/DS4Demo/README.md` for diagnostic examples, and the root README's
+[Configuration Reference](../README.md#configuration-reference) for the
+complete list of `DS4_*` environment variables.
 
 ## 5. SwiftUI App: `DwarfStar`
 
@@ -221,6 +235,13 @@ Open **Settings** and choose a GGUF with **Browse**. In sandboxed builds, this i
 required because the picker grants a security-scoped bookmark. The bookmark is
 stored so the same model can reopen on the next launch.
 
+Sandboxed builds can read ONLY the picked `.gguf` file: sidecar caches sitting
+next to it (`.q4dense`, `.expbundle`, e.g. built by the CLI demo) are invisible,
+so the app would re-create them inside its own container — a slow first load and
+gigabytes duplicated. **Grant Model Folder Access…** grants the whole model
+folder so those sidecars are reused directly; doing it once per model folder is
+recommended.
+
 Select a context size. The default is RAM-aware: low-RAM systems default to a
 small context because KV memory grows with context and competes with the page
 cache needed for expert streaming.
@@ -242,6 +263,13 @@ Optional memory and I/O settings:
   attention projections to Q4_K and caches them under Application Support.
 - **Disk KV:** checkpoint KV prefixes to disk for session/server reuse.
 - **Raw-KV ring:** keep raw sliding-window KV constant-size.
+- **Expert look-ahead:** speculatively prefill the next layer's cache slots
+  while the current layer computes (0 = hash layers only, which are always
+  prefetched exactly).
+
+Every knob behind these switches, plus the CLI-only ones, is documented in the
+root README's [Configuration Reference](../README.md#configuration-reference),
+which is the complete parameter reference.
 
 ### Step 2 — Load
 
@@ -261,6 +289,12 @@ In **Chat**, type a message and press Return. The store:
 4. streams reasoning, visible text, and tool-call markup;
 5. executes built-in tools as needed;
 6. persists the chat session and updates context usage.
+
+Chat sampling uses the configured temperature and repetition penalty with a
+fixed top-k of 40 (the llama.cpp default). Sampling over the entire 129k
+DeepSeek vocabulary let the noisy tail of a 2-bit model occasionally pick a
+Chinese token and drag the whole answer into Chinese; the cap removes that tail
+without hurting variety. The HTTP server still honors per-request `top_k`.
 
 ### Thinking, Stop, and New Chat
 
@@ -334,6 +368,60 @@ These presets do not change correctness; they reduce the chance of memory
 pressure. You can still raise context manually up to 1M, but KV and scratch
 memory scale with it.
 
+Beyond the static presets, Settings offers three measurement-driven tools that
+tune the engine for the actual machine. All three require a loaded model, keep
+the chat unusable while they run, and print a report to the panel and the
+engine log.
+
+### Prefill Benchmark (quick ~3 min / full ~10 min)
+
+The **Benchmark** section in Settings measures the two prefill knobs the engine
+re-reads on every prefill call — `DS4_PREFILL_UNION` (max experts per group in
+a prefill union) and `DS4_PREFILL_CHUNK` (tokens per chunk) — then applies and
+persists the fastest combination:
+
+- **Quick** compares union 192 vs 256 on a 256-token prefill. It deliberately
+  skips union 64: at short scale noise can make it win, while on real prefills
+  it is the catastrophic value.
+- **Full** compares union 64/192/256 on a 512-token prefill, then chunk
+  512 vs 1024 with the winning union on a 1024-token prefill (below 512 tokens
+  a second chunk does not exist, so quick mode cannot measure it).
+
+The applied values are shown in the "Attivi (prefill)" row.
+
+### Per-Machine Auto-Tune (~15-25 min)
+
+**Auto-tune macchina** finds the best LOAD-time knobs for this chip and RAM —
+expert cache slots, dense-stream ahead depth, async FFN pipeline, expert
+look-ahead, and `DS4_Q8_NSG` (Q8 matvec reduction partitioning, the one knob
+tied to GPU core count) — with a coordinate descent: one model reload per
+candidate, measured with a short warmed-up decode.
+
+- Candidates are RAM-gated (a 16 GB machine never tries 32 slots; a 96 GB Max
+  does), and after the first memory-pressure collapse larger candidates are
+  skipped.
+- The metric is the steady-state p99 decode speed, but a candidate only counts
+  if it is STABLE. Stability is judged from the temporal profile of per-token
+  speeds: a swap spiral has a tail slower than its head (progressive
+  degradation), which is exactly what separates "more slots = more hits" from
+  "more slots = swap spiral". A cold start has the opposite signature and does
+  not disqualify a configuration.
+- A candidate must beat the incumbent by more than 2% (anti-noise margin);
+  otherwise the persisted value stays.
+
+The winners are applied, persisted per chip/RAM, and summarized in the
+"Attivi (load)" row (slots, dense-ahead, async FFN, look-ahead, q8nsg). On
+error the knobs are restored to their starting values.
+
+### "Align to fast demo config" and One-Time Migrations
+
+The **Align to fast demo config** button resets every memory toggle to the
+measured-fast set: slots 16, pread + dense streaming + `mlock` + Q4 + bundle
+ON, dense-ahead 2, look-ahead 0, raw ring OFF. The app also runs one-time
+migrations at startup that move defaults persisted by older experimental builds
+to the current measured configuration (most recently: slots 16, dense-ahead 2,
+look-ahead 0); future manual changes are always preserved.
+
 ## 8. Memory, Streaming, and GUI Defaults
 
 The current GUI defaults are tuned for the measured fast path on a 16 GB Apple
@@ -349,10 +437,15 @@ Silicon machine:
 | Q4 attention projections | ON | Lossy speed path that removes large Q8 projections from per-token SSD traffic. |
 | Disk KV | ON | Reuses known prefixes across chats, reloads, and server requests. |
 | Raw-KV ring | OFF | Available as an experiment; full KV is the conservative default. |
+| Async FFN pipeline | ON | Commits the routed FFN asynchronously so the GPU no longer drains between layers (measured +10%, token-identical output). |
+| Dense-stream ahead | `2` | Staging ring reads one layer ahead of compute. |
+| Expert look-ahead | `0` | Speculative prefill measured neutral; the hash layers are always prefetched exactly. |
 
 Most of these values are persisted and apply on the next model load. The app
-performs a one-time migration from older experimental defaults to this faster
-profile; future user changes are preserved.
+performs one-time migrations from older experimental defaults to this measured
+profile (see Section 7); future user changes are preserved. The complete list
+of engine environment knobs, including the CLI-only ones, lives in the root
+README's [Configuration Reference](../README.md#configuration-reference).
 
 ### Page Cache vs Wired Buffers
 
@@ -380,7 +473,25 @@ cannot write there, it builds under `Application Support/DwarfStar/expert-bundle
 
 Dense streaming reads layer `i+1` while the GPU computes layer `i`. It uses
 `pread + F_NOCACHE`, avoids page-cache churn, and takes precedence over resident
-dense weights.
+dense weights. `DS4_DENSE_AHEAD` controls the staging-ring depth (default 2 =
+one layer ahead, the measured optimum; the auto-tune explores 1-3).
+
+Two lossless refinements are ON by default inside the dense stream:
+
+- `DS4_RESIDENT_COMP` keeps the four NSA compressor projections resident
+  (~0.6 GB) instead of streaming them — they are read every token on 41 of 43
+  layers, the single densest repeat-read in the stream. Same bytes, identical
+  numerics; `=0` restores full streaming as a tight-RAM fallback.
+- `DS4_LAZY_IDX` skips staging the indexer SCORING projections (~360 MB/token)
+  when the sparse top-k selection provably cannot activate at the current
+  context size. The proof is recomputed on every load, so a larger context
+  re-enables the staging automatically.
+
+Whether the sparse indexer path activates at all is governed by
+`DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` (default 1024, same env override
+and allowed values as the C): decode keeps attention dense over all compressed
+rows until their count exceeds the threshold, because around the ~2K frontier
+the sparse path's score/top-k setup costs more than the smaller dense scan.
 
 `DS4_MLOCK=1` pins hot buffers best-effort. This includes expert-cache pools,
 dense-stream staging, output-head resident buffers, and Q4 dense buffers. Failure
@@ -391,6 +502,25 @@ projections to Q4_K, caches the result under
 `Application Support/DwarfStar/q4-cache`, and keeps the reduced buffers resident.
 Disable it when you want the closest full-Q8 behavior rather than maximum
 single-machine throughput.
+
+### Async FFN Pipeline and GPU Kernel Knobs
+
+`DS4_ASYNC_FFN=1` (default ON) commits the routed-FFN work asynchronously so
+the GPU does not drain between layers. The Metal queue is in-order, so the
+output is token-identical to the synchronous path — measured +10% on M1 Pro.
+Setting it to `0` restores the historical synchronous waits and is kept as a
+debugging parachute.
+
+`DS4_FUSED_HC` (default ON) fuses the Hyper-Connection reduce tail —
+split + collapse + RMSNorm — into one dispatch instead of three; it runs twice
+per layer, saving ~170 dispatches/token. Same math; only the RMSNorm reduction
+order differs (±1 ulp class). `=0` restores the unfused path.
+
+`DS4_Q8_NSG` sets the simdgroups per threadgroup in the Q8 matvecs (a pure
+occupancy knob — identical numerics). The optimum depends on GPU core count:
+4 is the reference (best on M1 Pro); wider GPUs (Max/Ultra) may prefer 6-8.
+The engine re-reads it on every model load, which is how the auto-tune
+explores it.
 
 ### KV Cache
 
@@ -420,6 +550,17 @@ The expert slot-cache is per-layer. Each slot holds one expert. On 2-bit Flash,
 one slot costs roughly 6.9 MB per layer. Slot budgets should be tuned with the
 Tuning tab: look at hit-rate and per-layer concentration. Low hit-rate means the
 cache is not paying for its wired memory.
+
+`DS4_EXPERT_LOOKAHEAD` (Settings stepper, default 0) prefills the next layer's
+slots while the current layer computes: exact for the hash-routed layers
+(always on — the token-id selection is known in advance), top-N from the usage
+prior when greater than 0. Speculative I/O runs only in the SSD-idle window and
+yields to the real gather, so a wrong guess wastes only idle bandwidth.
+
+`DS4_PREAD_SPLIT` (default 1) splits each expert slab into N disjoint ranges
+read concurrently during the direct (`F_NOCACHE`) slot-cache fill, raising the
+NVMe queue depth for the same bytes. The historical single-`pread` path is the
+default; values up to 8 are accepted.
 
 ### Route/Attention Profiling
 
@@ -495,6 +636,44 @@ prefix; any mismatch falls back to a cold prefill. The ASSIGN also carries the
 usage imatrix, so each worker pre-warms its expert slot-cache (and persists
 its own slice-refined profile between sessions).
 
+Token-id routing (protocol v7): WORK frames carry the chunk's token ids. The
+first three layers route experts by token id (`ffn_gate_tid2eid`), so a shard
+that covers them cannot route from the HC state alone.
+
+Resumable transfers (protocol v8): the file offer carries a chained-hash
+checkpoint list per file — one SHA-256 every 256 MB, each folded over the
+previous, so checkpoint `k` commits to the whole prefix (a 70 GB GGUF adds
+~9 KB to the offer). A worker keeps its `.part` file across disconnects AND
+sessions, validates it block-by-block against the chain, truncates to the last
+good checkpoint, and answers with a per-file resume offset; the coordinator
+streams from there. Transport errors during a peer's setup are retried up to 3
+times (semantic errors — version mismatch, bad slice, worker-reported errors —
+are not), and each attempt re-sends at most 256 MB.
+
+Coordinator performance knobs (protocol v9): the ASSIGN carries the
+coordinator's measured `DS4_*` performance environment, restricted to a
+whitelist on both sides (`Dist.perfKnobKeys` in
+`Sources/DS4Engine/Distributed/DistProtocol.swift`) so the wire can never set
+arbitrary environment on a worker. All whitelisted knobs are performance-only
+and cannot change the shard's numerics; the one lossy knob (`DS4_DENSE_Q4`)
+travels as a typed field and its cache as a file. Before v9 a worker with
+factory defaults ran without dense streaming/`mlock`/pread and measured
+0.37 tok/s where the same hardware did 2.7 locally — the coordinator's measured
+configuration is now part of the job definition.
+
+Worker setup runs IN PARALLEL: file transfer and engine load of every peer
+proceed together, so the route activates in max(worker setup) instead of the
+sum. With files already distributed (from the second connect on), N workers
+become ready in the time of one; on a cold start the transfers share the
+coordinator's bandwidth, but one worker's load still overlaps the others'
+transfers. Route order remains the peer-list order.
+
+The full Q4 requant cache transferred by the coordinator also serves worker
+slices directly: cache records are matched by key (layer, field), so a shard
+loads the complete `.q4dense` in about half a second instead of requantizing
+its slice from scratch. Partial-slice writes go to a suffixed
+`<cache>.L<lo>-<hi>` file and never overwrite the full cache.
+
 ### Benchmark
 
 The benchmark panel measures prefill and generation throughput at increasing
@@ -502,6 +681,17 @@ context sizes. In Local mode it reuses the loaded shared engine when the chat is
 idle; the run mutates KV and is refused while generation is active. In
 Distributed mode it reuses the connected coordinator, so it must not overlap a
 distributed chat generation.
+
+The generation series in the chart and report is the steady-state p99 of the
+per-token speeds, not the mean: the mean is dragged down by the cold first
+tokens, while p99 is the cruise speed the run settles into (the log prints both).
+The chart draws a fine 0.1 t/s gridline because the A/B differences that matter
+are in the 0.05-0.3 t/s range.
+
+This panel measures at increasing context frontiers; the Settings tab has its
+own benchmark and auto-tune buttons that measure and APPLY configuration knobs
+(Section 7). The currently applied values appear in Settings as the
+"Attivi (prefill)" and "Attivi (load)" rows.
 
 ### Diagnostics
 
@@ -547,6 +737,8 @@ sign with a Developer ID and notarize.
 | Symptom | Likely Cause | What to Try |
 |---|---|---|
 | Model fails to open under the packaged app | Sandbox access missing | Choose the GGUF with **Browse** instead of typing a path. |
+| Load is refused with "unsupported DeepSeek4 shape" | The GGUF declares the Pro profile | The local runtime supports only the Flash profile (43 layers, 256 experts); use a Flash GGUF. |
+| First load rebuilds sidecars that already exist next to the GGUF | Sandbox can read only the picked file | Use **Grant Model Folder Access…** in Settings so `.q4dense`/`.expbundle` next to the model are reused. |
 | Output is nonsense | Quantization mismatch or wrong GGUF | Run `DS4_TYPES_ONLY=1 swift run DS4Demo <gguf>` and compare expected dtypes. |
 | Very slow decode on 16 GB | SSD expert streaming or dense rereads dominate | Use the GUI fast defaults: expert pread, dense streaming, `mlock`, Q4 attention cache, expert bundle, moderate context. |
 | First load takes a long time | Expert bundle or Q4 dense cache is being built | Watch the engine log. Later loads reuse the sidecar/cache. |
@@ -554,6 +746,9 @@ sign with a Developer ID and notarize.
 | Resident dense makes things worse | Wired memory pressure | Prefer dense streaming on 16 GB systems; resident dense is automatic in the GUI and mainly useful on RAM-rich systems or CLI A/B tests. |
 | Expert cache does not help | Routing is too uniform or cache too small | Check Tuning hit-rate and per-layer concentration; compare uniform vs usage-driven allocation. |
 | Distributed chat cannot connect | Route incomplete or workers not started | Start workers first and ensure slices cover every layer contiguously. |
+| Distributed connect fails with a version mismatch | Coordinator and worker run different builds | Update every Mac to the same DwarfStar build; the protocol version must match exactly. |
+| Distributed file transfer interrupted | Network hiccup mid-transfer | Nothing to do: the worker keeps its `.part`, setup retries up to 3 times, and each retry resumes from the last 256 MB checkpoint. |
+| Auto-tune reports an unstable baseline or progressive collapse | Memory pressure from other apps or too-large candidates | Free RAM (close other apps) and rerun; collapsing candidates are skipped automatically. |
 | Server works but chat slows down | Shared GPU/SSD resources | Avoid simultaneous chat and server generation on the same Mac. |
 | Build cannot write Swift/clang cache in sandbox | Toolchain cache outside writable roots | Build outside the managed sandbox or configure writable cache paths. |
 
@@ -571,6 +766,7 @@ sign with a Developer ID and notarize.
 | HC | Hyper-Connection hidden state transported through layers/workers. |
 | DSML | DeepSeek tool-call markup opened by the `｜DSML｜` token. |
 | Usage imatrix | Per-layer expert routing-frequency table used for cache tuning. |
+| Hash layer | One of the first 3 layers, whose experts are selected by token id via the `tid2eid` table instead of the router. |
 | Slot-cache | GPU-resident LRU cache of hot experts. |
 | Expert bundle | Sidecar that stores each expert's slabs contiguously for faster miss reads. |
 | Dense streaming | Per-layer dense-weight staging path that overlaps SSD reads with compute. |
