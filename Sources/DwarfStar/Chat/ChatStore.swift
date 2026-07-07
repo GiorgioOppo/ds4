@@ -991,10 +991,27 @@ final class ChatStore {
         Task.detached(priority: .userInitiated) {
             defer { poller.cancel() }
             do {
-                let svc = try InferenceService(modelPath: path,
-                                               contextSize: ctx,
-                                               systemPrompt: nil,   // set by applyAgent below
-                                               expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil)
+                // Il motore si costruisce su un thread GCD CLASSICO, non sul
+                // thread del pool cooperativo di Swift Concurrency di questo
+                // Task: il load usa DispatchQueue.concurrentPerform ovunque
+                // (riquantizzazione Q4, lettura cache, fill esperti) e chiamato
+                // da un thread cooperativo può degradare a esecuzione quasi
+                // seriale — un core al 100% e la riquantizzazione in ore. La
+                // demo CLI, che carica dal main thread, ha sempre avuto il
+                // fan-out pieno: stesso contesto anche qui.
+                let svc = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<InferenceService, Error>) in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            cont.resume(returning: try InferenceService(
+                                modelPath: path,
+                                contextSize: ctx,
+                                systemPrompt: nil,   // set by applyAgent below
+                                expertCacheSlots: cacheSlots > 0 ? cacheSlots : nil))
+                        } catch {
+                            cont.resume(throwing: error)
+                        }
+                    }
+                }
                 await svc.setDiskKV(directory: kvDir, budgetTokens: kvBudgetTokens)
                 let info = await svc.modelInfo()
                 await MainActor.run {

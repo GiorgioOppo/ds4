@@ -820,16 +820,27 @@ public final class DistWorker: @unchecked Sendable {
         }
         defer { poller.cancel() }
         do {
-            // Detached: the load (mmap + Metal init) runs for minutes and must
-            // not sit on this connection's task while frames could arrive.
-            // Phase breadcrumbs cover what LoadProgress does not (Metal/mmap).
+            // Off this connection's task: the load (mmap + Metal init) runs for
+            // minutes while frames could arrive. On a GCD thread, NOT a Swift
+            // Concurrency cooperative thread: the load fans out everywhere with
+            // DispatchQueue.concurrentPerform (Q4 requant, cache reads, expert
+            // fills), which from a cooperative thread can degrade to near-SERIAL
+            // execution — one core pegged and the requant taking hours instead
+            // of minutes. Phase breadcrumbs cover what LoadProgress does not.
             let slots = wanted.expertCacheSlots
-            let loaded = try await Task.detached(priority: .userInitiated) { [report] in
-                try DistEngine(modelPath: resolved, contextSize: wanted.contextSize,
-                               expertCacheSlots: slots > 0 ? slots : nil,
-                               kvLayers: wanted.layerStart..<(wanted.layerEnd + 1),
-                               onLoadLog: report)
-            }.value
+            let loaded = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<DistEngine, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async { [report] in
+                    do {
+                        cont.resume(returning: try DistEngine(
+                            modelPath: resolved, contextSize: wanted.contextSize,
+                            expertCacheSlots: slots > 0 ? slots : nil,
+                            kvLayers: wanted.layerStart..<(wanted.layerEnd + 1),
+                            onLoadLog: report))
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+            }
             poller.cancel()              // no progress frames after READY is submitted
             commitAssignment(loaded, wanted)
             applyAncillary(assign, to: loaded)
