@@ -996,6 +996,13 @@ final class ChatStore {
                     self.phase = .ready
                     self.activate(self.activeSessionId)   // load the active chat + apply its role
                 }
+                // Warmup in background A UI GIÀ PRONTA: paga ORA il costo
+                // una-tantum della prima generazione (creazione pool esperti
+                // + fill top-usage, ~GB da SSD, kernel Metal freddi) invece
+                // che sul primo messaggio. Un send immediato si accoda al
+                // warmup sull'actor: mai più lento di prima, di norma il
+                // primo token passa da ~5-7s a ~1s.
+                await svc.warmup()
             } catch {
                 await MainActor.run { self.phase = .failed("\(error)") }
             }

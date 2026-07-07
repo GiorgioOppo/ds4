@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-07 checkpoint prefisso + stop pulito"
+    public static let engineRevision = "2026-07-07 warmup al load + checkpoint prefisso + stop pulito"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -408,6 +408,33 @@ public actor InferenceService {
                           genTpsP99: p99,
                           genSpeeds: tokenSpeeds)
     }
+
+    /// Riscalda il motore subito dopo il load. La slot-cache degli esperti crea
+    /// i pool SOLO alla prima richiesta (allocazione Metal + fill dei top-usage:
+    /// ~slot × ~7 MB × layer instradati ≈ GB letti da SSD) e i percorsi
+    /// Metal/lookahead partono freddi: senza warmup è il PRIMO messaggio
+    /// dell'utente a pagare tutto — primi chunk di prefill lenti e 4-7 s sul
+    /// primo token. Un mini giro sintetico (12 token di prefill + 3 di decode)
+    /// sposta quel costo al load. Idempotente; preserva il system prompt attivo
+    /// e lascia lo stato pulito (il benchmark lo sporca di proposito).
+    public func warmup() {
+        guard !warmedUp else { return }
+        warmedUp = true
+        let saved = systemPrompt
+        let t0 = Date()
+        do {
+            _ = try benchmark(contextTokens: 12, genTokens: 3)
+            FileHandle.standardError.write(Data(String(
+                format: "DS4 engine: warmup completato in %.1fs (pool esperti + kernel caldi)\n",
+                Date().timeIntervalSince(t0)).utf8))
+        } catch {
+            // Best-effort: un warmup fallito non deve bloccare nulla — il primo
+            // messaggio reale pagherà la partenza fredda come prima.
+            FileHandle.standardError.write(Data("DS4 engine: warmup fallito: \(error)\n".utf8))
+        }
+        resetConversation(systemPrompt: saved)
+    }
+    private var warmedUp = false
 
     // MARK: - Sub-agents (isolated context, returns only the answer)
 

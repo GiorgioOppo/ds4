@@ -66,6 +66,11 @@ final class ServerController {
         // Only bind the listening socket off the main actor; the engine (and its
         // disk-KV, set when the chat loaded it) is already live and shared.
         let startTask = Task.detached { () -> LocalServer in
+            // Idempotente (no-op se la chat ha già scaldato il motore): la
+            // prima richiesta API non deve pagare la creazione dei pool
+            // esperti e i kernel freddi in mezzo al prefill del client.
+            onLog("riscaldamento motore (no-op se già caldo)…\n")
+            await engine.warmup()
             let srv = LocalServer(engine: engine, modelName: name, config: cfg, onLog: onLog)
             try srv.start()
             return srv
