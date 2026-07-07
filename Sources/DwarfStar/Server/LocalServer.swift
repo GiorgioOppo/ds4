@@ -203,6 +203,21 @@ final class LocalServer: @unchecked Sendable {
         return nil
     }
 
+    /// Composizione del transcript per ruolo: rende verificabile il conteggio
+    /// del prefill ("prefill 765 token" per un semplice "ciao" = il system
+    /// prompt nascosto del client, non il messaggio visibile).
+    private static func turnsSummary(_ turns: [ChatTurn]) -> String {
+        turns.map { t in
+            switch t {
+            case .system(let s):            return "system \(s.count) char"
+            case .user(let s):              return "user \(s.count) char"
+            case .assistant(let s, let c):  return "assistant \(s.count) char"
+                                                   + (c.isEmpty ? "" : " (+\(c.count) tool call)")
+            case .toolResult(_, _, let s):  return "tool_result \(s.count) char"
+            }
+        }.joined(separator: " · ")
+    }
+
     /// Acquisisce il gate MISURANDO l'attesa: se il motore è occupato (altra
     /// richiesta o turno chat in corso) la richiesta resta in coda in silenzio —
     /// senza questa riga il tempo di coda sembra un hang del server.
@@ -247,6 +262,7 @@ final class LocalServer: @unchecked Sendable {
         if let u = Self.lastUserText(parsed.turns) {
             onLog("→ user: \"\(preview(u))\"\n")
         }
+        onLog("→ transcript: \(Self.turnsSummary(parsed.turns))\n")
 
         // Serialize: only one generation runs against the single-model engine.
         await acquireGate()
