@@ -295,6 +295,18 @@ public final class DenseStreamer: @unchecked Sendable {
                                           from: 0.32, to: 0.88, units: totalMB)
                 Self.logQ4("riquantizzo \(missing.count) di \(q4Jobs.count) tensori (~\(totalMB) MB Q8) " +
                            "con checkpoint periodici in: \(writeCachePath)")
+                // Build non ottimizzata (Xcode Run in Debug, `swift build` senza
+                // -c release): il quantizzatore scalare diventa 20-50× più lento
+                // — ORE invece di minuti, con la CPU al 100% e la barra quasi
+                // ferma. È la prima causa di "bloccato sulla riquantizzazione":
+                // dillo forte nel log invece di lasciarlo indovinare.
+                var debugBuild = false
+                assert({ debugBuild = true; return true }())
+                if debugBuild {
+                    Self.logQ4("ATTENZIONE: build di DEBUG (-Onone) — la riquantizzazione può richiedere " +
+                               "ORE invece di minuti. Compila in Release (`make app` oppure Xcode con " +
+                               "configurazione Release) per pagarla una volta sola in pochi minuti.")
+                }
                 let lock = NSLock()
                 // nonisolated(unsafe): ogni iterazione scrive SOLO out[i] (indici
                 // disgiunti), jobs/rt/model sono letti e basta, l'errore e'
@@ -306,8 +318,10 @@ public final class DenseStreamer: @unchecked Sendable {
                 // viene persistita (stesso formato, meno record), così un load
                 // ucciso a metà riparte dai soli tensori mancanti invece che
                 // da zero. L'ordine di q4Jobs interfoglia layer e tipi di
-                // tensore, quindi i batch restano bilanciati.
-                let batchSize = 32
+                // tensore, quindi i batch restano bilanciati. 16 tensori
+                // (~550 MB sorgente): il PRIMO checkpoint arriva presto — è la
+                // prova visibile che il file viene scritto davvero.
+                let batchSize = 16
                 var doneCount = q4Jobs.count - missing.count
                 for start in stride(from: 0, to: missing.count, by: batchSize) {
                     let batch = Array(missing[start..<min(start + batchSize, missing.count)])

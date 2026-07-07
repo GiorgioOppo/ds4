@@ -96,79 +96,83 @@ public enum Quantize {
 
     private static func quantizeSuperblockQ4_K(_ x: UnsafePointer<Float>,
                                                into out: UnsafeMutableRawPointer) {
-        var L = [UInt8](repeating: 0, count: 256)
-        var Laux = [UInt8](repeating: 0, count: 32)
-        var weights = [Float](repeating: 0, count: 32)
-        var scales = [Float](repeating: 0, count: 8)
-        var mins = [Float](repeating: 0, count: 8)
+        // Scratch on the STACK instead of six heap arrays per call: this runs
+        // once per 256-element superblock over GIGABYTES of weights in the
+        // DENSE_Q4 requant, where the per-call malloc/ARC traffic dominated
+        // the profile — worst in unoptimized builds, where it stretched the
+        // one-time requant from minutes to hours (looking like a hang).
+        // Same operations in the same order → byte-identical output.
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 256 + 32 + 12) { ub in
+            withUnsafeTemporaryAllocation(of: Float.self, capacity: 32 + 8 + 8) { fb in
+                let L = ub.baseAddress!            // 256: 4-bit codes
+                let Laux = L + 256                 // 32: candidate codes per step
+                let sb = Laux + 32                 // 12: packed 6-bit scales/mins
+                let weights = fb.baseAddress!      // 32
+                let scales = weights + 32          // 8
+                let mins = scales + 8              // 8
 
-        var maxScale: Float = 0, maxMin: Float = 0
-        for j in 0..<8 {
-            let xj = x + j * 32
-            var sumX2: Float = 0
-            for i in 0..<32 { sumX2 += xj[i] * xj[i] }
-            let avX = (sumX2 / 32).squareRoot()
-            for i in 0..<32 { weights[i] = avX + abs(xj[i]) }
-            var theMin: Float = 0
-            scales[j] = L.withUnsafeMutableBufferPointer { lp in
-                Laux.withUnsafeMutableBufferPointer { la in
-                    makeQKX2Quants(n: 32, nmax: 15, x: xj, weights: weights,
-                                   L: lp.baseAddress! + j * 32, theMin: &theMin,
-                                   Laux: la.baseAddress!,
-                                   rmin: -1, rdelta: 0.1, nstep: 20, useMad: false)
+                var maxScale: Float = 0, maxMin: Float = 0
+                for j in 0..<8 {
+                    let xj = x + j * 32
+                    var sumX2: Float = 0
+                    for i in 0..<32 { sumX2 += xj[i] * xj[i] }
+                    let avX = (sumX2 / 32).squareRoot()
+                    for i in 0..<32 { weights[i] = avX + abs(xj[i]) }
+                    var theMin: Float = 0
+                    scales[j] = makeQKX2Quants(n: 32, nmax: 15, x: xj, weights: weights,
+                                               L: L + j * 32, theMin: &theMin, Laux: Laux,
+                                               rmin: -1, rdelta: 0.1, nstep: 20, useMad: false)
+                    mins[j] = theMin
+                    if scales[j] > maxScale { maxScale = scales[j] }
+                    if mins[j] > maxMin { maxMin = mins[j] }
+                }
+
+                for i in 0..<12 { sb[i] = 0 }      // temporary allocation is uninitialized; sb uses |=
+                let invScale: Float = maxScale > 0 ? 63 / maxScale : 0
+                let invMin: Float = maxMin > 0 ? 63 / maxMin : 0
+                for j in 0..<8 {
+                    let ls = UInt8(min(63, nearestInt(invScale * scales[j])))
+                    let lm = UInt8(min(63, nearestInt(invMin * mins[j])))
+                    if j < 4 {
+                        sb[j] = ls
+                        sb[j + 4] = lm
+                    } else {
+                        sb[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4)
+                        sb[j - 4] |= (ls >> 4) << 6
+                        sb[j] |= (lm >> 4) << 6
+                    }
+                }
+                let d = Half.bits(maxScale / 63)
+                let dmin = Half.bits(maxMin / 63)
+                out.storeBytes(of: d, toByteOffset: 0, as: UInt16.self)
+                out.storeBytes(of: dmin, toByteOffset: 2, as: UInt16.self)
+                for i in 0..<12 { out.storeBytes(of: sb[i], toByteOffset: 4 + i, as: UInt8.self) }
+
+                // Re-derive (scale, min) from the PACKED 6-bit values (like the
+                // ggml reference), then quantize each sub-block to 4 bits.
+                let dF = Half.float(d), dminF = Half.float(dmin)
+                for j in 0..<8 {
+                    let (sc, m) = scaleMinK4(j, sb)
+                    let dj = dF * Float(sc)
+                    if dj == 0 { continue }
+                    let mj = dminF * Float(m)
+                    for i in 0..<32 {
+                        let l = nearestInt((x[j * 32 + i] + mj) / dj)
+                        L[j * 32 + i] = UInt8(max(0, min(15, l)))
+                    }
+                }
+                // Pack nibbles: per 64-element chunk, qs[l] = L[l] | (L[l+32] << 4).
+                var qoff = 16
+                var base = 0
+                while base < 256 {
+                    for l in 0..<32 {
+                        out.storeBytes(of: L[base + l] | (L[base + l + 32] << 4),
+                                       toByteOffset: qoff + l, as: UInt8.self)
+                    }
+                    qoff += 32
+                    base += 64
                 }
             }
-            mins[j] = theMin
-            if scales[j] > maxScale { maxScale = scales[j] }
-            if mins[j] > maxMin { maxMin = mins[j] }
-        }
-
-        var sb = [UInt8](repeating: 0, count: 12)
-        let invScale: Float = maxScale > 0 ? 63 / maxScale : 0
-        let invMin: Float = maxMin > 0 ? 63 / maxMin : 0
-        for j in 0..<8 {
-            let ls = UInt8(min(63, nearestInt(invScale * scales[j])))
-            let lm = UInt8(min(63, nearestInt(invMin * mins[j])))
-            if j < 4 {
-                sb[j] = ls
-                sb[j + 4] = lm
-            } else {
-                sb[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4)
-                sb[j - 4] |= (ls >> 4) << 6
-                sb[j] |= (lm >> 4) << 6
-            }
-        }
-        let d = Half.bits(maxScale / 63)
-        let dmin = Half.bits(maxMin / 63)
-        out.storeBytes(of: d, toByteOffset: 0, as: UInt16.self)
-        out.storeBytes(of: dmin, toByteOffset: 2, as: UInt16.self)
-        for i in 0..<12 { out.storeBytes(of: sb[i], toByteOffset: 4 + i, as: UInt8.self) }
-
-        // Re-derive (scale, min) from the PACKED 6-bit values (like the ggml
-        // reference), then quantize each sub-block to 4 bits.
-        let dF = Half.float(d), dminF = Half.float(dmin)
-        sb.withUnsafeBufferPointer { sp in
-            for j in 0..<8 {
-                let (sc, m) = scaleMinK4(j, sp.baseAddress!)
-                let dj = dF * Float(sc)
-                if dj == 0 { continue }
-                let mj = dminF * Float(m)
-                for i in 0..<32 {
-                    let l = nearestInt((x[j * 32 + i] + mj) / dj)
-                    L[j * 32 + i] = UInt8(max(0, min(15, l)))
-                }
-            }
-        }
-        // Pack nibbles: per 64-element chunk, qs[l] = L[l] | (L[l+32] << 4).
-        var qoff = 16
-        var base = 0
-        while base < 256 {
-            for l in 0..<32 {
-                out.storeBytes(of: L[base + l] | (L[base + l + 32] << 4),
-                               toByteOffset: qoff + l, as: UInt8.self)
-            }
-            qoff += 32
-            base += 64
         }
     }
 

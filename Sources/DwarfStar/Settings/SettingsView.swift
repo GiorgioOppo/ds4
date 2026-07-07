@@ -198,8 +198,13 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: min(max(store.loadFraction, 0), 1))
                         .progressViewStyle(.linear)
-                    Text(store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                    // Percentuale a 0,1%: nelle fasi lunghe (riquantizzazione
+                    // Q4) il numero prova che il load avanza anche quando la
+                    // barra sembra ferma.
+                    Text((store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                         + String(format: " · %.1f%%", min(max(store.loadFraction, 0), 1) * 100))
                         .font(.caption).foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
             case .needsModel, .failed:
                 if case .failed(let message) = store.phase {

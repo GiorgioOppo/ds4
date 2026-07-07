@@ -22,8 +22,14 @@ struct ChatTabView: View {
                     ProgressView(value: min(max(store.loadFraction, 0), 1))
                         .progressViewStyle(.linear)
                         .frame(maxWidth: 360)
-                    Text(store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                    // Percentuale a 0,1%: le fasi lunghe (riquantizzazione Q4)
+                    // muovono la barra di frazioni di punto — il numero prova
+                    // che il caricamento sta AVANZANDO anche quando la barra
+                    // sembra ferma.
+                    Text((store.loadStage.isEmpty ? "Loading model..." : store.loadStage)
+                         + String(format: " · %.1f%%", min(max(store.loadFraction, 0), 1) * 100))
                         .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .needsModel, .failed:
