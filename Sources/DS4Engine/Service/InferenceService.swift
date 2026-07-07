@@ -112,7 +112,7 @@ public actor InferenceService {
     /// Engine revision stamp, printed to stderr at every init so the engine log
     /// always says WHICH build is running ("I rebuilt but nothing changed" is
     /// otherwise undiagnosable). Bump when engine behaviour changes materially.
-    public static let engineRevision = "2026-07-06 tokenizer-index + timing server"
+    public static let engineRevision = "2026-07-07 checkpoint prefisso + stop pulito"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -817,11 +817,30 @@ public actor InferenceService {
             FileHandle.standardError.write(Data(
                 "DS4 server: KV riusato in memoria (\(committedIds.count) token già caldi)\n".utf8))
             return run(suffixIds: Array(ids.dropFirst(committedIds.count)),
-                       think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+                       think: thinkMode, sampling: sampling, maxTokens: maxTokens,
+                       resumablePrefill: true)
         }
         resetConversation(systemPrompt: nil)
         self.tools = tools
-        return run(suffixIds: ids, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
+        // Confine del PREFISSO CONDIVISO (BOS + system prompt + tool): è la
+        // parte identica tra conversazioni diverse dello stesso client (ogni
+        // chat Xcode ripete lo stesso system prompt). Se è grande e non è già
+        // su disco, `generate` lo checkpointa APPENA prefillato: uno stream
+        // annullato o una chat nuova lo RESTAURANO in secondi invece di
+        // ripagare minuti di prefill. systemBlock è lo stesso pezzo che apre
+        // il render completo, quindi il confine è un prefisso per costruzione.
+        var checkpointAfter = 0
+        if let store = diskKV {
+            let sysPrefix = "<｜begin▁of▁sentence｜>" + ChatRenderer.systemBlock(
+                turns: turns, tools: tools, markup: markup, compact: compactTools)
+            let sysCount = tok.tokenizeRenderedChat(sysPrefix).count
+            if sysCount >= store.options.minTokens, ids.count > sysCount,
+               (store.storedPrefixLengths(of: ids, modelName: modelName).first ?? 0) < sysCount {
+                checkpointAfter = sysCount
+            }
+        }
+        return run(suffixIds: ids, think: thinkMode, sampling: sampling, maxTokens: maxTokens,
+                   checkpointAfter: checkpointAfter, resumablePrefill: true)
     }
 
     private func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
@@ -831,7 +850,8 @@ public actor InferenceService {
     }
 
     private func run(suffixIds: [Int], think: DS4ThinkMode, sampling: SamplingParams,
-                     maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
+                     maxTokens: Int, checkpointAfter: Int = 0,
+                     resumablePrefill: Bool = false) -> AsyncThrowingStream<GenEvent, Error> {
         AsyncThrowingStream { continuation in
             // .userInitiated: this is the task that actually runs the (synchronous,
             // GPU-blocking) decode loop on the actor's executor. The chat path already
@@ -840,7 +860,8 @@ public actor InferenceService {
             let task = Task(priority: .userInitiated) {
                 do {
                     try self.generate(suffixIds: suffixIds, think: think, sampling: sampling,
-                                      maxTokens: maxTokens, continuation: continuation)
+                                      maxTokens: maxTokens, checkpointAfter: checkpointAfter,
+                                      resumablePrefill: resumablePrefill, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -850,7 +871,17 @@ public actor InferenceService {
         }
     }
 
+    /// `checkpointAfter` > 0: posizione ASSOLUTA (in token) del confine del
+    /// prefisso condiviso (system prompt + tool) — appena il prefill la supera,
+    /// lo stato KV viene checkpointato su disco così un transcript divergente
+    /// (chat nuova, stream annullato) lo restaura invece di riprefillarlo.
+    /// `resumablePrefill`: il chiamante (server stateless) ricava il prompt dal
+    /// transcript completo e verifica il prefisso via `starts(with:)` — quindi
+    /// i token prefillati si possono COMMITTARE chunk per chunk e un annullamento
+    /// a metà prefill lascia stato pulito e riprendibile. I percorsi chat NON
+    /// lo usano: lì il chiamante assume suffissi tutto-o-niente.
     private func generate(suffixIds initialSuffixIds: [Int], think: DS4ThinkMode, sampling: SamplingParams, maxTokens: Int,
+                          checkpointAfter: Int = 0, resumablePrefill: Bool = false,
                           continuation: AsyncThrowingStream<GenEvent, Error>.Continuation) throws {
         var suffixIds = initialSuffixIds
 
@@ -907,15 +938,49 @@ public actor InferenceService {
         // STESSA del chunking interno del decoder (DS4_PREFILL_CHUNK): il
         // batching dell'unione esperti per blocco non cambia, zero costi.
         let pfChunk = max(64, ProcessInfo.processInfo.environment["DS4_PREFILL_CHUNK"].flatMap(Int.init) ?? 512)
+        // Confine del checkpoint relativo a QUESTO suffisso (0 = nessuno): se un
+        // restore da disco ha già superato il confine assoluto, non c'è nulla da
+        // checkpointare.
+        let checkpointRel = (checkpointAfter > startPos && checkpointAfter <= startPos + suffixIds.count)
+            ? checkpointAfter - startPos : 0
         var lastLogits: [Float] = []
         var pfDone = 0
         let pfT0 = Date()
         while pfDone < suffixIds.count {
-            try Task.checkCancellation()
-            let end = min(pfDone + pfChunk, suffixIds.count)
+            if Task.isCancelled {
+                // A inizio giro lo stato è coerente per costruzione (l'ultimo
+                // chunk è stato forwardato E committato): in modalità riprendibile
+                // il prossimo transcript identico ESTENDE da qui invece di
+                // ripartire da zero. Fuori da quella modalità i token del chunk
+                // non sono in committedIds → il flag dirty resta e si fa replay.
+                if resumablePrefill { kvDirty = false }
+                throw CancellationError()
+            }
+            var end = min(pfDone + pfChunk, suffixIds.count)
+            if checkpointRel > pfDone && checkpointRel < end { end = checkpointRel }
             lastLogits = try decoder.prefill(tokens: Array(suffixIds[pfDone..<end]),
                                              startPos: startPos + pfDone)
+            if resumablePrefill { committedIds.append(contentsOf: suffixIds[pfDone..<end]) }
             pfDone = end
+            if checkpointRel > 0 && pfDone == checkpointRel, let store = diskKV {
+                // Il prefisso condiviso è appena entrato nel KV: checkpoint SUBITO,
+                // non a fine generazione — uno stream annullato a metà decode o
+                // una conversazione nuova con lo stesso system prompt ripartono
+                // dal restore (secondi) invece che dal prefill (minuti).
+                continuation.yield(.progress("checkpoint del prefisso su disco (\(startPos + pfDone) token)…"))
+                let t0 = Date()
+                let box = DiskKVStore.SnapshotBox(decoder.exportKV(nKeys: startPos + pfDone))
+                FileHandle.standardError.write(Data(String(
+                    format: "DS4 diskkv: snapshot prefisso %d token esportato in %.2fs\n",
+                    startPos + pfDone, Date().timeIntervalSince(t0)).utf8))
+                let idsSnap = resumablePrefill ? committedIds
+                                               : committedIds + Array(suffixIds[0..<pfDone])
+                let name = modelName
+                Task.detached(priority: .utility) {
+                    store.store(tokens: idsSnap, modelName: name, box: box, reason: .cold)
+                }
+                lastDiskStoreCount = startPos + pfDone
+            }
             if pfDone < suffixIds.count {
                 let dt = Date().timeIntervalSince(pfT0)
                 let tps = dt > 0 ? Double(pfDone) / dt : 0
@@ -923,7 +988,7 @@ public actor InferenceService {
                                                     pfDone, suffixIds.count, tps)))
             }
         }
-        committedIds.append(contentsOf: suffixIds)
+        if !resumablePrefill { committedIds.append(contentsOf: suffixIds) }
         // Profile the DECODE only (not the prefill), matching DS4Demo: reset the
         // per-phase counters at the prefill→decode boundary so decodeProfileReport()
         // reflects steady-state generation. The decode loop is opaque to the UI (it
@@ -979,7 +1044,16 @@ public actor InferenceService {
         var lastProgress = Date(timeIntervalSince1970: 0)
         var regimeStart: Date?                     // timestamp after token 4 (demo's REGIME cut)
         while produced < maxTokens && pos < contextSize {
-            try Task.checkCancellation()
+            if Task.isCancelled {
+                // A inizio giro il KV corrisponde ESATTAMENTE a committedIds
+                // (l'ultimo token generato è stato forwardato E committato):
+                // uno stop qui non sporca nulla. Senza questo, ogni stop utente
+                // (o disconnessione del client) costava il replay INTEGRALE
+                // della conversazione al turno successivo. Il turno assistant
+                // resta aperto: needsClose lo chiude nel prossimo suffisso.
+                kvDirty = false
+                throw CancellationError()
+            }
             // Penalize the recently produced tokens to break repeat-loop collapse.
             let lo = max(0, committedIds.count - sampling.repeatLastN)
             let tSample = Date()
