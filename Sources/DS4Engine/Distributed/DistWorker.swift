@@ -933,11 +933,20 @@ public final class DistWorker: @unchecked Sendable {
             let maskData = assign.expertMask
             let slots = assign.expertCacheSlots
             let usageJSON = assign.usageJSON
-            let shard = try await Task.detached(priority: .userInitiated) {
-                try ExpertShardEngine(modelPath: resolved, expertMask: maskData,
-                                      expertCacheSlots: slots, usageJSON: usageJSON,
-                                      onLoadLog: report)
-            }.value
+            // Su thread GCD, non sul pool cooperativo (stessa ragione del load
+            // del motore a slice qui sopra: fan-out concurrentPerform pieni).
+            let shard = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<ExpertShardEngine, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        cont.resume(returning: try ExpertShardEngine(
+                            modelPath: resolved, expertMask: maskData,
+                            expertCacheSlots: slots, usageJSON: usageJSON,
+                            onLoadLog: report))
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+            }
             commitShard(shard)
             onLog("expert-shard pronto: \(shard.ownedCount)/256 esperti\n")
             try await conn.sendFrame(.ready, helloPayload().encoded())
@@ -1021,6 +1030,13 @@ public final class DistWorker: @unchecked Sendable {
 }
 
 /// Serializes async closures (the shard runs one step at a time).
+/// Executor su coda GCD seriale (SE-0392): i body fanno fan-out con
+/// DispatchQueue.concurrentPerform (gather esperti, slice del decoder), che
+/// da un thread del pool cooperativo può degradare al quasi-seriale — vedi
+/// InferenceService.engineQueue. Semantica identica (coda seriale), cambia
+/// solo il thread di esecuzione.
 actor DistGate {
+    private nonisolated let queue = DispatchSerialQueue(label: "ds4.dist.gate", qos: .userInitiated)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
     func run<T: Sendable>(_ body: @Sendable () throws -> T) async rethrows -> T { try body() }
 }

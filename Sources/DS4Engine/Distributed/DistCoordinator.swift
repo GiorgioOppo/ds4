@@ -414,9 +414,14 @@ public final class DistCoordinator: @unchecked Sendable {
         // Cache esperti locale spenta: gli esperti vivono sui worker e il
         // gather locale non parte mai (remoteExperts sostituisce quel ramo;
         // anche il look-ahead speculativo è disattivato dal decoder).
-        let engine = try DistEngine(modelPath: config.modelPath, contextSize: config.contextSize,
-                                    expertCacheSlots: 0, kvLayers: nil,
-                                    onLoadLog: { onLog("backbone: \($0)\n") })
+        // Su thread GCD, non sul pool cooperativo: il load del backbone fa
+        // fan-out con concurrentPerform (incluso l'eventuale requant Q4).
+        let cfg = config
+        let engine = try await Self.onGCD {
+            try DistEngine(modelPath: cfg.modelPath, contextSize: cfg.contextSize,
+                           expertCacheSlots: 0, kvLayers: nil,
+                           onLoadLog: { onLog("backbone: \($0)\n") })
+        }
         let peers = expertPeers
         let bits = config.activationBits == 16 ? 16 : 32
         engine.setRemoteExperts { [self] layer, ids, weights, activation in
@@ -879,6 +884,18 @@ public final class DistCoordinator: @unchecked Sendable {
         return engine.parseToolCalls(visible + toolText).calls
     }
 
+    /// Esegue `work` su un thread GCD classico, MAI sul pool cooperativo di
+    /// Swift Concurrency: il decode locale fa fan-out con concurrentPerform
+    /// (gather esperti) — che da un thread cooperativo può degradare al
+    /// quasi-seriale — e in verticale blocca anche sui round-trip di rete.
+    private static func onGCD<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                cont.resume(with: Result(catching: work))
+            }
+        }
+    }
+
     /// Un turno di chat sulla route VERTICALE (Fase D): stesso contratto di
     /// `send` — rendering della conversazione, streaming di reasoning/testo,
     /// DSML parse — ma il decode gira sul BACKBONE LOCALE (verticalEngine),
@@ -904,9 +921,9 @@ public final class DistCoordinator: @unchecked Sendable {
         onLog("prefill \(ids.count - startPos) di \(ids.count) token (verticale)…\n")
         let suffix = Array(ids[startPos...])
         let sp = startPos
-        var lastLogits = try await Task.detached {
+        var lastLogits = try await Self.onGCD {
             try vEngine.verticalPrefill(tokens: suffix, startPos: sp)
-        }.value
+        }
         var pos = ids.count
 
         // Decode: identico a `send` (reasoning/think, '<' trattenuto, DSML
@@ -950,9 +967,9 @@ public final class DistCoordinator: @unchecked Sendable {
             recentIds.append(next)
             if recentIds.count > sampling.repeatLastN { recentIds.removeFirst() }
             let p = pos
-            lastLogits = try await Task.detached {
+            lastLogits = try await Self.onGCD {
                 try vEngine.verticalForward(token: next, pos: p)
-            }.value
+            }
             producedIds.append(next)
             pos += 1; produced += 1
             let elapsed = Date().timeIntervalSince(t0)

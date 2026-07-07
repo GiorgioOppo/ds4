@@ -655,7 +655,13 @@ final class ChatStore {
         bundleBuildStatus = "Verifica/creazione in corso… (dettagli nel Log motore)"
         let path = modelPath
         Task.detached(priority: .userInitiated) {
-            let outcome = ExpertBundleTool.ensure(modelPath: path)
+            // Su thread GCD, non sul pool cooperativo: la build del bundle fa
+            // fan-out con concurrentPerform (copyExpert) — vedi ChatStore.load.
+            let outcome = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    cont.resume(returning: ExpertBundleTool.ensure(modelPath: path))
+                }
+            }
             await MainActor.run { self.bundleBuildStatus = outcome }
         }
     }

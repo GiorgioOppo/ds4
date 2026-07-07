@@ -70,6 +70,18 @@ public enum GenEvent: Sendable {
 }
 
 public actor InferenceService {
+    /// Executor dedicato su coda GCD SERIALE (SE-0392): tutto il lavoro
+    /// dell'actor — prefill, decode, warmup, benchmark — gira su un thread
+    /// GCD classico, lo stesso contesto della demo CLI (main thread). Il
+    /// motore fa fan-out con DispatchQueue.concurrentPerform a ogni token
+    /// (gather esperti, fill slot-cache, staging denso): chiamato da un
+    /// thread del pool cooperativo di Swift Concurrency può degradare fino
+    /// al quasi-seriale (un core al 100% — misurato sul requant Q4: ore
+    /// invece di secondi). La coda è seriale, quindi la semantica actor non
+    /// cambia; cambia solo il thread su cui gira.
+    private nonisolated let engineQueue = DispatchSerialQueue(label: "ds4.engine", qos: .userInitiated)
+    public nonisolated var unownedExecutor: UnownedSerialExecutor { engineQueue.asUnownedSerialExecutor() }
+
     private let rt: MetalRuntime
     private let model: GGUFModel
     private let tok: Tokenizer
