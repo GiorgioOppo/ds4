@@ -614,9 +614,15 @@ and should be treated as a separate A/B experiment.
 
 The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`,
 ~1.4 GB): the first load pays the requant once, every later load preads the
-cache back in well under a second. Validation is against the model *bytes*
-(content fingerprints of each source tensor plus size/job-list), not just the
-file size; write failures are ignored. The cache lives next to the model by
+cache back in well under a second. The requant runs in batches and
+**checkpoints the partial cache to disk between batches** (same format, fewer
+records): a first load interrupted mid-requant (force quit, crash, reboot)
+resumes from the completed tensors instead of restarting from zero, and the
+load bar advances per **MB of source converted** rather than per tensor, so a
+long conversion is visibly progressing instead of looking hung. Validation is
+against the model *bytes* (content fingerprints of each source tensor,
+checked per record), not just the file size; write failures are ignored. The
+cache lives next to the model by
 default (demo/CLI); the sandboxed app cannot write next to a picker-selected
 file, so `DS4_Q4_CACHE_DIR` points it at Application Support. Reads try both
 places, and a full cache found in the secondary location (e.g. produced by the

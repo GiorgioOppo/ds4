@@ -197,6 +197,7 @@
 		FED741843ED14A1A8DC1657D /* DiagnosticsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D42D48508A34E2A4BA439C /* DiagnosticsController.swift */; };
 		FF02D53C9212273310CA7306 /* MetalConcat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85B1C13B3E9BB7EE78644EBB /* MetalConcat.swift */; };
 		FF7922C1CC58A1CCAF3D6A3E /* ProjectCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC18FAC0A362D2B6F0219FC6 /* ProjectCacheTests.swift */; };
+		AA11B2C3D4E5F00000000001 /* QuantizeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11B2C3D4E5F00000000002 /* QuantizeTests.swift */; };
 		FFDE581F6879F475E6D714C4 /* MetalIndexerPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 183E178067339B3EEC399A6F /* MetalIndexerPool.swift */; };
 		FFFB5B01C065C8E0119BC4CD /* ProjectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54345172CFBE6BBDA90A6F16 /* ProjectView.swift */; };
 /* End PBXBuildFile section */
@@ -456,6 +457,7 @@
 		EA39D2B2A8E51D3591243B2F /* DistEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistEngine.swift; sourceTree = "<group>"; };
 		EAD2635053183CF1985B9EA1 /* MetalDenseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDenseTests.swift; sourceTree = "<group>"; };
 		EC18FAC0A362D2B6F0219FC6 /* ProjectCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectCacheTests.swift; sourceTree = "<group>"; };
+		AA11B2C3D4E5F00000000002 /* QuantizeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantizeTests.swift; sourceTree = "<group>"; };
 		EDADFE90A9EF121D8898A616 /* MetalSoftmax.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSoftmax.swift; sourceTree = "<group>"; };
 		F0A07878EE3EFF382234B00F /* ProjectEdit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectEdit.swift; sourceTree = "<group>"; };
 		F1D8C81019D3B45FB35B484B /* MetalHCSplitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalHCSplitTests.swift; sourceTree = "<group>"; };
@@ -848,6 +850,7 @@
 				13A5BBB1FD5EA8D0351778AB /* ModelDownloaderTests.swift */,
 				443E5FFE2893A34BD0ABA6FD /* ModelShapeTests.swift */,
 				EC18FAC0A362D2B6F0219FC6 /* ProjectCacheTests.swift */,
+				AA11B2C3D4E5F00000000002 /* QuantizeTests.swift */,
 				7240EEA4E23FDD3F48D3191C /* SamplerTests.swift */,
 				B89F8377FF5B4BD6C69CD77A /* SSDCachePlanTests.swift */,
 				EA207248D818B32ADCBF689F /* StreamingDecoderTests.swift */,
@@ -1366,6 +1369,7 @@
 				7971290CA62AC9C23C6A2C67 /* ModelDownloaderTests.swift in Sources */,
 				BA59762CC9596F5D6D83CEE0 /* ModelShapeTests.swift in Sources */,
 				FF7922C1CC58A1CCAF3D6A3E /* ProjectCacheTests.swift in Sources */,
+				AA11B2C3D4E5F00000000001 /* QuantizeTests.swift in Sources */,
 				1C31F78EB3D4C1BE846B4AA9 /* SSDCachePlanTests.swift in Sources */,
 				5C32F61C6874C9DF3ECFEAFB /* SamplerTests.swift in Sources */,
 				F2BC0C8F7C30A928C6C7354D /* StreamingDecoderTests.swift in Sources */,

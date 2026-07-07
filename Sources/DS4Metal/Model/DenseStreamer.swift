@@ -217,6 +217,9 @@ public final class DenseStreamer: @unchecked Sendable {
             // model (<gguf>.q4dense, ~1.4 GB) — the first load pays the requant
             // once, every later load preads the cache in ~0.5 s. Invalidated by
             // model size / job-list mismatches; write failures are ignored.
+            // Partial CHECKPOINTS (same format, fewer records) are persisted
+            // between requant batches: a first load interrupted mid-requant
+            // resumes from the completed tensors instead of restarting.
             // Cache location: next to the model by default (demo/CLI), or in
             // DS4_Q4_CACHE_DIR when set — the SANDBOXED app can't write next
             // to a picker-selected file, so it points this at Application
@@ -254,10 +257,21 @@ public final class DenseStreamer: @unchecked Sendable {
             // cache must match the MODEL BYTES, not just its size and layout.
             let hashes = q4Jobs.map { Self.sourceHash(fd: fd, tensor: $0.t) }
             LoadProgress.shared.begin("Lettura cache Q4…", from: 0.32, to: 0.92, units: q4Jobs.count)
+            // Seed dalla cache migliore: una cache COMPLETA salta il requant;
+            // un CHECKPOINT (cache parziale scritta da un load interrotto a
+            // metà requant — force quit, crash, riavvio) pre-riempie ciò che
+            // ha e solo i tensori mancanti vengono riconvertiti. Prima di
+            // questo, un'interruzione perdeva TUTTO il lavoro: il .q4dense
+            // non compariva mai e "solo il primo avvio" diventava ogni avvio.
+            var seed: [GPUTensor?]?
             for cand in readCandidates {
-                if let cached = Self.loadQ4Cache(rt, path: cand, modelSize: Int(model.size),
-                                                 jobs: q4Jobs, hashes: hashes) {
-                    converted = cached; loadedFrom = cand; break
+                guard let cached = Self.loadQ4Cache(rt, path: cand, modelSize: Int(model.size),
+                                                    jobs: q4Jobs, hashes: hashes) else { continue }
+                if !cached.contains(where: { $0 == nil }) {
+                    converted = cached.map { $0! }; loadedFrom = cand; break
+                }
+                if (seed?.compactMap({ $0 }).count ?? 0) < cached.compactMap({ $0 }).count {
+                    seed = cached
                 }
             }
             if let cached = converted, let src = loadedFrom, src != cachePath, !partial {
@@ -269,30 +283,62 @@ public final class DenseStreamer: @unchecked Sendable {
                                   tensors: cached, hashes: hashes)
             }
             if converted == nil {
+                var fresh = seed ?? [GPUTensor?](repeating: nil, count: q4Jobs.count)
+                let missing = fresh.indices.filter { fresh[$0] == nil }
+                // Barra in MB di sorgente Q8, non in tensori: un tensore può
+                // richiedere minuti e con l'avanzamento per-job la barra
+                // restava FERMA per tutto il primo batch — indistinguibile da
+                // un blocco (e l'utente chiudeva l'app a forza). requantQ4
+                // avanza di un'unità ogni ~1 MB convertito.
+                let totalMB = max(1, missing.reduce(0) { $0 + Int(q4Jobs[$1].t.bytes) } >> 20)
                 LoadProgress.shared.begin("Riquantizzazione Q4 (solo il primo avvio)…",
-                                          from: 0.32, to: 0.88, units: q4Jobs.count)
-                var fresh = [GPUTensor?](repeating: nil, count: q4Jobs.count)
+                                          from: 0.32, to: 0.88, units: totalMB)
+                Self.logQ4("riquantizzo \(missing.count) di \(q4Jobs.count) tensori (~\(totalMB) MB Q8) " +
+                           "con checkpoint periodici in: \(writeCachePath)")
                 let lock = NSLock()
                 // nonisolated(unsafe): ogni iterazione scrive SOLO out[i] (indici
                 // disgiunti), jobs/rt/model sono letti e basta, l'errore e'
                 // protetto dal lock.
-                nonisolated(unsafe) var firstError: Error?
                 nonisolated(unsafe) let jobs = q4Jobs
                 nonisolated(unsafe) let rtRef = rt
                 nonisolated(unsafe) let modelRef = model
-                try fresh.withUnsafeMutableBufferPointer { out in
-                    nonisolated(unsafe) let outBase = out.baseAddress!
-                    DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
-                        do {
-                            outBase[i] = try Self.requantQ4(rtRef, modelRef, fd: fd, tensor: jobs[i].t)
-                            LoadProgress.shared.advance()
-                        } catch {
-                            lock.lock()
-                            if firstError == nil { firstError = error }
-                            lock.unlock()
+                // A BATCH con checkpoint: dopo ogni batch la cache parziale
+                // viene persistita (stesso formato, meno record), così un load
+                // ucciso a metà riparte dai soli tensori mancanti invece che
+                // da zero. L'ordine di q4Jobs interfoglia layer e tipi di
+                // tensore, quindi i batch restano bilanciati.
+                let batchSize = 32
+                var doneCount = q4Jobs.count - missing.count
+                for start in stride(from: 0, to: missing.count, by: batchSize) {
+                    let batch = Array(missing[start..<min(start + batchSize, missing.count)])
+                    nonisolated(unsafe) var firstError: Error?
+                    try fresh.withUnsafeMutableBufferPointer { out in
+                        nonisolated(unsafe) let outBase = out.baseAddress!
+                        DispatchQueue.concurrentPerform(iterations: batch.count) { bi in
+                            let i = batch[bi]
+                            do {
+                                outBase[i] = try Self.requantQ4(rtRef, modelRef, fd: fd, tensor: jobs[i].t)
+                            } catch {
+                                lock.lock()
+                                if firstError == nil { firstError = error }
+                                lock.unlock()
+                            }
                         }
+                        if let e = firstError { throw e }
                     }
-                    if let e = firstError { throw e }
+                    doneCount += batch.count
+                    if start + batchSize < missing.count {
+                        var js: [(il: Int, f: Field, t: GGUFModel.Tensor)] = []
+                        var ts: [GPUTensor] = []
+                        var hs: [UInt64] = []
+                        for (i, t) in fresh.enumerated() {
+                            guard let t else { continue }
+                            js.append(q4Jobs[i]); ts.append(t); hs.append(hashes[i])
+                        }
+                        Self.writeQ4Cache(path: writeCachePath, modelSize: Int(model.size),
+                                          jobs: js, tensors: ts, hashes: hs)
+                        Self.logQ4("checkpoint requant: \(doneCount)/\(q4Jobs.count) tensori")
+                    }
                 }
                 let freshConverted = try fresh.enumerated().map { i, t -> GPUTensor in
                     guard let t else {
@@ -437,12 +483,15 @@ public final class DenseStreamer: @unchecked Sendable {
         FileHandle.standardError.write(Data(("DS4 q4cache: " + s + "\n").utf8))
     }
 
-    /// Load the requant cache if it exists and matches the job list exactly.
+    /// Load the requant cache if it exists and matches the model. Returns an
+    /// array aligned to `jobs`: fully populated for a complete cache, with nil
+    /// HOLES when the file is a CHECKPOINT written by an interrupted requant
+    /// (the caller requantizes only the holes). nil = file absent/unusable.
     /// Reads through F_NOCACHE straight into the resident buffers (~0.5 s for
     /// ~1.4 GB) — the requant is paid only on the very first load.
     private static func loadQ4Cache(_ rt: MetalRuntime, path: String, modelSize: Int,
                                     jobs: [(il: Int, f: Field, t: GGUFModel.Tensor)],
-                                    hashes: [UInt64]) -> [GPUTensor]? {
+                                    hashes: [UInt64]) -> [GPUTensor?]? {
         let cfd = open(path, O_RDONLY)
         guard cfd >= 0 else {
             logQ4("assente (\(String(cString: strerror(errno)))) — riquantizzo: \(path)")
@@ -460,14 +509,15 @@ public final class DenseStreamer: @unchecked Sendable {
         }
         func fu32(_ o: Int) -> UInt32 { fixed.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
         func fu64(_ o: Int) -> UInt64 { fixed.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt64.self) } }
-        // The cache may hold a SUPERSET of the jobs: a distributed worker's
-        // layer SLICE must reuse the full-model cache built by the coordinator
-        // or the demo (the exact-count check used to reject it → minutes of
-        // re-requant on every worker). Records are matched by (layer, field)
-        // KEY, not by position; bytes and source hash must still agree.
+        // The cache may hold a SUPERSET of the jobs (a distributed worker's
+        // layer SLICE reusing the full-model cache) or a SUBSET (a checkpoint
+        // from an interrupted requant). Records are matched by (layer, field)
+        // KEY, not by position or count; bytes and source hash must still
+        // agree PER RECORD, so a partially-replaced model invalidates only
+        // the tensors that actually changed.
         let cacheCount = Int(fu32(16))
         guard fu32(0) == q4CacheMagic, fu32(4) == q4CacheVersion,
-              fu64(8) == UInt64(modelSize), cacheCount >= jobs.count, cacheCount <= 8192 else {
+              fu64(8) == UInt64(modelSize), cacheCount >= 1, cacheCount <= 8192 else {
             logQ4("incompatibile (versione/modello/estensione diversi) — riquantizzo: \(path)")
             return nil
         }
@@ -488,15 +538,21 @@ public final class DenseStreamer: @unchecked Sendable {
             index[UInt64(u32(o)) << 32 | UInt64(u32(o + 4))] =
                 (bytes: u64(o + 8), hash: u64(o + 16), offset: Int(u64(o + 24)))
         }
-        var records: [(bytes: Int, offset: Int)] = []
+        var records: [(bytes: Int, offset: Int)?] = []
+        var found = 0
         for (i, job) in jobs.enumerated() {
             let expected = Int(job.t.elements) / 256 * 144
-            guard let r = index[UInt64(job.il) << 32 | UInt64(job.f.rawValue)],
-                  r.bytes == UInt64(expected), r.hash == hashes[i] else {
-                logQ4("incompatibile (tensore \(job.t.name) assente/diverso) — riquantizzo: \(path)")
-                return nil
+            if let r = index[UInt64(job.il) << 32 | UInt64(job.f.rawValue)],
+               r.bytes == UInt64(expected), r.hash == hashes[i] {
+                records.append((bytes: expected, offset: r.offset))
+                found += 1
+            } else {
+                records.append(nil)
             }
-            records.append((bytes: expected, offset: r.offset))
+        }
+        guard found > 0 else {
+            logQ4("incompatibile (nessun tensore in comune) — riquantizzo: \(path)")
+            return nil
         }
         var out = [GPUTensor?](repeating: nil, count: jobs.count)
         let lock = NSLock()
@@ -508,10 +564,11 @@ public final class DenseStreamer: @unchecked Sendable {
         out.withUnsafeMutableBufferPointer { buf in
             nonisolated(unsafe) let bufBase = buf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: recs.count) { i in
-                guard let t = try? GPUTensor.uninitializedBytes(rtRef, byteLength: recs[i].bytes,
-                                                                elementCount: recs[i].bytes),
+                guard let r = recs[i] else { return }   // hole: requantized by the caller
+                guard let t = try? GPUTensor.uninitializedBytes(rtRef, byteLength: r.bytes,
+                                                                elementCount: r.bytes),
                       GGUFWeights.preadFull(cfd, into: t.buffer.contents(),
-                                            bytes: recs[i].bytes, offset: recs[i].offset) else {
+                                            bytes: r.bytes, offset: r.offset) else {
                     lock.lock(); failed = true; lock.unlock()
                     return
                 }
@@ -519,12 +576,16 @@ public final class DenseStreamer: @unchecked Sendable {
                 LoadProgress.shared.advance()
             }
         }
-        guard !failed, out.compactMap({ $0 }).count == jobs.count else {
+        guard !failed, out.compactMap({ $0 }).count == found else {
             logQ4("lettura fallita — riquantizzo: \(path)")
             return nil
         }
-        logQ4("caricata (\(jobs.count)\(cacheCount > jobs.count ? " di \(cacheCount)" : "") tensori): \(path)")
-        return out.map { $0! }
+        if found < jobs.count {
+            logQ4("checkpoint parziale (\(found)/\(jobs.count) tensori) — riquantizzo solo i mancanti: \(path)")
+        } else {
+            logQ4("caricata (\(jobs.count)\(cacheCount > jobs.count ? " di \(cacheCount)" : "") tensori): \(path)")
+        }
+        return out
     }
 
     /// Persist the converted tensors (best-effort: failures leave no cache and
@@ -607,6 +668,12 @@ public final class DenseStreamer: @unchecked Sendable {
         // concurrent requant workers that was a multi-GB load-time spike).
         // Blocks are independent, so the numerics are identical.
         let nsb = elems / 256
+        // Heartbeat della barra di caricamento: un'unità (~1 MB di Q8
+        // sorgente, 3855 superblocchi da 272 B) ogni pochi superblocchi
+        // convertiti — il chiamante ha dimensionato la fase in MB. Senza
+        // questo la barra restava ferma per l'intero primo batch di tensori
+        // (minuti), indistinguibile da un'app bloccata.
+        let sbPerMB = max(1, (1 << 20) / 272)
         var scratch = [Float](repeating: 0, count: 256)
         q8.withUnsafeBytes { src in
             let base = src.baseAddress!
@@ -615,6 +682,7 @@ public final class DenseStreamer: @unchecked Sendable {
                 for sb in 0..<nsb {
                     Quantize.dequantQ8_0(base + sb * 272, count: 256, into: s.baseAddress!)
                     Quantize.quantizeQ4_K(s.baseAddress!, count: 256, into: dst + sb * 144)
+                    if sb % sbPerMB == sbPerMB - 1 { LoadProgress.shared.advance() }
                 }
             }
         }

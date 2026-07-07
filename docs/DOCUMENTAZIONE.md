@@ -500,8 +500,11 @@ to pin is not fatal; it only means macOS may compress or page those buffers.
 `DS4_DENSE_Q4=1` is a lossy speed path. It requantizes the largest Q8 attention
 projections to Q4_K, caches the result under
 `Application Support/DwarfStar/q4-cache`, and keeps the reduced buffers resident.
-Disable it when you want the closest full-Q8 behavior rather than maximum
-single-machine throughput.
+The first-launch conversion checkpoints its partial cache between batches, so a
+load interrupted mid-requant resumes from the completed tensors on the next
+launch instead of restarting from zero (progress and any cache-write failures
+are logged in the engine log as `DS4 q4cache:` lines). Disable it when you want
+the closest full-Q8 behavior rather than maximum single-machine throughput.
 
 ### Async FFN Pipeline and GPU Kernel Knobs
 
@@ -742,6 +745,7 @@ sign with a Developer ID and notarize.
 | Output is nonsense | Quantization mismatch or wrong GGUF | Run `DS4_TYPES_ONLY=1 swift run DS4Demo <gguf>` and compare expected dtypes. |
 | Very slow decode on 16 GB | SSD expert streaming or dense rereads dominate | Use the GUI fast defaults: expert pread, dense streaming, `mlock`, Q4 attention cache, expert bundle, moderate context. |
 | First load takes a long time | Expert bundle or Q4 dense cache is being built | Watch the engine log. Later loads reuse the sidecar/cache. |
+| Load seems stuck on "Riquantizzazione Q4 (solo il primo avvio)" | The one-time Q8→Q4_K conversion takes minutes; the bar now advances per MB converted | Let it run: partial checkpoints are written to disk, so even a force quit resumes from where it stopped. If the `.q4dense` never appears, check the engine log for `DS4 q4cache:` write errors (disk space, cache folder). |
 | Expert bundle is skipped | Not enough writable disk space or sandbox cannot write next to model | Use the Settings bundle directory under Application Support or free disk space. |
 | Resident dense makes things worse | Wired memory pressure | Prefer dense streaming on 16 GB systems; resident dense is automatic in the GUI and mainly useful on RAM-rich systems or CLI A/B tests. |
 | Expert cache does not help | Routing is too uniform or cache too small | Check Tuning hit-rate and per-layer concentration; compare uniform vs usage-driven allocation. |

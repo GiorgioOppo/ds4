@@ -34,6 +34,12 @@ public enum Quantize {
     public static func quantizeQ4_K(_ x: UnsafePointer<Float>, count: Int,
                                     into dst: UnsafeMutableRawPointer) {
         let nsb = count / 256
+        // Single superblock: call straight through. The streaming requant
+        // (DenseStreamer.requantQ4) converts superblock-by-superblock from
+        // INSIDE its own concurrentPerform — routing each 256-element call
+        // through a nested dispatch fan-out added ~4k dispatch round-trips
+        // per MB for zero extra parallelism.
+        if nsb == 1 { return quantizeSuperblockQ4_K(x, into: dst) }
         // nonisolated(unsafe): every iteration reads/writes a DISJOINT 256-elem
         // superblock (x + sb*256 → dst + sb*144) — no shared mutable state.
         nonisolated(unsafe) let src = x
