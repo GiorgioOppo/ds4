@@ -100,6 +100,10 @@ final class BenchController {
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 onLog("Running on the shared engine (no second model copy)...\n")
+                // No-op se il motore è già caldo: il PRIMO punto del grafico
+                // non deve misurare la creazione dei pool esperti (partenza
+                // fredda) al posto del regime.
+                await svc.warmup()
                 for c in frontiers {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")

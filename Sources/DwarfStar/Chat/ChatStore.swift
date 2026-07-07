@@ -419,6 +419,9 @@ final class ChatStore {
                 var bestUnion = prefillUnion
                 var bestTps = 0.0
                 _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
+                // No-op se già caldo: la prima misura union non deve pagare
+                // la partenza fredda (pool esperti) e vincere/perdere per quello.
+                await service.warmup()
                 for union in (quick ? [192, 256] : [64, 192, 256]) {
                     _ = setenv("DS4_PREFILL_UNION", String(union), 1)
                     benchStatus = "Benchmark union=\(union)…"
@@ -809,6 +812,10 @@ final class ChatStore {
             await service.setAgent(agent, tools: tools)
             await service.setCompactTools(compactTools)
             refreshTuningInfo()
+            // Se il CAMBIO di agente ha invalidato la slot-cache (profilo
+            // usage nuovo), i pool si riscaldano ORA in background invece che
+            // dentro il primo messaggio. No-op quando l'agente non è cambiato.
+            await service.warmup()
         }
     }
 
