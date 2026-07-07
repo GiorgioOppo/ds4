@@ -13,6 +13,9 @@ Cross-links:
 
 - [`DOCUMENTAZIONE.md`](DOCUMENTAZIONE.md) — app usage, panels, workflows.
 - [`../README.md`](../README.md) — repository overview and build commands.
+- [`../README.md#configuration-reference`](../README.md#configuration-reference)
+  — the authoritative list of every `DS4_*` knob mentioned below, with defaults
+  and tuning guidance.
 - [`../Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.md) — CLI demo and
   runtime knobs.
 
@@ -135,8 +138,29 @@ capture the DeepSeek-V4 Flash constants used by the port: layer count, hidden
 dimensions, expert counts, attention dimensions, sliding-window size, and related
 metadata.
 
-`ModelShape.fromGGUF` validates shape metadata against known model families.
+`ModelConfig(model:)` validates the metadata like the C loader
+(`config_validate_model`): every shape-defining field (layer count, head dims,
+LoRA ranks, expert counts, hash-layer count, indexer geometry, HC counts) must
+match a known profile exactly, and the engine-level constants declared by the
+file are cross-checked against what the runtime hardcodes — per-layer
+compression ratios against the expected formula, per-layer SwiGLU clamps, RoPE
+scaling parameters, `expert_weights_scale`, `expert_weights_norm`, and the
+RMS/HC epsilons (both `1.0e-6`, matching the C reference). A mismatch refuses
+the file at load instead of silently decoding with different math.
+
+Shape selection distinguishes the Flash and Pro profiles by exact match. A
+valid Pro GGUF is currently refused loudly by the local runtime
+(`InferenceService`): the DSV4Shape constants, router kernels (hardwired to
+256 experts / expert-weight scale 1.5) and slot-cache are wired for Flash, so
+decoding Pro with Flash shapes would produce plausible-looking garbage.
 Tests cross-check shape selection with real GGUF metadata.
+
+Tensor-level validation happens at load too: the hash-routing table
+(`ffn_gate_tid2eid.weight`) is required on hash-routed layers with its layout
+checked, the router bias layout is validated, and
+`GGUFWeights.validateRoutedExperts` verifies routed expert tensors against the
+detected quantization classes (mixed-precision layers are counted and decoded
+per layer, bypassing the single-class expert cache).
 
 The shape layer exists to keep hardcoded constants centralized. Decoder code
 should read dimensions from the shape or `DSV4Dims`, not scatter magic numbers
@@ -172,12 +196,23 @@ classes of bugs from the port.
 ### `GraphContext`
 
 `GraphContext` wraps one command-buffer sequence and the transient state used by
-kernel dispatches. In the current streaming path, commits wait for completion.
-This makes the pipeline simpler and avoids races where an expert slot is evicted
-while a previous command buffer is still using it.
+kernel dispatches. In the streaming path, route/attention commits wait for
+completion — the CPU must read back the selected expert ids — which also avoids
+races where an expert slot is evicted while a previous command buffer is still
+using it.
+
+The routed-FFN command buffer is the exception: with `DS4_ASYNC_FFN` (default
+on) it is committed *without* a CPU wait (`commitAsync`). The next layer's route
+commit+wait lands on the same in-order queue, so correctness is guaranteed by
+queue order while the CPU encode of layer i+1 overlaps the GPU execution of
+layer i's FFN — the per-layer encode bubble (encode time × 43 layers)
+disappears. The in-flight buffer is explicitly drained at end of token (before
+the output head readback / `readHC` / KV export) and on every error path,
+including the prefill's. `DS4_ASYNC_FFN=0` restores the synchronous commit.
 
 `DS4_PROFILE_ROUTE=1` deliberately adds extra phase boundaries to split
-`route/attn` timing. Those timings are diagnostic: ratios are useful, absolute
+`route/attn` timing, and keeps the synchronous FFN wait so per-phase attribution
+stays accurate. Those timings are diagnostic: ratios are useful, absolute
 throughput is not representative because extra synchronization is introduced.
 
 ## 6. Decoder: Full Forward Pass
@@ -240,6 +275,14 @@ This phase executes:
 - down-sum over active experts;
 - residual update.
 
+### Fused HC-Reduce
+
+The Hyper-Connection reduce tail (split + collapse + RMSNorm) runs as ONE fused
+dispatch instead of three (`DS4_FUSED_HC`, default on). It runs twice per layer,
+so the fusion removes roughly 170 dispatches per token. The math is unchanged;
+only the RMSNorm reduction order differs (±1 ulp class). `DS4_FUSED_HC=0`
+restores the unfused three-dispatch path for A/B comparison.
+
 The selected experts are the expensive SSD-streaming part. They can come from:
 
 - direct mmap gather;
@@ -259,17 +302,76 @@ selection used by decode. The raw sliding-window portion can optionally be store
 as a ring via `DS4_RAW_RING=1`, because the attention only reads the latest
 `nSWA` raw rows.
 
+With `DS4_DENSE_STREAM=1` the four NSA compressor projections are diverted out
+of the staging ring and kept RESIDENT (`DS4_RESIDENT_COMP`, default on, ~0.6 GB
+wired): they are read every token on 41 of 43 layers, the single densest
+repeat-read in the dense stream. Same bytes, identical numerics;
+`DS4_RESIDENT_COMP=0` restores full streaming as a tight-RAM fallback.
+
 ### NSA Indexer
 
 The indexer selects the relevant compressed positions used by attention. Flash
-uses a top-k indexer path (for example top-512 in the ported constants). The
+uses a top-k indexer path (top-512 in the ported constants). The
 indexer and compressor are part of why the KV state is not a simple append-only
 array that can be truncated without care.
+
+In decode, attention stays DENSE over all compressed rows until their count
+exceeds a sparse threshold, mirroring the C engine
+(`metal_graph_decode_indexer_sparse_threshold`): around the ~2K frontier the
+sparse path's score/top-k setup dominates the smaller attention scan. The
+default is 1024, overridable with
+`DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` (allowed values 64…4096, same as
+the C). Activation is checked prospectively per layer: the prospective
+compressed-row count must exceed both the sparse threshold and the indexer
+top-K.
+
+The top-K selection itself (`IndexerSelect.swift`) is heap-based — a binary
+min-heap of the k best indices, O(n log k) instead of a full sort — because it
+runs per ratio-4 layer per token once active.
+
+Two load-time consequences of the activation rule:
+
+- **Lazy indexer-scoring staging** (`DS4_LAZY_IDX`, default on, requires
+  `DS4_DENSE_STREAM=1`): if the "can-ever-activate" proof fails — the densest
+  (ratio-4) layers emit at most `maxKeys/4` compressed rows over the whole
+  context, and that bound cannot strictly exceed both the sparse threshold and
+  the top-K — the indexer *scoring* projections (`indexer.attn_q_b` +
+  `indexer.proj`, ~360 MB/token on Flash) are never staged: they would stream
+  every token to never be read. The indexer *compressor* pair keeps streaming
+  (recurrent state must stay coherent). Lossless — the skip only drops
+  never-executed work; recomputed on every load from the live
+  `maxKeys`/threshold, so a larger context re-enables staging. `=0` restores
+  always-stage for A/B.
+- **Checkpoint restore bound-check**: restoring a KV/compressor checkpoint
+  validates every length coming from the file against the live tensor
+  capacities *and* against the emission schedule (`count <= maxKeys / ratio`,
+  not the allocation, which carries slack rows) before any memcpy — a corrupt
+  checkpoint can never restore a row count no legitimate run can reach, which
+  is exactly the bound the lazy-staging proof relies on.
 
 ## 9. MoE: Router and Experts
 
 The router chooses active experts per token and layer. By default Flash uses 6
 active experts. The routed expert tensors dominate model size and SSD I/O.
+
+### Hash Routing and Selection Bias
+
+Two routing details track the C reference exactly:
+
+- The first `nHashLayer` (3) layers do not route from probabilities at all:
+  they route by TOKEN ID through the `ffn_gate_tid2eid.weight` table
+  (I32, `[6 x nVocab]`; the kernel clamps the token to `rows - 1`). The table
+  is REQUIRED at load on those layers, with its layout validated. Because the
+  selection depends only on the token id, these layers' expert I/O can always
+  be resolved ahead of time (see the slot-cache look-ahead below).
+- `exp_probs_b.bias` (F32 `[nExperts]`, optional per layer) shifts the router
+  probabilities for SELECTION only — the routing weights applied to the expert
+  outputs are computed from the unbiased probabilities, as in
+  `layer_topk_selected_experts_from_probs`.
+
+The router finalize kernel is hardwired to 256 experts and expert-weight scale
+1.5 (a 256-thread bitonic sort); a different shape is refused at decoder
+construction rather than silently misrouted.
 
 ### Fused MoE Kernels
 
@@ -296,12 +398,43 @@ expert cache.
 
 ### Layer-Major Prefill
 
-`prefill(tokens:chunk:)` processes prompt tokens in chunks. For each chunk, it
-loads each layer once and applies it to all tokens in the chunk. For routed FFN,
-it gathers the union of experts required by that chunk.
+`prefill(tokens:chunk:)` processes prompt tokens in chunks of
+`DS4_PREFILL_CHUNK` tokens (default 512). For each chunk, it loads each layer
+once and applies it to all tokens in the chunk. This is the opposite of naive
+token-major prefill, where every prompt token would reload the same layer
+weights; layer-major prefill is essential for long prompts. A larger chunk
+amortizes the per-chunk dense reload over more tokens at the cost of transient
+activation memory.
 
-This is the opposite of naive token-major prefill, where every prompt token would
-reload the same layer weights. Layer-major prefill is essential for long prompts.
+Within one layer the work is split in two phases (`batchedExpertLayer`):
+
+- **Phase A — routes.** Attention is causal within the layer (token j attends
+  KV written by tokens 0..j), so routes stay token-sequential — but they no
+  longer need a CPU round-trip each: runs of up to `DS4_PREFILL_ROUTE_BATCH`
+  tokens (default 32) are encoded into ONE command buffer, each token's FFN
+  inputs and router selection blit-copied GPU-side into a staging area, and
+  the CPU reads all selections after a single wait. Indexer-active tokens
+  (which need a CPU top-k mid-route) and `DS4_PROFILE_ROUTE` fall back to the
+  per-token path.
+- **Phase B — expert FFN.** Tokens are grouped so that each group's UNION of
+  selected experts stays below `DS4_PREFILL_UNION` (default 192, never below
+  the active-expert count); the union is gathered ONCE and every token's FFN
+  runs over it with remapped ids. With `DS4_PREFILL_FFN_BATCH` (default on)
+  all of a group's token-FFNs are encoded into ONE command buffer — one
+  commit+wait per group instead of one per token, which removes tens of
+  thousands of GPU syncs per chunk. Serial encoding keeps dispatch order and
+  numerics identical; `=0` restores the per-token path for A/B parity checks.
+
+`DS4_PREFILL_MM=1` (opt-in) additionally runs each group's routed FFN through
+batched `mul_mm_id` matrix-matrix kernels instead of per-token matvecs, so
+expert weights are read once per group rather than once per token. The
+matrix-matrix accumulation order differs from the matvec path, which is why it
+stays opt-in until validated A/B.
+
+Numerically the batched pipeline is identical to the per-token path (a token's
+FFN does not feed other tokens within the layer); only the expert I/O is
+deduplicated — at most `min(6·tokens, 256)` expert reads per layer per group
+instead of `6·tokens`.
 
 ### Expert Slot-Cache
 
@@ -309,26 +442,64 @@ reload the same layer weights. Layer-major prefill is essential for long prompts
 
 - fixed slot budgets;
 - minimum effective budget of 8 slots when enabled;
-- usage-driven allocation across layers;
-- pre-warming from persisted usage imatrix;
-- uniform allocation mode for A/B testing.
+- usage-driven allocation across layers (uniform mode for A/B via
+  `DS4_EXPERT_CACHE_UNIFORM=1`);
+- pre-warming from persisted usage imatrix.
 
 The cache is a wired-memory tradeoff. It helps only when routing is concentrated
 enough that hot experts repeat. The Tuning tab exposes hit-rate and concentration
 so this can be measured rather than guessed.
 
+**Interleaved pool layout** (`DS4_POOL_INTERLEAVE`, default on): each slot holds
+its expert's gate|up|down slabs CONTIGUOUS in one buffer — the same record
+layout as the expert-bundle sidecar — so a miss served from the bundle becomes
+ONE ~7 MB pread straight into the slot (1 syscall instead of 3, larger I/Os at
+the same queue depth). Kernels do not change: gate/up/down are three views of
+the same buffer and the stride between experts is the record size. `=0`
+restores the historical three-narrow-buffer layout.
+
+**Fill path**: on a miss without the bundle, the three slabs of an expert are
+read CONCURRENTLY (three parallel jobs per miss), and `DS4_PREAD_SPLIT=N`
+(default 1, max 8) further splits each slab into N disjoint ranges pread in
+parallel on the `F_NOCACHE` path — decode misses are few per layer, and raising
+the NVMe queue depth is what keeps the disk at its parallel ceiling.
+
+**Concurrency**: operations are serialized per layer (one lock per layer), so
+the decode thread's `acquire(layer: i)` can run while a background prefill
+fills layer i+1. The demand path has priority: a running speculative prefill
+fills in chunks and yields between chunks when a demand acquire is waiting, so
+speculation can delay the critical path by at most about one fill chunk. A
+speculative fill never evicts the slots of the last demand acquire (they may
+still be read by an in-flight command buffer).
+
+**Speculative look-ahead** (`kickLookahead`): at the start of layer i (and of
+each token), the decoder resolves layer i+1's likely expert ids on the decode
+thread and kicks their pool prefill on a background queue, so the fill I/O runs
+under layer i's compute — the C engine's `begin_selected_load` trick. For the
+hash-routed layers (0–2) the ids are EXACT (a `tid2eid` mmap read from the
+token id), so their expert I/O is always hidden; for the other layers the guess
+is the usage-prior top-N, opt-in with `DS4_EXPERT_LOOKAHEAD=N` (default 0; a
+wrong guess wastes idle-window bandwidth only). Prefilled slabs do not count as
+misses in the stats — their I/O ran off the critical path. Mixed-precision
+layers (outside the cache's size class) are excluded.
+
 ### Expert Bundle Sidecar
 
 `DS4_EXPERT_BUNDLE=1` adds a disk-side optimization for cache misses. The engine
-looks for or builds a sidecar where each expert's gate, up, and down slabs are
-stored contiguously. A miss can then be satisfied by one sequential read instead
-of three scattered reads from the original GGUF tensor layout.
+looks for or builds a sidecar (`<gguf>.expbundle`, 4 KB-aligned records ordered
+by layer then expert id) where each expert's gate, up, and down slabs are stored
+contiguously. A miss can then be satisfied by one ~7 MB sequential read instead
+of three scattered ~2 MB reads from the original GGUF tensor layout — and with
+the interleaved slot pool the record layout matches the slot layout, so the
+copy is a single pread into the slot.
 
 The sidecar is not a new quantization and does not change math. It duplicates
-the expert byte region on disk, is validated against the source model, and is
-skipped when writable space is insufficient. In sandboxed app builds,
-`DS4_BUNDLE_DIR` points creation at Application Support; a readable sidecar next
-to the GGUF can still be reused.
+the expert byte region on disk, is validated against the source model
+(size/geometry plus per-layer content fingerprints), and is skipped when
+writable space is insufficient. In sandboxed app builds, `DS4_BUNDLE_DIR`
+points creation at Application Support; a readable sidecar next to the GGUF can
+still be reused. Every load logs the bundle state, and use is proven at runtime
+by a logarithmic heartbeat (first expert served, then 5k, 10k, 20k, …).
 
 ### Dense Streaming and Resident Dense Weights
 
@@ -339,11 +510,26 @@ three strategies:
 | Strategy | Knob | Notes |
 |---|---|---|
 | mmap/page cache | default | Minimal wired memory; best when RAM can keep hot dense pages resident. |
-| dense streaming | `DS4_DENSE_STREAM=1` | Reads each layer's dense tensors into a small staging ring one layer ahead of compute. Takes precedence over resident dense. |
+| dense streaming | `DS4_DENSE_STREAM=1` | Reads each layer's dense tensors into a small staging ring (`pread + F_NOCACHE`) one layer ahead of compute, so the SSD read of layer i+1 overlaps the GPU compute of layer i. ~300 MB of staging instead of ~6 GB resident. Takes precedence over resident dense. |
 | resident dense | `DS4_RESIDENT_DENSE=1` | Copies dense weights into resident GPU buffers. Useful on RAM-rich systems, risky on 16 GB. |
 
-`DS4_DENSE_AHEAD` controls staging read-ahead depth. Larger depths can improve
-overlap but also compete with expert reads on the same SSD.
+`DS4_DENSE_AHEAD` controls staging read-ahead depth (default 1, the classic
+2-slot ring; clamped to at most 3). Larger depths can improve overlap but also
+compete with expert reads on the same SSD.
+
+The dense stream hosts several carve-outs, weights that leave the ring because
+streaming them every token is the wrong tradeoff:
+
+- the **output head** (`output.weight`, ~560 MB Q8, read in full every token)
+  is copied RESIDENT whenever `DS4_DENSE_STREAM=1` — mapped, it was re-read
+  through a cold page cache every token. The embedding table stays mapped: the
+  decode stages one ~8 KB row per token into a small staging buffer instead of
+  wiring the whole table;
+- the **NSA compressor projections** (`DS4_RESIDENT_COMP`, section 8);
+- the **indexer scoring projections** skipped entirely by `DS4_LAZY_IDX`
+  (section 8);
+- the **Q4-requantized projections** of `DS4_DENSE_Q4` / `DS4_SHARED_Q4`
+  (section 12).
 
 ### Hot-Buffer Pinning
 
@@ -364,7 +550,13 @@ The streaming path is intentionally split around CPU-visible routing decisions:
 
 This makes SSD expert I/O explicit and measurable. It also means command-buffer
 round-trip overhead can matter; `DS4_DIAG=1` measures empty command-buffer cost
-in the CLI demo.
+in the CLI demo. Step 4 is the asynchronous half of the pipeline: the routed-FFN
+buffer commits without a CPU wait (`DS4_ASYNC_FFN`, section 5) and the next
+layer's route wait doubles as the join point, so only the route round-trip
+remains synchronous.
+
+All the `DS4_*` knobs in this section are documented with defaults in the root
+[Configuration Reference](../README.md#configuration-reference).
 
 ### Constructors
 
@@ -413,12 +605,25 @@ expert cache and use correct gather/decode paths.
 
 ### Q4 Dense Requantization
 
-`DS4_DENSE_Q4=1` is a deliberate lossy speed path. The engine requantizes the
-largest Q8 attention projections (`q_b`, `output_a`, `output_b`) to Q4_K,
-caches the result, and keeps the reduced buffers resident. It removes several GB
-of per-token dense traffic from the SSD path. `DS4_SHARED_Q4=1` extends the same
-idea to shared-expert FFN projections and should be treated as a separate A/B
-experiment.
+`DS4_DENSE_Q4=1` (requires `DS4_DENSE_STREAM=1`) is a deliberate lossy speed
+path. The engine requantizes the largest Q8 attention projections (`q_b`,
+`output_a`, `output_b`) to Q4_K and keeps the reduced buffers resident. It
+removes several GB of per-token dense traffic from the SSD path.
+`DS4_SHARED_Q4=1` extends the same idea to the shared-expert FFN projections
+and should be treated as a separate A/B experiment.
+
+The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`,
+~1.4 GB): the first load pays the requant once, every later load preads the
+cache back in well under a second. Validation is against the model *bytes*
+(content fingerprints of each source tensor plus size/job-list), not just the
+file size; write failures are ignored. The cache lives next to the model by
+default (demo/CLI); the sandboxed app cannot write next to a picker-selected
+file, so `DS4_Q4_CACHE_DIR` points it at Application Support. Reads try both
+places, and a full cache found in the secondary location (e.g. produced by the
+demo next to the GGUF) is PROMOTED into the primary one so demo and app share
+a single conversion. Distributed layer slices read from the full cache but
+write their own per-range cache name, so a slice requant can never clobber the
+full cache.
 
 Because this changes weights, it is not a parity mode. Use it for throughput,
 not when comparing exact logits against a full-Q8 dense path.
@@ -467,6 +672,13 @@ schema.
 - tool declarations;
 - tool results.
 
+Tool-result payloads are wrapped in `<tool_result>…</tool_result>`. The
+renderer deliberately does NOT HTML-escape the content (shell output and file
+snippets must stay intact) but escapes the exact closing sentinel
+(`escapeToolResult`, mirroring the C `bpe_tokenize_tool_result_text`): a
+malicious or accidental `</tool_result>` inside a payload can therefore never
+terminate the wrapper early and inject control tokens into the prompt.
+
 `ToolCallParser` strips leaked markup and parses completed DSML blocks into
 `ToolCall` values.
 
@@ -486,6 +698,27 @@ The service loop:
 `ToolRegistry` owns built-ins and JSON schemas. Tools are split one per file for
 reviewability. Project tools operate on `ProjectCache`, which is separate from
 chat memory until tool results are inserted into the conversation.
+
+### MCP Client
+
+`DS4Engine/Tools/MCP` adds a Model Context Protocol client, so external MCP
+servers appear to the model next to the built-ins:
+
+- `MCPConfig` speaks the `{"mcpServers": …}` JSON interchange used by Claude
+  Desktop / Cursor / VS Code, so configs import and export verbatim;
+- `MCPTransport` implements the two spec transports: stdio (server spawned as
+  a child process, newline-delimited JSON-RPC on stdin/stdout) and Streamable
+  HTTP (POSTed frames, JSON or SSE responses, `Mcp-Session-Id` echoed);
+- `MCPClient` owns one connection: initialize handshake, per-request timeouts,
+  server pings, disconnect surfacing, and task cancellation (Stop settles an
+  in-flight call immediately);
+- `MCPManager` is the process-wide registry: it owns the clients and serves
+  cached snapshots (statuses, namespaced `ToolSpec`s) to chat, agents, and
+  distributed mode. Tool `read_file` on server `fs` becomes `mcp_fs_read_file`;
+  the reverse mapping is an explicit index, never name parsing.
+
+Tool loops never call this layer directly: `ToolRegistry.executeAuto(_:)`
+dispatches built-ins first, then MCP.
 
 ### Sub-Agents
 
@@ -512,11 +745,55 @@ prompt rendering, and final orchestration.
 
 ### Protocol and Topology
 
-The coordinator connects to workers, reads their hello frames, sorts them by
-`layerStart`, and validates contiguous coverage. Each token or prefill chunk
-sends HC state through the route. In relay mode, the coordinator round-trips
-through every worker. In forwarding mode, workers pass state to the next worker
-and the terminal worker returns to the coordinator listener.
+The wire protocol (`DistProtocol.swift`) is DwarfStar-native framing, currently
+at version 9. The coordinator validates the version FIRST, so a mixed cluster
+fails with a clear error instead of garbled frames. The version history doubles
+as the feature list:
+
+- **v2** — robustness: HELLO carries the version; WORK/RESULT carry a per-turn
+  `session` id echoed by the workers, so a result left in a TCP buffer by a
+  cancelled turn can never be mistaken for the next turn's reply.
+- **v3** — the COORDINATOR defines each worker's job. Workers start idle
+  (listening, no model loaded); the coordinator sends ASSIGN (gguf, context,
+  layer slice, cache slots) and the worker replies READY once its engine is
+  loaded.
+- **v4** — distributed KV continuity: ASSIGN carries the usage imatrix (slot
+  cache pre-warm) and a disk-KV token budget; KV control frames (`kvQuery` /
+  `kvLengths` / `kvRestore` / `kvSave` / `kvAck`) let the coordinator
+  checkpoint/restore each worker's shard; WORK gained `turnStart` so a turn
+  can begin mid-context.
+- **v5** — the coordinator DISTRIBUTES the files. After HELLO it sends a FILE
+  OFFER (name, size, SHA-256 for gguf + sidecars); the worker answers with what
+  it is missing (hash-verified against its store) and only that is streamed —
+  the huge setup runs once, later connects verify hashes from cached manifests
+  in milliseconds.
+- **v6** — derived caches travel too: the offer can include the Q4 dense
+  requant cache (`<gguf>.q4dense`), and ASSIGN carries the Q4 on/off decision.
+- **v7** — WORK carries the chunk's token ids: the first 3 layers route experts
+  by TOKEN ID (`ffn_gate_tid2eid`), so a shard covering them cannot route from
+  the HC state alone.
+- **v8** — RESUMABLE transfers: the offer carries a chained-hash checkpoint
+  list per file (one SHA-256 every 256 MB, each folded over the previous, so
+  `chain[k]` commits to the whole prefix); the worker keeps its `.part` across
+  disconnects and sessions, validates it block-by-block, truncates to the last
+  good checkpoint and answers FILE NEED with a per-file resume offset. The
+  coordinator retries a broken peer setup up to 3 times.
+- **v9** — ASSIGN carries the coordinator's PERFORMANCE KNOBS: a whitelisted
+  set of `DS4_*` env vars (`Dist.perfKnobKeys` — all performance-only, none
+  can change the shard's numerics; `DS4_DENSE_Q4`, the one lossy knob, travels
+  as a typed field and its cache as a file). The coordinator's measured
+  configuration IS the job definition; the worker applies it before loading
+  its engine.
+
+Peer setup runs IN PARALLEL: file transfer and engine load of every worker
+proceed together in a task group, so route activation costs `max(worker
+setup)` instead of the sum. Route order stays the peer-list order, and
+contiguous coverage is still validated after assembly.
+
+Each token or prefill chunk sends HC state through the route. In relay mode,
+the coordinator round-trips through every worker. In forwarding mode, workers
+pass state to the next worker and the terminal worker returns to the
+coordinator listener.
 
 Distributed benchmark reuses the already-connected coordinator. It must not run
 while distributed chat is generating, because both share the same route and reset
@@ -530,10 +807,13 @@ worker KV.
 | `ds4_metal.m` runtime and kernels | `DS4Metal/Runtime`, `DS4Metal/Kernels`, `metal/*.metal` |
 | GGUF parsing | `DS4Core/Format/GGUF.swift` |
 | SSD streaming expert model | `DS4Metal/Model/GGUFWeights.swift`, `StreamingDecoder` |
+| Dense streaming / Q4 requant cache | `DS4Metal/Model/DenseStreamer.swift` |
 | Expert cache | `ExpertSlotCache`, usage imatrix in `StreamingDecoder` |
+| Expert bundle sidecar | `DS4Metal/Model/ExpertBundle.swift` |
 | KV store | `DS4Core/Format/KVCFile.swift`, `DS4Engine/Service/DiskKVStore.swift` |
 | Server | `Sources/DwarfStar/Server`, `LocalServer` |
 | Distributed runtime | `DS4Engine/Distributed` |
+| MCP client (no C counterpart) | `DS4Engine/Tools/MCP` |
 | CLI bring-up | `Sources/DS4Demo/main.swift` |
 
 The Swift port deliberately replaces C-specific memory ownership with ARC,
