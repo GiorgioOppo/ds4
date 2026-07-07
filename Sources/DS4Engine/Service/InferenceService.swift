@@ -1130,6 +1130,14 @@ public actor InferenceService {
             FileHandle.standardError.write(Data(String(
                 format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f%@\n",
                 produced, wall, wall * per, engine * per, sampleS * per, other * per, regime).utf8))
+            // La STESSA attribuzione anche nello stream (→ log del pannello
+            // Server): "il server è lento" si diagnostica solo sapendo se il
+            // tempo è nel motore (gather/GPU: pressione di memoria, es. Xcode
+            // aperto sui 16GB) o fuori (percorso server). Il regime scarta il
+            // warm-up del primo token, che sporca la media cumulativa.
+            continuation.yield(.progress(String(
+                format: "resa: %.0f ms/token = motore %.0f + sampler %.0f + resto %.0f%@",
+                wall * per, engine * per, sampleS * per, other * per, regime)))
         }
 
         // Extract any tool calls from the generated output.

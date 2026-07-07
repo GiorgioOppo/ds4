@@ -327,7 +327,9 @@ final class LocalServer: @unchecked Sendable {
                 case .progress(let p):
                     // Il PREFILL può durare minuti (transcript intero al primo
                     // giro): senza queste righe il log tace e sembra un hang.
-                    if !p.isEmpty, Date().timeIntervalSince(lastNote) >= 2 {
+                    // "resa:" (attribuzione motore/sampler/resto a fine turno)
+                    // salta il throttle: è la riga che diagnostica la lentezza.
+                    if !p.isEmpty, p.hasPrefix("resa:") || Date().timeIntervalSince(lastNote) >= 2 {
                         lastNote = Date()
                         onLog("· \(p)\n")
                     }
