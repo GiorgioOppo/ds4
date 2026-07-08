@@ -120,6 +120,12 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08")
             applyFastDemoDefaults(persistExplicitly: true)
         }
+        // Migrazione UNA TANTUM v5 (2026-07-08, sera): union 256 (+19% prefill
+        // misurato a 3.5k token) e SHARED_Q4 (+7% decode, output coerente).
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_08b") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08b")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
@@ -381,6 +387,8 @@ final class ChatStore {
         mlockEnabled = true
         denseQ4Enabled = true
         qkvQ4Enabled = true        // +10% misurato (2.78 → 3.06 tok/s), output coerente
+        sharedQ4Enabled = true     // +7% misurato (3.13 → 3.36 tok/s), output coerente
+        prefillUnion = 256         // +19% di prefill misurato a 3.5k token (8.63 tok/s)
         expertBundleEnabled = true
         expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
@@ -395,6 +403,8 @@ final class ChatStore {
             d.set(true, forKey: "DS4MLock")
             d.set(true, forKey: "DS4DenseQ4")
             d.set(true, forKey: "DS4QkvQ4")
+            d.set(true, forKey: "DS4SharedQ4")
+            d.set(256, forKey: "DS4PrefillUnion")
             d.set(true, forKey: "DS4ExpertBundle")
             d.set(0, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
@@ -406,6 +416,8 @@ final class ChatStore {
             _ = setenv("DS4_MLOCK", "1", 1)
             _ = setenv("DS4_DENSE_Q4", "1", 1)
             _ = setenv("DS4_QKV_Q4", "1", 1)
+            _ = setenv("DS4_SHARED_Q4", "1", 1)
+            _ = setenv("DS4_PREFILL_UNION", "256", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)
