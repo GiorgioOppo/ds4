@@ -91,7 +91,9 @@ public struct DecodeProfile: Sendable {
 
 public final class StreamingDecoder {
     let rt: MetalRuntime
-    let d: DSV4Dims
+    /// `var` SOLO per `setActiveExperts` (draft self-speculative): mutata
+    /// esclusivamente tra un forward e l'altro, sul thread del decode.
+    var d: DSV4Dims
     let rope: RopeParams
     let nLayers: Int
     let layerProvider: (Int) throws -> LayerWeights

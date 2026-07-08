@@ -56,6 +56,7 @@
 		45AD4EDDB75C53913278733E /* ExpertCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4267586784BC763B45274B4F /* ExpertCacheTests.swift */; };
 		46F3D410F2A716BB2AF75C07 /* libDS4Engine.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AE55E668DADBC37930F51C9C /* libDS4Engine.a */; };
 		47117299DC6503A64B05E606 /* KVSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F423C4BF68F18EB9B94F930 /* KVSnapshot.swift */; };
+		AA22B2C3D4E5F00000000001 /* SpecDecode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA22B2C3D4E5F00000000002 /* SpecDecode.swift */; };
 		48879F12F4F145CF0C61A849 /* MetalArgsortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BEBD07CB2D4ADA6F303E577 /* MetalArgsortTests.swift */; };
 		4A1903480DE8D1F54498542C /* GraphDecodeLayerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBC998A5525F996C5DB5AC7A /* GraphDecodeLayerTests.swift */; };
 		4AE5B5FB63776B9B16A7B97B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E77CFAA095A70A324158B149 /* SettingsView.swift */; };
@@ -294,6 +295,7 @@
 		0C32847407FE236FBFF6C962 /* MetalMoE.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoE.swift; sourceTree = "<group>"; };
 		0ED257CE1080B93F522E995F /* ChatTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTabView.swift; sourceTree = "<group>"; };
 		0F423C4BF68F18EB9B94F930 /* KVSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVSnapshot.swift; sourceTree = "<group>"; };
+		AA22B2C3D4E5F00000000002 /* SpecDecode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpecDecode.swift; sourceTree = "<group>"; };
 		11C660B010109DE4FD878049 /* DistProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistProtocol.swift; sourceTree = "<group>"; };
 		12C7B01821E631AF32E88DAF /* GraphTwoSpanAttnTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphTwoSpanAttnTests.swift; sourceTree = "<group>"; };
 		13A5BBB1FD5EA8D0351778AB /* ModelDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloaderTests.swift; sourceTree = "<group>"; };
@@ -653,6 +655,7 @@
 				1768A7CE66C432C3B5FD1582 /* GraphCompressor.swift */,
 				8C6177886F90F46E272B1975 /* GraphContext.swift */,
 				0F423C4BF68F18EB9B94F930 /* KVSnapshot.swift */,
+				AA22B2C3D4E5F00000000002 /* SpecDecode.swift */,
 				9DD0614BC9FDBCBFDD355BED /* StreamingDecoder.swift */,
 			);
 			path = Decode;
@@ -1233,6 +1236,7 @@
 				62B5B4EB7A20DA93F14FFBF2 /* GraphCompressor.swift in Sources */,
 				BAC21DC46ADA1456ACE8BC97 /* GraphContext.swift in Sources */,
 				47117299DC6503A64B05E606 /* KVSnapshot.swift in Sources */,
+				AA22B2C3D4E5F00000000001 /* SpecDecode.swift in Sources */,
 				C03D6591694EDBB383989FF7 /* KernelSources.swift in Sources */,
 				69F4D04ACA0714532C075766 /* MetalArgsort.swift in Sources */,
 				363A1FD3DC66A7E7E7480F39 /* MetalAttnOutLow.swift in Sources */,
