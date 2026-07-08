@@ -125,7 +125,7 @@ func knobReport() -> String {
                  "DS4_PREFILL_CHUNK", "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG", "DS4_MOE_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
-                 "DS4_QKV_Q4", "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
+                 "DS4_QKV_Q4", "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT_EXPERTS"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }
@@ -327,6 +327,91 @@ do {
         var genTokens = 0
         let genStart = Date()
         var steadyStart = genStart
+        // DS4_SPEC_K=N (≥2): decode SELF-SPECULATIVE greedy (docs/SELF-SPECULATIVE.md).
+        // Round: snapshot → draft di N-1 candidati con DS4_SPEC_DRAFT_EXPERTS
+        // (default 2) esperti attivi → rollback → verifica batch full-config con
+        // logit per posizione → accettazione greedy del prefisso + bonus token.
+        // Parità bit-per-bit col decode normale per costruzione (stessi argmax
+        // full-config): DS4_SPEC_K=1 o assente = percorso storico.
+        let specK = ProcessInfo.processInfo.environment["DS4_SPEC_K"].flatMap(Int.init) ?? 0
+        if specK >= 2 {
+            let fullExperts = dec.activeExpertsNow
+            let draftExperts = max(1, min(fullExperts - 1,
+                ProcessInfo.processInfo.environment["DS4_SPEC_DRAFT_EXPERTS"].flatMap(Int.init) ?? 2))
+            var rounds = 0, drafted = 0, acceptedCands = 0
+            log("DS4Demo: decode speculativo — finestra \(specK), draft a \(draftExperts) esperti (full \(fullExperts))")
+            specLoop: while genTokens < maxNew {
+                // Il prossimo token VERO esce sempre da logit full-config
+                // (prefill al primo giro, verifica ai successivi).
+                let tP = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+                if Int32(tP) == tok.eosId { break }
+                stdout.write(Data(tok.tokenText(Int32(tP))))
+                genTokens += 1
+                if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
+                if genTokens >= maxNew { break }
+                let t0 = Date()
+                // 1) snapshot dello stato ricorrente + DRAFT economico:
+                //    catena tP → c1 → … (la finestra sono gli INPUT alle
+                //    posizioni pos..pos+|w|-1).
+                let snap = dec.specSnapshot(nKeys: pos)
+                dec.setActiveExperts(draftExperts)
+                var window = [tP]
+                do {
+                    var dLast = try dec.forward(token: tP, pos: pos, nKeys: pos + 1)
+                    while window.count < specK {
+                        let c = Sampler.sample(dLast, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+                        if Int32(c) == tok.eosId { break }   // la verifica decide comunque
+                        window.append(c)
+                        guard window.count < specK else { break }
+                        dLast = try dec.forward(token: c, pos: pos + window.count - 1,
+                                                nKeys: pos + window.count)
+                    }
+                }
+                dec.setActiveExperts(fullExperts)
+                // 2) rollback + VERIFICA batch full-config (riscrive KV e
+                //    stato per pos..pos+|w|-1 con i valori veri).
+                dec.specRestore(snap)
+                var logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
+                // 3) accettazione greedy: window[i+1] deve essere l'argmax
+                //    full-config di logitsAll[i].
+                var j = 0
+                while j + 1 < window.count {
+                    let a = Sampler.sample(logitsAll[j], temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+                    if a == window[j + 1] { j += 1 } else { break }
+                }
+                rounds += 1; drafted += window.count - 1; acceptedCands += j
+                // 4) rifiuto a metà finestra: lo stato oltre pos+j è stato
+                //    calcolato con input sbagliati — rollback e ricostruzione
+                //    pulita dei soli j+1 token committati.
+                if j + 1 < window.count {
+                    dec.specRestore(snap)
+                    logitsAll = try dec.specVerifyStep(tokens: Array(window.prefix(j + 1)), startPos: pos)
+                }
+                // 5) emetti i candidati accettati; l'ultimo logit verificato
+                //    fornisce il tP del round successivo (bonus token).
+                if j >= 1 {
+                    for c in window[1...j] {
+                        if Int32(c) == tok.eosId { break specLoop }
+                        stdout.write(Data(tok.tokenText(Int32(c))))
+                        genTokens += 1
+                        if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
+                        if genTokens >= maxNew { break }
+                    }
+                }
+                pos += j + 1
+                last = logitsAll[j]
+                let dt = Date().timeIntervalSince(t0)
+                log(String(format: "  [round %d  +%d tok  %.1fs  %.2f tok/s  accept %.2f]",
+                           rounds, j + 1, dt, dt > 0 ? Double(j + 1) / dt : 0,
+                           drafted > 0 ? Double(acceptedCands) / Double(drafted) : 0))
+                if genTokens >= maxNew { break }
+            }
+            if rounds > 0 {
+                log(String(format: "DS4Demo: speculativo — %d round, %.2f token/round, accettazione draft %.0f%%",
+                           rounds, Double(genTokens) / Double(rounds),
+                           drafted > 0 ? 100 * Double(acceptedCands) / Double(drafted) : 0))
+            }
+        } else {
         for _ in 0..<maxNew {
             let next = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
             if Int32(next) == tok.eosId { break }
@@ -340,6 +425,7 @@ do {
                 dec.resetProfile()
                 steadyStart = Date()
             }
+        }
         }
         stdout.write(Data("\n".utf8))
         let total = Date().timeIntervalSince(genStart)

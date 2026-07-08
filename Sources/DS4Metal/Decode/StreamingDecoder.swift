@@ -580,6 +580,55 @@ public final class StreamingDecoder {
         return last
     }
 
+    /// Fase B self-speculative (docs/SELF-SPECULATIVE.md): UN passo batch
+    /// full-config sui K token candidati con logit PER POSIZIONE — lo stesso
+    /// giro layer-major del prefill (pesi di ogni layer caricati una volta,
+    /// unione degli esperti dedupata da batchedExpertLayer), ma l'output head
+    /// è applicato a OGNI hidden finale (~8 ms/token: trascurabile a K ≤ 8).
+    /// Scrive KV raw e stato compressori full-config per le posizioni
+    /// startPos..<startPos+K; il chiamante gestisce snapshot/restore attorno
+    /// al round (specSnapshot/specRestore) e il rollback dei rifiutati.
+    /// Mai a inizio sequenza (il prompt passa dal prefill): startPos > 0.
+    public func specVerifyStep(tokens: [Int], startPos: Int) throws -> [[Float]] {
+        precondition(!tokens.isEmpty && startPos > 0)
+        precondition(startPos + tokens.count <= maxKeys, "specVerifyStep: oltre il KV")
+        let n = tokens.count
+        let hcDim = d.nHC * d.nEmbd
+        var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
+        var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
+        try embedTokensBatch(tokens, into: cur)
+        let stage: PrefillStage? = (expertGather != nil && n > 1)
+            ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
+        do {
+            for i in 0..<nLayers {
+                try autoreleasepool {
+                    try Task.checkCancellation()
+                    let w = try layerProvider(i)
+                    if i + 1 < nLayers { prefetch?(i + 1) }
+                    let layerRope = DSV4Shape.ropeParams(layer: i)
+                    if let gather = expertGather, n > 1, let stage {
+                        try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
+                                               n: n, posBase: startPos, tokens: tokens,
+                                               gather: gather, stage: stage)
+                    } else {
+                        for j in 0..<n {
+                            let pos = startPos + j
+                            try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                                         pos: pos, nKeys: pos + 1, token: tokens[j])
+                        }
+                    }
+                    swap(&cur, &other)
+                }
+            }
+        } catch {
+            drainFFN()   // stesso invariante di prefill: mai un cb in volo oltre l'errore
+            throw error
+        }
+        drainFFN()
+        profile.forwards += n
+        return try cur.map { try outputHead($0) }
+    }
+
     /// Max experts gathered per group in the batched prefill (bounds the packed
     /// union tensors' transient memory: ~7 MB/expert on the 2-bit model). Env
     /// override: DS4_PREFILL_UNION. Never below d.k.

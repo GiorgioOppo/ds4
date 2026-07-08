@@ -66,19 +66,26 @@ accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
 
 ## Piano incrementale
 
-1. **Fase A (primitivi)** — `setActiveExperts(_:)` runtime; snapshot/restore
-   leggero dello stato ricorrente (`SpecRecurrentState`). Self-contained,
-   nessun cambiamento di comportamento.
-2. **Fase B (verify)** — `verifyStep(tokens:[Int], startPos:) -> [[Float]]`:
-   passo batch full-config con logit per posizione (output head applicato a
-   ogni hidden finale, ~8 ms/token: accettabile a K≤8; eventualmente il
-   percorso MM del prefill).
-3. **Fase C (loop, demo)** — `DS4_SPEC_K=N` nella demo: loop
-   draft/verify/accept greedy; **parità obbligatoria a K=1** (stessi token
-   del decode normale, stessa velocità ±5%) prima di misurare K=2..6.
+1. **Fase A (primitivi) — FATTA**: `setActiveExperts(_:)`/`activeExpertsNow`
+   runtime; snapshot/restore leggero dello stato ricorrente
+   (`SpecRecurrentState`, `SpecDecode.swift`). Nessun cambiamento di
+   comportamento finché inutilizzati.
+2. **Fase B (verify) — FATTA**: `specVerifyStep(tokens:startPos:) ->
+   [[Float]]` (StreamingDecoder.swift, accanto a prefillRange di cui
+   riusa stage batchato e unione esperti): passo batch full-config con
+   logit per posizione (output head su ogni hidden finale, ~8 ms/token).
+3. **Fase C (loop, demo) — FATTA, da validare on-device**: `DS4_SPEC_K=N`
+   (+`DS4_SPEC_DRAFT_EXPERTS`, default 2) nella demo: loop
+   draft/verify/accept greedy con bonus token e ricostruzione su rifiuto.
+   VALIDAZIONE prima di misurare: stesso testo del decode normale (stessa
+   parità greedy) su più prompt, poi sweep K=2..6 e lettura di
+   token/round + accettazione dal log.
 4. **Fase D (GUI/engine)** — integrazione in InferenceService (generate
    greedy → speculativo quando temperature==0 o dietro toggle), telemetria
    accettazione nel profilo (token/round), poi rejection sampling.
+   Nota per l'integrazione: ripristinare SEMPRE activeExperts sugli error
+   path (defer), e il draft inquina marginalmente la usage imatrix (route
+   registrate con selezione draft) — accettabile, eventualmente gate.
 
 ## Rischi e mitigazioni
 
