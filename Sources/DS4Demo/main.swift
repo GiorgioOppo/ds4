@@ -69,14 +69,33 @@ func diskBench(path: String) -> (report: String, ceilingGBs: Double) {
         _ = pread(fd, b, slab, off_t(offs2[i]))
     }
     let qdN = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    // 4) come il 3, ma DISALLINEATO come il gather VERO: il GGUF allinea i
+    //    tensori a 32 byte e gli slab degli esperti hanno granularità di
+    //    blocco quantizzato (66/84/144 B) — le pread del gather partono quasi
+    //    sempre fuori pagina, e F_NOCACHE su I/O non allineato ricade (in
+    //    parte) sul percorso bufferizzato. Se questa riga è molto sotto il
+    //    "random parallelo", la leva è ALLINEARE le letture (finestra estesa
+    //    alla pagina + fixup), non aggiungere thread.
+    let offs3 = (0..<nSlabs).map { _ in randOff() + 66 }
+    t0 = Date()
+    DispatchQueue.concurrentPerform(iterations: offs3.count) { i in
+        let b = UnsafeMutableRawPointer.allocate(byteCount: slab + 128, alignment: align)
+        defer { b.deallocate() }
+        _ = pread(fd, b + 66, slab, off_t(offs3[i]))
+    }
+    let qdU = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
     let ceiling = max(seq, qd1, qdN)
+    let unalignedNote = qdU < qdN * 0.8
+        ? "  <- PENALITÀ: allineare le pread del gather vale ~\(String(format: "%.1f", qdN / max(0.01, qdU)))×"
+        : "  <- nessuna penalità significativa: l'allineamento NON è la leva"
     let report = String(format: """
       SSD (F_NOCACHE, slab %d MB):
         sequenziale coda 1  %6.2f GB/s
         random coda 1       %6.2f GB/s   <- gather senza hint/parallelismo
         random parallelo    %6.2f GB/s   <- gather con madvise/pread paralleli
+        random DISALLINEATO %6.2f GB/s%@
         TETTO               %6.2f GB/s   <- riferimento per la banda effettiva
-    """, slab >> 20, seq, qd1, qdN, ceiling)
+    """, slab >> 20, seq, qd1, qdN, qdU, unalignedNote, ceiling)
     return (report, ceiling)
 }
 
