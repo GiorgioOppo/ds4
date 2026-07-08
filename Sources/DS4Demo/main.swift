@@ -106,7 +106,7 @@ func knobReport() -> String {
                  "DS4_PREFILL_CHUNK", "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
-                 "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
+                 "DS4_QKV_Q4", "DS4_MLOCK", "DS4_PROFILE_ROUTE"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }

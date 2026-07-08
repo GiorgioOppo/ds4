@@ -609,8 +609,13 @@ expert cache and use correct gather/decode paths.
 path. The engine requantizes the largest Q8 attention projections (`q_b`,
 `output_a`, `output_b`) to Q4_K and keeps the reduced buffers resident. It
 removes several GB of per-token dense traffic from the SSD path.
-`DS4_SHARED_Q4=1` extends the same idea to the shared-expert FFN projections
-and should be treated as a separate A/B experiment.
+`DS4_SHARED_Q4=1` extends the same idea to the shared-expert FFN projections,
+and `DS4_QKV_Q4=1` to the remaining mid-size attention projections (`q_a`,
+`kv` — the last Q8 attention slabs still streamed, ~0.7 GB/token for ~0.35 GB
+resident); both should be treated as separate A/B experiments. All three
+knobs share the same `.q4dense` cache: records are matched per (layer,
+tensor) key, so enabling a new knob reuses the existing cache and requantizes
+only the tensors it adds.
 
 The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`,
 ~1.4 GB): the first load pays the requant once, every later load preads the

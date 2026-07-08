@@ -137,6 +137,13 @@ public final class DenseStreamer: @unchecked Sendable {
         // FFN projections — their Q8 slabs leave the per-token stream entirely,
         // freeing disk bandwidth for the expert gather. Lossy like the attn trio.
         let sharedQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_SHARED_Q4"] == "1"
+        // DS4_QKV_Q4 (opt-in, needs q4Dense): also requantize q_a and kv — the
+        // last mid-size Q8 attention slabs still streamed (~16 MB/layer:
+        // ~0.7 GB/token off the stream for ~0.35 GB resident). Same cache and
+        // checkpoint machinery: a cache built WITHOUT this knob stays valid and
+        // only the new tensors are requantized (records match per key). Lossy
+        // like the others — A/B before adopting as default.
+        let qkvQ4 = q4Dense && ProcessInfo.processInfo.environment["DS4_QKV_Q4"] == "1"
         var scoringSkipped = 0                  // bytes/pass NOT staged (diagnostics)
         // DS4_RESIDENT_COMP: NSA compressor projections diverted to resident
         // buffers (loaded once after the plan is built, like the Q4 jobs).
@@ -161,7 +168,8 @@ public final class DenseStreamer: @unchecked Sendable {
                 }
                 let attnQ4Field = f == .qB || f == .attnOut || f == .attnOutA
                 let sharedQ4Field = sharedQ4 && (f == .sharedGate || f == .sharedUp || f == .sharedDown)
-                if q4Dense, attnQ4Field || sharedQ4Field,
+                let qkvQ4Field = qkvQ4 && (f == .qA || f == .kvW)
+                if q4Dense, attnQ4Field || sharedQ4Field || qkvQ4Field,
                    let info = GGUF.typeInfo(t.type), info.name == "q8_0",
                    Int(t.elements) % 256 == 0 {
                     q4Jobs.append((il: il, f: f, t: t))
@@ -388,6 +396,8 @@ public final class DenseStreamer: @unchecked Sendable {
                 case .qB: skeleton[job.il]!.qB = q4; skeleton[job.il]!.qBQ4 = true
                 case .attnOut: skeleton[job.il]!.attnOut = q4; skeleton[job.il]!.attnOutQ4 = true
                 case .attnOutA: skeleton[job.il]!.attnOutA = q4; skeleton[job.il]!.attnOutAQ4 = true
+                case .qA: skeleton[job.il]!.qA = q4; skeleton[job.il]!.qAQ4 = true
+                case .kvW: skeleton[job.il]!.kvW = q4; skeleton[job.il]!.kvQ4 = true
                 case .sharedGate: skeleton[job.il]!.sharedGate = q4; skeleton[job.il]!.sharedGateQ4 = true
                 case .sharedUp: skeleton[job.il]!.sharedUp = q4; skeleton[job.il]!.sharedUpQ4 = true
                 case .sharedDown: skeleton[job.il]!.sharedDown = q4; skeleton[job.il]!.sharedDownQ4 = true

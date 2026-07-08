@@ -138,7 +138,7 @@ public actor InferenceService {
                      "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
-                     "DS4_LAZY_IDX", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
+                     "DS4_QKV_Q4", "DS4_LAZY_IDX", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
         let env = ProcessInfo.processInfo.environment
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")

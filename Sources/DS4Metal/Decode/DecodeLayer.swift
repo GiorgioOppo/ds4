@@ -139,6 +139,12 @@ public struct LayerWeights {
     public var sharedGateQ4 = false
     public var sharedUpQ4 = false
     public var sharedDownQ4 = false
+    // DS4_QKV_Q4 (requires DS4_DENSE_Q4): the remaining mid-size attention
+    // projections (q_a, kv — ~16 MB/layer of Q8 still streamed after the big
+    // trio went resident) requantized Q8_0 → Q4_K at load (resident). Lossy
+    // like the others; A/B before adopting as default.
+    public var qAQ4 = false
+    public var kvQ4 = false
     public init(hcAttnFn: GPUTensor, attnScale: GPUTensor, attnBase: GPUTensor, attnNorm: GPUTensor,
                 qA: GPUTensor, qANorm: GPUTensor, qB: GPUTensor, kvW: GPUTensor, kvNorm: GPUTensor,
                 attnSinks: GPUTensor,
@@ -313,7 +319,14 @@ extension GraphContext {
         try phase("comp")                             // DS4_PROFILE_ROUTE boundary (hc-pre + compressor)
         // 2) Q path: q_a -> norm -> q_b -> head-norm -> rope
         encoder.pushDebugGroup("q-proj")              // Instruments: name the GPU phase
-        try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
+        if w.qAQ4 {
+            // DS4_QKV_Q4: q_a requantized to Q4_K — same single-"expert"
+            // dispatch as q_b below.
+            try moeMatvecID(.q4_K, experts: w.qA, ids: s.id0, activation: s.cur, out: s.qr,
+                            k: 1, inDim: d.nEmbd, outDim: d.qRank, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.qA, x: s.cur, out: s.qr, inDim: d.nEmbd, outDim: d.qRank)
+        }
         try rmsNorm(s.qr, weight: w.qANorm, out: s.qrNorm, rows: 1, n: d.qRank, eps: rmsEps)
         if w.qBQ4 {
             // DS4_DENSE_Q4: q_b requantized to Q4_K — dense matvec through the
@@ -331,7 +344,13 @@ extension GraphContext {
         try phase("q")                                // DS4_PROFILE_ROUTE boundary (q proj)
         // 3) KV path: kv -> norm -> rope -> fp8 store into rawCache[pos]
         encoder.pushDebugGroup("kv-proj")
-        try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
+        if w.kvQ4 {
+            // DS4_QKV_Q4: kv requantized to Q4_K (see q_a above).
+            try moeMatvecID(.q4_K, experts: w.kvW, ids: s.id0, activation: s.cur, out: s.kvRaw,
+                            k: 1, inDim: d.nEmbd, outDim: d.headDim, perExpertAct: false)
+        } else {
+            try matmulQ8_0(weight: w.kvW, x: s.cur, out: s.kvRaw, inDim: d.nEmbd, outDim: d.headDim)
+        }
         try rmsNorm(s.kvRaw, weight: w.kvNorm, out: s.kv, rows: 1, n: d.headDim, eps: rmsEps)
         try ropeTail(x: s.kv, nTok: 1, nHead: 1, headDim: d.headDim, nRot: d.nRot, nCtxOrig: rope.nCtxOrig,
                      freqBase: rope.freqBase, freqScale: rope.freqScale, extFactor: rope.extFactor,
