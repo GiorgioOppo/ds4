@@ -117,6 +117,7 @@ final class ChatStore {
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default OFF (+10% misurato, lossy — A/B qualità)
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
@@ -298,6 +299,18 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
             _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
+        }
+    }
+    /// Requant Q4 anche di q_a e kv (DS4_QKV_Q4, richiede il Q4 sopra): gli
+    /// ultimi densi Q8 medi nello stream (~0.7 GB/token) diventano residenti
+    /// (~0.35 GB). MISURATO su M1 Pro (demo A/B 2026-07-08): decode 2.78 →
+    /// 3.06 tok/s (+10%), gather 627 → 606 MB/token, output coerente. LOSSY
+    /// come gli altri Q4 — default OFF finché la qualità non è validata in
+    /// chat; la cache Q4 esistente si estende in modo incrementale (~30 s).
+    var qkvQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4QkvQ4") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(qkvQ4Enabled, forKey: "DS4QkvQ4")
+            _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)
         }
     }
     /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
