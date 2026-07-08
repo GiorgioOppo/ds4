@@ -1,6 +1,7 @@
 import Foundation
 import DS4Core
 import DS4Metal
+import Metal
 ///Users/oppog/Downloads/ds4-main/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
 // DS4Demo: a tiny CLI that drives the PURE-SWIFT DeepSeek-V4 engine (DS4Core +
 // DS4Metal) with no external links — no C engine, no prebuilt static lib. It
@@ -84,6 +85,38 @@ func diskBench(path: String) -> (report: String, ceilingGBs: Double) {
         _ = pread(fd, b + 66, slab, off_t(offs3[i]))
     }
     let qdU = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(t0)) / 1e9
+    // 5) MTLIO (Metal fast resource loading, macOS 13+): stesso random
+    //    parallelo, ma orchestrato dal runtime Metal dentro MTLBuffer di
+    //    destinazione — l'equivalente Apple di DirectStorage e l'unico canale
+    //    "più diretto" della pread F_NOCACHE (che già scrive in DMA dentro la
+    //    memoria unificata). Se questa riga NON supera il "random parallelo",
+    //    la leva DS4_MTLIO è chiusa per questo hardware.
+    var mtlioLine = "    MTLIO               n/d"
+    if let dev = MTLCreateSystemDefaultDevice() {
+        do {
+            let ioDesc = MTLIOCommandQueueDescriptor()
+            ioDesc.type = .concurrent
+            let ioq = try dev.makeIOCommandQueue(descriptor: ioDesc)
+            let fh = try dev.makeIOHandle(url: URL(fileURLWithPath: path))
+            let offsM = (0..<nSlabs).map { _ in randOff() }
+            let bufs: [MTLBuffer] = offsM.map { _ in dev.makeBuffer(length: slab, options: .storageModeShared)! }
+            // warm-up: la prima submission paga la creazione della coda IO
+            if let wcb = ioq.makeCommandBuffer() as MTLIOCommandBuffer? {
+                wcb.load(bufs[0], offset: 0, size: slab, sourceHandle: fh, sourceHandleOffset: 0)
+                wcb.commit(); wcb.waitUntilCompleted()
+            }
+            let tM = Date()
+            let iocb = ioq.makeCommandBuffer()
+            for (i, off) in offsM.enumerated() {
+                iocb.load(bufs[i], offset: 0, size: slab, sourceHandle: fh, sourceHandleOffset: off)
+            }
+            iocb.commit(); iocb.waitUntilCompleted()
+            let gbs = Double(nSlabs * slab) / max(1e-9, Date().timeIntervalSince(tM)) / 1e9
+            mtlioLine = String(format: "    MTLIO random        %6.2f GB/s   <- Metal fast resource loading (candidato DS4_MTLIO)", gbs)
+        } catch {
+            mtlioLine = "    MTLIO               errore: \(error.localizedDescription)"
+        }
+    }
     let ceiling = max(seq, qd1, qdN)
     let unalignedNote = qdU < qdN * 0.8
         ? "  <- PENALITÀ: allineare le pread del gather vale ~\(String(format: "%.1f", qdN / max(0.01, qdU)))×"
@@ -96,7 +129,7 @@ func diskBench(path: String) -> (report: String, ceilingGBs: Double) {
         random DISALLINEATO %6.2f GB/s%@
         TETTO               %6.2f GB/s   <- riferimento per la banda effettiva
     """, slab >> 20, seq, qd1, qdN, qdU, unalignedNote, ceiling)
-    return (report, ceiling)
+    return (report + "\n" + mtlioLine, ceiling)
 }
 
 /// Pesi MTP (Multi-Token Prediction) nel GGUF: se presenti, la decodifica
