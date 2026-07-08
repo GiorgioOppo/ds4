@@ -304,6 +304,12 @@ do {
         // shell per i testi lunghi (benchmark del prefill). Troncato a
         // DS4_PROMPT_MAX_CHARS (default 12000 ≈ 3k token) per stare nel KV
         // della demo insieme ai token generati.
+        // DS4_PROMPT_FILE: come "@path" ma via env — immune allo splitting
+        // della shell sugli argomenti (visto in campo: il prompt arrivava
+        // spezzato alla prima parola nonostante le virgolette).
+        if let pf = ProcessInfo.processInfo.environment["DS4_PROMPT_FILE"], !pf.isEmpty {
+            prompt = "@" + pf
+        }
         if prompt.hasPrefix("@") {
             let path = (String(prompt.dropFirst()) as NSString).expandingTildeInPath
             guard var text = try? String(contentsOfFile: path, encoding: .utf8) else {
