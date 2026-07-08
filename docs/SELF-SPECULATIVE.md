@@ -87,6 +87,29 @@ accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
    path (defer), e il draft inquina marginalmente la usage imatrix (route
    registrate con selezione draft) — accettabile, eventualmente gate.
 
+## Prima misura sul campo (2026-07-08, M1 Pro, K=4, draft 2 esperti)
+
+- **Parità: PERFETTA** — testo identico carattere per carattere al decode
+  normale su 48 token. Snapshot/rollback della ricorrenza NSA, verifica e
+  accettazione funzionano (accettazione draft 49%, 2.53 token/round).
+- **Economia: oggi PERDE** (0.79 vs 3.13 tok/s). Due cause misurate:
+  1. la verifica passava da `batchedExpertLayer`, che a finestre piccole
+     rilegge l'UNIONE dal disco ignorando la slot-cache (692 vs 477
+     MB/token) → CORRETTO: `specVerifyStep` ora usa il percorso per-token
+     layer-major (hit dal pool, densi amortizzati una volta per layer);
+  2. il DRAFT non è ~1/3 del costo come stimato: con 2 esperti si riduce
+     solo il gather routed, ma ogni forward paga per intero il passaggio
+     denso in streaming (~0.9 GB/pass con QKV_Q4, senza SHARED_Q4) e
+     l'overhead per-layer → un draft forward ≈ 0.8× un forward pieno, e
+     con K=4 sono 3 passaggi extra per round.
+- **Perché vinca serve un draft da ≤0.2× forward**: (a) `DS4_SHARED_Q4=1`
+  (toglie le shared FFN dallo stream: beneficio anche al decode normale,
+  da rimisurare ora che q_a/kv/trio sono residenti); (b) draft che SALTA
+  la shared FFN (è un'approssimazione comunque: tocca solo l'accettazione);
+  (c) K piccolo (2) per ridurre i passaggi draft per round; (d) in
+  prospettiva, layer-skip nel draft o un GGUF con pesi MTP (draft head
+  dedicata, il DIAG già li rileva).
+
 ## Rischi e mitigazioni
 
 - Stato sporco dopo rifiuto → mini-verify di ricostruzione (passo 6);

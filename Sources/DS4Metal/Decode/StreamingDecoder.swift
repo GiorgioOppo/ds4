@@ -597,8 +597,6 @@ public final class StreamingDecoder {
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         try embedTokensBatch(tokens, into: cur)
-        let stage: PrefillStage? = (expertGather != nil && n > 1)
-            ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
         do {
             for i in 0..<nLayers {
                 try autoreleasepool {
@@ -606,16 +604,17 @@ public final class StreamingDecoder {
                     let w = try layerProvider(i)
                     if i + 1 < nLayers { prefetch?(i + 1) }
                     let layerRope = DSV4Shape.ropeParams(layer: i)
-                    if let gather = expertGather, n > 1, let stage {
-                        try batchedExpertLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
-                                               n: n, posBase: startPos, tokens: tokens,
-                                               gather: gather, stage: stage)
-                    } else {
-                        for j in 0..<n {
-                            let pos = startPos + j
-                            try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
-                                         pos: pos, nKeys: pos + 1, token: tokens[j])
-                        }
+                    // SEMPRE il percorso per-token layer-major (runLayer), MAI
+                    // batchedExpertLayer: a finestre piccole (K ≤ 8) l'unione
+                    // del prefill RILEGGE gli esperti dal disco ignorando la
+                    // slot-cache (misurato: 692 vs 477 MB/token) — il decode
+                    // path serve gli hit dal pool e paga solo i miss, e il
+                    // costo denso resta amortizzato una volta per layer per
+                    // TUTTA la finestra (il vantaggio del giro layer-major).
+                    for j in 0..<n {
+                        let pos = startPos + j
+                        try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                                     pos: pos, nKeys: pos + 1, token: tokens[j])
                     }
                     swap(&cur, &other)
                 }
