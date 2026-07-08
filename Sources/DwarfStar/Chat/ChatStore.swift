@@ -585,10 +585,13 @@ final class ChatStore {
                 }
 
                 // 1) Slot cache esperti — il knob più importante e più rischioso.
+                // 24 anche sui 16 GB: misurato in demo (2026-07-08, con QKV_Q4)
+                // 73% hit e 3.33 tok/s senza collasso — la guardia sulla
+                // stabilità qui sotto protegge comunque le macchine dove non regge.
                 let slotCands: [Int] = ramGB >= 96 ? [16, 24, 32, 48]
                                      : ramGB >= 48 ? [16, 24, 32]
                                      : ramGB >= 24 ? [12, 16, 24]
-                                     : [12, 16, 20]
+                                     : [16, 20, 24]
                 for cand in slotCands where cand != expertCacheSlots {
                     let saved = expertCacheSlots
                     expertCacheSlots = cand

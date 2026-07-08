@@ -187,20 +187,42 @@ Lettura delle misure:
   49% del token a ~53-57% del tetto: coda NVMe ~6-9 richieste (2-3 miss ×
   3 slab per layer) contro le ~24 a cui il disco rende il tetto.
 
-## 8. Prossimo passo
+## 8. Misure 2026-07-08 (stesso M1 Pro 16 GB, bundle ATTIVO, prompt 17 tok, 48 generati)
 
-1. **`DS4_PREAD_SPLIT=2/3/4`** (nuovo knob, in questo branch): spezza ogni
-   slab del fill in N pread concorrenti — alza la coda a parità di byte.
-   A/B sulla config Q4+PREAD; obiettivo gather ≥ 75% del tetto (~-100
-   ms/token ⇒ ~2.8 tok/s).
-2. **`DS4_EXPERT_BUNDLE=1`** resta da testare davvero: servono ~72 GB
-   liberi (svuotare il Cestino — il log lo dice). Alternativa alla 1 con
-   letture contigue invece che più profonde.
-3. Hit-rate: A/B `DS4_EXPERT_CACHE_SLOTS=20` (≈ +1.2 GB wired — controllare
-   lo swap: se la macchina inizia a paginare, peggiora tutto).
-4. Prefill: ora `experts` è il 36-38% — vale l'A/B `DS4_PREFILL_MM=1` su un
+Il bundle sidecar è entrato in funzione (costruito dall'app, riusato dalla
+demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
+
+| Config (sopra la base Q4+PREAD+bundle) | Decode regime | gather IO | hit |
+|---|---|---|---|
+| slots 16 | 2.78 tok/s | 627 MB/tok, 158 ms | 64% |
+| + `DS4_QKV_Q4` | **3.06 tok/s (+10%)** | 606 MB/tok, 141 ms | 65% |
+| + slots 20 | 3.20 tok/s | 550 MB/tok, 128 ms | 68% |
+| + slots 24 | **3.33 tok/s** | 479 MB/tok, 115 ms | **73%** (nessun collasso) |
+
+- **`DS4_QKV_Q4` promosso** (toggle in Settings, opt-in): q_a+kv residenti
+  Q4 valgono +10% da soli — meno byte nello stream E matvec dimezzato.
+  La cache `.q4dense` si estende in modo incrementale (86 tensori, ~30 s).
+- **`DS4_PREAD_SPLIT=2`: nel rumore** (2.84 vs 2.78) — il gather gira già
+  all'89-94% del tetto misurato; la coda non è più il collo.
+- **Allineamento pread: NON è una leva.** Il probe "random DISALLINEATO"
+  (DIAG) oscilla sopra e sotto l'allineato tra i run: varianza termica del
+  disco, nessuna penalità sistematica su questo SSD/OS.
+- Split `DS4_PROFILE_ROUTE` sul percorso Q4+QKV (decode, sincrono):
+  out 63 ms (output proj+HC+router), q 38, comp 28, attn 24, kv 16, più
+  experts 100 ms che l'ASYNC_FFN sovrappone quasi per intero. `q` e `out`
+  restano grandi CON i pesi già Q4 residenti ⇒ non è banda pesi: sono le
+  CATENE di micro-dispatch (proiezione→norm→rope, HC, router+readback),
+  ~140 ms/token di piccole operazioni in sequenza.
+
+## 9. Prossimo passo
+
+1. **Fusione delle micro-catene di route/attn** (~140 ms/token quantificati
+   dallo split): norm/rope nell'epilogo dei matvec q/kv (come già fatto per
+   SwiGLU), e il tail out (HC expand/reduce + router) in meno dispatch.
+2. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft
+   con `DS4_ACTIVE_EXPERTS=2` + verifica batch stile fase A del prefill —
+   l'unica leva che ammortizza I/O e compute su N token.
+3. Hit-rate oltre 24 slot: provare 28 in demo (guardare il collasso
+   progressivo); l'auto-tune della GUI ora include 24 sui 16 GB.
+4. Prefill: `experts` è il 36-38% — vale l'A/B `DS4_PREFILL_MM=1` su un
    prompt @file da ~3k token.
-5. Oltre il gather: a 2.2 tok/s route/attn+experts (compute) sono già il
-   49%. Il salto successivo resta il decode multi-token (MTP con un GGUF
-   convertito coi pesi `nextn`, o self-speculative con draft a
-   `ACTIVE_EXPERTS=2` e verifica batch stile prefill).
