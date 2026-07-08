@@ -236,6 +236,12 @@ demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
   nella memoria unificata e il gather è al 100-101% del tetto misurato:
   su questo hardware non c'è canale più veloce.
 
+- **Prefill A/B su 3481 token (config SHARED+QKV+24 slot)**:
+  union 192 = 7.23 tok/s; **union 256 = 8.63 tok/s (+19%, vincitore)**;
+  `DS4_PREFILL_MM=1`+chunk 1024 = 4.23 tok/s (`experts` 58→168
+  ms/token): **PREFILL_MM chiuso** su M1 Pro. Il benchmark rapido in
+  Settings copre 192/256 e applica il migliore.
+
 ## 9. Prossimo passo
 
 1. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft
