@@ -151,6 +151,7 @@ struct SettingsView: View {
                           systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.orange)
                     Toggle("Q4 also q_a/kv projections (LOSSY, ~+10% measured)", isOn: $store.qkvQ4Enabled)
+                    Toggle("Q4 shared-expert FFN (LOSSY, ~+7% measured)", isOn: $store.sharedQ4Enabled)
                     if store.qkvQ4Enabled {
                         Label("Also requantizes the remaining mid-size attention projections (q_a, kv) Q8→Q4_K: ~0.7 GB/token off the SSD stream for ~0.35 GB resident (+10% decode measured on M1 Pro). The existing Q4 cache is extended incrementally (~30 s once). A/B output quality before adopting.",
                               systemImage: "exclamationmark.triangle")

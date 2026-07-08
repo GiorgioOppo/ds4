@@ -219,6 +219,17 @@ demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
   CATENE di micro-dispatch (proiezione→norm→rope, HC, router+readback),
   ~140 ms/token di piccole operazioni in sequenza.
 
+### Aggiornamento serale (stesso giorno)
+
+- **`DS4_SHARED_Q4` oggi PAGA: +7%** (3.13 → 3.36 tok/s totali, regime
+  3.45) — era neutro nel tuning del 07-06, ma ora che trio+q_a+kv sono
+  residenti le shared FFN erano l'ultima voce grossa dello stream.
+  Lossy (la continuazione greedy cambia restando coerente): toggle GUI.
+- **Self-speculative (DS4_SPEC_K): parità perfetta, economia negativa**
+  (K=2: 78% accettazione ma 2.38 vs 3.36). Ragione strutturale: il token
+  è ormai dominato da route/attn seriale, che la verifica batch non
+  ammortizza. Parcheggiato come opt-in; dettagli in SELF-SPECULATIVE.md.
+
 ## 9. Prossimo passo
 
 1. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft

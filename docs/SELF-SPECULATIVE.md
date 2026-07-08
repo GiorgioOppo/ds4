@@ -110,6 +110,24 @@ accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
   prospettiva, layer-skip nel draft o un GGUF con pesi MTP (draft head
   dedicata, il DIAG già li rileva).
 
+## Seconda misura (verify via slot-cache + SHARED_Q4)
+
+- Parità di nuovo perfetta; K=2: **accettazione 78%**, 1.78 token/round;
+  K=4: 50%, 2.40 token/round. Forward medio sceso a 224 ms (dal fix
+  della verifica: 308 vs 692 MB/token dal disco).
+- **Ancora in perdita** (K=2: 2.38 vs 3.36 tok/s del baseline pari-knob).
+  Causa STRUTTURALE, non di implementazione: dopo le ottimizzazioni della
+  sessione il costo per token è dominato da route/attn SERIALE (~60%),
+  che la verifica batch non ammortizza — ogni posizione paga la sua
+  attention; si ammortizzano solo densi (ormai piccoli) e gather (ormai
+  in cache). Lo speculativo paga quando il token è dominato da I/O pesi
+  ammortizzabile: era vero a 0.47 tok/s, non lo è più a 3.4.
+- CONCLUSIONE: parcheggiato come opt-in sperimentale (DS4_SPEC_K).
+  Torna conveniente se/quando: (a) la verifica ottiene una route/attn
+  MULTI-TOKEN vera (flash-attn causale sulla finestra in un dispatch,
+  matvec→matmul per K righe); oppure (b) route/attn per token scende
+  molto (fusione micro-catene). Da rivalutare dopo quei cantieri.
+
 ## Rischi e mitigazioni
 
 - Stato sporco dopo rifiuto → mini-verify di ricostruzione (passo 6);

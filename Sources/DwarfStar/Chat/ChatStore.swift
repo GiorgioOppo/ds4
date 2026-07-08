@@ -127,6 +127,7 @@ final class ChatStore {
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
         _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default ON (+10% misurato, lossy, disattivabile)
+        _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)          // default OFF (+7% misurato, lossy — attivare dopo prova qualità)
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
@@ -334,6 +335,19 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(qkvQ4Enabled, forKey: "DS4QkvQ4")
             _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)
+        }
+    }
+
+    /// Requant Q4 delle shared-expert FFN (DS4_SHARED_Q4, richiede il Q4
+    /// sopra): l'ultima voce grossa rimasta nello stream denso. MISURATO su
+    /// M1 Pro (A/B 2026-07-08, sera): 3.13 → 3.36 tok/s (+7%) — era neutro
+    /// nel tuning del 07-06, ma allora trio/q_a/kv non erano residenti.
+    /// LOSSY (la continuazione greedy cambia restando coerente): default OFF,
+    /// da attivare dopo una prova di qualità in chat.
+    var sharedQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4SharedQ4") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(sharedQ4Enabled, forKey: "DS4SharedQ4")
+            _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)
         }
     }
     /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
