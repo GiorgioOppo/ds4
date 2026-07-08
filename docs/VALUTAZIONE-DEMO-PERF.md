@@ -207,6 +207,11 @@ demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
 - **Allineamento pread: NON è una leva.** Il probe "random DISALLINEATO"
   (DIAG) oscilla sopra e sotto l'allineato tra i run: varianza termica del
   disco, nessuna penalità sistematica su questo SSD/OS.
+- **`DS4_MOE_NSG`: il default 4 resta il migliore su M1 Pro** (A/B sulla
+  config QKV+24 slot: nsg=2 → 3.10, nsg=8 → 3.25, nsg=4 → 3.33 tok/s di
+  regime; nel prefill `experts` peggiora del ~20% con 2/8). Coerente col
+  fatto che in decode l'ASYNC_FFN nasconde gran parte della FFN routed
+  dal critical path. Il knob resta (auto-tune 2/8) per GPU più larghe.
 - Split `DS4_PROFILE_ROUTE` sul percorso Q4+QKV (decode, sincrono):
   out 63 ms (output proj+HC+router), q 38, comp 28, attn 24, kv 16, più
   experts 100 ms che l'ASYNC_FFN sovrappone quasi per intero. `q` e `out`
@@ -216,12 +221,15 @@ demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
 
 ## 9. Prossimo passo
 
-1. **Fusione delle micro-catene di route/attn** (~140 ms/token quantificati
-   dallo split): norm/rope nell'epilogo dei matvec q/kv (come già fatto per
-   SwiGLU), e il tail out (HC expand/reduce + router) in meno dispatch.
-2. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft
+1. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft
    con `DS4_ACTIVE_EXPERTS=2` + verifica batch stile fase A del prefill —
-   l'unica leva che ammortizza I/O e compute su N token.
+   l'unica leva rimasta che ammortizza I/O e compute su N token. A 3.3
+   tok/s il critical path è route (compute) ⊕ FFN assorbita ⊕ gather al
+   ~90% del tetto: le leve locali sono quasi esaurite.
+2. Fusione delle micro-catene di route/attn: resa incerta (gli assoluti
+   dello split sono gonfiati dai sync del profilo, ~0.5 ms × fase ×
+   layer) — prima di investirci serve una misura GPU-side pulita
+   (Instruments, i debug group ci sono già).
 3. Hit-rate oltre 24 slot: provare 28 in demo (guardare il collasso
    progressivo); l'auto-tune della GUI ora include 24 sui 16 GB.
 4. Prefill: `experts` è il 36-38% — vale l'A/B `DS4_PREFILL_MM=1` su un
