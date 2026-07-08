@@ -230,6 +230,12 @@ demo via `DS4_BUNDLE_DIR`) e la matrice del giorno ha chiuso quattro domande:
   è ormai dominato da route/attn seriale, che la verifica batch non
   ammortizza. Parcheggiato come opt-in; dettagli in SELF-SPECULATIVE.md.
 
+- **MTLIO (Metal fast resource loading): leva CHIUSA.** Probe A/B nel
+  DIAG, rapporto MTLIO/pread nello stesso run: 1.11 poi 0.81 — non
+  ripetibile, varianza termica. La pread F_NOCACHE scrive già in DMA
+  nella memoria unificata e il gather è al 100-101% del tetto misurato:
+  su questo hardware non c'è canale più veloce.
+
 ## 9. Prossimo passo
 
 1. **Decode multi-token self-speculative** (il GGUF non ha pesi MTP): draft
