@@ -111,13 +111,22 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_06")
             applyFastDemoDefaults(persistExplicitly: true)
         }
+        // Migrazione UNA TANTUM v4 (2026-07-08): matrice A/B in demo su M1 Pro
+        // 16 GB — QKV_Q4 promosso (+10%, output coerente) e slot 24 (73% hit,
+        // 3.33 tok/s di regime, nessun collasso). MOE_NSG=4 confermato,
+        // PREAD_SPLIT e allineamento pread falsificati dal probe DIAG.
+        // Dettagli e numeri: docs/VALUTAZIONE-DEMO-PERF.md §8.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_08") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
-        _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default OFF (+10% misurato, lossy — A/B qualità)
+        _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default ON (+10% misurato, lossy, disattivabile)
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
@@ -167,12 +176,12 @@ final class ChatStore {
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    /// DEFAULT 16: il punto dolce misurato su M1 Pro 16 GB con dense stream +
-    /// pread + MLOCK + Q4 (63% hit, ridistribuzione usage-driven attiva,
-    /// 1.17 tok/s a regime). Senza MLOCK i pool grandi vengono compressi/
-    /// paginati e conviene 8; senza Q4 il budget bloccato è più tirato e il
-    /// punto dolce scende a 12.
-    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 16 {
+    /// DEFAULT 24: il punto dolce misurato su M1 Pro 16 GB con dense stream +
+    /// pread + MLOCK + Q4 + QKV_Q4 (A/B 2026-07-08: 73% hit, 3.33 tok/s di
+    /// regime, nessun collasso progressivo; ~7.1 GB wired). Senza MLOCK i
+    /// pool grandi vengono compressi/paginati e conviene 8; senza Q4 il
+    /// budget bloccato è più tirato e il punto dolce scende a 12-16.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 24 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
     /// Look-ahead speculativo della slot-cache (DS4_EXPERT_LOOKAHEAD): mentre il
@@ -318,9 +327,10 @@ final class ChatStore {
     /// ultimi densi Q8 medi nello stream (~0.7 GB/token) diventano residenti
     /// (~0.35 GB). MISURATO su M1 Pro (demo A/B 2026-07-08): decode 2.78 →
     /// 3.06 tok/s (+10%), gather 627 → 606 MB/token, output coerente. LOSSY
-    /// come gli altri Q4 — default OFF finché la qualità non è validata in
-    /// chat; la cache Q4 esistente si estende in modo incrementale (~30 s).
-    var qkvQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4QkvQ4") as? Bool) ?? false {
+    /// come gli altri Q4 — default ON con avviso in GUI (come DENSE_Q4), il
+    /// toggle resta per chi preferisce la fedeltà piena; la cache Q4
+    /// esistente si estende in modo incrementale (~30 s una tantum).
+    var qkvQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4QkvQ4") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(qkvQ4Enabled, forKey: "DS4QkvQ4")
             _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)
@@ -341,33 +351,36 @@ final class ChatStore {
         }
     }
     /// Riporta TUTTI i toggle di performance ai valori della demo veloce
-    /// misurata su M1 Pro (prefill ~8 tok/s, decode 2.5+): slot 16, ring off,
-    /// willneed+pread+dense stream+mlock+Q4+bundle ON. Usato dalla migrazione
-    /// una-tantum in init e dal bottone in Settings ("i toggle persistiti
-    /// derivano dai vecchi esperimenti e restano incollati per sempre").
+    /// misurata su M1 Pro (matrice A/B 2026-07-08: 3.33 tok/s di regime):
+    /// slot 24 (73% hit, nessun collasso), ring off, willneed+pread+dense
+    /// stream+mlock+Q4+QKV_Q4+bundle ON. Usato dalla migrazione una-tantum
+    /// in init e dal bottone in Settings ("i toggle persistiti derivano dai
+    /// vecchi esperimenti e restano incollati per sempre").
     /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
     /// init i didSet delle stored property NON scattano.
     func applyFastDemoDefaults(persistExplicitly: Bool = false) {
-        expertCacheSlots = 16
+        expertCacheSlots = 24      // 73% hit misurato; l'auto-tune può correggere per macchina
         rawRingEnabled = false
         willNeedEnabled = true
         expertPreadEnabled = true
         denseStreamEnabled = true
         mlockEnabled = true
         denseQ4Enabled = true
+        qkvQ4Enabled = true        // +10% misurato (2.78 → 3.06 tok/s), output coerente
         expertBundleEnabled = true
         expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
         asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         if persistExplicitly {
             let d = UserDefaults.standard
-            d.set(16, forKey: "DS4ExpertCacheSlots")
+            d.set(24, forKey: "DS4ExpertCacheSlots")
             d.set(false, forKey: "DS4RawRing")
             d.set(true, forKey: "DS4WillNeed")
             d.set(true, forKey: "DS4ExpertPread")
             d.set(true, forKey: "DS4DenseStream")
             d.set(true, forKey: "DS4MLock")
             d.set(true, forKey: "DS4DenseQ4")
+            d.set(true, forKey: "DS4QkvQ4")
             d.set(true, forKey: "DS4ExpertBundle")
             d.set(0, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
@@ -378,6 +391,7 @@ final class ChatStore {
             _ = setenv("DS4_DENSE_STREAM", "1", 1)
             _ = setenv("DS4_MLOCK", "1", 1)
             _ = setenv("DS4_DENSE_Q4", "1", 1)
+            _ = setenv("DS4_QKV_Q4", "1", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)
