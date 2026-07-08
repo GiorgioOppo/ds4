@@ -115,6 +115,7 @@ view in the root README's
 | `DS4_ASYNC_FFN` | `=0` disables | on | Commits each layer's routed-FFN command buffer WITHOUT a CPU wait: the next layer's route commit+wait lands on the same in-order queue, so the GPU stays fed while the CPU encodes and the per-layer bubble (encode time × 43) disappears. Explicitly waited at end of token (before the output head) and on every error path; correctness is by queue order, numerics identical. `DS4_PROFILE_ROUTE` keeps the synchronous wait for accurate phase timing. `=0` for A/B. |
 | `DS4_PROFILE_ROUTE` | `=1` | off | Splits `route/attn` into diagnostic subphases such as compressor, Q/KV projections, attention, and output. Adds synchronization overhead; inspect ratios, not absolute tok/s. |
 | `DS4_Q8_NSG` | `1...8` | `4` | Simdgroups per threadgroup for dense Q8_0 matvecs. Results are identical; only scheduling, occupancy, and latency hiding change. Sweep `2/4/6/8` on the target Mac. |
+| `DS4_MOE_NSG` | `1`..`8` | `4` | Simdgroups per threadgroup in the MoE id-kernels: the routed FFN (`pair_swiglu`/`sum6` — the biggest measured compute item, ~100 ms/token on M1 Pro) and the resident dense-Q4 matvecs share these wrappers. Row-partitioned: every value is bit-identical, only occupancy changes; the optimum depends on the GPU core count. Re-read at decoder creation (the Settings auto-tune sweeps it with a reload). |
 
 ## What Should I Try First?
 

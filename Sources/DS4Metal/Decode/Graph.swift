@@ -395,7 +395,7 @@ extension GraphContext {
                             out: GPUTensor, k: Int, inDim: Int, outDim: Int, perExpertAct: Bool,
                             expertStride: Int? = nil) throws {
         precondition(inDim % 256 == 0)
-        let nsg = 4, nr0 = quant.nr0
+        let nsg = Int(GraphContext.moeNSG), nr0 = quant.nr0   // DS4_MOE_NSG (default 4)
         let blockBytes = quant.blockBytes
         let rowBytes = (inDim / 256) * blockBytes
         // expertStride: byte fra un esperto e il successivo nel buffer — di
@@ -443,7 +443,7 @@ extension GraphContext {
         case .q4_K:    kernel = "kernel_mul_mv_id_q4_K_pair_swiglu_f32"
         case .q2_K:    throw MetalError.missingKernel("no q2_K pair_swiglu kernel")
         }
-        let nsg = 4, nr0 = quant.nr0
+        let nsg = Int(GraphContext.moeNSG), nr0 = quant.nr0   // DS4_MOE_NSG (default 4)
         let rowBytes = (inDim / 256) * quant.blockBytes
         let args = Self.mulMVIdArgsFull(nei0: k, nei1: 1, nbi1: UInt64(k * 4), ne00: inDim, ne01: outDim,
                                         nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),
@@ -481,7 +481,7 @@ extension GraphContext {
         case .q4_K:    kernel = "kernel_mul_mv_id_q4_K_sum6_f32"
         case .iq2_xxs: throw MetalError.missingKernel("no iq2_xxs down_sum6 kernel")
         }
-        let nsg = 4, nr0 = quant.nr0
+        let nsg = Int(GraphContext.moeNSG), nr0 = quant.nr0   // DS4_MOE_NSG (default 4)
         let rowBytes = (inDim / 256) * quant.blockBytes
         let args = Self.mulMVIdArgsFull(nei0: 6, nei1: 1, nbi1: 6 * 4, ne00: inDim, ne01: outDim,
                                         nb00: UInt64(quant.blockBytes), nb01: UInt64(rowBytes),

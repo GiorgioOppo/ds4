@@ -122,6 +122,7 @@ final class ChatStore {
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
         _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // partizione K matvec Q8 (auto-tune)
+        _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)                          // occupancy kernel MoE/Q4 (auto-tune)
         _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
@@ -218,6 +219,18 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(q8NSG, forKey: "DS4Q8NSG")
             _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)
+        }
+    }
+
+    /// DS4_MOE_NSG: simdgroup per threadgroup nei kernel MoE id (FFN routed —
+    /// la voce compute più grossa misurata, ~100 ms/token — e matvec densi
+    /// Q4). Partizione per RIGHE: numerica identica per costruzione, cambia
+    /// solo l'occupancy. Come q8NSG: default 4 (storico), l'ottimo dipende
+    /// dai core GPU e l'auto-tune lo esplora con un reload.
+    var moeNSG: Int = (UserDefaults.standard.object(forKey: "DS4MoeNSG") as? Int) ?? 4 {
+        didSet {
+            UserDefaults.standard.set(moeNSG, forKey: "DS4MoeNSG")
+            _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)
         }
     }
 
@@ -566,10 +579,11 @@ final class ChatStore {
             // sweep non deve lasciare persistito il candidato perdente.
             let snapSlots = expertCacheSlots, snapAhead = denseAhead
             let snapAsync = asyncFFNEnabled, snapLook = expertLookahead
-            let snapNSG = q8NSG
+            let snapNSG = q8NSG, snapMoeNSG = moeNSG
             do {
                 let baseLabel = "baseline slot=\(expertCacheSlots) ahead=\(denseAhead) " +
-                                "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) q8nsg=\(q8NSG)"
+                                "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) " +
+                                "q8nsg=\(q8NSG) moensg=\(moeNSG)"
                 var best = try await measure(baseLabel).score
                 if best == 0 {
                     // Un solo retry: il primo giro paga il transitorio peggiore
@@ -637,11 +651,23 @@ final class ChatStore {
                     if r.score > best * 1.02 { best = r.score } else { q8NSG = saved }
                 }
 
+                // 6) DS4_MOE_NSG: occupancy dei kernel MoE id (FFN routed +
+                //    matvec densi Q4) — partizione per righe, numerica
+                //    identica; come q8NSG l'ottimo dipende dai core GPU.
+                for cand in [2, 8] where cand != moeNSG {
+                    let saved = moeNSG
+                    moeNSG = cand
+                    let r = try await measure("moensg=\(cand)")
+                    if r.score > best * 1.02 { best = r.score } else { moeNSG = saved }
+                }
+
                 // Reload finale con i vincitori (le proprietà sono già persistite).
                 _ = try await measure("finale slot=\(expertCacheSlots) ahead=\(denseAhead) " +
-                                      "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) q8nsg=\(q8NSG)")
+                                      "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) " +
+                                      "q8nsg=\(q8NSG) moensg=\(moeNSG)")
                 let summary = "slot=\(expertCacheSlots) ahead=\(denseAhead) " +
-                              "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) q8nsg=\(q8NSG)"
+                              "async=\(asyncFFNEnabled ? 1 : 0) look=\(expertLookahead) " +
+                              "q8nsg=\(q8NSG) moensg=\(moeNSG)"
                 log("MIGLIORI per \(chip)/\(ramGB)GB: \(summary) — applicati e salvati.")
                 UserDefaults.standard.set("\(summary) @ \(Date().formatted())",
                                           forKey: "DS4AutoTune-\(chip)-\(ramGB)")
@@ -649,7 +675,7 @@ final class ChatStore {
             } catch {
                 expertCacheSlots = snapSlots; denseAhead = snapAhead
                 asyncFFNEnabled = snapAsync; expertLookahead = snapLook
-                q8NSG = snapNSG
+                q8NSG = snapNSG; moeNSG = snapMoeNSG
                 benchStatus = "Auto-tune fallito: \(error.localizedDescription)"
                 log("INTERROTTO: \(error.localizedDescription) — knob ripristinati ai valori di partenza; " +
                     "se il modello è scarico, ricaricalo dalle Settings.")

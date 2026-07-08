@@ -48,7 +48,27 @@ public final class GraphContext {
     }
 
     /// Re-arm `q8NSG` from the live environment (called on decoder creation).
-    static func refreshQ8NSG() { q8NSG = readQ8NSG() }
+    static func refreshQ8NSG() { q8NSG = readQ8NSG(); moeNSG = readMoENSG() }
+
+    /// DS4_MOE_NSG: simdgroups-per-threadgroup for the MoE id-kernels — the
+    /// routed FFN (pair_swiglu/sum6, ~100 ms/token measured on M1 Pro, the
+    /// single biggest compute item) AND the resident dense-Q4 matvecs, which
+    /// go through the same wrappers. Unlike DS4_Q8_NSG (a K-split), here NSG
+    /// partitions OUTPUT ROWS across simdgroups: each row is computed by
+    /// exactly one simdgroup regardless of NSG, so any value in 1...8 is
+    /// bit-identical — only occupancy changes. The iq2_xxs codebook staging
+    /// is bounds-guarded and its threadgroup memory is NSG-independent
+    /// (fixed 256×8+128 table). Default 4 = the historical dispatch.
+    /// Same refresh discipline as q8NSG (re-read per decoder creation).
+    nonisolated(unsafe) static var moeNSG: Int16 = GraphContext.readMoENSG()
+
+    static func readMoENSG() -> Int16 {
+        if let v = ProcessInfo.processInfo.environment["DS4_MOE_NSG"].flatMap(Int.init),
+           v >= 1, v <= 8 {
+            return Int16(v)
+        }
+        return 4
+    }
 
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
