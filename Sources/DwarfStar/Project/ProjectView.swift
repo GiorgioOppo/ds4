@@ -2,8 +2,10 @@ import SwiftUI
 import AppKit
 import DS4Engine
 
-/// Library of saved projects: each entry keeps the folder's security-scoped
-/// bookmark (sandbox-safe across launches). ONE project at a time is active in
+/// Library of saved projects: folders imported by the user keep the folder's
+/// security-scoped bookmark (sandbox-safe across launches); repositories cloned
+/// by the github_clone tool live inside the app container and are tracked by
+/// plain path (no bookmark needed there). ONE project at a time is active in
 /// the ProjectCache (the project_* tools read from it); switching just reloads
 /// the cache — the chat memory is never touched.
 @MainActor
@@ -11,7 +13,19 @@ enum ProjectLibrary {
     struct SavedProject: Codable, Identifiable, Equatable {
         let id: String
         var name: String
-        let bookmark: Data
+        let bookmark: Data?      // user-imported folder (security-scoped)
+        let path: String?        // github_clone folder inside the app container
+
+        init(id: String, name: String, bookmark: Data?, path: String? = nil) {
+            self.id = id; self.name = name; self.bookmark = bookmark; self.path = path
+        }
+    }
+
+    /// True for entries that are clones made by the github_clone tool: they are
+    /// disposable copies inside the app container, so "remove" DELETES the
+    /// folder (otherwise the next sync would just re-list it).
+    static func isCloned(_ p: SavedProject) -> Bool {
+        p.path?.hasPrefix(GitHubTool.projectsDirectory().path) == true
     }
 
     private static let listKey = "ds4.projectLibrary"
@@ -58,9 +72,45 @@ enum ProjectLibrary {
 
     static func remove(id: String) {
         var list = all()
+        if let p = list.first(where: { $0.id == id }), isCloned(p), let path = p.path {
+            try? FileManager.default.removeItem(atPath: path)
+        }
         list.removeAll { $0.id == id }
         save(list)
         if activeId == id { activeId = nil }
+    }
+
+    /// Keep the library in sync with the github_clone destination folder:
+    /// every cloned repo appears as a path-based entry, entries whose folder
+    /// was deleted are pruned, and when the ProjectCache's current root IS one
+    /// of those folders (the model just ran github_clone in chat) that entry is
+    /// marked active so the GUI reflects what the tools already see. Call it
+    /// before reading `all()` in any view that lists projects.
+    static func syncClonedRepos() {
+        let fm = FileManager.default
+        let dir = GitHubTool.projectsDirectory()
+        let folders = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey],
+                                                    options: [.skipsHiddenFiles])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        var list = all()
+        let before = list
+        list.removeAll { p in
+            guard isCloned(p), let path = p.path else { return false }
+            return !fm.fileExists(atPath: path)
+        }
+        for f in folders where !list.contains(where: { $0.path == f.path }) {
+            // Stable id per folder: a re-clone of the same repo keeps its
+            // identity (and its active state) instead of duplicating the entry.
+            list.append(SavedProject(id: "github:" + f.lastPathComponent,
+                                     name: f.lastPathComponent + " (GitHub)",
+                                     bookmark: nil, path: f.path))
+        }
+        if list != before { save(list) }
+        if let root = ProjectCache.shared.rootURL(),
+           let match = list.first(where: { $0.path == root.path }),
+           activeId != match.id {
+            activeId = match.id
+        }
     }
 
     /// Resolve, load into the ProjectCache and mark active. Returns the project
@@ -73,10 +123,19 @@ enum ProjectLibrary {
         return info
     }
 
-    /// Resolve a saved project's folder and start security-scoped access.
+    /// Resolve a saved project's folder. Path-based entries (github_clone) live
+    /// inside the app container — plain access, no security scope; bookmark
+    /// entries resolve the scoped bookmark and start access.
     static func resolveURL(_ p: SavedProject) -> URL? {
+        if let path = p.path {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir),
+                  isDir.boolValue else { return nil }
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        guard let bm = p.bookmark else { return nil }
         var stale = false
-        guard let url = try? URL(resolvingBookmarkData: p.bookmark, options: .withSecurityScope,
+        guard let url = try? URL(resolvingBookmarkData: bm, options: .withSecurityScope,
                                  relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
         guard url.startAccessingSecurityScopedResource() else { return nil }
         return url
@@ -126,8 +185,9 @@ struct ProjectView: View {
                     Text("No saved projects.").foregroundStyle(.secondary)
                 }
                 ForEach(projects) { project in
+                    let cloned = ProjectLibrary.isCloned(project)
                     HStack {
-                        Label(project.name, systemImage: "folder")
+                        Label(project.name, systemImage: cloned ? "arrow.down.circle" : "folder")
                         if project.id == ProjectLibrary.activeId {
                             Text("active")
                                 .font(.caption)
@@ -142,7 +202,9 @@ struct ProjectView: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
-                        .help("Remove from the library (the folder on disk is not touched)")
+                        .help(cloned
+                              ? "Delete the cloned copy from disk (re-clone it anytime with github_clone)"
+                              : "Remove from the library (the folder on disk is not touched)")
                     }
                 }
                 Button {
@@ -153,7 +215,7 @@ struct ProjectView: View {
                 } label: {
                     Label("Import Folder...", systemImage: "folder.badge.plus")
                 }
-                Text("Text files only (<=1 MB each, max 3000); folders like .git and node_modules are excluded. Folders remain accessible across launches through sandbox bookmarks.")
+                Text("Text files only (<=1 MB each, max 3000); folders like .git and node_modules are excluded. Folders remain accessible across launches through sandbox bookmarks. Repositories cloned in chat with github_clone appear here automatically with a \u{2913} icon (stored in Application Support; removing one deletes the cloned copy).")
                     .font(.caption).foregroundStyle(.tertiary)
             }
 
@@ -186,14 +248,24 @@ struct ProjectView: View {
         }
         .formStyle(.grouped)
         .onAppear {
+            // Sync first so a repo just cloned in chat shows up (and is marked
+            // active) the moment this tab opens; then ALWAYS refresh the active
+            // info — the cache may have been swapped by github_clone since the
+            // last appearance.
+            ProjectLibrary.syncClonedRepos()
             projects = ProjectLibrary.all()
-            guard !restored else { return }
-            restored = true
             if let i = ProjectCache.shared.info() {
                 info = i
                 preview = ProjectCache.shared.sampleFiles(50)
-            } else if let activeId = ProjectLibrary.activeId,
-                      let p = projects.first(where: { $0.id == activeId }) {
+                restored = true
+                return
+            }
+            info = nil
+            preview = []
+            guard !restored else { return }
+            restored = true
+            if let activeId = ProjectLibrary.activeId,
+               let p = projects.first(where: { $0.id == activeId }) {
                 activate(p)
             }
         }

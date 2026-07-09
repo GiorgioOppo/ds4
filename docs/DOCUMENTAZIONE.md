@@ -332,6 +332,15 @@ content, so a large repository can be analyzed without prefilling it into the
 context. `github_clone` is not grantable to sub-agents because it swaps the
 shared active project.
 
+Cloned repositories are also first-class citizens in the GUI: they appear
+automatically in the **Project tab** (and in the chat/distributed Project
+menus) as library entries marked with a download icon and named
+`<owner>-<repo> (GitHub)`, already active right after the clone. From there
+you can switch back and forth between clones and user-imported folders with
+**Activate**, exactly like any other project. Removing a cloned entry deletes
+the copy from `Application Support/DwarfStar/github-projects` (it can be
+re-cloned anytime); removing a user-imported folder never touches the disk.
+
 ### MCP Servers
 
 The **MCP** tab connects the app, as a Model Context Protocol CLIENT, to

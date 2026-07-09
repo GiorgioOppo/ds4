@@ -161,6 +161,7 @@ struct CoordinatorChatView: View {
     }
 
     private func refreshProject() {
+        ProjectLibrary.syncClonedRepos()   // repos cloned via github_clone appear too
         projects = ProjectLibrary.all()
         activeProjectName = ProjectCache.shared.info()?.name
     }

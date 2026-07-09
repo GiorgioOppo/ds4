@@ -16,7 +16,7 @@ import Foundation
 /// character sets — the model cannot steer the fetch anywhere else. The archive
 /// is size-capped and extracted into a private per-repo directory (never inside
 /// an existing project).
-enum GitHubTool {
+public enum GitHubTool {
 
     struct Repo: Equatable {
         let owner: String
@@ -142,7 +142,8 @@ enum GitHubTool {
         }
         let at = repo.ref.map { "@\($0)" } ?? ""
         var out = "Imported github.com/\(repo.owner)/\(repo.name)\(at) as the ACTIVE project"
-        out += " (\(info.fileCount) text files, \(info.totalBytes / 1024) KB indexed; any previous project was replaced).\n\n"
+        out += " (\(info.fileCount) text files, \(info.totalBytes / 1024) KB indexed; any previous project was replaced."
+        out += " The user can switch projects anytime from the app's Project tab, where this clone is now listed).\n\n"
         out += ProjectCache.shared.treeTool(maxDepth: 2)
         let docs = docCandidates(in: ProjectCache.shared.fileList())
         if !docs.isEmpty {
@@ -155,8 +156,9 @@ enum GitHubTool {
     }
 
     /// Where imported repositories live: one folder per owner-repo, replaced on
-    /// re-clone. Inside the app sandbox this is always writable.
-    static func projectsDirectory() -> URL {
+    /// re-clone. Inside the app sandbox this is always writable. Public so the
+    /// GUI's ProjectLibrary can list cloned repos as selectable projects.
+    public static func projectsDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DwarfStar/github-projects", isDirectory: true)
     }

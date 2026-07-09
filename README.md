@@ -67,7 +67,7 @@ against the upstream behavior.
 | **Settings** | Shared model path, context size, RAM-aware execution mode, memory/I/O knobs, local model load, and distributed coordinator route. |
 | **Agents** | Role editor: system prompt, icon, tools, JSON import/export, and per-agent expert-usage profile. |
 | **MCP** | External MCP servers (stdio child process or Streamable HTTP): connection status, exposed tools, `mcpServers`-JSON import/export. |
-| **Project** | Library of imported folders with sandbox bookmarks. Project tools explore the active project without consuming chat context until a tool reads content. |
+| **Project** | Library of imported folders (sandbox bookmarks) and GitHub clones made in chat via `github_clone` (listed automatically). Project tools explore the active project without consuming chat context until a tool reads content. |
 | **Tuning** | Expert cache slots, hit-rate, per-layer routing concentration, and the usage imatrix. |
 | **Server** | Native in-process OpenAI/Anthropic-compatible HTTP server. |
 | **Worker** | Runs this Mac as a distributed worker: it starts idle and the coordinator assigns its job — GGUF, settings, and layer slice. |
@@ -87,7 +87,9 @@ Built-in DSML tools live one per file under
   documentation files). The Coding and Code agents use it to analyze a repo
   with the project tools — structure via `project_tree`, targeted code search
   via `project_find`/`project_search` — instead of reading every file into the
-  chat context.
+  chat context. Clones also appear automatically in the Project tab (and the
+  chat Project menu) as regular library entries, so they can be re-activated
+  from the GUI at any time.
 - **Raw project-root file tools:** `file_read`, `file_lines`, `file_write`,
   `file_add`, `file_modify`.
 - **Utilities:** `git` (local whitelist, no network), `calculator`,
