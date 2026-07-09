@@ -103,6 +103,15 @@ public final class ProjectCache: @unchecked Sendable {
         return info
     }
 
+    /// Re-walk the current root and rebuild the index (content cache cleared):
+    /// for changes made OUTSIDE the tools — `git stash` via the git tool,
+    /// scripts, the user's editor. Nil when no project is active.
+    @discardableResult
+    public func reload() -> Info? {
+        guard let r = rootURL() else { return nil }
+        return load(root: r)
+    }
+
     public func clear() {
         lock.lock()
         root = nil; files = []; contents = [:]; cachedBytes = 0; infoValue = nil
@@ -271,7 +280,7 @@ public final class ProjectCache: @unchecked Sendable {
         }
         var hits: [String] = []
         for f in snapshot {
-            guard let text = fileContents(f) else { continue }
+            guard let text = searchContents(f) else { continue }
             for (i, line) in text.components(separatedBy: "\n").enumerated()
             where line.lowercased().contains(q) {
                 hits.append("\(f):\(i + 1): \(String(line.trimmingCharacters(in: .whitespaces).prefix(160)))")
@@ -385,6 +394,18 @@ public final class ProjectCache: @unchecked Sendable {
         upsertIndex(rel, content: updated)
         let line = text[text.startIndex..<range.lowerBound].components(separatedBy: "\n").count
         return "Edited '\(rel)' around line \(line) (1 replacement)."
+    }
+
+    /// Contents for SEARCH: the cache when hot, otherwise straight from disk
+    /// WITHOUT inserting. Searching a project larger than the cache budget
+    /// used to flush the whole cache repeatedly (thrash), evicting exactly the
+    /// files the model is actively reading; a search visit is not a signal of
+    /// future reads, so it must not cost cache residency.
+    private func searchContents(_ relPath: String) -> String? {
+        lock.lock()
+        if let c = contents[relPath] { lock.unlock(); return c }
+        lock.unlock()
+        return freshContents(relPath)
     }
 
     /// Like fileContents but ALWAYS reread from disk (index membership still

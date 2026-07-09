@@ -80,7 +80,8 @@ Built-in DSML tools live one per file under
 `Sources/DS4Engine/Tools/Builtins/`.
 
 - **Project index tools:** `project_list`, `project_read`, `project_search`,
-  `project_write`, `project_edit`.
+  `project_write`, `project_edit`, `project_reload` (re-index after
+  out-of-band changes; `git stash` re-indexes automatically).
 - **GitHub import:** `github_clone` downloads a public repository (HTTPS
   tarball, no git binary or credentials) into Application Support and makes it
   the active project, returning a compact orientation summary (tree +

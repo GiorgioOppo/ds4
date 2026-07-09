@@ -38,7 +38,8 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               """,
               toolNames: ["github_clone",
                           "project_tree", "project_list", "project_find", "project_read", "project_search",
-                          "project_edit", "file_read", "file_lines", "file_write", "file_add", "file_modify",
+                          "project_reload", "project_edit",
+                          "file_read", "file_lines", "file_write", "file_add", "file_modify",
                           "file_delete", "git"]),
         .init(id: "revisore", name: "Reviewer", icon: "checkmark.seal",
               systemPrompt: """
@@ -49,7 +50,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               4) REPORT: a concise list ordered by severity. For each finding: file:line, what is wrong, why it matters, and a concrete suggested fix.
               """,
               toolNames: ["project_tree", "project_list", "project_find", "project_read", "project_search",
-                          "file_read", "file_lines", "git"]),
+                          "project_reload", "file_read", "file_lines", "git"]),
         .init(id: "debug", name: "Debug", icon: "ant",
               systemPrompt: """
               You are a debugging agent for the imported project: find the ROOT CAUSE of a bug, then apply the smallest fix. Method, one tool call at a time:
@@ -61,7 +62,7 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
               Conclude with: the root cause in one sentence, the fix (file:line), and how to verify it.
               """,
               toolNames: ["project_tree", "project_list", "project_find", "project_read", "project_search",
-                          "project_edit", "file_read", "file_lines", "git"]),
+                          "project_reload", "project_edit", "file_read", "file_lines", "git"]),
         .init(id: "orchestratore", name: "Orchestrator", icon: "person.3.sequence",
               systemPrompt: """
               You are an orchestrator: break down the task and delegate to isolated sub-agents without reading or editing files yourself.

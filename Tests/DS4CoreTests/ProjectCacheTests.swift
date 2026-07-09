@@ -113,7 +113,21 @@ final class ProjectCacheTests: XCTestCase {
     func testToolsAreRegistered() {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
         XCTAssertTrue(names.isSuperset(of: ["project_tree", "project_list", "project_find",
-                                            "project_read", "project_search", "file_delete"]))
+                                            "project_read", "project_search", "project_reload",
+                                            "file_delete"]))
+    }
+
+    /// project_reload picks up files created OUTSIDE the tools (scripts, git):
+    /// the index is an import-time snapshot until re-indexed.
+    func testReloadPicksUpExternalChanges() throws {
+        try "let late = true\n".write(to: root.appendingPathComponent("Sources/Late.swift"),
+                                      atomically: true, encoding: .utf8)
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "Late").contains("No files match"))
+        let info = ProjectCache.shared.reload()
+        XCTAssertEqual(info?.fileCount, 3)
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "Late").contains("Sources/Late.swift"))
+        ProjectCache.shared.clear()
+        XCTAssertNil(ProjectCache.shared.reload())
     }
 
     /// project_edit must base the replacement on the CURRENT file, not on the

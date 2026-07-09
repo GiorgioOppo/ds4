@@ -38,7 +38,15 @@ enum GitTool {
             args = ["-c", "user.name=DwarfStar Agent", "-c", "user.email=agent@dwarfstar.local"] + args
         }
         let out = execute(args, in: root, timeout: timeoutSeconds)
-        return out.isEmpty ? "(no output - command succeeded)" : out
+        var text = out.isEmpty ? "(no output - command succeeded)" : out
+        // `stash` (push/pop/apply/drop) is the only allowed subcommand that
+        // rewrites the working tree: re-index so the project_* tools see the
+        // new state instead of the import-time snapshot.
+        if sub == "stash" {
+            ProjectCache.shared.reload()
+            text += "\n(project re-indexed)"
+        }
+        return text
     }
 
     /// Whitespace tokenizer with double/single-quote support (no shell semantics).

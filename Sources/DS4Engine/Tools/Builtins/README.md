@@ -15,6 +15,7 @@ such as `stringArg`, `intArg`, and `binaryTool` live in `../ToolRegistry.swift`.
 | `project_tree` | `ProjectTree.swift` | Whole-project overview: directories with file counts, in one call. |
 | `project_find` | `ProjectFind.swift` | Finds files by name/path (`*` wildcard); contents are `project_search`'s job. |
 | `project_list`/`read`/`search` | `Project*.swift` | Explores the indexed project (`read` takes optional `lines` up to 400 per call; `search` accepts an optional `path` scope). |
+| `project_reload` | `ProjectReload.swift` | Re-indexes the active project from disk after out-of-band changes (scripts, editor, git — the `git` tool re-indexes automatically after `stash`). |
 | `project_write`/`edit` | `ProjectWrite`/`ProjectEdit.swift` | Writes or edits indexed text files. |
 | `file_read`/`lines`/`write`/`add`/`modify` | `File*.swift` | Raw file access, including line-based reads/edits. |
 | `file_delete` | `FileDelete.swift` | Deletes one file inside the project root (never directories). |
