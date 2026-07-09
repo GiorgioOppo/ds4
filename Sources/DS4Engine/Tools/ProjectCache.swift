@@ -71,10 +71,14 @@ public final class ProjectCache: @unchecked Sendable {
             if resolved.hasPrefix(plainPrefix) { return String(resolved.dropFirst(plainPrefix.count)) }
             return url.lastPathComponent
         }
-        if let en = fm.enumerator(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+        if let en = fm.enumerator(at: rootURL,
+                                  includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey],
                                   options: [.skipsHiddenFiles]) {
             for case let url as URL in en {
-                let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+                let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .isSymbolicLinkKey])
+                // Never index a symlink: reads follow it, and a link carried by
+                // an imported/cloned repo may point anywhere outside the root.
+                if vals?.isSymbolicLink == true { continue }
                 if vals?.isDirectory == true {
                     if Self.skipDirs.contains(url.lastPathComponent) { en.skipDescendants() }
                     continue
@@ -171,7 +175,9 @@ public final class ProjectCache: @unchecked Sendable {
     public func readTool(path relPath: String, fromLine: Int, maxLines: Int? = nil) -> String {
         guard !relPath.contains("..") else { return "Invalid path." }
         guard let text = fileContents(relPath) else {
-            return "File not found in the index: '\(relPath)'. Use project_list to explore."
+            return info() == nil
+                ? "No project imported."
+                : "File not found in the index: '\(relPath)'. Use project_list to explore."
         }
         let lines = text.components(separatedBy: "\n")
         let start = max(1, fromLine)
@@ -279,6 +285,18 @@ public final class ProjectCache: @unchecked Sendable {
         return out
     }
 
+    /// True when `url` (which may not exist yet) stays inside `root` AFTER
+    /// resolving symlinks. The lexical prefix checks catch "..", but a symlink
+    /// INSIDE the project (e.g. carried by a cloned repo) can point anywhere;
+    /// resolving only the existing components keeps not-yet-created write
+    /// targets valid, and resolving both sides also normalizes macOS
+    /// /var → /private/var.
+    private static func withinRoot(_ url: URL, root: URL) -> Bool {
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let prefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+        return url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(prefix)
+    }
+
     /// Load (and cache) a file's contents; nil if not in the index.
     private func fileContents(_ relPath: String) -> String? {
         lock.lock()
@@ -286,7 +304,8 @@ public final class ProjectCache: @unchecked Sendable {
         guard let root, files.contains(relPath) else { lock.unlock(); return nil }
         let url = root.appendingPathComponent(relPath)
         lock.unlock()
-        guard let data = try? Data(contentsOf: url),
+        guard Self.withinRoot(url, root: root),
+              let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else { return nil }
         lock.lock()
         if cachedBytes + data.count > Self.maxCacheBytes { contents = [:]; cachedBytes = 0 }
@@ -305,6 +324,7 @@ public final class ProjectCache: @unchecked Sendable {
         guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
         let url = root.appendingPathComponent(relPath).standardizedFileURL
         guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
+        guard Self.withinRoot(url, root: root) else { return nil }
         guard Self.textExtensions.contains(url.pathExtension.lowercased()) else { return nil }
         return (url, relPath)
     }
@@ -341,7 +361,11 @@ public final class ProjectCache: @unchecked Sendable {
             return "Invalid path or non-text extension: '\(relPath)'."
         }
         guard !find.isEmpty else { return "'find' is empty." }
-        guard let text = fileContents(rel) else {
+        // The edit base is reread from DISK, not from the content cache: the
+        // file may have changed since it was cached (the git tool, the user's
+        // editor) and applying the replacement to a stale base would silently
+        // revert those changes on write. upsertIndex refreshes the cache below.
+        guard let text = freshContents(rel) else {
             return "File not found in the index: '\(rel)'. Use project_list / project_read before editing."
         }
         let occurrences = text.components(separatedBy: find).count - 1
@@ -363,6 +387,18 @@ public final class ProjectCache: @unchecked Sendable {
         return "Edited '\(rel)' around line \(line) (1 replacement)."
     }
 
+    /// Like fileContents but ALWAYS reread from disk (index membership still
+    /// required). For edit bases: see the comment in editTool.
+    private func freshContents(_ relPath: String) -> String? {
+        lock.lock()
+        guard let r = root, files.contains(relPath) else { lock.unlock(); return nil }
+        lock.unlock()
+        let url = r.appendingPathComponent(relPath)
+        guard Self.withinRoot(url, root: r),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// Insert/update a file in the index and content cache after a write.
     private func upsertIndex(_ rel: String, content: String) {
         lock.lock()
@@ -371,6 +407,12 @@ public final class ProjectCache: @unchecked Sendable {
         } else {
             files.append(rel)
         }
+        // Replace, don't double-count: subtract the previous cached size first
+        // (repeated edits of one file used to inflate cachedBytes until the
+        // whole cache got flushed for nothing), then apply the same budget
+        // flush as fileContents.
+        if let old = contents[rel] { cachedBytes = max(0, cachedBytes - old.utf8.count) }
+        if cachedBytes + content.utf8.count > Self.maxCacheBytes { contents = [:]; cachedBytes = 0 }
         contents[rel] = content
         cachedBytes += content.utf8.count
         if let inf = infoValue {
@@ -388,6 +430,7 @@ public final class ProjectCache: @unchecked Sendable {
         guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
         let url = root.appendingPathComponent(relPath).standardizedFileURL
         guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
+        guard Self.withinRoot(url, root: root) else { return nil }
         return url
     }
 
@@ -416,13 +459,25 @@ public final class ProjectCache: @unchecked Sendable {
             for i in (from - 1)..<to { out += "\(i + 1)\t\(lines[i])\n" }
             return out
         }
-        // Whole file, capped.
-        let cap = 96 * 1024
-        guard let text = String(data: data.prefix(cap), encoding: .utf8) else {
+        // Whole file, capped. 24 KB ≈ 6k tokens: on the default low-RAM
+        // context (4096) even that is a big bite, so anything larger must be
+        // read by range — the old 96 KB cap could swallow several contexts.
+        let cap = 24 * 1024
+        var end = min(cap, data.count)
+        var text = String(data: data.prefix(end), encoding: .utf8)
+        // A cap landing mid-character makes a valid text file undecodable:
+        // back off up to 3 bytes (the longest UTF-8 continuation run).
+        while text == nil, data.count > cap, end > cap - 3 {
+            end -= 1
+            text = String(data: data.prefix(end), encoding: .utf8)
+        }
+        guard let text else {
             return "Non-text file ('\(relPath)', \(data.count) bytes): cannot read as text."
         }
         var out = "\(relPath) (\(data.count) bytes):\n\(text)"
-        if data.count > cap { out += "\n... (truncated to \(cap / 1024) KB; pass from_line/to_line for a range)" }
+        if data.count > end {
+            out += "\n... (truncated to \(cap / 1024) KB of \(data.count / 1024) KB; use from_line/to_line to read the rest in ranges)"
+        }
         return out
     }
 
@@ -486,7 +541,12 @@ public final class ProjectCache: @unchecked Sendable {
         var lines = existing.components(separatedBy: "\n")
         let n = lines.count
         let newLines = content.components(separatedBy: "\n")
-        let at = min(max(1, atLine ?? (n + 1)), n + 1)        // insert BEFORE this line; n+1 = append
+        let requested = min(max(1, atLine ?? (n + 1)), n + 1)  // insert BEFORE this line; n+1 = append
+        // Appending to a newline-terminated file: the trailing "" element is
+        // the phantom line AFTER the final newline — insert before it, or the
+        // join manufactures a blank line between old content and new (and the
+        // file keeps its trailing newline this way).
+        let at = (requested == n + 1 && lines.last == "") ? n : requested
         lines.insert(contentsOf: newLines, at: at - 1)
         let updated = lines.joined(separator: "\n")
         guard updated.utf8.count <= Self.maxFileBytes else {
@@ -495,7 +555,7 @@ public final class ProjectCache: @unchecked Sendable {
         do { try updated.write(to: url, atomically: true, encoding: .utf8) }
         catch { return "Write failed: \(error.localizedDescription)" }
         if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
-        return "Added \(newLines.count) lines to '\(relPath)' \(at > n ? "at the end" : "before line \(at)")."
+        return "Added \(newLines.count) lines to '\(relPath)' \(requested > n ? "at the end" : "before line \(at)")."
     }
 
     /// MODIFY by REPLACING lines [fromLine, toLine] (1-based, inclusive) of an
@@ -522,6 +582,9 @@ public final class ProjectCache: @unchecked Sendable {
         let removed = to - from + 1
         lines.replaceSubrange((from - 1)..<to, with: newLines)
         let updated = lines.joined(separator: "\n")
+        guard updated.utf8.count <= Self.maxFileBytes else {
+            return "Resulting file too large (max \(Self.maxFileBytes / 1024) KB)."
+        }
         do { try updated.write(to: url, atomically: true, encoding: .utf8) }
         catch { return "Write failed: \(error.localizedDescription)" }
         if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }

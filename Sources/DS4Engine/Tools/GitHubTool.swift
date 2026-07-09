@@ -260,6 +260,16 @@ public enum GitHubTool {
             let msg = String(data: out, encoding: .utf8) ?? ""
             return "tar failed (exit \(proc.terminationStatus)): \(String(msg.prefix(400)))"
         }
+        // A hostile repo's tarball can carry symlinks pointing anywhere on
+        // disk. The project tools refuse to follow them (ProjectCache resolves
+        // and re-checks the root), but drop them at the source too — a
+        // code-analysis import has no use for symlinks.
+        if let en = fm.enumerator(at: dir, includingPropertiesForKeys: [.isSymbolicLinkKey]) {
+            for case let item as URL in en
+            where (try? item.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+                try? fm.removeItem(at: item)
+            }
+        }
         return nil
     }
 }

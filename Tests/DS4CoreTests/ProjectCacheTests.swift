@@ -115,4 +115,86 @@ final class ProjectCacheTests: XCTestCase {
         XCTAssertTrue(names.isSuperset(of: ["project_tree", "project_list", "project_find",
                                             "project_read", "project_search", "file_delete"]))
     }
+
+    /// project_edit must base the replacement on the CURRENT file, not on the
+    /// content cache: an external change (git, the user's editor) between the
+    /// caching read and the edit must survive, not be silently reverted.
+    func testEditReadsFreshDiskContent() throws {
+        _ = ProjectCache.shared.readTool(path: "Sources/Main.swift", fromLine: 1)   // warm the cache
+        try "let answer = 43\nfunc main() {}\n".write(
+            to: root.appendingPathComponent("Sources/Main.swift"), atomically: true, encoding: .utf8)
+        // "43" exists only on disk: a stale-cache edit would report "not found".
+        let out = ProjectCache.shared.editTool(path: "Sources/Main.swift", find: "43", replace: "44")
+        XCTAssertTrue(out.contains("Edited"), "got: \(out)")
+        let disk = try String(contentsOf: root.appendingPathComponent("Sources/Main.swift"), encoding: .utf8)
+        XCTAssertTrue(disk.contains("let answer = 44"))
+    }
+
+    /// file_add append on a newline-terminated file must not manufacture a
+    /// blank line before the added content (and keeps the trailing newline).
+    func testAddLinesAppendKeepsShape() throws {
+        _ = ProjectCache.shared.writeFileTool(path: "tmp/nl.txt", content: "a\nb\n")
+        let out = ProjectCache.shared.addLinesTool(path: "tmp/nl.txt", content: "c")
+        XCTAssertTrue(out.contains("at the end"), "got: \(out)")
+        let disk = try String(contentsOf: root.appendingPathComponent("tmp/nl.txt"), encoding: .utf8)
+        XCTAssertEqual(disk, "a\nb\nc\n")
+    }
+
+    /// file_modify enforces the same resulting-size cap as file_add.
+    func testModifyLinesResultCapped() throws {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("tmp"),
+                                                withIntermediateDirectories: true)
+        let half = String(repeating: "a", count: 450_000)
+        try (half + "\n" + half).write(to: root.appendingPathComponent("tmp/big.txt"),
+                                       atomically: true, encoding: .utf8)
+        let out = ProjectCache.shared.modifyLinesTool(path: "tmp/big.txt",
+                                                      content: String(repeating: "b", count: 600_000),
+                                                      fromLine: 1)
+        XCTAssertTrue(out.contains("too large"), "got: \(out)")
+    }
+
+    /// file_read whole-file mode: a cap landing inside a multibyte character
+    /// must back off to a character boundary, not report "non-text".
+    func testWholeFileReadBacksOffUTF8Boundary() throws {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("tmp"),
+                                                withIntermediateDirectories: true)
+        let content = String(repeating: "a", count: 24 * 1024 - 1) + "é" + String(repeating: "b", count: 64)
+        try content.write(to: root.appendingPathComponent("tmp/utf8.txt"),
+                          atomically: true, encoding: .utf8)
+        let out = ProjectCache.shared.readFileTool(path: "tmp/utf8.txt")
+        XCTAssertFalse(out.contains("Non-text"), "got: \(out.prefix(200))")
+        XCTAssertTrue(out.contains("truncated"))
+    }
+
+    /// Symlinks must be second-class citizens: never indexed, never readable,
+    /// never a write path — a link in an imported/cloned repo can point
+    /// anywhere on disk.
+    func testSymlinksAreRefused() throws {
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ds4-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try "secret".write(to: outside.appendingPathComponent("secret.txt"),
+                           atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("link.txt"),
+            withDestinationURL: outside.appendingPathComponent("secret.txt"))
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("linkdir"),
+            withDestinationURL: outside)
+        ProjectCache.shared.load(root: root)                       // re-index with the links present
+        XCTAssertTrue(ProjectCache.shared.findTool(pattern: "link").contains("No files match"))
+        XCTAssertFalse(ProjectCache.shared.readFileTool(path: "link.txt").contains("secret"))
+        XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "linkdir/evil.txt", content: "x")
+            .contains("invalid path"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("evil.txt").path))
+    }
+
+    /// project_read without any project says so, instead of a misleading
+    /// "file not found in the index".
+    func testReadWithoutProjectSaysNoProject() {
+        ProjectCache.shared.clear()
+        XCTAssertTrue(ProjectCache.shared.readTool(path: "x.swift", fromLine: 1)
+            .contains("No project imported"))
+    }
 }

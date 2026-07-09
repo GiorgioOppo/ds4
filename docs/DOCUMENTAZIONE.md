@@ -318,8 +318,10 @@ The Coding and Code agents expose `github_clone`: the model downloads a PUBLIC
 GitHub repository as an HTTPS tarball (the request is pinned to
 `codeload.github.com`, owner/name/ref are strictly validated, and the archive
 is size-capped), extracts it under
-`Application Support/DwarfStar/github-projects`, and imports it into the
-project index as the ACTIVE project — replacing the current one. The tool's
+`Application Support/DwarfStar/github-projects` — any symlinks in the archive
+are stripped, and the project tools independently refuse paths that resolve
+outside the root — and imports it into the project index as the ACTIVE
+project, replacing the current one. The tool's
 result is deliberately small: a directory tree with file counts plus the
 documentation files to read first (README, root `.md` files, `docs/`).
 

@@ -15,7 +15,10 @@ library they operate on.
   `ToolSpec`s (`mcp_<server>_<tool>`) next to the built-ins (see `MCP/README.md`).
 - **`ProjectCache.swift`** indexes imported projects and backs the `project_*`
   and `file_*` tools for read/list/search/write/edit/add/line-modify operations.
-  It does not touch chat memory.
+  It does not touch chat memory. Every path is confined to the project root
+  even in the presence of symlinks (resolved and re-checked; symlinks are also
+  never indexed), and `project_edit` rereads its base from disk so an external
+  change (git, the user's editor) is never silently reverted.
 - **`WebClient.swift`** is the shared SSRF-guarded HTTP client behind
   `web_search`/`web_fetch`: http/https only, public hosts only, size- and
   time-capped responses (see `Builtins/README.md`).

@@ -21,9 +21,10 @@ public struct AgentProfile: Sendable, Identifiable, Codable, Equatable {
         .init(id: "generale", name: "General", icon: "person",
               systemPrompt: "", toolNames: []),
         .init(id: "coding", name: "Coding", icon: "chevron.left.forwardslash.chevron.right",
-              systemPrompt: "You are an expert programming assistant. Answer with correct, concise code; explain only what matters. When the user points you at a GitHub repository, import it first with github_clone ('owner/name' or URL): it returns the file tree and the documentation files. Orient from that summary (or from project_tree for an already-imported project), skim the README/docs with project_read — the first chunk is usually enough — then locate code with project_find / project_search and read only the relevant files with project_read before answering. Never read the repository wholesale: every token of tool output is prefill cost.",
+              systemPrompt: "You are an expert programming assistant. Answer with correct, concise code; explain only what matters. When the user points you at a GitHub repository, import it first with github_clone ('owner/name' or URL): it returns the file tree and the documentation files. Orient from that summary (or from project_tree for an already-imported project), skim the README/docs with project_read — the first chunk is usually enough — then locate code with project_find / project_search and read only the relevant files with project_read before answering (file_read reaches non-indexed files such as dotfiles; use its line ranges on big files). Never read the repository wholesale: every token of tool output is prefill cost.",
               toolNames: ["github_clone",
-                          "project_tree", "project_list", "project_find", "project_read", "project_search"]),
+                          "project_tree", "project_list", "project_find", "project_read", "project_search",
+                          "file_read", "file_lines"]),
         .init(id: "code", name: "Code", icon: "terminal",
               systemPrompt: """
               You are an autonomous coding agent working on the imported project. For every request, follow this method, one tool call at a time:
