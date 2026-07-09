@@ -1,4 +1,5 @@
 import SwiftUI
+import DS4Engine
 
 /// Sheet that downloads a GGUF natively (DS4Engine.ModelDownloader) with progress.
 struct DownloadView: View {
@@ -12,6 +13,14 @@ struct DownloadView: View {
                 .font(.title2).bold()
             Text("Native download from Hugging Face into \(store.scriptDir)/gguf. Partial downloads resume automatically.")
                 .font(.caption).foregroundStyle(.secondary)
+            if let source = HFTokenStore.activeSourceDescription() {
+                Label("Authenticated — \(source)", systemImage: "key.fill")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Label("No Hugging Face token: fine for public models. For gated/private repos set one in Settings → Hugging Face.",
+                      systemImage: "key.slash")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
             ForEach(ModelCatalog.downloadTargets) { target in
                 HStack {

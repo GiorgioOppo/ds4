@@ -728,6 +728,15 @@ The download sheet uses the native Swift `ModelDownloader`: resumable HTTP Range
 downloads from Hugging Face, `.part` resume files, and optional SHA-256 content
 verification. Downloads go to `<scriptDir>/gguf`.
 
+Authentication is configured in **Settings → Hugging Face**: paste a read-only
+token from `huggingface.co/settings/tokens` and press Save. The token is stored
+in the macOS **Keychain** (never UserDefaults), shown afterwards only in
+redacted form, and sent by the downloader as `Authorization: Bearer` — needed
+for gated/private repositories and to avoid anonymous rate limits. Remove
+deletes it from the Keychain. When no token is saved, the downloader falls back
+to the `HF_TOKEN` environment variable, then `~/.cache/huggingface/token`; the
+download sheet shows which source, if any, is active.
+
 ## 10. Build, Run, and Package
 
 ```sh

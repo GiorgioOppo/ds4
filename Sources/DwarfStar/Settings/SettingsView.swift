@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import DS4Engine
 
 /// The single place where the model and HOW it runs are configured. Every other
 /// screen (chat, server, benchmark, diagnostics, worker) inherits these values.
@@ -13,10 +14,17 @@ struct SettingsView: View {
     @Bindable var store: ChatStore
     @Bindable var dist: DistributedController
 
+    // Hugging Face token editor state. The field is write-only: the stored
+    // token is never echoed back into it, only the redacted status line.
+    @State private var hfTokenField = ""
+    @State private var hfRevealToken = false
+    @State private var hfStatus: String?
+
     var body: some View {
         VStack(spacing: 0) {
             Form {
                 modelSection
+                huggingFaceSection
                 Section("Mode") {
                     Picker("Execution", selection: $settings.mode) {
                         ForEach(AppSettings.EngineMode.allCases) { Text($0.rawValue).tag($0) }
@@ -38,6 +46,63 @@ struct SettingsView: View {
                 DistLogView(text: dist.coordLog, height: 120)
             }
         }
+    }
+
+    // MARK: Hugging Face token
+
+    /// Configuration for the token the model downloader sends as
+    /// `Authorization: Bearer`. Stored in the KEYCHAIN (never UserDefaults — a
+    /// token is a secret, not a preference) via `HFTokenStore` and passed
+    /// explicitly to `ModelDownloader.download`, so it wins over the `HF_TOKEN`
+    /// env var and `~/.cache/huggingface/token` fallbacks.
+    private var huggingFaceSection: some View {
+        Section("Hugging Face") {
+            HStack(spacing: 8) {
+                Group {
+                    if hfRevealToken {
+                        TextField("hf_...", text: $hfTokenField)
+                    } else {
+                        SecureField("hf_...", text: $hfTokenField)
+                    }
+                }
+                .autocorrectionDisabled()
+                Button {
+                    hfRevealToken.toggle()
+                } label: {
+                    Image(systemName: hfRevealToken ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.borderless)
+                .help(hfRevealToken ? "Hide the token" : "Show the token")
+                Button("Save") {
+                    if HFTokenStore.save(hfTokenField) {
+                        hfTokenField = ""
+                        hfRevealToken = false
+                    }
+                    refreshHFStatus()
+                }
+                .disabled(hfTokenField.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Remove", role: .destructive) {
+                    HFTokenStore.clear()
+                    refreshHFStatus()
+                }
+                .disabled(HFTokenStore.load() == nil)
+            }
+            if let status = hfStatus {
+                Label("Active token — \(status)", systemImage: "key.fill")
+                    .font(.caption)
+            } else {
+                Label("No token configured. Public models download without one.",
+                      systemImage: "key.slash")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Text("Used by the model downloader as \u{201C}Authorization: Bearer\u{201D} for gated/private Hugging Face repositories and to avoid anonymous rate limits. Create a read-only token at huggingface.co/settings/tokens. Saved in the macOS Keychain (not UserDefaults) and never shown again in full; saving replaces the previous one. Without a saved token the downloader falls back to the HF_TOKEN environment variable, then ~/.cache/huggingface/token.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear { refreshHFStatus() }
+    }
+
+    private func refreshHFStatus() {
+        hfStatus = HFTokenStore.activeSourceDescription()
     }
 
     // MARK: Modello (shared by both modes)

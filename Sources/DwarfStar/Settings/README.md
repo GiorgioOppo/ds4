@@ -2,7 +2,11 @@
 
 - **`SettingsView.swift`** renders global Settings. Model path and context length
   are configured once through `AppSettings` and inherited everywhere: Chat,
-  Server, Benchmark, Diagnostics, and Worker.
+  Server, Benchmark, Diagnostics, and Worker. The **Hugging Face** section
+  stores the download token in the macOS Keychain via
+  `DS4Engine.HFTokenStore` (write-only field, redacted status line; the
+  downloader receives it explicitly, winning over `HF_TOKEN` env and
+  `~/.cache/huggingface/token`).
 - **`MCPServersView.swift`** renders the MCP panel: `MCPStore` persists the
   configured MCP servers (UserDefaults, `mcpServers`-JSON import/export) and
   pushes them to `MCPManager.shared` (in `DS4Engine/Tools/MCP/`), which owns

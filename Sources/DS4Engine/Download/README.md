@@ -11,6 +11,14 @@ Native model download support.
   `HF_TOKEN` env > `~/.cache/huggingface/token`. See the root
   [Configuration Reference](../../../README.md#configuration-reference) for
   the download-related settings.
+- **`HFTokenStore.swift`** keeps the user's Hugging Face token in the macOS
+  **Keychain** (generic password, app-private — never UserDefaults). The GUI
+  edits it in Settings → Hugging Face and passes it to
+  `ModelDownloader.download(token:)` as the explicit tier, so it wins over the
+  env/file fallbacks; `resolveToken` itself stays keychain-free so the CLI demo
+  and tests never trigger a keychain prompt. Also provides the redacted
+  `masked()` display form and `activeSourceDescription()` for the status lines
+  in Settings and the download sheet.
 
 When `ModelTarget.sha256` is configured, the downloader verifies the downloaded
 file against that known SHA-256 digest. Otherwise it reports the calculated

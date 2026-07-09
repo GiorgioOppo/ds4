@@ -33,11 +33,15 @@ final class DownloadRunner {
         // Task inherits @MainActor (DownloadRunner is @MainActor), so we consume
         // events and update state directly here; the download runs in an async
         // let child that captures only Sendable values (target, dir, continuation).
+        // The keychain token (Settings → Hugging Face) rides the explicit-token
+        // tier of ModelDownloader.resolveToken, winning over HF_TOKEN env and
+        // ~/.cache/huggingface/token. nil = fall back to those, as before.
+        let keychainToken = HFTokenStore.load()
         task = Task {
             let (stream, cont) = AsyncStream<DLEvent>.makeStream()
             async let dl: String = {
                 let url = try await ModelDownloader.download(
-                    target: t, ggufDir: ggufDir,
+                    target: t, ggufDir: ggufDir, token: keychainToken,
                     onProgress: { done, total in cont.yield(.progress(done, total)) },
                     onStatus: { msg in cont.yield(.status(msg)) })
                 cont.finish()

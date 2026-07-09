@@ -358,7 +358,7 @@ Workflow guidance ("which knob to try first") is in
 | `DS4_Q4_CACHE_DIR` | dir; default: next to the GGUF | Where `.q4dense` requant caches are read/written. The app sets it to Application Support (sandbox can't write next to the model). |
 | `DS4_BUNDLE_DIR` | dir; default: next to the GGUF | Fallback directory for the `.expbundle` sidecar (a sibling of the GGUF is always tried first). The app sets it to Application Support. |
 | `DS4_SEARCH_URL` | URL template containing `%@`; default `https://html.duckduckgo.com/html/?q=%@` | Endpoint used by the built-in `web_search` tool; the query is percent-encoded into `%@` and results are parsed from DuckDuckGo-style HTML. |
-| `HF_TOKEN` | token; default: `~/.cache/huggingface/token` | Hugging Face token used by the model downloader for authenticated downloads. |
+| `HF_TOKEN` | token; default: `~/.cache/huggingface/token` | Hugging Face token used by the model downloader for authenticated downloads (bare processes: demo/tests). In the app, a token saved in Settings → Hugging Face (Keychain) takes precedence over this variable. |
 
 #### Diagnostics (demo-oriented)
 
@@ -546,8 +546,10 @@ built-ins, in the chat Tool sheet and in agent tool lists.
 
 The Download sheet drives the native resumable downloader (HTTP Range +
 `.part` files) against `huggingface.co/antirez/deepseek-v4-gguf`, saving into
-`<resources>/gguf/`. Authentication: explicit token > `HF_TOKEN` env >
-`~/.cache/huggingface/token`.
+`<resources>/gguf/`. Authentication: token saved in **Settings → Hugging Face**
+(stored in the macOS Keychain, shown only redacted, passed as the explicit
+token) > `HF_TOKEN` env > `~/.cache/huggingface/token`. The sheet shows which
+source is active; public models need none.
 
 | Target id | Contents | ~Size |
 |---|---|---|
