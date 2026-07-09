@@ -21,6 +21,13 @@ library they operate on.
   time-capped responses (see `Builtins/README.md`).
 - **`GitTool.swift`** runs whitelisted local git subcommands in the project root.
   Network operations are intentionally excluded.
+- **`GitHubTool.swift`** backs the `github_clone` built-in: downloads a public
+  GitHub repository as an HTTPS tarball (host pinned to `codeload.github.com`,
+  arguments strictly validated, size-capped), extracts it under
+  `Application Support/DwarfStar/github-projects`, imports it into
+  `ProjectCache` as the active project, and returns a compact orientation
+  summary (tree + documentation files) — so the model explores with the
+  `project_*` tools instead of paying prefill for the whole repository.
 - **`Agents.swift`** defines `AgentProfile` (system prompt, tools, and expert
   profile) and `AgentRegistry`, the shared roster read by `agents_list`.
   Default roles: General, Coding, Code (agentic editing), Reviewer (read-only

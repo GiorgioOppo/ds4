@@ -312,6 +312,26 @@ training template.
 Tool results are inserted back into the conversation as user-side tool-result
 turns. Built-ins run automatically. Unknown tools can be answered manually.
 
+### Analyzing a GitHub Repository from Chat
+
+The Coding and Code agents expose `github_clone`: the model downloads a PUBLIC
+GitHub repository as an HTTPS tarball (the request is pinned to
+`codeload.github.com`, owner/name/ref are strictly validated, and the archive
+is size-capped), extracts it under
+`Application Support/DwarfStar/github-projects`, and imports it into the
+project index as the ACTIVE project — replacing the current one. The tool's
+result is deliberately small: a directory tree with file counts plus the
+documentation files to read first (README, root `.md` files, `docs/`).
+
+From there the model works context-frugally, the same way as with a folder
+imported from the Project tab: structure via `project_tree`/`project_list`,
+file names via `project_find`, code search via `project_search` (optionally
+scoped to a subfolder), and targeted reads via `project_read` in line-capped
+chunks. Nothing enters the conversation KV until a tool actually returns
+content, so a large repository can be analyzed without prefilling it into the
+context. `github_clone` is not grantable to sub-agents because it swaps the
+shared active project.
+
 ### MCP Servers
 
 The **MCP** tab connects the app, as a Model Context Protocol CLIENT, to

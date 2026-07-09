@@ -81,6 +81,13 @@ Built-in DSML tools live one per file under
 
 - **Project index tools:** `project_list`, `project_read`, `project_search`,
   `project_write`, `project_edit`.
+- **GitHub import:** `github_clone` downloads a public repository (HTTPS
+  tarball, no git binary or credentials) into Application Support and makes it
+  the active project, returning a compact orientation summary (tree +
+  documentation files). The Coding and Code agents use it to analyze a repo
+  with the project tools — structure via `project_tree`, targeted code search
+  via `project_find`/`project_search` — instead of reading every file into the
+  chat context.
 - **Raw project-root file tools:** `file_read`, `file_lines`, `file_write`,
   `file_add`, `file_modify`.
 - **Utilities:** `git` (local whitelist, no network), `calculator`,
@@ -329,6 +336,7 @@ defaults write org.ds4.dwarfstar DS4DenseAhead -int 3     # `make app` bundles
 | `~/Library/Application Support/DwarfStar/q4-cache/` | `.q4dense` requant caches (~1.4 GB per model) — the sandboxed app cannot write next to the GGUF. |
 | `~/Library/Application Support/DwarfStar/expert-bundle/` | Expert-bundle sidecars built when the model folder is not writable (tens of GB). |
 | `~/Library/Application Support/DwarfStar/dist-models/` | Files received via distributed transfer (GGUF, sidecars), keyed by SHA-256 manifest. |
+| `~/Library/Application Support/DwarfStar/github-projects/` | Repositories imported by the `github_clone` tool, one `<owner>-<repo>` folder each (replaced on re-clone). |
 | `~/Library/Application Support/DwarfStar/expert-usage-<model>-<agent>.json` | Per-model, per-agent usage imatrix (routing history used to pre-warm the expert cache). |
 | `<resources>/gguf/` | Model download destination (`.part` files while downloading). |
 

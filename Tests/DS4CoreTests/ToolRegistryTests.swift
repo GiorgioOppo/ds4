@@ -92,7 +92,7 @@ final class ToolRegistryTests: XCTestCase {
     func testNewToolsAreDeclared() {
         let names = Set(ToolRegistry.builtins.map(\.spec.name))
         XCTAssertTrue(names.isSuperset(of: ["add", "subtract", "multiply",
-                                            "web_search", "web_fetch",
+                                            "web_search", "web_fetch", "github_clone",
                                             "project_tree", "project_find", "file_delete"]))
     }
 
@@ -102,12 +102,14 @@ final class ToolRegistryTests: XCTestCase {
     }
 
     /// Sub-agents may receive any built-in except the orchestration tools
-    /// (no nested sub-agents), and the new tools are grantable.
+    /// (no nested sub-agents) and github_clone (it replaces the shared active
+    /// project), and the new tools are grantable.
     func testSubAgentGrantable() {
         let g = ToolRegistry.subAgentGrantable
         XCTAssertFalse(g.contains("subagent_run"))
         XCTAssertFalse(g.contains("subagent_search"))
         XCTAssertFalse(g.contains("agents_list"))
+        XCTAssertFalse(g.contains("github_clone"))
         XCTAssertTrue(g.isSuperset(of: ["project_tree", "project_find", "file_delete",
                                         "web_search", "web_fetch", "git"]))
     }

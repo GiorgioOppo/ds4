@@ -31,7 +31,7 @@ public enum ToolRegistry {
     /// project_write/project_edit and file_write/file_add/file_modify have side
     /// effects (they modify files INSIDE the active project root only); else pure.
     public static let builtins: [BuiltinTool] = [clock, calculator, add, subtract, multiply,
-                                                 webSearch, webFetch,
+                                                 webSearch, webFetch, githubClone,
                                                  projectTree, projectList, projectFind,
                                                  projectRead, projectSearch,
                                                  projectWrite, projectEdit,
@@ -58,10 +58,13 @@ public enum ToolRegistry {
 
     /// Tools a sub-agent may be granted: every built-in EXCEPT the orchestration
     /// tools (no nested sub-agents; `agents_list` is for the orchestrator, not for
-    /// doing work). The main agent passes a minimal subset of these to
-    /// `subagent_run`; names outside this set are ignored.
+    /// doing work) and `github_clone`, which REPLACES the shared active project —
+    /// a sub-agent must not swap the project out from under the main agent. The
+    /// main agent passes a minimal subset of these to `subagent_run`; names
+    /// outside this set are ignored.
     public static var subAgentGrantable: Set<String> {
-        Set(builtins.map(\.spec.name)).subtracting(["subagent_run", "subagent_search", "agents_list"])
+        Set(builtins.map(\.spec.name)).subtracting(["subagent_run", "subagent_search", "agents_list",
+                                                    "github_clone"])
     }
 
     /// Run a model-emitted call against the built-ins; nil if it's not a built-in
