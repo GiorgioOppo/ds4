@@ -7,9 +7,22 @@ import Foundation
 //
 // Validation: cross-checked against the public C ds4_sample_logits over many
 // (temperature, top_k, top_p, min_p, seed) configurations with identical logits.
+//
+// DS4_FAST_SAMPLER (default on) short-circuits the full-vocabulary candidate
+// sort when min_p > 0 by collecting only the reachable candidates — same
+// selection and same RNG stream; `=0` restores the historical full build for
+// parity diagnostics.
 
 public enum Sampler {
     static let negInf: Float = -1.0e30
+
+    /// DS4_FAST_SAMPLER (default on; `=0` disables): threshold-collected fast
+    /// path for the full-vocabulary sampler (`topK <= 0`, `topP < 1`,
+    /// `minP > 0` — the server/subagent default config). See `fullVocab`.
+    /// Cached once: ProcessInfo.environment materializes a fresh dictionary
+    /// per call — far too costly per token.
+    static let fastFullVocab: Bool =
+        ProcessInfo.processInfo.environment["DS4_FAST_SAMPLER"] != "0"
 
     /// Port of sample_argmax.
     public static func argmax(_ logits: [Float]) -> Int {
@@ -40,10 +53,15 @@ public enum Sampler {
 
     private struct Candidate { var id: Int; var logit: Float; var prob: Float }
 
-    /// Port of sample_full_vocab (top_k <= 0 path).
-    private static func fullVocab(_ logits: [Float], _ nVocab: Int,
-                                  _ temperature: Float, _ topP: Float, _ minP: Float,
-                                  _ rng: inout UInt64) -> Int {
+    /// Port of sample_full_vocab (top_k <= 0 path). With `minP > 0` and
+    /// DS4_FAST_SAMPLER (default) the candidate build collects only the tokens
+    /// that the min-p walk can actually reach, skipping the full-vocabulary
+    /// sort — same selection, same RNG consumption (see the fast-path comment).
+    /// `fast` is injectable (internal) so the parity test can compare both
+    /// builds without touching the process environment.
+    static func fullVocab(_ logits: [Float], _ nVocab: Int,
+                          _ temperature: Float, _ topP: Float, _ minP: Float,
+                          _ rng: inout UInt64, fast: Bool = Sampler.fastFullVocab) -> Int {
         var maxLogit = negInf
         var best = 0
         var finite = 0
@@ -77,14 +95,42 @@ public enum Sampler {
         }
 
         var cand: [Candidate] = []
-        cand.reserveCapacity(finite)
         var sum: Float = 0.0
-        for i in 0..<nVocab {
-            let v = logits[i]
-            if !v.isFinite { continue }
-            let p = expf((v - maxLogit) / temperature)
-            cand.append(Candidate(id: i, logit: v, prob: p))
-            sum += p
+        if fast && minP > 0.0 {
+            // FAST PATH (DS4_FAST_SAMPLER): the sorted walk below never RETAINS
+            // a candidate whose p = prob/sum falls under minProb = (1/sum)*minP
+            // — probs are monotone in the sort order, so the first such
+            // candidate breaks the loop and everything after it is unreachable.
+            // Collecting only candidates with prob >= minP/4 therefore yields
+            // the SAME filtered prefix: the 4x margin is orders of magnitude
+            // beyond the few-ulp wobble of the exact per-candidate comparison
+            // (both sides divided by the same sum), and the max — prob =
+            // expf(0) = 1 — always survives min(pre, 1.0). `sum`, every
+            // retained expression and the RNG draw are evaluated verbatim in
+            // the same order, so the selection can only differ from the
+            // historical path in the ordering of EXACT logit ties (which the
+            // full sort itself leaves unspecified — see the sort note below).
+            // Net effect: the descending sort runs on the few candidates above
+            // threshold instead of on all ~129k (which cost ms per token on
+            // the topK=0 server/subagent path).
+            cand.reserveCapacity(1024)
+            let pre = min(minP * 0.25, 1.0)
+            for i in 0..<nVocab {
+                let v = logits[i]
+                if !v.isFinite { continue }
+                let p = expf((v - maxLogit) / temperature)
+                sum += p
+                if p >= pre { cand.append(Candidate(id: i, logit: v, prob: p)) }
+            }
+        } else {
+            cand.reserveCapacity(finite)
+            for i in 0..<nVocab {
+                let v = logits[i]
+                if !v.isFinite { continue }
+                let p = expf((v - maxLogit) / temperature)
+                cand.append(Candidate(id: i, logit: v, prob: p))
+                sum += p
+            }
         }
         if sum <= 0.0 || !sum.isFinite { return best }
 

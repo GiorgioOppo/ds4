@@ -148,6 +148,16 @@ public final class StreamingDecoder {
     /// end of token (before the output head / readHC) and on every error path.
     var inflightFFN: GraphContext?
     let asyncFFN = ProcessInfo.processInfo.environment["DS4_ASYNC_FFN"] != "0"
+    /// DS4_ASYNC_ROUTE (default ON): the decode route commits WITHOUT a CPU
+    /// wait and the shared FFN is committed right behind it, so the GPU chains
+    /// route→sharedFFN with no encode gap while the CPU waits for the
+    /// selection; the CPU join on the shared FFN before encoding the routed
+    /// FFN is also skipped (in-order queue + hazard tracking give the same
+    /// ordering — the DS4_ASYNC_FFN argument). `=0` restores the historical
+    /// fully-synchronous route path for A/B and debugging. Token-identical
+    /// either way; DS4_PROFILE_ROUTE forces the synchronous path regardless
+    /// (accurate per-phase attribution).
+    let asyncRoute = ProcessInfo.processInfo.environment["DS4_ASYNC_ROUTE"] != "0"
     /// One embedding-table ROW (F16, nEmbd × 2 B), CPU-staged per token.
     /// Binding the full multi-hundred-MB no-copy table to a command buffer
     /// makes Metal wire the WHOLE mapping every token — on tight-RAM machines

@@ -79,6 +79,48 @@ final class SamplerTests: XCTestCase {
         XCTAssertEqual(penalized, 3)
     }
 
+    /// DS4_FAST_SAMPLER parity: the threshold-collected fast path of the
+    /// full-vocabulary sampler must reproduce the historical full build
+    /// exactly — same token AND same RNG stream — across a grid of parameters
+    /// and logit shapes (scattered, peaked, -inf holes, all-ties). The shapes
+    /// are chosen so the collected subset is either all-distinct or the whole
+    /// vocabulary: ordering of exact logit ties inside a PROPER subset is the
+    /// one documented divergence (the full sort leaves it unspecified too).
+    func testFastFullVocabMatchesFullBuild() {
+        let n = 4001
+        var shapes: [[Float]] = []
+        shapes.append(makeLogits(n))                        // scattered, all distinct
+        var peaked = makeLogits(n); peaked[123] = 40        // near-argmax mass
+        shapes.append(peaked)
+        var withInf = makeLogits(n)                         // -inf holes are skipped
+        for i in stride(from: 0, to: n, by: 7) { withInf[i] = -Float.infinity }
+        shapes.append(withInf)
+        var flat = [Float](repeating: 0.5, count: n)        // ALL ties -> subset == full set
+        flat[0] = 0.6
+        shapes.append(flat)
+
+        let temps: [Float] = [0.3, 0.6, 1.0, 1.5]
+        let topPs: [Float] = [0.5, 0.9, 0.95, 0.999]
+        let minPs: [Float] = [0.001, 0.01, 0.05, 0.5]
+        let seeds: [UInt64] = [1, 42, 0xDEAD_BEEF]
+        for (si, logits) in shapes.enumerated() {
+            for temp in temps {
+                for topP in topPs {
+                    for minP in minPs {
+                        for seed in seeds {
+                            var ra = seed, rb = seed
+                            let slow = Sampler.fullVocab(logits, n, temp, topP, minP, &ra, fast: false)
+                            let fastTok = Sampler.fullVocab(logits, n, temp, topP, minP, &rb, fast: true)
+                            let label = "shape=\(si) temp=\(temp) topP=\(topP) minP=\(minP) seed=\(seed)"
+                            XCTAssertEqual(slow, fastTok, "token diverged: \(label)")
+                            XCTAssertEqual(ra, rb, "RNG stream diverged: \(label)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Self-consistency invariants across a grid of sampling parameters: the
     /// sampler must always return a valid in-range index, and top_k==1 must
     /// collapse to the argmax (the single most likely token).

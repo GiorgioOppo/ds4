@@ -58,13 +58,18 @@ extension StreamingDecoder {
             // SSD. La FFN condivisa (c1, asincrona) copre la latenza di rete
             // come copriva quella del disco.
             var t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            let route = try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            // La FFN condivisa non dipende dalla selezione: encode+commit PRIMA
+            // di attendere la route, così la GPU concatena route→FFN senza gap
+            // (ordine della queue in-order) mentre la CPU aspetta la selezione.
+            let c1 = GraphContext(rt)
+            do { try c1.begin(); try c1.decodeSharedFFN(w: w, s: scratch, d: d) }
+            catch { route.waitCompleted(); throw error }
+            c1.commitAsync()
+            route.waitCompleted()   // da qui s.selected/s.rw E s.cur sono leggibili CPU-side
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeSharedFFN(w: w, s: scratch, d: d)
-            c1.commitAsync()
-            // Attivazione (s.cur, finale dopo il route committato) → CPU.
+            // Attivazione (s.cur, finale dopo il route completato) → CPU.
             let nE = d.nEmbd
             let curPtr = (scratch.cur.buffer.contents() + scratch.cur.byteOffset)
                 .bindMemory(to: Float.self, capacity: nE)
@@ -87,30 +92,43 @@ extension StreamingDecoder {
                 memcpy(target.buffer.contents() + target.byteOffset, $0.baseAddress!, nE * 4)
             }
             t = Date()
-            c1.waitCompleted()   // s.sharedOut pronto (di solito già finito)
-            let c2 = GraphContext(rt); try c2.begin()
-            try c2.decodeRemoteTail(s: scratch, d: d, partial: target, outHc: other)
+            // c2 legge s.sharedOut SOLO su GPU: l'ordine della queue in-order
+            // basta (stesso argomento di commitFFN/DS4_ASYNC_FFN) — nessuna
+            // attesa CPU su c1 nel percorso felice. Il wait resta sotto
+            // profiling (attribuzione storica di expertsS), con
+            // DS4_ASYNC_ROUTE=0 e sugli error path.
+            if profileRoute || !asyncRoute { c1.waitCompleted() }
+            let c2 = GraphContext(rt)
+            do { try c2.begin(); try c2.decodeRemoteTail(s: scratch, d: d, partial: target, outHc: other) }
+            catch { c1.waitCompleted(); throw error }
             commitFFN(c2)
             profile.expertsS += Date().timeIntervalSince(t)
         } else if let gather = expertGather {
-            // Phase 1: route (own cb) -> read the selected ids (top-K reduced).
+            // Phase 1: route (own cb, in flight) -> shared FFN committed behind
+            // it -> JOIN the route -> read the selected ids (top-K reduced).
             var t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            let route = try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            // I/O–compute OVERLAP, senza gap GPU: la FFN condivisa non dipende
+            // dalla selezione, quindi è encodata e committata PRIMA del join
+            // della route — la GPU concatena route→FFN back-to-back e macina
+            // mentre la CPU legge la selezione e gathera gli esperti dall'SSD.
+            // On error the in-flight buffers are waited before rethrowing, so a
+            // rebuilt turn can never race a stale write into the scratch.
+            let c1 = GraphContext(rt)
+            do { try c1.begin(); try c1.decodeSharedFFN(w: w, s: scratch, d: d) }
+            catch { route.waitCompleted(); throw error }
+            c1.commitAsync()
+            route.waitCompleted()   // da qui s.selected/s.rw sono leggibili CPU-side
             profile.routeS += Date().timeIntervalSince(t)
             let (ids, rw) = readRouteSelection(layer: i)
             let K = ids.count
             if K < d.k {
+                // Route completata ⇒ (queue in-order) anche la FFN routed del
+                // layer precedente: queste scritture CPU non possono correre
+                // con un lettore GPU in volo (c1 non tocca rw/down6).
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            // I/O–compute OVERLAP: the shared-expert FFN does not depend on the
-            // routing selection, so commit it asynchronously FIRST — the GPU
-            // crunches it while the CPU gathers the routed experts from the SSD.
-            // On error the in-flight buffer is waited before rethrowing, so a
-            // rebuilt turn can never race a stale write into the scratch.
-            let c1 = GraphContext(rt); try c1.begin()
-            try c1.decodeSharedFFN(w: w, s: scratch, d: d)
-            c1.commitAsync()
             // The slot cache is a single size-class (the model-global/first-layer
             // quant). A mixed-precision layer (different expert bytes) can't share
             // the pool, so it falls through to the per-layer-correct gather path.
@@ -140,12 +158,21 @@ extension StreamingDecoder {
                     memcpy(slotsBuf.buffer.contents(), $0.baseAddress!, $0.count)
                 }
                 t = Date()
-                c1.waitCompleted()   // s.sharedOut ready (usually already done)
-                let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
-                                           upExp: pool.up, downExp: pool.down,
-                                           ids: slotsBuf, outHc: other, activeK: K,
-                                           expertStride: slotCacheStride)
+                // c2 legge s.sharedOut SOLO su GPU (l'add è un dispatch): la
+                // queue in-order ordina c1→c2, nessuna attesa CPU nel percorso
+                // felice — stesso argomento certificato per DS4_ASYNC_FFN. Il
+                // wait resta sotto profiling (attribuzione storica di expertsS),
+                // con DS4_ASYNC_ROUTE=0 e sugli error path (c1 non è tracciato
+                // da drainFFN).
+                if profileRoute || !asyncRoute { c1.waitCompleted() }
+                let c2 = GraphContext(rt)
+                do {
+                    try c2.begin()
+                    try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
+                                               upExp: pool.up, downExp: pool.down,
+                                               ids: slotsBuf, outHc: other, activeK: K,
+                                               expertStride: slotCacheStride)
+                } catch { c1.waitCompleted(); throw error }
                 commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             } else {
@@ -158,16 +185,24 @@ extension StreamingDecoder {
                 profile.gatherS += Date().timeIntervalSince(t)
                 profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
                 t = Date()
-                c1.waitCompleted()   // s.sharedOut ready (usually already done)
-                let c2 = GraphContext(rt); try c2.begin()
-                try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
-                                           ids: idsPacked, outHc: other, activeK: K)
+                if profileRoute || !asyncRoute { c1.waitCompleted() }   // vedi sopra
+                let c2 = GraphContext(rt)
+                do {
+                    try c2.begin()
+                    try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: g, upExp: u, downExp: dn,
+                                               ids: idsPacked, outHc: other, activeK: K)
+                } catch { c1.waitCompleted(); throw error }
                 commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
             }
         } else {
             let t = Date()
-            try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            let route = try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur, pos: pos, nKeys: nKeys, token: token)
+            // Percorso residente: nessuna lettura CPU della selezione, ma il
+            // memset di clearMaskIfDirty del layer successivo non deve correre
+            // con l'attention di QUESTO route ancora in volo — join immediato,
+            // identico al comportamento storico (commit bloccante).
+            route.waitCompleted()
             let lc = GraphContext(rt); try lc.begin()
             try lc.decodeExperts(w: w, s: scratch, d: d, gateExp: w.expGate, upExp: w.expUp,
                                  downExp: w.expDown, ids: scratch.selected, outHc: other)
@@ -177,14 +212,27 @@ extension StreamingDecoder {
         profile.layers += 1
     }
 
-    /// Encode (and COMMIT) the route for one token on layer `i`. When the NSA
-    /// indexer is active (ratio-4 layer with more compressed rows than the top-K),
-    /// the command buffer is split at the indexer scores: commit phase 1a, run the
+    /// Encode (and COMMIT) the route for one token on layer `i`, returning the
+    /// route's LAST command-buffer context. On the happy path (DS4_ASYNC_ROUTE,
+    /// default ON) the commit is ASYNCHRONOUS and the returned context is in
+    /// flight: il chiamante DEVE fare `waitCompleted()` prima di leggere
+    /// CPU-side la selezione (s.selected/s.rw) o l'attivazione (s.cur), e prima
+    /// di scritture CPU su buffer che la route legge (s.mask) — ma DOPO aver
+    /// committato il lavoro GPU che può accodarsi dietro la route sulla queue
+    /// in-order (la FFN condivisa), così la GPU non resta mai in bolla tra
+    /// route e FFN. Sotto DS4_PROFILE_ROUTE (o DS4_ASYNC_ROUTE=0) ogni commit
+    /// resta sincrono: il contesto tornato è già completo e waitCompleted() è
+    /// un no-op idempotente.
+    ///
+    /// When the NSA indexer is active (ratio-4 layer with more compressed rows
+    /// than the top-K), the command buffer is split at the indexer scores:
+    /// commit phase 1a SYNCHRONOUSLY (the CPU top-K reads the scores), run the
     /// CPU top-K to write the compressed-row mask, then encode the attention —
-    /// the C "dense top-k mask" path (indexer_allowed_decode_one). Otherwise a
-    /// single command buffer, numerically identical to the pre-indexer code.
+    /// the C "dense top-k mask" path (indexer_allowed_decode_one); only the
+    /// attention half is returned in flight. Otherwise a single command buffer,
+    /// numerically identical to the pre-indexer code.
     func encodeRoute(_ i: Int, w: LayerWeights, layerRope: RopeParams,
-                             curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
+                             curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws -> GraphContext {
         let idx = indexStates[i]
         // The indexer carries TWO independent weight sets. The compressor pair
         // (idxKv/idxGate) feeds the recurrent STATE update: it runs every token
@@ -215,9 +263,16 @@ extension StreamingDecoder {
                                   rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token,
                                   rmsEps: rmsEps, hcEps: hcEps, nComp: nComp,
                                   comp: compStates[i])
-            if profileRoute { try c.phase("router") }
-            c.commit()
-            if profileRoute { accumulateRoutePhases(c, nil) }
+            if profileRoute {
+                try c.phase("router")
+                c.commit()
+                accumulateRoutePhases(c, nil)
+            } else if asyncRoute {
+                c.commitAsync()
+            } else {
+                c.commit()
+            }
+            return c
         } else if active, let idx {
             // Indexer layers always split (CPU top-k sits between pre and attn). The
             // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
@@ -233,9 +288,16 @@ extension StreamingDecoder {
             try c2.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
-            try c2.phase("router")
-            c2.commit()
-            if profileRoute { accumulateRoutePhases(c1, c2) }
+            if profileRoute {
+                try c2.phase("router")
+                c2.commit()
+                accumulateRoutePhases(c1, c2)
+            } else if asyncRoute {
+                c2.commitAsync()
+            } else {
+                c2.commit()
+            }
+            return c2
         } else if profileRoute {
             // Profiling: detailed split. Extra commits inflate ABSOLUTE time.
             clearMaskIfDirty()
@@ -251,6 +313,7 @@ extension StreamingDecoder {
             try c.phase("router")
             c.commit()
             accumulateRoutePhases(c, nil)
+            return c
         } else {
             clearMaskIfDirty()
             let c1 = GraphContext(rt); try c1.begin()
@@ -261,7 +324,8 @@ extension StreamingDecoder {
             try c1.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                                    nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                                    nComp: nComp, comp: compStates[i])
-            c1.commit()
+            if asyncRoute { c1.commitAsync() } else { c1.commit() }
+            return c1
         }
     }
 

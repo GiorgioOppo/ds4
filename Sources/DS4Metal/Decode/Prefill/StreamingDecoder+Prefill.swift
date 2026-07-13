@@ -207,8 +207,11 @@ extension StreamingDecoder {
                     try Task.checkCancellation()
                     let pos = posBase + j
                     let t = Date()
-                    try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1,
-                                    token: tokens[j])
+                    let route = try encodeRoute(i, w: w, layerRope: layerRope, curHc: cur[j], pos: pos, nKeys: pos + 1,
+                                                token: tokens[j])
+                    // Fallback per-token: selezione E scratch (cur/afterAttn/split)
+                    // letti CPU-side subito sotto — semantica bloccante come prima.
+                    route.waitCompleted()
                     profile.routeS += Date().timeIntervalSince(t)
                     let (ids, rw) = readRouteSelection(layer: i)
                     idsT.append(ids); rwT.append(rw)
