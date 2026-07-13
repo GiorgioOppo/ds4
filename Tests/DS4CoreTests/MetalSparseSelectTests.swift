@@ -7,10 +7,42 @@ final class MetalSparseSelectTests: XCTestCase {
     static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
 
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/dsv4_misc.metal"),
-                          "vendored metal kernels not present")
-        do { return try MetalRuntime(metalDir: Self.metalDir) }
+        // Use the embedded source-of-truth so newly added kernels are exercised
+        // even when the historical external checkout is absent or stale.
+        do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
+    }
+
+    func testIndexerTopKMaskOneMatchesCPUHeap() throws {
+        let rt = try makeRuntime()
+        let nRaw = 127, nComp = 1800, nScores = 1703, topK = 512
+        var seed: UInt64 = 0x1D3E_7E2
+        var scores = [Float](repeating: 0, count: nScores)
+        for i in 0..<scores.count {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            // Deliberately quantize values so tie-breaking by lower row id is tested.
+            scores[i] = Float(Int32(truncatingIfNeeded: seed >> 48) % 97)
+        }
+        let expected = scores.withUnsafeBufferPointer {
+            IndexerSelect.allowedTopK(scores: $0.baseAddress!, count: nScores, k: topK)
+        }
+
+        let scoreT = try GPUTensor.floats(rt, scores)
+        let maskT = try GPUTensor.zerosBytes(rt, byteLength: (nRaw + nComp) * 2)
+        let c = GraphContext(rt); try c.begin()
+        try c.indexerTopKMask(scores: scoreT, mask: maskT, nRaw: nRaw,
+                              nComp: nComp, nScores: nScores, topK: topK)
+        c.commit()
+
+        let p = (maskT.buffer.contents() + maskT.byteOffset)
+            .bindMemory(to: UInt16.self, capacity: nRaw + nComp)
+        let zero = Float16(0).bitPattern
+        let negInf = Float16(-Float.infinity).bitPattern
+        for i in 0..<nRaw { XCTAssertEqual(p[i], zero, "raw row \(i)") }
+        for i in 0..<nComp {
+            let selected = i < nScores && expected[i]
+            XCTAssertEqual(p[nRaw + i], selected ? zero : negInf, "compressed row \(i)")
+        }
     }
 
     func testTopkMaskScatter() throws {

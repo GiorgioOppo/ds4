@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import DS4Core
 
 // DS4_EXPERT_BUNDLE=1: sidecar file (<gguf>.expbundle) that repacks the routed
@@ -35,6 +36,17 @@ public final class ExpertBundle: @unchecked Sendable {
     private let useLock = NSLock()
     private var served = 0
     private var nextBeat = 5000
+    /// Optional Metal 3 fast-resource-loading backend. It loads bundle ranges
+    /// straight into MTLBuffer resources; `pread` remains the permanent
+    /// correctness fallback if creation or any submission fails.
+    private struct MetalIOBackend {
+        let queue: any MTLIOCommandQueue
+        let handle: any MTLIOFileHandle
+    }
+    private let metalIOLock = NSLock()
+    private var metalIO: MetalIOBackend?
+    private var metalIOFailureLogged = false
+    private var metalIOSubmissions = 0
 
     private func noteUse() {
         useLock.lock()
@@ -45,6 +57,74 @@ public final class ExpertBundle: @unchecked Sendable {
         useLock.unlock()
         if n == 1 { Self.log("in uso: primo esperto servito dal sidecar") }
         else if beat { Self.log("in uso: \(n) esperti serviti dal sidecar") }
+    }
+
+    /// Enable Apple Metal fast resource loading for this already-validated
+    /// bundle. The queue is concurrent so demand fills and next-layer
+    /// look-ahead can remain in flight together. False means callers simply
+    /// keep using the existing F_NOCACHE pread path.
+    @discardableResult
+    public func enableMetalIO(device: MTLDevice) -> Bool {
+        do {
+            let desc = MTLIOCommandQueueDescriptor()
+            desc.type = .concurrent
+            desc.priority = .high
+            // A deep MetalIO queue can starve the demand gather on M1 Pro.
+            // Two command buffers preserve demand + look-ahead concurrency;
+            // 16 commands are enough to saturate its SSD without flooding it.
+            desc.maxCommandBufferCount = 2
+            desc.maxCommandsInFlight = 16
+            let queue = try device.makeIOCommandQueue(descriptor: desc)
+            let handle = try device.makeIOFileHandle(url: URL(fileURLWithPath: path))
+            // Pay queue/file-handle first-use cost once at model load, not in
+            // the first token's cache miss. Also proves this handle can read.
+            guard let scratch = device.makeBuffer(length: 4096, options: .storageModeShared) else {
+                Self.log("MetalIO non disponibile (scratch buffer) — uso pread")
+                return false
+            }
+            let warm = queue.makeCommandBuffer()
+            warm.load(scratch, offset: 0, size: 4096, sourceHandle: handle, sourceHandleOffset: 0)
+            warm.commit(); warm.waitUntilCompleted()
+            guard warm.status == .complete else {
+                Self.log("MetalIO warm-up fallito (\(warm.error?.localizedDescription ?? "stato \(warm.status.rawValue)")) — uso pread")
+                return false
+            }
+            metalIOLock.lock()
+            metalIO = MetalIOBackend(queue: queue, handle: handle)
+            metalIOFailureLogged = false
+            metalIOSubmissions = 0
+            metalIOLock.unlock()
+            Self.log("MetalIO attivo: SSD → MTLBuffer diretto (fallback pread disponibile)")
+            return true
+        } catch {
+            Self.log("MetalIO non disponibile (\(error.localizedDescription)) — uso pread")
+            return false
+        }
+    }
+
+    private func metalIOSnapshot() -> MetalIOBackend? {
+        metalIOLock.lock(); defer { metalIOLock.unlock() }
+        return metalIO
+    }
+
+    private func disableMetalIO(_ message: String) {
+        metalIOLock.lock()
+        metalIO = nil
+        let shouldLog = !metalIOFailureLogged
+        metalIOFailureLogged = true
+        metalIOLock.unlock()
+        if shouldLog { Self.log("MetalIO fallito (\(message)) — fallback permanente a pread") }
+    }
+
+    private func noteMetalIOSuccess(experts: Int, gbs: Double) {
+        metalIOLock.lock()
+        metalIOSubmissions += 1
+        let first = metalIOSubmissions == 1
+        metalIOLock.unlock()
+        if first {
+            Self.log(String(format: "MetalIO in uso: primo batch diretto di %d esperti → MTLBuffer (%.2f GB/s)",
+                            experts, gbs))
+        }
     }
 
     private static let magic: UInt32 = 0x4245_5344   // "DSEB" little-endian
@@ -283,6 +363,77 @@ public final class ExpertBundle: @unchecked Sendable {
     }
 
     // MARK: Read path
+
+    /// Batch-load expert records directly from the bundle into Metal buffers.
+    /// `slotStride == nil` means three tightly-packed destination buffers;
+    /// otherwise gate/up/down are views of one interleaved pool and every view
+    /// advances by the common record stride. Returns false when MetalIO is off
+    /// or fails; callers then execute the byte-identical pread path.
+    public func copyExpertsMetalIO(layer: Int,
+                                   pairs: [(id: Int32, slot: Int)],
+                                   gateDst: GPUTensor, upDst: GPUTensor, downDst: GPUTensor,
+                                   slotStride: Int? = nil) -> Bool {
+        guard let io = metalIOSnapshot(), layers.contains(layer), !pairs.isEmpty else { return false }
+        let destinations: [(fileOff: Int, bytes: Int, dst: GPUTensor)] = [
+            (0, gateBytes, gateDst),
+            (gateBytes, upBytes, upDst),
+            (gateBytes + upBytes, downBytes, downDst),
+        ]
+        for pair in pairs {
+            guard pair.id >= 0, Int(pair.id) < nExpert, pair.slot >= 0 else { return false }
+            for d in destinations {
+                let stride = slotStride ?? d.bytes
+                guard d.dst.byteOffset + pair.slot * stride + d.bytes <= d.dst.buffer.length else {
+                    return false
+                }
+            }
+        }
+
+        let cb = io.queue.makeCommandBuffer()
+        cb.label = "DS4 expert bundle MetalIO layer \(layer) × \(pairs.count)"
+        let payloadBytes = gateBytes + upBytes + downBytes
+        if let stride = slotStride {
+            // Bundle record and interleaved pool slot are both gate|up|down:
+            // ONE contiguous DMA command per expert, not three sub-loads.
+            for pair in pairs {
+                let sourceBase = dataBase + ((layer - layers.lowerBound) * nExpert + Int(pair.id)) * record
+                cb.load(gateDst.buffer,
+                        offset: gateDst.byteOffset + pair.slot * stride,
+                        size: payloadBytes,
+                        sourceHandle: io.handle,
+                        sourceHandleOffset: sourceBase)
+            }
+        } else {
+            for pair in pairs {
+                let sourceBase = dataBase + ((layer - layers.lowerBound) * nExpert + Int(pair.id)) * record
+                for d in destinations {
+                    cb.load(d.dst.buffer,
+                            offset: d.dst.byteOffset + pair.slot * d.bytes,
+                            size: d.bytes,
+                            sourceHandle: io.handle,
+                            sourceHandleOffset: sourceBase + d.fileOff)
+                }
+            }
+        }
+        let t0 = Date()
+        cb.commit()
+        cb.waitUntilCompleted()
+        guard cb.status == .complete else {
+            disableMetalIO(cb.error?.localizedDescription ?? "stato \(cb.status.rawValue)")
+            return false
+        }
+        let seconds = max(1e-9, Date().timeIntervalSince(t0))
+        let gbs = Double(pairs.count * payloadBytes) / seconds / 1e9
+        noteMetalIOSuccess(experts: pairs.count, gbs: gbs)
+        // Successful bytes are valid, so serve this batch. But a backend well
+        // below the existing pread path must not poison every later token.
+        let minGBs = ProcessInfo.processInfo.environment["DS4_MTLIO_MIN_GBS"].flatMap(Double.init) ?? 1.5
+        if gbs < minGBs {
+            disableMetalIO(String(format: "batch troppo lento: %.2f < %.2f GB/s", gbs, minGBs))
+        }
+        for _ in pairs { noteUse() }
+        return true
+    }
 
     /// pread expert (layer, id)'s three slabs into the pool slots. The slabs
     /// are ADJACENT in the sidecar: the three concurrent preads form one ~7 MB

@@ -235,6 +235,38 @@ public final class DecodeScratch {
 }
 
 extension GraphContext {
+    /// Exact decode-time NSA indexer top-K and f16 attention-mask construction,
+    /// encoded after `indexerScoresEnc` in the SAME command buffer. This removes
+    /// the historical GPU→CPU score readback and the second command-buffer wait.
+    /// The Metal kernel mirrors IndexerSelect's heap comparator, so this changes
+    /// scheduling only, not the selected compressed-row set.
+    func indexerTopKMask(scores: GPUTensor, mask: GPUTensor,
+                         nRaw: Int, nComp: Int, nScores: Int, topK: Int) throws {
+        precondition(nRaw >= 0 && nComp >= 0 && nScores >= 0)
+        precondition(nScores <= nComp && topK > 0)
+        let keep = min(topK, nScores)
+        var args = [UInt8](repeating: 0, count: 16)
+        func u32(_ off: Int, _ value: Int) {
+            var v = UInt32(value).littleEndian
+            withUnsafeBytes(of: &v) { args.replaceSubrange(off..<(off + 4), with: $0) }
+        }
+        u32(0, nRaw); u32(4, nComp); u32(8, nScores); u32(12, topK)
+        let pso = try rt.pipeline("kernel_dsv4_indexer_topk_mask_one")
+        let nth = max(32, keep)
+        guard nth <= pso.maxTotalThreadsPerThreadgroup else {
+            throw MetalError.unsupported(
+                "indexer GPU top-k richiede \(nth) thread, limite \(pso.maxTotalThreadsPerThreadgroup)")
+        }
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(scores.buffer, offset: scores.byteOffset, index: 1)
+        e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 2)
+        e.setThreadgroupMemoryLength(max(1, keep) * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
+    }
+
     /// One HC-reduce: flat=rmsNorm(curHc, hcDim); mix=matmulF32(mixerFn, flat);
     /// split=sinkhorn(mix, scale, base); embd=weightedSum(curHc, pre); cur=rmsNorm(embd, norm).
     private func hcReduce(curHc: GPUTensor, mixerFn: GPUTensor, scale: GPUTensor, base: GPUTensor,

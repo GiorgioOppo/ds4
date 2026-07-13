@@ -7,12 +7,8 @@ import Foundation
 /// EXACT same result as running over the full expert set with the real ids. This
 /// is the core of the expert-cache: stream ~K/256 of each layer's expert weight.
 final class ExpertCacheTests: XCTestCase {
-    static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
-
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/moe.metal"),
-                          "vendored metal kernels not present")
-        do { return try MetalRuntime(metalDir: Self.metalDir) }
+        do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
     }
 
@@ -60,6 +56,44 @@ final class ExpertCacheTests: XCTestCase {
     }
 
     private final class Flag: @unchecked Sendable { var on = false }
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func bump() { lock.lock(); value += 1; lock.unlock() }
+        func read() -> Int { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    func testSlotCacheUsesBatchFillWhenAvailable() throws {
+        let rt = try makeRuntime()
+        let expertBytes = 64
+        let singles = Counter(), batches = Counter()
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: expertBytes * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * expertBytes))
+            },
+            fill: { _, _, _, _ in singles.bump() },
+            fillBatch: { layer, pairs, pool in
+                batches.bump()
+                for pair in pairs {
+                    let p = pool.gate.buffer.contents()
+                        .advanced(by: pool.gate.byteOffset + pair.slot * expertBytes)
+                    p.storeBytes(of: Int32(layer * 1000) + pair.id, as: Int32.self)
+                }
+            })
+
+        let ids: [Int32] = [2, 4, 6, 8, 10, 12]
+        let (pool, slots) = try cache.acquire(layer: 5, ids: ids)
+        XCTAssertEqual(batches.read(), 1)
+        XCTAssertEqual(singles.read(), 0)
+        for (j, id) in ids.enumerated() {
+            let p = pool.gate.buffer.contents()
+                .advanced(by: pool.gate.byteOffset + Int(slots[j]) * expertBytes)
+            XCTAssertEqual(p.load(as: Int32.self), 5000 + id)
+        }
+    }
 
     /// ExpertSlotCache look-ahead: prefill(ids) fills the pool off the decode
     /// path (counted as `prefilled`, not misses); the demand acquire then

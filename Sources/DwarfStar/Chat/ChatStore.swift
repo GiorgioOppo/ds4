@@ -126,6 +126,14 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08b")
             applyFastDemoDefaults(persistExplicitly: true)
         }
+        // Migrazione UNA TANTUM v6 (2026-07-13): preset finale misurato sul
+        // M1 Pro 16 GB con RAM libera. Slot 20 evita pressione/swap, MetalIO
+        // e' sicuro grazie al fallback automatico, Q4 completo mantiene una
+        // generazione coerente a ~3.2-3.4 tok/s e il prefill arriva a ~4 tok/s.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_13") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_13")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
@@ -133,13 +141,18 @@ final class ChatStore {
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
         _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default ON (+10% misurato, lossy, disattivabile)
-        _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)          // default OFF (+7% misurato, lossy — attivare dopo prova qualità)
+        _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)          // default ON nel preset misurato (+7%, lossy)
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
         _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // partizione K matvec Q8 (auto-tune)
         _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)                          // occupancy kernel MoE/Q4 (auto-tune)
         _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
+        _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)              // Metal fast resource loading (A/B sperimentale)
+        _ = setenv("DS4_MTLIO_MIN_GBS", "1.5", 1)                           // fallback se MetalIO degrada davvero
+        _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)                            // un record contiguo per slot/esperto
+        _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)                          // un command buffer FFN per gruppo
+        _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)                           // evita top-k/readback sulla CPU
         // La cache del requant Q4 va in Application Support: l'app sandboxed
         // non può scrivere accanto al GGUF scelto col picker (il fallimento
         // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
@@ -169,6 +182,7 @@ final class ChatStore {
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
         _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+        _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
         // Restore the persisted chats (newest first). Always keep at least one so
         // there is an active conversation to write into.
         sessions = ChatSessionStore.loadAll()
@@ -183,12 +197,12 @@ final class ChatStore {
     var systemPrompt = ""
     /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
     /// 43 layer on the 2-bit model. Applied on the NEXT model load.
-    /// DEFAULT 24: il punto dolce misurato su M1 Pro 16 GB con dense stream +
-    /// pread + MLOCK + Q4 + QKV_Q4 (A/B 2026-07-08: 73% hit, 3.33 tok/s di
-    /// regime, nessun collasso progressivo; ~7.1 GB wired). Senza MLOCK i
+    /// DEFAULT 20: il punto stabile misurato su M1 Pro 16 GB con dense stream +
+    /// pread + MLOCK + Q4 completo (A/B 2026-07-13: 69% hit, 3.2-3.4 tok/s di
+    /// regime senza collasso; lascia piu' margine alla RAM rispetto a 24). Senza MLOCK i
     /// pool grandi vengono compressi/paginati e conviene 8; senza Q4 il
     /// budget bloccato è più tirato e il punto dolce scende a 12-16.
-    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 24 {
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 20 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
     /// Look-ahead speculativo della slot-cache (DS4_EXPERT_LOOKAHEAD): mentre il
@@ -348,9 +362,9 @@ final class ChatStore {
     /// sopra): l'ultima voce grossa rimasta nello stream denso. MISURATO su
     /// M1 Pro (A/B 2026-07-08, sera): 3.13 → 3.36 tok/s (+7%) — era neutro
     /// nel tuning del 07-06, ma allora trio/q_a/kv non erano residenti.
-    /// LOSSY (la continuazione greedy cambia restando coerente): default OFF,
-    /// da attivare dopo una prova di qualità in chat.
-    var sharedQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4SharedQ4") as? Bool) ?? false {
+    /// LOSSY (la continuazione greedy cambia restando coerente): default ON nel
+    /// preset misurato; il toggle resta disponibile per la massima fedelta'.
+    var sharedQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4SharedQ4") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(sharedQ4Enabled, forKey: "DS4SharedQ4")
             _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)
@@ -370,16 +384,27 @@ final class ChatStore {
             _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
         }
     }
+    /// Metal fast resource loading: batch di range dell'expert-bundle caricati
+    /// direttamente negli MTLBuffer della slot cache durante il decode. Il
+    /// prefill resta sul percorso pread. Default ON nel preset 16 GB misurato;
+    /// il fallback a pread è automatico su errore o banda insufficiente, quindi
+    /// una sessione sfavorevole non resta bloccata sul backend lento. Prossimo load.
+    var metalIOEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4MetalIO") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(metalIOEnabled, forKey: "DS4MetalIO")
+            _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)
+        }
+    }
     /// Riporta TUTTI i toggle di performance ai valori della demo veloce
-    /// misurata su M1 Pro (matrice A/B 2026-07-08: 3.33 tok/s di regime):
-    /// slot 24 (73% hit, nessun collasso), ring off, willneed+pread+dense
-    /// stream+mlock+Q4+QKV_Q4+bundle ON. Usato dalla migrazione una-tantum
+    /// misurata su M1 Pro 16 GB (A/B 2026-07-13: 3.2-3.4 tok/s di regime):
+    /// slot 20 (69% hit, margine RAM), ring off, MetalIO+willneed+pread+dense
+    /// stream+mlock+Q4 completo+bundle ON. Usato dalla migrazione una-tantum
     /// in init e dal bottone in Settings ("i toggle persistiti derivano dai
     /// vecchi esperimenti e restano incollati per sempre").
     /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
     /// init i didSet delle stored property NON scattano.
     func applyFastDemoDefaults(persistExplicitly: Bool = false) {
-        expertCacheSlots = 24      // 73% hit misurato; l'auto-tune può correggere per macchina
+        expertCacheSlots = 20      // 69% hit misurato; piu' margine RAM su 16 GB
         rawRingEnabled = false
         willNeedEnabled = true
         expertPreadEnabled = true
@@ -389,13 +414,18 @@ final class ChatStore {
         qkvQ4Enabled = true        // +10% misurato (2.78 → 3.06 tok/s), output coerente
         sharedQ4Enabled = true     // +7% misurato (3.13 → 3.36 tok/s), output coerente
         prefillUnion = 256         // +19% di prefill misurato a 3.5k token (8.63 tok/s)
+        prefillChunk = 512         // stabile su prompt brevi/lunghi entro il budget RAM
+        prefillRouteBatch = 32     // baseline stabile; il benchmark completo prova 16/32/64/128
         expertBundleEnabled = true
+        metalIOEnabled = true      // fallback automatico a pread sotto 1.5 GB/s
         expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
         asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
+        q8NSG = 4
+        moeNSG = 4
         if persistExplicitly {
             let d = UserDefaults.standard
-            d.set(24, forKey: "DS4ExpertCacheSlots")
+            d.set(20, forKey: "DS4ExpertCacheSlots")
             d.set(false, forKey: "DS4RawRing")
             d.set(true, forKey: "DS4WillNeed")
             d.set(true, forKey: "DS4ExpertPread")
@@ -405,10 +435,15 @@ final class ChatStore {
             d.set(true, forKey: "DS4QkvQ4")
             d.set(true, forKey: "DS4SharedQ4")
             d.set(256, forKey: "DS4PrefillUnion")
+            d.set(512, forKey: "DS4PrefillChunk")
+            d.set(32, forKey: "DS4PrefillRouteBatch")
             d.set(true, forKey: "DS4ExpertBundle")
+            d.set(true, forKey: "DS4MetalIO")
             d.set(0, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
             d.set(true, forKey: "DS4AsyncFFN")
+            d.set(4, forKey: "DS4Q8NSG")
+            d.set(4, forKey: "DS4MoeNSG")
             _ = setenv("DS4_RAW_RING", "0", 1)
             _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
             _ = setenv("DS4_EXPERT_PREAD", "1", 1)
@@ -418,10 +453,19 @@ final class ChatStore {
             _ = setenv("DS4_QKV_Q4", "1", 1)
             _ = setenv("DS4_SHARED_Q4", "1", 1)
             _ = setenv("DS4_PREFILL_UNION", "256", 1)
+            _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
+            _ = setenv("DS4_PREFILL_ROUTE_BATCH", "32", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
+            _ = setenv("DS4_MTLIO", "1", 1)
+            _ = setenv("DS4_MTLIO_MIN_GBS", "1.5", 1)
+            _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)
+            _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)
+            _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)
             _ = setenv("DS4_ASYNC_FFN", "1", 1)
+            _ = setenv("DS4_Q8_NSG", "4", 1)
+            _ = setenv("DS4_MOE_NSG", "4", 1)
         }
     }
 
@@ -442,18 +486,31 @@ final class ChatStore {
         }
     }
 
+    /// Numero di token route/attention codificati nello stesso command buffer
+    /// durante il prefill. Numerica invariata: i dispatch restano seriali e nello
+    /// stesso ordine, ma si riducono commit e attese CPU↔GPU. È letto a ogni layer
+    /// di prefill, quindi il benchmark può regolarlo senza ricaricare il modello.
+    var prefillRouteBatch: Int =
+        (UserDefaults.standard.object(forKey: "DS4PrefillRouteBatch") as? Int) ?? 32 {
+        didSet {
+            UserDefaults.standard.set(prefillRouteBatch, forKey: "DS4PrefillRouteBatch")
+            _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
+        }
+    }
+
     // Benchmark in-app (Settings): prova le combinazioni dei knob a caldo sul
     // motore GIÀ caricato e applica la migliore.
     var benchRunning = false
     var benchStatus: String?
     var benchResults: String = ""
 
-    /// Misura DS4_PREFILL_UNION (64/192/256) e DS4_PREFILL_CHUNK (512/1024) sul
+    /// Misura DS4_PREFILL_UNION (64/192/256), DS4_PREFILL_CHUNK (512/1024) e
+    /// DS4_PREFILL_ROUTE_BATCH (16/32/64/128) sul
     /// modello caricato con il benchmark sintetico del motore (prefill 512 o
     /// 1024 token + 8 di decode), poi APPLICA e persiste la combinazione col
     /// prefill più veloce. ~5 run, alcuni minuti; la chat resta inutilizzabile
     /// nel frattempo (il motore è un actor seriale). I knob che richiedono un
-    /// reload (DS4_PREFILL_MM, FFN/ROUTE_BATCH) non sono coperti.
+    /// reload (DS4_PREFILL_MM, FFN_BATCH) non sono coperti.
     /// `quick`: SOLO l'unione esperti su un prefill da 128 token (~2-3 min) —
     /// il divario fra le unioni emerge già a decine di token, mentre il chunk
     /// richiede prefill > 512 token per esistere e resta nella modalità
@@ -465,7 +522,7 @@ final class ChatStore {
         benchRunning = true
         benchResults = ""
         benchStatus = quick ? "Benchmark rapido in corso… (~3 min, non usare la chat)"
-                            : "Benchmark in corso… (~10 min, non usare la chat)"
+                            : "Benchmark in corso… (~15 min, non usare la chat)"
         Task {
             // Nested funcs non ereditano l'isolamento MainActor in Swift 6:
             // annotazione esplicita (chiamata sincrona dal Task, che eredita
@@ -511,15 +568,39 @@ final class ChatStore {
                         if p.prefillTps > bestChunkTps { bestChunkTps = p.prefillTps; bestChunk = chunk }
                     }
                 }
+                // 3) Route batch (solo completo). Ora è letto a ogni layer di
+                // prefill, quindi non richiede più un costoso reload del modello.
+                // Conserviamo il valore precedente salvo un vantaggio >2% per
+                // evitare di persistere rumore termico/SSD.
+                var bestRouteBatch = prefillRouteBatch
+                if !quick {
+                    _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
+                    var routeScores: [Int: Double] = [:]
+                    for routeBatch in [16, 32, 64, 128] {
+                        _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(routeBatch), 1)
+                        benchStatus = "Benchmark route batch=\(routeBatch)…"
+                        let p = try await service.benchmark(contextTokens: 512, genTokens: 4)
+                        log(String(format: "union=%d routeBatch=%d (512 token): prefill %.2f tok/s",
+                                   bestUnion, routeBatch, p.prefillTps))
+                        routeScores[routeBatch] = p.prefillTps
+                    }
+                    if let winner = routeScores.max(by: { $0.value < $1.value }),
+                       let current = routeScores[prefillRouteBatch],
+                       winner.value > current * 1.02 {
+                        bestRouteBatch = winner.key
+                    }
+                }
                 // Applica e persisti i vincitori (i didSet rifanno i setenv).
                 prefillUnion = bestUnion
                 prefillChunk = bestChunk
-                log("MIGLIORI: union=\(bestUnion) chunk=\(bestChunk) — applicati e salvati.")
-                benchStatus = "Fatto: union=\(bestUnion), chunk=\(bestChunk) applicati."
+                prefillRouteBatch = bestRouteBatch
+                log("MIGLIORI: union=\(bestUnion) chunk=\(bestChunk) routeBatch=\(bestRouteBatch) — applicati e salvati.")
+                benchStatus = "Fatto: union=\(bestUnion), chunk=\(bestChunk), route batch=\(bestRouteBatch)."
             } catch {
                 // Ripristina i valori persistiti dopo un errore/annullamento.
                 _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
                 _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+                _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
                 benchStatus = "Benchmark fallito: \(error)"
             }
             benchRunning = false

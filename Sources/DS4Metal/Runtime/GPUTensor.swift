@@ -10,8 +10,8 @@ public final class GPUTensor {
     public let buffer: MTLBuffer
     public let byteLength: Int
     public let count: Int   // logical element count (floats unless byte tensor)
-    /// Offset (bytes) of the logical data within `buffer`. Non-zero only for
-    /// no-copy mmap views, where the buffer starts at a page boundary <= the data.
+    /// Offset (bytes) of the logical data within `buffer`. Non-zero for no-copy
+    /// mmap views and for subviews carved out of a larger shared staging slab.
     /// Encode binds that read this tensor must use `setBuffer(offset: byteOffset)`.
     public let byteOffset: Int
 
@@ -20,6 +20,18 @@ public final class GPUTensor {
         self.byteLength = byteLength
         self.count = count
         self.byteOffset = byteOffset
+    }
+
+    /// A zero-copy logical slice of this tensor's Metal buffer. The returned
+    /// tensor retains the same MTLBuffer and only adjusts the binding offset.
+    /// Useful for hot paths that need many independent rows without allocating
+    /// one MTLBuffer per row (notably the layer-major prefill staging area).
+    public func subview(byteOffset relativeOffset: Int, byteLength: Int,
+                        count: Int) -> GPUTensor {
+        precondition(relativeOffset >= 0 && byteLength >= 0)
+        precondition(relativeOffset + byteLength <= self.byteLength)
+        return GPUTensor(buffer: buffer, byteLength: byteLength, count: count,
+                         byteOffset: self.byteOffset + relativeOffset)
     }
 
     /// No-copy GPU buffer over an mmap'd model region [ptr, ptr+byteLength). The
@@ -129,9 +141,9 @@ public final class GPUTensor {
     /// Read back the first `count` F32 elements (default: whole tensor).
     public func floatArray(_ n: Int? = nil) -> [Float] {
         let c = n ?? (byteLength / 4)
-        let p = buffer.contents().bindMemory(to: Float.self, capacity: c)
+        let p = (buffer.contents() + byteOffset).bindMemory(to: Float.self, capacity: c)
         return Array(UnsafeBufferPointer(start: p, count: c))
     }
 
-    public func zero() { memset(buffer.contents(), 0, byteLength) }
+    public func zero() { memset(buffer.contents() + byteOffset, 0, byteLength) }
 }

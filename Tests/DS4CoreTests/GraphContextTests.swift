@@ -6,13 +6,56 @@ import Foundation
 /// dispatches in ONE command buffer (rmsNorm -> matmulF32, and swiglu) — produce
 /// the same result as a CPU reference, proving resident-buffer chaining works.
 final class GraphContextTests: XCTestCase {
-    static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
-
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/norm.metal"),
-                          "vendored metal kernels not present")
-        do { return try MetalRuntime(metalDir: Self.metalDir) }
+        do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
+    }
+
+    func testTensorSubviewsShareStorageAndHonorOffsets() throws {
+        let rt = try makeRuntime()
+        let slab = try GPUTensor.zeros(rt, floatCount: 12)
+        let middle = slab.subview(byteOffset: 4 * 4, byteLength: 4 * 4, count: 4)
+        let values: [Float] = [11, 12, 13, 14]
+        _ = values.withUnsafeBytes {
+            memcpy(middle.buffer.contents() + middle.byteOffset, $0.baseAddress!, $0.count)
+        }
+
+        XCTAssertEqual(middle.floatArray(), values)
+        XCTAssertEqual(slab.floatArray(), [0, 0, 0, 0, 11, 12, 13, 14, 0, 0, 0, 0])
+
+        middle.zero()
+        XCTAssertEqual(slab.floatArray(), [Float](repeating: 0, count: 12))
+    }
+
+    /// Regression for the contiguous prefill slabs: a logical row is a view
+    /// into one MTLBuffer, so every compute binding must add GPUTensor.byteOffset.
+    /// Binding at zero makes every prompt token read row 0 and destroys quality.
+    func testMatmulReadsAndWritesSubviewOffsets() throws {
+        let rt = try makeRuntime()
+        let inDim = 1024, outDim = 2
+        let inputSlab = try GPUTensor.zeros(rt, floatCount: inDim * 2)
+        let input = inputSlab.subview(byteOffset: inDim * 4,
+                                      byteLength: inDim * 4, count: inDim)
+        var values = [Float](repeating: 0, count: inDim)
+        values[0] = 3; values[1] = -5
+        _ = values.withUnsafeBytes {
+            memcpy(input.buffer.contents() + input.byteOffset, $0.baseAddress!, $0.count)
+        }
+        var weights = [Float](repeating: 0, count: inDim * outDim)
+        weights[0] = 2
+        weights[inDim + 1] = 4
+        let weight = try GPUTensor.floats(rt, weights)
+        let outputSlab = try GPUTensor.zeros(rt, floatCount: outDim * 2)
+        let output = outputSlab.subview(byteOffset: outDim * 4,
+                                        byteLength: outDim * 4, count: outDim)
+
+        let ctx = GraphContext(rt)
+        try ctx.begin()
+        try ctx.matmulF32(weight: weight, x: input, out: output,
+                          inDim: inDim, outDim: outDim)
+        ctx.commit()
+
+        XCTAssertEqual(outputSlab.floatArray(), [0, 0, 6, -20])
     }
 
     func testChainedRMSNormMatmul() throws {

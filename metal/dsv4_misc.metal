@@ -319,6 +319,81 @@ kernel void kernel_dsv4_topk_mask_scatter(
     }
 }
 
+// Decode indexer top-k + dense f16 mask in one GPU dispatch. The historical
+// path committed the score graph, waited on the CPU, selected with a Swift heap,
+// wrote the mask, then committed attention. For decode n_comp is only a few
+// thousand rows but that CPU round-trip occurs in every ratio-4 layer/token.
+//
+// Thread 0 intentionally uses the same O(n log k) min-heap and strict ordering
+// as IndexerSelect.allowedTopK (score descending, row id ascending on ties), so
+// the selected SET is identical. The other threads initialize/scatter the mask;
+// the modest serial heap is far cheaper than ending and synchronizing a command
+// buffer and keeps score -> selection -> attention entirely on the GPU queue.
+struct ds4_metal_args_dsv4_indexer_topk_mask_one {
+    uint32_t n_raw;
+    uint32_t n_comp;
+    uint32_t n_scores;
+    uint32_t top_k;
+};
+
+static inline bool dsv4_indexer_better(device const float * scores, int a, int b) {
+    const float sa = scores[a];
+    const float sb = scores[b];
+    return sa != sb ? sa > sb : a < b;
+}
+
+kernel void kernel_dsv4_indexer_topk_mask_one(
+        constant ds4_metal_args_dsv4_indexer_topk_mask_one & args,
+        device const float * scores,
+        device       half  * mask,
+        threadgroup  int   * heap [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    const uint total = args.n_raw + args.n_comp;
+    for (uint i = tid; i < total; i += ntg) {
+        mask[i] = i < args.n_raw ? half(0.0h) : half(-INFINITY);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint keep = min(args.top_k, args.n_scores);
+    if (tid == 0 && keep > 0) {
+        uint heap_count = 0;
+        for (uint candidate = 0; candidate < args.n_scores; ++candidate) {
+            if (heap_count < keep) {
+                uint i = heap_count++;
+                heap[i] = (int)candidate;
+                while (i > 0) {
+                    const uint p = (i - 1) >> 1;
+                    if (!dsv4_indexer_better(scores, heap[p], heap[i])) break;
+                    const int tmp = heap[p]; heap[p] = heap[i]; heap[i] = tmp;
+                    i = p;
+                }
+            } else if (dsv4_indexer_better(scores, (int)candidate, heap[0])) {
+                heap[0] = (int)candidate;
+                uint i = 0;
+                while (true) {
+                    const uint l = 2 * i + 1;
+                    const uint r = l + 1;
+                    uint worst = i;
+                    if (l < heap_count && dsv4_indexer_better(scores, heap[worst], heap[l])) worst = l;
+                    if (r < heap_count && dsv4_indexer_better(scores, heap[worst], heap[r])) worst = r;
+                    if (worst == i) break;
+                    const int tmp = heap[i]; heap[i] = heap[worst]; heap[worst] = tmp;
+                    i = worst;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < keep) {
+        const int row = heap[tid];
+        if (row >= 0 && (uint)row < args.n_comp) {
+            mask[args.n_raw + (uint)row] = half(0.0h);
+        }
+    }
+}
+
 // Sorts each token's selected compressed rows by row id. The indexer selects by
 // score, but attention scans compressed K/V in cache order in the dense graph.
 // Sorting preserves that order while still letting the indexed attention kernel

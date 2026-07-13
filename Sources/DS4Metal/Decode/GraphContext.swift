@@ -158,10 +158,11 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(x.buffer, offset: 0, index: 1)
-        e.setBuffer((weight ?? x).buffer, offset: 0, index: 2)
-        e.setBuffer(x.buffer, offset: 0, index: 3)
-        e.setBuffer(out.buffer, offset: 0, index: 4)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 1)
+        let w = weight ?? x
+        e.setBuffer(w.buffer, offset: w.byteOffset, index: 2)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 3)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 4)
         e.setThreadgroupMemoryLength(32 * 4, index: 0)
         let nth = MetalRuntime.rmsNormThreads(n)
         e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
@@ -183,8 +184,8 @@ public final class GraphContext {
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
         e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
-        e.setBuffer(x.buffer, offset: 0, index: 2)
-        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
         e.setThreadgroupMemoryLength(32 * 2 * 4, index: 0)
         e.dispatchThreadgroups(MTLSize(width: (outDim + nr0 - 1) / nr0, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: Int(nsg), depth: 1))
@@ -205,8 +206,8 @@ public final class GraphContext {
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
         e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
-        e.setBuffer(x.buffer, offset: 0, index: 2)
-        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
         e.setThreadgroupMemoryLength(smem, index: 0)
         e.dispatchThreadgroups(MTLSize(width: (outDim + nr0 - 1) / nr0, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: Int(nsg), depth: 1))
@@ -226,8 +227,8 @@ public final class GraphContext {
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
         e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)   // byteOffset != 0 for no-copy mmap weights
-        e.setBuffer(x.buffer, offset: 0, index: 2)
-        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
         e.setThreadgroupMemoryLength(32 * 2 * 4, index: 0)
         e.dispatchThreadgroups(MTLSize(width: (outDim + nr0 - 1) / nr0, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: 32, height: Int(nsg), depth: 1))
@@ -242,9 +243,9 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(a.buffer, offset: 0, index: 1)
-        e.setBuffer(b.buffer, offset: 0, index: 2)
-        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(a.buffer, offset: a.byteOffset, index: 1)
+        e.setBuffer(b.buffer, offset: b.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
         e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
     }
@@ -260,9 +261,9 @@ public final class GraphContext {
         let e = encoder
         e.setComputePipelineState(pso)
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
-        e.setBuffer(gate.buffer, offset: 0, index: 1)
-        e.setBuffer(up.buffer, offset: 0, index: 2)
-        e.setBuffer(out.buffer, offset: 0, index: 3)
+        e.setBuffer(gate.buffer, offset: gate.byteOffset, index: 1)
+        e.setBuffer(up.buffer, offset: up.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
         e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
     }

@@ -108,6 +108,9 @@ public final class StreamingDecoder {
     /// attn (attention + out proj + HC + router), each its own command buffer + timed.
     /// Adds a commit/wait per layer (absolute numbers inflate); read the RATIO.
     let profileRoute = ProcessInfo.processInfo.environment["DS4_PROFILE_ROUTE"] == "1"
+    /// Keep NSA indexer score selection on the GPU. `=0` restores the historical
+    /// CPU heap/readback path for parity diagnostics.
+    let gpuIndexerTopK = ProcessInfo.processInfo.environment["DS4_GPU_INDEXER_TOPK"] != "0"
     /// Batched prefill phase B: encode ALL of a group's token-FFNs into ONE
     /// command buffer (serial encoder ⇒ same dispatch order and visibility as
     /// N separate buffers) instead of one commit+wait per token — the dominant
@@ -120,13 +123,15 @@ public final class StreamingDecoder {
     /// after a single wait, instead of one commit+wait per token per layer.
     /// Attention stays token-sequential INSIDE the buffer (serial encoder ⇒ same
     /// dispatch order ⇒ identical numerics). Default 32: cuts the route syncs
-    /// 32× while keeping each buffer's GPU run bounded. 0/1 = off (parity);
+    /// 32× while keeping each buffer's GPU run bounded. Read at each prefill
+    /// layer so the in-app benchmark can tune it without reloading the model.
+    /// 0/1 = off (parity);
     /// layers with the indexer ACTIVE always fall back to per-token (a CPU
     /// top-k sits between the two halves of their route).
-    let prefillRouteBatch: Int = {
+    private var prefillRouteBatch: Int {
         let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
         return max(1, v)
-    }()
+    }
     /// DS4_PREFILL_MM=1 (OPT-IN): the group's routed FFN runs through the
     /// mul_mm_id matrix-matrix kernels (expert weights read once per tile for
     /// ALL the group's tokens) instead of one matvec chain per token. Same
@@ -505,12 +510,30 @@ public final class StreamingDecoder {
             let ones: GPUTensor      // n × f32 = 1 (unit route weights for the rows-swiglu)
         }
         let mm: MMBuffers?
+
+        /// Allocate one zeroed Metal slab and expose `n` fixed-size logical
+        /// rows as GPUTensor views. Before this helper PrefillStage allocated
+        /// five MTLBuffers per prompt token (2,560 buffers at chunk=512), which
+        /// made buffer creation and Objective-C lifetime management measurable
+        /// prefill work. Views keep the same hazard-tracked shared buffer while
+        /// preserving every call site's existing GPUTensor API.
+        private static func rowViews(_ rt: MetalRuntime, n: Int,
+                                     rowBytes: Int, rowCount: Int) throws -> [GPUTensor] {
+            let slab = try GPUTensor.zerosBytes(rt, byteLength: n * rowBytes)
+            return (0..<n).map {
+                slab.subview(byteOffset: $0 * rowBytes, byteLength: rowBytes,
+                             count: rowCount)
+            }
+        }
+
         init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int) throws {
-            cur = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nEmbd) }
-            attn = try (0..<n).map { _ in try .zeros(rt, floatCount: d.nHC * d.nEmbd) }
-            split = try (0..<n).map { _ in try .zeros(rt, floatCount: 24) }
-            ids = try (0..<n).map { _ in try .zerosBytes(rt, byteLength: d.k * 4) }
-            rw = try (0..<n).map { _ in try .zeros(rt, floatCount: d.k) }
+            cur = try Self.rowViews(rt, n: n, rowBytes: d.nEmbd * 4,
+                                    rowCount: d.nEmbd)
+            attn = try Self.rowViews(rt, n: n, rowBytes: d.nHC * d.nEmbd * 4,
+                                     rowCount: d.nHC * d.nEmbd)
+            split = try Self.rowViews(rt, n: n, rowBytes: 24 * 4, rowCount: 24)
+            ids = try Self.rowViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
+            rw = try Self.rowViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
             if mmPath {
                 let onesBuf = try GPUTensor.zeros(rt, floatCount: n)
                 let op = (onesBuf.buffer.contents() + onesBuf.byteOffset)
@@ -666,6 +689,9 @@ public final class StreamingDecoder {
         // token overwrites it, and the CPU reads all the selections after a
         // single wait. Indexer-active tokens (CPU top-k mid-route) and
         // DS4_PROFILE_ROUTE fall back to the per-token path.
+        // Snapshot once per layer. ProcessInfo.environment materializes a new
+        // dictionary, so never query it in the per-token loop below.
+        let routeBatch = prefillRouteBatch
         var idsT: [[Int32]] = [], rwT: [[Float]] = []
         idsT.reserveCapacity(n); rwT.reserveCapacity(n)
         var j = 0
@@ -675,9 +701,9 @@ public final class StreamingDecoder {
             // deterministically with pos, so activation is checked prospectively
             // (extraRows) for the whole run before encoding any of it.
             var jEnd = j
-            if prefillRouteBatch > 1 && !profileRoute {
+            if routeBatch > 1 && !profileRoute {
                 var extraRows = 0
-                while jEnd < n && (jEnd - j) < prefillRouteBatch {
+                while jEnd < n && (jEnd - j) < routeBatch {
                     let pos = posBase + jEnd
                     if indexerActive(i, pos: pos, extraRows: extraRows) { break }
                     if let idx = indexStates[i], (pos + 1) % idx.ratio == 0 { extraRows += 1 }
@@ -1208,7 +1234,27 @@ public final class StreamingDecoder {
         let hasIdxState = w.idxKv != nil && w.idxGate != nil
         let hasIdxScoring = hasIdxState && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxScoring && indexerActive(i, pos: pos)
-        if active, let idx {
+        if active, let idx, gpuIndexerTopK {
+            // Score -> exact top-K mask -> attention in ONE command buffer. The
+            // recurrent compressor advances idx.count synchronously while these
+            // dispatches are encoded, so it is already the correct score count.
+            let c = GraphContext(rt); if profileRoute { c.phaseTimes = [:] }; try c.begin()
+            let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                            rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                            comp: compStates[i], idx: hasIdxState ? idx : nil,
+                                            indexerScoring: true)
+            let nRaw = min(nKeys, d.nSWA)
+            try c.indexerTopKMask(scores: scratch.idxScores, mask: scratch.mask,
+                                  nRaw: nRaw, nComp: nComp, nScores: idx.count,
+                                  topK: d.indexerTopK)
+            maskDirtyCount = max(maskDirtyCount, nRaw + nComp)
+            try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                  rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token,
+                                  rmsEps: rmsEps, hcEps: hcEps, nComp: nComp,
+                                  comp: compStates[i])
+            c.commit()
+            if profileRoute { accumulateRoutePhases(c, nil) }
+        } else if active, let idx {
             // Indexer layers always split (CPU top-k sits between pre and attn). The
             // phase() boundaries inside decodeRoutePre/Attn are no-ops unless profiling.
             let c1 = GraphContext(rt); if profileRoute { c1.phaseTimes = [:] }; try c1.begin()
@@ -1490,6 +1536,13 @@ public final class StreamingDecoder {
         } else if bundle == nil {
             FileHandle.standardError.write(Data("DS4 expbundle: NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF\n".utf8))
         }
+        let metalIORequested = ProcessInfo.processInfo.environment["DS4_MTLIO"] == "1"
+        if metalIORequested {
+            if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
+            else {
+                FileHandle.standardError.write(Data("DS4 expbundle: DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF\n".utf8))
+            }
+        }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
@@ -1559,8 +1612,7 @@ public final class StreamingDecoder {
                 }
             }
             slotStride = interleave ? recordBytes : nil
-            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
-                                    fill: { il, id, pool, slot in
+            let fillOne: (Int, Int32, ExpertSlotCache.LayerPool, Int) throws -> Void = { il, id, pool, slot in
                 // Sidecar bundle first: layout del record == layout dello slot
                 // interleaved -> UNA pread; col layout storico restano i 3
                 // pread adiacenti (comunque un burst sequenziale).
@@ -1600,7 +1652,20 @@ public final class StreamingDecoder {
                     }
                 }
                 if let e = firstError { throw e }
-            }, prefetch: fillPrefetch,
+            }
+            let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? =
+                metalIORequested && bundle != nil ? { il, pairs, pool in
+                    if bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
+                                                   gateDst: pool.gate, upDst: pool.up, downDst: pool.down,
+                                                   slotStride: interleave ? recordBytes : nil) {
+                        return
+                    }
+                    // Backend unavailable/failed: preserve the exact historical
+                    // fallback for every slot (bundle pread, then GGUF pread).
+                    for pair in pairs { try fillOne(il, pair.id, pool, pair.slot) }
+                } : nil
+            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
+                                    fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
                warm: { il in   // acquire trims to the pool's size; the range filter makes a
                                // corrupt profile degrade to "entry ignored", never a pool
                                // whose creation throws forever (copyExpert bounds-check)
@@ -1795,6 +1860,12 @@ public final class StreamingDecoder {
             ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
                                        gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
             : nil
+        if env["DS4_MTLIO"] == "1" {
+            if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
+            else {
+                FileHandle.standardError.write(Data("DS4 expbundle: DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF\n".utf8))
+            }
+        }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
             if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
@@ -1837,8 +1908,7 @@ public final class StreamingDecoder {
                 return p
             }
         }
-        let cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
-                                    fill: { il, id, pool, slot in
+        let fillOne: (Int, Int32, ExpertSlotCache.LayerPool, Int) throws -> Void = { il, id, pool, slot in
             if let b = bundle {
                 if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
                                                        slot: slot, stride: recordBytes) {
@@ -1868,7 +1938,18 @@ public final class StreamingDecoder {
                 }
             }
             if let e = firstError { throw e }
-        }, prefetch: fillPrefetch,
+        }
+        let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? =
+            env["DS4_MTLIO"] == "1" && bundle != nil ? { il, pairs, pool in
+                if bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
+                                               gateDst: pool.gate, upDst: pool.up, downDst: pool.down,
+                                               slotStride: interleave ? recordBytes : nil) {
+                    return
+                }
+                for pair in pairs { try fillOne(il, pair.id, pool, pair.slot) }
+            } : nil
+        let cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
+                                    fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
            warm: { il in
             usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
         },

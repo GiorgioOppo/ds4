@@ -384,6 +384,8 @@ Workflow guidance ("which knob to try first") is in
 | `DS4_EXPERT_PREAD` | `=1`; off | `pread`+`F_NOCACHE` expert reads that bypass the page cache, preventing expert churn from evicting dense weights. Often the single best knob on 16 GB. |
 | `DS4_PREAD_SPLIT` | `1...8`; `1` | With expert pread: splits each slab into N concurrent 16 KB-aligned range reads to raise NVMe queue depth (the disk only peaks at ~24 requests in flight). Same bytes. |
 | `DS4_EXPERT_BUNDLE` | `=1`; off | Builds/reuses the `<gguf>.expbundle` sidecar with contiguous per-expert slabs: one ~7 MB sequential read per miss instead of three scattered ones. Duplicates the expert region on disk (tens of GB). |
+| `DS4_MTLIO` | `=1`; off | Metal fast resource loading from the expert bundle directly into slot-cache `MTLBuffer` destinations during decode. Prefill deliberately stays on the established parallel-`pread` path. Experimental: benchmark against pread per Mac. |
+| `DS4_MTLIO_MIN_GBS` | float; `1.5` | MetalIO circuit breaker: after a successful batch below this bandwidth, later cache fills permanently fall back to `pread` for that model load. |
 | `DS4_POOL_INTERLEAVE` | `=0` disables; on | Slot-cache pool layout with gate/up/down contiguous per slot, so a bundle miss is ONE pread. `=0` restores the historical 3-buffer layout for parity checks. |
 | `DS4_WILLNEED_EXPERTS` | `=0` disables; on | `madvise(WILLNEED)` on exactly the experts the router selected, right before the gather. Non-speculative. |
 | `DS4_PREFETCH` | `=1`; off | `madvise` read-ahead of the NEXT layer's non-routed weights during the current layer's compute. Can help or hurt depending on SSD saturation. |
@@ -411,6 +413,7 @@ Workflow guidance ("which knob to try first") is in
 | `DS4_PREFILL_UNION` | int ≥6; `192` | Max experts grouped per layer-major prefill read (hot-reloadable). Governs prefill bytes/token; `64` measured catastrophic, `192` best on M1 Pro. Costs ~1.3 GB ×2 transient during prefill. |
 | `DS4_PREFILL_FFN_BATCH` | `=0` disables; on | Encodes all of a group's token-FFNs into one Metal command buffer instead of one per token (the per-token sync was a dominant prefill cost). Identical numerics. |
 | `DS4_PREFILL_ROUTE_BATCH` | int; `32` (`0`/`1` off) | Batches up to N consecutive tokens' route/attention into one command buffer, cutting phase-A syncs N×. Identical numerics; indexer-active tokens fall back to per-token. |
+| `DS4_GPU_INDEXER_TOPK` | `=0` disables; on | Keeps long-context NSA indexer score → exact top-K mask → attention in one GPU command buffer. Removes one CPU readback/wait per active indexer layer; `=0` restores the CPU heap for parity diagnostics. |
 | `DS4_PREFILL_MM` | `=1`; off (opt-in) | **Changes accumulation order** (close but not bit-identical). Routed + shared prefill FFN through matrix-matrix kernels: expert weights read once per tile for all the group's tokens. Flash-shape quants only. |
 
 #### Kernels and numerics

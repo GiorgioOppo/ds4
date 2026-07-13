@@ -132,7 +132,7 @@ struct SettingsView: View {
                         store.runSettingsBenchmark(quick: true)
                     }
                     .disabled(store.benchRunning || store.phase != .ready)
-                    Button("Completo (~10 min)") {
+                    Button("Completo (~15 min)") {
                         store.runSettingsBenchmark(quick: false)
                     }
                     .disabled(store.benchRunning || store.phase != .ready)
@@ -142,7 +142,7 @@ struct SettingsView: View {
                     .disabled(store.benchRunning || store.phase != .ready)
                     if store.benchRunning { ProgressView().controlSize(.small) }
                 }
-                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (64/192/256) su 128 token. Completo: anche il chunk (512/1024) su 1024 token — sotto i 512 token un secondo chunk non esiste, quindi il rapido non può misurarlo. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
+                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (192/256). Completo: anche chunk (512/1024) e route batch (16/32/64/128); quest’ultimo riduce i round-trip CPU↔GPU senza cambiare la numerica. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = store.benchStatus {
                     Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")
@@ -154,7 +154,7 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Attivi (prefill)", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk)")
+                LabeledContent("Attivi (prefill)", value: "union \(store.prefillUnion) · chunk \(store.prefillChunk) · route batch \(store.prefillRouteBatch)")
                     .font(.caption)
                 // Il set di CARICAMENTO scelto dall'auto-tune: slot e look-ahead
                 // hanno i loro stepper (si aggiornano da soli), ma dense-ahead,
@@ -163,19 +163,20 @@ struct SettingsView: View {
                 LabeledContent("Attivi (load)",
                                value: "slot \(store.expertCacheSlots) · ahead \(store.denseAhead) · " +
                                       "asyncFFN \(store.asyncFFNEnabled ? "on" : "off") · " +
-                                      "look \(store.expertLookahead) · q8nsg \(store.q8NSG)")
+                                      "look \(store.expertLookahead) · q8nsg \(store.q8NSG) · " +
+                                      "MetalIO \(store.metalIOEnabled ? "on" : "off")")
                     .font(.caption)
             }
             Section("Memory") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
-                    Text("Resets every toggle below to the measured-fast set (2026-07-08: slots 24, Q4 + q_a/kv + shared FFN Q4 ON, prefill union 256, pread + dense stream + mlock + bundle ON, dense-ahead 2, look-ahead 0, ring OFF). Applies on the next model load.")
+                    Text("Resets performance controls to the measured M1 Pro 16 GB preset (2026-07-13): slots 20, full Q4, prefill 256/512/32, pread + dense stream + mlock + bundle + MetalIO ON, dense-ahead 2, look-ahead 0, NSG 4, ring OFF. MetalIO falls back automatically if slower. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
-                if store.expertCacheSlots > 12 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                    Label("Each slot costs ~0.3 GB of wired memory (6.9 MB × 43 layers): with low RAM too many slots swap and decode collapses.",
+                if store.expertCacheSlots > 20 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
+                    Label("The measured 16 GB preset uses 20 slots. Each extra slot costs ~0.3 GB across 43 layers; excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
@@ -186,6 +187,9 @@ struct SettingsView: View {
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
                 Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
                 if store.expertBundleEnabled {
+                    Toggle("MetalIO direct SSD → GPU buffers (recommended preset)", isOn: $store.metalIOEnabled)
+                    Text("Loads expert records directly into MTLBuffer cache slots. Enabled by the measured preset; automatically falls back to pread on an error or low bandwidth. Prefill continues to use parallel pread. Applies on the next model load.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Label("Reuses <model>.expbundle next to the GGUF when readable (e.g. built by the demo); otherwise the first load builds it under Application Support. Same bytes reordered so a cache miss is ONE sequential ~7 MB read (measured: gather 2.7→4.8 GB/s, +27% tok/s). Duplicates the expert region on disk (tens of GB); skipped automatically when space is short. Check the engine log for 'DS4 expbundle:' lines.",
                           systemImage: "externaldrive.badge.plus")
                         .font(.caption).foregroundStyle(.orange)

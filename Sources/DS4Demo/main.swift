@@ -97,7 +97,7 @@ func diskBench(path: String) -> (report: String, ceilingGBs: Double) {
             let ioDesc = MTLIOCommandQueueDescriptor()
             ioDesc.type = .concurrent
             let ioq = try dev.makeIOCommandQueue(descriptor: ioDesc)
-            let fh = try dev.makeIOHandle(url: URL(fileURLWithPath: path))
+            let fh = try dev.makeIOFileHandle(url: URL(fileURLWithPath: path))
             let offsM = (0..<nSlabs).map { _ in randOff() }
             let bufs: [MTLBuffer] = offsM.map { _ in dev.makeBuffer(length: slab, options: .storageModeShared)! }
             // warm-up: la prima submission paga la creazione della coda IO
@@ -158,7 +158,9 @@ func knobReport() -> String {
                  "DS4_PREFILL_CHUNK", "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG", "DS4_MOE_NSG",
                  "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                  "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
-                 "DS4_QKV_Q4", "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT_EXPERTS"]
+                 "DS4_QKV_Q4", "DS4_GPU_INDEXER_TOPK", "DS4_MTLIO", "DS4_MTLIO_MIN_GBS", "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_SPEC_K", "DS4_SPEC_DRAFT_EXPERTS",
+                 "DS4_DEMO_TEMPERATURE", "DS4_DEMO_TOP_K", "DS4_DEMO_TOP_P", "DS4_DEMO_MIN_P",
+                 "DS4_DEMO_REPEAT_PENALTY", "DS4_DEMO_REPEAT_LAST_N"]
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }
@@ -327,8 +329,22 @@ do {
         }
         let tok = try Tokenizer(model: model)
         let ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
+        // Sampling defaults remain greedy for benchmark/backward compatibility,
+        // but the 2-bit model can fall into a coherent yet unrelated greedy
+        // continuation after one quantization flip. Demo-specific env knobs let
+        // users exercise the same focused top-k path as the GUI.
+        let sampleTemperature = ProcessInfo.processInfo.environment["DS4_DEMO_TEMPERATURE"].flatMap(Float.init) ?? 0
+        let sampleTopK = ProcessInfo.processInfo.environment["DS4_DEMO_TOP_K"].flatMap(Int.init) ?? 0
+        let sampleTopP = ProcessInfo.processInfo.environment["DS4_DEMO_TOP_P"].flatMap(Float.init) ?? 1
+        let sampleMinP = ProcessInfo.processInfo.environment["DS4_DEMO_MIN_P"].flatMap(Float.init) ?? 0
+        let sampleRepeat = ProcessInfo.processInfo.environment["DS4_DEMO_REPEAT_PENALTY"].flatMap(Float.init) ?? 1
+        let sampleRepeatN = max(0, ProcessInfo.processInfo.environment["DS4_DEMO_REPEAT_LAST_N"].flatMap(Int.init) ?? 64)
         let shown = prompt.count > 120 ? String(prompt.prefix(120)) + "…" : prompt
-        log("DS4Demo: prompt '\(shown)' (\(prompt.count) car.) -> \(ids.count) tokens; generating \(maxNew) (greedy, streaming)…")
+        let samplingLabel = sampleTemperature <= 0
+            ? "greedy"
+            : String(format: "temp %.2f, top-k %d, top-p %.2f, min-p %.2f, repeat %.2f",
+                     sampleTemperature, sampleTopK, sampleTopP, sampleMinP, sampleRepeat)
+        log("DS4Demo: prompt '\(shown)' (\(prompt.count) car.) -> \(ids.count) tokens; generating \(maxNew) (\(samplingLabel), streaming)…")
         if ids.count + maxNew + 1 > 4096 {
             log("DS4Demo: ERRORE il prompt (\(ids.count) token) + \(maxNew) generati supera il KV della demo (maxKeys 4096) — abbassa DS4_PROMPT_MAX_CHARS")
             exit(2)
@@ -363,6 +379,7 @@ do {
             ?? (diag ? min(4, max(0, maxNew - 1)) : 0)
         stdout.write(Data("\nRisposta: ".utf8))
         var rng: UInt64 = 1
+        var recent = ids
         var genTokens = 0
         let genStart = Date()
         var steadyStart = genStart
@@ -372,7 +389,11 @@ do {
         // logit per posizione → accettazione greedy del prefisso + bonus token.
         // Parità bit-per-bit col decode normale per costruzione (stessi argmax
         // full-config): DS4_SPEC_K=1 o assente = percorso storico.
-        let specK = ProcessInfo.processInfo.environment["DS4_SPEC_K"].flatMap(Int.init) ?? 0
+        let requestedSpecK = ProcessInfo.processInfo.environment["DS4_SPEC_K"].flatMap(Int.init) ?? 0
+        let specK = (sampleTemperature <= 0 && sampleRepeat <= 1) ? requestedSpecK : 0
+        if requestedSpecK >= 2 && specK == 0 {
+            log("DS4Demo: self-speculative disattivata — richiede sampling greedy senza repetition penalty")
+        }
         if specK >= 2 {
             let fullExperts = dec.activeExpertsNow
             let draftExperts = max(1, min(fullExperts - 1,
@@ -452,9 +473,14 @@ do {
             }
         } else {
         for _ in 0..<maxNew {
-            let next = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+            let recentLo = max(0, recent.count - sampleRepeatN)
+            let next = Sampler.sample(last, temperature: sampleTemperature, topK: sampleTopK,
+                                      topP: sampleTopP, minP: sampleMinP,
+                                      repetitionPenalty: sampleRepeat,
+                                      recent: recent[recentLo...], rng: &rng)
             if Int32(next) == tok.eosId { break }
             stdout.write(Data(tok.tokenText(Int32(next))))   // stream immediately (unbuffered)
+            recent.append(next)
             let t0 = Date()
             last = try dec.forward(token: next, pos: pos, nKeys: pos + 1); pos += 1
             genTokens += 1

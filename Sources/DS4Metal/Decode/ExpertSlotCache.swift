@@ -73,6 +73,12 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// MUST be safe to call concurrently for distinct slots (misses are filled
     /// in parallel — each fill writes only its own slot's slabs).
     private let fill: (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void
+    /// Optional batch fill. MetalIO uses this to encode all cache misses into
+    /// ONE I/O command buffer, directly targeting their disjoint pool slots.
+    /// The closure must fall back internally or throw; numerics/layout are the
+    /// same as repeated `fill` calls.
+    private let fillBatch: ((_ layer: Int, _ pairs: [(id: Int32, slot: Int)],
+                            _ pool: LayerPool) throws -> Void)?
     /// Optional readahead hint, called with ALL the ids about to be filled BEFORE
     /// the copies (e.g. madvise(WILLNEED) on their mmap slabs) so the SSD serves
     /// the regions concurrently instead of fault-by-fault.
@@ -85,6 +91,8 @@ public final class ExpertSlotCache: @unchecked Sendable {
                 bytesPerExpert: Int = 0,
                 makePool: @escaping (_ slots: Int) throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
                 fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void,
+                fillBatch: ((_ layer: Int, _ pairs: [(id: Int32, slot: Int)],
+                             _ pool: LayerPool) throws -> Void)? = nil,
                 prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
                 warm: ((_ layer: Int) -> [Int32])? = nil,
                 slotsFor: ((_ layer: Int) -> Int)? = nil) {
@@ -92,6 +100,7 @@ public final class ExpertSlotCache: @unchecked Sendable {
         self.bytesPerExpert = bytesPerExpert
         self.makePool = makePool
         self.fill = fill
+        self.fillBatch = fillBatch
         self.prefetch = prefetch
         self.warm = warm
         self.slotsFor = slotsFor
@@ -116,6 +125,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
     private func fillAll(layer: Int, pairs: [(id: Int32, slot: Int)], pool: LayerPool) throws {
         guard !pairs.isEmpty else { return }
         prefetch?(layer, pairs.map { $0.id })
+        if let fillBatch {
+            try fillBatch(layer, pairs, pool)
+            return
+        }
         if pairs.count == 1 {
             try fill(layer, pairs[0].id, pool, pairs[0].slot)
             return
