@@ -5,6 +5,11 @@ DwarfStar's engine is a **pure-Swift rewrite** of the upstream C project
 upstream comparison so that the next review starts from a known baseline instead
 of rediscovering the same commit history.
 
+This is a dated synchronization snapshot, not a statement about the current
+upstream HEAD. The documentation restructuring on 2026-07-13 did not perform a
+new network comparison; use the commands in the final section before advancing
+the baseline.
+
 ## Current Baseline
 
 | Field | Value |
@@ -23,11 +28,14 @@ files are relevant:
   `DS4Core` + `DS4Metal`.
 - `ds4_metal.m` — Metal runtime and kernels. DwarfStar equivalent: `DS4Metal`.
 - `ds4_server.c` — HTTP server behavior. DwarfStar equivalent:
-  `Sources/DwarfStar/Server`.
+  `Sources/DwarfStar/Features/Server`.
 
 Out of scope for this port: CUDA/ROCm backends (`ds4_cuda.cu`, `ds4_rocm.cu`,
-`rocm/`), MTP/speculative decoding, the terminal agent (`ds4_agent.c`,
-raw-mode/TTY behavior), `ds4-eval`, and `ds4_cli.c`.
+`rocm/`), the upstream MTP-backed speculative path, the terminal agent
+(`ds4_agent.c`, raw-mode/TTY behavior), `ds4-eval`, and `ds4_cli.c`. DwarfStar's
+separate, MTP-free self-speculative CLI experiment is documented in
+[`SELF-SPECULATIVE.md`](SELF-SPECULATIVE.md) and is not evidence that the
+upstream MTP surface was ported.
 
 ## Recent Commit Review (Through `80ebbc3`)
 
@@ -43,8 +51,8 @@ raw-mode/TTY behavior), `ds4-eval`, and `ds4_cli.c`.
 | `f2d701a` Fix distributed SSD streaming layer slices | distributed | **Deferred.** DwarfStar's distributed mode is implemented but still needs numerical validation. Review together with that validation work. |
 | `81f35e7` + `b548d86` mixed-precision routed experts | streaming/quant | **Ported.** Per-layer routed expert quantization is supported. See below. |
 
-Commits not listed here, such as ROCm/CUDA, MTP, terminal agent, and `ds4-eval`
-work, are currently outside the DwarfStar port boundary.
+Commits not listed here, such as ROCm/CUDA, the upstream MTP path, terminal
+agent, and `ds4-eval` work, are currently outside the DwarfStar port boundary.
 
 ## Ported: Per-Layer Mixed-Precision Routed Experts
 
@@ -84,7 +92,8 @@ For every new commit, ask:
 - Does it touch an area DwarfStar shares with upstream: engine, Metal, or server?
 - Is it a behavioral or correctness change, rather than a C-specific memory,
   warning, or backend-only change?
-- Is it outside the excluded surfaces: CUDA/ROCm, MTP, TTY agent, eval tooling?
+- Is it outside the excluded surfaces: CUDA/ROCm, upstream MTP execution, TTY
+  agent, eval tooling?
 
 If the answer is yes, evaluate a Swift port. Otherwise, record the commit as
 N/A and advance the baseline after review.

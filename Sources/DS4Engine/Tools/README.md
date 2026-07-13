@@ -1,42 +1,30 @@
-# DS4Engine/Tools
+# Tools
 
-Function-calling support: built-in tools the model can invoke, plus the project
-library they operate on.
+Implementa il function calling del modello: contratti, strumenti incorporati,
+integrazioni condivise e server MCP esterni.
 
-- **`ToolRegistry.swift`** defines the registry surface: `builtins`,
-  `projectScoped`, `subAgentGrantable`, `execute`, `specs`, plus shared helpers
-  for argument parsing, arithmetic tools, and expression evaluation.
-- **`Builtins/`** contains **one file per tool** using
-  `extension ToolRegistry { static let X = BuiltinTool(...) }`. Adding a tool
-  means adding a file here and registering it in `builtins[]`.
-- **`MCP/`** contains the MCP (Model Context Protocol) client: config,
-  JSON-RPC protocol helpers, stdio/HTTP transports, per-server client, and
-  `MCPManager.shared`, which exposes connected servers' tools as namespaced
-  `ToolSpec`s (`mcp_<server>_<tool>`) next to the built-ins (see `MCP/README.md`).
-- **`ProjectCache.swift`** indexes imported projects and backs the `project_*`
-  and `file_*` tools for read/list/search/write/edit/add/line-modify operations.
-  It does not touch chat memory. Every path is confined to the project root
-  even in the presence of symlinks (resolved and re-checked; symlinks are also
-  never indexed), and `project_edit` rereads its base from disk so an external
-  change (git, the user's editor) is never silently reverted. `project_search`
-  reads cold files without inserting them into the content cache, so searching
-  a project larger than the cache budget cannot evict the files being read.
-- **`WebClient.swift`** is the shared SSRF-guarded HTTP client behind
-  `web_search`/`web_fetch`: http/https only, public hosts only, size- and
-  time-capped responses (see `Builtins/README.md`).
-- **`GitTool.swift`** runs whitelisted local git subcommands in the project root.
-  Network operations are intentionally excluded. `stash` — the one allowed
-  subcommand that rewrites the working tree — triggers an automatic project
-  re-index (`project_reload` covers every other out-of-band change).
-- **`GitHubTool.swift`** backs the `github_clone` built-in: downloads a public
-  GitHub repository as an HTTPS tarball (host pinned to `codeload.github.com`,
-  arguments strictly validated, size-capped), extracts it under
-  `Application Support/DwarfStar/github-projects`, imports it into
-  `ProjectCache` as the active project, and returns a compact orientation
-  summary (tree + documentation files) — so the model explores with the
-  `project_*` tools instead of paying prefill for the whole repository.
-- **`Agents.swift`** defines `AgentProfile` (system prompt, tools, and expert
-  profile) and `AgentRegistry`, the shared roster read by `agents_list`.
-  Default roles: General, Coding, Code (agentic editing), Reviewer (read-only
-  code review), Debug (root-cause + minimal fix), Orchestrator (sub-agents),
-  Research (web), Math, Writing, LaTeX, Documentation.
+## Struttura
+
+- [`Core`](Core/README.md): `BuiltinTool`, `ToolOutput` e `ToolRegistry`.
+- [`Builtins`](Builtins/README.md): un tool per file, raggruppato per dominio.
+- [`Integrations`](Integrations/README.md): client web, git e GitHub riutilizzabili.
+- [`MCP`](MCP/README.md): configurazione, protocollo, trasporti e manager MCP.
+
+Le proprietà di sicurezza e le superfici autorizzate sono riassunte in
+[`SICUREZZA.md`](SICUREZZA.md).
+
+## Flusso
+
+1. Il client chiede a `ToolRegistry` le `ToolSpec` abilitate.
+2. Il modello emette nome e JSON degli argomenti.
+3. `executeAuto` risolve prima i built-in e poi l'indice MCP.
+4. `ToolOutput` torna al ciclo di inferenza come risultato del tool.
+
+I tool di progetto usano [`ProjectCache`](../Projects/README.md); i profili in
+[`Agents`](../Agents/README.md) decidono quali nomi sono dichiarati.
+
+## Estensione
+
+Un nuovo tool deve avere schema ristretto, output limitato, errori leggibili e
+una politica chiara per progetto/sub-agent. La logica condivisa o con side
+effect esterni va in `Integrations`, non duplicata nella closure del built-in.

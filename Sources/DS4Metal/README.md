@@ -1,18 +1,30 @@
 # DS4Metal
 
-Pure Swift Metal runtime plus decode graph: a faithful port of `ds4_metal.m`.
-This target compiles the embedded `metal/*.metal` kernels, owns the GPU dispatch
-path, and links `Metal.framework`. It depends on `DS4Core`.
+Backend Metal di DeepSeek-V4: carica i pesi, compila i kernel incorporati,
+costruisce il grafo e gestisce prefill e generazione token-per-token. Il target
+dipende da `DS4Core` e da `Metal.framework`.
 
-- **`Runtime/`**: `MetalRuntime` for device/pipeline setup, `GPUTensor` for
-  shared-memory buffers, and generated embedded kernel sources.
-- **`Model/`**: compiled model shape (`DSV4Shape`), GGUF-backed weight loading
-  (`GGUFWeights`) with no-copy mmap access and expert gathering, dense-weight
-  streaming (`DenseStreamer`), and the contiguous expert sidecar (`ExpertBundle`).
-- **`Decode/`**: `StreamingDecoder`, forward/prefill/slice execution, decode graph,
-  KV cache, raw window plus NSA compressor, expert slot cache, and KV snapshots.
-- **`Kernels/`**: one Swift wrapper per Metal kernel, covering MoE matvec,
-  flash attention, RoPE, normalization, utility kernels, and related dispatch
-  glue.
+## Struttura
 
-Correctness is rule #1 and is validated by tests in `Tests/DS4CoreTests`.
+- [`Runtime/`](Runtime/README.md): device, command queue, pipeline e tensori GPU.
+- [`Model/`](Model/README.md): architettura, pesi GGUF, expert e streaming SSD.
+- [`Kernels/`](Kernels/README.md): wrapper Swift dei kernel `.metal`.
+- [`Graph/`](Graph/README.md): operazioni che compongono il grafo di inferenza.
+- [`Decode/`](Decode/README.md): stato ricorrente, prefill e generazione.
+
+## Flusso
+
+`MetalRuntime` compila le sorgenti incorporate; il loader converte i tensor
+descriptor di `DS4Core.GGUFModel` in `GPUTensor`; `StreamingDecoder` dimensiona
+scratch e KV cache. Ogni forward usa `GraphContext` e i wrapper kernel per
+codificare command buffer, quindi l'output head restituisce i logits al sampler
+di `DS4Core`.
+
+## Regole di modifica
+
+- Correttezza numerica e parità con il percorso di riferimento precedono le
+  ottimizzazioni.
+- Dichiarare esplicitamente layout, tipo quantizzato, offset e sincronizzazione.
+- Non modificare direttamente codice generato; rigenerarlo dalla sorgente.
+- Documentare nuovi knob `DS4_*` nella configurazione principale e nel dominio.
+- Aggiungere test CPU o Metal mirati per ogni nuovo percorso di dispatch.

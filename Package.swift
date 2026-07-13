@@ -1,10 +1,34 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
 
 // DS4-gui: a native Swift/SwiftUI front-end for DeepSeek V4 (DwarfStar). The
 // engine is a pure-Swift reimplementation (DS4Core + DS4Metal): no C engine, no
 // prebuilt static lib, no external links — so everything builds in a clean
 // SwiftPM package and the standalone .xcodeproj. Run `swift build` or `make`.
+
+/// Documentation is intentionally colocated with every source/test directory.
+/// Keep the manifest warning-free without duplicating that growing list here:
+/// SwiftPM receives paths relative to the target root, while XcodeGen applies
+/// the equivalent recursive `**/*.md` exclusions from project.yml.
+func markdownFiles(in relativeRoot: String, also extra: [String] = []) -> [String] {
+    let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    let root = packageRoot.appendingPathComponent(relativeRoot).standardizedFileURL
+    let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+    var paths = extra
+    if let files = FileManager.default.enumerator(
+        at: root,
+        includingPropertiesForKeys: nil,
+        options: [.skipsHiddenFiles]
+    ) {
+        for case let file as URL in files where file.pathExtension.lowercased() == "md" {
+            let path = file.standardizedFileURL.path
+            guard path.hasPrefix(prefix) else { continue }
+            paths.append(String(path.dropFirst(prefix.count)))
+        }
+    }
+    return Array(Set(paths)).sorted()
+}
 
 let package = Package(
     name: "DS4Gui",
@@ -24,7 +48,7 @@ let package = Package(
         // module (see the C->Swift conversion phases).
         .target(
             name: "DS4Core",
-            exclude: ["README.md", "Format/README.md", "Inference/README.md", "Streaming/README.md"]
+            exclude: markdownFiles(in: "Sources/DS4Core")
         ),
 
         // Swift Metal runtime (Phase 8+): compiles the vendored metal/ kernels
@@ -32,7 +56,7 @@ let package = Package(
         .target(
             name: "DS4Metal",
             dependencies: ["DS4Core"],
-            exclude: ["README.md", "Decode/README.md", "Kernels/README.md", "Model/README.md", "Runtime/README.md"],
+            exclude: markdownFiles(in: "Sources/DS4Metal"),
             linkerSettings: [.linkedFramework("Metal")]
         ),
 
@@ -41,7 +65,7 @@ let package = Package(
         .testTarget(
             name: "DS4CoreTests",
             dependencies: ["DS4Core", "DS4Metal", "DS4Engine"],
-            exclude: ["README.md"]
+            exclude: markdownFiles(in: "Tests/DS4CoreTests")
         ),
 
         // Swift-native inference service backing the GUI: pure-Swift engine
@@ -49,23 +73,18 @@ let package = Package(
         .target(
             name: "DS4Engine",
             dependencies: ["DS4Core", "DS4Metal"],
-            exclude: ["README.md", "Service/README.md", "Tools/README.md",
-                      "Tools/Builtins/README.md", "Tools/MCP/README.md",
-                      "Download/README.md", "Distributed/README.md"]
+            exclude: markdownFiles(in: "Sources/DS4Engine")
         ),
 
         // The SwiftUI GUI app — driven by the pure-Swift engine (DS4Engine).
         // No C engine, no prebuilt static lib: builds in the standalone .xcodeproj.
         .executableTarget(
             name: "DwarfStar",
-            dependencies: ["DS4Engine"],
+            dependencies: ["DS4Engine", "DS4Core"],
             // Assets.xcassets is the .app icon catalog: consumed by the xcodegen
             // .xcodeproj build, but SwiftPM has no asset-catalog compiler — exclude
             // it here so `swift build`/`swift test` don't warn about unhandled files.
-            exclude: ["README.md", "App/README.md", "Chat/README.md", "Models/README.md",
-                      "Project/README.md", "Tuning/README.md", "Server/README.md",
-                      "Distributed/README.md", "Bench/README.md", "Diagnostics/README.md",
-                      "Settings/README.md", "Support/README.md", "Assets.xcassets"]
+            exclude: markdownFiles(in: "Sources/DwarfStar", also: ["Assets.xcassets"])
         ),
 
         // Pure-Swift engine demo CLI: drives DS4Core + DS4Metal directly (Metal
@@ -74,7 +93,7 @@ let package = Package(
         .executableTarget(
             name: "DS4Demo",
             dependencies: ["DS4Core", "DS4Metal"],
-            exclude: ["README.md"]
+            exclude: markdownFiles(in: "Sources/DS4Demo")
         ),
     ]
 )

@@ -1,0 +1,581 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+import DS4Engine
+import DS4Core
+
+/// Main-thread view model. Owns the `InferenceService` actor and mirrors its
+/// streamed output into observable UI state.
+@MainActor
+@Observable
+final class ChatStore {
+    enum Phase: Equatable {
+        case needsModel
+        case loading
+        case ready
+        case failed(String)
+    }
+
+    // Configuration (editable before loading). Defaults adapt to dev vs bundle.
+    // NOTE: the pure-Swift engine always runs the SSD-streaming path (mmap no-copy
+    // + per-token expert gather); the old C-engine streaming/RAM-mode toggles were
+    // dead and have been removed.
+    /// Shared app settings: model path / context / mode are owned by the
+    /// Impostazioni screen; this store (like every other controller) proxies them.
+    let settings: AppSettings
+    var modelPath: String {
+        get { settings.modelPath }
+        set { settings.modelPath = newValue }
+    }
+    var contextSize: Int {
+        get { settings.contextSize }
+        set { settings.contextSize = newValue }
+    }
+    var scriptDir = AppEnvironment.resourceDir   // download_model.sh / gguf
+
+    init(settings: AppSettings) {
+        self.settings = settings
+        AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
+        // MCP servers connect asynchronously: when one (dis)connects, bump the
+        // observable mirror (so pickers listing MCP tools re-render) and re-push
+        // the declared tools to the engine (specs exist only while connected —
+        // without this, an agent with mcp_* tools active at launch would never
+        // expose them to the model).
+        MCPManager.shared.addChangeHandler { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.mcpVersion = MCPManager.shared.version
+                self.syncTools()
+            }
+        }
+        // Migrazione UNA TANTUM alla configurazione veloce misurata (2026-07,
+        // demo A/B sul campo: slot 16 + ring off + bundle = 2.3-2.6 tok/s
+        // contro ~1 con slot 6/ring on/contesto 302k). Applica i valori buoni
+        // ai default persistiti da vecchi esperimenti; le modifiche manuali
+        // FUTURE dell'utente restano sovrane (il flag impedisce di ripeterla).
+        // NB: dentro init i didSet non scattano — persistenza esplicita.
+        if !UserDefaults.standard.bool(forKey: "DS4FastConfig2026_07") {
+            UserDefaults.standard.set(true, forKey: "DS4FastConfig2026_07")
+            expertCacheSlots = 16
+            UserDefaults.standard.set(16, forKey: "DS4ExpertCacheSlots")
+            rawRingEnabled = false
+            UserDefaults.standard.set(false, forKey: "DS4RawRing")
+            if settings.contextSize > 32768 { settings.contextSize = 8192 }
+        }
+        // Migrazione UNA TANTUM v2 (2026-07-04): allinea TUTTI i toggle alla
+        // configurazione della demo veloce (8 tok/s prefill / 2.5+ decode) —
+        // i valori persistiti derivano dagli esperimenti fatti in Settings
+        // (es. bundle spento per un test A/B) e restavano incollati per sempre.
+        // NB: dentro init i didSet non scattano — persistenza esplicita; i
+        // setenv qui sotto leggono già i valori allineati.
+        if !UserDefaults.standard.bool(forKey: "DS4DemoAlign2026_07_04") {
+            UserDefaults.standard.set(true, forKey: "DS4DemoAlign2026_07_04")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        // Migrazione UNA TANTUM v3 (2026-07-06): allinea alla configurazione
+        // MISURATA della sessione di tuning (matrice completa di A/B in demo):
+        // slot 16, dense-ahead 2, look-ahead 0 (speculativo neutro, hash layers
+        // sempre attivi), niente SHARED_Q4. I valori sperimentali persistiti
+        // (slot 12, look-ahead 4) derivavano dai test intermedi.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_06") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_06")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        // Migrazione UNA TANTUM v4 (2026-07-08): matrice A/B in demo su M1 Pro
+        // 16 GB — QKV_Q4 promosso (+10%, output coerente) e slot 24 (73% hit,
+        // 3.33 tok/s di regime, nessun collasso). MOE_NSG=4 confermato,
+        // PREAD_SPLIT e allineamento pread falsificati dal probe DIAG.
+        // Dettagli e numeri: docs/VALUTAZIONE-DEMO-PERF.md §8.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_08") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        // Migrazione UNA TANTUM v5 (2026-07-08, sera): union 256 (+19% prefill
+        // misurato a 3.5k token) e SHARED_Q4 (+7% decode, output coerente).
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_08b") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_08b")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        // Migrazione UNA TANTUM v6 (2026-07-13): preset finale misurato sul
+        // M1 Pro 16 GB con RAM libera. Slot 20 evita pressione/swap, MetalIO
+        // e' sicuro grazie al fallback automatico, Q4 completo mantiene una
+        // generazione coerente a ~3.2-3.4 tok/s e il prefill arriva a ~4 tok/s.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredAlign2026_07_13") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredAlign2026_07_13")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        // Migrazione v7: confronto greedy identico 20→22 slot sul M1 Pro 16 GB:
+        // miss/byte SSD -7,8%, gather -6,1%, regime 3,18→3,30 tok/s, senza
+        // pressione RAM osservabile. Aggiorna anche installazioni già migrate.
+        if !UserDefaults.standard.bool(forKey: "DS4MeasuredSlots22_2026_07_13") {
+            UserDefaults.standard.set(true, forKey: "DS4MeasuredSlots22_2026_07_13")
+            applyFastDemoDefaults(persistExplicitly: true)
+        }
+        _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
+        _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
+        _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
+        _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)                // default ON (+10% misurato, lossy, disattivabile)
+        _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)          // default ON nel preset misurato (+7%, lossy)
+        _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
+        _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
+        _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
+        _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // partizione K matvec Q8 (auto-tune)
+        _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)                          // occupancy kernel MoE/Q4 (auto-tune)
+        _ = setenv("DS4_DENSE_Q4_NSG", "4", 1)                              // sweep M1 Pro: 4 batte 2/8
+        _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
+        _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)              // Metal fast resource loading (A/B sperimentale)
+        _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)                           // M1 Pro: pread arriva a ~5 GB/s
+        _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)                            // un record contiguo per slot/esperto
+        _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)                          // un command buffer FFN per gruppo
+        _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)                           // evita top-k/readback sulla CPU
+        _ = setenv("DS4_DENSE_Q4_KERNEL", "1", 1)                            // matvec Q4 dense senza wrapper MoE k=1
+        _ = setenv("DS4_FUSED_ROUTER_PROBS", "1", 1)                         // softplus+sqrt in un dispatch
+        _ = setenv("DS4_FUSED_ROUTER_FINALIZE", "1", 1)                      // top-6 + pesi in un dispatch
+        _ = setenv("DS4_FUSED_COMP_PROJ", "1", 1)                            // compressore KV+gate, attivazione condivisa
+        // La cache del requant Q4 va in Application Support: l'app sandboxed
+        // non può scrivere accanto al GGUF scelto col picker (il fallimento
+        // sarebbe silenzioso e il requant si ripeterebbe a ogni load).
+        _ = setenv("DS4_Q4_CACHE_DIR", Self.q4CacheDirectory.path, 1)
+        // Stessa ragione per l'expert-bundle: il sidecar accanto al GGUF resta
+        // leggibile quando la sandbox lo consente (riuso di quello della demo,
+        // 72 GB non copiati), altrimenti la COSTRUZIONE va qui.
+        _ = setenv("DS4_BUNDLE_DIR", Self.bundleDirectory.path, 1)
+        // Densi residenti: SOLO automatico dalla RAM (niente toggle in GUI) —
+        // su 16 GB nell'app rallenta; il valore persistito di vecchie build
+        // viene ripulito così non può restare incollato un ON stantio.
+        // (Con DS4_DENSE_STREAM attivo il motore da' comunque precedenza allo stream.)
+        UserDefaults.standard.removeObject(forKey: "DS4ResidentDense")
+        _ = setenv("DS4_RESIDENT_DENSE", Self.residentDenseAuto ? "1" : "0", 1)
+        _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)     // diagnostic, default OFF
+        // Riparazione una-tantum: la prima versione del benchmark rapido
+        // poteva scegliere union=64 su una misura da 128 token troppo corta
+        // (rumore) — a scala reale 64 è il valore catastrofico. Riporta al
+        // consigliato; il benchmark corretto non lo riproporrà.
+        if !UserDefaults.standard.bool(forKey: "DS4BenchUnionFix2026_07_04"),
+           prefillUnion < 192 {
+            UserDefaults.standard.set(true, forKey: "DS4BenchUnionFix2026_07_04")
+            prefillUnion = 192
+            UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
+        }
+        // Knob del prefill regolabili a caldo (persistiti dal benchmark in
+        // Settings): letti dal motore a ogni chiamata di prefill.
+        _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+        _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
+        // Restore the persisted chats (newest first). Always keep at least one so
+        // there is an active conversation to write into.
+        sessions = ChatSessionStore.loadAll()
+        if let first = sessions.first {
+            activeSessionId = first.id
+        } else {
+            let s = ChatSession(agentId: selectedAgentId, systemNote: systemPrompt)
+            sessions = [s]
+            activeSessionId = s.id
+        }
+    }
+    var systemPrompt = ""
+    /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
+    /// 43 layer on the 2-bit model. Applied on the NEXT model load.
+    /// DEFAULT 22: punto misurato su M1 Pro 16 GB con dense stream + pread +
+    /// MLOCK + Q4 completo (A/B greedy 2026-07-13: 70% hit, 3.30 tok/s,
+    /// miss/byte SSD -7,8% vs 20 senza collasso). Senza MLOCK i
+    /// pool grandi vengono compressi/paginati e conviene 8; senza Q4 il
+    /// budget bloccato è più tirato e il punto dolce scende a 12-16.
+    var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 22 {
+        didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
+    }
+    /// Look-ahead speculativo della slot-cache (DS4_EXPERT_LOOKAHEAD): mentre il
+    /// layer i calcola, il pool del layer i+1 viene PREriempito con i top-N
+    /// esperti del prior d'uso (I/O reale nella finestra in cui l'SSD è idle;
+    /// il demand ha priorità — un prefill in corso cede il passo entro ~2 slab).
+    /// I layer hash 0-2 sono SEMPRE prefetchati esatti (selezione nota dal token
+    /// id), indipendentemente da questo valore. 0 = solo hash. Si applica al
+    /// prossimo caricamento del modello. Speculativo: A/B per macchina.
+    var expertLookahead: Int = (UserDefaults.standard.object(forKey: "DS4ExpertLookahead") as? Int) ?? 0 {
+        didSet {
+            UserDefaults.standard.set(expertLookahead, forKey: "DS4ExpertLookahead")
+            _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)
+        }
+    }
+    /// Profondita' del ring di staging del dense stream (DS4_DENSE_AHEAD):
+    /// 2 = legge un layer piu' avanti, +1,5% misurato su M1 Pro (costo ~150 MB
+    /// di staging). Nessun toggle in GUI: e' il default misurato; regolabile
+    /// via UserDefaults per esperimenti. Si applica al prossimo load.
+    var denseAhead: Int = (UserDefaults.standard.object(forKey: "DS4DenseAhead") as? Int) ?? 2 {
+        didSet {
+            UserDefaults.standard.set(denseAhead, forKey: "DS4DenseAhead")
+            _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)
+        }
+    }
+    /// Pipeline asincrona del FFN routed (DS4_ASYNC_FFN): certificata da A/B
+    /// (+10%, 335 vs 374 ms/token, output identico token-per-token — la
+    /// correttezza e' garantita dalla coda Metal in-order). Default ON;
+    /// persistito senza UI: e' il paracadute per debug (=false ripristina il
+    /// percorso storico coi wait sincroni). Si applica al prossimo load.
+    var asyncFFNEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4AsyncFFN") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(asyncFFNEnabled, forKey: "DS4AsyncFFN")
+            _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)
+        }
+    }
+
+    /// DS4_Q8_NSG: simdgroup per threadgroup nei matvec Q8 (partizione della
+    /// riduzione K — stesso risultato numerico, cambia solo l'occupancy).
+    /// L'ottimo dipende dai core GPU: 4 = riferimento (migliore su M1 Pro);
+    /// su GPU più larghe (Max/Ultra) possono vincere 6-8. Il motore lo
+    /// rilegge a ogni load del modello: l'auto-tune lo esplora con un reload.
+    var q8NSG: Int = (UserDefaults.standard.object(forKey: "DS4Q8NSG") as? Int) ?? 4 {
+        didSet {
+            UserDefaults.standard.set(q8NSG, forKey: "DS4Q8NSG")
+            _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)
+        }
+    }
+
+    /// DS4_MOE_NSG: simdgroup per threadgroup nei kernel MoE id (FFN routed —
+    /// la voce compute più grossa misurata, ~100 ms/token — e matvec densi
+    /// Q4). Partizione per RIGHE: numerica identica per costruzione, cambia
+    /// solo l'occupancy. Come q8NSG: default 4 (storico), l'ottimo dipende
+    /// dai core GPU e l'auto-tune lo esplora con un reload.
+    var moeNSG: Int = (UserDefaults.standard.object(forKey: "DS4MoeNSG") as? Int) ?? 4 {
+        didSet {
+            UserDefaults.standard.set(moeNSG, forKey: "DS4MoeNSG")
+            _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)
+        }
+    }
+
+    // Disk KV cache (ds4_kvstore model): checkpoints completed generations and
+    // restores matching prefixes on cold starts. Applied on the NEXT model load.
+    // ON by default so conversations are checkpointed and re-prefill is avoided
+    // across reloads; the explicit user choice is then persisted.
+    var diskKVEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4DiskKV") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(diskKVEnabled, forKey: "DS4DiskKV") }
+    }
+    /// Disk-KV budget in THOUSANDS of tokens (default 1000 = 1M tokens total
+    /// across checkpoints — the live window stays `contextSize`). Tokens, not MB:
+    /// per-token checkpoint bytes depend on the model (~22 KB/token on the 61-layer
+    /// 2-bit Flash → 1M tokens ≈ 22 GB on disk), so tokens are the stable unit.
+    var diskKVBudgetKTok: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000 {
+        didSet { UserDefaults.standard.set(diskKVBudgetKTok, forKey: "DS4DiskKVBudgetKTok") }
+    }
+    /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
+    /// instead of the full context, so the KV RAM is constant. Sets the engine env
+    /// var; applied on the NEXT model load.
+    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
+            _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
+        }
+    }
+    /// madvise(WILLNEED) sui 6 esperti selezionati prima del gather: anticipa e
+    /// batcha il read-ahead a freddo dei soli slab che servono. Solo advisory (non
+    /// cambia i numeri). DEFAULT ON; si applica al PROSSIMO caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var willNeedEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4WillNeed") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(willNeedEnabled, forKey: "DS4WillNeed")
+            _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Lettura diretta degli esperti (DS4_EXPERT_PREAD): pread + F_NOCACHE dei soli
+    /// slab selezionati, direttamente nei buffer di destinazione, SENZA passare
+    /// dalla page cache. Su RAM stretta il churn degli esperti (~1 GB/token)
+    /// smette così di evictare i pesi densi: misurato su M1 Pro 16 GB vale ~+20%
+    /// di tok/s da solo e rende conveniente i densi residenti (insieme: 0.17 →
+    /// 0.27 tok/s). Con RAM abbondante conviene invece la page cache (i re-read
+    /// degli esperti tiepidi sono gratis) → DEFAULT ON sotto i 24 GB, OFF sopra.
+    /// Stessi byte, stesse numeriche. Si applica al prossimo caricamento.
+    var expertPreadEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4ExpertPread") as? Bool)
+        ?? (MemoryInfo.physicalBytes < 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(expertPreadEnabled, forKey: "DS4ExpertPread")
+            _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Streaming double-buffered dei pesi densi (DS4_DENSE_STREAM): invece di
+    /// tenere ~6 GB di densi residenti/cachati, ogni layer viene letto con
+    /// pread+F_NOCACHE in un ring a 2 slot (~300 MB) UN LAYER IN ANTICIPO, così
+    /// l'I/O SSD del layer i+1 si sovrappone al compute del layer i. Byte
+    /// identici → numeriche identiche. MISURATO su M1 Pro 16 GB: route/attn
+    /// −87%, 0.17 → 0.34 tok/s dalla baseline, primo token 8.7 s invece di 24,
+    /// prefill −65%. DEFAULT ON sotto i 24 GB; sopra conviene la residenza
+    /// piena (automatica), quindi lì default OFF. Prevale su DS4_RESIDENT_DENSE.
+    /// Si applica al prossimo caricamento del modello.
+    var denseStreamEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4DenseStream") as? Bool)
+        ?? (MemoryInfo.physicalBytes < 24 * 1_073_741_824) {
+        didSet {
+            UserDefaults.standard.set(denseStreamEnabled, forKey: "DS4DenseStream")
+            _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Requant Q4_K delle tre proiezioni giganti dell'attention (DS4_DENSE_Q4):
+    /// q_b / output_a / output_b (Q8, 107 dei ~145 MB/layer) requantizzate al
+    /// load e tenute residenti (~1.4 GB, mlockate). MISURATO su M1 Pro 16 GB:
+    /// 0.88 → 1.17 tok/s. ATTENZIONE: è l'unica opzione LOSSY — deriva di
+    /// logit ~0.01%, output greedy occasionalmente diverso ma coerente
+    /// (validato dall'autore sul campo). DEFAULT ON con avviso in GUI; il
+    /// toggle resta per chi preferisce la fedeltà piena. Richiede il dense
+    /// stream; si applica al prossimo caricamento del modello.
+    var denseQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4DenseQ4") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(denseQ4Enabled, forKey: "DS4DenseQ4")
+            _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)
+        }
+    }
+    /// Requant Q4 anche di q_a e kv (DS4_QKV_Q4, richiede il Q4 sopra): gli
+    /// ultimi densi Q8 medi nello stream (~0.7 GB/token) diventano residenti
+    /// (~0.35 GB). MISURATO su M1 Pro (demo A/B 2026-07-08): decode 2.78 →
+    /// 3.06 tok/s (+10%), gather 627 → 606 MB/token, output coerente. LOSSY
+    /// come gli altri Q4 — default ON con avviso in GUI (come DENSE_Q4), il
+    /// toggle resta per chi preferisce la fedeltà piena; la cache Q4
+    /// esistente si estende in modo incrementale (~30 s una tantum).
+    var qkvQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4QkvQ4") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(qkvQ4Enabled, forKey: "DS4QkvQ4")
+            _ = setenv("DS4_QKV_Q4", qkvQ4Enabled ? "1" : "0", 1)
+        }
+    }
+
+    /// Requant Q4 delle shared-expert FFN (DS4_SHARED_Q4, richiede il Q4
+    /// sopra): l'ultima voce grossa rimasta nello stream denso. MISURATO su
+    /// M1 Pro (A/B 2026-07-08, sera): 3.13 → 3.36 tok/s (+7%) — era neutro
+    /// nel tuning del 07-06, ma allora trio/q_a/kv non erano residenti.
+    /// LOSSY (la continuazione greedy cambia restando coerente): default ON nel
+    /// preset misurato; il toggle resta disponibile per la massima fedelta'.
+    var sharedQ4Enabled: Bool = (UserDefaults.standard.object(forKey: "DS4SharedQ4") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(sharedQ4Enabled, forKey: "DS4SharedQ4")
+            _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)
+        }
+    }
+    /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
+    /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
+    /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
+    /// MISURATO: gather 2.7 → 4.8 GB/s (79% del tetto SSD), 2.10 → 2.66 tok/s.
+    /// Stessi byte, numeriche identiche. DEFAULT ON: al load il file viene
+    /// cercato (accanto al GGUF, poi in Application Support), costruito una
+    /// tantum se assente — e SALTATO con log esplicito quando mancano i ~73 GB
+    /// liberi che il sidecar duplica su disco. Si applica al prossimo load.
+    var expertBundleEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ExpertBundle") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(expertBundleEnabled, forKey: "DS4ExpertBundle")
+            _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Metal fast resource loading: batch di range dell'expert-bundle caricati
+    /// direttamente negli MTLBuffer della slot cache durante il decode. Il
+    /// prefill resta sul percorso pread. Default ON nel preset 16 GB misurato;
+    /// il fallback a pread è automatico su errore o banda insufficiente, quindi
+    /// una sessione sfavorevole non resta bloccata sul backend lento. Prossimo load.
+    var metalIOEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4MetalIO") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(metalIOEnabled, forKey: "DS4MetalIO")
+            _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Riporta TUTTI i toggle di performance ai valori della demo veloce
+    /// misurata su M1 Pro 16 GB (A/B 2026-07-13: 3.2-3.4 tok/s di regime):
+    /// slot 22 (70% hit misurato), ring off, MetalIO+willneed+pread+dense
+    /// stream+mlock+Q4 completo+bundle ON. Usato dalla migrazione una-tantum
+    /// in init e dal bottone in Settings ("i toggle persistiti derivano dai
+    /// vecchi esperimenti e restano incollati per sempre").
+    /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
+    /// init i didSet delle stored property NON scattano.
+
+
+    /// Unione massima di esperti per gruppo nel prefill (DS4_PREFILL_UNION) e
+    /// token per chunk (DS4_PREFILL_CHUNK): gli unici knob del prefill letti a
+    /// OGNI chiamata dal motore, quindi regolabili senza ricaricare il modello.
+    /// Persistiti; il benchmark in Settings li misura e applica i migliori.
+    var prefillUnion: Int = (UserDefaults.standard.object(forKey: "DS4PrefillUnion") as? Int) ?? 192 {
+        didSet {
+            UserDefaults.standard.set(prefillUnion, forKey: "DS4PrefillUnion")
+            _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
+        }
+    }
+    var prefillChunk: Int = (UserDefaults.standard.object(forKey: "DS4PrefillChunk") as? Int) ?? 512 {
+        didSet {
+            UserDefaults.standard.set(prefillChunk, forKey: "DS4PrefillChunk")
+            _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
+        }
+    }
+
+    /// Numero di token route/attention codificati nello stesso command buffer
+    /// durante il prefill. Numerica invariata: i dispatch restano seriali e nello
+    /// stesso ordine, ma si riducono commit e attese CPU↔GPU. È letto a ogni layer
+    /// di prefill, quindi il benchmark può regolarlo senza ricaricare il modello.
+    var prefillRouteBatch: Int =
+        (UserDefaults.standard.object(forKey: "DS4PrefillRouteBatch") as? Int) ?? 32 {
+        didSet {
+            UserDefaults.standard.set(prefillRouteBatch, forKey: "DS4PrefillRouteBatch")
+            _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
+        }
+    }
+
+    // Benchmark in-app (Settings): prova le combinazioni dei knob a caldo sul
+    // motore GIÀ caricato e applica la migliore.
+    var benchRunning = false
+    var benchStatus: String?
+    var benchResults: String = ""
+
+
+
+    /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
+    var bundleBuildStatus: String?
+
+
+    /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
+    /// output head residente e staging dello stream (~3.3 GB con i default).
+    /// I buffer Metal shared sono memoria anonima che macOS COMPRIME tra un
+    /// token e l'altro: MISURATO su M1 Pro 16 GB, bloccarli vale head 235→19 ms
+    /// ed experts 748→144 ms (totale −38%, 0.39 → 0.52+ tok/s). Best-effort
+    /// (fallimenti ignorati), numeriche identiche. DEFAULT ON; si applica al
+    /// prossimo caricamento del modello.
+    var mlockEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4MLock") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(mlockEnabled, forKey: "DS4MLock")
+            _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Pesi densi residenti (DS4_RESIDENT_DENSE): copia i ~5 GB di pesi non-esperti
+    /// in buffer residenti invece di mapparli no-copy. NON esposto nella GUI e
+    /// deciso SOLO dalla RAM (ON ≥24 GB): nella demo CLI a contesto corto su
+    /// 16 GB risultava più veloce, ma nell'app reale (SwiftUI, trascrizioni,
+    /// server, contesti più lunghi) il budget wired sfora e RALLENTA — misurato.
+    /// Con DS4_DENSE_STREAM attivo il motore da' comunque precedenza allo stream.
+    /// Il knob env DS4_RESIDENT_DENSE resta per la demo/gli esperimenti.
+
+    /// Profilo decode route/attn (DS4_PROFILE_ROUTE): splitta route/attn in 5 fasi
+    /// (comp/q/kv/attn/out), ognuna con commit+wait dedicato. DIAGNOSTICO: i commit
+    /// extra RALLENTANO la generazione (gli assoluti si gonfiano; conta il RAPPORTO),
+    /// quindi DEFAULT OFF e NON usarlo mentre misuri la velocità. Il report finisce
+    /// nel Log motore a fine turno. Si applica al prossimo caricamento del modello
+    /// (l'engine legge l'env alla costruzione del decoder).
+    var profileRouteEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4ProfileRoute") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(profileRouteEnabled, forKey: "DS4ProfileRoute")
+            _ = setenv("DS4_PROFILE_ROUTE", profileRouteEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Application Support/DwarfStar/kv-cache (shared by chat and HTTP server).
+
+
+    // Tuning tab state.
+    var tuningInfo: InferenceService.TuningInfo?
+
+    // Agents (roles). Selecting one starts a fresh chat with its role and swaps
+    // the per-agent expert-usage profile (the cache re-warms with ITS experts).
+    // Editable + persisted; edits apply on the next new chat / agent switch.
+    var agents: [AgentProfile] = ChatStore.loadAgents() {
+        didSet { AgentRegistry.shared.set(agents) }   // keep the engine-side agents_list tool in sync
+    }
+    var selectedAgentId: String = UserDefaults.standard.string(forKey: "DS4SelectedAgent") ?? "generale" {
+        didSet { UserDefaults.standard.set(selectedAgentId, forKey: "DS4SelectedAgent") }
+    }
+
+    // Discovered GGUF files on disk.
+    var discoveredModels: [DiscoveredModel] = []
+
+    // Last applied preset explanation, shown in the load screen.
+    var presetNote: String?
+
+    // Sampling. Temperature is user-tunable (lower = more focused, less drift —
+    // helps on aggressively-quantized models). Persisted across launches.
+    var temperature: Double = UserDefaults.standard.object(forKey: "DS4Temperature") as? Double ?? 0.6 {
+        didSet { UserDefaults.standard.set(temperature, forKey: "DS4Temperature") }
+    }
+    /// Repetition penalty (>1 discourages repeats; breaks the repeat-loop collapse
+    /// on quantized models). 1.0 = off. Persisted.
+    var repetitionPenalty: Double = UserDefaults.standard.object(forKey: "DS4RepPenalty") as? Double ?? 1.1 {
+        didSet { UserDefaults.standard.set(repetitionPenalty, forKey: "DS4RepPenalty") }
+    }
+
+
+    // Tools.
+    var toolsEnabled = false
+    var enabledToolNames: Set<String> = Set(ToolRegistry.builtins.map { $0.spec.name })
+    /// Compact tool declaration (just name(params)) — fewer prefill tokens. On by
+    /// default for local inference.
+    var compactTools = true
+    /// Tool calls awaiting a manually-entered result (non-built-in tools).
+    var pendingManualCalls: [ToolCall] = []
+    /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
+    var awaitingManualResults = false
+    var partialAutoOutputs: [ToolOutput] = []
+    /// Tool-loop bound. Illimitato su richiesta: il loop si ferma comunque quando
+    /// il contesto è pieno o l'utente preme Stop.
+    var toolRounds = 0
+    var maxToolRounds: Int { .max }
+
+    // Live state.
+    var phase: Phase = .needsModel
+    var info: ModelInfo?
+    var messages: [UIMessage] = []
+    var input = ""
+    /// Text files staged for the next message (folded into the user turn on send).
+    var attachments: [ChatAttachment] = []
+    /// Transient composer note (e.g. a file that couldn't be decoded as text).
+    var attachmentNote: String?
+    /// Rough token estimate of the staged attachments (≈4 chars/token); nil if none.
+    /// Used to warn before they overflow the context window.
+    var attachmentTokenEstimate: Int? {
+        guard !attachments.isEmpty else { return nil }
+        return attachments.reduce(0) { $0 + $1.content.count } / 4
+    }
+    var think = false
+    var isGenerating = false
+    var status = ""          // live prefill/decode progress
+    /// Tokens committed to the KV (≈ context used); drives the near-full warning.
+    var contextUsed = 0
+
+    // MARK: - Chat sessions (persistent, multiple)
+
+    /// All persisted chats, newest first. The active one's transcript is mirrored
+    /// in `messages`; the others live on disk and are loaded on demand.
+    var sessions: [ChatSession] = []
+    /// Id of the chat currently shown in `messages`.
+    var activeSessionId: String = ""
+    /// True when the engine's KV already holds the active chat. False right after a
+    /// persisted chat is restored: the next send re-primes the engine from the
+    /// visible history (the disk-KV cache restores the prefix), after which turns
+    /// are incremental again.
+    var enginePrimed = true
+
+    var service: InferenceService?
+    var generation: Task<Void, Never>?
+
+    /// THE single in-process engine, loaded once in Settings and SHARED by every
+    /// feature (Chat, Benchmark, Server). There is never a second full engine:
+    /// with the default resident-Q4 + mlock config a second copy doubles wired
+    /// memory and OOM-crashes on 16 GB. `InferenceService` is an actor, so
+    /// concurrent callers are serialized safely. nil until a model is ready.
+    var sharedEngine: InferenceService? { isReady ? service : nil }
+    /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
+    /// KV, so it's refused while the chat is mid-generation.
+    var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }
+    var loadedModelPath: String? { isReady ? modelPath : nil }
+
+    var isReady: Bool { if case .ready = phase { return true } else { return false } }
+    /// Everything togglable in pickers/agents: built-ins + connected MCP tools.
+    var availableTools: [ToolSpec] { builtinTools + mcpTools }
+    var builtinTools: [ToolSpec] { ToolRegistry.builtins.map(\.spec) }
+    /// Reading `mcpVersion` here registers the SwiftUI dependency: MCPManager is
+    /// a plain singleton, so views listing MCP tools re-render only because the
+    /// change handler (see init) bumps this observable mirror.
+    var mcpTools: [ToolSpec] { _ = mcpVersion; return MCPManager.shared.toolSpecs() }
+    /// Observable mirror of MCPManager.version (bumped by the change handler).
+    var mcpVersion = 0
+
+    var bookmarkRestored = false
+
+
+    /// Avanzamento del caricamento del modello (0…1) + fase corrente: scritti
+    /// dal motore via LoadProgress e riletti qui a ~8 Hz mentre `.loading`.
+    var loadFraction: Double = 0
+    var loadStage: String = ""
+
+}

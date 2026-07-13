@@ -19,3 +19,12 @@ Application shell and shared state.
 - **`AppEnvironment.swift`** resolves paths for development vs bundled app runs,
   computes RAM-based hardware presets (default context 4096 below 24 GB, 8192
   below 80 GB, 32768 above), and exposes memory helpers.
+
+## Change rules
+
+- Create process-wide observable state here and inject it into features.
+- Keep feature-specific state in that feature's controller or view model.
+- Preserve the single shared local engine and the main-actor ownership of UI
+  state.
+- Add new sidebar destinations through `AppSection` and `RootView`, with their
+  implementation under `Features/`.

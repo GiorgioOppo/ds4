@@ -17,7 +17,7 @@ swift:
 test:
 	swift test
 
-# Regenerate the embedded kernel sources (Sources/DS4Metal/Runtime/KernelSources.swift)
+# Regenerate the embedded kernel sources (Sources/DS4Metal/Runtime/Generated/KernelSources.swift)
 # from metal/*.metal. Run after editing any kernel.
 embed-kernels:
 	sh scripts/embed_kernels.sh

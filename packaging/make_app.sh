@@ -4,7 +4,7 @@
 # Produces build/DwarfStar.app with:
 #   Contents/MacOS/DwarfStar          the release executable
 #   Contents/Info.plist               bundle metadata
-#   Contents/Resources/metal/*.metal  Metal kernel sources (REQUIRED at runtime)
+#   Contents/Resources/metal/*.metal  optional fallback Metal kernel sources
 #   Contents/Resources/bin/ds4*       helper binaries, if already built (optional)
 #   Contents/Resources/download_model.sh, speed-bench/   optional helpers
 #
@@ -24,7 +24,7 @@ SIGN_IDENTITY="${DS4_SIGN_IDENTITY:--}"   # default: ad-hoc
 
 # Pure-Swift stack: no separate engine static library — `swift build` compiles
 # DS4Core + DS4Metal + DS4Engine + DwarfStar together (Metal kernels are embedded
-# in the binary via Sources/DS4Metal/Runtime/KernelSources.swift).
+# in the binary via Sources/DS4Metal/Runtime/Generated/KernelSources.swift).
 echo "==> Building SwiftPM release"
 ( cd "$GUI_DIR" && swift build -c release --product "$APP_NAME" )
 
@@ -55,7 +55,7 @@ $PB -c "Set :NSHighResolutionCapable true" "$PLIST" 2>/dev/null \
     || $PB -c "Add :NSHighResolutionCapable bool true" "$PLIST"
 
 # Optional fallback: the Metal kernel SOURCES. The runtime compiles the kernels
-# EMBEDDED in the binary (Sources/DS4Metal/Runtime/KernelSources.swift), so the
+# EMBEDDED in the binary (Sources/DS4Metal/Runtime/Generated/KernelSources.swift), so the
 # bundle does not need this folder; copy it only if present (harmless extra).
 [ -d "$GUI_DIR/metal" ] && cp -R "$GUI_DIR/metal" "$APP/Contents/Resources/metal"
 

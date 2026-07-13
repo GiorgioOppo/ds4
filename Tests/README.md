@@ -4,9 +4,12 @@ Unit tests for the pure-Swift engine layers. **Correctness is rule #1** in this
 project: these tests validate the Swift port against the original C reference and
 against CPU-faithful implementations where useful.
 
-- **`DS4CoreTests/`** covers MoE matvec kernels, flash attention, normalization,
-  RoPE, the decode graph, GGUF loading, tokenization, sampling, KV serialization,
-  and the downloader.
+- **`DS4CoreTests/Core/`** covers deterministic formats, tokenization,
+  conversation rendering, sampling, model shapes, and storage planning.
+- **`DS4CoreTests/Metal/`** covers individual GPU kernels, graph composition,
+  decode/cache behavior, model loading, and runtime creation.
+- **`DS4CoreTests/Engine/`** covers distributed protocol, persistence, project
+  safety, model management, diagnostics, and tools.
 
 ```sh
 make test        # or: swift test
@@ -24,7 +27,13 @@ make xcodeproj
 xcodebuild test -project DwarfStar.xcodeproj -scheme DwarfStar -destination 'platform=macOS'
 ```
 
-> Metal kernel tests currently self-skip with `XCTSkipUnless` until their
-> `metalDir`, currently a fixed absolute path at the top of each test file, points
-> at the real `metal/` directory. They should be migrated to the embedded kernels
-> through `MetalRuntime()` before being enabled in CI/Xcode.
+## Metal prerequisites and skips
+
+Metal tests may skip when the host exposes no Metal device. A number of legacy
+tests also still use a developer-specific `metalDir` or production-GGUF path;
+those skip when the fixture is absent and should be migrated to embedded kernels
+or compact fixtures. A skip is not a pass and must be reported separately.
+
+See [`METAL-TESTS.md`](METAL-TESTS.md) for the full skip, parity, and numerical
+comparison conventions. Every test subdirectory has a local README describing
+its scope and fixture rules.

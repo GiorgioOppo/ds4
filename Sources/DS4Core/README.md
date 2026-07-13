@@ -1,17 +1,30 @@
 # DS4Core
 
-The engine's **pure Swift, no-Metal** foundation. It contains model parsing,
-tokenization, sampling, and the chat/tool prompt format. `DS4Metal` and
-`DS4Engine` both build on this target, and this layer has the broadest unit-test
-coverage under `Tests/DS4CoreTests`.
+Fondazione portabile del progetto, scritta in Swift e priva di dipendenze da
+Metal. Espone formati, modelli conversazionali, tokenizzazione, campionamento e
+tipi condivisi usati da `DS4Metal` e `DS4Engine`.
 
-- **`Format/`**: on-disk formats and low-level helpers, including GGUF mmap,
-  `Half` f16 conversion, CPU (re)quantization, and `KVCFile` disk checkpoints
-  for KV cache state.
-- **`Inference/`**: model shape, DeepSeek-V4 BPE tokenizer and control tokens,
-  sampler, chat rendering, DSML tool-call parsing, and load-progress reporting.
-- **`Streaming/`**: SSD cache planning and a memory lock that simulates reduced
-  available RAM, used to reason about working sets before real runtime wiring.
+## Struttura
 
-There are no external dependencies and no link to Metal. That keeps this target
-portable, fast to compile, and easy to test.
+- [`Conversation/`](Conversation/README.md): tipi della conversazione e protocollo DSML.
+- [`Diagnostics/`](Diagnostics/README.md): avanzamento thread-safe del caricamento.
+- [`Formats/`](Formats/README.md): GGUF, checkpoint KV e primitive di quantizzazione.
+- [`Generation/`](Generation/README.md): selezione del token successivo.
+- [`Model/`](Model/README.md): forma e configurazione portabile del modello.
+- [`Storage/`](Storage/README.md): pianificazione della cache SSD e simulazione RAM.
+- [`Tokenization/`](Tokenization/README.md): tokenizer byte-level BPE DeepSeek.
+
+## Dipendenze e flusso
+
+`DS4Core` dipende unicamente dalla libreria standard e da Foundation. Il flusso
+tipico è: apertura del GGUF -> costruzione del tokenizer -> rendering della
+conversazione -> tokenizzazione -> campionamento dei logits prodotti dal backend.
+Le operazioni GPU e l'esecuzione del decoder appartengono a `DS4Metal`.
+
+## Regole di modifica
+
+- Non introdurre import o tipi Metal in questo target.
+- Mantenere deterministici parser, rendering e sampler, con test di parità.
+- Conservare la compatibilità binaria dei formati persistenti.
+- Collocare ogni nuova responsabilità nella sottocartella di dominio e aggiornare
+  il relativo README.

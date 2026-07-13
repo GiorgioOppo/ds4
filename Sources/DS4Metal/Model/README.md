@@ -1,23 +1,28 @@
-# DS4Metal/Model
+# Model
 
-Model shape definitions and GGUF-to-GPU weight loading.
+Descrizione Metal dell'architettura e strategie per trasformare un GGUF in pesi
+utilizzabili dal decoder, residenti o in streaming.
 
-- **`DSV4Shape.swift`** contains compiled model constants such as layer count,
-  attention head count, `nHeadDim`, per-layer compression ratios and RoPE
-  parameters, expert count, and the derived `DSV4Dims` values used by kernels.
-- **`GGUFWeights.swift`** assembles layer weights from the GGUF. Non-routed weights
-  stay mmap-backed and no-copy through the page cache, while the selected 6/256
-  experts are gathered into contiguous slabs. It also provides primitives used by
-  the expert slot cache.
-- **`DenseStreamer.swift`** streams the per-layer dense weights through a
-  pread/F_NOCACHE staging ring instead of keeping them resident
-  (`DS4_DENSE_STREAM`, read-ahead depth `DS4_DENSE_AHEAD`). It also hosts the
-  resident Q4 requant of the big attention projections (`DS4_DENSE_Q4`, plus
-  `DS4_SHARED_Q4` and the `DS4_Q4_CACHE_DIR` requant cache) and the resident
-  NSA-compressor projections (`DS4_RESIDENT_COMP`).
-- **`ExpertBundle.swift`** builds and serves the opt-in `<gguf>.expbundle`
-  sidecar that repacks each routed expert's gate/up/down slabs contiguously
-  (`DS4_EXPERT_BUNDLE`, location override `DS4_BUNDLE_DIR`).
+## Struttura
 
-These knobs are documented in the root README's
+- [`Architecture/`](Architecture/README.md): dimensioni e parametri DeepSeek-V4 Flash.
+- [`Weights/`](Weights/README.md): validazione e assemblaggio dei pesi GGUF.
+- [`Quantization/`](Quantization/README.md): metadati dei layout MoE quantizzati.
+- [`Streaming/`](Streaming/README.md): ring di staging dei pesi densi da SSD.
+- [`Experts/`](Experts/README.md): sidecar contiguo, I/O e supporto cache expert.
+
+## Flusso
+
+I metadati GGUF vengono validati contro `DSV4Shape`; il loader crea pesi piccoli
+residenti e sceglie tra viste mmap, cache quantizzate, streaming denso ed expert
+gather. `LayerWeights` presenta al decoder un contratto uniforme indipendente
+dalla provenienza corrente dei byte.
+
+Le opzioni sono descritte nella
 [Configuration Reference](../../../README.md#configuration-reference).
+
+## Regole di modifica
+
+Fallire esplicitamente su forma o quantizzazione non supportata. Tenere separati
+layout del modello, policy di residenza e meccanismo I/O. Ogni cache persistente
+deve includere abbastanza identità/versione da non riusare byte incompatibili.

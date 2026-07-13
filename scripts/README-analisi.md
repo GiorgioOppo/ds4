@@ -1,61 +1,81 @@
-# GGUF Compression Analysis
+# Analisi della comprimibilita dei GGUF
 
-Two Python tools help reason from measured numbers before investing in new
-kernels, compression strategies, or fine-tuning work. They are especially useful
-for exploring quantization and graph-style representations where weights live on
-edges.
+Questa guida descrive i due strumenti esplorativi usati per misurare la
+ridondanza dei pesi prima di investire in nuovi kernel, rappresentazioni
+fattorizzate o fine-tuning. Entrambi leggono il GGUF senza modificarlo e non
+producono un modello immediatamente eseguibile da DwarfStar.
 
-```sh
-pip install -U gguf numpy        # llama.cpp's gguf package provides correct dequantization
-```
+Tornare all'[indice degli script](README.md).
 
-## 1. `gguf_spectrum.py`: How Compressible Is It?
-
-For the main tensors, this script computes the **singular-value spectrum** and
-reports the effective rank at 90/95/99% retained energy, plus the potential
-parameter savings from low-rank factorization.
-
-For **experts**, it estimates **redundancy across the 256 experts** with PCA over
-expert matrices. That tells you how many shared bases might be enough before a
-quality recovery pass.
+## Requisiti
 
 ```sh
-python3 scripts/gguf_spectrum.py model.gguf                      # layer 2, dense tensors
-python3 scripts/gguf_spectrum.py model.gguf --layers 0,2,20 --experts
-python3 scripts/gguf_spectrum.py model.gguf --full              # also output/embeddings; slower
+python3 -m pip install -U gguf numpy
 ```
 
-The script only reads and measures. It does not modify the model. Use the output
-to decide *where* factorization is worth trying.
+Il pacchetto `gguf` fornisce la dequantizzazione dei formati supportati da
+`gguf.quants`. I comandi seguenti presuppongono di essere eseguiti dalla radice
+del repository.
 
-## 2. `gguf_to_graph.py`: Moving Weights From Nodes To Edges
+## `gguf_spectrum.py`: spettro e ridondanza
 
-This script turns matrices into a **factorized graph**. Each `W[out x in]` becomes
-a path:
+Per i tensori selezionati lo script calcola lo spettro dei valori singolari e
+riporta il rango effettivo al 90%, 95% e 99% dell'energia. Per gli esperti
+routed stima inoltre, tramite proiezione e PCA, quante basi condivise servono a
+spiegare la variabilita fra esperti.
+
+```sh
+python3 scripts/gguf_spectrum.py /percorso/modello.gguf
+python3 scripts/gguf_spectrum.py /percorso/modello.gguf --layers 0,2,20 --experts
+python3 scripts/gguf_spectrum.py /percorso/modello.gguf --full
+python3 scripts/gguf_spectrum.py /percorso/modello.gguf --layers 2 --json risultati.json
+```
+
+`--full` include anche embedding e testa di output e puo richiedere molto piu
+tempo e memoria. Le stime sugli esperti dipendono da `--proj`: sono uno
+strumento decisionale, non una prova di equivalenza del modello.
+
+## `gguf_to_graph.py`: fattorizzazione su grafo
+
+Ogni matrice `W[out x in]` selezionata viene approssimata con una SVD troncata:
 
 ```text
-in -- B[r x in] --> bottleneck r -- A[out x r] --> out
+input -- B[r x in] --> bottleneck r -- A[out x r] --> output
 ```
 
-The factorization is truncated SVD, so `W ~= A * B`. Parameters live on the A/B
-edges, while nodes are parameter-free activation spaces. The tool can emit the
-graph as JSON or Graphviz DOT, optionally write factors as `.npz`, and report the
-compression summary plus **reconstruction error**.
+I parametri risiedono sugli archi `A` e `B`; i nodi descrivono soltanto gli
+spazi di attivazione. Lo script puo produrre JSON, Graphviz DOT e, su richiesta,
+un archivio NumPy con i fattori.
 
 ```sh
-python3 scripts/gguf_to_graph.py model.gguf --layers 2 --energy 0.95 --dot graph.dot
-dot -Tsvg graph.dot -o graph.svg
-python3 scripts/gguf_to_graph.py model.gguf --layers 0,2 --experts --rank 64 --npz factors.npz
+python3 scripts/gguf_to_graph.py /percorso/modello.gguf \
+  --layers 2 --energy 0.95 --dot grafo.dot --json grafo.json
+
+dot -Tsvg grafo.dot -o grafo.svg
+
+python3 scripts/gguf_to_graph.py /percorso/modello.gguf \
+  --layers 0,2 --experts --rank 64 --npz fattori.npz
 ```
 
-The factorization is **lossy**. The script prints the relative error for each
-matrix; recovering model quality would require fine-tuning. This tool builds and
-measures the graph representation, but it does not produce a ready-to-run model.
+La trasformazione e **lossy**. Il riepilogo riporta frazione di parametri
+conservata ed errore relativo di ricostruzione; recuperare la qualita richiede
+normalmente addestramento o fine-tuning e una successiva validazione end-to-end.
 
-## Format Notes
+## Scelta del GGUF
 
-The Swift engine executes expert tensors in **Q4_K / Q2_K / IQ2_XXS**, dense
-tensors in **Q8_0**, plus F16/F32 where needed. The analysis scripts can
-dequantize any format supported by `gguf.quants`, but for high-detail expert
-analysis the **q4** GGUF is usually the best input because experts remain Q4_K.
-The 2-bit model is already close to the edge of the supported formats.
+Il motore gestisce tensori esperti in `Q4_K`, `Q2_K` e `IQ2_XXS`, tensori densi
+in `Q8_0` e valori `F16`/`F32` dove necessari. Per un'analisi dettagliata degli
+esperti conviene partire da un GGUF meno aggressivamente quantizzato: le
+conclusioni tratte da un modello a 2 bit non si trasferiscono automaticamente
+ad altre varianti.
+
+## Interpretazione corretta
+
+- Un rango numericamente basso non garantisce che la qualita linguistica resti
+  invariata.
+- I risultati dipendono dal layer, dal tensore, dalla quantizzazione e dai
+  parametri di campionamento dell'analisi.
+- Prima di implementare un nuovo formato, confrontare memoria, banda, errore
+  sui logit e qualita su un insieme di prompt riproducibile.
+- Questi script sono strumenti offline: non fanno parte del percorso di
+  caricamento o inferenza della GUI e della demo.

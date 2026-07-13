@@ -1,89 +1,132 @@
-# Expert Parallelism — scissione VERTICALE del modello (design)
+# Expert parallelism — scissione verticale del modello
 
-Stato: **Fase A** (protocollo scaffolded, non attivo). Prerequisito di rete:
-RTT < 1 ms tra i nodi (Thunderbolt bridge o Ethernet diretta). Su Wi-Fi
-(RTT ~7 ms misurato) questa architettura è matematicamente perdente:
-~41 layer routed × RTT ≈ 300 ms/token di sola latenza.
+Stato al 13 luglio 2026: **fasi A-C implementate nel protocollo v10**. Sono
+attivi payload, worker expert shard, backbone del coordinatore, chat verticale e
+benchmark GUI. Restano da ampliare la validazione multi-Mac e le ottimizzazioni
+di fase D.
 
-## Perché verticale, e perché SOLO per la MoE
+Prerequisito operativo: RTT inferiore a circa 1 ms fra i nodi, tramite bridge
+Thunderbolt o Ethernet diretta. Con circa 41 layer routed, un RTT di 7 ms
+aggiunge quasi 300 ms per token prima del lavoro utile; su Wi-Fi questa
+topologia è normalmente perdente.
 
-La pipeline orizzontale (layer a fette) usa gli SSD dei worker IN SERIE:
-worker1 gathera gli esperti dei suoi layer (~150 ms), POI worker2 i suoi.
-Token = somma. Il taglio verticale giusto per una MoE non è il tensor
-parallelism classico (matmul spezzati: 2 all-reduce per layer per
-accelerare la parte già veloce) ma l'**expert parallelism**: i 256 esperti
-per layer si dividono tra i worker, e per ogni layer TUTTI gli SSD
-gatherano in parallelo la loro quota dei 6 esperti selezionati.
-Token = max invece di somma sul costo dominante (~2× su 2 worker).
+## Perché una scissione verticale
 
-## Architettura
+La pipeline orizzontale assegna intervalli di layer ai worker. Gli SSD lavorano
+in sequenza lungo il percorso del token: il tempo dominante tende alla somma
+dei gather delle slice.
 
-- **Coordinatore = backbone denso completo**: embed, route/attention di
-  TUTTI i layer (stream denso, KV, compressori NSA — come un motore locale),
-  selezione del router, FFN condivisa (densa), somma finale, head.
-  Il coordinatore NON tiene esperti routed.
-- **Worker = shard di esperti**: possiede un sottoinsieme dei 256 esperti
-  (lo STESSO sottoinsieme per tutti i layer — il bundle sidecar è già
-  ordinato per (layer, esperto), lo shard legge solo i suoi record).
-  Niente KV, niente attention, niente stato di sequenza: un worker
-  verticale è puro (gather dall'SSD + FFN esperti + somma parziale pesata).
+Nella scissione verticale i 256 esperti di ogni layer sono distribuiti fra i
+worker. Quando il router sceglie sei esperti, ogni SSD legge in parallelo la
+propria quota e restituisce una somma parziale. Sul costo dominante il tempo può
+avvicinarsi al massimo dei worker anziché alla somma, ma si paga un round-trip
+di rete per layer routed.
 
-### Flusso per token, per layer routed
+## Architettura implementata
 
-1. Coordinatore: route/attn → 6 id + pesi (`routerFinalizeTop6`).
-2. Partiziona gli id per proprietario; a ogni worker coinvolto invia
-   `expertWork`: layer, seq, i SUOI id+pesi, l'attivazione `s.cur`
-   (4096 × f32/f16 secondo `activationBits`, come la pipeline).
-3. Ogni worker: gather dei suoi id (slot-cache + bundle, invariati) →
-   gate/up/down → SOMMA PARZIALE pesata (4096) → `expertSum` (seq).
-4. Coordinatore: somma le parziali + output FFN condivisa → hcExpand →
-   layer successivo.
+- **Coordinatore/backbone locale**: embedding, route/attention di tutti i
+  layer, KV, compressori NSA, FFN shared, riduzioni HC e output head.
+- **Worker expert shard**: sottoinsieme degli esperti valido per tutti i layer;
+  nessun KV o stato di conversazione; gather, gate/up/down e somma pesata.
+- **Protocollo v10**: `expertAssign`, `expertWork`, `expertSum`.
+- **GUI**: toggle Vertical split, connessione, chat e benchmark dedicato.
 
-Overlap gratuiti: la FFN condivisa del layer i gira sul coordinatore
-MENTRE i worker computano gli esperti; lo stream denso di i+1 è già in
-background; per i layer hash (0-2) gli id dipendono solo dal token → le
-`expertWork` dei 3 layer partono in anticipo appena campionato il token.
+`StreamingDecoder` espone una callback `remoteExperts` usata al posto del ramo
+FFN routed locale. Il coordinatore carica il backbone con cache esperti locale
+disattivata; gli expert shard usano bundle, slot-cache e knob assegnati.
 
-### Costi di comunicazione (2 worker, 41 layer routed)
+## Flusso per token e layer routed
 
-- ~64 KB/layer/token andata+ritorno a f32 (32 KB a f16) ≈ 2.6 MB/token:
-  ~3 ms su bridge Thunderbolt (~10 Gbit), ~25 ms su gigabit.
-- Latenza: 1 RTT per layer (scatter e gather in un solo round):
-  41 × 0.3 ms ≈ 12 ms su cavo. Su Wi-Fi ≈ 300 ms → vietato.
+1. Il backbone calcola route/attention e produce id e pesi dei sei esperti.
+2. Il coordinator raggruppa gli id per mask proprietaria.
+3. Invia in parallelo `expertWork` con layer, sequenza, id, pesi e attivazione.
+4. Ogni worker valida che gli id siano posseduti, esegue la FFN e invia
+   `expertSum`.
+5. Il coordinator somma le parziali e prosegue con shared FFN/riduzione del
+   layer.
 
-### Assegnazione degli esperti
+Le attivazioni e le somme verticali sono trasportate a 32 o 16 bit. Il valore 8
+bit disponibile per la pipeline orizzontale non viene usato dal percorso
+verticale corrente.
 
-`expertMask` esplicita (32 byte, bit e = posseduto) nell'assign — non un
-range: la usage imatrix bilancia il CARICO (route effettive), non il
-conteggio. Costruzione: greedy sui conteggi della imatrix (hot expert
-alternati tra i worker), fallback pari/dispari senza storia. Ogni id deve
-essere posseduto da ESATTAMENTE un worker (validato al connect).
+## Assegnazione degli esperti
 
-### Trasferimento file
+`DistExpertAssign.expertMask` contiene 256 bit: il bit `e` indica il possesso
+dell'esperto `e`. La partizione corrente è **round-robin** (`e % workerCount`),
+con copertura esatta e senza sovrapposizioni.
 
-Un worker verticale non ha bisogno del GGUF intero: gli bastano i record
-del bundle sidecar dei SUOI esperti (~72 GB / n worker) + il manifest.
-Fase B parte pragmatica: si riusa la distribuzione v8 del bundle completo
-(ripresa a checkpoint inclusa); l'offerta "solo shard" è un'ottimizzazione
-successiva (nuovo kind nel manifest con la stessa catena di hash).
+Il bilanciamento greedy basato sulla usage imatrix non è ancora attivo. È una
+possibile fase D: dovrebbe distribuire il carico osservato, non soltanto il
+numero di esperti, mantenendo copertura esatta e configurazione riproducibile.
 
-## Fasi
+## Costi di comunicazione
 
-- **A (fatta)**: design + frame `expertWork`/`expertSum`/`expertAssign` +
-  payload con encode/decode bound-checked + test round-trip. Nessun
-  percorso attivo li usa; i tipi sconosciuti sono ignorati dai loop v9.
-- **B**: worker shard — modalità del DistWorker che carica SOLO la
-  macchineria esperti (bundle + slot-cache filtrata sulla mask, tutte le
-  layer) e serve `expertWork` → `expertSum`. Testabile da sola (loopback).
-- **C**: coordinatore verticale — variante del motore locale in cui
-  `decodeRoutedExperts` diventa scatter/gather remoto; toggle
-  "Verticale (expert parallelism)" nel tab Distribuito; v10.
-- **D**: overlap (hash layers in anticipo, FFN condivisa concorrente),
-  bilanciamento dalla imatrix, benchmark A/B contro pipeline e locale.
+Con attivazione di 4096 elementi, ogni layer coinvolto invia e riceve circa:
 
-## Criteri di successo / abbandono
+- 32 KiB complessivi a F32, oltre a header/id/pesi;
+- 16 KiB complessivi a F16, oltre a header/id/pesi.
 
-- Prerequisito misurato PRIMA di attivare: `ping` sul link diretto < 1 ms.
-- Obiettivo: ≥ 1.5× il locale a parità di qualità (6 esperti).
-- Se il gather parallelo non batte la pipeline configurata (v9, slot
-  raddoppiati sui worker), il verticale resta una modalità opzionale.
+Su 41 layer routed sono circa 1,3 MiB/token a F32 o 0,65 MiB/token a F16 per
+worker coinvolto nel caso semplice. La latenza, più della banda, è il vincolo:
+il round-trip si ripete lungo la sequenza dei layer.
+
+Queste sono stime di ordine di grandezza. Il benchmark deve misurare traffico e
+latenza reali con lo stesso GGUF e la stessa cache della baseline locale.
+
+## Trasferimento dei file
+
+Il setup riusa il trasferimento resumable del protocollo v8: GGUF e sidecar
+sono offerti con SHA-256 e checkpoint concatenati. Al momento il worker può
+ricevere il bundle completo e aprire soltanto i record necessari alla propria
+mask.
+
+Un trasferimento futuro di un bundle fisicamente shardato ridurrebbe spazio e
+tempo di setup, ma richiede un nuovo tipo di manifest e una strategia di
+validazione dedicata.
+
+## Stato delle fasi
+
+- **A — completata**: design, frame v10, encode/decode bound-checked e test
+  round-trip.
+- **B — completata**: `ExpertShard`, assegnazione worker, mask, bundle/cache e
+  serving `expertWork` -> `expertSum`.
+- **C — completata**: backbone locale, scatter/gather remoto, chat verticale,
+  toggle e benchmark.
+- **D — aperta**: bilanciamento dalla usage imatrix, overlap aggiuntivo,
+  eventuali file shard e campagna A/B multi-Mac.
+
+## Criteri di validazione
+
+1. Misurare RTT prima di connettere la route verticale.
+2. Verificare copertura e unicità delle mask.
+3. Confrontare F32 verticale con il percorso locale a sei esperti.
+4. Misurare separatamente F16 per qualità e rete.
+5. Registrare prefill, decode a regime, byte/token, banda e cache hit-rate.
+6. Confrontare verticale, pipeline e locale con modello, prompt e warm-up
+   identici.
+
+L'obiettivo progettuale resta almeno 1,5x rispetto al locale a parità di
+qualità. Se la latenza di rete o lo sbilanciamento annullano il gather parallelo,
+la modalità deve restare opzionale.
+
+## Limiti e sicurezza
+
+- il backbone completo deve stare sul coordinator secondo il profilo locale;
+- ogni worker riceve attivazioni del modello in chiaro;
+- la perdita di un peer invalida gli esperti che possiede;
+- chat e benchmark non possono condividere simultaneamente la route;
+- il protocollo non offre autenticazione o TLS.
+
+Usare soltanto una rete fidata. Per il quadro completo vedere
+[INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) e
+[CRITTOGRAFIA.md](CRITTOGRAFIA.md).
+
+## Mappa del codice
+
+- `Sources/DS4Engine/Distributed/Protocol/Experts`
+- `Sources/DS4Engine/Distributed/Coordinator/DistCoordinator+ExpertParallelism.swift`
+- `Sources/DS4Engine/Distributed/Coordinator/DistCoordinator+VerticalChat.swift`
+- `Sources/DS4Engine/Distributed/Execution/ExpertShard.swift`
+- `Sources/DS4Engine/Distributed/Worker/Assignments/DistWorker+ExpertAssignment.swift`
+- `Sources/DS4Metal/Decode/Execution/StreamingDecoder.swift`
+- `Sources/DS4Metal/Decode/Execution/DecodeLayer.swift`

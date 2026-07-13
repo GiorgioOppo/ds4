@@ -190,6 +190,77 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Two same-shaped Q8_0 projections from one activation. Used by the NSA
+// compressor KV+gate pair: activation values are loaded once while each
+// matrix keeps the exact accumulation and simdgroup-reduction order of the
+// standalone Q8_0 matvec.
+kernel void kernel_mul_mv_q8_0_f32_pair(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * y = (device const float *)(src1 + offset1);
+
+    device const block_q8_0 * ax_a[NR0];
+    device const block_q8_0 * ax_b[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 +
+            (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        ax_a[row] = (device const block_q8_0 *)((device const char *)src0_a + offset0);
+        ax_b[row] = (device const block_q8_0 *)((device const char *)src0_b + offset0);
+    }
+
+    float sum_a[NR0] = { 0.f };
+    float sum_b[NR0] = { 0.f };
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NQ];
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) { yl[i] = yb[i]; }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qa = ax_a[row][ib].qs + il*NQ;
+            device const int8_t * qb = ax_b[row][ib].qs + il*NQ;
+            float sa = 0.f, sb = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sa += qa[i]*yl[i];
+                sb += qb[i]*yl[i];
+            }
+            sum_a[row] += sa*ax_a[row][ib].d;
+            sum_b[row] += sb*ax_b[row][ib].d;
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * out_a = (device float *)dst_a +
+        (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    device float * out_b = (device float *)dst_b +
+        (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0>(out_a, sum_a, r0, args.ne01, tiisg, sgitg, shmem);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    helper_mv_reduce_and_write<NR0>(out_b, sum_b, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)

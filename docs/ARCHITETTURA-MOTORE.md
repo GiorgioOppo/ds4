@@ -12,6 +12,12 @@ the macOS sandbox.
 Cross-links:
 
 - [`DOCUMENTAZIONE.md`](DOCUMENTAZIONE.md) — app usage, panels, workflows.
+- [`PIPELINE-INFERENZA.md`](PIPELINE-INFERENZA.md) — request lifecycle,
+  ownership of state, prefill and decode.
+- [`BACKEND-METAL.md`](BACKEND-METAL.md) — runtime, wrappers, generated
+  kernels and numerical-validation rules.
+- [`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md) — horizontal and
+  vertical topologies and protocol v10.
 - [`../README.md`](../README.md) — repository overview and build commands.
 - [`../README.md#configuration-reference`](../README.md#configuration-reference)
   — the authoritative list of every `DS4_*` knob mentioned below, with defaults
@@ -70,7 +76,8 @@ decodes tokens.
 
 ## 2. Model Loading: GGUF
 
-`DS4Core/Format/GGUF.swift` parses GGUF metadata and tensor descriptors. The
+`Sources/DS4Core/Formats/GGUF/` contains the GGUF types, binary cursor, and
+mapped model used to parse metadata and tensor descriptors. The
 model file is opened with mmap so tensor data can be referenced without copying.
 
 Core responsibilities:
@@ -107,7 +114,7 @@ global expert quantization for every layer.
 
 ## 3. Tokenizer
 
-`DS4Core/Inference/Tokenizer.swift` is the pure-Swift tokenizer used by the app,
+`Sources/DS4Core/Tokenization/Tokenizer.swift` is the pure-Swift tokenizer used by the app,
 demo, server, diagnostics, and tests.
 
 ### Components
@@ -117,7 +124,9 @@ demo, server, diagnostics, and tests.
 - special token ids such as BOS, EOS, user, assistant, thinking markers, and
   DSML;
 - fallback byte handling;
-- chat-prompt rendering helpers aligned with the GGUF template.
+- chat-prompt rendering helpers manually aligned with the reference template;
+  the GGUF Jinja text is exposed for diagnostics but is not interpreted at
+  runtime.
 
 ### Public API
 
@@ -133,7 +142,8 @@ same native tokenization path used by inference. No subprocess tokenizer remains
 
 ## 4. Model Shape and Validation
 
-`DS4Core/Inference/ModelShape.swift` and `DS4Metal/Model/DSV4Shape.swift`
+`DS4Core/Model/ModelShape.swift` and
+`DS4Metal/Model/Architecture/DSV4Shape.swift`
 capture the DeepSeek-V4 Flash constants used by the port: layer count, hidden
 dimensions, expert counts, attention dimensions, sliding-window size, and related
 metadata.
@@ -149,10 +159,11 @@ RMS/HC epsilons (both `1.0e-6`, matching the C reference). A mismatch refuses
 the file at load instead of silently decoding with different math.
 
 Shape selection distinguishes the Flash and Pro profiles by exact match. A
-valid Pro GGUF is currently refused loudly by the local runtime
-(`InferenceService`): the DSV4Shape constants, router kernels (hardwired to
-256 experts / expert-weight scale 1.5) and slot-cache are wired for Flash, so
-decoding Pro with Flash shapes would produce plausible-looking garbage.
+valid Pro GGUF is currently refused loudly by both local and distributed
+execution (`InferenceService`, `DistEngine` and the vertical expert-shard
+path): the DSV4Shape constants, router kernels (hardwired to 256 experts /
+expert-weight scale 1.5) and slot-cache are wired for Flash, so decoding Pro
+with Flash shapes would produce plausible-looking garbage.
 Tests cross-check shape selection with real GGUF metadata.
 
 Tensor-level validation happens at load too: the hash-routing table
@@ -170,7 +181,7 @@ through graph stages.
 
 ### `MetalRuntime`
 
-`DS4Metal/Runtime/MetalRuntime.swift` owns:
+`DS4Metal/Runtime/Core/MetalRuntime.swift` owns:
 
 - the selected `MTLDevice`;
 - command queue creation;
@@ -570,7 +581,7 @@ The important construction families are:
 
 ## 11. Sampling: Logits to Token
 
-`DS4Core/Inference/Sampler.swift` implements:
+`DS4Core/Generation/Sampler.swift` implements:
 
 - greedy mode (`temperature = 0`);
 - temperature sampling;
@@ -596,12 +607,15 @@ The engine handles the quantized formats needed by the target GGUFs:
 - IQ2_XXS routed experts;
 - F16/F32 scalar or normalization tensors where required.
 
-`DS4_Q8_NSG` tunes dense Q8_0 matvec scheduling. It partitions work across
-simdgroups; it does not change mathematical results.
+`DS4_Q8_NSG` tunes dense Q8_0 matvec scheduling. It partitions work and partial
+sums across simdgroups: the mathematical operation is unchanged, but the
+floating-point reduction order can alter the last bits.
 
-Mixed routed expert quantization is supported per layer. Uniform models remain
-byte-identical in behavior, while out-of-class mixed layers bypass single-class
-expert cache and use correct gather/decode paths.
+Mixed routed expert quantization is supported per layer. Uniform models keep the
+same single-quantization-class selection path; out-of-class mixed layers bypass
+that cache and select the gather/decode format declared for the individual
+layer. This statement concerns format/path selection, not byte-identical logits
+or generated tokens.
 
 ### Q4 Dense Requantization
 
@@ -617,9 +631,11 @@ knobs share the same `.q4dense` cache: records are matched per (layer,
 tensor) key, so enabling a new knob reuses the existing cache and requantizes
 only the tensors it adds.
 
-The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`,
-~1.4 GB): the first load pays the requant once, every later load preads the
-cache back in well under a second. The requant **creates the cache file
+The conversion is persisted in a **Q4 requant cache** (`<gguf>.q4dense`, about
+1.4 GB for the base dense-Q4 trio and larger when QKV/shared records are
+enabled): the first load pays the requant once, while later loads pread the
+validated cache instead of converting the same tensors again; load time depends
+on SSD, memory pressure and hardware. The requant **creates the cache file
 empty up front** (valid header, zero records — a write preflight: permission,
 path or disk-space problems surface in the log *before* any conversion work,
 and the file's presence proves checkpoints have somewhere to land), then runs
@@ -630,8 +646,11 @@ resumes from the completed tensors instead of restarting from zero, and the
 load bar advances per **MB of source converted** rather than per tensor, so a
 long conversion is visibly progressing instead of looking hung. Validation is
 against the model *bytes* (content fingerprints of each source tensor,
-checked per record), not just the file size; write failures are ignored. The
-cache lives next to the model by
+checked per record), not just the file size. A failed preflight or checkpoint
+write is logged as `DS4 q4cache:`; writes use a temporary sibling plus rename,
+so a torn file never replaces a valid cache. The current load safely continues
+with converted tensors in memory, while a later load requantizes records that
+were not persisted. The cache lives next to the model by
 default (demo/CLI); the sandboxed app cannot write next to a picker-selected
 file, so `DS4_Q4_CACHE_DIR` points it at Application Support. Reads try both
 places, and a full cache found in the secondary location (e.g. produced by the
@@ -673,10 +692,11 @@ The tokenizer recognizes DS4 protocol tokens:
 
 ### DSML Format
 
-DSML is the model-native tool-call format. DwarfStar renders tool definitions
-from the model's chat-template surface. The compact GUI mode sends a shorter
-declaration for lower prefill cost; the full mode is closer to the training
-schema.
+DSML is the model-native tool-call format. DwarfStar's compiled `ChatRenderer`
+implements the format against a reference DeepSeek-V4 template; it does not run
+the GGUF's Jinja text. The compact GUI mode is enabled by default and sends a
+shorter declaration for lower prefill cost, deliberately deviating from the
+full training-oriented text; full mode stays closer to that reference schema.
 
 ### Rendering and Parsing
 
@@ -697,16 +717,19 @@ terminate the wrapper early and inject control tokens into the prompt.
 `ToolCallParser` strips leaked markup and parses completed DSML blocks into
 `ToolCall` values.
 
-### InferenceService Loop
+### Tool-Loop Orchestration
 
-The service loop:
+`InferenceService` streams assistant text, parses a complete DSML block and
+emits `.toolCall`; it does not execute the requested tool. The application owns
+the loop:
 
-1. streams assistant text until a DSML call is complete;
-2. parses tool calls;
-3. executes built-ins automatically;
-4. collects manual results for unknown tools if needed;
-5. appends tool results;
-6. resumes generation.
+1. `ChatStore+ToolLoop` handles local chat, while `DistributedController`
+   handles distributed chat;
+2. the orchestrator dispatches built-ins/MCP through `ToolRegistry.executeAuto`
+   and handles sub-agent or manual-result flows where supported;
+3. it records the outputs and requests a continuation;
+4. local chat calls `InferenceService.provideToolResults`, while distributed
+   chat appends `toolResult` turns before calling the coordinator again.
 
 ### Registry and Tools
 
@@ -760,8 +783,9 @@ prompt rendering, and final orchestration.
 
 ### Protocol and Topology
 
-The wire protocol (`DistProtocol.swift`) is DwarfStar-native framing, currently
-at version 9. The coordinator validates the version FIRST, so a mixed cluster
+The wire protocol (`Sources/DS4Engine/Distributed/Protocol/`) is
+DwarfStar-native framing, currently
+at version 10. The coordinator validates the version FIRST, so a mixed cluster
 fails with a clear error instead of garbled frames. The version history doubles
 as the feature list:
 
@@ -794,11 +818,19 @@ as the feature list:
   good checkpoint and answers FILE NEED with a per-file resume offset. The
   coordinator retries a broken peer setup up to 3 times.
 - **v9** — ASSIGN carries the coordinator's PERFORMANCE KNOBS: a whitelisted
-  set of `DS4_*` env vars (`Dist.perfKnobKeys` — all performance-only, none
-  can change the shard's numerics; `DS4_DENSE_Q4`, the one lossy knob, travels
-  as a typed field and its cache as a file). The coordinator's measured
-  configuration IS the job definition; the worker applies it before loading
-  its engine.
+  set of `DS4_*` env vars (`Dist.perfKnobKeys`). The whitelist prevents the wire
+  from setting arbitrary environment; it is not a numerical-parity contract.
+  Allowed fusion, batching and prefill-MM paths may change floating-point
+  reduction/accumulation order. `DS4_DENSE_Q4`, deliberately lossy, travels as
+  a separate typed field with its cache. The worker applies the coordinator's
+  job configuration before loading, without promising bit-identical results
+  across hardware or execution paths.
+- **v10** — expert parallelism: `expertAssign`, `expertWork` and `expertSum`
+  let workers own masks over the 256 routed experts across every layer. The
+  coordinator runs the dense backbone and combines remote partial FFN sums.
+  Vertical chat and benchmark are wired in the app; the topology requires a
+  low-latency wired link because it performs a network round-trip per routed
+  layer.
 
 Peer setup runs IN PARALLEL: file transfer and engine load of every worker
 proceed together in a task group, so route activation costs `max(worker
@@ -814,22 +846,25 @@ Distributed benchmark reuses the already-connected coordinator. It must not run
 while distributed chat is generating, because both share the same route and reset
 worker KV.
 
+The full operational flow, file-resume behavior and topology comparison are in
+[`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md).
+
 ## 16. C-to-Swift Cross-Reference
 
 | Upstream C Area | Swift Port |
 |---|---|
-| `ds4.c` model shape, tokenizer use, decoder flow | `DS4Core`, `DS4Metal/Decode`, `DS4Engine/Service` |
+| `ds4.c` model shape, tokenizer use, decoder flow | `DS4Core`, `DS4Metal/Decode`, `DS4Engine/Inference/Service` |
 | `ds4_metal.m` runtime and kernels | `DS4Metal/Runtime`, `DS4Metal/Kernels`, `metal/*.metal` |
-| GGUF parsing | `DS4Core/Format/GGUF.swift` |
-| SSD streaming expert model | `DS4Metal/Model/GGUFWeights.swift`, `StreamingDecoder` |
-| Dense streaming / Q4 requant cache | `DS4Metal/Model/DenseStreamer.swift` |
-| Expert cache | `ExpertSlotCache`, usage imatrix in `StreamingDecoder` |
-| Expert bundle sidecar | `DS4Metal/Model/ExpertBundle.swift` |
-| KV store | `DS4Core/Format/KVCFile.swift`, `DS4Engine/Service/DiskKVStore.swift` |
-| Server | `Sources/DwarfStar/Server`, `LocalServer` |
+| GGUF parsing | `Sources/DS4Core/Formats/GGUF/` |
+| SSD streaming expert model | `Sources/DS4Metal/Model/Weights/GGUFWeights.swift`, `StreamingDecoder` |
+| Dense streaming / Q4 requant cache | `Sources/DS4Metal/Model/Streaming/DenseStreamer.swift` |
+| Expert cache | `Sources/DS4Metal/Decode/Cache/`, usage imatrix in `StreamingDecoder` |
+| Expert bundle sidecar | `Sources/DS4Metal/Model/Experts/ExpertBundle.swift` |
+| KV store | `Sources/DS4Core/Formats/KVCheckpoint/KVCFile.swift`, `Sources/DS4Engine/Persistence/KV/DiskKVStore.swift` |
+| Server | `Sources/DwarfStar/Features/Server`, `LocalServer` |
 | Distributed runtime | `DS4Engine/Distributed` |
 | MCP client (no C counterpart) | `DS4Engine/Tools/MCP` |
-| CLI bring-up | `Sources/DS4Demo/main.swift` |
+| CLI bring-up | `Sources/DS4Demo/Command/main.swift` |
 
 The Swift port deliberately replaces C-specific memory ownership with ARC,
 Foundation parsing where appropriate, Swift actors for service isolation, and

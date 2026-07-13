@@ -87,6 +87,7 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    uint32_t write_weights;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -230,6 +231,7 @@ kernel void kernel_dsv4_router_finalize_one(
         device const int32_t *hash,
         device const int32_t *tokens,
         device int32_t *selected,
+        device float *weights,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]]) {
     if (tid >= 256) return;
@@ -277,6 +279,19 @@ kernel void kernel_dsv4_router_finalize_one(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Optional fused normalization. Every participating lane deliberately
+    // repeats the same six-term sum in the same order as the historical
+    // kernel_dsv4_router_weights_one, preserving its float bit pattern while
+    // removing one dispatch from every routed layer.
+    if (args.write_weights && tid < 6) {
+        float sum = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            sum += probs[selected[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        weights[tid] = probs[selected[tid]] / sum * 1.5f;
+    }
 }
 
 // Fills the dense compressed-attention mask with -inf. The selected top-k rows

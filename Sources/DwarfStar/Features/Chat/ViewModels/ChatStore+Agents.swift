@@ -1,0 +1,106 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+import DS4Engine
+import DS4Core
+
+extension ChatStore {
+    var selectedAgent: AgentProfile { agents.first { $0.id == selectedAgentId } ?? agents[0] }
+
+    static func loadAgents() -> [AgentProfile] {
+        if let data = UserDefaults.standard.data(forKey: "DS4Agents"),
+           var arr = try? JSONDecoder().decode([AgentProfile].self, from: data), !arr.isEmpty {
+            // New DEFAULT agents (e.g. "code") must appear even for users with a
+            // persisted list: append the missing ones without touching edits.
+            for d in AgentProfile.defaults where !arr.contains(where: { $0.id == d.id }) {
+                arr.append(d)
+            }
+            return arr
+        }
+        return AgentProfile.defaults
+    }
+
+    func saveAgents() {
+        if let data = try? JSONEncoder().encode(agents) {
+            UserDefaults.standard.set(data, forKey: "DS4Agents")
+        }
+    }
+
+    func isDefaultAgent(_ id: String) -> Bool { AgentProfile.defaults.contains { $0.id == id } }
+
+    func addAgent() {
+        let id = "custom-\(UUID().uuidString.prefix(8))"
+        agents.append(AgentProfile(id: id, name: "New Agent", icon: "person.fill.questionmark",
+                                   systemPrompt: "", toolNames: []))
+        saveAgents()
+    }
+
+    func deleteAgent(_ id: String) {
+        guard !isDefaultAgent(id), agents.count > 1 else { return }
+        agents.removeAll { $0.id == id }
+        if selectedAgentId == id { selectAgent(agents[0].id) }
+        saveAgents()
+    }
+
+    func restoreDefaultAgents() {
+        agents = AgentProfile.defaults
+        if !agents.contains(where: { $0.id == selectedAgentId }) { selectAgent(agents[0].id) }
+        saveAgents()
+    }
+
+    /// Agents as pretty JSON (for export/sharing between machines).
+    func exportAgentsData() -> Data? {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? enc.encode(agents)
+    }
+
+    /// Merge agents from JSON: matching ids are updated, new ones appended.
+    /// Returns how many agents were imported (0 = invalid file).
+    @discardableResult
+    func importAgents(from data: Data) -> Int {
+        guard let imported = try? JSONDecoder().decode([AgentProfile].self, from: data),
+              !imported.isEmpty else { return 0 }
+        for a in imported {
+            if let i = agents.firstIndex(where: { $0.id == a.id }) { agents[i] = a }
+            else { agents.append(a) }
+        }
+        saveAgents()
+        return imported.count
+    }
+
+    /// The agent with the user's extra system prompt appended (if any).
+    func resolvedAgent() -> AgentProfile {
+        var agent = selectedAgent
+        let extra = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !extra.isEmpty {
+            agent.systemPrompt = agent.systemPrompt.isEmpty ? extra : agent.systemPrompt + "\n\n" + extra
+        }
+        return agent
+    }
+
+    /// Apply the agent to the running service: fresh chat with its role + tools,
+    /// per-agent usage profile swapped in, slot-cache re-warmed.
+    func applyAgent() {
+        guard let service else { return }
+        let agent = resolvedAgent()
+        toolsEnabled = !agent.toolNames.isEmpty
+        enabledToolNames = Set(agent.toolNames)
+        let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
+        Task {
+            await service.setAgent(agent, tools: tools)
+            await service.setCompactTools(compactTools)
+            refreshTuningInfo()
+            // Se il CAMBIO di agente ha invalidato la slot-cache (profilo
+            // usage nuovo), i pool si riscaldano ORA in background invece che
+            // dentro il primo messaggio. No-op quando l'agente non è cambiato.
+            await service.warmup()
+        }
+    }
+
+    func selectAgent(_ id: String) {
+        selectedAgentId = id
+        startNewChat()   // a role switch starts a fresh persisted chat with that role
+    }
+
+}

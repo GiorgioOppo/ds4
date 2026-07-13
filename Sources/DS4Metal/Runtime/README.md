@@ -1,12 +1,21 @@
-# DS4Metal/Runtime
+# Runtime
 
-Foundational Metal runtime pieces.
+Fondazione Metal sulla quale poggiano loader, grafo e decoder.
 
-- **`MetalRuntime.swift`** owns the device, command queue, and pipeline
-  compilation/cache for the embedded kernel sources.
-- **`GPUTensor.swift`** wraps shared-storage `MTLBuffer` allocations on unified
-  memory. It exposes helpers such as `zeros`, `bytes`, `floats`, `count`,
-  `byteOffset`, and no-copy views over mmap-backed data.
-- **`KernelSources.swift`** is **generated** from `metal/*.metal` by
-  `scripts/embed_kernels.sh` through `make embed-kernels`. Do not edit it by
-  hand; edit the `.metal` files and regenerate.
+## Struttura
+
+- [`Core/`](Core/README.md): device, libreria, pipeline e `GPUTensor`.
+- [`Generated/`](Generated/README.md): sorgenti kernel incorporate e generate.
+
+## Flusso e dipendenze
+
+`MetalRuntime` crea device e command queue, concatena le sorgenti nell'ordine
+canonico e compila una `MTLLibrary`. I wrapper richiedono pipeline per nome e
+operano su `GPUTensor` in memoria unificata. In produzione non è necessaria una
+cartella `metal/` accanto all'app.
+
+## Regole di modifica
+
+Tenere questo livello indipendente dalla semantica DeepSeek quando possibile.
+Centralizzare creazione e cache delle pipeline, propagare errori descrittivi e
+non introdurre sincronizzazioni implicite nei contenitori tensor.

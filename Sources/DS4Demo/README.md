@@ -12,13 +12,14 @@ It is useful for:
 - running a one-token forward smoke test;
 - generating real tokens while measuring prefill, decode, and expert I/O.
 
-`main.swift` opens a GGUF with no-copy mmap, detects MoE quantization, runs one
-forward pass, and when requested performs layer-major prompt prefill followed by
-greedy streaming decode.
+[`Command/main.swift`](Command/main.swift) opens a GGUF with no-copy mmap,
+detects MoE quantization, runs one forward pass, and when requested performs
+layer-major prompt prefill followed by streaming decode.
 
-The demo uses a fixed context window of `maxKeys = 4096`. Sampling is greedy
-(`temperature = 0`). It is intended for engine measurement, not for chat UX; use
-the DwarfStar app for normal conversation.
+The demo uses a fixed context window of `maxKeys = 4096`. Sampling is greedy by
+default (`temperature = 0`), while the `DS4_DEMO_*` variables below enable the
+same sampler filters used by the engine. It is intended for engine measurement,
+not for chat UX; use the DwarfStar app for normal conversation.
 
 ## Positional Arguments
 
@@ -65,6 +66,8 @@ throughput.
 
 | Variable | Values | Default | Effect |
 |---|---|---|---|
+| `DS4_PROMPT_FILE` | path | unset | Reads the prompt from a UTF-8 file. This is equivalent to the positional `@/path/file` form and avoids shell argument splitting for long prompts. |
+| `DS4_PROMPT_MAX_CHARS` | positive integer | `12000` | Maximum number of characters read from a prompt file before truncation. The final tokenized prompt plus requested output must still fit the 4096-position demo KV. |
 | `DS4_TYPES_ONLY` | present, usually `=1` | off | GGUF audit mode. Prints critical tensor dtypes, tokenizer special ids, and prompt tokenization, then exits before constructing the decoder. Use it first when a model produces nonsense or when validating a new quantization. |
 | `DS4_DIAG` | `=1` | off | Full streaming diagnostic run. Before generation it prints active knobs, measures disk bandwidth with `F_NOCACHE`, and checks whether MTP weights exist in the GGUF. After generation it prints per-layer routing, expert concentration, cache-slot allocation, and effective gather bandwidth versus measured SSD ceiling. |
 | `DS4_ACTIVE_EXPERTS` | `1...6` | `6` | Reduces how many routed MoE experts are actually used per token. This lowers I/O and gather time but changes quality because Flash is trained for 6 experts. Useful as a degraded low-RAM mode or to estimate expert-I/O cost. |
@@ -74,10 +77,10 @@ throughput.
 ### Engine Knobs
 
 `DS4Demo` builds a `StreamingDecoder`, so it inherits the same runtime knobs used
-by the app. Unless stated otherwise, they are performance or memory experiments
-and should not change numerics. `DS4_ACTIVE_EXPERTS` and `DS4_FUSED_MOE=0` are
-intentional exceptions. The same knobs are documented from the app's point of
-view in the root README's
+by the app. Every row states whether the option only changes storage/scheduling,
+can alter accumulation order, or is deliberately lossy. Do not infer numerical
+equivalence merely from the fact that a knob is performance-oriented. The same
+knobs are documented from the app's point of view in the root README's
 [Configuration Reference](../../README.md#configuration-reference).
 
 | Variable | Values | Default | Effect |
@@ -89,6 +92,10 @@ view in the root README's
 | `DS4_PREFILL_MM` | `=1` | off (OPT-IN) | Routed AND shared FFN of the batched prefill through matrix-matrix kernels: expert weights are read once per 64×32 tile for ALL the group's tokens instead of once per token (matvec), and the shared expert runs 3 matmuls per GROUP instead of 3 matvecs per token (Q8_0 shared weights; `DS4_SHARED_Q4` residents keep the per-token path). Same math, different accumulation order (simdgroup MMA, f16 mid) — outputs are close but NOT bit-identical to the matvec path, hence opt-in until A/B-validated. iq2_xxs gate/up + q2_K down only (the Flash shape); groups with `DS4_ACTIVE_EXPERTS` < 6 or fewer than 8 tokens fall back to matvec. Costs ~80 MB of extra transient staging per chunk. |
 | `DS4_PREFILL_ROUTE_BATCH` | integer (`0`/`1` = off) | `32` | Batched prefill route phase: up to N consecutive tokens' route/attention are encoded into ONE command buffer — each token's scratch snapshot (FFN inputs + router selection) is blit-copied GPU-side before the next token overwrites it, and the CPU reads all the selections after a single wait. Cuts phase-A syncs N×. Serial encoder ⇒ identical numerics. The app's full benchmark tests 16/32/64/128 live. |
 | `DS4_GPU_INDEXER_TOPK` | `0` disables | on | Long-context decode keeps indexer scores, exact heap-equivalent top-K mask, and attention in one command buffer. `0` restores the historical CPU selection for parity checks. |
+| `DS4_DENSE_Q4_KERNEL` | `0` disables | on | Dedicated resident dense-Q4 matvec. It reuses the exact Q4_K row implementation but removes the synthetic single-expert ID wrapper. Set `0` for bit-parity/performance A/B. |
+| `DS4_FUSED_ROUTER_PROBS` | `0` disables | on | Computes the router's `sqrt(softplus(logit))` in one vector dispatch instead of two scalar passes. Set `0` for parity A/B. |
+| `DS4_FUSED_ROUTER_FINALIZE` | `0` disables | on | Combines top-6 selection and bit-identical route-weight normalization, saving one dispatch on every routed layer. |
+| `DS4_FUSED_COMP_PROJ` | `0` disables | on | Computes compressor KV+gate projections together for F16 and Q8, sharing activation traffic and one dispatch while preserving each reduction order. |
 | `DS4_DEMO_TEMPERATURE` | float | `0` | Demo sampling temperature. `0` keeps historical greedy decoding; `0.3` is a focused choice for the 2-bit model. |
 | `DS4_DEMO_TOP_K` | integer | `0` | Candidate cap; use `40` with nonzero temperature to avoid the noisy 129k-vocabulary tail. |
 | `DS4_DEMO_TOP_P` / `DS4_DEMO_MIN_P` | float | `1` / `0` | Nucleus and minimum-probability filters for the demo sampler. |
@@ -98,7 +105,7 @@ view in the root README's
 | `DS4_EXPERT_CACHE_UNIFORM` | `=1` | off | Disables usage-driven slot redistribution. By default, layers with concentrated routing receive more slots at the same total budget. Use this for A/B comparisons. |
 | `DS4_EXPERT_BUNDLE` | `=1` | off | Sidecar `<gguf>.expbundle` with each routed expert's gate/up/down slabs CONTIGUOUS: a slot-cache miss becomes one ~7 MB sequential burst instead of three scattered ~2 MB reads. Same bytes, same numerics. The FIRST run builds it next to the model (duplicates the expert region on disk — tens of GB, skipped if space is short); later runs open it in milliseconds. Invalidated automatically when the model changes. |
 | `DS4_MTLIO` | `=1` | off | Apple Metal fast resource loading for expert slot-cache misses during decode. An interleaved expert is loaded with one contiguous command directly into its destination `MTLBuffer`; prefill remains on parallel `pread`. Any failure permanently falls back to `pread`. Same bytes and numerics; A/B on the target Mac because MetalIO is not consistently faster on M1 Pro. |
-| `DS4_MTLIO_MIN_GBS` | float | `1.5` | Automatic circuit-breaker threshold. If the first successful MetalIO batch is slower, subsequent fills use `pread` for the rest of that model load. |
+| `DS4_MTLIO_MIN_GBS` | float | `1.5` | Automatic circuit-breaker threshold. Timings are aggregated into 64 MiB windows; two consecutive slow windows switch the model load to `pread`. Small batches and isolated stalls are ignored. |
 | `DS4_BUNDLE_DIR` | directory path | unset (sidecar next to the GGUF) | Where the `.expbundle` sidecar is BUILT when set (`<dir>/<gguf-name>.expbundle`); reading always tries the sibling `<gguf>.expbundle` first, then the directory. The sandboxed app sets it to its Application Support (it cannot write next to a picker-selected model); to share ONE copy between demo and app, point the demo at the same dir: `DS4_BUNDLE_DIR="$HOME/Library/Application Support/DwarfStar/expert-bundle"`. |
 | `DS4_POOL_INTERLEAVE` | `=0` disables | on | Slot-cache pool layout: each slot holds the expert's gate\|up\|down slabs CONTIGUOUS (same record layout as the bundle sidecar), as three views of one buffer with the record size passed as the expert stride to the MoE kernels. A cache miss with the bundle becomes ONE ~7 MB pread straight into the slot (one syscall instead of three, larger I/Os at the same queue depth). Same bytes, same kernels ⇒ identical numerics. `=0` restores the historical 3-buffer layout (parity checks). |
 | `DS4_EXPERT_PREAD` | `=1` | off | Reads expert slabs with `pread` + `F_NOCACHE` directly into destination buffers, bypassing the system page cache. This prevents expert churn from evicting dense weights and is often useful on 16 GB systems. Numerics are unchanged. |
@@ -112,20 +119,22 @@ view in the root README's
 | `DS4_DENSE_STREAM` | `=1` | off | Double-buffered dense-weight STREAMING: instead of trying to keep ~6 GB of dense weights resident, each layer's dense tensors are `pread`+`F_NOCACHE` into a 2-slot staging ring, kicked one layer AHEAD so the SSD read of layer i+1 overlaps the GPU compute of layer i (the dense access pattern is fully sequential — no speculation). ~300 MB of staging instead of ~6 GB resident, zero page-cache footprint. Takes precedence over `DS4_RESIDENT_DENSE`. Identical numerics. The candidate cure when `route/attn` dominates on 16 GB. |
 | `DS4_LAZY_IDX` | `=0` disables | on (requires `DS4_DENSE_STREAM=1`) | Skips staging the NSA indexer SCORING projections (`indexer.attn_q_b` + `indexer.proj`, ~360 MB/token on Flash) when the top-K selection provably can NEVER activate at the current context size — with the demo's `maxKeys = 4096` and the default sparse threshold they would stream every token to never be read. The indexer compressor pair keeps streaming (its recurrent state must stay coherent). LOSSLESS: only never-executed work is dropped. `=0` restores the always-stage behaviour for A/B. |
 | `DS4_RESIDENT_COMP` | `=0` disables | on (requires `DS4_DENSE_STREAM=1`) | Keeps the four NSA compressor projections RESIDENT (~0.6 GB) instead of streaming them — they are read EVERY token on 41 of 43 layers, the single densest repeat-read in the dense stream. Same bytes, identical numerics. `=0` restores full streaming (tight-RAM fallback / A/B). |
+| `DS4_COMP_Q8` | `=1` | off | **Lossy, experimental.** Converts the resident attention/indexer compressor projections from F16 to Q8_0, approximately halving their RAM and GPU traffic. The first run creates a `.q8comp.Lx-y` sidecar in `DS4_Q4_CACHE_DIR` (or beside the GGUF). |
 | `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` | `64`, `128`, `256`, `512`, `1024`, `2048`, `4096` | `1024` | Number of compressed rows above which decode attention switches from the dense scan to the sparse indexer path — around the ~2K frontier the sparse score/top-k setup dominates the smaller attention scan. Changes only WHICH implementation consumes the compressed rows (the 512-row indexer selection is a separate, lower bound); same env override and allowed values as the C engine. Also feeds the `DS4_LAZY_IDX` "can the indexer ever activate" proof. |
 | `DS4_MLOCK` | `=1` | off | `mlock()` best-effort on the hot resident buffers: expert-cache pools, resident output head (with `DS4_DENSE_STREAM`), and the dense staging ring. Shared Metal buffers are anonymous memory that macOS COMPRESSES between uses — a buffer touched once per token re-reads at ~2.4 GB/s through the compressor instead of RAM speed (the measured ~235 ms output head on a "resident" copy). Pins ~3.3 GB at the default settings; identical numerics. A/B and watch `output head` and `experts` in the profile. |
-| `DS4_DENSE_Q4` | `=1` (requires `DS4_DENSE_STREAM=1`) | off | **LOSSY.** Requantizes the three giant attention projections (`q_b`, `output_a`, `output_b` — Q8_0, 107 of ~145 MB/layer) to Q4_K at load and keeps them RESIDENT (~1.4 GB, locked with `DS4_MLOCK`): half their bytes, RAM-speed reads, ~4.6 GB/token removed from the SSD stream — the biggest byte-reduction available once the decode is disk-bound. Uses the already-validated Q4_K matvec kernels (dense matvec = MoE id-kernel with k=1; the grouped `output_a` = k=8 with per-group activation rows). Quality: logit drift ~0.02%, greedy outputs occasionally diverge but stay coherent. The FIRST load pays a parallel requant pass and writes a cache next to the model (`<gguf>.q4dense`, ~1.4 GB); later loads pread the cache in ~0.5 s. Delete the file to force a re-requant. |
+| `DS4_DENSE_Q4` | `=1` (requires `DS4_DENSE_STREAM=1`) | off | **LOSSY.** Requantizes the three giant attention projections (`q_b`, `output_a`, `output_b` — Q8_0, 107 of ~145 MB/layer) to Q4_K at load and keeps them RESIDENT (~1.4 GB, locked with `DS4_MLOCK`): half their bytes, RAM-speed reads, ~4.6 GB/token removed from the SSD stream — the biggest byte-reduction available once the decode is disk-bound. Uses the already-validated Q4_K matvec kernels (dense matvec = MoE id-kernel with k=1; the grouped `output_a` = k=8 with per-group activation rows). Quality: logit drift ~0.02%, greedy outputs occasionally diverge but stay coherent. The FIRST load pays a parallel requant pass and writes a cache next to the model (`<gguf>.q4dense`, ~1.4 GB for this base trio); QKV/shared options add records and increase its size. Later loads reuse the validated cache, with load time dependent on SSD and memory pressure. Delete the file to force a re-requant. |
 | `DS4_SHARED_Q4` | `=1` (requires `DS4_DENSE_Q4=1`) | off | **LOSSY.** Also requantizes the shared-expert FFN projections (gate/up/down, Q8_0) to Q4_K and keeps them resident: their slabs leave the per-token dense stream entirely, freeing disk bandwidth for the expert gather. Same `.q4dense` cache (toggling re-requants once). A/B quality before adopting. |
 | `DS4_QKV_Q4` | `=1` (requires `DS4_DENSE_Q4=1`) | off | **LOSSY.** Also requantizes the remaining mid-size attention projections (`q_a`, `kv` — Q8_0, ~16 MB/layer) to Q4_K and keeps them resident: ~0.7 GB/token off the stream for ~0.35 GB of RAM, and the Q4 matvec reads half the bytes of the Q8 one. Same `.q4dense` cache — a cache built without this knob stays valid and only the new tensors are requantized (records match per key). A/B quality before adopting. |
-| `DS4_SPEC_K` | `2`..`8` | off | **Decode SELF-SPECULATIVE greedy** (docs/SELF-SPECULATIVE.md): per round, N-1 candidati generati con un draft economico e verificati in UN passo batch full-config (logit per posizione); il prefisso confermato + il bonus token avanzano insieme. Parità bit-per-bit col decode normale per costruzione (gli argmax accettati sono full-config). Il log stampa token/round e tasso di accettazione del draft. |
+| `DS4_SPEC_K` | `2`..`8` | off | **Decode SELF-SPECULATIVE greedy** ([design e misure](../../docs/SELF-SPECULATIVE.md)): per round, N-1 candidati generati con un draft economico e verificati in un passo batch full-config. Si attiva soltanto con temperatura `0` e repetition penalty `<=1`; altrimenti la demo lo disabilita. Il percorso resta opt-in perche le misure correnti non mostrano un vantaggio prestazionale. |
 | `DS4_SPEC_DRAFT_EXPERTS` | `1`..`k-1` | `2` | Esperti attivi del DRAFT speculativo (route weights rinormalizzati, stesso meccanismo di `DS4_ACTIVE_EXPERTS`): meno esperti = draft più economico ma accettazione più bassa. A/B per modello. |
 | `DS4_Q4_CACHE_DIR` | directory path | unset (cache next to the GGUF) | Where the `.q4dense` requant cache is WRITTEN when set (`<dir>/<gguf-name>.q4dense`). Reading tries both places: a cache produced by the demo next to the GGUF is picked up and PROMOTED into the primary location, so demo and app share one conversion. The sandboxed app sets it to its Application Support (it cannot write next to a picker-selected model). |
 | `DS4_FUSED_MOE` | `=0` disables | on | Uses fused MoE kernels by default. `=0` selects the non-fused path for numerical A/B and debugging; it may change rounding and output. |
 | `DS4_FUSED_HC` | `=0` disables | on | Fused HC-reduce tail: split+collapse+RMSNorm in ONE dispatch instead of three. It runs twice per layer, so the fusion saves ~170 dispatches/token. Same math; only the RMSNorm reduction order differs (±1 ulp class). `=0` restores the unfused path. |
 | `DS4_ASYNC_FFN` | `=0` disables | on | Commits each layer's routed-FFN command buffer WITHOUT a CPU wait: the next layer's route commit+wait lands on the same in-order queue, so the GPU stays fed while the CPU encodes and the per-layer bubble (encode time × 43) disappears. Explicitly waited at end of token (before the output head) and on every error path; correctness is by queue order, numerics identical. `DS4_PROFILE_ROUTE` keeps the synchronous wait for accurate phase timing. `=0` for A/B. |
 | `DS4_PROFILE_ROUTE` | `=1` | off | Splits `route/attn` into diagnostic subphases such as compressor, Q/KV projections, attention, and output. Adds synchronization overhead; inspect ratios, not absolute tok/s. |
-| `DS4_Q8_NSG` | `1...8` | `4` | Simdgroups per threadgroup for dense Q8_0 matvecs. Results are identical; only scheduling, occupancy, and latency hiding change. Sweep `2/4/6/8` on the target Mac. |
-| `DS4_MOE_NSG` | `1`..`8` | `4` | Simdgroups per threadgroup in the MoE id-kernels: the routed FFN (`pair_swiglu`/`sum6` — the biggest measured compute item, ~100 ms/token on M1 Pro) and the resident dense-Q4 matvecs share these wrappers. Row-partitioned: every value is bit-identical, only occupancy changes; the optimum depends on the GPU core count. Re-read at decoder creation (the Settings auto-tune sweeps it with a reload). |
+| `DS4_Q8_NSG` | `1...8` | `4` | Simdgroups per threadgroup for dense Q8_0 matvecs. Scheduling and occupancy change, and the K reduction is partitioned differently, so the final floating-point bits are not guaranteed identical. Sweep `2/4/6/8` on the target Mac and include output validation when parity matters. |
+| `DS4_MOE_NSG` | `1`..`8` | `4` | Simdgroups per threadgroup in routed MoE kernels. Row-partitioned: every value is bit-identical, only occupancy changes; the optimum depends on the GPU core count. Re-read at decoder creation. |
+| `DS4_DENSE_Q4_NSG` | `1`..`8` | inherits `DS4_MOE_NSG` | Independent row occupancy for resident dense/grouped Q4_K projections. Bit-identical; lets `q`/`out` tune separately from routed experts. |
 
 ## What Should I Try First?
 
@@ -133,7 +142,7 @@ view in the root README's
 |---|---|---|
 | `expert gather` dominates and effective gather bandwidth is far below SSD ceiling | Compare default vs `DS4_WILLNEED_EXPERTS=0`, then try `DS4_EXPERT_PREAD=1`, then `DS4_EXPERT_BUNDLE=1` | Separates read-ahead benefit, page-cache churn, and scattered-read overhead. |
 | `route/attn`, `embed`, or `head` stay slow after warm-up | `DS4_DENSE_STREAM=1`, `DS4_MLOCK=1`, then `DS4_DENSE_Q4=1` if lossy speed is acceptable | Dense weights are likely rereading from SSD or memory-compressed buffers. Streaming + pinning reduces churn; Q4 removes large Q8 projections from the hot path. |
-| Expert-cache hit-rate is low but routing is concentrated | `DS4_EXPERT_CACHE_SLOTS=8/12/16`, with a fixed `DS4_USAGE_FILE` | More slots may retain hot experts and reduce SSD reads; a fixed usage file makes pre-warm repeatable. |
+| Expert-cache hit-rate is low but routing is concentrated | Sweep `DS4_EXPERT_CACHE_SLOTS=8/12/16/20/22`, with a fixed `DS4_USAGE_FILE` | More slots may retain hot experts and reduce SSD reads; the measured GUI preset uses 22 on an M1 Pro 16 GB with the full Q4 profile, but the optimum depends on free RAM. |
 | Expert cache is enabled but not helping | `DS4_EXPERT_CACHE_UNIFORM=1` A/B | Tests whether usage-driven redistribution is helping or whether the budget is wrong. |
 | Short runs are noisy | `DS4_WARMUP=4` and fixed `DS4_USAGE_FILE=<path>` | Separates cold costs from steady state and makes routing history repeatable. |
 | You want best single-machine throughput | sweep `DS4_Q8_NSG=2/4/6/8` | Dense Q8 scheduling optimum is SoC- and memory-pressure-specific. |
@@ -174,7 +183,7 @@ swift run DS4Demo /path/model.gguf 32 "Explain RoPE briefly."
 ### 5. Low-RAM experiment
 
 ```sh
-DS4_EXPERT_PREAD=1 DS4_DENSE_STREAM=1 DS4_MLOCK=1 DS4_EXPERT_CACHE_SLOTS=16 \
+DS4_EXPERT_PREAD=1 DS4_DENSE_STREAM=1 DS4_MLOCK=1 DS4_EXPERT_CACHE_SLOTS=22 \
   swift run DS4Demo /path/model.gguf 16
 ```
 
@@ -202,7 +211,7 @@ Useful A/B comparisons with `DS4_DIAG=1`:
 
 - default `DS4_WILLNEED_EXPERTS` vs `DS4_WILLNEED_EXPERTS=0`;
 - default usage-driven allocation vs `DS4_EXPERT_CACHE_UNIFORM=1`;
-- `DS4_EXPERT_CACHE_SLOTS=8/12/16`;
+- `DS4_EXPERT_CACHE_SLOTS=8/12/16/20/22`;
 - `DS4_Q8_NSG=2/4/6/8`.
 
 ### 8. Clean steady-state profile
@@ -225,3 +234,14 @@ swift run DS4Demo /path/model.gguf 8 > answer.txt
 ```
 
 The file receives only the generated answer; logs remain on screen.
+
+## Source layout
+
+- [`Command/README.md`](Command/README.md) documents the CLI entry point and its
+  dependency boundary.
+- [`Diagnostics/README.md`](Diagnostics/README.md) documents logging, GGUF
+  inspection, and disk-measurement helpers.
+
+Keep this README as the authoritative command and environment-variable
+reference. When a knob or positional argument changes, update it in the same
+change as the implementation.

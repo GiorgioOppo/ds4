@@ -1,11 +1,19 @@
-# Decode self-speculative (design)
+# Decode self-speculative CLI sperimentale
 
-Obiettivo: rompere la struttura "un giro completo per token" del decode —
-route → readback selezione → gather → FFN, ×43 layer — pagandola **una volta
-ogni N token**. A 3.33 tok/s (misure 2026-07-08) le leve locali sono esaurite:
-gather all'87-94% del tetto SSD, sync 3 ms, FFN routed nascosta dall'ASYNC_FFN.
-Questa è l'unica leva strutturale rimasta con il GGUF corrente (che NON ha
-pesi MTP — il DIAG lo verifica: la variante qui sotto non li richiede).
+> **Stato al 13 luglio 2026:** le fasi A-C sono implementate nella demo CLI e
+> abilitate soltanto con `DS4_SPEC_K`; non sono integrate nel percorso GUI o
+> nell'`InferenceService`. Le prove del 2026-07-08 su M1 Pro 16 GB e GGUF Flash
+> IQ2_XXS hanno verificato la parità greedy sui prompt provati, ma il throughput
+> è risultato inferiore al decode normale. La funzione è quindi opt-in e
+> parcheggiata, non un profilo consigliato. Tutti i numeri sotto sono snapshot di
+> quella configurazione e non una promessa per altri modelli o Mac.
+
+Obiettivo dell'esperimento: rompere la struttura "un giro completo per token"
+del decode — route → readback selezione → gather → FFN, ×43 layer — pagandola
+**una volta ogni N token**. Nello snapshot a 3.33 tok/s del 2026-07-08 le leve
+locali apparivano esaurite: gather all'87-94% del tetto SSD, sync 3 ms, FFN
+routed nascosta dall'ASYNC_FFN.
+Il GGUF provato non aveva pesi MTP; la variante qui sotto non li richiede.
 
 ## Schema
 
@@ -29,9 +37,11 @@ stato S a posizione P (ultimo token accettato t0)
               Se j == K: lo stato della verifica È già quello giusto.
 ```
 
-Costo per round: 1 verify batch (≈ 1 giro pieno, ammortizzato su j+1 token) +
-K draft a ~1/3 dell'I/O esperti + (solo su rifiuto) un mini-verify dei token
-accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
+Stima iniziale del costo per round: 1 verify batch (≈ 1 giro pieno,
+ammortizzato su j+1 token) + K draft a ~1/3 dell'I/O esperti + (solo su
+rifiuto) un mini-verify dei token
+accettati. L'attesa era **1.5-2.5×** con accettazione media 2-3; le misure
+successive hanno smentito l'ipotesi di un draft abbastanza economico.
 
 ## Vincoli verificati sul codice
 
@@ -71,23 +81,27 @@ accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
    (`SpecRecurrentState`, `SpecDecode.swift`). Nessun cambiamento di
    comportamento finché inutilizzati.
 2. **Fase B (verify) — FATTA**: `specVerifyStep(tokens:startPos:) ->
-   [[Float]]` (StreamingDecoder.swift, accanto a prefillRange di cui
+   [[Float]]` (`Sources/DS4Metal/Decode/Prefill/StreamingDecoder+Prefill.swift`,
+   accanto a `prefillRange`, di cui
    riusa stage batchato e unione esperti): passo batch full-config con
    logit per posizione (output head su ogni hidden finale, ~8 ms/token).
-3. **Fase C (loop, demo) — FATTA, da validare on-device**: `DS4_SPEC_K=N`
+3. **Fase C (loop, demo) — FATTA e misurata su copertura limitata**:
+   `DS4_SPEC_K=N`
    (+`DS4_SPEC_DRAFT_EXPERTS`, default 2) nella demo: loop
    draft/verify/accept greedy con bonus token e ricostruzione su rifiuto.
-   VALIDAZIONE prima di misurare: stesso testo del decode normale (stessa
-   parità greedy) su più prompt, poi sweep K=2..6 e lettura di
-   token/round + accettazione dal log.
-4. **Fase D (GUI/engine)** — integrazione in InferenceService (generate
-   greedy → speculativo quando temperature==0 o dietro toggle), telemetria
+   La validazione permanente deve confrontare lo stesso testo del decode
+   normale su più prompt e fare sweep K=2..6 leggendo token/round e accettazione.
+4. **Fase D (GUI/engine) — non avviata, parcheggiata**: integrazione in
+   InferenceService (generate greedy → speculativo quando temperature==0 o
+   dietro toggle), telemetria
    accettazione nel profilo (token/round), poi rejection sampling.
    Nota per l'integrazione: ripristinare SEMPRE activeExperts sugli error
    path (defer), e il draft inquina marginalmente la usage imatrix (route
    registrate con selezione draft) — accettabile, eventualmente gate.
 
-## Prima misura sul campo (2026-07-08, M1 Pro, K=4, draft 2 esperti)
+## Prima misura sul campo
+
+Snapshot 2026-07-08: M1 Pro 16 GB, Flash IQ2_XXS, K=4, draft 2 esperti.
 
 - **Parità: PERFETTA** — testo identico carattere per carattere al decode
   normale su 48 token. Snapshot/rollback della ricorrenza NSA, verifica e
@@ -107,10 +121,11 @@ accettati. Con accettazione media 2-3: **1.5-2.5×** attesi.
   da rimisurare ora che q_a/kv/trio sono residenti); (b) draft che SALTA
   la shared FFN (è un'approssimazione comunque: tocca solo l'accettazione);
   (c) K piccolo (2) per ridurre i passaggi draft per round; (d) in
-  prospettiva, layer-skip nel draft o un GGUF con pesi MTP (draft head
-  dedicata, il DIAG già li rileva).
+  prospettiva, layer-skip nel draft o una futura integrazione MTP con draft head
+  dedicata. Il DIAG oggi ne rileva soltanto la presenza: il percorso corrente
+  non carica né usa quei pesi.
 
-## Seconda misura (verify via slot-cache + SHARED_Q4)
+## Seconda misura (stesso snapshot, verify via slot-cache + SHARED_Q4)
 
 - Parità di nuovo perfetta; K=2: **accettazione 78%**, 1.78 token/round;
   K=4: 50%, 2.40 token/round. Forward medio sceso a 224 ms (dal fix

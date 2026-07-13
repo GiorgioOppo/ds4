@@ -297,7 +297,8 @@ kernel void kernel_dsv4_softplus_sqrt_f32_4(
     const int k0 = tgpig.x/args.ne01;
     const int i01 = tgpig.x - k0*args.ne01;
     const int i0 = k0*ntg.x + tpitg.x;
-    if (i0 >= args.ne0) return;
+    // i0 indexes float4 values while ne0 is the scalar row width.
+    if (i0 * 4 >= args.ne0) return;
 
     device const float4 *s = (device const float4 *)(src + i01*args.nb01);
     device       float4 *d = (device       float4 *)(dst + i01*args.nb1);

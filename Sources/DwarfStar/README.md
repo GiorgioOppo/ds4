@@ -7,24 +7,52 @@ persisted setting (UserDefaults key, default value, engine environment
 variable) is documented in the root
 [Configuration Reference](../../README.md#configuration-reference).
 
-The app is organized by **feature**, with one folder per tab or area:
+The app is organized by **feature**, with one folder per tab or area under
+`Features/`:
 
 - **`App/`**: entry point, shared settings, root view, and environment helpers.
-- **`Chat/`**: streaming chat with Markdown, reasoning, live tool calls,
+- **`Features/Chat/`**: models, persistence, view model and views for streaming
+  chat with Markdown, reasoning, live tool calls,
   attachments, and the `ChatStore` view model.
-- **`Models/`**: GGUF selection, scanning, and downloads.
-- **`Project/`**: project library, with sandbox-bookmarked folders indexed for
+- **`Features/ModelManagement/`**: GGUF selection, scanning, and downloads.
+- **`Features/Project/`**: project library, with sandbox-bookmarked folders indexed for
   agent tools.
-- **`Tuning/`**: expert-cache slots, hit-rate, routing concentration, and agent
+- **`Features/Tuning/`**: expert-cache slots, hit-rate, routing concentration, and agent
   editor.
-- **`Server/`**: native in-process HTTP server compatible with OpenAI and
+- **`Features/Server/`**: API adapters, networking, concurrency and UI for the
+  native in-process HTTP server compatible with OpenAI and
   Anthropic-style endpoints, exposing the shared Settings-loaded engine.
-- **`Distributed/`**: UI for worker/coordinator distributed inference.
-- **`Bench/`**: local or distributed prefill/generation benchmarks over growing
+- **`Features/Distributed/`**: UI for worker/coordinator distributed inference.
+- **`Features/Benchmark/`**: local or distributed prefill/generation benchmarks over growing
   context sizes.
-- **`Diagnostics/`**: token and chat-template dumps.
-- **`Settings/`**: global model, context, execution mode, and memory/I/O
+- **`Features/Diagnostics/`**: token and chat-template dumps.
+- **`Features/Settings/`**: global model, context, execution mode, and memory/I/O
   settings such as expert bundle, dense streaming, Q4 dense cache, disk KV, and
   raw-KV ring.
-- **`Support/`**: cross-cutting utilities such as engine logs and process streams.
+- **`Shared/Support/`**: cross-cutting utilities such as engine logs and process streams.
 - **`Assets.xcassets/`**: app icon assets.
+
+## Dependency and state flow
+
+`DwarfStarApp` creates `AppSettings`, `ChatStore`, and MCP state. `RootView`
+passes those shared objects to feature controllers and views. Chat owns the one
+local `InferenceService`; Server and local Benchmark borrow that instance and
+serialize work instead of loading duplicate weights.
+
+Application code may adapt APIs from `DS4Engine` and `DS4Core`. Reusable model,
+inference, protocol, storage, and tool behavior belongs in those modules, not in
+the SwiftUI target.
+
+## Documentation map
+
+- [`App/README.md`](App/README.md): startup and shared settings.
+- [`Features/README.md`](Features/README.md): feature index and boundaries.
+- [`Features/Chat/FLOW.md`](Features/Chat/FLOW.md): message, tool, persistence,
+  and shared-engine flow.
+- [`Features/Server/HTTP-API.md`](Features/Server/HTTP-API.md): endpoints and
+  request lifecycle.
+- [`Shared/README.md`](Shared/README.md): cross-feature support rules.
+
+Every source directory has a local README. Update the nearest README when files
+move or ownership changes; do not document environment defaults in multiple
+places when the root Configuration Reference is authoritative.

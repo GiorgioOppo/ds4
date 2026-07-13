@@ -1,21 +1,23 @@
-# DS4Metal/Kernels
+# Kernels
 
-One Swift wrapper per Metal kernel. Each wrapper prepares arguments, selects the
-pipeline, and dispatches work. The **kernel sources** live in `metal/*.metal`
-and are the source of truth; they are embedded into the binary by
-`make embed-kernels`, which regenerates `Runtime/KernelSources.swift`.
+Wrapper Swift delle compute pipeline Metal. Ogni file associa una famiglia di
+funzioni `.metal`, valida gli argomenti essenziali e codifica il dispatch.
 
-Main groups:
+## Struttura
 
-- **MoE:** `MetalMoE`, `MetalMoEFused` for fused SwiGLU-pair expert matvec plus
-  down-sum6, `MetalRouter`, `MetalSparseSelect`, and `MetalArgsort`.
-- **Attention:** `MetalFlashAttn`, `MetalAttnOutLow`, `MetalRoPE`,
-  `MetalKVCompress`, `MetalCompressor`, `MetalIndexerScore`, and
-  `MetalIndexerPool`.
-- **Algebra/utility:** `MetalDense`, `MetalMatmulMM`, `MetalNorm`,
-  `MetalSoftmax`, `MetalSumRows`, `MetalGLU`, `MetalUnary`,
-  `MetalGetRows`/`MetalSetRows`, `MetalCopy`, `MetalConcat`, `MetalRepeat`,
-  `MetalBin`, `MetalHCSplit`, and `MetalHyperConnections`.
+- [`Attention/`](Attention/README.md): flash attention, RoPE e indexer sparso.
+- [`Compression/`](Compression/README.md): compressor KV e HyperConnections.
+- [`Dense/`](Dense/README.md): matvec/matmul densi e quantizzati.
+- [`MoE/`](MoE/README.md): router ed expert FFN.
+- [`Tensor/`](Tensor/README.md): trasformazioni tensor generiche.
 
-When adding or changing a kernel, edit `metal/*.metal`, run
-`make embed-kernels`, then update or add the matching Swift wrapper here.
+Le sorgenti autorevoli sono in `metal/*.metal`; la copia incorporata è descritta
+in [`Runtime/Generated`](../Runtime/Generated/README.md).
+
+## Flusso e regole
+
+Il [`Graph`](../Graph/README.md) chiama questi wrapper con `GPUTensor` e command
+buffer. Un wrapper non decide la sequenza del modello e non deve effettuare
+attese CPU nascoste. Dopo un cambio kernel: modificare la sorgente `.metal`,
+eseguire `make embed-kernels`, aggiornare firma/dispatch Swift e aggiungere test
+su forma, dtype, offset non nullo e limiti delle threadgroup.
