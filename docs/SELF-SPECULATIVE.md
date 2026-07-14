@@ -143,7 +143,32 @@ Snapshot 2026-07-08: M1 Pro 16 GB, Flash IQ2_XXS, K=4, draft 2 esperti.
   matvec→matmul per K righe); oppure (b) route/attn per token scende
   molto (fusione micro-catene). Da rivalutare dopo quei cantieri.
 
-## Fase M — draft con la testa MTP (in corso)
+## Fase N — draft prompt-lookup (n-gram), senza pesi nuovi
+
+Con la Fase M bloccata sull'artefatto (sotto), l'unico draft a costo ~zero
+disponibile OGGI è il transcript stesso: `PromptLookup.draft`
+(`Sources/DS4Core/Generation/`) cerca l'occorrenza più recente del suffisso
+corrente (n-gramma 4→2) in prompt+generato e propone i token che la
+seguirono. Demo: `DS4_SPEC_K=N DS4_SPEC_DRAFT=ngram`. Proprietà chiave
+rispetto al draft a esperti ridotti: quando il lookup non trova nulla il
+round degrada a un forward NORMALE (niente snapshot, niente verifica) — il
+percorso paga solo dove c'è davvero da copiare. Stessa verifica batch
+full-config, stessa accettazione greedy, stessa parità per costruzione;
+telemetria per round: accettazione + conteggio miss. Aspettativa onesta: il
+guadagno esiste solo su testo ripetitivo (codice, output di tool, citazioni
+del prompt — il caso d'uso agentico), perché la verifica resta per-token
+sulla route/attn; su prosa nuova il comportamento converge al decode
+normale.
+
+## Fase M — draft con la testa MTP (BLOCCATA sull'artefatto)
+
+> **Stato 2026-07-14:** il componente `mtp` del catalogo
+> (`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`) NON risulta pubblicato sul
+> repo HF `antirez/deepseek-v4-gguf`, e il GGUF principale Flash IQ2_XXS non
+> contiene pesi nextn/mtp (verificato con `DS4_DIAG=1`: "MTP: nessun peso nel
+> GGUF"). La Fase M1 (sotto) resta pronta: se/quando l'artefatto compare,
+> il report d'inventario è il primo passo. Produrre il sidecar in proprio
+> richiederebbe la release originale DeepSeek-V4 e una conversione dedicata.
 
 La seconda misura ha chiuso il draft a esperti ridotti: costa ~0.8× un forward
 pieno (paga per intero densi in streaming e overhead per-layer) e il tetto

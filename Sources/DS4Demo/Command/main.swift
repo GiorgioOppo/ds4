@@ -262,7 +262,84 @@ do {
         if requestedSpecK >= 2 && specK == 0 {
             log("DS4Demo: self-speculative disattivata — richiede sampling greedy senza repetition penalty")
         }
-        if specK >= 2 {
+        // DS4_SPEC_DRAFT=ngram (prompt-lookup, docs/SELF-SPECULATIVE.md § Fase N):
+        // il draft non è un modello ma il transcript stesso — l'occorrenza più
+        // recente del suffisso corrente propone la sua continuazione. Zero
+        // forward di draft: quando il lookup non trova nulla il round degrada a
+        // un forward normale, quindi si paga la verifica SOLO dove c'è davvero
+        // da copiare (codice, output di tool, testo ripetitivo). Stessa
+        // verifica batch full-config e stessa accettazione greedy del loop a
+        // esperti ridotti: parità bit-per-bit col decode normale per costruzione.
+        let specDraft = ProcessInfo.processInfo.environment["DS4_SPEC_DRAFT"] ?? "experts"
+        if specK >= 2, specDraft == "ngram" {
+            var history = ids
+            var rounds = 0, drafted = 0, acceptedCands = 0, misses = 0
+            log("DS4Demo: decode speculativo prompt-lookup — finestra \(specK), n-gramma 4→2")
+            ngramLoop: while genTokens < maxNew {
+                // Il prossimo token VERO esce sempre da logit full-config.
+                let tP = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+                if Int32(tP) == tok.eosId { break }
+                stdout.write(Data(tok.tokenText(Int32(tP))))
+                history.append(tP)
+                genTokens += 1
+                if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
+                if genTokens >= maxNew { break }
+                // 1) draft dal transcript. Nessun match = nessuna speculazione:
+                //    forward normale, niente snapshot/verifica da pagare.
+                let cands = PromptLookup.draft(history: history, count: specK - 1)
+                if cands.isEmpty {
+                    misses += 1
+                    last = try dec.forward(token: tP, pos: pos, nKeys: pos + 1)
+                    pos += 1
+                    continue
+                }
+                let t0 = Date()
+                // 2) snapshot (serve solo per l'eventuale rollback: il draft
+                //    n-gram NON tocca lo stato del modello) + verifica batch
+                //    full-config con logit per posizione.
+                let snap = dec.specSnapshot(nKeys: pos)
+                var window = [tP]; window.append(contentsOf: cands)
+                var logitsAll = try dec.specVerifyStep(tokens: window, startPos: pos)
+                // 3) accettazione greedy: window[i+1] deve essere l'argmax
+                //    full-config di logitsAll[i].
+                var j = 0
+                while j + 1 < window.count {
+                    let a = Sampler.sample(logitsAll[j], temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
+                    if a == window[j + 1] { j += 1 } else { break }
+                }
+                rounds += 1; drafted += window.count - 1; acceptedCands += j
+                // 4) rifiuto a metà finestra: rollback e ricostruzione pulita
+                //    dei soli j+1 token committati (come nel loop a esperti).
+                if j + 1 < window.count {
+                    dec.specRestore(snap)
+                    logitsAll = try dec.specVerifyStep(tokens: Array(window.prefix(j + 1)), startPos: pos)
+                }
+                // 5) emetti gli accettati; l'ultimo logit verificato dà il tP
+                //    del round successivo (bonus token).
+                if j >= 1 {
+                    for c in window[1...j] {
+                        if Int32(c) == tok.eosId { break ngramLoop }
+                        stdout.write(Data(tok.tokenText(Int32(c))))
+                        history.append(c)
+                        genTokens += 1
+                        if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
+                        if genTokens >= maxNew { break }
+                    }
+                }
+                pos += j + 1
+                last = logitsAll[j]
+                let dt = Date().timeIntervalSince(t0)
+                log(String(format: "  [round %d  +%d tok  %.1fs  %.2f tok/s  accept %.2f  miss %d]",
+                           rounds, j + 1, dt, dt > 0 ? Double(j + 1) / dt : 0,
+                           drafted > 0 ? Double(acceptedCands) / Double(drafted) : 0, misses))
+                if genTokens >= maxNew { break }
+            }
+            if rounds > 0 || misses > 0 {
+                log(String(format: "DS4Demo: prompt-lookup — %d round speculativi, %d forward diretti (miss), accettazione draft %.0f%%",
+                           rounds, misses,
+                           drafted > 0 ? 100 * Double(acceptedCands) / Double(drafted) : 0))
+            }
+        } else if specK >= 2 {
             let fullExperts = dec.activeExpertsNow
             let draftExperts = max(1, min(fullExperts - 1,
                 ProcessInfo.processInfo.environment["DS4_SPEC_DRAFT_EXPERTS"].flatMap(Int.init) ?? 2))
