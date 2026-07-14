@@ -53,7 +53,20 @@ public final class GraphContext {
         moeNSG = readMoENSG()
         denseQ4NSG = readDenseQ4NSG()
         fusedCompressorProj = ProcessInfo.processInfo.environment["DS4_FUSED_COMP_PROJ"] != "0"
+        adaptiveSplitK = ProcessInfo.processInfo.environment["DS4_ADAPTIVE_SPLITK"] != "0"
     }
+
+    /// DS4_ADAPTIVE_SPLITK (default on; `=0` restores the fixed dispatch):
+    /// adaptive split-K depth for the decode flash-attention. Historically the
+    /// vec kernel always dispatched nwg=32 workgroups in depth; at short
+    /// context most of them exit their chunk loop immediately but still write
+    /// a full DV=512 partial (+S/M) that the reduce reads back — dead traffic
+    /// that scales with nHead*nwg, not with the context. The adaptive dispatch
+    /// keeps every ACTIVE workgroup on exactly the same chunks (bit-for-bit
+    /// partials) and drops only the empty ones; see flashAttnCore. Same
+    /// refresh discipline as q8NSG (re-read per decoder creation).
+    nonisolated(unsafe) static var adaptiveSplitK =
+        ProcessInfo.processInfo.environment["DS4_ADAPTIVE_SPLITK"] != "0"
 
     /// DS4_MOE_NSG: simdgroups-per-threadgroup for the MoE id-kernels — the
     /// routed FFN (pair_swiglu/sum6, ~100 ms/token measured on M1 Pro, the

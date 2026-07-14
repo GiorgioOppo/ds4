@@ -492,6 +492,7 @@ performance runs stay comparable.
 | `DS4_MOE_NSG` | `1...8`; `4` | Simdgroups per threadgroup for routed MoE/Q4 id kernels. It partitions output rows and is tuned independently from the dense Q8 K-split. |
 | `DS4_DENSE_Q4_NSG` | `1...8`; inherits `DS4_MOE_NSG` | Simdgroups per threadgroup for resident dense/grouped Q4_K projections. Row-partitioned and bit-identical; separated from routed-expert occupancy for per-GPU tuning. |
 | `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` | `64/128/256/512/1024/2048/4096`; `1024` | Number of compressed KV rows above which decode attention switches from the dense scan to the sparse NSA-indexer path (below it, the top-k setup costs more than it saves). Also feeds the `DS4_LAZY_IDX` can-ever-activate proof. |
+| `DS4_ADAPTIVE_SPLITK` | `=0` disables; on | Adaptive split-K depth for the decode flash-attention: dispatches `nwg = pow2 >= ceil(keys/32)` workgroups (max 32) instead of always 32, so short contexts stop writing+reading ~16 MB/layer/token of empty partials; `nwg == 1` skips the reduce dispatch entirely (the vec kernel self-normalizes). Every active workgroup receives exactly the historical chunks — bit-identical output. `=0` restores the fixed 32-deep dispatch for A/B. |
 
 Example — the measured low-RAM profile in the demo (what the app applies by
 default):

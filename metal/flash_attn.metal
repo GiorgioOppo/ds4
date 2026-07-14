@@ -1402,11 +1402,18 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    // NWG < 32 (adaptive split-K): a simdgroup still has 32 lanes, so lanes
+    // iwg >= NWG must NOT read past their row (they would pull the next row's
+    // S/M and partials into simd_max/simd_sum). Give them exactly the neutral
+    // (S=0, M=-FLT_MAX/2, partial=0) an empty workgroup used to write when the
+    // dispatch was fixed at nwg=32 — the reduction is bit-identical. With
+    // NWG == 32 the guards are compile-time true (NWG is a function constant)
+    // and the historical code path is unchanged.
+    float S = iwg < NWG ? ss[rid*(2*NWG) + 2*iwg + 0] : 0.0f;
+    float M = iwg < NWG ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
-    const float ms = exp(M - m);
+    const float ms = iwg < NWG ? exp(M - m) : 0.0f;
 
     S = simd_sum(S*ms);
     S = S == 0.0f ? 0.0f : 1.0f/S;
@@ -1417,7 +1424,7 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+        const float4 v = simd_sum(iwg < NWG ? htmp4[i*NWG + iwg]*ms : (float4) 0.0f);
 
         if (iwg == 0) {
             dst4[i] = v*S;

@@ -13,13 +13,31 @@ extension GraphContext {
                               hasSinks: Bool = false,
                               comp: GPUTensor? = nil, nComp: Int = 0) throws {
         let headDim = 512
-        let ncpsg = 32, nwg = 32
+        let ncpsg = 32
         // Two-span attention: raw SWA rows (nKeys) followed by compressed rows (nComp),
         // contiguous in kvF16. The flash kernel then attends over the union.
         let total = nKeys + nComp
         let kvpad = (total % ncpsg) != 0
+        // Split-K ADATTIVO (DS4_ADAPTIVE_SPLITK, default on). Storico: nwg=32
+        // SEMPRE — a contesto corto quasi tutti i workgroup uscivano subito dal
+        // loop dei chunk ma scrivevano comunque il loro partial DV=512 (+S/M),
+        // che il reduce rileggeva: ~2·nHead·512·32·4 B di traffico morto per
+        // layer per token. Il loop del kernel assegna il chunk ic0=iwg·NSG+sgitg
+        // con passo nwg·NSG: per QUALSIASI nwg >= nchunks ogni workgroup attivo
+        // vede al più un chunk — esattamente gli stessi chunk del dispatch
+        // storico, quindi partial bit-identici; spariscono solo i workgroup
+        // vuoti. nwg è arrotondato alla potenza di 2 (≤32) per limitare le
+        // varianti di PSO compilate (≤6). nsg resta calcolato con la formula
+        // storica (nwg=32): supera 1 solo oltre 2048 chiavi, dove comunque
+        // nchunks > 32 e quindi nwg = 32.
+        let nchunks = (total + ncpsg - 1) / ncpsg
+        var nwg = 32
+        if GraphContext.adaptiveSplitK {
+            nwg = 1
+            while nwg < nchunks && nwg < 32 { nwg *= 2 }
+        }
         var nsg = 1
-        while 2 * nwg * nsg * ncpsg < total && nsg < 4 { nsg *= 2 }
+        while 2 * 32 * nsg * ncpsg < total && nsg < 4 { nsg *= 2 }
         let e = encoder
 
         // 1) cpy F32 -> F16: raw rows (kvF32 -> kvF16[0..]) then comp rows (comp -> kvF16[nKeys..]).
@@ -83,20 +101,27 @@ extension GraphContext {
         e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 4)
         e.setBuffer(sinks.buffer, offset: sinks.byteOffset, index: 5)
         e.setBuffer(pad.buffer, offset: pad.byteOffset, index: 6)
-        e.setBuffer(tmp.buffer, offset: tmp.byteOffset, index: 7)
+        // Con nwg == 1 il kernel vec normalizza da solo (S = 1/ss[0], stesso
+        // identico calcolo che il reduce farebbe con un solo lane attivo) e il
+        // suo layout di scrittura dst4[rid·DV4 + i] coincide con quello del
+        // reduce: si scrive direttamente in `heads` e il reduce si salta.
+        let vecDst = nwg == 1 ? heads : tmp
+        e.setBuffer(vecDst.buffer, offset: vecDst.byteOffset, index: 7)
         e.setThreadgroupMemoryLength(sharedBytes, index: 0)
         e.dispatchThreadgroups(MTLSize(width: 1, height: nHead, depth: nwg),
                                threadsPerThreadgroup: MTLSize(width: 32, height: nsg, depth: 1))
 
-        // 3) reduce
-        let reduce = try rt.flashReducePipeline(dv: Int32(headDim), nwg: Int32(nwg))
-        var reduceArgs = Int32(nHead)
-        e.setComputePipelineState(reduce)
-        e.setBytes(&reduceArgs, length: 4, index: 0)
-        e.setBuffer(tmp.buffer, offset: tmp.byteOffset, index: 1)
-        e.setBuffer(heads.buffer, offset: heads.byteOffset, index: 2)
-        e.dispatchThreadgroups(MTLSize(width: nHead, height: 1, depth: 1),
-                               threadsPerThreadgroup: MTLSize(width: 32 * nwg, height: 1, depth: 1))
+        // 3) reduce (solo con split-K reale: nwg == 1 ha già scritto in heads)
+        if nwg > 1 {
+            let reduce = try rt.flashReducePipeline(dv: Int32(headDim), nwg: Int32(nwg))
+            var reduceArgs = Int32(nHead)
+            e.setComputePipelineState(reduce)
+            e.setBytes(&reduceArgs, length: 4, index: 0)
+            e.setBuffer(tmp.buffer, offset: tmp.byteOffset, index: 1)
+            e.setBuffer(heads.buffer, offset: heads.byteOffset, index: 2)
+            e.dispatchThreadgroups(MTLSize(width: nHead, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: 32 * nwg, height: 1, depth: 1))
+        }
     }
 }
 
