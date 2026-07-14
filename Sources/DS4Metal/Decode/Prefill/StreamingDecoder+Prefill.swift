@@ -111,6 +111,20 @@ extension StreamingDecoder {
         var cur: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         try embedTokensBatch(tokens, into: cur)
+        // Fase V1 (DS4_SPEC_VERIFY_BATCH, default on): dove possibile la route/
+        // attention dell'INTERA finestra va in UN command buffer per layer
+        // (encodeRouteInto + snapshot blit, la fase A del prefill batchato — una
+        // sync per layer invece di una per token) e la FFN routed è servita
+        // dalla SLOT-CACHE per token (hit dal pool, niente unione da disco: il
+        // motivo per cui questa funzione evitava batchedExpertLayer). Stessi
+        // dispatch nello stesso ordine per token -> numerica identica al
+        // percorso per-token; i layer non idonei (indexer attivo nella
+        // finestra, quant fuori classe, activeExperts ridotti) ricadono sul
+        // giro per-token storico.
+        let stage: PrefillStage? = (specVerifyBatch && n > 1 && remoteExperts == nil
+                                    && expertGather != nil && slotCache != nil
+                                    && !profileRoute && d.activeExperts >= d.k)
+            ? try PrefillStage(rt, n: n, d: d, mmPath: false, maxUnion: d.k) : nil
         do {
             for i in 0..<nLayers {
                 try autoreleasepool {
@@ -118,17 +132,21 @@ extension StreamingDecoder {
                     let w = try layerProvider(i)
                     if i + 1 < nLayers { prefetch?(i + 1) }
                     let layerRope = DSV4Shape.ropeParams(layer: i)
-                    // SEMPRE il percorso per-token layer-major (runLayer), MAI
-                    // batchedExpertLayer: a finestre piccole (K ≤ 8) l'unione
-                    // del prefill RILEGGE gli esperti dal disco ignorando la
-                    // slot-cache (misurato: 692 vs 477 MB/token) — il decode
-                    // path serve gli hit dal pool e paga solo i miss, e il
-                    // costo denso resta amortizzato una volta per layer per
-                    // TUTTA la finestra (il vantaggio del giro layer-major).
-                    for j in 0..<n {
-                        let pos = startPos + j
-                        try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
-                                     pos: pos, nKeys: pos + 1, token: tokens[j])
+                    if let stage, let cache = slotCache,
+                       w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant,
+                       specWindowIndexerInactive(i, startPos: startPos, n: n) {
+                        try specVerifyBatchedLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
+                                                   n: n, startPos: startPos, tokens: tokens,
+                                                   cache: cache, stage: stage)
+                    } else {
+                        // Percorso per-token storico (runLayer): resta il
+                        // riferimento di parità e il fallback dei layer non
+                        // batchabili.
+                        for j in 0..<n {
+                            let pos = startPos + j
+                            try runLayer(i, w: w, layerRope: layerRope, cur: cur[j], other: other[j],
+                                         pos: pos, nKeys: pos + 1, token: tokens[j])
+                        }
                     }
                     swap(&cur, &other)
                 }
@@ -140,6 +158,101 @@ extension StreamingDecoder {
         drainFFN()
         profile.forwards += n
         return try cur.map { try outputHead($0) }
+    }
+
+    /// La finestra speculativa può usare encodeRouteInto su questo layer?
+    /// (richiede indexer INATTIVO per ogni posizione, controllato
+    /// prospetticamente come nel prefill batchato.)
+    private func specWindowIndexerInactive(_ i: Int, startPos: Int, n: Int) -> Bool {
+        var extra = 0
+        for j in 0..<n {
+            let pos = startPos + j
+            if indexerActive(i, pos: pos, extraRows: extra) { return false }
+            if let idx = indexStates[i], (pos + 1) % idx.ratio == 0 { extra += 1 }
+        }
+        return true
+    }
+
+    /// Un layer di verifica speculativa in forma batchata. Fase A: le route dei
+    /// token della finestra (causali: il token j vede il KV scritto da 0..j in
+    /// QUESTO layer) encodate in UN command buffer, con lo snapshot per-token
+    /// di FFN input + selezione blit-copiato prima che il token successivo
+    /// sovrascriva lo scratch — una sync per layer. Fase B: FFN condivisa +
+    /// routed per token, esperti dalla SLOT-CACHE. Le FFN sono serializzate al
+    /// confine di token (join del c2 precedente prima dell'acquire): acquire
+    /// back-to-back sullo stesso layer con FFN in volo potrebbe evictare slot
+    /// ancora letti dalla GPU — un hazard che il percorso per-token non ha mai
+    /// esposto alla cache. La shared FFN (commit async) copre la bolla.
+    private func specVerifyBatchedLayer(_ i: Int, w: LayerWeights, layerRope: RopeParams,
+                                        cur: [GPUTensor], other: [GPUTensor], n: Int,
+                                        startPos: Int, tokens: [Int],
+                                        cache: ExpertSlotCache, stage: PrefillStage) throws {
+        if remoteExperts == nil { kickLookahead(after: i, token: tokens[0]) }
+        // Fase A: route batchata (stessi encode, stesso ordine del per-token).
+        var t = Date()
+        clearMaskIfDirty()
+        let c = GraphContext(rt); try c.begin()
+        for j in 0..<n {
+            let pos = startPos + j
+            try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[j],
+                                pos: pos, nKeys: pos + 1, token: tokens[j])
+            try c.blitCopies([
+                (scratch.cur, 0, stage.cur[j], 0, d.nEmbd * 4),
+                (scratch.afterAttn, 0, stage.attn[j], 0, d.nHC * d.nEmbd * 4),
+                (scratch.split, 0, stage.split[j], 0, 24 * 4),
+                (scratch.selected, 0, stage.ids[j], 0, d.k * 4),
+                (scratch.rw, 0, stage.rw[j], 0, d.k * 4),
+            ])
+        }
+        c.commit()               // UNA sync per layer per l'intera finestra
+        profile.routeS += Date().timeIntervalSince(t)
+        // Fase B: FFN per token dalla slot-cache. stage.ids[j] viene RISCRITTO
+        // con gli SLOT del pool dopo la lettura CPU della selezione (buffer
+        // per-token: nessun aliasing né race — lo stesso schema del prefill).
+        var prev: GraphContext?
+        for j in 0..<n {
+            let (ids, _) = selection(sel: stage.ids[j], weights: stage.rw[j], layer: i)
+            // Shared FFN subito (non dipende dalla selezione): sulla queue
+            // in-order esegue dopo il c2 del token precedente, e copre con
+            // GPU utile l'attesa/acquire CPU qui sotto.
+            let c1 = GraphContext(rt)
+            do { try c1.begin(); try c1.decodeSharedFFN(w: w, s: scratch, d: d, cur: stage.cur[j]) }
+            catch { prev?.waitCompleted(); throw error }
+            c1.commitAsync()
+            // Join del token precedente PRIMA dell'acquire: il suo c2 legge
+            // ancora il pool di questo layer.
+            prev?.waitCompleted()
+            t = Date()
+            let h0 = cache.hits, m0 = cache.misses, p0 = cache.prefilled
+            let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
+            do { acquired = try cache.acquire(layer: i, ids: ids) }
+            catch { c1.waitCompleted(); throw error }
+            let (pool, slots) = acquired
+            profile.gatherS += Date().timeIntervalSince(t)
+            profile.expertHits += cache.hits - h0
+            profile.expertMisses += cache.misses - m0
+            profile.expertPrefilled += cache.prefilled - p0
+            profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
+            _ = slots.withUnsafeBytes {
+                memcpy(stage.ids[j].buffer.contents() + stage.ids[j].byteOffset,
+                       $0.baseAddress!, $0.count)
+            }
+            t = Date()
+            let c2 = GraphContext(rt)
+            do {
+                try c2.begin()
+                try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
+                                           upExp: pool.up, downExp: pool.down,
+                                           ids: stage.ids[j], outHc: other[j],
+                                           cur: stage.cur[j], afterAttn: stage.attn[j],
+                                           split: stage.split[j], rw: stage.rw[j],
+                                           expertStride: slotCacheStride)
+            } catch { c1.waitCompleted(); throw error }
+            commitFFN(c2)
+            prev = c2
+            profile.expertsS += Date().timeIntervalSince(t)
+            profile.layers += 1
+        }
     }
 
     /// Max experts gathered per group in the batched prefill (bounds the packed

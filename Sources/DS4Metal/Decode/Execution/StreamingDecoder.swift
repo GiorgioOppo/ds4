@@ -158,6 +158,13 @@ public final class StreamingDecoder {
     /// either way; DS4_PROFILE_ROUTE forces the synchronous path regardless
     /// (accurate per-phase attribution).
     let asyncRoute = ProcessInfo.processInfo.environment["DS4_ASYNC_ROUTE"] != "0"
+    /// DS4_SPEC_VERIFY_BATCH (default ON): la verifica speculativa incoda la
+    /// route/attention dell'INTERA finestra in un solo command buffer per layer
+    /// (fase A del prefill batchato) e serve le FFN routed dalla slot-cache,
+    /// invece del giro per-token completo. Stessi dispatch, stesso ordine per
+    /// token: numerica identica. `=0` ripristina il percorso per-token storico
+    /// di specVerifyStep per A/B.
+    let specVerifyBatch = ProcessInfo.processInfo.environment["DS4_SPEC_VERIFY_BATCH"] != "0"
     /// One embedding-table ROW (F16, nEmbd × 2 B), CPU-staged per token.
     /// Binding the full multi-hundred-MB no-copy table to a command buffer
     /// makes Metal wire the WHOLE mapping every token — on tight-RAM machines

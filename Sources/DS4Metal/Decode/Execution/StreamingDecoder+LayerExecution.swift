@@ -7,8 +7,10 @@ extension StreamingDecoder {
     /// the next layer's route commit+wait is on the same in-order queue, so
     /// correctness is by queue order and the CPU encode overlaps this buffer's
     /// GPU execution. DS4_PROFILE_ROUTE keeps the synchronous wait (accurate
-    /// per-phase attribution beats the overlap when profiling).
-    private func commitFFN(_ c: GraphContext) {
+    /// per-phase attribution beats the overlap when profiling). Internal (non
+    /// private): anche la verifica speculativa batchata (+Prefill) committa le
+    /// sue FFN routed da qui, così drainFFN traccia SEMPRE l'ultimo cb in volo.
+    func commitFFN(_ c: GraphContext) {
         if asyncFFN && !profileRoute {
             c.commitAsync()
             inflightFFN = c

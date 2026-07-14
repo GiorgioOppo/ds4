@@ -179,6 +179,35 @@ del prompt — il caso d'uso agentico), perché la verifica resta per-token
 sulla route/attn; su prosa nuova il comportamento converge al decode
 normale.
 
+## Fase V — verifica multi-token (in corso)
+
+La conclusione delle misure C ed N è la stessa: con `verify(K) ≈ K forward`
+nessun draft può vincere. Questa fase attacca la verifica.
+
+1. **V1 (FATTA, da misurare)** — `DS4_SPEC_VERIFY_BATCH` (default on):
+   specVerifyStep incoda la route/attention dell'intera finestra in UN
+   command buffer per layer (encodeRouteInto + snapshot blit, la fase A del
+   prefill batchato: una sync per layer invece di 3·K cb) e serve le FFN
+   routed dalla SLOT-CACHE per token (hit dal pool — il motivo per cui la
+   verifica evitava batchedExpertLayer e la sua unione da disco). Le FFN
+   sono serializzate al confine di token (join prima dell'acquire: acquire
+   back-to-back sullo stesso layer con FFN in volo potrebbe evictare slot
+   ancora letti dalla GPU). Stessi dispatch nello stesso ordine per token:
+   numerica identica; i layer non idonei ricadono sul per-token. Guadagno
+   atteso ONESTO: solo sincronizzazione/orchestrazione (~3-8%): il lavoro
+   GPU della route resta per-token — V1 è soprattutto l'IMPALCATURA di V2.
+2. **V2 (da fare)** — matvec→matmul sulla finestra: le proiezioni dense
+   della route (q/kv/out/shared, oggi rilette K volte) diventano matmul
+   [K × inDim] che leggono i pesi UNA volta (kernel esistenti:
+   kernel_mul_mm_q8_0/f16 densi; per il Q4_K residente si riusa
+   kernel_mul_mm_id_q4_K_f32 con esperto singolo id=0, lo stesso trucco del
+   matvec denso). Richiede di spaccare encodeRouteInto in pre-attn
+   (batchabile) / attention (sequenziale sul KV) / post-attn (batchabile
+   dopo barriera). È qui il grosso del guadagno.
+3. **V3 (da fare)** — flash-attention causale sulla finestra in un
+   dispatch (kernel batched dk512 esistente + prepass blk + maschera
+   causale): chiude il residuo.
+
 ## Fase M — draft con la testa MTP (BLOCCATA sull'artefatto)
 
 > **Stato 2026-07-14:** il componente `mtp` del catalogo
