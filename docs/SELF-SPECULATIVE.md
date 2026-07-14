@@ -143,6 +143,42 @@ Snapshot 2026-07-08: M1 Pro 16 GB, Flash IQ2_XXS, K=4, draft 2 esperti.
   matvec→matmul per K righe); oppure (b) route/attn per token scende
   molto (fusione micro-catene). Da rivalutare dopo quei cantieri.
 
+## Fase M — draft con la testa MTP (in corso)
+
+La seconda misura ha chiuso il draft a esperti ridotti: costa ~0.8× un forward
+pieno (paga per intero densi in streaming e overhead per-layer) e il tetto
+strutturale resta la route/attn seriale che la verifica non ammortizza. La
+testa MTP di DeepSeek è il draft giusto: UN blocco transformer + head
+(~1/43 dei layer per candidato) addestrato esattamente per il token
+successivo — accettazione attesa ben sopra il 49-78% del draft ridotto. Il
+sidecar esiste nel catalogo download (id `mtp`,
+`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`, ~4 GB, solo Flash); interfaccia
+DeepSeek: `h' = blocco(eh_proj([enorm(emb(t)); hnorm(hidden)]))` →
+`shared_head(norm(h'))`, iterata K-1 volte riusando `h'`.
+
+1. **M1 (FATTA)**: `MTPSidecar` (`Sources/DS4Metal/Model/MTP/`) — apertura,
+   classificazione dei ruoli (eh_proj, embed_tokens, enorm, hnorm,
+   shared_head.*, blocco) e report di validazione contro vocab/nEmbd del
+   modello principale. Demo: `DS4_MTP_GGUF=<path>` (o `=1` per cercare
+   `*MTP*.gguf` accanto al modello). Nessun effetto sul decode: produce il
+   ground truth (nomi/forme/quant REALI del sidecar) per cablare M2 senza
+   indovinare la conversione.
+2. **M2**: caricamento residente (~4 GB, RAM-gated) + forward del draft.
+   Richiede: l'hidden finale pre-head del modello principale esposto dal
+   decoder (l'`oembd` di outputHead, prima di `out.norm`); il KV proprio del
+   blocco MTP (la sua attention vede le posizioni della finestra); il wiring
+   esatto del blocco deciso dal report M1 (se il blocco è un layer DSV4
+   completo si riusa `decodeLayer` con `LayerWeights` dedicati, altrimenti
+   kernel dedicati).
+3. **M3**: aggancio al loop demo (il draft chain MTP sostituisce la catena a
+   esperti ridotti dentro `DS4_SPEC_K`), stessa verifica/accettazione; sweep
+   K=2..4, parità greedy carattere-per-carattere, telemetria accettazione.
+
+Aspettativa onesta (dalla seconda misura): draft MTP da solo ≈ 1.2-1.3×
+perché la verifica resta per-token sulla route/attn; il pacchetto da 1.5-2×
+richiede anche la verifica multi-token vera (flash-attn causale sulla
+finestra + matvec→matmul per K righe).
+
 ## Rischi e mitigazioni
 
 - Stato sporco dopo rifiuto → mini-verify di ricostruzione (passo 6);

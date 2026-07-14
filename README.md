@@ -429,6 +429,7 @@ performance runs stay comparable.
 | `DS4_DEMO_REPEAT_LAST_N` | int ≥0; `64` | Number of recent ids considered by the repetition penalty. |
 | `DS4_SPEC_K` | int; unset/`0`/`1` = off, ≥2 enables | Self-speculative greedy window. Draft candidates are rolled back and verified in one full-configuration batch; it is automatically disabled when temperature sampling or repetition penalty is active. |
 | `DS4_SPEC_DRAFT_EXPERTS` | int; `2` | Active routed experts used by the draft pass, clamped to at least 1 and below the full configured expert count. Changes draft cost, not the full-config verification rule. |
+| `DS4_MTP_GGUF` | path, or `=1`; unset | MTP speculative phase M1 (diagnostic only): opens the MTP sidecar GGUF (catalog id `mtp`), prints the tensor inventory and the draft-interface validation against the main model's vocab/nEmbd. `=1` looks for `*MTP*.gguf` next to the main model. Does not affect decoding yet. |
 
 #### Expert streaming and cache
 

@@ -115,6 +115,24 @@ do {
     let mq = GGUFWeights.detectMoEQuant(model)
     dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
     log("DS4Demo: MoE quant gate=\(mq.gate) up=\(mq.up) down=\(mq.down) routerF16=\(mq.routerF16)")
+    // DS4_MTP_GGUF (Fase M1, docs/SELF-SPECULATIVE.md § Fase M): apre il
+    // sidecar MTP e stampa inventario + validazione dell'interfaccia draft.
+    // Solo diagnostica — nessun effetto sul decode. `=1` cerca *MTP*.gguf
+    // accanto al modello; altrimenti è il percorso esplicito del sidecar.
+    if let mtpEnv = ProcessInfo.processInfo.environment["DS4_MTP_GGUF"], !mtpEnv.isEmpty {
+        let mtpPath = (mtpEnv == "1") ? MTPSidecar.locate(near: ggufPath) : mtpEnv
+        if let p = mtpPath, FileManager.default.fileExists(atPath: p) {
+            do {
+                let side = try MTPSidecar(path: p)
+                log(side.report(vocab: Int(dims.vocab), nEmbd: Int(dims.nEmbd)))
+            } catch {
+                log("DS4 mtp: apertura sidecar FALLITA (\(p)): \(error)")
+            }
+        } else {
+            log("DS4 mtp: sidecar non trovato (DS4_MTP_GGUF=\(mtpEnv)) — scaricalo dal catalogo " +
+                "(id 'mtp': DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf) o passa il percorso esplicito")
+        }
+    }
     // Optional: reduce active experts per token (DS4_ACTIVE_EXPERTS=2..6). Fewer
     // experts = less expert I/O (faster on RAM-starved machines), lower quality.
     if let s = ProcessInfo.processInfo.environment["DS4_ACTIVE_EXPERTS"], let kk = Int(s) {
