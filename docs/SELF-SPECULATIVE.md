@@ -143,7 +143,26 @@ Snapshot 2026-07-08: M1 Pro 16 GB, Flash IQ2_XXS, K=4, draft 2 esperti.
   matvec→matmul per K righe); oppure (b) route/attn per token scende
   molto (fusione micro-catene). Da rivalutare dopo quei cantieri.
 
-## Fase N — draft prompt-lookup (n-gram), senza pesi nuovi
+## Fase N — draft prompt-lookup (n-gram): misurata, parcheggiata
+
+> **Misura 2026-07-14** (M1 Pro 16 GB, Flash IQ2_XXS, preset veloce, K=4,
+> prompt a lista incrementale, 100 token): parità PERFETTA col decode
+> normale; throughput 1.86 vs 3.08 tok/s. Due cause:
+> 1. **Strutturale, decisiva**: anche i round ad accettazione PIENA (+4
+>    token) sono andati a 2.64-2.95 tok/s, SOTTO il baseline — la verifica
+>    batch costa ~1 forward PER POSIZIONE (route/attn seriale, come già
+>    misurato per la Fase C). Con verify(K) ≈ K forward, NESSUN draft — 
+>    nemmeno uno gratis — può vincere: il tetto teorico è ~1.0× più il solo
+>    bonus token, e i rifiuti (re-verify del prefisso) portano sotto.
+>    Profilo: 187 posizioni calcolate per 100 token emessi.
+> 2. Il prompt a numeri incrementali è ADVERSARIALE per il prompt-lookup:
+>    il pattern ", numero " si ripete ma il numero che segue cambia ogni
+>    volta (accettazione 39%, round a +2). Su ripetizione letterale
+>    l'accettazione sale, ma per la causa 1 non basta comunque.
+> CONCLUSIONE: opt-in sperimentale come la Fase C. Qualunque speculazione
+> su questo motore diventa conveniente SOLO con la verifica multi-token
+> vera (flash-attn causale sulla finestra in un dispatch + matvec→matmul
+> per K righe) — è quello il cantiere che sblocca l'intera famiglia.
 
 Con la Fase M bloccata sull'artefatto (sotto), l'unico draft a costo ~zero
 disponibile OGGI è il transcript stesso: `PromptLookup.draft`
