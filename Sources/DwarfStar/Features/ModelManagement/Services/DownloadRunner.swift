@@ -281,26 +281,35 @@ final class DownloadRunner {
         for await event in stream {
             switch event {
             case .snapshot(let progress, let state):
-                active?.phase = Self.friendlyPhase(state)
+                // `active` is an optional value type tracked by @Observable.
+                // Mutating one of its fields opens `_modify` on the complete
+                // optional. Reading `active` again on the right-hand side of
+                // that mutation trips Swift's exclusivity runtime. Apply the
+                // complete event to a local value and publish it once instead.
+                guard var nextActive = active,
+                      nextActive.entryID == entry.id.rawValue,
+                      nextActive.artifactName == target.file else { continue }
+
+                nextActive.phase = Self.friendlyPhase(state)
                 switch state {
                 case .verifying:
-                    active?.overallFraction = max(
-                        active?.overallFraction ?? 0,
+                    nextActive.overallFraction = max(
+                        nextActive.overallFraction,
                         (Double(index) + 0.9) / Double(count)
                     )
                 case .finalizing:
-                    active?.overallFraction = max(
-                        active?.overallFraction ?? 0,
+                    nextActive.overallFraction = max(
+                        nextActive.overallFraction,
                         (Double(index) + 0.99) / Double(count)
                     )
                 case .completed:
-                    active?.overallFraction = Double(index + 1) / Double(count)
+                    nextActive.overallFraction = Double(index + 1) / Double(count)
                 default:
                     break
                 }
                 if let progress {
-                    active?.completedBytes = progress.completedBytes
-                    active?.totalBytes = progress.totalBytes ?? 0
+                    nextActive.completedBytes = progress.completedBytes
+                    nextActive.totalBytes = progress.totalBytes ?? 0
                     let rawFraction = progress.fractionCompleted ?? 0
                     // The integrity pass re-reads the complete file and reports
                     // bytes from zero. Reserve the last 10% for SHA verification
@@ -312,8 +321,9 @@ final class DownloadRunner {
                         artifactFraction = rawFraction * 0.9
                     }
                     let next = (Double(index) + artifactFraction) / Double(count)
-                    active?.overallFraction = max(active?.overallFraction ?? 0, next)
+                    nextActive.overallFraction = max(nextActive.overallFraction, next)
                 }
+                active = nextActive
             }
             // Coalesce a burst into at most ~8 visible updates per second.
             try? await Task.sleep(for: .milliseconds(125))

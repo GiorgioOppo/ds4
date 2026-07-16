@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import CryptoKit
-import DS4Engine
+@testable import DS4Engine
 
 /// Pure/synthetic coverage for the native model catalog and downloader. These
 /// tests never contact Hugging Face.
@@ -201,6 +201,90 @@ final class ModelDownloaderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: file) }
         let oneShot = SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
         XCTAssertEqual(try ModelDownloader.sha256Hex(of: file, chunk: 64), oneShot)
+    }
+
+    func testSHA256CapsAnOversizedRequestedChunk() throws {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ds4-sha-cap-\(UUID().uuidString).bin")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: nil))
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let handle = try FileHandle(forWritingTo: file)
+        let oneMiB = Data(repeating: 0xa5, count: 1 << 20)
+        for _ in 0..<9 { try handle.write(contentsOf: oneMiB) }
+        try handle.close()
+
+        var checkpoints: [Int64] = []
+        _ = try ModelDownloader.sha256Hex(of: file, chunk: .max) {
+            checkpoints.append($0)
+        }
+
+        XCTAssertEqual(checkpoints.last, 9 << 20)
+        var previous: Int64 = 0
+        for checkpoint in checkpoints {
+            XCTAssertLessThanOrEqual(
+                checkpoint - previous,
+                Int64(ModelDownloader.maximumSHA256ChunkBytes)
+            )
+            previous = checkpoint
+        }
+    }
+
+    func testDownloadTransportDisablesCachesAndSerializesBodyCallbacks() {
+        let configuration = HTTPRangeFileTransfer.makeSessionConfiguration()
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertNil(configuration.urlCredentialStorage)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+        XCTAssertEqual(configuration.httpMaximumConnectionsPerHost, 1)
+
+        let queue = HTTPRangeFileTransfer.makeDelegateQueue()
+        XCTAssertEqual(queue.maxConcurrentOperationCount, 1)
+        XCTAssertNotNil(queue.underlyingQueue)
+    }
+
+    func testResumeMetadataRejectsOversizedFileWithoutDecodingIt() throws {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ds4-resume-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(repeating: 0x20, count: Int(ResumeMetadata.maximumEncodedBytes) + 1)
+            .write(to: file)
+        XCTAssertNil(ResumeMetadata.load(from: file))
+    }
+
+    func testResumeMetadataStillLoadsWithinBound() throws {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ds4-resume-valid-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        ResumeMetadata(validator: "test-etag", totalBytes: 123).save(to: file)
+        let loaded = ResumeMetadata.load(from: file)
+        XCTAssertEqual(loaded?.validator, "test-etag")
+        XCTAssertEqual(loaded?.totalBytes, 123)
+    }
+
+    func testResumeMetadataDoesNotWriteOversizedValidator() {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ds4-resume-write-cap-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        ResumeMetadata(
+            validator: String(repeating: "x", count: ResumeMetadata.maximumEncodedBytes),
+            totalBytes: 123
+        ).save(to: file)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testDownloadFileDescriptorCanBypassUnifiedCache() throws {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ds4-nocache-\(UUID().uuidString).bin")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: nil))
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        XCTAssertTrue(ModelDownloader.enableUncachedIO(for: handle))
     }
 
     private func temporaryDirectory() -> URL {

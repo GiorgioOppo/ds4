@@ -19,7 +19,16 @@ esterni.
 Il downloader scrive in `<ggufDir>/<nome>.part`, riprende dall'offset presente e
 rinomina solo a stream concluso. `URLSessionDataDelegate` consegna blocchi
 `Data`: non esiste un'iterazione Swift per ciascun byte dei GGUF da centinaia di
-GB. Le notifiche di avanzamento sono limitate per non sovraccaricare la GUI.
+GB. La sessione ephemeral non usa cache HTTP, cookie o credential storage e la
+delegate queue è seriale: viene elaborato un solo blocco per volta. Le notifiche
+di avanzamento sono limitate per non sovraccaricare la GUI.
+
+I descrittori usati per scrivere il `.part` e per la verifica SHA dopo un resume
+sono marcati `F_NOCACHE`: i byte sequenziali del download non devono riempire la
+unified file cache di macOS ed espellere pesi o pagine utili del modello. La
+verifica legge al massimo 8 MiB per volta e svuota l'autorelease pool a ogni
+blocco. Anche il sidecar JSON di resume è accettato solo entro 64 KiB. Il picco
+RAM del downloader resta quindi indipendente dalla dimensione totale del GGUF.
 
 Una risposta `206` è accettata solo se `Content-Range` parte dalla dimensione
 locale. Se il server risponde `200` a una richiesta Range, il `.part` viene

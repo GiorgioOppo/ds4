@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 public enum ModelLocalFileState: Sendable, Hashable {
     case missing
@@ -209,8 +210,10 @@ public enum ModelDownloader {
         return overflow ? Int64.max : sum
     }
 
-    /// Stream a file from disk and return its lowercase-hex SHA-256. Memory use
-    /// is bounded by `chunk`, and cancellation is checked between blocks.
+    /// Stream a file from disk and return its lowercase-hex SHA-256. The caller
+    /// may request smaller blocks for tests, but blocks are capped at 8 MiB so
+    /// an accidental value cannot make verification allocate with GGUF size.
+    /// `F_NOCACHE` also keeps this full-file pass out of macOS's unified cache.
     public static func sha256Hex(
         of url: URL,
         chunk: Int = 8 << 20,
@@ -218,11 +221,37 @@ public enum ModelDownloader {
     ) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
+        _ = enableUncachedIO(for: handle)
+
+        let blockBytes = min(max(1, chunk), maximumSHA256ChunkBytes)
         var hasher = SHA256()
         var hashed: Int64 = 0
-        while let data = try handle.read(upToCount: max(1, chunk)), !data.isEmpty {
-            hasher.update(data: data)
-            hashed += Int64(data.count)
+
+        while true {
+            var blockCount = 0
+            var reachedEnd = false
+            var readError: Error?
+
+            // FileHandle is backed by Foundation/NSData. Drain temporary ObjC
+            // objects for every block instead of retaining them for a hash that
+            // can run for hours on a several-hundred-gigabyte model.
+            autoreleasepool {
+                do {
+                    guard let data = try handle.read(upToCount: blockBytes),
+                          !data.isEmpty else {
+                        reachedEnd = true
+                        return
+                    }
+                    hasher.update(data: data)
+                    blockCount = data.count
+                } catch {
+                    readError = error
+                }
+            }
+
+            if let readError { throw readError }
+            if reachedEnd { break }
+            hashed += Int64(blockCount)
             onProgress(hashed)
             try Task.checkCancellation()
         }
@@ -435,6 +464,15 @@ public enum ModelDownloader {
         ))?.volumeAvailableCapacityForImportantUsage
     }
 
+    /// Best-effort opt-out from macOS's unified file cache for long sequential
+    /// streams. Failure is non-fatal (for example on an unusual filesystem),
+    /// while callers still retain bounded application-level buffers.
+    @discardableResult
+    static func enableUncachedIO(for handle: FileHandle) -> Bool {
+        fcntl(handle.fileDescriptor, F_NOCACHE, 1) == 0
+    }
+
+    static let maximumSHA256ChunkBytes = 8 << 20
     private static let downloadGate = ModelDownloadGate()
 }
 
@@ -455,12 +493,36 @@ struct ResumeMetadata: Codable, Sendable {
     let totalBytes: Int64?
 
     static func load(from url: URL) -> ResumeMetadata? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil else {
+            return nil
+        }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        // Read one byte past the accepted maximum. Unlike a stat-then-
+        // Data(contentsOf:) sequence, this remains bounded even if another
+        // process grows the sidecar between the metadata check and the read.
+        let data: Data
+        do {
+            guard let block = try handle.read(upToCount: Int(maximumEncodedBytes) + 1) else {
+                return nil
+            }
+            data = block
+        } catch {
+            return nil
+        }
+        guard data.count <= maximumEncodedBytes else { return nil }
         return try? JSONDecoder().decode(Self.self, from: data)
     }
 
     func save(to url: URL) {
-        guard let data = try? JSONEncoder().encode(self) else { return }
+        guard let data = try? JSONEncoder().encode(self),
+              data.count <= Self.maximumEncodedBytes else { return }
         try? data.write(to: url, options: .atomic)
     }
+
+    static let maximumEncodedBytes = 64 << 10
+    static let maximumValidatorBytes = 8 << 10
 }

@@ -11,6 +11,15 @@ struct HTTPRangeTransferResult: Sendable {
 /// to disk. This avoids one Swift async iteration per byte, which is essential
 /// for GGUFs measured in hundreds of gigabytes.
 final class HTTPRangeFileTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    /// `OperationQueue.underlyingQueue` is unowned, so retain this queue for the
+    /// process lifetime. Sharing it also prevents two independent downloads
+    /// from processing large body callbacks at the same instant.
+    private static let delegateDispatchQueue = DispatchQueue(
+        label: "org.ds4.model-download.delegate",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
+
     private let request: URLRequest
     private let partialURL: URL
     private let metadataURL: URL
@@ -88,18 +97,8 @@ final class HTTPRangeFileTransfer: NSObject, URLSessionDataDelegate, @unchecked 
             return
         }
 
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.urlCache = nil
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 120
-        configuration.timeoutIntervalForResource = 60 * 60 * 24 * 30
-        configuration.waitsForConnectivity = true
-        configuration.httpMaximumConnectionsPerHost = 1
-
-        let queue = OperationQueue()
-        queue.name = "org.ds4.model-download"
-        queue.maxConcurrentOperationCount = 1
-        queue.qualityOfService = .utility
+        let configuration = Self.makeSessionConfiguration()
+        let queue = Self.makeDelegateQueue()
 
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
         let task = session.dataTask(with: request)
@@ -112,6 +111,35 @@ final class HTTPRangeFileTransfer: NSObject, URLSessionDataDelegate, @unchecked 
         } else {
             task.resume()
         }
+    }
+
+    /// Keep the transport itself memory-bounded. Ephemeral storage alone can
+    /// still create in-memory cookie/credential stores, so disable them
+    /// explicitly as GGUF requests only need the request's bearer header.
+    static func makeSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 60 * 60 * 24 * 30
+        configuration.waitsForConnectivity = true
+        configuration.httpMaximumConnectionsPerHost = 1
+        return configuration
+    }
+
+    /// A serial delegate queue guarantees that URLSession cannot pile up
+    /// multiple GGUF body blocks while the previous one is being written.
+    /// Per-work-item autorelease pools promptly drain Foundation bridge objects.
+    static func makeDelegateQueue() -> OperationQueue {
+        let queue = OperationQueue()
+        queue.name = "org.ds4.model-download"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .utility
+        queue.underlyingQueue = delegateDispatchQueue
+        return queue
     }
 
     func urlSession(
@@ -137,8 +165,11 @@ final class HTTPRangeFileTransfer: NSObject, URLSessionDataDelegate, @unchecked 
         }
 
         let etag = http.value(forHTTPHeaderField: "ETag")
-        validator = etag.flatMap { $0.hasPrefix("W/") ? nil : $0 }
+        let candidateValidator = etag.flatMap { $0.hasPrefix("W/") ? nil : $0 }
             ?? http.value(forHTTPHeaderField: "Last-Modified")
+        validator = candidateValidator.flatMap {
+            $0.utf8.count <= ResumeMetadata.maximumValidatorBytes ? $0 : nil
+        }
 
         do {
             switch http.statusCode {
@@ -356,6 +387,7 @@ final class HTTPRangeFileTransfer: NSObject, URLSessionDataDelegate, @unchecked 
             )
         }
         let handle = try FileHandle(forWritingTo: partialURL)
+        _ = ModelDownloader.enableUncachedIO(for: handle)
         if truncate {
             try handle.truncate(atOffset: 0)
             try handle.seek(toOffset: 0)
