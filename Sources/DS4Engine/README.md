@@ -19,6 +19,8 @@ DS4Metal ─┘
 
 ## Cartelle
 
+- [`Runtime`](Runtime/README.md): ispezione GGUF, selezione del backend e
+  capability effettivamente esposte a servizi e GUI.
 - [`Inference`](Inference/README.md): API e actor che possiede il decoder.
 - [`Distributed`](Distributed/README.md): protocollo, trasporto, coordinator e worker.
 - [`Tools`](Tools/README.md): function calling, strumenti integrati e MCP.
@@ -38,6 +40,8 @@ DS4Metal ─┘
 5. La persistenza non deve trattenere snapshot completi in RAM quando può
    elaborarli in streaming.
 6. Le estensioni di un tipo principale seguono `Tipo+Responsabilita.swift`.
+7. Ogni GGUF passa da `RuntimeBackendFactory` prima di tokenizer, configurazione
+   o decoder specifici; riconoscere una famiglia non significa implementarla.
 
 ## Verifica delle modifiche
 

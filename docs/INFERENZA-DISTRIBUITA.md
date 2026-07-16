@@ -2,7 +2,7 @@
 
 DwarfStar supporta due topologie distinte sullo stesso protocollo TCP nativo:
 pipeline orizzontale per intervalli di layer ed expert parallelism verticale.
-Questo documento descrive il comportamento implementato dal protocollo v10.
+Questo documento descrive il comportamento implementato dal protocollo v11.
 
 ## Quando usarla
 
@@ -42,8 +42,9 @@ backbone locale -+-> worker 2: subset esperti di tutti i layer --+-> somma
 ```
 
 Il coordinatore esegue l'intero backbone denso: embedding, route/attention, KV,
-compressori, FFN shared e output head. I 256 esperti routed di ogni layer sono
-partizionati fra i worker con mask esplicite. Per ciascun layer routed il
+compressori, FFN shared e output head. Gli esperti routed di ogni layer — 256
+per Flash o 384 per Pro — sono partizionati fra i worker con mask esplicite.
+Per ciascun layer routed il
 coordinatore invia ai soli proprietari coinvolti attivazione, id e pesi; i
 worker restituiscono una somma parziale.
 
@@ -72,8 +73,9 @@ I dettagli prestazionali sono in
 4. Il worker richiede soltanto file o suffissi mancanti.
 5. Il coordinatore invia `ASSIGN` per una slice orizzontale oppure
    `EXPERT_ASSIGN` per uno shard verticale.
-6. Il worker applica la whitelist dei knob, carica il motore assegnato e invia
-   progressi e `READY`.
+6. Il worker applica la whitelist dei knob, ispeziona la geometria del GGUF,
+   convalida la slice o la mask, carica il motore assegnato e invia progressi e
+   `READY` con 43 layer per Flash o 61 per Pro.
 7. La route diventa disponibile soltanto quando tutti i peer necessari sono
    pronti e la copertura è valida.
 
@@ -81,11 +83,16 @@ Il setup dei peer procede in parallelo. Una disconnessione durante un file
 transfer conserva il `.part`; alla riconnessione la catena di hash individua
 l'ultimo checkpoint valido e riparte da lì.
 
-## Protocollo v10
+## Protocollo v11
 
 Il framing usa magic `DS4D`, header little-endian e payload con limiti espliciti.
 La versione deve coincidere esattamente: non esiste negoziazione fra semantiche
 incompatibili.
+
+`EXPERT_ASSIGN` contiene una mask a lunghezza prefissata: 32 byte per Flash e
+48 per Pro. Il decoder rifiuta lunghezze errate, bit di padding non nulli e
+payload troncati. Un worker non assegnato annuncia zero layer; dopo `ASSIGN`,
+`READY` deve coincidere con la geometria realmente caricata.
 
 Le famiglie di messaggi sono separate per responsabilità:
 
@@ -122,6 +129,10 @@ trasferire:
 - expert bundle;
 - cache Q4 dense;
 - altri sidecar dichiarati nel manifest.
+
+Per Pro è eseguibile il GGUF Q2 completo a file singolo. Il package Pro Q4
+`Layers00-30`/`Layers31-output` può essere trasferito e scaricato, ma non è una
+route valida: l'assemblaggio multi-shard non è implementato.
 
 I chunk sono da 4 MiB. Ogni file ha SHA-256 finale e checkpoint concatenati
 ogni 256 MiB. Un file derivato viene riutilizzato soltanto se il manifest e le
@@ -175,5 +186,7 @@ esporre la porta worker su Internet. Vedere
 4. parità locale/pipeline con 32 bit;
 5. A/B 16 e 8 bit per qualità e rete;
 6. benchmark verticale solo dopo avere misurato RTT e baseline locale.
+7. per Pro, parità numerica e benchmark multi-Mac sul GGUF Q2 reale prima di
+   considerare conclusa la validazione prestazionale.
 
 Non confrontare topologie con modelli, cache o warm-up diversi.

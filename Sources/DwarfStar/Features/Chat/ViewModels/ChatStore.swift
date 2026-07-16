@@ -25,7 +25,10 @@ final class ChatStore {
     let settings: AppSettings
     var modelPath: String {
         get { settings.modelPath }
-        set { settings.modelPath = newValue }
+        set {
+            if settings.modelPath != newValue { inspectedModelDescriptor = nil }
+            settings.modelPath = newValue
+        }
     }
     var contextSize: Int {
         get { settings.contextSize }
@@ -177,8 +180,9 @@ final class ChatStore {
         }
     }
     var systemPrompt = ""
-    /// Expert slot-cache slots per layer (0 = off). Memory ≈ 6,9 MB/slot ×
-    /// 43 layer on the 2-bit model. Applied on the NEXT model load.
+    /// Expert slot-cache slots per layer (0 = off). On Flash IQ2, memory is
+    /// ≈ 6.9 MB/slot × 43 layers; Pro has 61 larger expert slabs. Applied on
+    /// the NEXT model load.
     /// DEFAULT 22: punto misurato su M1 Pro 16 GB con dense stream + pread +
     /// MLOCK + Q4 completo (A/B greedy 2026-07-13: 70% hit, 3.30 tok/s,
     /// miss/byte SSD -7,8% vs 20 senza collasso). Senza MLOCK i
@@ -498,6 +502,13 @@ final class ChatStore {
     // Tools.
     var toolsEnabled = false
     var enabledToolNames: Set<String> = Set(ToolRegistry.builtins.map { $0.spec.name })
+    /// Exact allow-list baked into the active conversation prefix. Tool picker
+    /// changes affect the next fresh chat; execution must follow what was actually
+    /// declared, not a mutable UI selection changed mid-turn.
+    var activeConversationToolNames: Set<String> = []
+    /// Trusted transitive-capability ceiling captured with the active agent.
+    /// Model arguments to subagent_run may only narrow this set.
+    var activeConversationDelegatedToolNames: Set<String> = []
     /// Compact tool declaration (just name(params)) — fewer prefill tokens. On by
     /// default for local inference.
     var compactTools = true
@@ -505,15 +516,44 @@ final class ChatStore {
     var pendingManualCalls: [ToolCall] = []
     /// Drives the manual-results sheet (set when `pendingManualCalls` is filled).
     var awaitingManualResults = false
-    var partialAutoOutputs: [ToolOutput] = []
-    /// Tool-loop bound. Illimitato su richiesta: il loop si ferma comunque quando
-    /// il contesto è pieno o l'utente preme Stop.
+    /// One slot per tool call in the model-emitted order. Automatic/error results
+    /// are filled immediately; manual results fill their recorded positions when
+    /// the sheet is submitted. Never concatenate result classes: DSML associates
+    /// consecutive `tool_result` blocks positionally with a multi-call batch.
+    var pendingOrderedToolOutputs: [ToolOutput?] = []
+    var pendingManualOutputIndices: [Int] = []
+    /// Epoch which owns the pending manual sheet. A session change/Stop invalidates
+    /// it so a late sheet action cannot resume a different conversation.
+    var pendingManualEpoch: UInt64?
+    /// Tool-loop safety budget. A local quantized model can otherwise repeat an
+    /// expensive or mutating call until the context is exhausted.
     var toolRounds = 0
-    var maxToolRounds: Int { .max }
+    let maxToolRounds = 16
+    let maxToolCallsPerRound = 8
+    /// Fingerprints from the immediately previous round: identical consecutive
+    /// calls are rejected, while a later verification read after another action
+    /// remains possible.
+    var previousToolRoundFingerprints: Set<String> = []
 
     // Live state.
     var phase: Phase = .needsModel
     var info: ModelInfo?
+    /// Metadata-only inspection of the selected GGUF. It is available before a
+    /// backend loads, so settings can hide architecture-specific controls even
+    /// for a recognized backend that is not implemented yet.
+    var inspectedModelDescriptor: RuntimeModelDescriptor?
+    var modelCapabilities: BackendCapabilities {
+        info?.capabilities ?? inspectedModelDescriptor?.capabilities ?? []
+    }
+    var supportsDeepSeekPerformanceTuning: Bool {
+        modelCapabilities.contains(.deepSeekPerformanceTuning)
+    }
+    var supportsExpertTuning: Bool {
+        modelCapabilities.contains(.expertRouting)
+    }
+    var supportsReasoning: Bool {
+        modelCapabilities.contains(.reasoning)
+    }
     var messages: [UIMessage] = []
     var input = ""
     /// Text files staged for the next message (folded into the user turn on send).
@@ -547,6 +587,10 @@ final class ChatStore {
 
     var service: InferenceService?
     var generation: Task<Void, Never>?
+    /// Monotonic ownership token for all asynchronous chat work. Every fresh user
+    /// turn, Stop, new chat, or session activation advances it. Stream/tool tasks
+    /// may mutate UI state only while the captured value still matches.
+    var conversationEpoch: UInt64 = 0
 
     /// THE single in-process engine, loaded once in Settings and SHARED by every
     /// feature (Chat, Benchmark, Server). There is never a second full engine:

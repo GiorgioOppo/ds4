@@ -93,6 +93,34 @@ struct AgentsView: View {
                         }
                     }
 
+                    if agent.toolNames.contains("subagent_run") {
+                        let delegatedCount = agent.delegatedToolNames?.count ?? 0
+                        DisclosureGroup("Delegable to sub-agents (\(delegatedCount))") {
+                            Text("Trusted upper limit: a sub-agent can receive only these tools, even if the model selects a broader role. Keep mutation tools disabled unless this agent is intended to delegate edits.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            ForEach(store.availableTools.filter {
+                                ToolRegistry.subAgentGrantable.contains($0.name)
+                            }) { tool in
+                                Toggle(isOn: Binding(
+                                    get: { agent.delegatedToolNames?.contains(tool.name) == true },
+                                    set: { on in
+                                        var names = agent.delegatedToolNames ?? []
+                                        if on {
+                                            if !names.contains(tool.name) { names.append(tool.name) }
+                                        } else {
+                                            names.removeAll { $0 == tool.name }
+                                        }
+                                        agent.delegatedToolNames = names
+                                    })) {
+                                    VStack(alignment: .leading) {
+                                        Text(tool.name).font(.body.monospaced())
+                                        Text(tool.description).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if !store.isDefaultAgent(agent.id) {
                         Button(role: .destructive) { store.deleteAgent(agent.id) } label: {
                             Label("Delete Agent", systemImage: "trash")

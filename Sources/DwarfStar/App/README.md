@@ -18,7 +18,13 @@ Application shell and shared state.
   keys and defaults.
 - **`AppEnvironment.swift`** resolves paths for development vs bundled app runs,
   computes RAM-based hardware presets (default context 4096 below 24 GB, 8192
-  below 80 GB, 32768 above), and exposes memory helpers.
+  below 80 GB, 32768 above), exposes memory helpers and owns the writable model
+  download directory `~/Library/Application Support/DwarfStar/models/`.
+
+Catalog models inside that directory are app-managed and do not need a
+security-scoped bookmark. When one is selected, the old external-model bookmark
+must not override it on the next launch. Remote model identities and support
+policy remain in `DS4Engine.DeepSeekV4ModelCatalog`, not in `AppEnvironment`.
 
 ## Change rules
 
@@ -26,5 +32,7 @@ Application shell and shared state.
 - Keep feature-specific state in that feature's controller or view model.
 - Preserve the single shared local engine and the main-actor ownership of UI
   state.
+- Keep writable downloads in Application Support; bundle Resources are
+  read-only after installation.
 - Add new sidebar destinations through `AppSection` and `RootView`, with their
   implementation under `Features/`.

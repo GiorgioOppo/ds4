@@ -27,7 +27,8 @@ extension ChatStore {
     /// Silent fallbacks here (empty question, ignored unknown role…) would waste
     /// a whole sub-agent run and leave the user staring at a garbage answer.
     private static func subAgentCallProblem(_ argumentsJSON: String,
-                                            question: String, agent: String, tools: [String]) -> String? {
+                                            question: String, agent: String, tools: [String],
+                                            allowedDelegatedTools: Set<String>) -> String? {
         guard let data = argumentsJSON.data(using: .utf8),
               (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] != nil else {
             return #"the arguments are not a JSON object; expected {"target":"<file path or project>","question":"<self-contained task>"}"#
@@ -47,8 +48,10 @@ extension ChatStore {
         if !mcpRequested.isEmpty {
             return "MCP tools cannot be granted to sub-agents: \(mcpRequested.joined(separator: ", ")); retry with built-in tools only"
         }
-        if !tools.isEmpty, !tools.contains(where: { ToolRegistry.subAgentGrantable.contains($0) }) {
-            return "none of the requested tools exist or are grantable to sub-agents; grantable tools: \(ToolRegistry.subAgentGrantable.sorted().joined(separator: ", "))"
+        let denied = tools.filter { !allowedDelegatedTools.contains($0) }
+        if !denied.isEmpty {
+            let allowed = allowedDelegatedTools.sorted().joined(separator: ", ")
+            return "requested tools exceed the parent agent's delegation scope: \(denied.joined(separator: ", ")); allowed: \(allowed.isEmpty ? "(none)" : allowed)"
         }
         return nil
     }
@@ -58,43 +61,51 @@ extension ChatStore {
         return messages.count - 1
     }
 
-    func finishIfIdle() {
+    func finishIfIdle(epoch: UInt64) {
+        guard conversationEpoch == epoch else { return }
         if pendingManualCalls.isEmpty {
+            generation = nil
             isGenerating = false
             status = ""
-            refreshContextUsage()
+            refreshContextUsage(epoch: epoch)
             persistActiveSession()        // checkpoint the completed turn
             // Il Profilo decode va nel Log motore DOPO OGNI risposta: i contatori
             // sono raccolti comunque, il report costa nulla, e "a quanto genera
             // davvero l'app e dove va il tempo" deve essere leggibile dal log
             // senza attivare niente. (profileRouteEnabled resta il gate della
             // sola scomposizione route/attn, che aggiunge sync GPU.)
-            emitDecodeProfile()
+            emitDecodeProfile(epoch: epoch)
         }
     }
 
     /// Print the last turn's prefill + decode profiles to stderr so they land in
     /// the Log motore (EngineLog captures fd 2), mirroring the demo's DIAG output.
-    private func emitDecodeProfile() {
+    private func emitDecodeProfile(epoch: UInt64) {
         guard let service else { return }
-        Task {
+        Task { [weak self] in
             let prefill = await service.prefillProfileReport()
             let report = await service.decodeProfileReport()
+            guard let self, self.conversationEpoch == epoch else { return }
             FileHandle.standardError.write(Data(("\n" + prefill + "\n\n" + report + "\n").utf8))
         }
     }
 
     /// Refresh the committed-token count (context usage) from the engine.
-    private func refreshContextUsage() {
+    private func refreshContextUsage(epoch: UInt64) {
         guard let service else { contextUsed = 0; return }
-        Task { contextUsed = await service.committedTokens() }
+        Task { [weak self] in
+            let tokens = await service.committedTokens()
+            guard let self, self.conversationEpoch == epoch else { return }
+            self.contextUsed = tokens
+        }
     }
 
     /// Drain one generation stream into the assistant message at `index`.
-    func consume(_ stream: AsyncThrowingStream<GenEvent, Error>, into index: Int) async {
+    func consume(_ stream: AsyncThrowingStream<GenEvent, Error>, into index: Int,
+                 epoch: UInt64) async {
         do {
             for try await event in stream {
-                guard index < messages.count else { break }
+                guard ownsConversationWork(epoch), index < messages.count else { return }
                 switch event {
                 case .reasoning(let r): messages[index].reasoning += r
                 case .text(let t): messages[index].text += t
@@ -120,7 +131,7 @@ extension ChatStore {
             // shows clean prose. A tool block that streamed but never parsed into a
             // call must NOT vanish silently: surface it as an explicit error row so
             // the user sees the model attempted (and botched) a tool call.
-            if index < messages.count {
+            if ownsConversationWork(epoch), index < messages.count {
                 let unparsed = messages[index].toolStreamText.trimmingCharacters(in: .whitespacesAndNewlines)
                 messages[index].toolStreamText = ""
                 messages[index].text = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
@@ -132,6 +143,7 @@ extension ChatStore {
         } catch is CancellationError {
             // User-initiated stop: keep the partial text, no error banner.
         } catch {
+            guard ownsConversationWork(epoch) else { return }
             let tail = EngineLog.shared.tail()
             if index < messages.count {
                 messages[index].text += "\n[errore: \(error)]"
@@ -144,8 +156,8 @@ extension ChatStore {
     /// manual ones, and continue the conversation. Returns true if generation
     /// continues (a continuation was spawned or we're awaiting manual input) — in
     /// which case the caller must NOT mark generation finished.
-    func handleToolCalls(assistantIndex index: Int) async -> Bool {
-        guard let service, index < messages.count else { return false }
+    func handleToolCalls(assistantIndex index: Int, epoch: UInt64) async -> Bool {
+        guard ownsConversationWork(epoch), let service, index < messages.count else { return false }
         let calls = messages[index].toolCalls
         guard !calls.isEmpty else { return false }
 
@@ -155,9 +167,39 @@ extension ChatStore {
             return false
         }
 
-        var outputs: [ToolOutput] = []
+        // Slots mirror the model's call order exactly. Mixed automatic/manual
+        // batches must not be regrouped by execution kind: DSML tool results are
+        // positional, so even denial/duplicate/budget errors retain their slot.
+        var outputSlots = [ToolOutput?](repeating: nil, count: calls.count)
         var manual: [ToolCall] = []
-        for c in calls {
+        var manualIndices: [Int] = []
+        var currentFingerprints = Set<String>()
+        let policy = ToolExecutionPolicy(allowedToolNames: activeConversationToolNames)
+        let executableCalls = calls.prefix(maxToolCallsPerRound)
+        for (callIndex, c) in executableCalls.enumerated() {
+            // Check immediately before every call, including synchronous built-ins.
+            // Stop/session changes advance the epoch, while direct task cancellation
+            // closes the interval before that main-actor invalidation is observed.
+            guard ownsConversationWork(epoch) else { return false }
+            let fingerprint = c.fingerprint
+            let firstInRound = currentFingerprints.insert(fingerprint).inserted
+            if !firstInRound || previousToolRoundFingerprints.contains(fingerprint) {
+                let content = #"{"error":"duplicate_tool_call","message":"identical consecutive tool call rejected; use the previous result or change the arguments"}"#
+                messages.append(UIMessage(role: .tool, text: "✗ \(c.name) not executed: duplicate consecutive call"))
+                outputSlots[callIndex] = ToolOutput(callId: c.id, name: c.name, content: content)
+                continue
+            }
+            // Authorization is checked before every special execution path.
+            // In particular, subagent_run is driven directly by the engine and
+            // would otherwise bypass ToolRegistry's central policy boundary.
+            if !policy.allows(c.name) {
+                let out = ToolRegistry.execute(c, policy: policy)
+                    ?? ToolOutput(callId: c.id, name: c.name,
+                                  content: #"{"error":"tool_not_allowed"}"#)
+                outputSlots[callIndex] = out
+                messages.append(UIMessage(role: .tool, text: "✗ \(c.name) not executed: not allowed for this conversation"))
+                continue
+            }
             // subagent_run runs ON the engine (it drives the decoder in an isolated
             // context): the main KV only commits this call + the returned answer.
             if c.name == "subagent_run" {
@@ -165,13 +207,16 @@ extension ChatStore {
                 // A malformed call must fail loudly BEFORE spending a sub-agent run
                 // on it: the explanatory error goes back to the model (so it can fix
                 // the call) and into the transcript (so the failure is visible).
-                if let problem = Self.subAgentCallProblem(c.argumentsJSON, question: question,
-                                                          agent: agent, tools: tools) {
+                if let problem = Self.subAgentCallProblem(
+                    c.argumentsJSON, question: question, agent: agent, tools: tools,
+                    allowedDelegatedTools: activeConversationDelegatedToolNames) {
                     messages.append(UIMessage(role: .tool, text: "✗ subagent_run not executed: \(problem)"))
-                    outputs.append(ToolOutput(callId: c.id, name: c.name,
-                                              content: "Error, sub-agent NOT run: \(problem)"))
+                    outputSlots[callIndex] = ToolOutput(
+                        callId: c.id, name: c.name,
+                        content: "Error, sub-agent NOT run: \(problem)")
                     continue
                 }
+                guard ownsConversationWork(epoch) else { return false }
                 status = "sub-agent su \(target)…"
                 // Show the run in the transcript IMMEDIATELY (a sub-agent can take
                 // minutes) and stream its internal steps into the card as they
@@ -191,9 +236,11 @@ extension ChatStore {
                 do {
                     run = try await service.runSubAgent(
                         target: target, question: question, agent: agent, tools: tools,
+                        allowedTools: activeConversationDelegatedToolNames.sorted(),
                         onStep: { [weak self] step in
                             Task { @MainActor in
-                                guard let self, placeholder < self.messages.count,
+                                guard let self, self.conversationEpoch == epoch,
+                                      placeholder < self.messages.count,
                                       self.messages[placeholder].subAgentRunning,
                                       let sa = self.messages[placeholder].subAgent else { return }
                                 self.messages[placeholder].subAgent = InferenceService.SubAgentRun(
@@ -208,43 +255,73 @@ extension ChatStore {
                     run = InferenceService.SubAgentRun(target: target, question: question,
                                                        answer: "Sub-agent error: \(error)", steps: streamedSteps())
                 }
+                // The await above yields the main actor. Stop/new chat/session switch
+                // may have replaced `messages`; never index or append after that.
+                guard ownsConversationWork(epoch) else { return false }
                 if placeholder < messages.count, messages[placeholder].subAgent != nil {
                     messages[placeholder].subAgent = run
                     messages[placeholder].subAgentRunning = false
                 } else {
                     messages.append(UIMessage(role: .tool, text: "", subAgent: run))
                 }
-                outputs.append(ToolOutput(callId: c.id, name: c.name, content: run.answer))
+                outputSlots[callIndex] = ToolOutput(callId: c.id, name: c.name, content: run.answer)
                 continue
             }
             // Built-ins run synchronously; MCP tools go async to their server
             // (a failure — server gone, timeout — comes back as an error output
             // the model can react to).
             if MCPManager.shared.isMCPTool(named: c.name) { status = "MCP: \(c.name)…" }
-            if let out = await ToolRegistry.executeAuto(c) {
-                outputs.append(out)
+            guard ownsConversationWork(epoch) else { return false }
+            if let out = await ToolRegistry.executeAuto(c, policy: policy) {
+                // MCP execution yields; even a synchronous built-in passes the
+                // cancellation guard immediately above before it is dispatched.
+                guard ownsConversationWork(epoch) else { return false }
+                outputSlots[callIndex] = out
                 messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
-                // Stop pressed during the (long) MCP await: show the result but
-                // do NOT spawn a continuation — the user asked this turn to end.
-                if Task.isCancelled { return false }
                 continue
             }
             manual.append(c)
+            manualIndices.append(callIndex)
         }
 
+        // A single malformed/degraded block must not execute an unbounded batch.
+        // Return one explicit result for every dropped call so the transcript and
+        // model remain structurally aligned.
+        if calls.count > maxToolCallsPerRound {
+            guard ownsConversationWork(epoch) else { return false }
+            for callIndex in maxToolCallsPerRound..<calls.count {
+                let c = calls[callIndex]
+                let content = #"{"error":"tool_call_batch_limit","message":"call not executed: too many calls in one round"}"#
+                outputSlots[callIndex] = ToolOutput(callId: c.id, name: c.name, content: content)
+                messages.append(UIMessage(role: .tool, text: "✗ \(c.name) not executed: per-round limit \(maxToolCallsPerRound)"))
+            }
+        }
+        guard ownsConversationWork(epoch) else { return false }
+        previousToolRoundFingerprints = currentFingerprints
+
         if !manual.isEmpty {
-            partialAutoOutputs = outputs
+            pendingOrderedToolOutputs = outputSlots
             pendingManualCalls = manual
+            pendingManualOutputIndices = manualIndices
+            pendingManualEpoch = epoch
             awaitingManualResults = true
             return true
         }
-        continueWithToolOutputs(outputs, service: service)
-        return true
+        guard outputSlots.allSatisfy({ $0 != nil }) else {
+            messages.append(UIMessage(role: .tool,
+                                      text: "✗ internal tool-result alignment error; continuation stopped"))
+            return false
+        }
+        return continueWithToolOutputs(outputSlots.compactMap { $0 }, service: service,
+                                       epoch: epoch)
     }
 
     /// Feed tool outputs back and stream the model's continuation (which may emit
     /// further tool calls — the loop repeats, bounded by maxToolRounds).
-    func continueWithToolOutputs(_ outputs: [ToolOutput], service: InferenceService) {
+    @discardableResult
+    func continueWithToolOutputs(_ outputs: [ToolOutput], service: InferenceService,
+                                 epoch: UInt64) -> Bool {
+        guard ownsConversationWork(epoch) else { return false }
         let index = appendAssistant()
         isGenerating = true
         let mode = thinkMode
@@ -252,9 +329,12 @@ extension ChatStore {
         generation = Task(priority: .userInitiated) { [weak self] in   // see send(): keep decode QoS high
             let stream = await service.provideToolResults(outputs, thinkMode: mode,
                                                           sampling: params, maxTokens: 4096)
-            await self?.consume(stream, into: index)
-            let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
-            if !continued { await MainActor.run { self?.finishIfIdle() } }
+            guard let self, self.ownsConversationWork(epoch) else { return }
+            await self.consume(stream, into: index, epoch: epoch)
+            guard self.ownsConversationWork(epoch) else { return }
+            let continued = await self.handleToolCalls(assistantIndex: index, epoch: epoch)
+            if !continued { self.finishIfIdle(epoch: epoch) }
         }
+        return true
     }
 }

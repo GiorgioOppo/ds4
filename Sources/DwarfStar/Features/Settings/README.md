@@ -7,6 +7,10 @@
   `DS4Engine.HFTokenStore` (write-only field, redacted status line; the
   downloader receives it explicitly, winning over `HF_TOKEN` env and
   `~/.cache/huggingface/token`).
+  The Model section also opens **Scarica…**, whose sheet is owned by
+  `Features/ModelManagement`: the three catalog Flash variants and the
+  single-file Pro Q2 may be selected after download, while Pro Q4 split remains
+  visibly download-only.
 - **`Views/MCPServersView.swift`** renders the MCP panel: `MCPStore` persists the
   configured MCP servers (UserDefaults, `mcpServers`-JSON import/export) and
   pushes them to `MCPManager.shared` (in `DS4Engine/Tools/MCP/`), which owns
@@ -27,6 +31,16 @@ budget, and raw-KV ring. Most defaults are RAM-aware; the current low-RAM path
 prefers streaming and pinned hot buffers over keeping every dense weight
 resident. Every setting's UserDefaults key and default value is documented in
 the root [Configuration Reference](../../../../README.md#configuration-reference).
+
+Model inspection runs without loading Metal. Benchmark and Memory controls are
+shown only when `ModelInfo`/`RuntimeModelDescriptor` advertises
+`deepSeekPerformanceTuning`; a recognized Qwen model therefore never receives
+DeepSeek-only expert, NSA, bundle or requantization settings.
+
+**Browse** is the advanced path for an external GGUF. It validates the runtime
+descriptor before updating `DS4ModelPath` and persists a security-scoped
+bookmark only for external files. A catalog model under Application Support is
+persisted as an app-managed path and clears a stale external bookmark.
 
 `Views/` owns presentation and the app-facing MCP store. Persistent keys and
 defaults must stay backward compatible; model-layout settings apply on the next

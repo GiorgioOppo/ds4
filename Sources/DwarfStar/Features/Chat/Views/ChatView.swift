@@ -8,6 +8,7 @@ struct ChatView: View {
     @State private var showChats = false
     @State private var projects: [ProjectLibrary.SavedProject] = []
     @State private var activeProjectName: String?
+    @State private var lastAutoScroll = Date.distantPast
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,10 +28,16 @@ struct ChatView: View {
     private var header: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(store.info?.name ?? "DeepSeek V4")
+                Text(store.info?.displayName
+                     ?? store.inspectedModelDescriptor?.displayName
+                     ?? "Nessun modello caricato")
                     .font(.headline)
                 if let info = store.info {
-                    Text("\(info.layers) layer · \(info.routedQuantBits)-bit · ctx \(info.contextSize) · KV ~\(kvSize(info.kvCacheBytes))")
+                    Text("\(info.architecture.rawValue) · \(info.layers) layer · \(info.quantizationSummary) · ctx \(info.contextSize) · KV ~\(kvSize(info.kvCacheBytes))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let descriptor = store.inspectedModelDescriptor {
+                    Text("\(descriptor.architecture.rawValue) · backend \(descriptor.backendAvailability.rawValue)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -46,14 +53,18 @@ struct ChatView: View {
             .pickerStyle(.menu)
             .fixedSize()
             .help("Change role: starts a new chat with the agent's system prompt and tools; the expert cache warms from that agent's usage profile.")
-            Button {
-                showTools = true
-            } label: {
-                Label(toolButtonTitle, systemImage: "wrench.and.screwdriver")
+            if store.modelCapabilities.contains(.tools) {
+                Button {
+                    showTools = true
+                } label: {
+                    Label(toolButtonTitle, systemImage: "wrench.and.screwdriver")
+                }
             }
             temperatureMenu
-            Toggle("Thinking", isOn: $store.think)
-                .toggleStyle(.switch)
+            if store.supportsReasoning {
+                Toggle("Thinking", isOn: $store.think)
+                    .toggleStyle(.switch)
+            }
             Button {
                 showChats = true
             } label: {
@@ -172,7 +183,21 @@ struct ChatView: View {
             }
             .onChange(of: store.messages.last.map { $0.reasoning.count + $0.text.count + $0.toolStreamText.count }) {
                 if let last = store.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    let now = Date()
+                    guard !store.isGenerating || now.timeIntervalSince(lastAutoScroll) >= 0.20 else {
+                        return
+                    }
+                    lastAutoScroll = now
+
+                    // Live deltas must not accumulate overlapping SwiftUI
+                    // animations. Apart from wasting main-thread time, an
+                    // animation can retain the ScrollViewProxy while this view
+                    // is being removed after a sidebar navigation.
+                    if store.isGenerating {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    } else {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
                 }
             }
         }
@@ -241,4 +266,3 @@ struct ChatView: View {
         .padding(.vertical, 10)
     }
 }
-

@@ -15,13 +15,15 @@ public enum ExpertBundleTool {
         guard !modelPath.isEmpty else { return "Nessun modello selezionato." }
         do {
             let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
-            var dims = DSV4Shape.dims
+            _ = try RuntimeBackendFactory.prepare(model: model)
+            let geometry = DSV4RuntimeGeometry(configuration: try ModelConfig(model: model))
+            var dims = geometry.dims
             let mq = GGUFWeights.detectMoEQuant(model)
             dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down
             let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
             let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
             let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
-            let bundle = ExpertBundle.openOrBuild(model: model, layers: 0..<DSV4Shape.nLayer,
+            let bundle = ExpertBundle.openOrBuild(model: model, layers: 0..<geometry.nLayers,
                                                   nExpert: dims.nExperts,
                                                   gateBytes: gateBytes, upBytes: upBytes,
                                                   downBytes: downBytes)

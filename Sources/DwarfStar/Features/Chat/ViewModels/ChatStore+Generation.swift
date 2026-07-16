@@ -5,6 +5,35 @@ import DS4Engine
 import DS4Core
 
 extension ChatStore {
+    /// Start a new asynchronous owner for the active conversation. Cancelling the
+    /// old task is not sufficient on its own: a stream or tool await may still
+    /// resume once, so every continuation also compares this epoch before touching
+    /// state or executing another tool.
+    @discardableResult
+    func beginConversationWork() -> UInt64 {
+        generation?.cancel()
+        generation = nil
+        conversationEpoch &+= 1
+        return conversationEpoch
+    }
+
+    /// Invalidate every stream/tool continuation that captured the previous epoch.
+    /// Used by Stop and by conversation identity changes.
+    @discardableResult
+    func invalidateConversationWork() -> UInt64 {
+        generation?.cancel()
+        generation = nil
+        conversationEpoch &+= 1
+        return conversationEpoch
+    }
+
+    /// `Task.isCancelled` closes the small window before an epoch-changing UI
+    /// action runs; the epoch closes the larger window after an awaited operation
+    /// resumes despite cancellation.
+    func ownsConversationWork(_ epoch: UInt64) -> Bool {
+        !Task.isCancelled && conversationEpoch == epoch
+    }
+
     var sampling: SamplingParams {
         // topK 40 (default llama.cpp): con topK=0 si campiona sull'INTERO
         // vocabolario DeepSeek (129k token, in gran parte cinesi) e sulla coda
@@ -22,6 +51,7 @@ extension ChatStore {
     func send() {
         let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let service, !isGenerating, !(typed.isEmpty && attachments.isEmpty) else { return }
+        let epoch = beginConversationWork()
         let atts = attachments
         let text = Self.composeUserText(typed: typed, attachments: atts)
         input = ""
@@ -37,6 +67,7 @@ extension ChatStore {
         let index = appendAssistant()
         isGenerating = true
         toolRounds = 0                     // fresh user turn resets the tool-loop guard
+        previousToolRoundFingerprints = []
         persistActiveSession()             // checkpoint the user turn right away
 
         let mode = thinkMode
@@ -51,25 +82,38 @@ extension ChatStore {
                 ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
                 : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
                                                 thinkMode: mode, sampling: params, maxTokens: 4096)
-            await self?.consume(stream, into: index)
-            let continued = await self?.handleToolCalls(assistantIndex: index) ?? false
-            if !continued { await MainActor.run { self?.finishIfIdle() } }
+            guard let self, self.ownsConversationWork(epoch) else { return }
+            await self.consume(stream, into: index, epoch: epoch)
+            guard self.ownsConversationWork(epoch) else { return }
+            let continued = await self.handleToolCalls(assistantIndex: index, epoch: epoch)
+            if !continued { self.finishIfIdle(epoch: epoch) }
         }
     }
 
     /// Submit manually-entered results for the pending (non-built-in) tool calls.
     func submitManualResults(_ contents: [String: String]) {
-        guard let service, !pendingManualCalls.isEmpty else { return }
-        var outputs = partialAutoOutputs
-        for c in pendingManualCalls {
+        guard let service, !pendingManualCalls.isEmpty,
+              let epoch = pendingManualEpoch,
+              conversationEpoch == epoch,
+              pendingManualCalls.count == pendingManualOutputIndices.count else { return }
+        var slots = pendingOrderedToolOutputs
+        for (c, slot) in zip(pendingManualCalls, pendingManualOutputIndices) {
+            guard slots.indices.contains(slot) else { return }
             let content = contents[c.id] ?? ""
-            outputs.append(ToolOutput(callId: c.id, name: c.name, content: content))
+            slots[slot] = ToolOutput(callId: c.id, name: c.name, content: content)
             messages.append(UIMessage(role: .tool, text: "\(c.name) → \(content)"))
         }
+        // Every call (automatic, denied, duplicate, over-budget, sub-agent, or
+        // manual) owns exactly one positional slot. Refuse a structurally partial
+        // batch instead of silently shifting later tool_result associations.
+        guard slots.allSatisfy({ $0 != nil }) else { return }
+        let outputs = slots.compactMap { $0 }
         pendingManualCalls = []
-        partialAutoOutputs = []
+        pendingOrderedToolOutputs = []
+        pendingManualOutputIndices = []
+        pendingManualEpoch = nil
         awaitingManualResults = false
-        continueWithToolOutputs(outputs, service: service)
+        continueWithToolOutputs(outputs, service: service, epoch: epoch)
     }
 
     /// Abandon the pending manual tool calls without answering them. The calls
@@ -82,10 +126,38 @@ extension ChatStore {
             messages.append(UIMessage(role: .tool, text: "✗ no results provided for: \(names)"))
         }
         pendingManualCalls = []
-        partialAutoOutputs = []
+        pendingOrderedToolOutputs = []
+        pendingManualOutputIndices = []
+        pendingManualEpoch = nil
         awaitingManualResults = false
-        finishIfIdle()
+        let epoch = invalidateConversationWork()
+        finishIfIdle(epoch: epoch)
     }
 
-    func stop() { generation?.cancel() }
+    func stop() {
+        let epoch = invalidateConversationWork()
+        if !pendingManualCalls.isEmpty {
+            let names = pendingManualCalls.map(\.name).joined(separator: ", ")
+            messages.append(UIMessage(role: .tool, text: "✗ stopped before results were provided for: \(names)"))
+        }
+        pendingManualCalls = []
+        pendingOrderedToolOutputs = []
+        pendingManualOutputIndices = []
+        pendingManualEpoch = nil
+        awaitingManualResults = false
+        // The stale task is no longer allowed to perform its old cleanup, so Stop
+        // finalizes the visible state itself. In-flight sub-agent cards remain as
+        // trace evidence but are no longer shown as running.
+        for i in messages.indices where messages[i].subAgentRunning {
+            messages[i].subAgentRunning = false
+            if let run = messages[i].subAgent, run.answer.isEmpty {
+                messages[i].subAgent = InferenceService.SubAgentRun(
+                    target: run.target, question: run.question,
+                    answer: "(sub-agent stopped)", steps: run.steps)
+            }
+        }
+        isGenerating = false
+        status = ""
+        finishIfIdle(epoch: epoch)
+    }
 }

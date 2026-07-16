@@ -5,12 +5,72 @@ import DS4Engine
 import DS4Core
 
 extension ChatStore {
+    /// Select a runnable entry found by the catalog scanner, preserving an exact
+    /// matching sandbox bookmark and neutralizing an unrelated stale one.
+    @discardableResult
+    func selectCatalogModel(path: String) -> Bool {
+        guard phase != .loading else { return false }
+        guard ModelPicker.acceptRunnableGGUF(path: path) else { return false }
+        ModelPicker.rememberCatalogGGUF(path: path)
+        commitModelSelection(path: path)
+        scanModels()
+        return true
+    }
+
+    /// Commit a path already validated and bookmarked by `ModelPicker.pickGGUF`.
+    func selectPickedModel(path: String) {
+        guard phase != .loading else { return }
+        commitModelSelection(path: path)
+        scanModels()
+    }
+
+    /// A path change cannot keep advertising the old in-memory engine as ready.
+    /// Stop in-flight work, persist the transcript and release the old backend;
+    /// Settings will then offer Load Model for the newly selected GGUF.
+    private func commitModelSelection(path: String) {
+        guard modelPath != path else { return }
+        if isGenerating { stop() }
+        if service != nil {
+            persistActiveSession()
+        }
+        service = nil
+        info = nil
+        inspectedModelDescriptor = nil
+        phase = .needsModel
+        enginePrimed = messages.isEmpty
+        contextUsed = 0
+        modelPath = path
+    }
+
+    /// Refresh architecture/capability metadata without allocating Metal or
+    /// constructing a decoder. Stale results are discarded if the user changes
+    /// the selected file while inspection is running.
+    func inspectSelectedModel(path explicitPath: String? = nil) async {
+        let path = explicitPath ?? modelPath
+        guard !path.isEmpty else {
+            inspectedModelDescriptor = nil
+            return
+        }
+        guard modelPath != path || inspectedModelDescriptor == nil else { return }
+        let descriptor = await Task.detached(priority: .utility) {
+            try? InferenceService.inspectModel(path: path)
+        }.value
+        guard modelPath == path else { return }
+        inspectedModelDescriptor = descriptor
+    }
+
     /// Under the App Sandbox, re-open the last user-picked GGUF via its persisted
     /// security-scoped bookmark (starts access). No-op if none / already restored.
     func restoreModelBookmark() {
         guard !bookmarkRestored else { return }
         bookmarkRestored = true
-        if let path = ModelPicker.restoreBookmark() { modelPath = path }
+        // Models downloaded by DwarfStar live in its Application Support
+        // container and need no security-scoped bookmark. In particular, do not
+        // let an older manual-picker bookmark overwrite a newer catalog choice.
+        if !AppEnvironment.isManagedModelPath(modelPath),
+           let path = ModelPicker.restoreBookmark() {
+            modelPath = path
+        }
         // Folder grant (sandbox): re-arm access to the model's directory so the
         // sidecar caches next to the GGUF stay readable across launches.
         ModelPicker.restoreFolderBookmark()
@@ -19,7 +79,15 @@ extension ChatStore {
     /// Scan the configured directories for GGUF files.
     func scanModels() {
         let gguf = (scriptDir as NSString).appendingPathComponent("gguf")
-        discoveredModels = ModelCatalog.scan(directories: [scriptDir, gguf])
+        var directories = [
+            AppEnvironment.modelDownloadDirectory.path,
+            scriptDir,
+            gguf,
+        ]
+        if !modelPath.isEmpty {
+            directories.append((modelPath as NSString).deletingLastPathComponent)
+        }
+        discoveredModels = ModelCatalog.scan(directories: directories)
     }
 
     /// Apply the preset recommended for the detected RAM.
@@ -31,10 +99,13 @@ extension ChatStore {
         var note = preset.summary
         if preset.prefersTwoBit {
             if let twoBit = discoveredModels.first(where: { HardwarePresets.isTwoBit($0.name) }) {
-                modelPath = twoBit.path
-                note += " Selected 2-bit model: \(twoBit.name)."
+                if selectCatalogModel(path: twoBit.path) {
+                    note += " Selected 2-bit model: \(twoBit.name)."
+                } else {
+                    note += " Il file 2-bit trovato non è caricabile dal runtime corrente."
+                }
             } else {
-                note += " No 2-bit model found: download it with the Download button (target q2-imatrix) or `./download_model.sh q2-imatrix`."
+                note += " Nessun modello 2-bit trovato: apri Scarica modelli e scegli DeepSeek V4 Flash IQ2XXS."
             }
         }
         presetNote = note
@@ -43,7 +114,10 @@ extension ChatStore {
     /// Open the model off the main thread, then flip to `.ready`.
 
     func load() {
-        guard phase != .loading else { return }
+        // Rebuilding a decoder while it is generating keeps the old model and
+        // its Metal buffers alive during the new allocation. On memory-bound
+        // Macs that can exhaust swap and make the app appear to crash.
+        guard phase != .loading, !isGenerating else { return }
         phase = .loading
         loadFraction = 0
         loadStage = ""
@@ -64,6 +138,12 @@ extension ChatStore {
         Task.detached(priority: .userInitiated) {
             defer { poller.cancel() }
             do {
+                // Populate capability-driven UI even when backend construction
+                // subsequently fails (for example a recognized Qwen GGUF).
+                let inspected = try InferenceService.inspectModel(path: path)
+                await MainActor.run {
+                    if self.modelPath == path { self.inspectedModelDescriptor = inspected }
+                }
                 // Il motore si costruisce su un thread GCD CLASSICO, non sul
                 // thread del pool cooperativo di Swift Concurrency di questo
                 // Task: il load usa DispatchQueue.concurrentPerform ovunque
@@ -112,6 +192,13 @@ extension ChatStore {
     func syncTools() {
         guard let service else { return }
         let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
+        // Before the first prompt (also when a persisted chat still needs to be
+        // re-primed), this selection is exactly what the model will see. Once a
+        // live KV exists, setTools intentionally applies only to the next chat,
+        // so keep the execution policy tied to the already-declared set.
+        if messages.isEmpty || !enginePrimed {
+            activeConversationToolNames = Set(tools.map(\.name))
+        }
         let compact = compactTools
         Task { await service.setTools(tools); await service.setCompactTools(compact) }
     }

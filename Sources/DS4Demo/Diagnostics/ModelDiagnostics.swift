@@ -20,7 +20,7 @@ func mtpReport(_ model: GGUFModel) -> String {
 /// I knob DS4_* attivi: rende ogni run auto-documentante (i confronti A/B
 /// hanno senso solo a knob uguali).
 func knobReport() -> String {
-    let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD", "DS4_PREAD_SPLIT",
+    let knobs = ["DS4_DEMO_CONTEXT", "DS4_DEMO_LIVE_CONTEXT", "DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD", "DS4_PREAD_SPLIT",
                  "DS4_EXPERT_BUNDLE", "DS4_WILLNEED_EXPERTS", "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS",
                  "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN",
                  "DS4_PREFILL_UNION", "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH",
@@ -34,4 +34,3 @@ func knobReport() -> String {
     let env = ProcessInfo.processInfo.environment
     return "  knob: " + knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
 }
-

@@ -14,6 +14,12 @@ feature.
 5. The completed transcript is mapped to `StoredMessage` and saved by
    `ChatSessionStore`.
 
+The stream and every continuation carry the turn's `conversationEpoch`. Stop,
+New Chat, or a session switch invalidates it before changing the transcript, so
+a late token/tool result cannot execute another tool, write through a reused
+message index, or clear the status of newer work. Mixed tool batches also retain
+one ordered output slot per call while waiting for any manual results.
+
 ## Reopened session
 
 Opening a chat restores UI history, not the model's in-memory KV state. On the
@@ -27,4 +33,3 @@ Chat, local Benchmark, and Server share one `InferenceService`. Chat generation
 and HTTP requests are serialized, while Benchmark may run only when Chat is
 idle because it rewrites KV state. Changes must preserve this single-engine
 ownership rule to avoid duplicate multi-gigabyte model allocations.
-

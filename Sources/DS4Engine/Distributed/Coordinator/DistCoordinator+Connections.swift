@@ -240,9 +240,11 @@ extension DistCoordinator {
                 throw DistError.badFrame
             }
             guard ready.layerStart == ls, ready.layerEnd == le, ready.hasOutput == hasOutput,
-                  ready.contextSize == config.contextSize else {
+                  ready.contextSize == config.contextSize,
+                  ready.nLayers == engine.nLayers else {
                 throw DistError.sliceGap(
-                    "worker \(p.host):\(p.port) loaded layers \(ready.layerStart)...\(ready.layerEnd) instead of \(ls)...\(le)")
+                    "worker \(p.host):\(p.port) loaded \(ready.nLayers)-layer model, "
+                    + "slice \(ready.layerStart)...\(ready.layerEnd); expected \(engine.nLayers) layers, \(ls)...\(le)")
             }
             if ready.modelName != modelName {
                 onLog("warning: worker \(p.host) loaded '\(ready.modelName)' != '\(modelName)'\n")

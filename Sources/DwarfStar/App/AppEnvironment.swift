@@ -6,7 +6,7 @@ import Foundation
 /// In dev mode we use ABSOLUTE paths into the upstream ds4 project so the app
 /// works regardless of the working directory Xcode runs it from. In a bundle
 /// we ship `metal/` (kernel sources, required), and optionally the `ds4*`
-/// helper binaries under `bin/`, `download_model.sh`, and `speed-bench/`.
+/// helper binaries under `bin/` and `speed-bench/`.
 enum AppEnvironment {
     /// Root of the upstream ds4 project on this machine. Hardcoded for the
     /// user's machine; override with the DS4_ROOT environment variable.
@@ -29,6 +29,25 @@ enum AppEnvironment {
     static var resourceDir: String {
         if isBundled, let r = Bundle.main.resourceURL?.path { return r }
         return projectRoot
+    }
+
+    /// Writable, persistent home for models acquired by the app. Bundle
+    /// Resources are read-only after installation and cannot hold downloads;
+    /// Application Support is both sandbox-safe and available on the next run.
+    static var modelDownloadDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask)[0]
+        let directory = base.appendingPathComponent("DwarfStar/models", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory,
+                                                 withIntermediateDirectories: true)
+        return directory
+    }
+
+    static func isManagedModelPath(_ path: String) -> Bool {
+        guard !path.isEmpty else { return false }
+        let root = modelDownloadDirectory.standardizedFileURL.path
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL.path
+        return candidate == root || candidate.hasPrefix(root + "/")
     }
 
     /// Directory containing the metal/*.metal kernel sources. These now live

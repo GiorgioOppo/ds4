@@ -4,6 +4,7 @@
 the refusal of unsafe symlinks.
 
 Fixtures must live under a temporary project root. Every path-handling change
-needs traversal and symlink escape tests; never let a test read or modify files
-outside its fixture directory.
-
+needs traversal, final-link and linked-parent tests, plus a positive case for
+creating genuinely missing nested directories. Tests may use a separate
+temporary directory as an escape target, but must assert that its contents were
+not read or modified.

@@ -64,7 +64,7 @@ extension InferenceService {
         let usage = decoder.usage
         var summaries: [String] = []
         if let usage, usage.totalRoutes > 0 {
-            for il in 0..<DSV4Shape.nLayer {
+            for il in 0..<runtimeGeometry.nLayers {
                 let conc = usage.concentration(layer: il, n: 8)
                 let top = usage.top(layer: il, n: 8).map(String.init).joined(separator: ",")
                 guard conc > 0 else { continue }
@@ -80,9 +80,15 @@ extension InferenceService {
     }
 
     public func modelInfo() -> ModelInfo {
-        return ModelInfo(name: modelName, layers: DSV4Shape.nLayer, nEmbd: dims.nEmbd,
-                         nVocab: dims.vocab, contextSize: contextSize, routedQuantBits: 4,
-                         kvCacheBytes: estimatedKVCacheBytes())
+        let routedBits = dims.gateQuant == .q4_K ? 4 : 2
+        return ModelInfo(name: modelName, layers: runtimeGeometry.nLayers, nEmbd: dims.nEmbd,
+                         nVocab: dims.vocab, contextSize: contextSize,
+                         routedQuantBits: routedBits,
+                         kvCacheBytes: estimatedKVCacheBytes(),
+                         architecture: backendDescriptor.architecture,
+                         displayName: backendDescriptor.displayName,
+                         quantizationSummary: "routed \(routedBits)-bit",
+                         capabilities: backendDescriptor.capabilities)
     }
 
     /// Worst-case (full-context) KV-cache RAM, matching what the decoder actually
@@ -97,9 +103,9 @@ extension InferenceService {
         let ctx = UInt64(contextSize)
         let rawRows = ringOn ? UInt64(min(dims.nSWA, contextSize)) : ctx
         var bytes: UInt64 = 0
-        for il in 0..<DSV4Shape.nLayer {
+        for il in 0..<runtimeGeometry.nLayers {
             bytes += rawRows * headDim * 4                                  // raw cache (every layer)
-            let ratio = DSV4Shape.compressRatio(layer: il)
+            let ratio = runtimeGeometry.compressRatio(layer: il)
             guard ratio > 0 else { continue }
             bytes += (ctx / UInt64(ratio)) * headDim * 4                   // NSA compressor cache
             if ratio == 4 {
@@ -115,4 +121,3 @@ extension InferenceService {
     /// Tokens currently committed to the KV (used to warn before the context fills).
     public func committedTokens() -> Int { committedIds.count }
 }
-

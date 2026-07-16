@@ -56,7 +56,11 @@ public enum Dist {
     /// route verticale (backbone denso locale + FFN routed remota). Il bump
     /// evita il mix: un worker più vecchio ignorerebbe l'expertAssign e il
     /// coordinatore resterebbe in attesa del READY per sempre.
-    public static let protocolVersion: UInt32 = 10
+    /// v11: geometria DeepSeek V4 ricavata dal GGUF (Flash 43/256 e Pro
+    /// 61/384). EXPERT ASSIGN prefissa la mask con la sua lunghezza invece di
+    /// fissarla a 32 byte; READY deve riportare il numero di layer realmente
+    /// caricato e ogni slice viene convalidata contro quel modello.
+    public static let protocolVersion: UInt32 = 11
 
     /// The env knobs an ASSIGN may carry and a worker will apply (v9). A
     /// WHITELIST on both sides: the wire must never gain the power to set
@@ -104,9 +108,9 @@ public enum Dist {
         case fileDone  = 15   // coordinator → worker: file complete (worker verifies hash)
         case fileAck   = 16   // worker → coordinator: per-file receive outcome
         case progress  = 17   // worker → coordinator: load progress text (informational)
-        // Expert parallelism (scissione VERTICALE, Fase A — vedi
-        // docs/EXPERT_PARALLELISM.md). Frame definiti e testati ma non ancora
-        // emessi da nessun percorso attivo: i loop v9 ignorano i tipi ignoti.
+        // Expert parallelism (scissione VERTICALE — vedi
+        // docs/EXPERT_PARALLELISM.md). Questi frame alimentano il percorso
+        // coordinator/backbone + worker expert-shard attivo dal protocollo v10.
         case expertAssign = 18  // coordinator → worker: shard di ESPERTI (mask), non di layer
         case expertWork   = 19  // coordinator → worker: attivazione + id/pesi del layer corrente
         case expertSum    = 20  // worker → coordinator: somma parziale pesata degli esperti
@@ -126,4 +130,3 @@ public enum Dist {
 
     public enum ResultKind: UInt32, Sendable { case hidden = 0, logits = 1, ack = 2 }
 }
-

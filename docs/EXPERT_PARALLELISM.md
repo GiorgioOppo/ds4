@@ -1,9 +1,10 @@
 # Expert parallelism — scissione verticale del modello
 
-Stato al 13 luglio 2026: **fasi A-C implementate nel protocollo v10**. Sono
+Stato al 16 luglio 2026: **fasi A-C implementate nel protocollo v11**. Sono
 attivi payload, worker expert shard, backbone del coordinatore, chat verticale e
 benchmark GUI. Restano da ampliare la validazione multi-Mac e le ottimizzazioni
-di fase D.
+di fase D. Flash usa 256 esperti; il GGUF Pro Q2 completo usa 384 esperti. Il
+package Pro Q4 in due file non è ancora eseguibile.
 
 Prerequisito operativo: RTT inferiore a circa 1 ms fra i nodi, tramite bridge
 Thunderbolt o Ethernet diretta. Con circa 41 layer routed, un RTT di 7 ms
@@ -16,8 +17,9 @@ La pipeline orizzontale assegna intervalli di layer ai worker. Gli SSD lavorano
 in sequenza lungo il percorso del token: il tempo dominante tende alla somma
 dei gather delle slice.
 
-Nella scissione verticale i 256 esperti di ogni layer sono distribuiti fra i
-worker. Quando il router sceglie sei esperti, ogni SSD legge in parallelo la
+Nella scissione verticale gli esperti di ogni layer — 256 per Flash o 384 per
+Pro — sono distribuiti fra i worker. Quando il router sceglie sei esperti, ogni
+SSD legge in parallelo la
 propria quota e restituisce una somma parziale. Sul costo dominante il tempo può
 avvicinarsi al massimo dei worker anziché alla somma, ma si paga un round-trip
 di rete per layer routed.
@@ -28,7 +30,8 @@ di rete per layer routed.
   layer, KV, compressori NSA, FFN shared, riduzioni HC e output head.
 - **Worker expert shard**: sottoinsieme degli esperti valido per tutti i layer;
   nessun KV o stato di conversazione; gather, gate/up/down e somma pesata.
-- **Protocollo v10**: `expertAssign`, `expertWork`, `expertSum`.
+- **Protocollo v11**: `expertAssign`, `expertWork`, `expertSum`, con geometria
+  e lunghezza della maschera validate dal GGUF.
 - **GUI**: toggle Vertical split, connessione, chat e benchmark dedicato.
 
 `StreamingDecoder` espone una callback `remoteExperts` usata al posto del ramo
@@ -51,9 +54,12 @@ verticale corrente.
 
 ## Assegnazione degli esperti
 
-`DistExpertAssign.expertMask` contiene 256 bit: il bit `e` indica il possesso
-dell'esperto `e`. La partizione corrente è **round-robin** (`e % workerCount`),
-con copertura esatta e senza sovrapposizioni.
+`DistExpertAssign.expertMask` è preceduta sul wire dalla propria lunghezza e
+contiene un bit per esperto: 32 byte per Flash, 48 per Pro. Il bit `e` indica il
+possesso dell'esperto `e`. La partizione corrente è **round-robin**
+(`e % workerCount`), con copertura esatta e senza sovrapposizioni. Lunghezza,
+bit di padding, copertura e unicità sono rifiutati se non coincidono con la
+geometria caricata.
 
 Il bilanciamento greedy basato sulla usage imatrix non è ancora attivo. È una
 possibile fase D: dovrebbe distribuire il carico osservato, non soltanto il
@@ -61,14 +67,15 @@ numero di esperti, mantenendo copertura esatta e configurazione riproducibile.
 
 ## Costi di comunicazione
 
-Con attivazione di 4096 elementi, ogni layer coinvolto invia e riceve circa:
+Ogni layer coinvolto invia un'attivazione e riceve una somma della larghezza
+del modello. Il traffico complessivo per worker coinvolto è circa:
 
-- 32 KiB complessivi a F32, oltre a header/id/pesi;
-- 16 KiB complessivi a F16, oltre a header/id/pesi.
+- Flash (4096 elementi): 32 KiB a F32 o 16 KiB a F16;
+- Pro (7168 elementi): 56 KiB a F32 o 28 KiB a F16;
+- in entrambi i casi si aggiungono header, id e pesi.
 
-Su 41 layer routed sono circa 1,3 MiB/token a F32 o 0,65 MiB/token a F16 per
-worker coinvolto nel caso semplice. La latenza, più della banda, è il vincolo:
-il round-trip si ripete lungo la sequenza dei layer.
+La latenza, più della banda, è il vincolo: il round-trip si ripete lungo la
+sequenza dei layer routed e cresce quindi con la geometria del profilo.
 
 Queste sono stime di ordine di grandezza. Il benchmark deve misurare traffico e
 latenza reali con lo stesso GGUF e la stessa cache della baseline locale.
@@ -86,7 +93,7 @@ validazione dedicata.
 
 ## Stato delle fasi
 
-- **A — completata**: design, frame v10, encode/decode bound-checked e test
+- **A — completata**: design, frame v11, encode/decode bound-checked e test
   round-trip.
 - **B — completata**: `ExpertShard`, assegnazione worker, mask, bundle/cache e
   serving `expertWork` -> `expertSum`.
@@ -104,6 +111,8 @@ validazione dedicata.
 5. Registrare prefill, decode a regime, byte/token, banda e cache hit-rate.
 6. Confrontare verticale, pipeline e locale con modello, prompt e warm-up
    identici.
+7. Prima di certificare Pro, eseguire parità numerica e benchmark multi-Mac sul
+   GGUF Q2 completo; i test di protocollo da soli non misurano logits o qualità.
 
 L'obiettivo progettuale resta almeno 1,5x rispetto al locale a parità di
 qualità. Se la latenza di rete o lo sbilanciamento annullano il gather parallelo,
@@ -115,6 +124,8 @@ la modalità deve restare opzionale.
 - ogni worker riceve attivazioni del modello in chiaro;
 - la perdita di un peer invalida gli esperti che possiede;
 - chat e benchmark non possono condividere simultaneamente la route;
+- i due GGUF Pro Q4 parziali non possono essere usati come worker slice: manca
+  ancora il loader multi-shard;
 - il protocollo non offre autenticazione o TLS.
 
 Usare soltanto una rete fidata. Per il quadro completo vedere
@@ -128,5 +139,5 @@ Usare soltanto una rete fidata. Per il quadro completo vedere
 - `Sources/DS4Engine/Distributed/Coordinator/DistCoordinator+VerticalChat.swift`
 - `Sources/DS4Engine/Distributed/Execution/ExpertShard.swift`
 - `Sources/DS4Engine/Distributed/Worker/Assignments/DistWorker+ExpertAssignment.swift`
-- `Sources/DS4Metal/Decode/Execution/StreamingDecoder.swift`
-- `Sources/DS4Metal/Decode/Execution/DecodeLayer.swift`
+- `Sources/DS4Metal/Backends/DeepSeekV4/Decode/Execution/StreamingDecoder.swift`
+- `Sources/DS4Metal/Backends/DeepSeekV4/Decode/Execution/DecodeLayer.swift`

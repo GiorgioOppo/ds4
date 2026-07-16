@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
+import DS4Engine
 
 /// Sandbox-friendly model selection. Under the App Sandbox the engine can only
 /// `open()` files the user explicitly granted access to, so we pick the GGUF via
@@ -25,9 +26,39 @@ enum ModelPicker {
             panel.allowedContentTypes = [gguf, .data]   // prefer .gguf, still allow any file
         }
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        _ = url.startAccessingSecurityScopedResource()
+        let scoped = url.startAccessingSecurityScopedResource()
+        do {
+            _ = try validateRunnableGGUF(at: url)
+        } catch {
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            presentValidationError(error)
+            return nil
+        }
         saveBookmark(url)
         return url.path
+    }
+
+    /// Metadata-only runtime validation used by Browse. Catalog download-only
+    /// artifacts (PRO, split shards, MTP) and future unsupported architectures
+    /// must not silently become the active local model.
+    @discardableResult
+    static func validateRunnableGGUF(at url: URL) throws -> RuntimeModelDescriptor {
+        let descriptor = try InferenceService.inspectModel(path: url.path)
+        _ = try BackendSelector.select(descriptor)
+        return descriptor
+    }
+
+    /// Validate an already-accessible path and present a concise error when it
+    /// is not runnable. This is used for legacy catalog files before selection;
+    /// it inspects metadata only and never hashes hundreds of GB.
+    static func acceptRunnableGGUF(path: String) -> Bool {
+        do {
+            _ = try validateRunnableGGUF(at: URL(fileURLWithPath: path))
+            return true
+        } catch {
+            presentValidationError(error)
+            return false
+        }
     }
 
     /// Resolve a previously-picked model, starting security-scoped access. Returns
@@ -48,6 +79,33 @@ enum ModelPicker {
             return path
         }
         return nil
+    }
+
+    /// Persist a GGUF owned by DwarfStar (for example a catalog download under
+    /// Application Support). It needs no security-scoped grant, so discard an
+    /// older external-file bookmark before saving the plain path; otherwise the
+    /// stale bookmark would win again on the next launch.
+    static func rememberManagedGGUF(path: String) {
+        guard FileManager.default.isReadableFile(atPath: path) else { return }
+        UserDefaults.standard.set(path, forKey: pathKey)
+        UserDefaults.standard.removeObject(forKey: bookmarkKey)
+    }
+
+    /// Commit a catalog selection found outside the managed directory. Preserve
+    /// the security-scoped bookmark only when it grants this exact file; an old
+    /// bookmark for another GGUF must not override the new catalog path later.
+    static func rememberCatalogGGUF(path: String) {
+        guard FileManager.default.isReadableFile(atPath: path) else { return }
+        if AppEnvironment.isManagedModelPath(path) {
+            rememberManagedGGUF(path: path)
+            return
+        }
+        if bookmarkMatches(path: path) {
+            // `saveBookmark` already persisted the matching grant. Keep it.
+            return
+        }
+        UserDefaults.standard.set(path, forKey: pathKey)
+        UserDefaults.standard.removeObject(forKey: bookmarkKey)
     }
 
     // MARK: Model-FOLDER grant (sandbox sibling caches)
@@ -110,5 +168,27 @@ enum ModelPicker {
             UserDefaults.standard.set(url.path, forKey: pathKey)
             UserDefaults.standard.removeObject(forKey: bookmarkKey)
         }
+    }
+
+    private static func bookmarkMatches(path: String) -> Bool {
+        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return false }
+        var stale = false
+        guard let bookmarked = try? URL(
+            resolvingBookmarkData: data,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        ) else { return false }
+        return bookmarked.resolvingSymlinksInPath().standardizedFileURL.path
+            == URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func presentValidationError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Modello non supportato"
+        alert.informativeText = "Il GGUF scelto non può essere eseguito dal runtime corrente.\n\n\(error)"
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }

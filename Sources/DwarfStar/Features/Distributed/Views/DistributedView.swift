@@ -21,7 +21,7 @@ struct WorkerView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
-                Section("Worker - \(controller.modelLayers)-layer model") {
+                Section("Worker - \(controller.modelLayersLabel) layer") {
                     TextField("Port", value: $controller.port, format: .number.grouping(.never))
                     Text("Layer slice, context, and cache budget are chosen by the coordinator and shown in the log when the assignment arrives.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -48,6 +48,7 @@ struct WorkerView: View {
 
             DistLogView(text: controller.workerLog, height: 140)
         }
+        .task(id: controller.modelPath) { await controller.refreshModelGeometry() }
     }
 }
 
@@ -94,7 +95,7 @@ struct CoordinatorChatView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(modelName)
                     .font(.headline)
-                Text("distributed · \(controller.modelLayers) layers on \(controller.parsePeers().count) workers · ctx \(controller.contextSize) · \(controller.forwardEnabled ? "forwarding" : "relay")")
+                Text("distributed · \(controller.modelLayersLabel) layers on \(controller.parsePeers().count) workers · ctx \(controller.contextSize) · \(controller.forwardEnabled ? "forwarding" : "relay")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -37,9 +37,13 @@ extension DistWorker {
         params.allowLocalEndpointReuse = true
         guard let port = NWEndpoint.Port(rawValue: config.port) else { throw DistError.badPort }
         let l = try NWListener(using: params, on: port)
-        l.stateUpdateHandler = { [onLog, config] state in
+        l.stateUpdateHandler = { [onLog, config, localModelLayers] state in
             switch state {
-            case .ready: onLog("worker in ascolto su :\(config.port) — in attesa dell'assegnazione dal coordinatore\n")
+            case .ready:
+                let geometry = localModelLayers > 0
+                    ? " · hint locale \(localModelLayers) layer"
+                    : " · geometria ricevuta dal coordinatore"
+                onLog("worker in ascolto su :\(config.port)\(geometry) — in attesa dell'assegnazione\n")
             case .failed(let e): onLog("worker listener failed: \(e)\n")
             default: break
             }
@@ -89,7 +93,7 @@ extension DistWorker {
                              nLayers: engine.nLayers, contextSize: a.contextSize)
         }
         return .idle(localModelName: (config.localModelPath as NSString).lastPathComponent,
-                     nLayers: DistEngine.modelLayers)
+                     nLayers: localModelLayers)
     }
 
     /// Current (engine, assignment) if ready to serve WORK; nil while idle/loading.

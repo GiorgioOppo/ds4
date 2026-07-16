@@ -28,6 +28,13 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.modelName, "local.gguf")
         XCTAssertEqual(decoded.nLayers, 43)
         XCTAssertEqual(decoded.contextSize, 0)
+
+        // A worker without a readable local hint is geometry-agnostic until
+        // ASSIGN; zero is explicit "unknown", never an implicit Flash 43.
+        let unknown = try XCTUnwrap(DistHello.decode(
+            DistHello.idle(localModelName: "", nLayers: 0).encoded()))
+        XCTAssertFalse(unknown.assigned)
+        XCTAssertEqual(unknown.nLayers, 0)
     }
 
     func testAssignRoundTrip() throws {
@@ -69,7 +76,7 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertNil(DistAssign.decode(assign.encoded().dropLast(4)))   // usage blob truncated
     }
 
-    // MARK: Expert parallelism payloads (Fase A — non ancora attivi sul filo)
+    // MARK: Expert parallelism payloads
 
     func testExpertParallelismRoundTrips() throws {
         // Assign: mask esplicita a 256 bit + knob + usage.
@@ -89,6 +96,41 @@ final class DistProtocolTests: XCTestCase {
         XCTAssertEqual(dAssign.envKnobs[0].key, "DS4_EXPERT_PREAD")
         XCTAssertEqual(dAssign.usageJSON, Data(#"{"l":1}"#.utf8))
         XCTAssertNil(DistExpertAssign.decode(assign.encoded().dropLast(1)))
+
+        // v11: Pro carries all 384 ownership bits. The mask must not be
+        // truncated/padded back to the historical Flash-only 32 bytes.
+        var proMask = Data(repeating: 0, count: 48)
+        proMask[0] = 1
+        proMask[47] = 0b1000_0000                 // esperto 383
+        let proAssign = DistExpertAssign(modelName: "ds4-pro.gguf", expertCacheSlots: 12,
+                                         useExpertBundle: false, expertMask: proMask)
+        let decodedPro = try XCTUnwrap(DistExpertAssign.decode(proAssign.encoded()))
+        XCTAssertEqual(decodedPro.expertMask, proMask)
+        XCTAssertEqual(decodedPro.expertMask.count, 48)
+
+        // The length prefix is hostile input: zero, over-cap, truncation and
+        // trailing ambiguity are all rejected instead of shifting later fields.
+        func replacingMaskLength(_ value: UInt32, in source: Data,
+                                 modelName: String) -> Data {
+            var out = source
+            let offset = 4 + modelName.utf8.count + 4 + 4
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) {
+                out.replaceSubrange(offset..<(offset + 4), with: $0)
+            }
+            return out
+        }
+        let proFrame = proAssign.encoded()
+        XCTAssertNil(DistExpertAssign.decode(
+            replacingMaskLength(0, in: proFrame, modelName: proAssign.modelName)))
+        XCTAssertNil(DistExpertAssign.decode(
+            replacingMaskLength(UInt32(DistExpertAssign.maxExpertMaskBytes + 1),
+                                in: proFrame, modelName: proAssign.modelName)))
+        XCTAssertNil(DistExpertAssign.decode(
+            replacingMaskLength(49, in: proFrame, modelName: proAssign.modelName)))
+        var withTrailingByte = proFrame
+        withTrailingByte.append(0)
+        XCTAssertNil(DistExpertAssign.decode(withTrailingByte))
 
         // Work: id posseduti + pesi + attivazione (f16), seq per il matching.
         let act = Data((0..<64).map { UInt8($0) })
@@ -246,9 +288,39 @@ final class DistProtocolTests: XCTestCase {
         let even = try DistCoordinator.partition(nLayers: 8, workers: 4)
         XCTAssertEqual(even.map { $0.start }, [0, 2, 4, 6])
         XCTAssertEqual(even.map { $0.end }, [1, 3, 5, 7])
+        // Pro: 61 layers on 4 workers -> 16 + 15 + 15 + 15.
+        let pro = try DistCoordinator.partition(nLayers: 61, workers: 4)
+        XCTAssertEqual(pro.map { $0.start }, [0, 16, 31, 46])
+        XCTAssertEqual(pro.map { $0.end }, [15, 30, 45, 60])
         // Degenerate configs fail loudly.
         XCTAssertThrowsError(try DistCoordinator.partition(nLayers: 4, workers: 5))
         XCTAssertThrowsError(try DistCoordinator.partition(nLayers: 4, workers: 0))
+    }
+
+    func testExpertPartitionCoversFlashAndProExactlyOnce() throws {
+        for (nExperts, workers) in [(256, 3), (384, 5)] {
+            let masks = DistCoordinator.partitionExperts(nExperts: nExperts, workers: workers)
+            XCTAssertEqual(masks.count, workers)
+            XCTAssertTrue(masks.allSatisfy { $0.count == (nExperts + 7) / 8 })
+            let decoded = try masks.map {
+                try XCTUnwrap(DistCoordinator.decodeExpertMask($0, nExperts: nExperts))
+            }
+            for expert in 0..<nExperts {
+                XCTAssertEqual(decoded.reduce(0) { $0 + ($1[expert] ? 1 : 0) }, 1,
+                               "expert \(expert) ownership")
+            }
+            let counts = decoded.map { $0.filter { $0 }.count }
+            XCTAssertLessThanOrEqual((counts.max() ?? 0) - (counts.min() ?? 0), 1)
+        }
+        XCTAssertEqual(DistCoordinator.partitionExperts(nExperts: 384, workers: 0), [])
+
+        let validTen = DistCoordinator.partitionExperts(nExperts: 10, workers: 1)[0]
+        XCTAssertNotNil(DistCoordinator.decodeExpertMask(validTen, nExperts: 10))
+        var dirtyPadding = validTen
+        dirtyPadding[1] |= 0b1000_0000
+        XCTAssertNil(DistCoordinator.decodeExpertMask(dirtyPadding, nExperts: 10))
+        XCTAssertNil(DistCoordinator.decodeExpertMask(Data(repeating: 0, count: 32),
+                                                       nExperts: 384))
     }
 
     // MARK: Worker-side gguf resolution

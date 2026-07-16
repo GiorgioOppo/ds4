@@ -19,6 +19,7 @@ struct SettingsView: View {
     @State private var hfTokenField = ""
     @State private var hfRevealToken = false
     @State private var hfStatus: String?
+    @State private var showModelDownloads = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,6 +46,19 @@ struct SettingsView: View {
             if settings.mode == .distributed {
                 DistLogView(text: dist.coordLog, height: 120)
             }
+        }
+        .task(id: "\(settings.mode.rawValue)|\(settings.modelPath)") {
+            await store.inspectSelectedModel(path: settings.modelPath)
+            // The distributed controller performs its own GGUF metadata pass.
+            // Local mode already gets the same descriptor from ChatStore, so a
+            // second parse here only adds I/O and temporary allocations while
+            // the inference engine may be under memory pressure.
+            if settings.mode == .distributed {
+                await dist.refreshModelGeometry()
+            }
+        }
+        .sheet(isPresented: $showModelDownloads) {
+            DownloadView(store: store)
         }
     }
 
@@ -111,8 +125,21 @@ struct SettingsView: View {
         Group {
             Section("Model") {
                 HStack {
-                    TextField("GGUF model", text: $settings.modelPath)
-                    Button("Browse") { if let p = ModelPicker.pickGGUF() { settings.modelPath = p } }
+                    Text(settings.modelPath.isEmpty ? "Nessun GGUF selezionato" : settings.modelPath)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                    Button("Browse") {
+                        if let path = ModelPicker.pickGGUF() { store.selectPickedModel(path: path) }
+                    }
+                    .disabled(store.phase == .loading)
+                    Button {
+                        showModelDownloads = true
+                    } label: {
+                        Label("Scarica…", systemImage: "arrow.down.circle")
+                    }
+                    .disabled(store.phase == .loading)
                 }
                 Button("Grant Model Folder Access…") {
                     _ = ModelPicker.pickModelFolder(near: settings.modelPath)
@@ -126,20 +153,21 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
-            Section("Benchmark") {
+            if store.supportsDeepSeekPerformanceTuning {
+                Section("Benchmark DeepSeek V4") {
                 HStack(spacing: 8) {
                     Button(store.benchRunning ? "Benchmark in corso…" : "Rapido (~3 min)") {
                         store.runSettingsBenchmark(quick: true)
                     }
-                    .disabled(store.benchRunning || store.phase != .ready)
+                    .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
                     Button("Completo (~15 min)") {
                         store.runSettingsBenchmark(quick: false)
                     }
-                    .disabled(store.benchRunning || store.phase != .ready)
+                    .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
                     Button("Auto-tune macchina (~15-25 min)") {
                         store.runAutoTune()
                     }
-                    .disabled(store.benchRunning || store.phase != .ready)
+                    .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
                     if store.benchRunning { ProgressView().controlSize(.small) }
                 }
                 Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (192/256). Completo: anche chunk (512/1024) e route batch (16/32/64/128); quest’ultimo riduce i round-trip CPU↔GPU senza cambiare la numerica. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
@@ -167,7 +195,7 @@ struct SettingsView: View {
                                       "MetalIO \(store.metalIOEnabled ? "on" : "off")")
                     .font(.caption)
             }
-            Section("Memory") {
+                Section("Memory · DeepSeek V4") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
                     Text("Resets performance controls to the measured M1 Pro 16 GB preset (2026-07-13): slots 20, full Q4, prefill 256/512/32, pread + dense stream + mlock + bundle + MetalIO ON, dense-ahead 2, look-ahead 0, NSG 4, ring OFF. MetalIO falls back automatically if slower. Applies on the next model load.")
@@ -176,7 +204,7 @@ struct SettingsView: View {
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
                 if store.expertCacheSlots > 20 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                    Label("The measured 16 GB preset uses 20 slots. Each extra slot costs ~0.3 GB across 43 layers; excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
+                    Label("The measured 16 GB Flash preset uses 20 slots. On Flash each extra slot costs ~0.3 GB across 43 layers; Pro has 61 layers and larger experts, so do not reuse this RAM estimate. Excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
@@ -250,6 +278,16 @@ struct SettingsView: View {
                 }
                 Text("Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
+                }
+            } else if let descriptor = store.inspectedModelDescriptor {
+                Section("Backend settings") {
+                    Label("\(descriptor.displayName) · \(descriptor.architecture.rawValue)",
+                          systemImage: "cpu")
+                    Text(descriptor.backendAvailability == .recognizedButNotImplemented
+                         ? "Modello riconosciuto, ma il backend non è ancora implementato. I controlli DeepSeek-specifici restano nascosti."
+                         : "Questa architettura non espone impostazioni runtime specifiche in questa build.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -269,6 +307,10 @@ struct SettingsView: View {
                     }
                     Spacer()
                     Button("Reload") { store.load() }
+                        .disabled(store.isGenerating)
+                        .help(store.isGenerating
+                              ? "Stop generation before reloading the model."
+                              : "Reload the model with the current settings.")
                 }
             case .loading:
                 VStack(alignment: .leading, spacing: 4) {
@@ -343,7 +385,7 @@ struct SettingsView: View {
         } else {
             Section("Cluster") {
                 HStack {
-                    Label("Connected · \(dist.parsePeers().count) workers · \(dist.modelLayers) layers",
+                    Label("Connected · \(dist.parsePeers().count) workers · \(dist.modelLayersLabel) layers",
                           systemImage: "link")
                         .foregroundStyle(.green)
                     Spacer()

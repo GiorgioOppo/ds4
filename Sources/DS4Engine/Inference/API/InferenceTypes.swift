@@ -44,8 +44,32 @@ public struct ModelInfo: Sendable {
     public let nEmbd: Int
     public let nVocab: Int
     public let contextSize: Int
+    /// Legacy DeepSeek field retained for source compatibility. New UI should
+    /// prefer `quantizationSummary`, since dense backends need not route experts.
     public let routedQuantBits: Int
     public let kvCacheBytes: UInt64
+    public let architecture: ModelArchitectureID
+    public let displayName: String
+    public let quantizationSummary: String
+    public let capabilities: BackendCapabilities
+
+    public init(name: String, layers: Int, nEmbd: Int, nVocab: Int,
+                contextSize: Int, routedQuantBits: Int, kvCacheBytes: UInt64,
+                architecture: ModelArchitectureID = ModelArchitectureID(""),
+                displayName: String? = nil, quantizationSummary: String? = nil,
+                capabilities: BackendCapabilities = []) {
+        self.name = name
+        self.layers = layers
+        self.nEmbd = nEmbd
+        self.nVocab = nVocab
+        self.contextSize = contextSize
+        self.routedQuantBits = routedQuantBits
+        self.kvCacheBytes = kvCacheBytes
+        self.architecture = architecture
+        self.displayName = displayName ?? name
+        self.quantizationSummary = quantizationSummary ?? "routed \(routedQuantBits)-bit"
+        self.capabilities = capabilities
+    }
 }
 
 public enum GenEvent: Sendable {
@@ -55,4 +79,3 @@ public enum GenEvent: Sendable {
     case toolCall([ToolCall])   // the model requested one or more tools; generation paused
     case progress(String)       // prefill/decode status (e.g. "prefill 3/11" or "12 tok · 1.4 tok/s")
 }
-

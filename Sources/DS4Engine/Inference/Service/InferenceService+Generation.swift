@@ -304,15 +304,22 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         var calls: [ToolCall] = []
         if inTool {
             let block = String(bytes: toolBytes, encoding: .utf8) ?? ""
-            calls = ToolCallParser.parse(visible + block, markup: markup).calls
-            if calls.isEmpty {
+            do {
+                calls = try ToolCallParser.parseStrict(visible + block, markup: markup).calls
+            } catch {
                 // The model opened a DSML block we could not parse: surface it
-                // instead of dropping it silently (the user can see what it tried).
-                continuation.yield(.text("\n[chiamata tool non interpretabile]\n" + block))
+                // instead of dropping it silently. Strict parsing is deliberately
+                // all-or-nothing: a truncated write/edit call is never executed.
+                continuation.yield(.text("\n[chiamata tool incompleta o non valida: non eseguita]\n" + block))
             }
         } else {
-            let c = ToolCallParser.parse(visible, markup: markup).calls
-            if !c.isEmpty { calls = c }
+            // Some quantized models spell DSML with ordinary BPE pieces instead
+            // of emitting the dedicated token. A complete block remains valid,
+            // but recovery/partial parsing is never an execution boundary.
+            if let parsed = try? ToolCallParser.parseStrict(visible, markup: markup),
+               !parsed.calls.isEmpty {
+                calls = parsed.calls
+            }
         }
         if !calls.isEmpty { continuation.yield(.toolCall(calls)) }
         kvDirty = false                         // clean completion: KV matches committedIds
@@ -348,4 +355,3 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         continuation.yield(.progress(""))
     }
 }
-

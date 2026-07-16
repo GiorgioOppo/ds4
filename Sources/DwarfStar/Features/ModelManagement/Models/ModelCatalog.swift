@@ -1,4 +1,5 @@
 import Foundation
+import DS4Engine
 
 /// A GGUF file discovered on disk.
 struct DiscoveredModel: Identifiable, Hashable {
@@ -12,17 +13,17 @@ struct DiscoveredModel: Identifiable, Hashable {
     }
 }
 
-/// A `download_model.sh` target the user can fetch.
-struct DownloadTarget: Identifiable, Hashable {
-    let id: String      // the argument passed to download_model.sh
-    let title: String
-    let detail: String
-}
-
 enum ModelCatalog {
-    /// Scan the given directories for *.gguf files (skips partial *.part).
+    /// Scan the given directories for runnable catalog models. Custom GGUFs
+    /// remain available through Browse, but optional components, PRO downloads,
+    /// split shards and future unsupported architectures never appear as a
+    /// one-click load choice.
     static func scan(directories: [String]) -> [DiscoveredModel] {
         let fm = FileManager.default
+        let supportedFiles = Set(
+            DeepSeekV4ModelCatalog.selectableEntries
+                .compactMap { $0.primaryArtifact?.file }
+        )
         var seen = Set<String>()
         var out: [DiscoveredModel] = []
         for dir in directories {
@@ -32,20 +33,21 @@ enum ModelCatalog {
                 let resolved = (try? fm.destinationOfSymbolicLink(atPath: full)).map {
                     ($0 as NSString).isAbsolutePath ? $0 : (dir as NSString).appendingPathComponent($0)
                 } ?? full
+                let resolvedName = (resolved as NSString).lastPathComponent
+                guard supportedFiles.contains(item) || supportedFiles.contains(resolvedName) else {
+                    continue
+                }
+                let values = try? URL(fileURLWithPath: resolved).resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey]
+                )
+                guard values?.isRegularFile == true, let bytes = values?.fileSize, bytes > 0 else {
+                    continue
+                }
                 guard seen.insert(resolved).inserted else { continue }
-                let size = ((try? fm.attributesOfItem(atPath: full))?[.size] as? NSNumber)?.int64Value ?? 0
-                out.append(DiscoveredModel(path: full, name: item, sizeBytes: size))
+                let displayName = supportedFiles.contains(item) ? item : resolvedName
+                out.append(DiscoveredModel(path: full, name: displayName, sizeBytes: Int64(bytes)))
             }
         }
         return out.sorted { $0.name < $1.name }
     }
-
-    /// The download targets exposed by download_model.sh (see README).
-    static let downloadTargets: [DownloadTarget] = [
-        .init(id: "q2-imatrix", title: "Flash q2 (imatrix)", detail: "96/128 GB RAM"),
-        .init(id: "q2-q4-imatrix", title: "Flash q2 + last 6 layers q4", detail: "96/128 GB RAM"),
-        .init(id: "q4-imatrix", title: "Flash q4 (imatrix)", detail: ">= 256 GB RAM"),
-        .init(id: "pro-q2-imatrix", title: "PRO q2 (imatrix)", detail: "512 GB / 128 GB streaming"),
-        .init(id: "mtp", title: "MTP speculative (Flash)", detail: "optional, use with --mtp"),
-    ]
 }

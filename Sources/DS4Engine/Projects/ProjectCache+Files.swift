@@ -6,12 +6,7 @@ extension ProjectCache {
     /// Validate a relative path against the project root: inside it, no traversal.
     /// Unlike `writableURL`, no text-extension restriction (raw files allowed).
     private func rootRelativeURL(_ relPath: String) -> URL? {
-        guard let root = rootURL() else { return nil }
-        guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
-        let url = root.appendingPathComponent(relPath).standardizedFileURL
-        guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
-        guard Self.withinRoot(url, root: root) else { return nil }
-        return url
+        confinedProjectURL(for: relPath)
     }
 
     /// Read ANY file inside the project root (not just the index), decoded as text.
@@ -91,7 +86,12 @@ extension ProjectCache {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
-            try content.write(to: url, atomically: true, encoding: .utf8)
+            // Revalidate after directory creation: every formerly missing
+            // component now exists and must still be a real directory.
+            guard let checkedURL = rootRelativeURL(relPath) else {
+                return "No project imported or invalid path: '\(relPath)'."
+            }
+            try content.write(to: checkedURL, atomically: true, encoding: .utf8)
         } catch {
             return "Write failed: \(error.localizedDescription)"
         }
@@ -132,7 +132,10 @@ extension ProjectCache {
         guard updated.utf8.count <= Self.maxFileBytes else {
             return "Resulting file too large (max \(Self.maxFileBytes / 1024) KB)."
         }
-        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        guard let checkedURL = rootRelativeURL(relPath) else {
+            return "No project imported or invalid path: '\(relPath)'."
+        }
+        do { try updated.write(to: checkedURL, atomically: true, encoding: .utf8) }
         catch { return "Write failed: \(error.localizedDescription)" }
         if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
         return "Added \(newLines.count) lines to '\(relPath)' \(requested > n ? "at the end" : "before line \(at)")."
@@ -165,7 +168,10 @@ extension ProjectCache {
         guard updated.utf8.count <= Self.maxFileBytes else {
             return "Resulting file too large (max \(Self.maxFileBytes / 1024) KB)."
         }
-        do { try updated.write(to: url, atomically: true, encoding: .utf8) }
+        guard let checkedURL = rootRelativeURL(relPath) else {
+            return "No project imported or invalid path: '\(relPath)'."
+        }
+        do { try updated.write(to: checkedURL, atomically: true, encoding: .utf8) }
         catch { return "Write failed: \(error.localizedDescription)" }
         if Self.textExtensions.contains(url.pathExtension.lowercased()) { upsertIndex(relPath, content: updated) }
         return "Modified lines \(from)-\(to) of '\(relPath)': \(removed) removed -> \(newLines.count) inserted."
@@ -185,7 +191,10 @@ extension ProjectCache {
         guard !isDir.boolValue else {
             return "'\(relPath)' is a directory: only single files can be deleted."
         }
-        do { try FileManager.default.removeItem(at: url) }
+        guard let checkedURL = rootRelativeURL(relPath) else {
+            return "No project imported or invalid path: '\(relPath)'."
+        }
+        do { try FileManager.default.removeItem(at: checkedURL) }
         catch { return "Delete failed: \(error.localizedDescription)" }
         lock.lock()
         files.removeAll { $0 == relPath }

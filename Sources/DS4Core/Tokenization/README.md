@@ -1,26 +1,36 @@
 # Tokenization
 
-Tokenizer byte-level BPE compatibile con il vocabolario e il pre-tokenizer
-JoyAI/DeepSeek contenuti nel GGUF.
+Contratto comune e implementazioni di tokenizzazione specifiche dei backend.
 
-## File principali
+## Struttura
 
-- [`Tokenizer.swift`](Tokenizer.swift): carica vocaboli e merge, riconosce token
-  di controllo, tokenizza testo o chat renderizzata e detokenizza gli id.
-- [`ByteLevel.swift`](ByteLevel.swift): codifica byte-level e decodifica UTF-8
-  usate internamente dal BPE.
-- [`ThinkMode.swift`](ThinkMode.swift): scelta tipizzata della modalità reasoning.
+- [`API/`](API/README.md): superficie minima `TokenizerProtocol`.
+- [`Common/`](Common/README.md): primitive byte-level riutilizzabili.
+- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): BPE JoyAI/DeepSeek,
+  token speciali e reasoning; conserva l'alias storico `Tokenizer`.
+- [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione, senza
+  implementazione fittizia.
 
 ## Flusso
 
-`Tokenizer` legge le tabelle tramite [`GGUFModel`](../Formats/GGUF/README.md).
+`DeepSeekV4Tokenizer` legge le tabelle tramite
+[`GGUFModel`](../Formats/GGUF/README.md).
 Il testo semplice attraversa pre-tokenizzazione e merge BPE; una chat già resa
 riconosce prima i token speciali indicizzati per byte iniziale. Gli id generati
 alimentano prefill e decode; gli id in uscita vengono ricomposti in byte/testo.
 
+`neutralizeSpecialTokenLiterals(in:)` contiene i confini del prompt: spezza le
+sequenze letterali che il modello classifica come token di controllo quando
+provengono da dati non fidati. Va applicato ai singoli campi prima del rendering
+(system, user, storico, risultati e schemi tool), mai alla chat già renderizzata:
+BOS, ruoli e DSML aggiunti dal renderer devono restare token atomici.
+La variante `inJSON:` decodifica e visita ricorsivamente chiavi e valori prima
+di riserializzare: anche un delimitatore occultato con escape `\uXXXX` viene
+neutralizzato prima che il renderer degli schemi o degli argomenti lo espanda.
+
 ## Regole di modifica
 
-La corrispondenza byte-per-byte col tokenizer del modello è obbligatoria.
+La corrispondenza byte-per-byte col tokenizer selezionato è obbligatoria.
 Preservare longest-match dei token speciali e fallback sui singoli byte; testare
 Unicode, CJK, delimitatori DSML e input malformati. Evitare allocazioni nel ciclo
 caldo senza misurarne l'impatto sul prefill.

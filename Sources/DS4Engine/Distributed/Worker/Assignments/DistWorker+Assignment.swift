@@ -12,9 +12,9 @@ extension DistWorker {
             return
         }
         guard assign.layerStart >= 0, assign.layerStart <= assign.layerEnd,
-              assign.layerEnd < DistEngine.modelLayers, assign.contextSize > 0 else {
+              assign.contextSize > 0 else {
             let msg = "invalid ASSIGN: layers \(assign.layerStart)...\(assign.layerEnd) "
-                + "(model has \(DistEngine.modelLayers)), context \(assign.contextSize)"
+                + "and context \(assign.contextSize)"
             onLog(msg + "\n")
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
@@ -29,6 +29,25 @@ extension DistWorker {
                                          localHint: config.localModelPath) else {
             let msg = "gguf '\(assign.modelName)' not available on this worker "
                 + "(not offered/transferred, and no hash-matching local file)"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
+            return
+        }
+        // Validate the slice against the model that actually won resolution
+        // (transferred/hash-matched/local), before allocating Metal or KV. A
+        // worker may have a Flash local hint while the coordinator assigns Pro.
+        let modelLayout: (nLayers: Int, nExperts: Int)
+        do {
+            modelLayout = try DistEngine.inspectLayout(modelPath: resolved)
+        } catch {
+            let msg = "cannot inspect assigned GGUF '\(assign.modelName)': \(error)"
+            onLog(msg + "\n")
+            try await conn.sendFrame(.error, Data(msg.utf8))
+            return
+        }
+        guard assign.layerEnd < modelLayout.nLayers else {
+            let msg = "invalid ASSIGN: layers \(assign.layerStart)...\(assign.layerEnd) "
+                + "outside resolved \(modelLayout.nLayers)-layer model"
             onLog(msg + "\n")
             try await conn.sendFrame(.error, Data(msg.utf8))
             return
@@ -112,6 +131,7 @@ extension DistWorker {
 
         onLog("assegnazione: \(assign.modelName) · layer \(wanted.layerStart)...\(wanted.layerEnd)"
               + (wanted.hasOutput ? " +output" : "") + " · ctx \(wanted.contextSize)"
+              + " · modello \(modelLayout.nLayers) layer/\(modelLayout.nExperts) esperti"
               + (wanted.expertCacheSlots > 0 ? " · \(wanted.expertCacheSlots) slot cache" : "")
               + " — carico il motore…\n")
         let t0 = Date()

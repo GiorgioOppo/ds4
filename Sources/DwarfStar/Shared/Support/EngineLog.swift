@@ -10,7 +10,14 @@ import Darwin
 final class EngineLog {
     static let shared = EngineLog()
 
+    /// The console is diagnostic context, not an archival log. Keeping it
+    /// bounded matters when DS4_DIAG emits continuously during a long decode.
+    private static let maximumCharacters = 2 * 1_024 * 1_024
+    private static let retainedCharactersAfterTrim = 3 * maximumCharacters / 4
+
     private(set) var text = ""
+    @ObservationIgnored private var pendingText = ""
+    @ObservationIgnored private var flushTask: Task<Void, Never>?
     private var installed = false
     private var originalStderr: Int32 = -1
     /// Holds the redirect pipe and the file handles for the lifetime of the
@@ -21,7 +28,30 @@ final class EngineLog {
 
     /// Tail of the captured log, useful to attach to a surfaced error.
     func tail(_ maxChars: Int = 1200) -> String {
-        text.count <= maxChars ? text : String(text.suffix(maxChars))
+        flushPendingText()
+        return text.count <= maxChars ? text : String(text.suffix(maxChars))
+    }
+
+    /// Coalesce stderr publications so the Diagnostics view is not invalidated
+    /// for every pipe fragment while inference is streaming.
+    private func enqueue(_ chunk: String) {
+        pendingText += chunk
+        guard flushTask == nil else { return }
+        flushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard let self else { return }
+            self.flushTask = nil
+            self.flushPendingText()
+        }
+    }
+
+    private func flushPendingText() {
+        guard !pendingText.isEmpty else { return }
+        text += pendingText
+        pendingText.removeAll(keepingCapacity: true)
+        guard text.count > Self.maximumCharacters else { return }
+        text = "[earlier engine log omitted]\n"
+            + String(text.suffix(Self.retainedCharactersAfterTrim))
     }
 
     /// Redirect fd 2 (stderr) to a pipe we drain. Call once at launch.
@@ -50,7 +80,7 @@ final class EngineLog {
                 if let base = raw.baseAddress { _ = write(original, base, data.count) }
             }
             if let s = String(data: data, encoding: .utf8) {
-                Task { @MainActor in EngineLog.shared.text += s }
+                Task { @MainActor in EngineLog.shared.enqueue(s) }
             }
         }
     }

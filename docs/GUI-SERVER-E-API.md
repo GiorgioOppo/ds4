@@ -13,10 +13,10 @@ globali e navigazione. Il comportamento è organizzato sotto
 | Feature | Responsabilità |
 |---|---|
 | `Chat` | sessioni, rendering, allegati, tool loop e generazione |
-| `Settings` | modello, memoria, prestazioni, MCP e configurazione distribuita |
+| `Settings` | modello, ispezione architettura, controlli per capability, MCP e distribuzione |
 | `ModelManagement` | catalogo e download dei GGUF |
 | `Project` | selezione e ispezione del progetto attivo |
-| `Tuning` | cache esperti, profili e auto-tune |
+| `Tuning` | cache esperti e profili soltanto per backend con expert routing |
 | `Server` | listener HTTP e adattatori OpenAI/Anthropic |
 | `Distributed` | coordinator, worker e benchmark verticale |
 | `Benchmark` | throughput del motore condiviso |
@@ -55,6 +55,69 @@ stato osservabile e inizializzazione; le estensioni separano:
 Il view model converte gli eventi del servizio in modelli di presentazione. Non
 implementa tokenizer, sampler o parsing wire. Le viste non devono chiamare
 direttamente il backend Metal.
+
+Prima del load, `ChatStore` usa l'ispezione metadata-only di
+`InferenceService` per ottenere architettura e capacità senza allocare Metal.
+Settings, Chat e Tuning mostrano quindi solo le funzioni dichiarate dal backend:
+un Qwen riconosciuto ma non implementato conserva percorso e contesto, ma non
+riceve controlli DeepSeek per cache esperti, NSA, Q4, bundle o MetalIO.
+
+## Download e selezione dei modelli
+
+Il pulsante **Scarica…** di Settings apre `DownloadView`. La vista non possiede
+una copia dei nomi remoti: renderizza `DeepSeekV4ModelCatalog.entries`, definito
+in `DS4Engine`, e usa `DownloadRunner` soltanto come adattatore `@MainActor` fra
+eventi del downloader e stato SwiftUI.
+
+Il catalogo principale presenta cinque scelte logiche:
+
+| Edizione | Varianti | Download | Selezione/esecuzione |
+|---|---|---:|---:|
+| DeepSeek V4 Flash | Q2, mixed Q2/Q4, Q4 | sì | sì |
+| DeepSeek V4 Pro | Q2 singolo, Q4 split a due shard | sì | no |
+
+La GUI espone per ogni voce dimensione indicativa, stato locale, spazio libero,
+progresso aggregato e disponibilità del runtime. Una voce Flash completa può
+essere selezionata; al termine del download diventa il modello attivo e la
+scelta persiste senza security-scoped bookmark, perché il file appartiene al
+container dell'app. Una voce Pro resta `downloadOnly`: il pulsante di selezione
+non compare e il download non cambia il modello attivo. MTP è un accessorio e
+non appare nel catalogo principale.
+
+### Percorsi e riuso
+
+La destinazione scrivibile è:
+
+```text
+~/Library/Application Support/DwarfStar/models/
+```
+
+Prima della rete, il runner cerca il filename esatto del catalogo nella
+destinazione, nella root di sviluppo e nella sua sottocartella `gguf/`, oltre
+alla directory del modello attualmente configurato. Un file finale regolare e
+non vuoto viene riusato in posizione e non viene scaricato di nuovo. Le scansioni
+automatiche del menu modelli includono solo le tre varianti Flash dichiarate
+selezionabili dal catalogo.
+
+Un trasferimento incompleto resta come `<nome>.part`; **Riprendi** usa HTTP
+Range. La UI permette di annullare e conserva il parziale. Il downloader
+controlla lo spazio, valida la dimensione restituita dal server, verifica il
+digest SHA-256 fissato nel catalogo e pubblica il filename finale soltanto dopo
+la verifica.
+
+### Browse manuale
+
+**Browse** resta il percorso avanzato per GGUF esterni. `ModelPicker` acquisisce
+l'accesso security-scoped, esegue `InferenceService.inspectModel` e passa il
+descrittore a `BackendSelector` prima di salvare la scelta. Se il profilo non è
+eseguibile dalla build corrente, mostra un errore e conserva il modello attivo
+precedente. Il bookmark viene usato solo per file esterni; scegliere un modello
+gestito dall'app elimina un eventuale vecchio bookmark, evitando che torni a
+prevalere al riavvio.
+
+Il token Hugging Face opzionale si configura in Settings, vive nel Keychain e
+viene passato esplicitamente al downloader. Il pannello mostra soltanto la fonte
+attiva o la forma mascherata, mai il segreto completo.
 
 ## Server locale
 
@@ -143,6 +206,10 @@ di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 
 - `Sources/DwarfStar/App/AppEnvironment.swift`
 - `Sources/DwarfStar/Features/Chat/ViewModels/ChatStore.swift`
+- `Sources/DwarfStar/Features/ModelManagement/Views/DownloadView.swift`
+- `Sources/DwarfStar/Features/ModelManagement/Services/DownloadRunner.swift`
+- `Sources/DS4Engine/ModelManagement/Catalog/ModelCatalog.swift`
+- `Sources/DS4Engine/ModelManagement/Download/ModelDownloader.swift`
 - `Sources/DwarfStar/Features/Server/Services/LocalServer.swift`
 - `Sources/DwarfStar/Features/Server/Concurrency/RequestGate.swift`
 - `Sources/DS4Engine/Inference/Service/InferenceService.swift`

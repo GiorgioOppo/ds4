@@ -33,13 +33,13 @@ struct ModelLoadView: View {
         Form {
             Section {
                 if store.discoveredModels.isEmpty {
-                    Text("No GGUF found in \(store.scriptDir) or \(store.scriptDir)/gguf.")
+                    Text("Nessun modello DeepSeek V4 Flash supportato trovato. Puoi scaricarne uno oppure scegliere manualmente un GGUF avanzato.")
                         .foregroundStyle(.secondary)
                         .font(.callout)
                 } else {
                     ForEach(store.discoveredModels) { model in
                         Button {
-                            store.modelPath = model.path
+                            store.selectCatalogModel(path: model.path)
                         } label: {
                             HStack {
                                 Image(systemName: store.modelPath == model.path
@@ -63,7 +63,7 @@ struct ModelLoadView: View {
                     Spacer()
                     Button { store.scanModels() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
-                    Button { showDownload = true } label: { Label("Download...", systemImage: "arrow.down.circle") }
+                    Button { showDownload = true } label: { Label("Scarica…", systemImage: "arrow.down.circle") }
                         .buttonStyle(.borderless)
                 }
             }
@@ -81,9 +81,12 @@ struct ModelLoadView: View {
             }
 
             Section("Paths") {
-                TextField("GGUF path", text: $store.modelPath)
+                Text(store.modelPath.isEmpty ? "Nessun GGUF selezionato" : store.modelPath)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
                 Button {
-                    if let path = ModelPicker.pickGGUF() { store.modelPath = path }
+                    if let path = ModelPicker.pickGGUF() { store.selectPickedModel(path: path) }
                 } label: {
                     Label("Browse...", systemImage: "folder")
                 }

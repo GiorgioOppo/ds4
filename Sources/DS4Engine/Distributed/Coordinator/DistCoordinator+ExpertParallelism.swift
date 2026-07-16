@@ -4,17 +4,32 @@ import DS4Core
 extension DistCoordinator {
     // MARK: - Verticale (expert parallelism, Fase C — docs/EXPERT_PARALLELISM.md)
 
-    /// Partizione round-robin: esperto e → worker e % n (una mask a 256 bit a
-    /// testa, copertura esatta). Il bilanciamento per CARICO dalla usage
+    /// Partizione round-robin: esperto e → worker e % n (mask dimensionata da
+    /// nExperts, copertura esatta). Il bilanciamento per CARICO dalla usage
     /// imatrix è Fase D; il round-robin distribuisce già bene gli esperti
     /// caldi (id sparsi su tutto lo spazio).
     static func partitionExperts(nExperts: Int, workers: Int) -> [Data] {
+        guard nExperts > 0, workers > 0 else { return [] }
         var masks = [Data](repeating: Data(repeating: 0, count: (nExperts + 7) / 8),
-                           count: max(1, workers))
+                           count: workers)
         for e in 0..<nExperts {
-            masks[e % max(1, workers)][e / 8] |= UInt8(1 << (e % 8))
+            masks[e % workers][e / 8] |= UInt8(1 << (e % 8))
         }
         return masks
+    }
+
+    /// Strict mask decoder shared by route construction/tests. It rejects both
+    /// the wrong byte length and non-zero padding bits so malformed ownership
+    /// can never silently leave an expert unassigned or multiply assigned.
+    static func decodeExpertMask(_ data: Data, nExperts: Int) -> [Bool]? {
+        guard nExperts > 0, data.count == (nExperts + 7) / 8 else { return nil }
+        if nExperts % 8 != 0, let last = data.last {
+            let validMask = UInt8((1 << (nExperts % 8)) - 1)
+            guard last & ~validMask == 0 else { return nil }
+        }
+        return (0..<nExperts).map { e in
+            (data[data.startIndex + e / 8] >> UInt8(e % 8)) & 1 == 1
+        }
     }
 
     /// Stabilisce la route VERTICALE: ogni peer riceve i file (v8, ripresa a
@@ -27,7 +42,9 @@ extension DistCoordinator {
         let offer = try buildFileOffer(onLog: onLog)
         let n = config.peers.count
         guard n >= 1 else { throw DistError.sliceGap("verticale: serve almeno un worker") }
-        let masks = Self.partitionExperts(nExperts: 256, workers: n)
+        let nExperts = engine.nExperts
+        let masks = Self.partitionExperts(nExperts: nExperts, workers: n)
+        guard masks.count == n else { throw DistError.sliceGap("verticale: partizione esperti vuota") }
         var setup = [DistConnection?](repeating: nil, count: n)
         try await withThrowingTaskGroup(of: (Int, DistConnection).self) { group in
             for (i, p) in config.peers.enumerated() {
@@ -40,12 +57,17 @@ extension DistCoordinator {
             for try await (i, conn) in group { setup[i] = conn }
         }
         expertPeers = setup.enumerated().compactMap { i, conn in
-            guard let conn else { return nil }
-            var bools = [Bool](repeating: false, count: 256)
-            for e in 0..<256 where (masks[i][e / 8] >> UInt8(e % 8)) & 1 == 1 { bools[e] = true }
+            guard let conn,
+                  let bools = Self.decodeExpertMask(masks[i], nExperts: nExperts) else { return nil }
             return (conn, bools)
         }
         guard expertPeers.count == n else { throw DistError.badFrame }
+        for expert in 0..<nExperts {
+            guard expertPeers.reduce(0, { $0 + ($1.mask[expert] ? 1 : 0) }) == 1 else {
+                throw DistError.sliceGap(
+                    "verticale: esperto \(expert) non ha esattamente un proprietario")
+            }
+        }
         onLog("carico il backbone denso locale (route/attention/KV/head)…\n")
         // Cache esperti locale spenta: gli esperti vivono sui worker e il
         // gather locale non parte mai (remoteExperts sostituisce quel ramo;
@@ -65,7 +87,7 @@ extension DistCoordinator {
                                       activation: activation, peers: peers, bits: bits)
         }
         verticalEngine = engine
-        onLog("route verticale completa: \(n) shard di esperti + backbone locale\n")
+        onLog("route verticale completa: \(n) shard · \(nExperts) esperti · \(engine.nLayers) layer + backbone locale\n")
     }
 
     /// Setup di UN peer verticale: handshake+file condivisi, poi EXPERT ASSIGN
@@ -101,7 +123,17 @@ extension DistCoordinator {
                     if rType == .error {
                         throw DistError.remote("\(p.host):\(p.port): " + String(decoding: rPayload, as: UTF8.self))
                     }
-                    guard rType == .ready else { throw DistError.badFrame }
+                    guard rType == .ready,
+                          let ready = DistHello.decode(rPayload), ready.assigned else {
+                        throw DistError.badFrame
+                    }
+                    guard ready.nLayers == engine.nLayers,
+                          ready.layerStart == 0,
+                          ready.layerEnd == engine.nLayers - 1 else {
+                        throw DistError.sliceGap(
+                            "worker verticale \(p.host):\(p.port) ha caricato \(ready.nLayers) layer "
+                            + "(\(ready.layerStart)...\(ready.layerEnd)), attesi \(engine.nLayers)")
+                    }
                     break
                 }
                 onLog("shard \(p.host):\(p.port) pronto (\(owned) esperti)\n")

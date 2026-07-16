@@ -23,6 +23,10 @@ public final class DistWorker: @unchecked Sendable {
 
     let config: Config
     let onLog: @Sendable (String) -> Void
+    /// Best-effort metadata from the optional local hint. Zero means that the
+    /// worker is genuinely geometry-agnostic until the coordinator assigns and
+    /// transfers a model.
+    let localModelLayers: Int
     let queue = DispatchQueue(label: "ds4.dist.worker")
     let gate = DistGate()
     var listener: NWListener?
@@ -65,5 +69,7 @@ public final class DistWorker: @unchecked Sendable {
     public init(config: Config, onLog: @escaping @Sendable (String) -> Void) {
         self.config = config
         self.onLog = onLog
+        self.localModelLayers = (try? DistEngine.inspectLayout(
+            modelPath: config.localModelPath))?.nLayers ?? 0
     }
 }

@@ -14,7 +14,11 @@ final class DistributedController {
     let settings: AppSettings
     var modelPath: String {
         get { settings.modelPath }
-        set { settings.modelPath = newValue }
+        set {
+            settings.modelPath = newValue
+            modelLayers = nil
+            modelExperts = nil
+        }
     }
     var contextSize: Int {
         get { settings.contextSize }
@@ -28,7 +32,9 @@ final class DistributedController {
     // here: the worker starts idle and the coordinator ASSIGNs its whole job
     // (gguf, settings, layer range) at connect time.
     var port = 9100
-    var modelLayers: Int { DistEngine.modelLayers }
+    private(set) var modelLayers: Int?
+    private(set) var modelExperts: Int?
+    var modelLayersLabel: String { modelLayers.map(String.init) ?? "dal GGUF" }
     var workerRunning = false
     var workerLog = ""
 
@@ -53,15 +59,25 @@ final class DistributedController {
     /// re-rendered in full on every send (stateless coordinator).
     private var turns: [ChatTurn] = []
     private var toolRounds = 0
+    private var previousToolRoundFingerprints: Set<String> = []
     /// Bumped by Stop / New Chat: an async tool round (MCP call in flight)
     /// captured under an older epoch must drop its results instead of
     /// appending to a conversation the user has ended or cleared.
     private var chatEpoch = 0
-    /// Tool-loop bound. Illimitato su richiesta. Si ferma per contesto pieno o
-    /// Stop. (I round riusano il prefisso KV del cluster quando la conversazione
-    /// ri-renderizzata lo estende esattamente — v4 — quindi un round tool non
-    /// ripaga più l'intero prefill.)
-    private var maxToolRounds: Int { .max }
+    /// Finite safety budgets: a degraded local model must not repeat expensive
+    /// or mutating calls until the cluster context is exhausted.
+    private let maxToolRounds = 16
+    private let maxToolCallsPerRound = 8
+
+    /// One entry for every model-emitted call. Rejected entries carry a ready
+    /// result, while executable entries are resolved asynchronously. Keeping a
+    /// single ordered list prevents fast rejections from overtaking earlier MCP
+    /// calls in the conversation transcript.
+    private struct PlannedToolCall: Sendable {
+        let call: ToolCall
+        let presetOutput: ToolOutput?
+        let presetMessage: String?
+    }
 
     // Agent (role): same library as the local chat, own selection. Tools run
     // LOCALLY on this (coordinator) Mac — incl. project_* against the active project.
@@ -83,6 +99,23 @@ final class DistributedController {
     private var eventTask: Task<Void, Never>?
 
     var workerSummary: String { "worker :\(port) · job assigned by the coordinator" }
+
+    /// Metadata-only refresh for labels shown before a coordinator is built.
+    /// The authoritative values are overwritten from DistCoordinator after its
+    /// full GGUF validation, so the UI never assumes Flash's 43 layers.
+    func refreshModelGeometry() async {
+        let requestedPath = ProcessStream.absolutePath(modelPath)
+        guard !requestedPath.isEmpty else {
+            modelLayers = nil; modelExperts = nil
+            return
+        }
+        let layers: Int? = await Task.detached(priority: .utility) {
+            (try? InferenceService.inspectModel(path: requestedPath))?.layerCount
+        }.value
+        guard requestedPath == ProcessStream.absolutePath(modelPath) else { return }
+        modelLayers = layers
+        modelExperts = nil
+    }
 
     /// The connected coordinator, exposed so the Benchmark panel can reuse the live
     /// route instead of opening a second connection (nil unless connected). The
@@ -160,6 +193,8 @@ final class DistributedController {
         coordTask = Task {
             do {
                 let coord = try await Task.detached { try DistCoordinator(config: cfg) }.value
+                self.modelLayers = coord.modelLayers
+                self.modelExperts = coord.modelExperts
                 if vertical {
                     try await coord.connectVertical(onLog: onLog)
                 } else {
@@ -176,7 +211,8 @@ final class DistributedController {
 
     // MARK: Verticale (expert parallelism, Fase C)
 
-    /// Scissione VERTICALE: i worker ricevono shard di ESPERTI (mask sui 256)
+    /// Scissione VERTICALE: i worker ricevono shard di ESPERTI (mask dimensionata
+    /// dal GGUF: 256 Flash, 384 Pro)
     /// e il backbone denso (route/attention/KV/head) gira su QUESTO Mac.
     /// Prerequisito misurato: RTT < 1 ms tra i nodi (Thunderbolt/Ethernet
     /// diretta) — su Wi-Fi i ~41 round-trip per token costano più del guadagno.
@@ -226,6 +262,7 @@ final class DistributedController {
         messages.append(UIMessage(role: .user, text: text))
         turns.append(.user(text))
         toolRounds = 0
+        previousToolRoundFingerprints = []
         isGenerating = true
         generateTurn()
     }
@@ -233,6 +270,7 @@ final class DistributedController {
     /// One generation round (assistant reply or tool call) + tool continuation.
     private func generateTurn() {
         guard let coord = coordinator else { isGenerating = false; return }
+        let epoch = chatEpoch
         let index = messages.count
         messages.append(UIMessage(role: .assistant, text: ""))
 
@@ -241,14 +279,21 @@ final class DistributedController {
         // trips Swift 6 region analysis: "sending parameter risks data races").
         let sendTurns: [ChatTurn] = (agent.systemPrompt.isEmpty ? [] : [.system(agent.systemPrompt)]) + turns
         let tools = agent.toolNames.isEmpty ? [] : ToolRegistry.autoSpecs(enabled: Set(agent.toolNames))
+        // This is the authoritative capability snapshot for this exact model
+        // invocation. Agent selection and MCP availability can change while a
+        // decode is running; neither may broaden what its output can execute.
+        let declaredToolNames = Set(tools.map(\.name))
         let wantThink = think, maxT = maxTokens, samp = SamplingParams()
 
         enum Ev: Sendable { case log(String), progress(String), reasoning(String), token(String) }
         let (stream, cont) = AsyncStream<Ev>.makeStream()
         eventTask?.cancel()
-        eventTask = Task { [weak self] in
+        let eventConsumer = Task { [weak self] in
             for await e in stream {
-                guard let self, index < self.messages.count else { continue }
+                guard !Task.isCancelled,
+                      let self,
+                      epoch == self.chatEpoch else { break }
+                guard index < self.messages.count else { continue }
                 switch e {
                 case .log(let s): self.coordLog += s
                 case .progress(let s): self.status = s     // live "N token · X tok/s"
@@ -257,6 +302,7 @@ final class DistributedController {
                 }
             }
         }
+        eventTask = eventConsumer
         let onLog: @Sendable (String) -> Void = { cont.yield(.log($0)) }
         let onProgress: @Sendable (String) -> Void = { cont.yield(.progress($0)) }
         let onReasoning: @Sendable (String) -> Void = { cont.yield(.reasoning($0)) }
@@ -289,18 +335,27 @@ final class DistributedController {
             let result = await withTaskCancellationHandler { await work.value }
                                                   onCancel: { work.cancel() }
             cont.finish()
+            // Drain all queued stream events before reading the assembled
+            // assistant text. This also makes the epoch check cover the final
+            // tokens that raced with decode completion.
+            await eventConsumer.value
+            guard !Task.isCancelled, epoch == self.chatEpoch else { return }
             switch result {
             case .failure(let error):
                 if !(error is CancellationError) { self.coordLog += "error: \(error)\n" }
                 self.isGenerating = false; self.status = ""
             case .success(let calls):
-                self.finishTurn(index: index, calls: calls)
+                self.finishTurn(index: index, calls: calls,
+                                declaredToolNames: declaredToolNames,
+                                epoch: epoch)
             }
         }
     }
 
     /// Record the assistant turn; execute tool calls locally and continue, or stop.
-    private func finishTurn(index: Int, calls: [ToolCall]) {
+    private func finishTurn(index: Int, calls: [ToolCall],
+                            declaredToolNames: Set<String>, epoch: Int) {
+        guard !Task.isCancelled, epoch == chatEpoch else { return }
         guard index < messages.count else { isGenerating = false; status = ""; return }
         let visible = ToolCallParser.stripLeakedMarkup(messages[index].text, markup: .dsv4)
         messages[index].text = visible
@@ -320,17 +375,58 @@ final class DistributedController {
         // guard drops the round if Stop or New Chat ran during an await —
         // otherwise a finished MCP call would append stale turns and silently
         // resume a generation the user ended.
-        let epoch = chatEpoch
+        let policy = ToolExecutionPolicy(allowedToolNames: declaredToolNames)
+        var currentFingerprints = Set<String>()
+        var plannedCalls: [PlannedToolCall] = []
+        plannedCalls.reserveCapacity(calls.count)
+        for (offset, call) in calls.enumerated() {
+            if offset >= maxToolCallsPerRound {
+                let content = #"{"error":"tool_call_batch_limit","message":"call not executed: too many calls in one round"}"#
+                let output = ToolOutput(callId: call.id, name: call.name, content: content)
+                plannedCalls.append(PlannedToolCall(
+                    call: call,
+                    presetOutput: output,
+                    presetMessage: "✗ \(call.name) not executed: per-round limit \(maxToolCallsPerRound)"))
+                continue
+            }
+
+            let firstInRound = currentFingerprints.insert(call.fingerprint).inserted
+            if firstInRound, !previousToolRoundFingerprints.contains(call.fingerprint) {
+                plannedCalls.append(PlannedToolCall(call: call,
+                                                    presetOutput: nil,
+                                                    presetMessage: nil))
+            } else {
+                let content = #"{"error":"duplicate_tool_call","message":"identical consecutive tool call rejected"}"#
+                let output = ToolOutput(callId: call.id, name: call.name, content: content)
+                plannedCalls.append(PlannedToolCall(
+                    call: call,
+                    presetOutput: output,
+                    presetMessage: "✗ \(call.name) not executed: duplicate consecutive call"))
+            }
+        }
+        previousToolRoundFingerprints = currentFingerprints
         coordTask = Task {
-            for c in calls {
-                if MCPManager.shared.isMCPTool(named: c.name) { status = "MCP: \(c.name)…" }
-                let out = await ToolRegistry.executeAuto(c)
-                    ?? ToolOutput(callId: c.id, name: c.name,
-                                  content: #"{"error":"unknown tool: not built in and not provided by a connected MCP server"}"#)
+            for planned in plannedCalls {
                 guard !Task.isCancelled, epoch == chatEpoch else { return }
-                messages.append(UIMessage(role: .tool, text: "\(c.name) → \(out.content)"))
+
+                let out: ToolOutput
+                let displayText: String
+                if let preset = planned.presetOutput {
+                    out = preset
+                    displayText = planned.presetMessage ?? "\(planned.call.name) → \(preset.content)"
+                } else {
+                    let call = planned.call
+                    if MCPManager.shared.isMCPTool(named: call.name) { status = "MCP: \(call.name)…" }
+                    out = await ToolRegistry.executeAuto(call, policy: policy)
+                        ?? ToolOutput(callId: call.id, name: call.name,
+                                      content: #"{"error":"unknown tool: not built in and not provided by a connected MCP server"}"#)
+                    displayText = "\(call.name) → \(out.content)"
+                }
+                guard !Task.isCancelled, epoch == chatEpoch else { return }
+                messages.append(UIMessage(role: .tool, text: displayText))
                 turns.append(.toolResult(callId: out.callId, name: out.name, content: out.content))
             }
+            guard !Task.isCancelled, epoch == chatEpoch else { return }
             generateTurn()      // continue with the tool results
         }
     }
@@ -338,15 +434,26 @@ final class DistributedController {
     func stopGeneration() {
         chatEpoch += 1                    // invalidate any in-flight async tool round
         coordTask?.cancel()
+        coordTask = nil
+        eventTask?.cancel()
+        eventTask = nil
         isGenerating = false
+        status = ""
         coordLog += "[stopped] (the next question starts from scratch)\n"
     }
 
     func newChat() {
         chatEpoch += 1                    // an in-flight tool round must not touch the fresh chat
+        coordTask?.cancel()
+        coordTask = nil
+        eventTask?.cancel()
+        eventTask = nil
+        isGenerating = false
+        status = ""
         messages.removeAll()
         turns.removeAll()
         toolRounds = 0
+        previousToolRoundFingerprints = []
         agents = ChatStore.loadAgents()
     }
 

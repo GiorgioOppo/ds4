@@ -3,7 +3,8 @@ import DS4Core
 import DS4Metal
 
 /// Motore VERTICALE del worker (expert parallelism, Fase B — vedi
-/// docs/EXPERT_PARALLELISM.md): possiede un sottoinsieme dei 256 esperti
+/// docs/EXPERT_PARALLELISM.md): possiede un sottoinsieme degli esperti dichiarati
+/// dal GGUF (256 per Flash, 384 per Pro)
 /// (mask, la STESSA per tutti i layer) e serve richieste `expertWork` →
 /// `expertSum`: attivazione + id/pesi in ingresso, somma parziale pesata
 /// dei SUOI esperti in uscita. Nessun KV, nessuna attention, nessuno stato
@@ -16,6 +17,7 @@ import DS4Metal
 public final class ExpertShardEngine: @unchecked Sendable {
     private let rt: MetalRuntime
     private let model: GGUFModel
+    private let geometry: DSV4RuntimeGeometry
     private let dims: DSV4Dims
     private let scratch: DecodeScratch
     private let idsPacked: GPUTensor      // 0..<k rimappati (gli slab del gather sono impacchettati)
@@ -33,6 +35,7 @@ public final class ExpertShardEngine: @unchecked Sendable {
     /// kernel deve seguire il layer, non il globale del primo layer routed.
     private let layerQuants: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)]
     public let nLayers: Int
+    public let nExperts: Int
     /// mask[e] = questo shard possiede l'esperto e (per tutti i layer routed).
     public let mask: [Bool]
     public var ownedCount: Int { mask.lazy.filter { $0 }.count }
@@ -47,27 +50,27 @@ public final class ExpertShardEngine: @unchecked Sendable {
         self.rt = try MetalRuntime()
         onLoadLog?("mmap gguf…")
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
+        _ = try RuntimeBackendFactory.prepare(model: model)
         // Stessa validazione di carico del motore locale/pipeline: metadata
-        // (config_validate_model), solo profilo Flash, quant chiusi.
+        // (config_validate_model), geometria per istanza e quant chiusi.
         let config = try ModelConfig(model: model)
-        guard config.shape.variant == .flash else {
-            throw ModelConfigError.unsupportedShape(
-                "\(config.shape.name): il runtime supporta solo il profilo Flash")
-        }
-        var d = DSV4Shape.dims
+        let runtimeGeometry = DSV4RuntimeGeometry(configuration: config)
+        var d = runtimeGeometry.dims
         let mq = GGUFWeights.detectMoEQuant(model)
         d.gateQuant = mq.gate; d.upQuant = mq.up; d.downQuant = mq.down; d.routerF16 = mq.routerF16
-        try GGUFWeights.validateRoutedExperts(model, dims: d, nLayers: DSV4Shape.nLayer)
+        try GGUFWeights.validateRuntimeLayout(model, geometry: runtimeGeometry)
+        self.geometry = runtimeGeometry
         self.dims = d
-        self.nLayers = DSV4Shape.nLayer
+        self.nLayers = runtimeGeometry.nLayers
+        self.nExperts = d.nExperts
         // Quant PER-LAYER (GGUF mixed-precision, "boosted layer"): il percorso
         // locale dispatcha su w.*Quant per layer — usare il globale del primo
         // layer routed decodificherebbe gli slab di un layer boosted col
         // kernel sbagliato: garbage finito e SILENZIOSO. Stessa mappatura di
         // GGUFWeights.setExpertQuant; fallback al globale sui layer densi.
         var lq: [(gate: MoEQuant, up: MoEQuant, down: MoEQuant)] = []
-        lq.reserveCapacity(DSV4Shape.nLayer)
-        for il in 0..<DSV4Shape.nLayer {
+        lq.reserveCapacity(runtimeGeometry.nLayers)
+        for il in 0..<runtimeGeometry.nLayers {
             let p = "blk.\(il)."
             let g = model.findTensor(p + "ffn_gate_exps.weight").flatMap { MoEQuant.from(ggufType: $0.type) } ?? d.gateQuant
             let u = model.findTensor(p + "ffn_up_exps.weight").flatMap { MoEQuant.from(ggufType: $0.type) } ?? d.upQuant
@@ -75,8 +78,19 @@ public final class ExpertShardEngine: @unchecked Sendable {
             lq.append((gate: g, up: u, down: dn))
         }
         self.layerQuants = lq
+        let expectedMaskBytes = (d.nExperts + 7) / 8
+        guard expertMask.count == expectedMaskBytes else {
+            throw GGUFWeights.LoadError.message(
+                "ExpertShard: mask di \(expertMask.count) byte, attesi \(expectedMaskBytes) per \(d.nExperts) esperti")
+        }
+        if d.nExperts % 8 != 0, let last = expertMask.last {
+            let validMask = UInt8((1 << (d.nExperts % 8)) - 1)
+            guard last & ~validMask == 0 else {
+                throw GGUFWeights.LoadError.message("ExpertShard: bit di padding non zero nella mask")
+            }
+        }
         var m = [Bool](repeating: false, count: d.nExperts)
-        for e in 0..<min(d.nExperts, expertMask.count * 8) {
+        for e in 0..<d.nExperts {
             let byte = expertMask[expertMask.startIndex + e / 8]
             m[e] = (byte >> UInt8(e % 8)) & 1 == 1
         }
@@ -91,19 +105,20 @@ public final class ExpertShardEngine: @unchecked Sendable {
         self.partialOut = try GPUTensor.zeros(rt, floatCount: d.nEmbd)
         // D2: bundle + slot-cache + pre-warm dalla usage imatrix — la stessa
         // terna del motore locale, assemblata dal helper condiviso.
-        let stats = ExpertUsageStats(nLayers: DSV4Shape.nLayer)
+        let stats = ExpertUsageStats(nLayers: runtimeGeometry.nLayers,
+                                     nExperts: runtimeGeometry.dims.nExperts)
         if !usageJSON.isEmpty { stats.load(usageJSON) }
         self.usage = stats
         let mlock = ProcessInfo.processInfo.environment["DS4_MLOCK"] == "1"
         let stack = StreamingDecoder.makeExpertGatherStack(rt: rt, model: model, dims: d,
-                                                           nLayers: DSV4Shape.nLayer,
+                                                           nLayers: runtimeGeometry.nLayers,
                                                            slots: expertCacheSlots, usage: stats,
                                                            lockResident: mlock)
         self.gatherFn = stack.gather
         self.slotCache = stack.cache
         self.slotStride = stack.stride
         self.slotsStage = try GPUTensor.zerosBytes(rt, byteLength: d.k * 4)
-        onLoadLog?("shard pronto: \(ownedCount)/\(d.nExperts) esperti"
+        onLoadLog?("shard \(config.shape.name) pronto: \(ownedCount)/\(d.nExperts) esperti · \(runtimeGeometry.nLayers) layer"
                    + (stack.cache != nil ? " · cache \(max(8, expertCacheSlots)) slot/layer" : " · cache OFF"))
     }
 

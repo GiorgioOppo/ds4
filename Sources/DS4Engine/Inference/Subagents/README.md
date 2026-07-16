@@ -9,6 +9,8 @@ principale.
 prepara un prefisso dedicato; salva la KV principale; esegue round limitati di
 inferenza/tool; infine ripristina il contesto originale. I prefissi di file o
 progetto possono essere riusati tramite una cache KV content-addressed.
+Contenuto di progetto, domanda, prompt di ruolo, schemi e risultati tool vengono
+neutralizzati prima di aggiungere il framing fidato della chat isolata.
 
 ## Dipendenze
 
@@ -17,7 +19,9 @@ Usa [`Agents`](../../Agents/README.md), [`Projects`](../../Projects/README.md),
 
 ## Estensione
 
-- Intersecare sempre i tool richiesti con `subAgentGrantable`.
+- Intersecare sempre i tool richiesti sia con `subAgentGrantable` sia con
+  `allowedTools`, lo scope fidato catturato dal profilo padre. Il ruolo e gli
+  argomenti scelti dal modello possono restringere lo scope, mai ampliarlo.
 - Imporre limiti a round, token e testo riportato nel trace.
 - Ripristinare la KV principale anche in caso di errore o cancellazione.
 - Non condividere implicitamente contenuti o autorizzazioni fra agenti.

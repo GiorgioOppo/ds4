@@ -10,7 +10,9 @@ import DS4Core
 /// arguments and returns a JSON (or plain text) result string.
 public struct BuiltinTool: Sendable {
     public let spec: ToolSpec
-    public let run: @Sendable (_ argumentsJSON: String) -> String
+    // Deliberately module-internal: external callers must cross the policy-
+    // checked ToolRegistry execution boundary instead of invoking closures.
+    let run: @Sendable (_ argumentsJSON: String) -> String
     public init(spec: ToolSpec, run: @escaping @Sendable (_ argumentsJSON: String) -> String) {
         self.spec = spec; self.run = run
     }
@@ -23,6 +25,44 @@ public struct ToolOutput: Sendable, Equatable {
     public var content: String
     public init(callId: String, name: String, content: String) {
         self.callId = callId; self.name = name; self.content = content
+    }
+}
+
+/// The execution boundary for model-emitted tool calls.
+///
+/// A policy is intentionally explicit and has no permissive default: every
+/// execution context (chat, distributed generation, sub-agent, …) must build it
+/// from the exact tool names declared to that model invocation. An empty set is
+/// a valid deny-all policy.
+public struct ToolExecutionPolicy: Sendable, Equatable {
+    public let allowedToolNames: Set<String>
+
+    public init(allowedToolNames: Set<String>) {
+        self.allowedToolNames = allowedToolNames
+    }
+
+    public func allows(_ toolName: String) -> Bool {
+        allowedToolNames.contains(toolName)
+    }
+
+    /// Stable JSON rejection returned to the model instead of falling through
+    /// to manual tool entry. This distinction is security-sensitive: `nil`
+    /// means "allowed but not auto-executable", never "denied".
+    func rejection(for call: ToolCall) -> ToolOutput {
+        let payload: [String: String] = [
+            "error": "tool_not_allowed",
+            "message": "Tool '\(call.name)' is not allowed in this execution context.",
+            "tool": call.name,
+        ]
+        let content: String
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            content = json
+        } else {
+            // All payload values are Strings, so this should be unreachable.
+            content = #"{"error":"tool_not_allowed"}"#
+        }
+        return ToolOutput(callId: call.id, name: call.name, content: content)
     }
 }
 
@@ -67,9 +107,28 @@ public enum ToolRegistry {
                                                     "github_clone"])
     }
 
-    /// Run a model-emitted call against the built-ins; nil if it's not a built-in
-    /// (the UI must then supply the result manually).
-    public static func execute(_ call: ToolCall) -> ToolOutput? {
+    /// Apply the parent profile's trusted delegation ceiling to a model-selected
+    /// role/tool list. Stable order is preserved for compact prompt declarations.
+    /// This is the hard boundary that prevents `subagent_run` from turning one
+    /// orchestration grant into every globally grantable capability.
+    public static func constrainSubAgentTools(_ candidates: [String],
+                                              allowedByParent: Set<String>) -> [String] {
+        let permitted = subAgentGrantable.intersection(allowedByParent)
+        return candidates.filter { permitted.contains($0) }
+    }
+
+    /// Run a model-emitted call against the built-ins after enforcing the exact
+    /// allow-list declared for this generation. A denied call always returns an
+    /// error output; nil is reserved for an allowed, non-built-in/manual tool.
+    public static func execute(_ call: ToolCall,
+                               policy: ToolExecutionPolicy) -> ToolOutput? {
+        guard policy.allows(call.name) else { return policy.rejection(for: call) }
+        return executeUnchecked(call)
+    }
+
+    /// Internal dispatch primitive. Keeping it non-public prevents app targets
+    /// from accidentally bypassing ToolExecutionPolicy.
+    static func executeUnchecked(_ call: ToolCall) -> ToolOutput? {
         guard let tool = builtin(named: call.name) else { return nil }
         return ToolOutput(callId: call.id, name: call.name, content: tool.run(call.argumentsJSON))
     }
@@ -80,9 +139,13 @@ public enum ToolRegistry {
     /// the connected MCP servers. Nil only if NO source knows the name (the UI
     /// then falls back to manual entry). All tool loops — chat, distributed —
     /// should call this instead of hand-rolling the cascade.
-    public static func executeAuto(_ call: ToolCall) async -> ToolOutput? {
-        if let out = execute(call) { return out }
-        return await MCPManager.shared.execute(call)
+    public static func executeAuto(_ call: ToolCall,
+                                   policy: ToolExecutionPolicy) async -> ToolOutput? {
+        // Check before either lookup. In particular, a hallucinated/unknown
+        // disallowed name must not fall through to the manual-result UI.
+        guard policy.allows(call.name) else { return policy.rejection(for: call) }
+        if let out = executeUnchecked(call) { return out }
+        return await MCPManager.shared.executeUnchecked(call)
     }
 
     /// The specs to declare to the model for a tool-name selection: built-ins

@@ -6,8 +6,13 @@ Implementa inferenza su più Mac con due strategie:
 - **parallelismo verticale degli esperti**: il coordinator esegue il backbone e
   aggrega contributi MoE prodotti da shard remoti.
 
-Il protocollo wire corrente è `Dist.protocolVersion = 10` e richiede uguaglianza
+Il protocollo wire corrente è `Dist.protocolVersion = 11` e richiede uguaglianza
 stretta fra i nodi.
+
+La geometria viene letta dal GGUF: la pipeline copre 43 layer/256 esperti per
+Flash e 61 layer/384 esperti per Pro. Il runtime distribuito accetta il GGUF Pro
+Q2 completo; i due file del package Pro Q4 non sono slice eseguibili e restano
+solo scaricabili finché non esisterà un loader multi-shard.
 
 ## Struttura
 

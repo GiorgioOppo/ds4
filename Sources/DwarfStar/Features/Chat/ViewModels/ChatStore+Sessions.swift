@@ -13,7 +13,7 @@ extension ChatStore {
     /// chat if it's still empty (so flipping the agent before sending anything
     /// doesn't pile up blank chats).
     func startNewChat() {
-        generation?.cancel()
+        invalidateConversationWork()
         isGenerating = false
         status = ""
         clearTransientTurnState()
@@ -63,7 +63,7 @@ extension ChatStore {
     /// chat must re-prime on the next send, since the engine no longer holds its KV.
     func activate(_ id: String) {
         guard let target = sessions.first(where: { $0.id == id }) else { return }
-        generation?.cancel()
+        invalidateConversationWork()
         isGenerating = false
         status = ""
         clearTransientTurnState()
@@ -102,9 +102,12 @@ extension ChatStore {
         attachments = []
         attachmentNote = nil
         pendingManualCalls = []
-        partialAutoOutputs = []
+        pendingOrderedToolOutputs = []
+        pendingManualOutputIndices = []
+        pendingManualEpoch = nil
         awaitingManualResults = false
         toolRounds = 0
+        previousToolRoundFingerprints = []
     }
 
     /// First non-empty user line, for an auto title.

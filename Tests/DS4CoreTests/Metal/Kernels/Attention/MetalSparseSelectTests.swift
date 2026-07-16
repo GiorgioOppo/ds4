@@ -45,6 +45,38 @@ final class MetalSparseSelectTests: XCTestCase {
         }
     }
 
+    func testIndexerTopKMaskSupportsProTop1024Without1024ThreadDispatch() throws {
+        let rt = try makeRuntime()
+        let nRaw = 128, nComp = 2600, nScores = 2417, topK = 1024
+        var seed: UInt64 = 0xD54_1024
+        var scores = [Float](repeating: 0, count: nScores)
+        for i in scores.indices {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            scores[i] = Float(Int32(truncatingIfNeeded: seed >> 47) % 211)
+        }
+        let expected = scores.withUnsafeBufferPointer {
+            IndexerSelect.allowedTopK(scores: $0.baseAddress!, count: nScores, k: topK)
+        }
+
+        let scoreT = try GPUTensor.floats(rt, scores)
+        let maskT = try GPUTensor.zerosBytes(rt, byteLength: (nRaw + nComp) * 2)
+        let c = GraphContext(rt); try c.begin()
+        try c.indexerTopKMask(scores: scoreT, mask: maskT, nRaw: nRaw,
+                              nComp: nComp, nScores: nScores, topK: topK)
+        c.commit()
+
+        let p = (maskT.buffer.contents() + maskT.byteOffset)
+            .bindMemory(to: UInt16.self, capacity: nRaw + nComp)
+        let zero = Float16(0).bitPattern
+        let negInf = Float16(-Float.infinity).bitPattern
+        for i in 0..<nRaw { XCTAssertEqual(p[i], zero, "raw row \(i)") }
+        for i in 0..<nComp {
+            let selected = i < nScores && expected[i]
+            XCTAssertEqual(p[nRaw + i], selected ? zero : negInf,
+                           "compressed row \(i)")
+        }
+    }
+
     func testTopkMaskScatter() throws {
         let rt = try makeRuntime()
         let nTokens = 3, topK = 4, nComp = 20

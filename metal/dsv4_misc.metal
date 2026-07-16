@@ -88,6 +88,13 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t token;
     uint32_t hash_rows;
     uint32_t write_weights;
+    uint32_t n_experts;
+    float    expert_weight_scale;
+};
+
+struct ds4_metal_args_dsv4_router_weights_one {
+    uint32_t n_experts;
+    float    expert_weight_scale;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -197,9 +204,10 @@ kernel void kernel_dsv4_indexer_score_one_direct(
 
 // Decode router post-processing for one token. The selected expert ids are
 // already known; this gathers their probabilities, normalizes by the selected
-// sum, clamps the denominator like the reference path, and applies DS4's 1.5
-// expert-weight scale in one tiny dispatch.
+// sum, clamps the denominator like the reference path, and applies the
+// architecture-specific expert-weight scale in one tiny dispatch.
 kernel void kernel_dsv4_router_weights_one(
+        constant ds4_metal_args_dsv4_router_weights_one & args,
         device const char *probs,
         device const char *selected,
         device       char *weights,
@@ -208,15 +216,20 @@ kernel void kernel_dsv4_router_weights_one(
 
     device const float *p = (device const float *)probs;
     device const int   *s = (device const int *)selected;
+    device float *w = (device float *)weights;
 
     float sum = 0.0f;
     for (uint i = 0; i < 6; i++) {
-        sum += p[s[i]];
+        const int expert = s[i];
+        if (expert < 0 || (uint)expert >= args.n_experts) {
+            w[tid] = 0.0f;
+            return;
+        }
+        sum += p[expert];
     }
     sum = max(sum, 6.103515625e-5f);
 
-    device float *w = (device float *)weights;
-    w[tid] = p[s[tid]] / sum * 1.5f;
+    w[tid] = p[s[tid]] / sum * args.expert_weight_scale;
 }
 
 // Decode router selection for one token after the existing
@@ -233,13 +246,22 @@ kernel void kernel_dsv4_router_finalize_one(
         device int32_t *selected,
         device float *weights,
         threadgroup float *scratch [[threadgroup(0)]],
-        uint tid [[thread_position_in_threadgroup]]) {
-    if (tid >= 256) return;
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    // The Flash router dispatches 256 lanes. Pro dispatches 512 lanes and pads
+    // experts 384...511 with -inf, allowing the same power-of-two bitonic network
+    // to select top-6 without reading outside the 384-element probability row.
+    // All padded lanes must participate in every barrier, so none may return.
+    const uint n_experts = min(args.n_experts, ntg);
 
     threadgroup float *sel_scores = scratch;
-    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
-    const float p = probs[tid];
-    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + ntg);
+    if (tid < n_experts) {
+        const float p = probs[tid];
+        sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    } else {
+        sel_scores[tid] = -INFINITY;
+    }
     idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -253,7 +275,7 @@ kernel void kernel_dsv4_router_finalize_one(
             }
         }
     } else {
-        for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint k = 2; k <= ntg; k <<= 1) {
             for (uint j = k >> 1; j > 0; j >>= 1) {
                 const uint other = tid ^ j;
                 if (other > tid) {
@@ -290,7 +312,7 @@ kernel void kernel_dsv4_router_finalize_one(
             sum += probs[selected[i]];
         }
         sum = max(sum, 6.103515625e-5f);
-        weights[tid] = probs[selected[tid]] / sum * 1.5f;
+        weights[tid] = probs[selected[tid]] / sum * args.expert_weight_scale;
     }
 }
 
@@ -401,8 +423,12 @@ kernel void kernel_dsv4_indexer_topk_mask_one(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < keep) {
-        const int row = heap[tid];
+    // Scattering does not require one lane per selected row.  Pro keeps 1024
+    // rows, while some Apple GPU families expose fewer than 1024 threads per
+    // threadgroup.  Let a portable-sized group stride over the heap instead of
+    // making top_k an implicit hardware requirement.
+    for (uint i = tid; i < keep; i += ntg) {
+        const int row = heap[i];
         if (row >= 0 && (uint)row < args.n_comp) {
             mask[args.n_raw + (uint)row] = half(0.0h);
         }

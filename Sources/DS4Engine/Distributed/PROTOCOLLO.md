@@ -1,4 +1,4 @@
-# Protocollo distribuito v10
+# Protocollo distribuito v11
 
 ## Frame
 
@@ -35,10 +35,18 @@ Un risultato con sessione obsoleta viene scartato.
 
 ## Parallelismo verticale
 
-`EXPERT_ASSIGN` distribuisce maschere disgiunte di esperti. Per ciascun layer
+`EXPERT_ASSIGN` distribuisce maschere disgiunte di esperti. Il payload codifica
+prima la lunghezza `UInt32` e poi i byte della maschera: 32 byte per i 256
+esperti Flash, 48 byte per i 384 esperti Pro. Lunghezza, bit di padding e
+copertura vengono validati rispetto alla geometria del GGUF. Per ciascun layer
 MoE il coordinator invia `EXPERT_WORK` con ID, pesi e attivazione; ogni shard
 risponde con `EXPERT_SUM`. Le somme parziali validate vengono aggregate nel
 backbone locale.
+
+Le assegnazioni orizzontali sono validate contro il numero di layer realmente
+ispezionato: 43 per Flash o 61 per Pro. Un worker inattivo annuncia zero layer
+fino al completamento di `ASSIGN`; `READY` deve poi riportare la geometria
+caricata.
 
 ## Continuità KV
 

@@ -1,13 +1,19 @@
 # Backend Metal
 
-Questa guida descrive i confini del backend GPU e il percorso corretto per
-modificare runtime, wrapper o kernel. Le formule del modello sono approfondite
-in [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md).
+Questa guida descrive i confini del runtime GPU condiviso e il percorso
+corretto per modificare un backend, un wrapper o un kernel. Le formule del
+backend DeepSeek sono approfondite in
+[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); la separazione multi-modello
+è definita in
+[ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md).
 
 ## Livelli del backend
 
 ```text
-StreamingDecoder e provider dei pesi
+Backend concreto (oggi DeepSeekV4/StreamingDecoder)
+             |
+             v
+decoder, stato KV e provider dei pesi del backend
              |
              v
 Graph/Core + Graph/Operations
@@ -25,9 +31,13 @@ funzioni Metal in metal/*.metal
 | `Runtime/Generated` | copia generata dei sorgenti Metal incorporati nel binario |
 | `Kernels` | binding Swift, argomenti, dimensioni di dispatch e buffer |
 | `Graph` | composizione delle operazioni e gestione del command buffer |
-| `Decode` | ordine di esecuzione, stato KV, prefill e generazione |
-| `Model` | forma, descrittori dei pesi, quantizzazione, bundle e streaming |
+| `Model/Quantization` | descrittori di quantizzazione realmente condivisi |
+| `Backends/DeepSeekV4` | forma, tensori, streaming, esperti, MTP, decoder, prefill e KV DeepSeek |
+| `Backends/Qwen` | placeholder documentato; nessuna implementazione GPU corrente |
 | `metal` | implementazione GPU autorevole |
+
+La selezione avviene prima di costruire il decoder. Il ciclo per layer usa il
+tipo concreto del backend e non consulta un registro o un protocollo dinamico.
 
 ## Runtime e tensori
 
@@ -98,7 +108,8 @@ Il backend usa più rappresentazioni in base al tensore:
 - Q4_K, Q2_K e IQ2_XXS per gli esperti;
 - cache derivate Q4/Q8 abilitate soltanto dai relativi toggle.
 
-`LayerWeights` porta la quantizzazione effettiva del singolo layer. Non bisogna
+Nel backend DeepSeek, `LayerWeights` porta la quantizzazione effettiva del
+singolo layer. Non bisogna
 dedurre il formato da un'impostazione globale quando il GGUF può essere mixed
 precision. `GGUFWeights` valida tipo, forma, offset e dimensione prima di
 esporre un tensore al grafo.
@@ -142,10 +153,14 @@ non raggiunto senza risolverne o validarne le precondizioni.
 
 ## Aggiungere una nuova operazione
 
-1. Stabilire il dominio (`Attention`, `Compression`, `Dense`, `MoE`, `Tensor`).
+1. Stabilire prima se l'operazione è condivisa o appartiene a un solo backend;
+   poi scegliere il dominio (`Attention`, `Compression`, `Dense`, `MoE`,
+   `Tensor`).
 2. Aggiungere o modificare il kernel nel file `.metal` appropriato.
 3. Creare un wrapper focalizzato sotto `Sources/DS4Metal/Kernels/<Area>`.
-4. Comporlo in `Graph/Operations` senza inserire stato della GUI o del servizio.
+4. Comporlo nel backend proprietario; usare `Graph/Operations` solo per una
+   primitiva con contratto realmente comune, senza stato della GUI o del
+   servizio.
 5. Aggiungere un test kernel con riferimento CPU.
 6. Aggiungere un test di grafo se l'operazione partecipa a una catena.
 7. Rigenerare `KernelSources.swift` e compilare demo e app.

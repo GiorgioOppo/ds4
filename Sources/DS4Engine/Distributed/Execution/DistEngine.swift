@@ -12,12 +12,10 @@ import DS4Metal
 /// worker that only calls `forwardSlice` over its range never faults in the other
 /// layers' weights — that is where the per-node memory saving comes from.
 public final class DistEngine: @unchecked Sendable {
-    /// Layer count of the compiled model shape (Flash = 43, Pro = 61). The UI
-    /// uses it to bound the worker slice and validate full coverage.
-    public static let modelLayers = DSV4Shape.nLayer
-
     public let modelName: String
     public let nLayers: Int
+    public let nExperts: Int
+    public let headDim: Int
     public let contextSize: Int
     private let rt: MetalRuntime
     private let model: GGUFModel
@@ -41,31 +39,54 @@ public final class DistEngine: @unchecked Sendable {
         self.rt = try MetalRuntime()
         onLoadLog?("mmap gguf…")
         self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
+        let backend = try RuntimeBackendFactory.prepare(model: model)
+        onLoadLog?("backend \(backend.backend.rawValue) · \(backend.descriptor.architecture.rawValue)")
         onLoadLog?("tokenizer…")
         self.tok = try Tokenizer(model: model)
         // Same load-time validation as InferenceService: metadata like the C
-        // config_validate_model, Flash-only runtime, closed expert-quant set.
+        // config_validate_model and the closed expert-quant set. Geometry is
+        // instance-owned: a Flash and a Pro engine may coexist in one process
+        // without sharing static dimensions, compression ratios or RoPE.
         let config = try ModelConfig(model: model)
-        guard config.shape.variant == .flash else {
-            throw ModelConfigError.unsupportedShape(
-                "\(config.shape.name): il runtime supporta solo il profilo Flash")
-        }
-        var dims = DSV4Shape.dims
+        let geometry = DSV4RuntimeGeometry(configuration: config)
+        var dims = geometry.dims
         let mq = GGUFWeights.detectMoEQuant(model)
         dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
-        try GGUFWeights.validateRoutedExperts(model, dims: dims, nLayers: DSV4Shape.nLayer)
+        if let kvLayers {
+            guard kvLayers.lowerBound >= 0,
+                  kvLayers.upperBound <= geometry.nLayers else {
+                throw GGUFWeights.LoadError.message(
+                    "distributed KV slice \(kvLayers) outside model layers 0..<\(geometry.nLayers)")
+            }
+        }
+        guard contextSize > 0 else {
+            throw GGUFWeights.LoadError.message("distributed context size must be positive")
+        }
         self.contextSize = contextSize
-        self.nLayers = DSV4Shape.nLayer
+        self.nLayers = geometry.nLayers
+        self.nExperts = dims.nExperts
+        self.headDim = dims.headDim
         self.modelName = (modelPath as NSString).lastPathComponent
-        let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
-                              attnFactor: 1, betaFast: 32, betaSlow: 1)
+        let rope = geometry.ropeParams(layer: 0)
         self.markup = ToolMarkup.discover(in: tok)
         self.kvQuantBits = dims.gateQuant == .iq2_xxs ? 2 : 4
+        onLoadLog?("geometria \(config.shape.name): \(geometry.nLayers) layer · \(dims.nExperts) esperti")
         onLoadLog?("costruzione decoder (pesi, cache, KV)…")
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(
-            rt: rt, model: model, dims: dims, rope: rope, nLayers: DSV4Shape.nLayer,
-            maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers)
+            rt: rt, model: model, dims: dims, rope: rope, nLayers: geometry.nLayers,
+            maxKeys: contextSize, cacheSlots: expertCacheSlots, kvLayers: kvLayers,
+            geometry: geometry)
         onLoadLog?("decoder pronto")
+    }
+
+    /// Metadata-only geometry inspection used by workers before allocating
+    /// Metal/KV for a coordinator-provided slice. The returned values come from
+    /// the validated GGUF, never from the local build's legacy Flash constants.
+    static func inspectLayout(modelPath: String) throws -> (nLayers: Int, nExperts: Int) {
+        let inspected = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
+        _ = try RuntimeBackendFactory.prepare(model: inspected)
+        let geometry = DSV4RuntimeGeometry(configuration: try ModelConfig(model: inspected))
+        return (geometry.nLayers, geometry.dims.nExperts)
     }
 
     // MARK: Usage imatrix (worker slot-cache pre-warm)
@@ -132,7 +153,7 @@ public final class DistEngine: @unchecked Sendable {
             let sorted = tokenSpeeds.sorted()
             p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
         }
-        let kv = UInt64(DSV4Shape.nLayer) * UInt64(ctx) * UInt64(DSV4Shape.dims.headDim) * 4
+        let kv = UInt64(nLayers) * UInt64(ctx) * UInt64(headDim) * 4
         return InferenceService.BenchPoint(contextTokens: ctx,
                                            prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                                            genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
@@ -182,15 +203,48 @@ public final class DistEngine: @unchecked Sendable {
     /// assistant open) — the coordinator re-renders the whole chat each turn
     /// (stateless). Tools use the compact declaration like the local chat.
     public func chatPromptIds(turns: [ChatTurn], tools: [ToolSpec] = [], think: Bool) -> [Int] {
-        let s = ChatRenderer.render(turns: turns, tools: tools, think: think ? .high : .none,
+        let safeTurns = turns.map { turn -> ChatTurn in
+            switch turn {
+            case .system(let text):
+                return .system(tok.neutralizeSpecialTokenLiterals(in: text))
+            case .user(let text):
+                return .user(tok.neutralizeSpecialTokenLiterals(in: text))
+            case .assistant(let text, let calls):
+                let safeCalls = calls.map {
+                    ToolCall(id: $0.id,
+                             name: tok.neutralizeSpecialTokenLiterals(in: $0.name),
+                             argumentsJSON: tok.neutralizeSpecialTokenLiterals(inJSON: $0.argumentsJSON))
+                }
+                return .assistant(text: tok.neutralizeSpecialTokenLiterals(in: text),
+                                  toolCalls: safeCalls)
+            case .toolResult(let callId, let name, let content):
+                return .toolResult(callId: callId,
+                                   name: tok.neutralizeSpecialTokenLiterals(in: name),
+                                   content: tok.neutralizeSpecialTokenLiterals(in: content))
+            }
+        }
+        let safeTools = tools.map {
+            ToolSpec(name: tok.neutralizeSpecialTokenLiterals(in: $0.name),
+                     description: tok.neutralizeSpecialTokenLiterals(in: $0.description),
+                     parametersJSON: tok.neutralizeSpecialTokenLiterals(inJSON: $0.parametersJSON))
+        }
+        let s = ChatRenderer.render(turns: safeTurns, tools: safeTools, think: think ? .high : .none,
                                     markup: markup, compactTools: true)
         return tok.tokenizeRenderedChat(s).map { Int($0) }
     }
 
     /// Parse DSML tool calls out of generated text (coordinator-side tool loop).
     public func parseToolCalls(_ text: String) -> (calls: [ToolCall], visible: String) {
-        let r = ToolCallParser.parse(text, markup: markup)
-        return (r.calls, r.visibleText)
+        do {
+            let r = try ToolCallParser.parseStrict(text, markup: markup)
+            return (r.calls, r.visibleText)
+        } catch {
+            // Distributed execution has the same all-or-nothing boundary as the
+            // local engine: recovery parsing is display-only and cannot authorize
+            // a truncated or structurally malformed call.
+            let visible = ToolCallParser.parse(text, markup: markup).visibleText
+            return ([], visible)
+        }
     }
 
     /// HC state width crossing the wire (nHC * nEmbd floats).
@@ -231,9 +285,6 @@ public final class DistEngine: @unchecked Sendable {
 
     public var eosId: Int { Int(tok.eosId) }
     public var bosId: Int { Int(tok.bosId) }
-
-    /// KV per-head dimension of the compiled shape (for benchmark KV-size reporting).
-    public var headDim: Int { DSV4Shape.nHeadDim }
 
     /// Sample the next token id from a logits vector, penalizing `recent` tokens.
     public func sample(_ logits: [Float], params: SamplingParams, recent: ArraySlice<Int> = ArraySlice<Int>(),

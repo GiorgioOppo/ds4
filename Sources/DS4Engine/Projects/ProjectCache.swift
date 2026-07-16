@@ -45,4 +45,56 @@ public final class ProjectCache: @unchecked Sendable {
         "tex", "bib", "cls", "sty", "latex",
     ]
 
+    /// Resolve a tool-supplied relative path below the active project without
+    /// ever accepting a symbolic link below the imported root.  Checking only
+    /// `resolvingSymlinksInPath()` on the final URL is insufficient when the
+    /// leaf does not exist: Foundation then leaves an earlier directory link
+    /// unresolved (for example `link/new-file.txt`).  Walking every existing
+    /// component catches both file and directory links while still allowing a
+    /// write to create genuinely missing nested directories.
+    ///
+    /// The imported root itself is the trusted boundary and may use an OS-level
+    /// alias such as `/tmp` -> `/private/tmp`; only components *below* it are
+    /// rejected.  Errors other than "not found" fail closed.
+    func confinedProjectURL(for relativePath: String) -> URL? {
+        guard let root = rootURL(),
+              !relativePath.isEmpty,
+              !relativePath.hasPrefix("/") else { return nil }
+
+        let rawComponents = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !rawComponents.isEmpty else { return nil }
+        let components = rawComponents.map(String.init)
+        guard components.allSatisfy({ component in
+            !component.isEmpty
+                && component != "."
+                && component != ".."
+                && !component.utf8.contains(0)
+        }) else { return nil }
+
+        var candidate = root.standardizedFileURL
+        var missingAncestor = false
+        for (index, component) in components.enumerated() {
+            candidate.appendPathComponent(component)
+            guard !missingAncestor else { continue }
+
+            do {
+                let values = try candidate.resourceValues(
+                    forKeys: [.isSymbolicLinkKey, .isDirectoryKey]
+                )
+                guard values.isSymbolicLink != true else { return nil }
+                if index < components.count - 1, values.isDirectory != true {
+                    return nil
+                }
+            } catch {
+                let nsError = error as NSError
+                guard nsError.domain == NSCocoaErrorDomain,
+                      nsError.code == CocoaError.Code.fileReadNoSuchFile.rawValue else {
+                    return nil
+                }
+                missingAncestor = true
+            }
+        }
+        return candidate
+    }
+
 }

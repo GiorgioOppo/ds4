@@ -40,12 +40,49 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         "<｜Assistant｜>" + (think == .high ? "<think>" : "</think>")
     }
 
+    /// Keep untrusted payload text from becoming model control tokens when the
+    /// completed transcript is passed to `tokenizeRenderedChat`. Trusted framing
+    /// is added by `ChatRenderer` only after these field-level transformations.
+    func promptSafeText(_ text: String) -> String {
+        tok.neutralizeSpecialTokenLiterals(in: text)
+    }
+
+    func promptSafeTools(_ specs: [ToolSpec]) -> [ToolSpec] {
+        specs.map {
+            ToolSpec(name: promptSafeText($0.name),
+                     description: promptSafeText($0.description),
+                     parametersJSON: tok.neutralizeSpecialTokenLiterals(inJSON: $0.parametersJSON))
+        }
+    }
+
+    func promptSafeTurns(_ turns: [ChatTurn]) -> [ChatTurn] {
+        turns.map { turn in
+            switch turn {
+            case .system(let text):
+                return .system(promptSafeText(text))
+            case .user(let text):
+                return .user(promptSafeText(text))
+            case .assistant(let text, let calls):
+                let safeCalls = calls.map {
+                    ToolCall(id: $0.id, name: promptSafeText($0.name),
+                             argumentsJSON: tok.neutralizeSpecialTokenLiterals(inJSON: $0.argumentsJSON))
+                }
+                return .assistant(text: promptSafeText(text), toolCalls: safeCalls)
+            case .toolResult(let callId, let name, let content):
+                return .toolResult(callId: callId, name: promptSafeText(name),
+                                   content: promptSafeText(content))
+            }
+        }
+    }
+
     /// The prefix that opens a new user/tool turn: BOS + system (+ tools) the first
     /// time, otherwise the <eos> that closes the previous (still-open) assistant turn.
     func openingPrefix() -> String {
         if committedIds.isEmpty {
-            let sys = ChatRenderer.systemBlock(turns: systemPrompt.map { [.system($0)] } ?? [],
-                                               tools: tools, markup: markup, compact: compactTools)
+            let systemTurns = promptSafeTurns(systemPrompt.map { [.system($0)] } ?? [])
+            let sys = ChatRenderer.systemBlock(turns: systemTurns,
+                                               tools: promptSafeTools(tools),
+                                               markup: markup, compact: compactTools)
             return "<｜begin▁of▁sentence｜>" + sys
         }
         return needsClose ? "<｜end▁of▁sentence｜>" : ""
@@ -55,7 +92,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
     /// new suffix, reusing the KV cache of the prior turns).
     public func send(userText: String, thinkMode: DS4ThinkMode, sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
-        let suffix = openingPrefix() + "<｜User｜>" + userText + assistantOpen(thinkMode)
+        let suffix = openingPrefix() + "<｜User｜>" + promptSafeText(userText) + assistantOpen(thinkMode)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
 
@@ -73,7 +110,8 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         var turns: [ChatTurn] = self.systemPrompt.map { [.system($0)] } ?? []
         turns.append(contentsOf: history)
         turns.append(.user(userText))
-        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
+        let suffix = ChatRenderer.render(turns: promptSafeTurns(turns),
+                                         tools: promptSafeTools(tools), think: thinkMode.core,
                                          markup: markup, compactTools: compactTools)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
@@ -82,7 +120,10 @@ public func resetDecodeProfile() { decoder.resetProfile() }
     public func provideToolResults(_ outputs: [ToolOutput], thinkMode: DS4ThinkMode,
                                    sampling: SamplingParams, maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         var suffix = openingPrefix() + "<｜User｜>"
-        for o in outputs { suffix += "<tool_result>" + ChatRenderer.escapeToolResult(o.content) + "</tool_result>" }
+        for o in outputs {
+            let content = promptSafeText(ChatRenderer.escapeToolResult(o.content))
+            suffix += "<tool_result>" + content + "</tool_result>"
+        }
         suffix += assistantOpen(thinkMode)
         return run(suffix: suffix, think: thinkMode, sampling: sampling, maxTokens: maxTokens)
     }
@@ -97,7 +138,9 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         // sull'actor PRIMA che parta il prefill — se è lento è "tempo morto"
         // invisibile per il client, quindi lo misuriamo e lo denunciamo.
         let tPrep = Date()
-        let suffix = ChatRenderer.render(turns: turns, tools: tools, think: thinkMode.core,
+        let safeTurns = promptSafeTurns(turns)
+        let safeTools = promptSafeTools(tools)
+        let suffix = ChatRenderer.render(turns: safeTurns, tools: safeTools, think: thinkMode.core,
                                          markup: markup, compactTools: compactTools)
         let ids = tok.tokenizeRenderedChat(suffix).map { Int($0) }
         let prepS = Date().timeIntervalSince(tPrep)
@@ -133,7 +176,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         var checkpointAfter = 0
         if let store = diskKV {
             let sysPrefix = "<｜begin▁of▁sentence｜>" + ChatRenderer.systemBlock(
-                turns: turns, tools: tools, markup: markup, compact: compactTools)
+                turns: safeTurns, tools: safeTools, markup: markup, compact: compactTools)
             let sysCount = tok.tokenizeRenderedChat(sysPrefix).count
             if sysCount >= store.options.minTokens, ids.count > sysCount,
                (store.storedPrefixLengths(of: ids, modelName: modelName).first ?? 0) < sysCount {
@@ -144,4 +187,3 @@ public func resetDecodeProfile() { decoder.resetProfile() }
                    checkpointAfter: checkpointAfter, resumablePrefill: true)
     }
 }
-

@@ -14,6 +14,8 @@ Le specifiche leggono [`AgentRegistry`](../../../Agents/README.md); l'esecuzione
 effettiva del sub-agent è gestita da
 [`Inference/Subagents`](../../../Inference/Subagents/README.md), così il tool non
 possiede direttamente il decoder.
+Il ruolo e la lista `tools` sono input del modello e possono soltanto restringere
+lo scope `delegatedToolNames` del profilo padre, mai ampliarlo.
 
 ## Estensione
 

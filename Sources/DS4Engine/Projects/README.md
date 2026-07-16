@@ -6,7 +6,8 @@ e `file_*`.
 
 ## File
 
-- `ProjectCache.swift`: singleton thread-safe, limiti e stato dell'indice.
+- `ProjectCache.swift`: singleton thread-safe, limiti, stato dell'indice e
+  validazione centrale dei percorsi componente per componente.
 - `+Indexing`: import, filtri, traversal e reload.
 - `+Queries`: lista, albero, ricerca e letture limitate.
 - `+Editing`: write/edit con rilettura del contenuto corrente.
@@ -25,6 +26,8 @@ principale consumer.
 
 ## Estensione
 
-Limitare sempre output e memoria, preservare thread safety e riconvalidare il
-percorso reale immediatamente prima di ogni I/O. Le operazioni distruttive
-richiedono un contratto tool esplicito e non devono operare su directory.
+Limitare sempre output e memoria, preservare thread safety e passare ogni I/O
+tool da `confinedProjectURL`, che rifiuta traversal e symlink in qualunque
+componente esistente. Riconvalidare subito prima dell'I/O; le operazioni
+distruttive richiedono un contratto tool esplicito e non devono operare su
+directory.

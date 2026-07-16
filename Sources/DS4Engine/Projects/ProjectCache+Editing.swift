@@ -6,11 +6,7 @@ extension ProjectCache {
     /// Validate a relative path for writing: inside the root, no traversal,
     /// textual extension only (this is a code assistant, not a binary editor).
     private func writableURL(_ relPath: String) -> (URL, String)? {
-        guard let root else { return nil }
-        guard !relPath.isEmpty, !relPath.hasPrefix("/"), !relPath.contains("..") else { return nil }
-        let url = root.appendingPathComponent(relPath).standardizedFileURL
-        guard url.path.hasPrefix(root.standardizedFileURL.path + "/") else { return nil }
-        guard Self.withinRoot(url, root: root) else { return nil }
+        guard let url = confinedProjectURL(for: relPath) else { return nil }
         guard Self.textExtensions.contains(url.pathExtension.lowercased()) else { return nil }
         return (url, relPath)
     }
@@ -29,7 +25,10 @@ extension ProjectCache {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
-            try content.write(to: url, atomically: true, encoding: .utf8)
+            guard let (checkedURL, _) = writableURL(relPath) else {
+                return "Invalid path or non-text extension: '\(relPath)'."
+            }
+            try content.write(to: checkedURL, atomically: true, encoding: .utf8)
         } catch {
             return "Write failed: \(error.localizedDescription)"
         }
@@ -43,7 +42,7 @@ extension ProjectCache {
     /// must include more surrounding context), like an agentic editor should.
     public func editTool(path relPath: String, find: String, replace: String) -> String {
         guard info() != nil else { return "No project imported." }
-        guard let (url, rel) = writableURL(relPath) else {
+        guard let (_, rel) = writableURL(relPath) else {
             return "Invalid path or non-text extension: '\(relPath)'."
         }
         guard !find.isEmpty else { return "'find' is empty." }
@@ -63,8 +62,11 @@ extension ProjectCache {
         }
         guard let range = text.range(of: find) else { return "Text not found." }
         let updated = text.replacingCharacters(in: range, with: replace)
+        guard let (checkedURL, _) = writableURL(relPath) else {
+            return "Invalid path or non-text extension: '\(relPath)'."
+        }
         do {
-            try updated.write(to: url, atomically: true, encoding: .utf8)
+            try updated.write(to: checkedURL, atomically: true, encoding: .utf8)
         } catch {
             return "Write failed: \(error.localizedDescription)"
         }
@@ -79,6 +81,7 @@ extension ProjectCache {
     /// files the model is actively reading; a search visit is not a signal of
     /// future reads, so it must not cost cache residency.
     func searchContents(_ relPath: String) -> String? {
+        guard confinedProjectURL(for: relPath) != nil else { return nil }
         lock.lock()
         if let c = contents[relPath] { lock.unlock(); return c }
         lock.unlock()
@@ -89,10 +92,9 @@ extension ProjectCache {
     /// required). For edit bases: see the comment in editTool.
     private func freshContents(_ relPath: String) -> String? {
         lock.lock()
-        guard let r = root, files.contains(relPath) else { lock.unlock(); return nil }
+        guard root != nil, files.contains(relPath) else { lock.unlock(); return nil }
         lock.unlock()
-        let url = r.appendingPathComponent(relPath)
-        guard Self.withinRoot(url, root: r),
+        guard let url = confinedProjectURL(for: relPath),
               let data = try? Data(contentsOf: url) else { return nil }
         return String(data: data, encoding: .utf8)
     }

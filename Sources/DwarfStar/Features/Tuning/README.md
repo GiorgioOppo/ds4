@@ -11,3 +11,7 @@
 This feature presents and edits engine configuration; it does not implement
 expert routing, cache policy, tool authorization, or agent execution. Preserve
 that boundary when adding controls.
+
+`TuningView` is capability-gated: without `expertRouting` it displays an
+architecture-neutral placeholder instead of DeepSeek cache steppers and usage
+statistics.

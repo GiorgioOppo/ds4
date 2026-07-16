@@ -6,13 +6,13 @@ tipi condivisi usati da `DS4Metal` e `DS4Engine`.
 
 ## Struttura
 
-- [`Conversation/`](Conversation/README.md): tipi della conversazione e protocollo DSML.
+- [`Conversation/`](Conversation/README.md): tipi comuni e formati chat per backend.
 - [`Diagnostics/`](Diagnostics/README.md): avanzamento thread-safe del caricamento.
 - [`Formats/`](Formats/README.md): GGUF, checkpoint KV e primitive di quantizzazione.
 - [`Generation/`](Generation/README.md): selezione del token successivo.
-- [`Model/`](Model/README.md): forma e configurazione portabile del modello.
+- [`Model/`](Model/README.md): rilevamento architettura e configurazioni per backend.
 - [`Storage/`](Storage/README.md): pianificazione della cache SSD e simulazione RAM.
-- [`Tokenization/`](Tokenization/README.md): tokenizer byte-level BPE DeepSeek.
+- [`Tokenization/`](Tokenization/README.md): API comune e tokenizer per backend.
 
 ## Dipendenze e flusso
 

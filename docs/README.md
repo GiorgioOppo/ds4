@@ -12,11 +12,15 @@ principali e regole di modifica.
   pannelli e troubleshooting.
 - [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md) — moduli, dipendenze e mappa
   delle cartelle.
+- [ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md) — matrice dei
+  backend, rilevamento GGUF, capacità e regole per introdurre Qwen.
 - [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) — workflow per modificare codice,
   documentazione, kernel e progetto Xcode.
 
 ## Motore e inferenza
 
+- [`architectures/`](architectures/README.md) — documentazione separata per
+  DeepSeek V4 e per il backend Qwen ancora in preparazione.
 - [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md) — ciclo completo da prompt a
   token, ownership dello stato, prefill, decode e tool loop.
 - [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md) — dettagli del modello,
@@ -45,7 +49,7 @@ default universali.
 ## Distribuzione
 
 - [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) — topologia
-  orizzontale e verticale, setup, file, KV, sicurezza e protocollo v10.
+  orizzontale e verticale, setup, file, KV, sicurezza e protocollo v11.
 - [EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.md) — stato implementativo,
   costi e validazione della scissione verticale.
 - [`Distributed/PROTOCOLLO.md`](../Sources/DS4Engine/Distributed/PROTOCOLLO.md)

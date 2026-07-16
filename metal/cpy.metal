@@ -55,3 +55,32 @@ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 template [[host_name("kernel_cpy_f32_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<float, float>;
 template [[host_name("kernel_cpy_f32_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<float, half>;
 template [[host_name("kernel_cpy_f16_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<half, float>;
+
+// Materialize a chronological raw-KV window from the circular F32 cache while
+// converting it to the F16 layout consumed by decode FlashAttention. The old
+// host path split a wrapped window into two cpy dispatches for every layer and
+// token after the 128-row boundary. One 2D dispatch keeps every row coalesced
+// and removes that extra command without changing storage or rounding.
+struct ds4_metal_args_raw_ring_cpy {
+    uint32_t n_rows;
+    uint32_t row_width;
+    uint32_t raw_cap;
+    uint32_t raw_start;
+};
+
+kernel void kernel_dsv4_raw_ring_cpy_f32_f16(
+        constant ds4_metal_args_raw_ring_cpy & args,
+        device const float * src,
+        device       half  * dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.row_width || gid.y >= args.n_rows) {
+        return;
+    }
+    // raw_start and gid.y are both below raw_cap, so one subtraction is enough
+    // and avoids a modulo/division in every GPU lane.
+    uint physical_row = args.raw_start + gid.y;
+    if (physical_row >= args.raw_cap) {
+        physical_row -= args.raw_cap;
+    }
+    dst[gid.y * args.row_width + gid.x] = half(src[physical_row * args.row_width + gid.x]);
+}

@@ -1,9 +1,11 @@
-# Engine Architecture — DeepSeek V4 (`DS4Core` + `DS4Metal`)
+# Backend DeepSeek V4 — architettura del motore
 
-This document describes the pure-Swift engine behind DwarfStar: how a GGUF model
-is opened, how text becomes tokens, how tokens flow through the Metal decode
-graph, how routed experts are streamed from SSD, and how the service layer turns
-logits back into a chat stream.
+This document describes the operational **DeepSeek V4 backend** behind
+DwarfStar: how its GGUF is opened, how text becomes DeepSeek tokens, how tokens
+flow through its Metal decode graph, how routed experts are streamed from SSD,
+and how the service layer turns logits back into a chat stream. Architecture
+detection and the rules shared with future backends are documented separately
+in [`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.md).
 
 The goal of the port is behavioral fidelity to upstream `ds4.c` / `ds4_metal.m`,
 while integrating cleanly with Swift, SwiftUI, actors, `Network.framework`, and
@@ -12,12 +14,14 @@ the macOS sandbox.
 Cross-links:
 
 - [`DOCUMENTAZIONE.md`](DOCUMENTAZIONE.md) — app usage, panels, workflows.
+- [`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.md) — model-family
+  detection, backend boundaries and current support matrix.
 - [`PIPELINE-INFERENZA.md`](PIPELINE-INFERENZA.md) — request lifecycle,
   ownership of state, prefill and decode.
 - [`BACKEND-METAL.md`](BACKEND-METAL.md) — runtime, wrappers, generated
   kernels and numerical-validation rules.
 - [`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md) — horizontal and
-  vertical topologies and protocol v10.
+  vertical topologies and protocol v11.
 - [`../README.md`](../README.md) — repository overview and build commands.
 - [`../README.md#configuration-reference`](../README.md#configuration-reference)
   — the authoritative list of every `DS4_*` knob mentioned below, with defaults
@@ -114,8 +118,10 @@ global expert quantization for every layer.
 
 ## 3. Tokenizer
 
-`Sources/DS4Core/Tokenization/Tokenizer.swift` is the pure-Swift tokenizer used by the app,
-demo, server, diagnostics, and tests.
+`Sources/DS4Core/Tokenization/Backends/DeepSeekV4/DeepSeekV4Tokenizer.swift` is
+the pure-Swift tokenizer used by the current DeepSeek app, demo, server,
+diagnostics, and tests. The historical public name `Tokenizer` remains an alias
+for source compatibility; it is not the architecture-neutral tokenizer API.
 
 ### Components
 
@@ -142,29 +148,33 @@ same native tokenization path used by inference. No subprocess tokenizer remains
 
 ## 4. Model Shape and Validation
 
-`DS4Core/Model/ModelShape.swift` and
-`DS4Metal/Model/Architecture/DSV4Shape.swift`
-capture the DeepSeek-V4 Flash constants used by the port: layer count, hidden
-dimensions, expert counts, attention dimensions, sliding-window size, and related
-metadata.
+`DS4Core/Model/Backends/DeepSeekV4/DeepSeekV4Configuration.swift` describes and
+validates both known profiles. After validation,
+`DS4Metal/Backends/DeepSeekV4/Architecture/DSV4RuntimeGeometry.swift` turns the
+selected profile and its per-layer metadata into immutable instance-owned
+dimensions. `DSV4Shape.swift` remains only as the source-compatible Flash
+facade for legacy callers; model-aware decoder construction does not use it to
+override a Pro file.
 
 `ModelConfig(model:)` validates the metadata like the C loader
 (`config_validate_model`): every shape-defining field (layer count, head dims,
 LoRA ranks, expert counts, hash-layer count, indexer geometry, HC counts) must
-match a known profile exactly, and the engine-level constants declared by the
-file are cross-checked against what the runtime hardcodes — per-layer
-compression ratios against the expected formula, per-layer SwiGLU clamps, RoPE
-scaling parameters, `expert_weights_scale`, `expert_weights_norm`, and the
+match a known profile exactly. Engine-level metadata is cross-checked against
+the selected profile — per-layer compression ratios against the expected
+formula, per-layer SwiGLU clamps, RoPE scaling parameters,
+`expert_weights_scale`, `expert_weights_norm`, and the
 RMS/HC epsilons (both `1.0e-6`, matching the C reference). A mismatch refuses
 the file at load instead of silently decoding with different math.
 
-Shape selection distinguishes the Flash and Pro profiles by exact match. A
-valid Pro GGUF is currently refused loudly by both local and distributed
-execution (`InferenceService`, `DistEngine` and the vertical expert-shard
-path): the DSV4Shape constants, router kernels (hardwired to 256 experts /
-expert-weight scale 1.5) and slot-cache are wired for Flash, so decoding Pro
-with Flash shapes would produce plausible-looking garbage.
-Tests cross-check shape selection with real GGUF metadata.
+Shape selection distinguishes the Flash and Pro profiles by exact match. Flash
+uses 43 layers, width 4096, 64 heads and 256 experts; Pro uses 61 layers, width
+7168, 128 heads and 384 experts. The local service and CLI bind a
+`DSV4RuntimeGeometry` before constructing weights, scratch, KV, cache and
+decoder. The router accepts either 256 experts or a 512-lane bitonic dispatch
+padded above Pro's 384 real experts, and applies the profile scale (1.5 or 2.5).
+This is the supported local path for the single-file Pro Q2 GGUF. The Pro Q4
+package remains download-only because it consists of two shards, while Pro
+distributed execution remains under verification.
 
 Tensor-level validation happens at load too: the hash-routing table
 (`ffn_gate_tid2eid.weight`) is required on hash-routed layers with its layout
@@ -173,9 +183,9 @@ checked, the router bias layout is validated, and
 detected quantization classes (mixed-precision layers are counted and decoded
 per layer, bypassing the single-class expert cache).
 
-The shape layer exists to keep hardcoded constants centralized. Decoder code
-should read dimensions from the shape or `DSV4Dims`, not scatter magic numbers
-through graph stages.
+The shape layer exists to keep constants centralized without making them
+global runtime state. Decoder code reads dimensions from its geometry or
+`DSV4Dims`; adding a static Flash fallback in a model-aware path is a regression.
 
 ## 5. Metal Execution Substrate
 
@@ -216,7 +226,7 @@ The routed-FFN command buffer is the exception: with `DS4_ASYNC_FFN` (default
 on) it is committed *without* a CPU wait (`commitAsync`). The next layer's route
 commit+wait lands on the same in-order queue, so correctness is guaranteed by
 queue order while the CPU encode of layer i+1 overlaps the GPU execution of
-layer i's FFN — the per-layer encode bubble (encode time × 43 layers)
+layer i's FFN — the per-layer encode bubble (43 Flash layers or 61 Pro layers)
 disappears. The in-flight buffer is explicitly drained at end of token (before
 the output head readback / `readHC` / KV export) and on every error path,
 including the prefill's. `DS4_ASYNC_FFN=0` restores the synchronous commit.
@@ -311,18 +321,35 @@ state is restored or rebuilt from committed ids.
 The compressor path maintains compressed rows and supports the sparse attention
 selection used by decode. The raw sliding-window portion can optionally be stored
 as a ring via `DS4_RAW_RING=1`, because the attention only reads the latest
-`nSWA` raw rows.
+`nSWA` raw rows. This ring remains an `MTLBuffer` in shared Apple-silicon memory;
+it does not stream KV from the SSD and must not be confused with the Disk-KV
+checkpoint store. Once the chronological window wraps, a dedicated 2D Metal
+kernel reorders its rows and converts F32→F16 in one dispatch rather than
+splitting the window into two copy dispatches.
+
+Decode FlashAttention sizes adaptive split-K from every visible row (raw plus
+compressed):
+
+```text
+nwg = min(32, max(1, ceil((nRaw + nCompressed) / 32)))
+```
+
+All workgroup depths from 1 through 32 are valid. There is no power-of-two
+rounding, so the first compressed row after a full 128-row raw window selects 5
+workgroups for 129 total rows instead of jumping from 4 to 8. Setting
+`DS4_ADAPTIVE_SPLITK=0` restores the historical fixed depth of 32 for A/B tests.
 
 With `DS4_DENSE_STREAM=1` the four NSA compressor projections are diverted out
-of the staging ring and kept RESIDENT (`DS4_RESIDENT_COMP`, default on, ~0.6 GB
-wired): they are read every token on 41 of 43 layers, the single densest
-repeat-read in the dense stream. Same bytes, identical numerics;
+of the staging ring and kept RESIDENT (`DS4_RESIDENT_COMP`, default on; the
+~0.6 GB figure is for Flash): they are read every token on 41 of 43 Flash
+layers and all 61 Pro layers, the single densest repeat-read in the dense
+stream. Same bytes, identical numerics;
 `DS4_RESIDENT_COMP=0` restores full streaming as a tight-RAM fallback.
 
 ### NSA Indexer
 
 The indexer selects the relevant compressed positions used by attention. Flash
-uses a top-k indexer path (top-512 in the ported constants). The
+uses top-512 and Pro top-1024, both supplied by the runtime geometry. The
 indexer and compressor are part of why the KV state is not a simple append-only
 array that can be truncated without care.
 
@@ -340,29 +367,38 @@ The top-K selection itself (`IndexerSelect.swift`) is heap-based — a binary
 min-heap of the k best indices, O(n log k) instead of a full sort — because it
 runs per ratio-4 layer per token once active.
 
-Two load-time consequences of the activation rule:
+Two resource-management consequences of the activation rule:
 
 - **Lazy indexer-scoring staging** (`DS4_LAZY_IDX`, default on, requires
-  `DS4_DENSE_STREAM=1`): if the "can-ever-activate" proof fails — the densest
-  (ratio-4) layers emit at most `maxKeys/4` compressed rows over the whole
-  context, and that bound cannot strictly exceed both the sparse threshold and
-  the top-K — the indexer *scoring* projections (`indexer.attn_q_b` +
-  `indexer.proj`, ~360 MB/token on Flash) are never staged: they would stream
-  every token to never be read. The indexer *compressor* pair keeps streaming
-  (recurrent state must stay coherent). Lossless — the skip only drops
-  never-executed work; recomputed on every load from the live
-  `maxKeys`/threshold, so a larger context re-enables staging. `=0` restores
-  always-stage for A/B.
+  `DS4_DENSE_STREAM=1`) follows the **used** context, not the configured
+  `maxKeys`. While the live ratio-4 compressed-row count cannot exceed both the
+  sparse threshold and top-K, the indexer *scoring* projections
+  (`indexer.attn_q_b` + `indexer.proj`) are absent from the per-token staging
+  plan. With the defaults (threshold 1024, top-K 512), live keys 4096 and 4099
+  remain dense; key 4100 is the first boundary that can require scoring. At
+  that boundary the scorer projections are loaded once into resident Metal
+  buffers and reused for the rest of the session, instead of adding about
+  360 MB of SSD reads to every earlier token. The indexer *compressor* pair
+  keeps running from token one because its recurrent state must stay coherent.
+  This is lossless: only the load time and storage location change. `=0`
+  restores always-stage behaviour for A/B.
+- **High-water attention scratch** starts from the rows needed by the live
+  sequence and grows geometrically only when a new high-water mark is reached.
+  The required row count is the current raw sliding window
+  (`min(liveKeys, nSWA)`) plus the prospective ratio-4 compressed rows and a
+  small safety margin; growth is capped by the configured maximum. Raising the
+  context limit therefore no longer commits the maximum attention/indexer
+  scratch on the first question. Existing buffers are retained between tokens,
+  so steady-state decode does not allocate on every step.
 - **Checkpoint restore bound-check**: restoring a KV/compressor checkpoint
   validates every length coming from the file against the live tensor
   capacities *and* against the emission schedule (`count <= maxKeys / ratio`,
   not the allocation, which carries slack rows) before any memcpy — a corrupt
-  checkpoint can never restore a row count no legitimate run can reach, which
-  is exactly the bound the lazy-staging proof relies on.
+  checkpoint can never restore a row count no legitimate run can reach.
 
 ## 9. MoE: Router and Experts
 
-The router chooses active experts per token and layer. By default Flash uses 6
+The router chooses active experts per token and layer. Flash and Pro both use 6
 active experts. The routed expert tensors dominate model size and SSD I/O.
 
 ### Hash Routing and Selection Bias
@@ -380,9 +416,11 @@ Two routing details track the C reference exactly:
   outputs are computed from the unbiased probabilities, as in
   `layer_topk_selected_experts_from_probs`.
 
-The router finalize kernel is hardwired to 256 experts and expert-weight scale
-1.5 (a 256-thread bitonic sort); a different shape is refused at decoder
-construction rather than silently misrouted.
+The router finalize path receives `nExperts` and `expertWeightScale` from the
+active geometry. Flash dispatches a 256-thread bitonic sort with scale 1.5;
+Pro dispatches 512 threads, pads lanes 384...511 to negative infinity and uses
+scale 2.5. Both produce the same top-6 contract without reading beyond the
+probability row.
 
 ### Fused MoE Kernels
 
@@ -537,18 +575,18 @@ streaming them every token is the wrong tradeoff:
   decode stages one ~8 KB row per token into a small staging buffer instead of
   wiring the whole table;
 - the **NSA compressor projections** (`DS4_RESIDENT_COMP`, section 8);
-- the **indexer scoring projections** skipped entirely by `DS4_LAZY_IDX`
-  (section 8);
+- the **indexer scoring projections**, deferred by `DS4_LAZY_IDX` until the
+  live sparse boundary and then kept resident (section 8);
 - the **Q4-requantized projections** of `DS4_DENSE_Q4` / `DS4_SHARED_Q4`
   (section 12).
 
 ### Hot-Buffer Pinning
 
 `DS4_MLOCK=1` requests best-effort `mlock()` on hot shared Metal buffers such as
-expert-cache pools, dense-stream staging, resident output head, and Q4 dense
-buffers. This is a performance guard against macOS memory-compressor churn, not
-a correctness requirement. Failure to pin is logged or ignored depending on the
-call site; decode continues.
+expert-cache pools, dense-stream staging, resident output head, Q4 dense buffers
+and the enabled raw-KV ring. This is a performance guard against macOS
+memory-compressor churn, not a correctness requirement. Failure to pin is logged
+or ignored depending on the call site; decode continues.
 
 ### Split Command Buffer Pattern
 
@@ -831,6 +869,11 @@ as the feature list:
   Vertical chat and benchmark are wired in the app; the topology requires a
   low-latency wired link because it performs a network round-trip per routed
   layer.
+- **v11** — model-owned distributed geometry: horizontal slices validate 43
+  Flash or 61 Pro layers, while `expertAssign` carries a length-prefixed mask
+  for 256 Flash or 384 Pro experts. `READY` reports the geometry actually
+  loaded. The full Pro Q2 GGUF is accepted; split Pro Q4 still requires a
+  multi-shard loader.
 
 Peer setup runs IN PARALLEL: file transfer and engine load of every worker
 proceed together in a task group, so route activation costs `max(worker
@@ -853,13 +896,13 @@ The full operational flow, file-resume behavior and topology comparison are in
 
 | Upstream C Area | Swift Port |
 |---|---|
-| `ds4.c` model shape, tokenizer use, decoder flow | `DS4Core`, `DS4Metal/Decode`, `DS4Engine/Inference/Service` |
+| `ds4.c` model shape, tokenizer use, decoder flow | `DS4Core/Model/Backends/DeepSeekV4`, `DS4Core/Tokenization/Backends/DeepSeekV4`, `DS4Metal/Backends/DeepSeekV4/Decode`, `DS4Engine/Inference/Service` |
 | `ds4_metal.m` runtime and kernels | `DS4Metal/Runtime`, `DS4Metal/Kernels`, `metal/*.metal` |
 | GGUF parsing | `Sources/DS4Core/Formats/GGUF/` |
-| SSD streaming expert model | `Sources/DS4Metal/Model/Weights/GGUFWeights.swift`, `StreamingDecoder` |
-| Dense streaming / Q4 requant cache | `Sources/DS4Metal/Model/Streaming/DenseStreamer.swift` |
-| Expert cache | `Sources/DS4Metal/Decode/Cache/`, usage imatrix in `StreamingDecoder` |
-| Expert bundle sidecar | `Sources/DS4Metal/Model/Experts/ExpertBundle.swift` |
+| SSD streaming expert model | `Sources/DS4Metal/Backends/DeepSeekV4/Weights/GGUFWeights.swift`, `StreamingDecoder` |
+| Dense streaming / Q4 requant cache | `Sources/DS4Metal/Backends/DeepSeekV4/Streaming/DenseStreamer.swift` |
+| Expert cache | `Sources/DS4Metal/Backends/DeepSeekV4/Decode/Cache/`, usage imatrix in `StreamingDecoder` |
+| Expert bundle sidecar | `Sources/DS4Metal/Backends/DeepSeekV4/Experts/ExpertBundle.swift` |
 | KV store | `Sources/DS4Core/Formats/KVCheckpoint/KVCFile.swift`, `Sources/DS4Engine/Persistence/KV/DiskKVStore.swift` |
 | Server | `Sources/DwarfStar/Features/Server`, `LocalServer` |
 | Distributed runtime | `DS4Engine/Distributed` |

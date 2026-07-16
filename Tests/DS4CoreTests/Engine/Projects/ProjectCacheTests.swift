@@ -188,7 +188,8 @@ final class ProjectCacheTests: XCTestCase {
             .appendingPathComponent("ds4-outside-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: outside) }
-        try "secret".write(to: outside.appendingPathComponent("secret.txt"),
+        let sentinel = "OUTSIDE_SENTINEL_CONTENT"
+        try sentinel.write(to: outside.appendingPathComponent("secret.txt"),
                            atomically: true, encoding: .utf8)
         try FileManager.default.createSymbolicLink(
             at: root.appendingPathComponent("link.txt"),
@@ -196,12 +197,58 @@ final class ProjectCacheTests: XCTestCase {
         try FileManager.default.createSymbolicLink(
             at: root.appendingPathComponent("linkdir"),
             withDestinationURL: outside)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("internal-link"),
+            withDestinationURL: root.appendingPathComponent("Sources"))
+        let brokenTarget = outside.appendingPathComponent("missing.txt")
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("broken-link.txt"),
+            withDestinationURL: brokenTarget)
+        let brokenDirectoryTarget = outside.appendingPathComponent("missing-directory")
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("broken-linkdir"),
+            withDestinationURL: brokenDirectoryTarget)
         ProjectCache.shared.load(root: root)                       // re-index with the links present
         XCTAssertTrue(ProjectCache.shared.findTool(pattern: "link").contains("No files match"))
-        XCTAssertFalse(ProjectCache.shared.readFileTool(path: "link.txt").contains("secret"))
+        XCTAssertFalse(ProjectCache.shared.readFileTool(path: "link.txt").contains(sentinel))
+        XCTAssertFalse(ProjectCache.shared.readFileTool(path: "linkdir/secret.txt").contains(sentinel))
+        XCTAssertTrue(ProjectCache.shared.lineCountTool(path: "linkdir/secret.txt").contains("invalid path"))
         XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "linkdir/evil.txt", content: "x")
             .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "link.txt", content: "replaced")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.addLinesTool(path: "linkdir/secret.txt", content: "x")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.modifyLinesTool(path: "linkdir/secret.txt", content: "x", fromLine: 1)
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.deleteFileTool(path: "linkdir/secret.txt")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.writeTool(path: "linkdir/evil.swift", content: "x")
+            .contains("Invalid path"))
+        XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "internal-link/evil.txt", content: "x")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "broken-link.txt", content: "x")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.writeFileTool(path: "broken-linkdir/evil.txt", content: "x")
+            .contains("invalid path"))
+        XCTAssertTrue(ProjectCache.shared.editTool(path: "linkdir/secret.txt", find: "secret", replace: "x")
+            .contains("Invalid path"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("evil.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: brokenTarget.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: brokenDirectoryTarget.path))
+        XCTAssertEqual(try String(contentsOf: outside.appendingPathComponent("secret.txt"), encoding: .utf8),
+                       sentinel)
+    }
+
+    /// A missing directory hierarchy is not a symlink and remains a valid
+    /// creation target; once created, every component is revalidated.
+    func testWriteCreatesNewNestedDirectories() throws {
+        let out = ProjectCache.shared.writeFileTool(path: "fresh/nested/ok.txt", content: "safe")
+        XCTAssertTrue(out.contains("Created"), "got: \(out)")
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("fresh/nested/ok.txt"), encoding: .utf8),
+            "safe"
+        )
     }
 
     /// project_read without any project says so, instead of a misleading

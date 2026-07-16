@@ -36,6 +36,23 @@ public struct ToolCall: Sendable, Equatable, Identifiable {
     public init(id: String, name: String, argumentsJSON: String) {
         self.id = id; self.name = name; self.argumentsJSON = argumentsJSON
     }
+
+    /// Stable identity for loop/duplicate detection. JSON object keys are sorted
+    /// so formatting or key order alone cannot bypass the repeated-call guard.
+    public var fingerprint: String {
+        let canonical: String
+        if let data = argumentsJSON.data(using: .utf8),
+           let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+           JSONSerialization.isValidJSONObject(value),
+           let normalized = try? JSONSerialization.data(withJSONObject: value,
+                                                        options: [.sortedKeys, .withoutEscapingSlashes]),
+           let text = String(data: normalized, encoding: .utf8) {
+            canonical = text
+        } else {
+            canonical = argumentsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return name + "\u{0}" + canonical
+    }
 }
 
 /// One turn of a conversation, as the engine needs to render it.
@@ -45,4 +62,3 @@ public enum ChatTurn: Sendable, Equatable {
     case assistant(text: String, toolCalls: [ToolCall])
     case toolResult(callId: String, name: String, content: String)
 }
-

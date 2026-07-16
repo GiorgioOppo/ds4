@@ -23,14 +23,16 @@ extension InferenceService {
     /// Resolve a sub-agent target ("project"/"" or a project file path), an optional
     /// ROLE to assume (`agentId`), and the MINIMAL tool set into the sub-agent's
     /// system prompt, the content block that seeds the KV, and the declared tools.
-    /// Granted tools = explicit `requested` (∩ grantable), else the role's tools,
-    /// else a read-only default. Works WITHOUT an imported project: that is not an
-    /// error — the sub-agent then runs on the task alone (no project content/tools).
+    /// Granted tools = explicit `requested`, else the role's tools, else a
+    /// read-only default; every candidate is intersected with both the global
+    /// grantable set and the trusted parent `delegableToolNames` ceiling. Works
+    /// WITHOUT an imported project: that is not an error — the sub-agent then
+    /// runs on the task alone (no project content/tools).
     /// `seedFileContent: false` builds the FALLBACK context for a file target too
     /// large to preload: same file focus, but the sub-agent reads it in chunks
     /// with the read tools instead of having the text seeded into the prefix.
     func subContext(for target: String, agent agentId: String, toolNames requested: [String],
-                            seedFileContent: Bool = true) -> SubContext {
+                    delegableToolNames: Set<String>, seedFileContent: Bool = true) -> SubContext {
         let t = target.trimmingCharacters(in: .whitespacesAndNewlines)
         let isProject = t.isEmpty || t.lowercased() == "project" || t == "."
         let role = agentId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil
@@ -39,15 +41,23 @@ extension InferenceService {
         let fileText = (projectInfo != nil && !isProject && seedFileContent)
             ? ProjectCache.shared.fullText(of: t) : nil
 
-        // Granted = explicit ∩ grantable, else role's tools ∩ grantable, else default.
-        var granted = requested.filter { ToolRegistry.subAgentGrantable.contains($0) }
-        if granted.isEmpty, let role { granted = role.toolNames.filter { ToolRegistry.subAgentGrantable.contains($0) } }
+        // The caller supplies a TRUSTED delegation ceiling captured from the
+        // parent profile. Model-selected `tools` or `agent` can only narrow it;
+        // they can never expand subagent_run into globally grantable mutations.
+        var granted = ToolRegistry.constrainSubAgentTools(
+            requested, allowedByParent: delegableToolNames)
+        if granted.isEmpty, let role {
+            granted = ToolRegistry.constrainSubAgentTools(
+                role.toolNames, allowedByParent: delegableToolNames)
+        }
         if granted.isEmpty {
             // File targets also get raw file_read/file_lines: the target may exist
             // in the root without being indexed (too large / unusual extension).
-            granted = projectInfo == nil ? []
+            let defaults = projectInfo == nil ? []
                 : (isProject ? ["project_tree", "project_list", "project_find", "project_read", "project_search"]
                              : ["project_read", "project_search", "file_read", "file_lines"])
+            granted = ToolRegistry.constrainSubAgentTools(
+                defaults, allowedByParent: delegableToolNames)
         }
         // Without an imported project, project-scoped tools can't do anything → drop them.
         if projectInfo == nil { granted = granted.filter { !ToolRegistry.projectScoped.contains($0) } }
@@ -115,10 +125,15 @@ extension InferenceService {
     /// tokens: 1024 was routinely eaten by a long think before any visible
     /// answer, which surfaced as sub-agents "cutting their replies" — hence the
     /// 4096 default (a cap, not a target: EOS ends the turn normally).
+    /// `allowedTools` is not model input: it is the trusted delegation ceiling
+    /// captured from the parent profile by the app. Empty means deny all tools.
     public func runSubAgent(target: String, question: String, agent: String = "", tools: [String] = [],
+                            allowedTools: [String] = [],
                             maxTokens: Int = 4096, maxRounds: Int = 16,
                             onStep: (@Sendable (String) -> Void)? = nil) async throws -> SubAgentRun {
-        var ctx = subContext(for: target, agent: agent, toolNames: tools)
+        let delegationCeiling = ToolRegistry.subAgentGrantable.intersection(allowedTools)
+        var ctx = subContext(for: target, agent: agent, toolNames: tools,
+                             delegableToolNames: delegationCeiling)
         // A dirty main KV must be rebuilt before snapshotting so the restore is exact.
         if kvDirty, !committedIds.isEmpty { _ = try decoder.prefill(tokens: committedIds, startPos: 0); kvDirty = false }
 
@@ -153,8 +168,9 @@ extension InferenceService {
         // 1. Build or restore the content-keyed KV prefix (lazy cache).
         func renderPrefix(_ c: SubContext) -> [Int] {
             let text = "<｜begin▁of▁sentence｜>"
-                + ChatRenderer.systemBlock(turns: [.system(c.system)], tools: c.tools, markup: markup, compact: true)
-                + "<｜User｜>" + c.content
+                + ChatRenderer.systemBlock(turns: [.system(promptSafeText(c.system))],
+                                           tools: promptSafeTools(c.tools), markup: markup, compact: true)
+                + "<｜User｜>" + promptSafeText(c.content)
             return tok.tokenizeRenderedChat(text).map { Int($0) }
         }
         var prefixIds = renderPrefix(ctx)
@@ -163,7 +179,8 @@ extension InferenceService {
             // (same file focus, read tools instead of seeded content) rather
             // than refusing the run outright.
             let oversized = prefixIds.count
-            ctx = subContext(for: target, agent: agent, toolNames: tools, seedFileContent: false)
+            ctx = subContext(for: target, agent: agent, toolNames: tools,
+                             delegableToolNames: delegationCeiling, seedFileContent: false)
             prefixIds = renderPrefix(ctx)
             guard prefixIds.count < contextSize - 32 else {
                 return SubAgentRun(target: ctx.label, question: question,
@@ -189,9 +206,12 @@ extension InferenceService {
 
         // 2. Sub-agent tool loop: question → answer/tool-calls → results → … (bounded).
         var recent: [Int] = []
-        var suffix = question + assistantOpen(.none)
+        var suffix = promptSafeText(question) + assistantOpen(.none)
         var answer = ""
         var round = 0
+        let maxCallsPerRound = 8
+        let policy = ToolExecutionPolicy(allowedToolNames: Set(ctx.toolNames))
+        var previousToolRoundFingerprints = Set<String>()
         while true {
             let suffixIds = tok.tokenizeRenderedChat(suffix).map { Int($0) }
             guard pos + suffixIds.count < contextSize else { note("sub-agent context exhausted"); break }
@@ -233,12 +253,34 @@ extension InferenceService {
             }
             round += 1
             var results = ""
-            for c in calls {
-                let out = ToolRegistry.execute(c)
+            var currentFingerprints = Set<String>()
+            for c in calls.prefix(maxCallsPerRound) {
+                try Task.checkCancellation()
+                let firstInRound = currentFingerprints.insert(c.fingerprint).inserted
+                let out: ToolOutput
+                if !firstInRound || previousToolRoundFingerprints.contains(c.fingerprint) {
+                    out = ToolOutput(
+                        callId: c.id, name: c.name,
+                        content: #"{"error":"duplicate_tool_call","message":"identical consecutive tool call rejected"}"#)
+                } else {
+                    out = ToolRegistry.execute(c, policy: policy)
                     ?? ToolOutput(callId: c.id, name: c.name, content: #"{"error":"tool unavailable in sub-agent"}"#)
+                }
                 note("\(c.name) \(c.argumentsJSON) → " + excerpt(out.content))
-                results += "<tool_result>" + ChatRenderer.escapeToolResult(out.content) + "</tool_result>"
+                let content = promptSafeText(ChatRenderer.escapeToolResult(out.content))
+                results += "<tool_result>" + content + "</tool_result>"
             }
+            if calls.count > maxCallsPerRound {
+                for c in calls.dropFirst(maxCallsPerRound) {
+                    let out = ToolOutput(
+                        callId: c.id, name: c.name,
+                        content: #"{"error":"tool_call_batch_limit","message":"call not executed: too many calls in one round"}"#)
+                    note("\(c.name) not executed: per-round limit \(maxCallsPerRound)")
+                    let content = promptSafeText(ChatRenderer.escapeToolResult(out.content))
+                    results += "<tool_result>" + content + "</tool_result>"
+                }
+            }
+            previousToolRoundFingerprints = currentFingerprints
             suffix = "<｜end▁of▁sentence｜><｜User｜>" + results + assistantOpen(.none)
         }
         let final = answer.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -289,11 +331,19 @@ extension InferenceService {
         }
         let visibleRaw = String(bytes: visibleBytes, encoding: .utf8) ?? ""
         let toolText = String(bytes: toolBytes, encoding: .utf8) ?? ""
-        let parsed = ToolCallParser.parse(inTool ? visibleRaw + toolText : visibleRaw, markup: markup)
-        return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls,
-                !sawEos, inTool)
+        let generated = inTool ? visibleRaw + toolText : visibleRaw
+        do {
+            let parsed = try ToolCallParser.parseStrict(generated, markup: markup)
+            return (parsed.visibleText.trimmingCharacters(in: .whitespacesAndNewlines), parsed.calls,
+                    !sawEos, false)
+        } catch {
+            // Never expose calls recovered from a partial block to execution.
+            // Keep only the prose before the attempted block as the answer.
+            let recovered = ToolCallParser.parse(generated, markup: markup).visibleText
+            return (recovered.trimmingCharacters(in: .whitespacesAndNewlines), [],
+                    !sawEos, inTool)
+        }
     }
 
     /// Per-phase decode timing (route/attn vs expert gather I/O vs experts compute…).
 }
-

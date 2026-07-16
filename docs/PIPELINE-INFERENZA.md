@@ -88,7 +88,8 @@ per chunk:
 `DS4_PREFILL_CHUNK`, `DS4_PREFILL_UNION` e `DS4_PREFILL_ROUTE_BATCH`
 controllano rispettivamente ammortamento dei pesi densi, memoria transitoria e
 numero di sincronizzazioni. Il prefill non è un decode ripetuto in un ciclo:
-usa strutture dedicate sotto `DS4Metal/Decode/Prefill`.
+usa strutture dedicate sotto
+`DS4Metal/Backends/DeepSeekV4/Decode/Prefill`.
 
 ## 4. Decode di un token
 
@@ -165,8 +166,10 @@ Metal non deve conoscere sessioni, viste o protocollo HTTP.
 - `Sources/DS4Core/Conversation` — modelli, rendering e parsing DSML.
 - `Sources/DS4Core/Tokenization` — BPE e detokenizzazione byte-level.
 - `Sources/DS4Core/Generation` — sampler.
-- `Sources/DS4Metal/Decode` — prefill, decode, KV e cache.
-- `Sources/DS4Metal/Model` — forme, pesi, esperti e streaming.
+- `Sources/DS4Metal/Backends/DeepSeekV4/Decode` — prefill, decode, KV e cache
+  del backend attualmente operativo.
+- `Sources/DS4Metal/Backends/DeepSeekV4` — forma Metal, pesi, esperti e
+  streaming DeepSeek; runtime e kernel condivisi restano fuori dal backend.
 - `Sources/DS4Engine/Inference` — API ed actor applicativo.
 - `Sources/DS4Engine/Persistence/KV` — checkpoint su disco.
 - `Sources/DwarfStar/Features/Chat` — stato e presentazione della chat.

@@ -32,9 +32,14 @@ public actor InferenceService {
     let tok: Tokenizer
     let decoder: StreamingDecoder
     let dims: DSV4Dims
+    let runtimeGeometry: DSV4RuntimeGeometry
     let contextSize: Int
     let modelName: String
     let markup: ToolMarkup
+    /// Architecture-neutral metadata + implemented runtime capabilities. The
+    /// decoder stays concrete; this descriptor is for selection, UI and optional
+    /// feature gates only.
+    let backendDescriptor: RuntimeModelDescriptor
 
     // Append-only conversation state: `committedIds` are the exact token ids already
     // in the KV cache. Each turn prefills ONLY the new suffix and appends here, so
@@ -74,7 +79,7 @@ public actor InferenceService {
     var warmedUp = false
     var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
 
-    public static let engineRevision = "2026-07-13 slots22 + paired compressor + grouped-Q4 + fused router"
+    public static let engineRevision = "2026-07-16 dynamic Flash/Pro geometry + router384"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil) throws {
@@ -95,33 +100,36 @@ public actor InferenceService {
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
         FileHandle.standardError.write(Data("DS4 engine: knob \(knobLine)\n".utf8))
         FileHandle.standardError.write(Data("DS4 engine: contextSize=\(contextSize) cacheSlots=\(expertCacheSlots.map(String.init) ?? "env/off")\n".utf8))
+        // Inspect and select BEFORE constructing the DeepSeek tokenizer/config.
+        // A recognized Qwen GGUF must fail as "backend non ancora implementato",
+        // never as a missing deepseek4.* key after an expensive Metal bring-up.
+        let openedModel = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
+        let selection = try RuntimeBackendFactory.prepare(model: openedModel)
+        self.model = openedModel
+        self.backendDescriptor = selection.descriptor
+        FileHandle.standardError.write(Data(
+            "DS4 engine: backend=\(selection.backend.rawValue) architecture=\(selection.descriptor.architecture.rawValue) model=\(selection.descriptor.displayName)\n".utf8))
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
-        self.model = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         self.tok = try Tokenizer(model: model)
-        // Validate the metadata like the C loader (config_validate_model) and
-        // select the declared profile. The runtime (DSV4Shape constants, router
-        // kernels, slot-cache) is wired for Flash: a valid Pro GGUF must be
-        // refused LOUDLY here, not decoded with Flash shapes into garbage.
+        // Validate the metadata like the C loader (config_validate_model), then
+        // bind one immutable instance-owned geometry. Flash and Pro share the
+        // same hot decoder implementation but never share static dimensions,
+        // compression ratios or per-layer RoPE decisions.
         let config = try ModelConfig(model: model)
-        guard config.shape.variant == .flash else {
-            throw ModelConfigError.unsupportedShape(
-                "\(config.shape.name): il runtime supporta solo il profilo Flash "
-                + "(43 layer, 256 esperti); il profilo Pro non e' ancora cablato")
-        }
+        let geometry = DSV4RuntimeGeometry(configuration: config)
         // Configure the MoE/router quant scheme from the GGUF (Q4_K+Q8 vs IQ2_XXS/Q2_K+F16).
-        var configuredDims = DSV4Shape.dims
+        var configuredDims = geometry.dims
         let mq = GGUFWeights.detectMoEQuant(model)
         configuredDims.gateQuant = mq.gate; configuredDims.upQuant = mq.up
         configuredDims.downQuant = mq.down; configuredDims.routerF16 = mq.routerF16
         // Mixed-precision GGUFs (some routed layers upcast, e.g. to Q4_K): those
         // layers decode per-layer and bypass the single-class expert slot-cache,
         // reading experts via the mmap gather. Uniform models report 0 (no-op).
-        try GGUFWeights.validateRoutedExperts(model, dims: configuredDims, nLayers: DSV4Shape.nLayer)
-        let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: DSV4Shape.nLayer)
+        let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: geometry.nLayers)
         if mixed > 0 {
             FileHandle.standardError.write(Data(
-                "ds4: mixed-precision GGUF: \(mixed)/\(DSV4Shape.nLayer) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); decoded per-layer, bypassing expert cache\n".utf8))
+                "ds4: mixed-precision GGUF: \(mixed)/\(geometry.nLayers) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); decoded per-layer, bypassing expert cache\n".utf8))
         }
         // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
         // per token = less expert I/O, lower quality. Honored by the streaming path.
@@ -129,17 +137,18 @@ public actor InferenceService {
             configuredDims.activeExperts = max(1, min(kk, configuredDims.k))
         }
         self.dims = configuredDims
+        self.runtimeGeometry = geometry
         self.contextSize = contextSize
         self.modelName = (modelPath as NSString).lastPathComponent
         self.markup = ToolMarkup.discover(in: tok)
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
-        let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
-                              attnFactor: 1, betaFast: 32, betaSlow: 1)
+        let rope = geometry.ropeParams(layer: 0)
         // Fast 16GB path (C --ssd-streaming model): non-routed weights are no-copy mmap
         // (resident via page cache, evictable), only the 6 selected experts gathered/token.
         self.decoder = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
-                                                                       nLayers: DSV4Shape.nLayer, maxKeys: contextSize,
-                                                                       cacheSlots: expertCacheSlots)
+                                                                       nLayers: geometry.nLayers, maxKeys: contextSize,
+                                                                       cacheSlots: expertCacheSlots,
+                                                                       geometry: geometry)
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.
@@ -155,6 +164,13 @@ public actor InferenceService {
                                       budgetTokens: 1_000_000)
     }
 
+    /// Metadata-only inspection used by the GUI before loading a backend. It does
+    /// not allocate Metal resources and may return a recognized, unavailable
+    /// architecture such as Qwen.
+    public nonisolated static func inspectModel(path: String) throws -> RuntimeModelDescriptor {
+        try RuntimeBackendFactory.inspect(modelPath: path)
+    }
+
     /// Directory holding the per-file / per-project sub-agent KV caches.
     nonisolated static func subAgentKVDir(modelName: String) -> URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -163,4 +179,3 @@ public actor InferenceService {
         return dir
     }
 }
-

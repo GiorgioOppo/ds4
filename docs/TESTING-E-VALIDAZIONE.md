@@ -92,7 +92,7 @@ route, attention, compressore o MoE verificare:
 Il prefill e il decode devono convergere allo stesso stato per una sequenza
 equivalente, salvo percorsi esplicitamente approssimati.
 
-## Test prestazionali
+## Benchmark di velocità
 
 Un benchmark utile mantiene costanti modello, prompt, contesto, sampling,
 usage profile e stato delle cache. Registrare separatamente:
@@ -106,6 +106,62 @@ usage profile e stato delle cache. Registrare separatamente:
 
 Cambiare un solo knob per prova. `DS4_PROFILE_ROUTE` altera il timing e non va
 usato per il throughput finale.
+
+## Benchmark di correttezza next-token
+
+Il benchmark di correttezza misura la **top-1/top-2/top-3 accuracy in teacher
+forcing** su un testo fisso. Per ogni posizione il modello riceve il prefisso
+reale, ordina i token per logit e verifica se il token successivo del corpus è
+il primo candidato, compare nei primi due o compare nei primi tre; nel passo
+seguente viene comunque inserito il token reale. Temperatura e sampling della
+generazione non partecipano alla metrica. Il seed del benchmark sceglie soltanto
+i segmenti del corpus e le loro lunghezze di contesto: a parità di input rende
+il piano riproducibile, ma non altera logits o graduatoria dei candidati. I tre
+candidati sono token del vocabolario, non esperti MoE.
+
+La prova multi-segmento richiede numero di segmenti, contesto minimo/massimo,
+token massimi per segmento e seed. Ogni primo target deve essere distinto; i
+segmenti possono però sovrapporsi. Il contesto viene estratto uniformemente
+entro l'intervallo effettivo e non può superare l'indice del target: perciò il
+massimo del singolo segmento è `min(massimoEffettivo, targetStart)`. Il punto di
+inizio del contesto deve restare non negativo. Il planner preferisce target che
+permettono il numero massimo richiesto di valutazioni e ricorre alla coda corta
+solo se sono necessari altri segmenti; ogni segmento valuta comunque fra uno e
+il limite richiesto di token.
+
+Se il testo produce `N` token e si usa il prefisso minimo di un token, le
+predizioni verificabili sono `N - 1`: il primo token costituisce il contesto
+iniziale e non è un target. Con un prefisso non valutato di `C` token, i target
+disponibili diventano `N - C`, prima degli eventuali limiti di contesto o di
+durata scelti dalla UI. Questi confini devono restare coperti da test espliciti,
+perché valutare il prefisso o saltare l'ultimo target introduce un errore
+off-by-one nella percentuale. Questa è anche la semantica dell'overload storico
+a segmento singolo, che usa un contesto fisso.
+
+Registrare almeno:
+
+- testo/corpus o hash stabile del contenuto e lingua;
+- GGUF, tokenizer, build e configurazione completa del motore;
+- numero di token tokenizzati e numero di predizioni realmente valutate;
+- seed, segmenti richiesti/effettivi, intervallo di contesto e massimo per
+  segmento;
+- token corretti e accuracy complessiva per top-1, top-2 e top-3;
+- punto di partenza, contesto e token valutati per ciascun segmento;
+- eventuale troncamento imposto dal contesto o dal limite scelto.
+
+Le tre metriche devono essere annidate in ogni osservazione, bucket e risultato:
+`top-1 <= top-2 <= top-3`. Le curve cumulative mostrano le percentuali
+dall'inizio della prova; le serie locali misurano soltanto il bucket corrente.
+L'ultimo bucket può contenere meno elementi e deve usare il proprio conteggio
+reale come denominatore per tutti e tre i ranghi. Anche una top-3 accuracy bassa
+non equivale automaticamente a una risposta semanticamente scorretta: testi
+naturali ammettono spesso più continuazioni plausibili. La metrica è soprattutto
+utile per confrontare build, quantizzazioni e ottimizzazioni sullo stesso corpus.
+
+L'accuratezza globale deve essere calcolata come somma dei token corretti divisa
+per somma dei token valutati. Non fare la media semplice delle percentuali dei
+segmenti: darebbe troppo peso ai campioni corti. Il grafico per-segmento serve a
+mostrare la variabilità lungo il corpus, mentre i KPI globali restano ponderati.
 
 ## Baseline della ristrutturazione
 

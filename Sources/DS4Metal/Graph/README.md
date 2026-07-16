@@ -11,10 +11,10 @@ matematiche del modello in dispatch su tensori e command buffer.
 
 ## Flusso e dipendenze
 
-[`Decode`](../Decode/README.md) crea o riusa un `GraphContext`; le estensioni in
+Il [`decode DeepSeek-V4`](../Backends/DeepSeekV4/Decode/README.md) crea o riusa un `GraphContext`; le estensioni in
 `Operations` scelgono il wrapper di [`Kernels`](../Kernels/README.md), impostano
 buffer/offset e codificano il dispatch. I tensor sono forniti da
-[`Runtime`](../Runtime/README.md) e i pesi da [`Model`](../Model/README.md).
+[`Runtime`](../Runtime/README.md) e i pesi dal backend selezionato.
 
 ## Regole di modifica
 

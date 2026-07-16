@@ -68,8 +68,14 @@ extension DistWorker {
                 }
             }
             commitShard(shard)
-            onLog("expert-shard pronto: \(shard.ownedCount)/256 esperti\n")
-            try await conn.sendFrame(.ready, helloPayload().encoded())
+            onLog("expert-shard pronto: \(shard.ownedCount)/\(shard.nExperts) esperti · \(shard.nLayers) layer\n")
+            // READY describes the shard that was actually loaded, not the
+            // worker's optional local hint (and not a stale horizontal job).
+            let ready = DistHello(modelName: assign.modelName,
+                                  layerStart: 0, layerEnd: shard.nLayers - 1,
+                                  hasOutput: false, nLayers: shard.nLayers,
+                                  contextSize: 0)
+            try await conn.sendFrame(.ready, ready.encoded())
         } catch {
             commitShard(nil)
             onLog("expert-shard: load fallito (\(error))\n")

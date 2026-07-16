@@ -81,7 +81,7 @@ successive hanno smentito l'ipotesi di un draft abbastanza economico.
    (`SpecRecurrentState`, `SpecDecode.swift`). Nessun cambiamento di
    comportamento finché inutilizzati.
 2. **Fase B (verify) — FATTA**: `specVerifyStep(tokens:startPos:) ->
-   [[Float]]` (`Sources/DS4Metal/Decode/Prefill/StreamingDecoder+Prefill.swift`,
+   [[Float]]` (`Sources/DS4Metal/Backends/DeepSeekV4/Decode/Prefill/StreamingDecoder+Prefill.swift`,
    accanto a `prefillRange`, di cui
    riusa stage batchato e unione esperti): passo batch full-config con
    logit per posizione (output head su ogni hidden finale, ~8 ms/token).
@@ -210,7 +210,7 @@ nessun draft può vincere. Questa fase attacca la verifica.
 
 ## Fase M — draft con la testa MTP (BLOCCATA sull'artefatto)
 
-> **Stato 2026-07-14:** il componente `mtp` del catalogo
+> **Stato 2026-07-14:** il componente MTP registrato come accessorio interno
 > (`DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`) NON risulta pubblicato sul
 > repo HF `antirez/deepseek-v4-gguf`, e il GGUF principale Flash IQ2_XXS non
 > contiene pesi nextn/mtp (verificato con `DS4_DIAG=1`: "MTP: nessun peso nel
@@ -224,12 +224,14 @@ strutturale resta la route/attn seriale che la verifica non ammortizza. La
 testa MTP di DeepSeek è il draft giusto: UN blocco transformer + head
 (~1/43 dei layer per candidato) addestrato esattamente per il token
 successivo — accettazione attesa ben sopra il 49-78% del draft ridotto. Il
-sidecar esiste nel catalogo download (id `mtp`,
+sidecar ha un descrittore accessorio interno (id `mtp`, fuori dal catalogo dei
+modelli principali della GUI;
 `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`, ~4 GB, solo Flash); interfaccia
 DeepSeek: `h' = blocco(eh_proj([enorm(emb(t)); hnorm(hidden)]))` →
 `shared_head(norm(h'))`, iterata K-1 volte riusando `h'`.
 
-1. **M1 (FATTA)**: `MTPSidecar` (`Sources/DS4Metal/Model/MTP/`) — apertura,
+1. **M1 (FATTA)**: `MTPSidecar`
+   (`Sources/DS4Metal/Backends/DeepSeekV4/MTP/`) — apertura,
    classificazione dei ruoli (eh_proj, embed_tokens, enorm, hnorm,
    shared_head.*, blocco) e report di validazione contro vocab/nEmbd del
    modello principale. Demo: `DS4_MTP_GGUF=<path>` (o `=1` per cercare

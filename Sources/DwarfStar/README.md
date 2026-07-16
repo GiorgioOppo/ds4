@@ -14,7 +14,9 @@ The app is organized by **feature**, with one folder per tab or area under
 - **`Features/Chat/`**: models, persistence, view model and views for streaming
   chat with Markdown, reasoning, live tool calls,
   attachments, and the `ChatStore` view model.
-- **`Features/ModelManagement/`**: GGUF selection, scanning, and downloads.
+- **`Features/ModelManagement/`**: catalog-backed GGUF discovery, validated
+  manual selection, resumable downloads and progress UI. Flash and the
+  single-file Pro Q2 are runnable; the two-file Pro Q4 package is download-only.
 - **`Features/Project/`**: project library, with sandbox-bookmarked folders indexed for
   agent tools.
 - **`Features/Tuning/`**: expert-cache slots, hit-rate, routing concentration, and agent
@@ -43,12 +45,18 @@ Application code may adapt APIs from `DS4Engine` and `DS4Core`. Reusable model,
 inference, protocol, storage, and tool behavior belongs in those modules, not in
 the SwiftUI target.
 
+Downloaded GGUFs live in `~/Library/Application Support/DwarfStar/models/`.
+The app renders the catalog from `DS4Engine`; it does not duplicate remote
+filenames, SHA-256 values or runtime support decisions.
+
 ## Documentation map
 
 - [`App/README.md`](App/README.md): startup and shared settings.
 - [`Features/README.md`](Features/README.md): feature index and boundaries.
 - [`Features/Chat/FLOW.md`](Features/Chat/FLOW.md): message, tool, persistence,
   and shared-engine flow.
+- [`Features/ModelManagement/README.md`](Features/ModelManagement/README.md):
+  GUI catalog, reuse, resume, selection and runtime boundary.
 - [`Features/Server/HTTP-API.md`](Features/Server/HTTP-API.md): endpoints and
   request lifecycle.
 - [`Shared/README.md`](Shared/README.md): cross-feature support rules.

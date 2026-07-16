@@ -89,6 +89,11 @@ public final class DistCoordinator: @unchecked Sendable {
     var seqCounter: UInt32 = 0
     public var verticalReady: Bool { verticalEngine != nil }
 
+    /// Validated GGUF geometry exposed to UI/diagnostics after coordinator
+    /// construction. Unlike the old global value, this is 43/256 for Flash and
+    /// 61/384 for Pro.
+    public var modelLayers: Int { engine.nLayers }
+    public var modelExperts: Int { engine.nExperts }
     public var routeSummary: String { "\(engine.nLayers) layers · \(entries.count) workers" }
 
     public init(config: Config) throws {

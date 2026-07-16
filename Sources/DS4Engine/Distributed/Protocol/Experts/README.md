@@ -1,10 +1,12 @@
 # Protocol/Experts
 
-Definisce i frame del parallelismo verticale MoE introdotti dal protocollo v10.
+Definisce i frame del parallelismo verticale MoE, estesi dal protocollo v11 per
+la geometria Pro.
 
 ## Tipi
 
-- `DistExpertAssign`: modello, maschera esperti, cache, usage e knob.
+- `DistExpertAssign`: modello, maschera esperti a lunghezza prefissata, cache,
+  usage e knob. La maschera è di 32 byte per Flash e 48 per Pro.
 - `DistExpertWork`: sequenza, layer, esperti selezionati, pesi e attivazione.
 - `DistExpertSum`: sequenza, layer e somma parziale dello shard.
 
@@ -17,5 +19,5 @@ calcola il contributo locale; il coordinator valida sequenza/layer e aggrega.
 ## Estensione
 
 Le maschere devono essere disgiunte o avere una politica di aggregazione
-esplicita. Validare conteggi di ID/pesi, precisione e dimensione dell'attivazione
-prima di eseguire il kernel.
+esplicita. Lunghezza esatta, bit di padding, conteggi di ID/pesi, precisione e
+dimensione dell'attivazione devono essere validati prima di eseguire il kernel.

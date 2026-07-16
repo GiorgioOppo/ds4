@@ -5,6 +5,11 @@ completa di ogni chiave, valore e default resta la
 [Configuration Reference](../README.md#configuration-reference), che è la
 fonte autorevole per i singoli parametri.
 
+I knob storici `DS4_*` descritti qui appartengono al backend DeepSeek V4 salvo
+indicazione contraria. La GUI li espone soltanto quando il descrittore runtime
+dichiara la capability corrispondente; il futuro backend Qwen avrà un profilo
+proprio e non erediterà automaticamente cache esperti, NSA o geometrie Q4.
+
 ## Livelli di configurazione
 
 La configurazione arriva da tre livelli:

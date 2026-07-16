@@ -7,7 +7,8 @@ but one feature should not own another feature's state.
 ## Areas
 
 - `Chat/`: conversations, generation state, tools, attachments, and sessions.
-- `ModelManagement/`: local GGUF discovery, selection, and downloads.
+- `ModelManagement/`: Engine-catalog-backed GGUF discovery, validated manual
+  selection, resumable downloads and package progress.
 - `Project/`: project-library bookmarks and project selection.
 - `Settings/`: global runtime and MCP configuration.
 - `Tuning/`: expert-cache telemetry and agent editing.
@@ -24,4 +25,3 @@ but one feature should not own another feature's state.
 - Read shared model and runtime settings through `AppSettings`; do not create a
   second model instance for an individual panel.
 - Add a feature-level README and update this index when introducing an area.
-

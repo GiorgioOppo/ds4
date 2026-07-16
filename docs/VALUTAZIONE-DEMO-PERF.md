@@ -29,7 +29,7 @@ con la lunghezza del prompt (4.6 → ~8 tok/s da 64 a 3k token).
 Percorso: `StreamingDecoder.forward()` → per ognuno dei 43 layer
 `runLayer()` (route+attn → readback selezione → shared FFN async → gather →
 routed FFN) → `outputHead()`. Riferimento:
-`Sources/DS4Metal/Decode/Execution/StreamingDecoder.swift`.
+`Sources/DS4Metal/Backends/DeepSeekV4/Decode/Execution/StreamingDecoder.swift`.
 
 | Fase (profilo) | Cosa muove/fa | Costo tipico | Vincolo |
 |---|---|---|---|
@@ -84,11 +84,18 @@ si applicano a tutti i token del chunk.
 | Staging ring densi | ~300 MB (2 slot) / +150 MB con `DS4_DENSE_AHEAD=2` | al posto di ~6 GB residenti |
 | `DS4_MLOCK` totale | ~3.3 GB pinnati ai default | il compressore macOS rilegge a ~2.4 GB/s i buffer non pinnati |
 | Prefill transiente | unione 192 × ~7 MB × 2 (pipeline) ≈ **~2.7 GB** + ~80 MB (`PREFILL_MM`) | abbassare `DS4_PREFILL_UNION` su macchine strette |
-| KV raw | lazy (zero-fill-on-demand); `DS4_RAW_RING` lo rende costante | il footprint segue i token realmente generati |
+| KV raw | lazy (zero-fill-on-demand); `DS4_RAW_RING` lo rende costante | ring in memoria shared Metal, non KV on-disk; il footprint senza ring segue i token realmente generati |
 
 Nella baseline a 16 slot il budget va conteso: slot-cache + Q4 residenti + mlock ≈ 7 GB
 wired prima ancora del KV — è il motivo per cui il bench a contesto 104k
 scende a 1.3 tok/s.
+
+Nel percorso raw-ring, il wrap della finestra da 128 righe viene materializzato
+con una sola dispatch GPU F32→F16. Lo split-K conta sia le righe raw sia quelle
+compresse e usa esattamente `min(32, max(1, ceil(totalRows/32)))`: il passaggio
+128→129 usa quindi 4→5 workgroup, non il precedente arrotondamento 4→8. Per
+isolare questa politica in un A/B usare `DS4_ADAPTIVE_SPLITK=0` come controllo a
+profondità fissa 32.
 
 ## 5. Runbook storico di riproduzione (sul Mac)
 

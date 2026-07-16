@@ -27,9 +27,9 @@ import all three libraries.
 
 | Target | Type | Direct target dependencies | Responsibility |
 |---|---|---|---|
-| `DS4Core/` | library | none | Pure Swift data formats, tokenizer, sampler, model metadata, conversation models and DSML rendering. No Metal or SwiftUI. |
-| `DS4Metal/` | library | `DS4Core` | Metal runtime, GPU tensors, kernel dispatch, decode/prefill graph, model weights, expert streaming and caches. |
-| `DS4Engine/` | library | `DS4Core`, `DS4Metal` | Application orchestration: inference service, public DTOs, tools, agents, persistence, downloads and distributed inference. |
+| `DS4Core/` | library | none | Pure Swift formats, architecture inspection, portable contracts and backend-owned tokenizer/conversation frontends. No Metal or SwiftUI. |
+| `DS4Metal/` | library | `DS4Core` | Shared Metal runtime and kernels plus concrete, physically separated model decoders and GPU state. |
+| `DS4Engine/` | library | `DS4Core`, `DS4Metal` | Backend selection and application orchestration: inference service, DTOs, tools, persistence, downloads and distribution. |
 | `DwarfStar/` | executable | `DS4Engine`, `DS4Core` | Native SwiftUI application and its app-facing HTTP server, grouped by user-visible feature. |
 | `DS4Demo/` | executable | `DS4Core`, `DS4Metal` | Small CLI that drives the core and GPU runtime directly for audit, diagnostics and generation. |
 
@@ -39,37 +39,43 @@ import all three libraries.
 DS4Core/
   Conversation/
     Models/             chat turns, tool calls and shared conversation data
-    DSML/               chat-template renderer, markup and tool-call parser
+    Backends/
+      DeepSeekV4/DSML/  DeepSeek template, markup and tool-call parser
+      Qwen/             documented placeholder, not implemented
   Diagnostics/          load/progress reporting without UI dependencies
   Formats/
     GGUF/                GGUF types, cursor and mapped model
     KVCheckpoint/        on-disk KV checkpoint format
     Quantization/        numeric conversion and CPU quantization helpers
   Generation/           sampling
-  Model/                hardware-independent model shape
+  Model/
+    Common/             architecture id, family, descriptor and capabilities
+    Backends/
+      DeepSeekV4/       Flash/Pro shape and metadata validation
+      Qwen/             documented placeholder, not implemented
   Storage/              SSD/cache planning and memory-lock simulation
-  Tokenization/         tokenizer, byte-level helpers and thinking mode
+  Tokenization/
+    API/                minimal architecture-neutral tokenizer contract
+    Common/             byte-level helpers
+    Backends/
+      DeepSeekV4/       concrete tokenizer, special tokens and thinking mode
+      Qwen/             documented placeholder, not implemented
 
 DS4Metal/
   Runtime/
     Core/                Metal device, pipelines and GPU tensor primitives
     Generated/           generated embedded Metal source; never hand-edit
-  Model/
-    Architecture/        DeepSeek-V4 dimensions and RoPE parameters
-    Weights/             GGUF-backed layer weights and providers
-    Quantization/        GPU/model quantization descriptors
-    Experts/             expert bundle and MetalIO safety state
-    Streaming/           dense-weight streaming
-  Decode/
-    Execution/           decoder state, forward pass and per-layer execution
-    Generation/          output-head and generation operations
-    Attention/           indexer/attention selection support
-    Cache/               expert cache and usage statistics
-    KV/                  KV snapshots
-    Prefill/             prefill stages, orchestration and I/O gathering
-    State/               transient decode state
-    Diagnostics/         decode profiling
-    Reference/           parity/reference decoder
+  Model/Quantization/   architecture-independent quantization descriptors
+  Backends/
+    Common/             high-level boundary; never dispatches inside a layer
+    DeepSeekV4/
+      Architecture/     Flash dimensions and RoPE parameters
+      Weights/          GGUF-backed layer weights and providers
+      Experts/ MTP/     expert bundle, MetalIO and optional MTP sidecar
+      Streaming/        dense-weight streaming and requant caches
+      Decode/           Execution, Generation, Attention, Cache, KV, Prefill,
+                        State, Diagnostics and Reference
+    Qwen/               documented placeholder, no decoder or fake kernels
   Graph/
     Core/                graph context
     Operations/          focused graph stages (attention, MoE, RoPE, output…)
@@ -78,6 +84,11 @@ DS4Metal/
                         Swift dispatch wrappers grouped by operation
 
 DS4Engine/
+  Runtime/
+    Common/             model inspection, descriptor, capabilities and selector
+    Backends/
+      DeepSeekV4/       registration of the operational concrete backend
+      Qwen/             recognized but deliberately unavailable backend
   Inference/
     API/                 public request/result/event data structures
     Service/             inference actor and conversation/generation extensions
@@ -126,9 +137,11 @@ DS4Demo/
 ## Placement Rules
 
 - Put reusable, hardware-independent data in `DS4Core`; do not import Metal,
-  Network or SwiftUI there.
+  Network or SwiftUI there. Keep architecture identity common but tokenizer,
+  chat format and shape in the backend that owns them.
 - Put GPU-backed state and operations in `DS4Metal`. Model-visible application
-  policy belongs in `DS4Engine`, not in a kernel wrapper.
+  policy belongs in `DS4Engine`, not in a kernel wrapper. Never add model-family
+  conditionals to the per-layer hot loop; select a concrete backend first.
 - Put public inference request/result/event types in `DS4Engine/Inference/API`.
   Keep service behavior in a focused `InferenceService+Area.swift` extension.
 - Put distributed wire data under `DS4Engine/Distributed/Protocol`, grouped by
@@ -145,6 +158,8 @@ DS4Demo/
 
 See [`../docs/STRUTTURA-PROGETTO.md`](../docs/STRUTTURA-PROGETTO.md) for the
 dependency rules, contribution workflow and build commands.
+See [`../docs/ARCHITETTURE-SUPPORTATE.md`](../docs/ARCHITETTURE-SUPPORTATE.md)
+for the support matrix and the checklist for adding Qwen.
 
 ## Local Documentation Rule
 

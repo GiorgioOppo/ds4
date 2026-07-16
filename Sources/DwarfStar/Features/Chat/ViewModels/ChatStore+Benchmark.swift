@@ -19,6 +19,7 @@ extension ChatStore {
     func runSettingsBenchmark(quick: Bool = false) {
         guard let service else { benchStatus = "Carica prima il modello."; return }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard !isGenerating else { benchStatus = "Ferma la generazione prima del benchmark."; return }
         guard !benchRunning else { return }
         benchRunning = true
         benchResults = ""
@@ -140,6 +141,7 @@ extension ChatStore {
     func runAutoTune() {
         guard service != nil else { benchStatus = "Carica prima il modello."; return }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard !isGenerating else { benchStatus = "Ferma la generazione prima dell'auto-tune."; return }
         guard !benchRunning else { return }
         benchRunning = true
         benchResults = ""

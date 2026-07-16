@@ -1,13 +1,14 @@
 # Model Management Models
 
-`ModelCatalog.swift` defines discovered local models, downloadable targets, and
-filesystem scanning helpers used by the picker and download UI.
+`ModelCatalog.swift` definisce il record leggero `DiscoveredModel` e lo scanner
+usato dalla schermata di caricamento. Il catalogo remoto non è duplicato qui:
+proviene da `DS4Engine.DeepSeekV4ModelCatalog`.
 
 These are lightweight app catalog records, not GGUF parser types. Keep GGUF
 metadata parsing in `DS4Core` and remote-download policy in `DS4Engine`.
 
-Catalog availability is intentionally broader than runtime compatibility. Pro
-and MTP records are download-only with the current backend: local/distributed
-execution accepts Flash, and no load path consumes the separate MTP component.
-Do not describe a catalog row as runnable unless the corresponding loader and
-shape validation are implemented and tested.
+Lo scanner automatico ammette solo i `primaryArtifact` delle entry che Engine
+dichiara selezionabili, inclusi Flash e Pro Q2 singolo; non presenta MTP, shard,
+package Pro Q4 o architetture future come modelli pronti al load. **Browse** resta disponibile
+per quantizzazioni custom, ma `ModelPicker` esegue l'ispezione e la selezione del
+backend prima di salvare il bookmark.

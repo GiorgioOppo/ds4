@@ -6,9 +6,14 @@ and how the advanced panels fit together.
 
 DwarfStar is both:
 
-- a macOS SwiftUI application for local and distributed DeepSeek-V4 inference;
-- a pure-Swift Metal port of the DS4 engine, used by the app, the CLI demo, the
+- a macOS SwiftUI application with architecture-aware model loading;
+- a pure-Swift Metal runtime whose operational backend today is DeepSeek V4,
+  used by the app, the CLI demo, the
   native HTTP server, the benchmark panel, diagnostics, and distributed workers.
+
+Qwen is currently recognized from GGUF metadata but not executable. See the
+[support matrix](ARCHITETTURE-SUPPORTATE.md) for the precise distinction
+between recognized and supported models.
 
 For lower-level engine details, see
 [`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md). For App Store export
@@ -33,10 +38,17 @@ distributed execution, GUI/server, configuration and testing.
 
 ## 1. Overview
 
-DwarfStar runs DeepSeek-V4-Flash locally on Apple Silicon by streaming a 284B MoE
-model from SSD. Only a small routed subset of the model is touched for each
-token. The project avoids the old subprocess approach: the SwiftUI app talks
-directly to the Swift engine through actors and async streams.
+DwarfStar currently runs DeepSeek V4 Flash and the single-file Pro Q2 profile
+locally on Apple Silicon by streaming routed MoE weights from SSD. Only a small
+routed subset of the selected model is touched for each token. Pro Q4 remains
+download-only because its catalog artifact is split across two GGUF shards;
+distributed Pro Q2 uses geometry-aware horizontal and expert-shard paths, with
+real-model multi-Mac numerical validation still pending. Backend selection is
+explicit, so a future Qwen
+implementation can provide its own tokenizer, tensor mapping and decoder
+without changing the DeepSeek hot path. The project avoids the old subprocess
+approach: the SwiftUI app talks directly to the Swift engine through actors and
+async streams.
 
 The same engine implementation powers:
 
@@ -101,8 +113,10 @@ active working set small enough that the machine can progress token by token.
 
 ### MoE and Routed Experts
 
-DeepSeek-V4-Flash is a Mixture-of-Experts model. The router selects a top-k set
-of experts for each token and layer. The default active count is 6. Reducing the
+DeepSeek V4 Flash and Pro are Mixture-of-Experts profiles. The router selects a
+top-k set of experts for each token and layer. The default active count is 6.
+Flash routes among 256 experts with scale 1.5; Pro routes among 384 with scale
+2.5. Reducing the
 active expert count with `DS4_ACTIVE_EXPERTS` lowers I/O but changes model
 quality and should be treated as a degraded mode or diagnostic experiment.
 
@@ -113,9 +127,11 @@ compute) and for distributed shards that cover those layers.
 
 At load the engine validates GGUF metadata the same way the C loader does
 (a port of `config_validate_model`) and selects the declared profile. The local
-runtime is wired for the Flash profile (43 layers, 256 experts); a valid Pro
-GGUF is refused with an explicit error instead of being decoded with Flash
-shapes into garbage. Numerics also follow the C reference: the RMSNorm and
+runtime constructs immutable geometry from that configuration: Flash uses 43
+layers and 256 experts, while Pro uses 61 layers and 384. The Pro router pads a
+512-lane bitonic dispatch above expert 383, so it never applies Flash geometry
+or reads beyond the Pro probability row. Numerics also follow the C reference:
+the RMSNorm and
 Hyper-Connection epsilons default to `1e-6`, matching `DS4_DEFAULT_RMS_EPS`
 and `DS4_DEFAULT_HC_EPS` in `ds4.c`.
 
@@ -199,7 +215,7 @@ server mode, distributed mode, diagnostics, and tuning panels.
 | **Tuning** | Expert slot-cache controls and usage imatrix. |
 | **Server** | OpenAI/Anthropic-compatible native HTTP server. |
 | **Worker** | Run this Mac as a distributed worker; the coordinator assigns GGUF, settings, and layer slice. |
-| **Benchmark** | Native throughput charting across context frontiers. |
+| **Benchmark** | Native throughput and teacher-forced next-token accuracy charts. |
 | **Diagnostics** | Tokenizer dump and chat-template/tool-format inspection. |
 
 ### Chat State: `ChatStore`
@@ -400,8 +416,10 @@ The app detects physical RAM and proposes conservative defaults:
 These RAM tiers are capacity recommendations, not numerical-parity profiles:
 the selected model quantization affects quality, and the optional Q4 speed paths
 below are deliberately lossy. Their purpose is to reduce memory pressure. You
-can still raise context manually up to 1M, but KV and scratch memory scale with
-it.
+can still raise context manually up to 1M. KV/compressor capacity retains that
+upper bound, while the context-dependent attention scratch grows from the
+**used-token high-water mark** and is capped by it: selecting a large limit no
+longer commits maximum scratch on the first question.
 
 Beyond the static presets, Settings offers three measurement-driven tools that
 tune the engine for the actual machine. All three require a loaded model, keep
@@ -518,23 +536,35 @@ one layer ahead, the measured optimum; the auto-tune explores 1-3).
 Two lossless refinements are ON by default inside the dense stream:
 
 - `DS4_RESIDENT_COMP` keeps the four NSA compressor projections resident
-  (~0.6 GB) instead of streaming them — they are read every token on 41 of 43
-  layers, the single densest repeat-read in the stream. Same bytes, identical
-  numerics; `=0` restores full streaming as a tight-RAM fallback.
-- `DS4_LAZY_IDX` skips staging the indexer SCORING projections (~360 MB/token)
-  when the sparse top-k selection provably cannot activate at the current
-  context size. The proof is recomputed on every load, so a larger context
-  re-enables the staging automatically.
+  instead of streaming them — they are read every token on 41/43 Flash layers
+  and all 61 Pro layers; the ~0.6 GB estimate is Flash-specific. This is the
+  single densest repeat-read in the stream. Same bytes, identical numerics;
+  `=0` restores full streaming as a tight-RAM fallback.
+- `DS4_LAZY_IDX` defers the indexer SCORING projections according to the
+  **actually used context**, not the configured context capacity. Before the
+  sparse boundary they are omitted from the dense stream; on first activation
+  they are loaded once into resident buffers and then reused. This avoids about
+  360 MB/token of premature SSD reads on Flash even when `maxKeys` is large.
+  The recurrent indexer compressor remains active from the beginning.
+
+The context-dependent attention/indexer scratch follows the same live policy.
+It starts from the raw sliding-window rows plus the emitted compressed rows,
+grows geometrically only at a new high-water mark, and never exceeds the
+configured cap. Buffer reuse keeps the normal token path allocation-free after
+each growth step.
 
 Whether the sparse indexer path activates at all is governed by
 `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` (default 1024, same env override
 and allowed values as the C): decode keeps attention dense over all compressed
 rows until their count exceeds the threshold, because around the ~2K frontier
-the sparse path's score/top-k setup costs more than the smaller dense scan.
+the sparse path's score/top-k setup costs more than the smaller dense scan. At
+the default threshold 1024 and top-K 512, 4096 and 4099 live keys remain on the
+dense path; 4100 is the first live-key count that can activate scorer loading.
 
 `DS4_MLOCK=1` pins hot buffers best-effort. This includes expert-cache pools,
-dense-stream staging, output-head resident buffers, and Q4 dense buffers. Failure
-to pin is not fatal; it only means macOS may compress or page those buffers.
+dense-stream staging, output-head resident buffers, Q4 dense buffers and the
+raw-KV ring when `DS4_RAW_RING=1`. Failure to pin is not fatal; it only means
+macOS may compress or page those buffers.
 
 `DS4_DENSE_Q4=1` is a lossy speed path. It requantizes the largest Q8 attention
 projections to Q4_K, caches the result under
@@ -585,8 +615,17 @@ checkpoint until the end.
 ### Raw-KV Ring
 
 NSA sliding-window attention reads only the recent raw rows. `DS4_RAW_RING=1`
-keeps raw KV in a ring of `nSWA` rows, reducing raw-KV memory. It does not remove
-all compressed KV state.
+keeps raw KV in an `nSWA`-row `MTLBuffer` in shared/unified memory, reducing
+raw-KV RAM. It is not an on-disk cache: Disk KV separately saves and restores
+completed prefix checkpoints. The ring also does not remove the compressed KV
+state.
+
+When the requested chronological window wraps around the physical ring, one 2D
+GPU dispatch reorders its rows while converting F32→F16 for FlashAttention. The
+attention split-K depth is based on the raw and compressed rows together and is
+chosen exactly as `min(32, max(1, ceil(totalRows/32)))`. It is not rounded to a
+power of two: 128 rows use 4 workgroups, while 129 use 5. Disable
+`DS4_ADAPTIVE_SPLITK` to compare against the historical fixed depth of 32.
 
 ### Expert Cache
 
@@ -711,14 +750,17 @@ streaming/`mlock`/pread and measured 0.37 tok/s where the same hardware did 2.7
 locally — carrying the measured configuration aligns the job, but does not
 promise bit-identical output across hardware or execution paths.
 
-Expert parallelism (protocol v10): in addition to the horizontal layer
+Expert parallelism (protocol v11): in addition to the horizontal layer
 pipeline, the coordinator can keep the complete dense backbone locally and
-assign each worker a 256-bit ownership mask over the routed experts of every
-layer. For each routed layer it sends `expertWork` to the owners selected by
-the router and sums their `expertSum` replies. The worker path is implemented
-by `ExpertShard`; vertical chat and a dedicated benchmark are exposed by the
-Distributed feature. This topology needs a wired RTT below roughly 1 ms because
-it introduces about one round-trip per routed layer. See
+assign each worker a length-prefixed ownership mask over the routed experts of
+every layer: 256 bits for Flash or 384 for Pro. For each routed layer it sends
+`expertWork` to the owners selected by the router and sums their `expertSum`
+replies. The worker path is implemented by `ExpertShard`; vertical chat and a
+dedicated benchmark are exposed by the Distributed feature. Horizontal slices
+likewise validate 43 Flash or 61 Pro layers. This topology needs a wired RTT
+below roughly 1 ms because it introduces about one round-trip per routed layer.
+The full Pro Q2 GGUF is accepted; split Pro Q4 remains download-only until a
+multi-shard loader exists. See
 [`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md) and
 [`EXPERT_PARALLELISM.md`](EXPERT_PARALLELISM.md).
 
@@ -738,11 +780,35 @@ guarantee). Partial-slice writes go to a suffixed
 
 ### Benchmark
 
-The benchmark panel measures prefill and generation throughput at increasing
-context sizes. In Local mode it reuses the loaded shared engine when the chat is
-idle; the run mutates KV and is refused while generation is active. In
-Distributed mode it reuses the connected coordinator, so it must not overlap a
-distributed chat generation.
+The benchmark panel offers two distinct measurements. **Speed** measures prefill
+and generation throughput at increasing context sizes. **Correctness** measures
+teacher-forced top-1, top-2 and top-3 next-token accuracy on user-provided text
+over multiple seeded corpus pieces and charts all three accuracies for every
+piece. Pieces have distinct first-target positions but may overlap. Their
+context length is sampled uniformly inside the effective min/max interval, and
+each evaluates up to the configured per-piece limit. The planner prefers full
+pieces and uses a shorter corpus tail only when the requested count requires
+it. The three candidates are vocabulary tokens, not MoE experts, and the nested
+metrics always satisfy `top-1 <= top-2 <= top-3`. Correctness always advances
+the decoder with the reference token, not with its prediction, so one wrong
+guess does not change the context of later observations.
+
+With the minimum one-token prefix, tokenization yielding `N` tokens makes
+exactly `N - 1` predictions. More generally, an unscored prefix of `C` tokens
+leaves `N - C` eligible targets before the selected evaluation and context
+limits are applied. This legacy single-piece contract remains available through
+the fixed-context overload. The multi-piece summary reports the effective plan,
+evaluated tokens, top-k correct counts, accuracies, truncation and throughput.
+Global accuracy divides total correct tokens by total evaluated tokens, so
+short pieces are weighted correctly rather than averaged as equal percentages.
+The seed makes sampling reproducible but does not affect model logits. This is
+a deterministic continuation metric, not a general semantic-quality score,
+because several different next tokens may be linguistically valid.
+
+In Local mode the panel reuses the loaded shared engine when the chat is idle;
+the run mutates KV and is refused while generation is active. In Distributed
+mode the speed benchmark reuses the connected coordinator, so it must not
+overlap a distributed chat generation.
 
 The generation series in the chart and report is the steady-state p99 of the
 per-token speeds, not the mean: the mean is dragged down by the cold first
@@ -765,8 +831,11 @@ path. This replaces the old subprocess-driven `ds4 --dump-tokens` workflow.
 ### Model Downloads
 
 The download sheet uses the native Swift `ModelDownloader`: resumable HTTP Range
-downloads from Hugging Face, `.part` resume files, and optional SHA-256 content
-verification. Downloads go to `<scriptDir>/gguf`.
+downloads from Hugging Face, `.part` resume files, and catalog-pinned SHA-256
+verification for new transfers. GUI downloads go to the writable
+`~/Library/Application Support/DwarfStar/models/` directory. Exact catalog files
+already present as regular, non-empty files in known model directories are
+reused without a network request; interrupted `.part` files are resumed.
 
 Authentication is configured in **Settings → Hugging Face**: paste a read-only
 token from `huggingface.co/settings/tokens` and press Save. The token is stored
@@ -777,10 +846,13 @@ deletes it from the Keychain. When no token is saved, the downloader falls back
 to the `HF_TOKEN` environment variable, then `~/.cache/huggingface/token`; the
 download sheet shows which source, if any, is active.
 
-The download catalog also exposes Pro and MTP artifacts for acquisition and
-inspection. They are **not runtime support declarations**: current local and
-distributed execution accepts only the Flash profile, and no current load path
-consumes the separately downloaded MTP component.
+The catalog exposes three Flash entries and the single-file Pro Q2 entry as
+downloadable, selectable and runnable locally. The two-shard Pro Q4 package is
+visible/downloadable but explicitly `downloadOnly`; neither shard becomes an
+independent local model. Pro distribution remains under verification. MTP is
+an accessory outside the main-model GUI catalog, and no current load path
+consumes it. Manual **Browse** remains available, but validates the GGUF with
+the runtime selector before changing the active model.
 
 ## 10. Build, Run, and Package
 
@@ -814,7 +886,8 @@ sign with a Developer ID and notarize.
 | Symptom | Likely Cause | What to Try |
 |---|---|---|
 | Model fails to open under the packaged app | Sandbox access missing | Choose the GGUF with **Browse** instead of typing a path. |
-| Load is refused with "unsupported DeepSeek4 shape" | The GGUF declares the Pro profile | Current local and distributed runtimes support only Flash (43 layers, 256 experts); the Pro download target is catalog-only. Use a Flash GGUF. |
+| Load is refused with "unsupported DeepSeek4 shape" | Shape metadata does not match either the complete Flash or Pro profile | Audit the file with `DS4_TYPES_ONLY=1`; a valid single-file Pro Q2 is supported locally, so this error indicates missing/mismatched metadata or a different profile. |
+| A downloaded Pro Q4 shard cannot be selected | Pro Q4 is a two-shard package | Use the single-file Pro Q2 model for local execution; split-Q4 loading is not implemented. |
 | First load rebuilds sidecars that already exist next to the GGUF | Sandbox can read only the picked file | Use **Grant Model Folder Access…** in Settings so `.q4dense`/`.expbundle` next to the model are reused. |
 | Output is nonsense | Quantization mismatch or wrong GGUF | Run `DS4_TYPES_ONLY=1 swift run DS4Demo <gguf>` and compare expected dtypes. |
 | Very slow decode on 16 GB | SSD expert streaming or dense rereads dominate | Use the GUI fast defaults: expert pread, dense streaming, `mlock`, Q4 attention cache, expert bundle, moderate context. |

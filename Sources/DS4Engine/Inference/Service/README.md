@@ -17,6 +17,15 @@ Il chiamante configura conversazione e strumenti, quindi avvia `send`,
 la KV, esegue prefill e decode, e restituisce un `AsyncThrowingStream<GenEvent>`.
 Il flusso dettagliato è in [`../FLUSSO-INFERENZA.md`](../FLUSSO-INFERENZA.md).
 
+Prima di tokenizer, configurazione DeepSeek e Metal, l'inizializzatore passa da
+[`RuntimeBackendFactory`](../../Runtime/README.md). Qwen viene riconosciuto ma
+rifiutato esplicitamente come backend non ancora implementato; il decode
+DeepSeek continua a usare il tipo concreto `StreamingDecoder`.
+
+Prima del rendering, ogni campo fornito da utenti, storico, tool o API viene
+neutralizzato rispetto ai token strutturali del GGUF. Solo il framing prodotto
+da `ChatRenderer` può quindi diventare BOS, ruolo o delimitatore DSML atomico.
+
 ## Dipendenze
 
 Dipende da `DS4Core`, `DS4Metal`, [`Persistence/KV`](../../Persistence/KV/README.md),

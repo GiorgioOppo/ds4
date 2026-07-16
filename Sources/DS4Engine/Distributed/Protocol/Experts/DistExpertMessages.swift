@@ -3,10 +3,10 @@ import DS4Core
 
 // MARK: - Expert parallelism payloads (Fase A — docs/EXPERT_PARALLELISM.md)
 //
-// Scissione VERTICALE: i worker possiedono un sottoinsieme dei 256 esperti
+// Scissione VERTICALE: i worker possiedono un sottoinsieme degli esperti del GGUF
 // (lo stesso per tutti i layer), il coordinatore tiene l'intero backbone
-// denso (route/attention/KV/head). Definiti e testati in Fase A; nessun
-// percorso attivo li emette ancora (i loop v9 ignorano i tipi ignoti).
+// denso (route/attention/KV/head). La mask è dimensionata dal modello: 32 byte
+// per Flash (256 esperti), 48 byte per Pro (384 esperti).
 
 /// EXPERT ASSIGN: lo shard di ESPERTI di un worker verticale. La proprietà è
 /// una MASK esplicita (bit e = esperto posseduto) e non un range: il
@@ -14,10 +14,15 @@ import DS4Core
 /// deve appartenere a ESATTAMENTE un worker (il coordinatore valida la
 /// partizione al connect).
 public struct DistExpertAssign: Sendable {
+    /// Defensive wire cap: current profiles need at most 48 bytes. Keeping a
+    /// generous ceiling leaves room for future variants without letting a
+    /// hostile length field force an unbounded allocation/slice.
+    static let maxExpertMaskBytes = 4096
+
     public var modelName: String
     public var expertCacheSlots: Int
     public var useExpertBundle: Bool
-    /// 32 byte (256 bit): bit e (byte e/8, bit e%8) = 1 ⇔ questo worker
+    /// ceil(nExperts/8) byte: bit e (byte e/8, bit e%8) = 1 ⇔ questo worker
     /// possiede l'esperto e, per TUTTI i layer routed.
     public var expertMask: Data
     /// Knob di performance del coordinatore (whitelist Dist.perfKnobKeys).
@@ -35,16 +40,14 @@ public struct DistExpertAssign: Sendable {
     }
 
     public func encoded() -> Data {
+        precondition(!expertMask.isEmpty && expertMask.count <= Self.maxExpertMaskBytes,
+                     "expert mask must contain 1...\(Self.maxExpertMaskBytes) bytes")
         var d = Data()
         let name = Data(modelName.utf8)
         d.appendLE(UInt32(name.count)); d.append(name)
         d.appendLE(UInt32(expertCacheSlots))
         d.appendLE(UInt32(useExpertBundle ? 1 : 0))
-        // ESATTAMENTE 32 byte sul filo: una mask corta scalerebbe i campi
-        // successivi (usageLen letto dentro la mask) — pad a zero, mai meno.
-        var mask32 = expertMask.prefix(32)
-        if mask32.count < 32 { mask32.append(Data(repeating: 0, count: 32 - mask32.count)) }
-        d.append(mask32)
+        d.appendLE(UInt32(expertMask.count)); d.append(expertMask)
         d.appendLE(UInt32(usageJSON.count)); d.append(usageJSON)
         d.appendLE(UInt32(envKnobs.count))
         for (k, v) in envKnobs {
@@ -59,11 +62,14 @@ public struct DistExpertAssign: Sendable {
         var o = d.startIndex
         guard d.count >= 4 else { return nil }
         let nameLen = Int(d.readLE(&o) as UInt32)
-        guard nameLen > 0, nameLen < 1024, o + nameLen + 8 + 32 + 4 <= d.endIndex else { return nil }
+        guard nameLen > 0, nameLen < 1024, o + nameLen + 12 <= d.endIndex else { return nil }
         let name = String(decoding: d[o..<o+nameLen], as: UTF8.self); o += nameLen
         let slots = Int(d.readLE(&o) as UInt32)
         let bundle = (d.readLE(&o) as UInt32) != 0
-        let mask = Data(d[o..<o+32]); o += 32
+        let maskLen = Int(d.readLE(&o) as UInt32)
+        guard maskLen > 0, maskLen <= Self.maxExpertMaskBytes,
+              o + maskLen + 4 <= d.endIndex else { return nil }
+        let mask = Data(d[o..<o+maskLen]); o += maskLen
         let usageLen = Int(d.readLE(&o) as UInt32)
         guard usageLen >= 0, o + usageLen + 4 <= d.endIndex else { return nil }
         let usage = Data(d[o..<o+usageLen]); o += usageLen
@@ -80,6 +86,7 @@ public struct DistExpertAssign: Sendable {
             let v = String(decoding: d[o..<o+vLen], as: UTF8.self); o += vLen
             knobs.append((key: k, value: v))
         }
+        guard o == d.endIndex else { return nil }
         return DistExpertAssign(modelName: name, expertCacheSlots: slots, useExpertBundle: bundle,
                                 expertMask: mask, envKnobs: knobs, usageJSON: usage)
     }
@@ -175,4 +182,3 @@ public struct DistExpertSum: Sendable {
         return DistExpertSum(seq: seq, layer: layer, partial: Data(d[o..<o+len]), bits: bits)
     }
 }
-

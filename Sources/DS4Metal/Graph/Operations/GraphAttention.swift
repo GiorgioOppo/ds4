@@ -2,11 +2,20 @@ import Foundation
 import Metal
 
 extension GraphContext {
+    /// Number of decode FlashAttention workgroups for the live row count.
+    /// Arbitrary NWG values in 1...32 are supported by both vec and reduce
+    /// kernels; using the exact chunk count avoids the 4 -> 8 cliff at 129 rows.
+    static func splitKWorkgroups(totalRows: Int, adaptive: Bool) -> Int {
+        guard adaptive else { return 32 }
+        let chunks = max(1, (max(0, totalRows) + 31) / 32)
+        return min(32, chunks)
+    }
+
     /// Decode FlashAttention core (MLA dk=dv=512), encode form. Converts the F32
     /// latent `kvF32` (nKeys x 512) to F16 (`kvF16` scratch) via cpy, then the
     /// vec + reduce kernels, all into the shared command buffer. K==V==latent,
-    /// no mask. Requires nKeys % 32 == 0. `mask` must be a zeroed nKeys*2 byte
-    /// tensor; sinks/pad/tmp are scratch sized per the C dispatch.
+    /// no mask. A partial final 32-row block is padded internally. `mask` must
+    /// be zeroed; sinks/pad/tmp are scratch sized per the C dispatch.
     public func flashAttnCore(q: GPUTensor, kvF32: GPUTensor, kvF16: GPUTensor,
                               mask: GPUTensor, sinks: GPUTensor, pad: GPUTensor, tmp: GPUTensor,
                               heads: GPUTensor, nHead: Int, nKeys: Int, rawStartRow: Int = 0,
@@ -23,19 +32,13 @@ extension GraphContext {
         // loop dei chunk ma scrivevano comunque il loro partial DV=512 (+S/M),
         // che il reduce rileggeva: ~2·nHead·512·32·4 B di traffico morto per
         // layer per token. Il loop del kernel assegna il chunk ic0=iwg·NSG+sgitg
-        // con passo nwg·NSG: per QUALSIASI nwg >= nchunks ogni workgroup attivo
-        // vede al più un chunk — esattamente gli stessi chunk del dispatch
-        // storico, quindi partial bit-identici; spariscono solo i workgroup
-        // vuoti. nwg è arrotondato alla potenza di 2 (≤32) per limitare le
-        // varianti di PSO compilate (≤6). nsg resta calcolato con la formula
-        // storica (nwg=32): supera 1 solo oltre 2048 chiavi, dove comunque
-        // nchunks > 32 e quindi nwg = 32.
-        let nchunks = (total + ncpsg - 1) / ncpsg
-        var nwg = 32
-        if GraphContext.adaptiveSplitK {
-            nwg = 1
-            while nwg < nchunks && nwg < 32 { nwg *= 2 }
-        }
+        // con passo nwg·NSG. NWG non deve essere una potenza di due: il reduce
+        // usa un simdgroup da 32 lane, neutralizza quelle >= NWG e distribuisce
+        // DV4 fra gli NWG simdgroup del threadgroup. Usiamo quindi esattamente
+        // ceil(total/32), fino a 32, evitando il salto 4 -> 8 a 129 righe.
+        // NSG resta 1/2/4 come nel kernel storico.
+        let nwg = GraphContext.splitKWorkgroups(totalRows: total,
+                                                adaptive: GraphContext.adaptiveSplitK)
         var nsg = 1
         while 2 * 32 * nsg * ncpsg < total && nsg < 4 { nsg *= 2 }
         let e = encoder
@@ -56,17 +59,23 @@ extension GraphContext {
         }
         // Raw span: only the SWA window starting at `rawStartRow` (rows hold their
         // absolute-RoPE'd values, so a shifted span is exactly the C slid cache).
-        // With a ring-buffer raw cache (count < contextSize) the window can wrap;
-        // copy it in up to two segments so kvF16 holds it in chronological order.
-        // With the full cache it never wraps -> a single copy identical to before.
+        // With a ring-buffer raw cache (count < contextSize) the window can wrap.
+        // A dedicated kernel de-rotates and converts that window in ONE dispatch;
+        // the full-cache/non-wrapped path remains the historical contiguous cpy.
         let rawRows = kvF32.count / headDim
         let physStart = ((rawStartRow % rawRows) + rawRows) % rawRows
         if physStart + nKeys <= rawRows {
             cpyF32toF16(kvF32, srcOff: physStart * headDim * 4, dstOff: 0, count: nKeys * headDim)
         } else {
-            let seg1 = rawRows - physStart                       // older rows at the physical tail
-            cpyF32toF16(kvF32, srcOff: physStart * headDim * 4, dstOff: 0, count: seg1 * headDim)
-            cpyF32toF16(kvF32, srcOff: 0, dstOff: seg1 * headDim * 2, count: (nKeys - seg1) * headDim)
+            let ringPso = try rt.pipeline("kernel_dsv4_raw_ring_cpy_f32_f16")
+            let args = [UInt32(nKeys), UInt32(headDim), UInt32(rawRows), UInt32(physStart)]
+            e.setComputePipelineState(ringPso)
+            args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+            e.setBuffer(kvF32.buffer, offset: kvF32.byteOffset, index: 1)
+            e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 2)
+            let width = min(headDim, max(1, ringPso.threadExecutionWidth))
+            e.dispatchThreads(MTLSize(width: headDim, height: nKeys, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         }
         if let comp = comp, nComp > 0 {
             cpyF32toF16(comp, srcOff: comp.byteOffset, dstOff: nKeys * headDim * 2, count: nComp * headDim)
@@ -124,4 +133,3 @@ extension GraphContext {
         }
     }
 }
-

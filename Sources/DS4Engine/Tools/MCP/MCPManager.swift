@@ -282,7 +282,10 @@ public final class MCPManager: @unchecked Sendable {
     /// Execute a model-emitted call if it targets an MCP tool; nil if the name
     /// is not an MCP tool (callers then fall back to manual entry). Transport /
     /// server errors come back as an error ToolOutput so the model can react.
-    public func execute(_ call: ToolCall) async -> ToolOutput? {
+    /// Policy-free transport primitive used only by ToolRegistry after it has
+    /// enforced ToolExecutionPolicy. Keep this internal so app targets cannot
+    /// dispatch MCP calls directly.
+    func executeUnchecked(_ call: ToolCall) async -> ToolOutput? {
         guard let target = target(forToolNamed: call.name) else { return nil }
         let client = target.client
         let serverName = target.serverName

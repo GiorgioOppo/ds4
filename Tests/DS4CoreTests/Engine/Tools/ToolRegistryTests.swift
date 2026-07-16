@@ -5,9 +5,13 @@ import DS4Core
 /// Pure-Swift checks of the built-in demo tools and the registry dispatch.
 final class ToolRegistryTests: XCTestCase {
 
+    private var allBuiltinsPolicy: ToolExecutionPolicy {
+        ToolExecutionPolicy(allowedToolNames: Set(ToolRegistry.builtins.map(\.spec.name)))
+    }
+
     func testCalculatorEvaluates() {
         let call = ToolCall(id: "c0", name: "calculator", argumentsJSON: #"{"expression":"2+3*4"}"#)
-        let out = ToolRegistry.execute(call)
+        let out = ToolRegistry.execute(call, policy: allBuiltinsPolicy)
         XCTAssertEqual(out?.name, "calculator")
         XCTAssertEqual(out?.callId, "c0")
         XCTAssertTrue(out?.content.contains("14") ?? false, "got \(out?.content ?? "nil")")
@@ -54,22 +58,26 @@ final class ToolRegistryTests: XCTestCase {
 
     func testCalculatorMissingArgument() {
         let call = ToolCall(id: "c1", name: "calculator", argumentsJSON: "{}")
-        let out = ToolRegistry.execute(call)
+        let out = ToolRegistry.execute(call, policy: allBuiltinsPolicy)
         XCTAssertTrue(out?.content.contains("error") ?? false)
     }
 
     func testClockReturnsDatetime() {
-        let out = ToolRegistry.execute(ToolCall(id: "c2", name: "now", argumentsJSON: "{}"))
+        let out = ToolRegistry.execute(ToolCall(id: "c2", name: "now", argumentsJSON: "{}"),
+                                       policy: allBuiltinsPolicy)
         XCTAssertTrue(out?.content.contains("datetime") ?? false)
     }
 
     func testUnknownToolIsManual() {
-        XCTAssertNil(ToolRegistry.execute(ToolCall(id: "c3", name: "get_weather", argumentsJSON: "{}")))
+        let policy = ToolExecutionPolicy(allowedToolNames: ["get_weather"])
+        XCTAssertNil(ToolRegistry.execute(ToolCall(id: "c3", name: "get_weather", argumentsJSON: "{}"),
+                                          policy: policy))
     }
 
     func testAddSubtractMultiply() {
         func run(_ name: String, _ args: String) -> String? {
-            ToolRegistry.execute(ToolCall(id: "x", name: name, argumentsJSON: args))?.content
+            ToolRegistry.execute(ToolCall(id: "x", name: name, argumentsJSON: args),
+                                 policy: allBuiltinsPolicy)?.content
         }
         XCTAssertTrue(run("add", #"{"a":2,"b":3}"#)?.contains("5") ?? false)
         XCTAssertTrue(run("subtract", #"{"a":10,"b":4}"#)?.contains("6") ?? false)
@@ -80,12 +88,14 @@ final class ToolRegistryTests: XCTestCase {
     }
 
     func testBinaryToolAcceptsQuotedNumbers() {
-        let out = ToolRegistry.execute(ToolCall(id: "q", name: "add", argumentsJSON: #"{"a":"2","b":"40"}"#))
+        let out = ToolRegistry.execute(ToolCall(id: "q", name: "add", argumentsJSON: #"{"a":"2","b":"40"}"#),
+                                       policy: allBuiltinsPolicy)
         XCTAssertTrue(out?.content.contains("42") ?? false)
     }
 
     func testBinaryToolRejectsMissingArgs() {
-        let out = ToolRegistry.execute(ToolCall(id: "m", name: "add", argumentsJSON: #"{"a":2}"#))
+        let out = ToolRegistry.execute(ToolCall(id: "m", name: "add", argumentsJSON: #"{"a":2}"#),
+                                       policy: allBuiltinsPolicy)
         XCTAssertTrue(out?.content.contains("error") ?? false)
     }
 
@@ -114,6 +124,13 @@ final class ToolRegistryTests: XCTestCase {
                                         "web_search", "web_fetch", "git"]))
     }
 
+    func testSubAgentToolsCannotExceedParentDelegationScope() {
+        let constrained = ToolRegistry.constrainSubAgentTools(
+            ["project_read", "file_delete", "git", "subagent_run", "project_search"],
+            allowedByParent: ["project_read", "project_search"])
+        XCTAssertEqual(constrained, ["project_read", "project_search"])
+    }
+
     /// Every tool a default agent declares must exist in the registry —
     /// catches typos when agent rosters and built-ins evolve separately.
     func testDefaultAgentToolsExist() {
@@ -128,9 +145,66 @@ final class ToolRegistryTests: XCTestCase {
 
     /// agents_list output carries the role hint the orchestrator picks by.
     func testAgentsListDescribesRoles() {
-        let out = ToolRegistry.execute(ToolCall(id: "a", name: "agents_list", argumentsJSON: "{}"))?.content ?? ""
+        let out = ToolRegistry.execute(ToolCall(id: "a", name: "agents_list", argumentsJSON: "{}"),
+                                       policy: allBuiltinsPolicy)?.content ?? ""
         XCTAssertTrue(out.contains("revisore"))
         XCTAssertTrue(out.contains("debug"))
         XCTAssertTrue(out.contains("role:"))
+    }
+
+    // MARK: Execution policy
+
+    func testPolicyAllowsOnlyDeclaredBuiltin() {
+        let policy = ToolExecutionPolicy(allowedToolNames: ["calculator"])
+        let allowed = ToolRegistry.execute(
+            ToolCall(id: "ok", name: "calculator", argumentsJSON: #"{"expression":"6*7"}"#),
+            policy: policy
+        )
+        XCTAssertEqual(allowed?.content, #"{"result":42}"#)
+
+        let denied = ToolRegistry.execute(
+            ToolCall(id: "no", name: "file_delete", argumentsJSON: #"{"path":"important"}"#),
+            policy: policy
+        )
+        XCTAssertEqual(denied?.callId, "no")
+        XCTAssertEqual(denied?.name, "file_delete")
+        XCTAssertTrue(denied?.content.contains(#""error":"tool_not_allowed""#) ?? false)
+        XCTAssertTrue(denied?.content.contains(#""tool":"file_delete""#) ?? false)
+    }
+
+    func testEmptyPolicyDeniesByDefault() {
+        let denied = ToolRegistry.execute(
+            ToolCall(id: "deny", name: "calculator", argumentsJSON: #"{"expression":"1+1"}"#),
+            policy: ToolExecutionPolicy(allowedToolNames: [])
+        )
+        XCTAssertTrue(denied?.content.contains("tool_not_allowed") ?? false)
+        XCTAssertFalse(denied?.content.contains(#""result":2""#) ?? false)
+    }
+
+    func testDisallowedUnknownDoesNotFallThroughToManualEntry() {
+        let denied = ToolRegistry.execute(
+            ToolCall(id: "hallucinated", name: "unknown_mutation", argumentsJSON: "{}"),
+            policy: ToolExecutionPolicy(allowedToolNames: [])
+        )
+        XCTAssertNotNil(denied)
+        XCTAssertTrue(denied?.content.contains("tool_not_allowed") ?? false)
+    }
+
+    func testAutoPolicyRejectsMCPNameBeforeDispatch() async {
+        let denied = await ToolRegistry.executeAuto(
+            ToolCall(id: "mcp-denied", name: "mcp_files_delete", argumentsJSON: "{}"),
+            policy: ToolExecutionPolicy(allowedToolNames: [])
+        )
+        XCTAssertEqual(denied?.callId, "mcp-denied")
+        XCTAssertTrue(denied?.content.contains("tool_not_allowed") ?? false)
+    }
+
+    func testAllowedUnknownAutoToolStillFallsBackToManualEntry() async {
+        let name = "manual_weather_for_policy_test"
+        let output = await ToolRegistry.executeAuto(
+            ToolCall(id: "manual", name: name, argumentsJSON: "{}"),
+            policy: ToolExecutionPolicy(allowedToolNames: [name])
+        )
+        XCTAssertNil(output)
     }
 }

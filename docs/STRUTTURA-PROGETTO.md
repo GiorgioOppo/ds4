@@ -18,9 +18,9 @@ In particolare:
 
 | Target | Dipendenze | Contenuto |
 |---|---|---|
-| `DS4Core` | nessuna interna | Formati, strutture dati portabili, tokenizer, sampling, rendering della conversazione. |
-| `DS4Metal` | `DS4Core` | Runtime Metal, tensori GPU, grafo di decode/prefill, pesi e streaming degli esperti. |
-| `DS4Engine` | `DS4Core`, `DS4Metal` | Servizio di inferenza, strumenti, agenti, persistenza, download e distribuzione. |
+| `DS4Core` | nessuna interna | Formati e contratti portabili, rilevamento architettura, sampling e componenti Core dei backend. |
+| `DS4Metal` | `DS4Core` | Runtime e kernel Metal comuni; decoder, pesi e stato GPU separati per backend. |
+| `DS4Engine` | `DS4Core`, `DS4Metal` | Selezione del backend, servizio di inferenza, strumenti, persistenza, download e distribuzione. |
 | `DwarfStar` | `DS4Engine`, `DS4Core` | Interfaccia SwiftUI, stato delle feature e server HTTP esposto dall'app. |
 | `DS4Demo` | `DS4Core`, `DS4Metal` | CLI diagnostica che usa direttamente il motore, senza lo strato applicativo. |
 
@@ -30,42 +30,62 @@ responsabilità del codice; i confini reali sono i target dichiarati in
 
 ## Mappa delle responsabilità
 
-### DS4Core: dati e logica portabile
+### DS4Core: contratti portabili e frontend dei backend
 
+- `Model/Common`: identificatore `general.architecture`, famiglia, descrittore,
+  capacità e rilevamento senza dipendenze Metal.
+- `Model/Backends/DeepSeekV4`: forma, profili Flash/Pro, default e validazione
+  dei metadati `deepseek4.*`.
+- `Model/Backends/Qwen`: punto di estensione documentato; nessuna forma Qwen è
+  ancora implementata.
 - `Conversation/Models`: turni, specifiche e chiamate tool condivise.
-- `Conversation/DSML`: `ChatRenderer`, markup DSML e parsing delle chiamate.
+- `Conversation/Backends/DeepSeekV4`: renderer, markup DSML e parsing delle
+  chiamate specifici del template DeepSeek.
+- `Tokenization/Common`: primitive byte-level riutilizzabili.
+- `Tokenization/Backends/DeepSeekV4`: tokenizer, token speciali e modalità
+  thinking DeepSeek; il percorso Qwen resta separato e non operativo.
 - `Formats/GGUF`: tipi GGUF, cursore binario e modello mappato in memoria.
-- `Formats/KVCheckpoint`: formato persistente dei checkpoint KV.
+- `Formats/KVCheckpoint`: involucro persistente comune; i payload restano dei
+  singoli backend.
 - `Formats/Quantization`: conversioni numeriche e quantizzazione CPU.
-- `Tokenization`: tokenizer, gestione byte e modalità thinking.
 - `Generation`: sampling e politiche di scelta del token.
-- `Model`: forma del modello indipendente dal backend.
 - `Storage` e `Diagnostics`: pianificazione cache/SSD e avanzamento del load.
 
-Qui devono vivere le strutture riutilizzabili senza Metal, rete o UI.
+Qui devono vivere strutture riutilizzabili senza Metal, rete o UI. Un tipo non
+diventa comune solo perché due modelli hanno un concetto con lo stesso nome:
+layout, token speciali e semantica devono essere realmente compatibili.
 
-### DS4Metal: backend e stato GPU
+### DS4Metal: runtime comune e backend GPU concreti
 
 - `Runtime/Core`: device, command queue, pipeline e `GPUTensor`.
 - `Runtime/Generated`: sorgenti Metal incorporati e generati.
-- `Model/Architecture`: dimensioni DeepSeek-V4 e parametri RoPE.
-- `Model/Weights`: descrittori e provider dei pesi per layer.
-- `Model/Quantization`, `Experts`, `Streaming`: formati GPU, bundle/cache degli
-  esperti e streaming dei pesi densi.
-- `Decode/Execution`: stato dell'orchestratore, forward e lavoro per layer.
-- `Decode/Generation`: output head e operazioni di generazione.
-- `Decode/State`, `KV`, `Cache`: scratch state, snapshot KV e cache esperti.
-- `Decode/Attention`, `Prefill`, `Diagnostics`, `Reference`: supporto mirato
-  alle singole fasi, profilazione e implementazione di riferimento.
-- `Graph/Core` e `Graph/Operations`: contesto del grafo e uno stage per file.
-- `Kernels/<Area>`: wrapper Swift dei kernel raggruppati per operazione.
+- `Kernels/<Area>`: wrapper Swift di operazioni riutilizzabili, raggruppati per
+  attenzione, compressione, dense, MoE e tensori.
+- `Graph/Core` e `Graph/Operations`: infrastruttura del grafo oggi condivisa
+  con il backend DeepSeek; non ospita la selezione dell'architettura.
+- `Model/Quantization`: descrittori di quantizzazione GPU comuni.
+- `Backends/Common`: confine di esecuzione ad alto livello e regole che
+  impediscono dispatch dinamico nel ciclo per layer.
+- `Backends/DeepSeekV4/Architecture`: dimensioni Flash e parametri RoPE.
+- `Backends/DeepSeekV4/Weights`, `Streaming`, `Experts`, `MTP`: mapping GGUF,
+  pesi densi ed esperti, sidecar e streaming specifici DeepSeek.
+- `Backends/DeepSeekV4/Decode`: esecuzione, generazione, attenzione, cache,
+  KV, prefill, diagnostica, riferimento e stato del decoder concreto.
+- `Backends/Qwen`: placeholder documentato; nessun kernel o decoder fittizio.
 
 Una struttura dati che contiene buffer o risorse Metal appartiene a questo
-target. Una scelta applicativa su come usare il modello appartiene invece a
-`DS4Engine`.
+target. La scelta dell'architettura avviene prima di entrare nel percorso caldo:
+non aggiungere `if qwen` a `StreamingDecoder` o ai suoi layer. Una scelta
+applicativa su come usare il modello appartiene invece a `DS4Engine`.
 
 ### DS4Engine: API e funzionalità applicative
 
+- `Runtime/Common`: ispezione del modello, selezione del backend, descrittore e
+  capacità consumate dai client.
+- `Runtime/Backends/DeepSeekV4`: costruzione e impostazioni del backend
+  operativo senza cambiare il percorso caldo del decoder.
+- `Runtime/Backends/Qwen`: errore esplicito e punto di estensione, non una
+  implementazione simulata.
 - `Inference/API`: DTO pubblici di richieste, eventi, risultati e benchmark.
 - `Inference/Service`: actor principale e sue estensioni per conversazione,
   generazione e agenti.
@@ -87,6 +107,9 @@ target. Una scelta applicativa su come usare il modello appartiene invece a
 I tipi trasmessi su rete non devono dipendere dal coordinator o dal worker.
 Il trasporto non deve definire la semantica dei messaggi. Le estensioni del
 servizio seguono il nome `InferenceService+Responsabilita.swift`.
+`InferenceService` resta la façade pubblica: ispeziona e seleziona una volta il
+backend, poi conserva il decoder concreto. Demo, GUI e diagnostica non devono
+duplicare euristiche basate sul nome del file.
 
 ### DwarfStar: feature dell'interfaccia
 
@@ -116,9 +139,9 @@ modulo e responsabilità:
 
 ```text
 Tests/DS4CoreTests/
-  Core/                 Conversation, Formats, Generation, Model, Storage, Tokenization
-  Metal/                Decode, Graph, Kernels, Model, Runtime
-  Engine/               Diagnostics, Distributed, ModelManagement, Persistence, Projects, Tools
+  Core/                 contratti comuni e regressioni dei backend Core
+  Metal/                runtime/kernel comuni e regressioni dei backend GPU
+  Engine/               selezione backend, inferenza e servizi applicativi
 ```
 
 Le sottocartelle sono scoperte ricorsivamente sia da SwiftPM sia da XcodeGen.
@@ -136,14 +159,17 @@ target non implica che debba riguardare soltanto `DS4Core`.
    un tipo usare `Tipo+Funzionalita.swift`.
 4. Tenere le dipendenze orientate verso il basso: Core non conosce Metal,
    Engine o UI; Metal non conosce Engine o UI; Engine non conosce SwiftUI.
-5. Un wrapper Metal va in `Kernels/<Area>`; il sorgente eseguito dalla GPU va
-   in `metal/*.metal`.
-6. Una feature GUI nuova riceve una cartella propria, con sottocartelle create
+5. Ispezione e descrizione dell'architettura stanno nel livello comune; forma,
+   tokenizer, template, tensori, decoder e payload KV stanno nel backend.
+6. Un wrapper Metal riutilizzabile va in `Kernels/<Area>`; il sorgente eseguito
+   dalla GPU va in `metal/*.metal`. Un grafo specifico va in
+   `Backends/<Architettura>` e non nel runtime comune.
+7. Una feature GUI nuova riceve una cartella propria, con sottocartelle create
    solo quando esistono responsabilità distinte (modelli, servizi, controller,
    viste o persistenza).
-7. Non modificare a mano file generati. Documentare sempre il comando che li
+8. Non modificare a mano file generati. Documentare sempre il comando che li
    rigenera.
-8. Ogni nuova cartella sorgente, test o operativa deve contenere un
+9. Ogni nuova cartella sorgente, test o operativa deve contenere un
    `README.md` con scopo, dipendenze, file principali e regole di verifica. I
    dettagli trasversali vanno in un documento tematico sotto `docs/`.
 

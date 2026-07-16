@@ -148,27 +148,14 @@ extension ProjectCache {
         return out
     }
 
-    /// True when `url` (which may not exist yet) stays inside `root` AFTER
-    /// resolving symlinks. The lexical prefix checks catch "..", but a symlink
-    /// INSIDE the project (e.g. carried by a cloned repo) can point anywhere;
-    /// resolving only the existing components keeps not-yet-created write
-    /// targets valid, and resolving both sides also normalizes macOS
-    /// /var → /private/var.
-    static func withinRoot(_ url: URL, root: URL) -> Bool {
-        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
-        let prefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
-        return url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(prefix)
-    }
-
     /// Load (and cache) a file's contents; nil if not in the index.
     func fileContents(_ relPath: String) -> String? {
+        guard let url = confinedProjectURL(for: relPath) else { return nil }
         lock.lock()
         if let c = contents[relPath] { lock.unlock(); return c }
-        guard let root, files.contains(relPath) else { lock.unlock(); return nil }
-        let url = root.appendingPathComponent(relPath)
+        guard root != nil, files.contains(relPath) else { lock.unlock(); return nil }
         lock.unlock()
-        guard Self.withinRoot(url, root: root),
-              let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else { return nil }
         lock.lock()
         if cachedBytes + data.count > Self.maxCacheBytes { contents = [:]; cachedBytes = 0 }

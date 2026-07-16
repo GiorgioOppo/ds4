@@ -7,7 +7,9 @@ Contiene i tipi pubblici e `Sendable` usati dai client del motore.
 - `ChatRole`: ruolo logico di un turno.
 - `DS4ThinkMode`: modalità di reasoning esposta dall'applicazione.
 - `SamplingParams`: temperatura, top-k/top-p/min-p, seed e penalità ripetizione.
-- `ModelInfo`: descrizione sintetica del modello caricato.
+- `ModelInfo`: descrizione sintetica del modello caricato; conserva
+  `routedQuantBits` per compatibilità e aggiunge architettura, nome visualizzato,
+  riepilogo quantizzazione e capability runtime.
 - `GenEvent`: stream di reasoning, testo, tool call e avanzamento.
 - `InferenceError`: errori applicativi presentabili al chiamante.
 

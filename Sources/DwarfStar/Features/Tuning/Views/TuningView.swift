@@ -7,8 +7,9 @@ import DS4Engine
 struct TuningView: View {
     @Bindable var store: ChatStore
 
-    var body: some View {
-        VStack(spacing: 0) {
+    @ViewBuilder var body: some View {
+        if store.supportsExpertTuning {
+            VStack(spacing: 0) {
             Form {
                 Section {
                     Label("Weight fine-tuning is not possible on-device: the engine is inference-only (no backward pass), and quantized 2-bit weights are not trainable. This tab tunes runtime behavior: which experts stay resident in RAM and the usage profile that selects them.",
@@ -19,7 +20,7 @@ struct TuningView: View {
                 Section("Expert Cache - Persistent + Dynamic") {
                     Stepper("Slots per layer: \(store.expertCacheSlots == 0 ? "off" : "\(store.expertCacheSlots)")",
                             value: $store.expertCacheSlots, in: 0...64, step: 8)
-                    Text("Each slot keeps one expert resident on the GPU (about 7 MB/slot x 43 layers on the 2-bit model: 8 slots is about 2.4 GB wired). Hot experts stay in RAM (hit = zero copies); cold experts rotate out via LRU. Applies on the next model load.")
+                    Text("Each slot keeps one expert resident on the GPU. On the 43-layer Flash 2-bit model it is about 7 MB/slot/layer (8 slots ≈ 2.4 GB wired); Pro has 61 layers and larger experts, so its cost is substantially higher. Hot experts stay in RAM (hit = zero copies); cold experts rotate out via LRU. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let info = store.tuningInfo, info.cacheHits + info.cacheMisses > 0 {
                         let rate = Double(info.cacheHits) / Double(info.cacheHits + info.cacheMisses) * 100
@@ -83,7 +84,14 @@ struct TuningView: View {
                 .padding(8)
             }
             .background(Color.black.opacity(0.05))
+            }
+            .onAppear { store.refreshTuningInfo() }
+        } else {
+            ContentUnavailableView(
+                "Tuning esperti non disponibile",
+                systemImage: "slider.horizontal.3",
+                description: Text("Il modello selezionato non espone routing/cache esperti in questo backend. I controlli DeepSeek-specifici restano nascosti.")
+            )
         }
-        .onAppear { store.refreshTuningInfo() }
     }
 }

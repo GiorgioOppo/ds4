@@ -2,10 +2,14 @@
 import PackageDescription
 import Foundation
 
-// DS4-gui: a native Swift/SwiftUI front-end for DeepSeek V4 (DwarfStar). The
-// engine is a pure-Swift reimplementation (DS4Core + DS4Metal): no C engine, no
-// prebuilt static lib, no external links — so everything builds in a clean
-// SwiftPM package and the standalone .xcodeproj. Run `swift build` or `make`.
+// DwarfStar: a native Swift/SwiftUI front-end for local LLM backends. DeepSeek
+// V4 Flash and the single-file Pro Q2 profile are operational locally through
+// one geometry-driven backend; split Pro Q4 loading is not implemented. Qwen is
+// recognized but deliberately not executable until its own tokenizer, tensor
+// mapping and decoder exist. The engine is pure Swift (DS4Core + DS4Metal): no
+// C engine, prebuilt static library
+// or external process, so everything builds in SwiftPM and the standalone
+// .xcodeproj. Run `swift build` or `make`.
 
 /// Documentation is intentionally colocated with every source/test directory.
 /// Keep the manifest warning-free without duplicating that growing list here:
@@ -44,15 +48,15 @@ let package = Package(
         .executable(name: "DS4Demo", targets: ["DS4Demo"]),
     ],
     targets: [
-        // Pure-Swift reimplementation of the ds4 engine, built up module by
-        // module (see the C->Swift conversion phases).
+        // Portable formats, architecture inspection and backend-owned model
+        // contracts. It has no Metal, UI or application dependencies.
         .target(
             name: "DS4Core",
             exclude: markdownFiles(in: "Sources/DS4Core")
         ),
 
-        // Swift Metal runtime (Phase 8+): compiles the vendored metal/ kernels
-        // at runtime and dispatches them. Links the Metal framework.
+        // Swift Metal runtime plus concrete architecture backends. It compiles
+        // the vendored metal/ kernels at runtime and links Metal.framework.
         .target(
             name: "DS4Metal",
             dependencies: ["DS4Core"],
@@ -68,8 +72,8 @@ let package = Package(
             exclude: markdownFiles(in: "Tests/DS4CoreTests")
         ),
 
-        // Swift-native inference service backing the GUI: pure-Swift engine
-        // (DS4Core tokenizer/GGUF + DS4Metal StreamingDecoder) — NO external links.
+        // Swift-native inference service backing the GUI. It inspects the GGUF,
+        // selects one concrete backend once, then keeps dispatch out of hot loops.
         .target(
             name: "DS4Engine",
             dependencies: ["DS4Core", "DS4Metal"],

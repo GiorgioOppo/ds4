@@ -10,7 +10,7 @@ GGUF, so verify it against the exact model being deployed.
 
 At runtime the selected GGUF supplies vocabulary and special-token metadata,
 while the compiled
-[`ChatRenderer`](../Sources/DS4Core/Conversation/DSML/ChatRenderer.swift)
+[`ChatRenderer`](../Sources/DS4Core/Conversation/Backends/DeepSeekV4/DSML/ChatRenderer.swift)
 constructs conversation text. DwarfStar can display the GGUF's embedded Jinja
 template for diagnostics, but does not interpret it during generation. This
 file is likewise not loaded at runtime and does not override the model; renderer
@@ -92,7 +92,7 @@ print(prompt)
 - Schema/specification: DeepSeek-V4 paper, Table 4 for the tool-call schema and
   Table 5 for special tokens.
 - Equivalent Swift implementation:
-  [`ChatRenderer`](../Sources/DS4Core/Conversation/DSML/ChatRenderer.swift).
+  [`ChatRenderer`](../Sources/DS4Core/Conversation/Backends/DeepSeekV4/DSML/ChatRenderer.swift).
 - Engine details:
   [`docs/ARCHITETTURA-MOTORE.md`](../docs/ARCHITETTURA-MOTORE.md), section 14.
 - Tool lifecycle and ownership:

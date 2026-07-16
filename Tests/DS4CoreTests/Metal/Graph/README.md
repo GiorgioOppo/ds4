@@ -1,10 +1,11 @@
 # Metal Graph Tests
 
-`Graph*Tests.swift` validates composed `DS4Metal` operations: context setup,
-QKV, router, MoE, FFN, compressor, attention variants, HC reduction, complete
-decode layers, and decoder execution.
+Questa cartella conserva le operazioni di grafo realmente comuni: gestione del
+`GraphContext` e blocco FFN denso. Le composizioni MLA, HyperConnections, NSA,
+router e decode layer sono testate nel
+[`backend DeepSeek-V4`](../Backends/DeepSeekV4/Graph/README.md).
 
-Graph tests sit above individual kernels. They should detect wiring, shape,
-buffer-lifetime, and command-order errors while using CPU/reference components
-for expected output. Keep kernel-only edge cases in `Kernels/`.
-
+I test di grafo stanno sopra i singoli kernel. Devono rilevare errori di wiring,
+shape, durata dei buffer e ordine dei comandi usando componenti CPU/reference
+per calcolare i risultati attesi. I casi limite dei singoli kernel restano in
+`Kernels/`.

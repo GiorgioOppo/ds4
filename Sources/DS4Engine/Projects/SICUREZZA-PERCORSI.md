@@ -8,9 +8,14 @@ percorso standardizzato/risolto esce dalla root devono essere rifiutati.
 
 ## Link simbolici
 
-I symlink non vengono indicizzati. Prima di leggere, scrivere o eliminare si
-risolve nuovamente il percorso e si verifica che resti sotto la root; questo
-controllo deve avvenire al momento dell'I/O per ridurre rischi TOCTOU.
+I symlink non vengono indicizzati e non sono mai percorsi validi per i tool,
+anche quando puntano a una destinazione interna. Prima di leggere, scrivere,
+modificare o eliminare si controlla separatamente ogni componente esistente
+sotto la root. Il controllo non si limita a risolvere l'URL finale: se la foglia
+non esiste, Foundation può lasciare irrisolto un symlink in una directory padre.
+Le directory realmente mancanti restano valide per la creazione di nuovi file.
+Le scritture riconvalidano il percorso dopo aver creato le directory intermedie
+e subito prima dell'I/O, così da ridurre la finestra TOCTOU.
 
 ## Indicizzazione
 

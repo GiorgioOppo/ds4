@@ -28,6 +28,29 @@ do {
     }
     let ggufPath = args[1]
     let maxNew = args.count >= 3 ? (Int(args[2]) ?? 4) : 4
+    let maxKeys: Int
+    if let rawContext = ProcessInfo.processInfo.environment["DS4_DEMO_CONTEXT"] {
+        guard let parsed = Int(rawContext), (1_024...1_000_000).contains(parsed) else {
+            log("DS4Demo: DS4_DEMO_CONTEXT deve essere un intero tra 1024 e 1000000")
+            exit(2)
+        }
+        maxKeys = parsed
+    } else {
+        maxKeys = 4_096
+    }
+    log("DS4Demo: capacita' contesto = \(maxKeys) token (DS4_DEMO_CONTEXT)")
+    let syntheticLiveContext: Int?
+    if let rawLive = ProcessInfo.processInfo.environment["DS4_DEMO_LIVE_CONTEXT"] {
+        guard let parsed = Int(rawLive), parsed >= 8,
+              parsed + maxNew + 1 <= maxKeys else {
+            log("DS4Demo: DS4_DEMO_LIVE_CONTEXT deve essere >= 8 e lasciare spazio a maxNew+1 entro DS4_DEMO_CONTEXT")
+            exit(2)
+        }
+        syntheticLiveContext = parsed
+        log("DS4Demo: target contesto realmente usato = \(parsed) token sintetici")
+    } else {
+        syntheticLiveContext = nil
+    }
 
     let diag = ProcessInfo.processInfo.environment["DS4_DIAG"] == "1"
     var diskCeilingGBs = 0.0
@@ -87,6 +110,26 @@ do {
 
     log("DS4Demo: opening \(ggufPath) …")
     let model = try GGUFModel(path: ggufPath, metalMapping: true, prefetchCPU: false)
+    // DS4Demo cannot import DS4Engine without changing the XcodeGen target graph,
+    // so it shares the same canonical DS4Core detector used by the engine factory.
+    // Select before constructing DeepSeek tokenizer/dims: Qwen must never fall
+    // through into misleading errors about missing deepseek4.* metadata.
+    let detectedArchitecture = try ModelArchitectureDetector.detect(in: model)
+    do {
+        try ModelArchitectureDetector.requireImplemented(detectedArchitecture)
+    } catch {
+        if detectedArchitecture.family == .qwen {
+            log("DS4Demo: backend \(detectedArchitecture.id.rawValue) non ancora implementato")
+        } else {
+            log("DS4Demo: \(error)")
+        }
+        exit(2)
+    }
+    guard detectedArchitecture.id == .deepSeekV4 else {
+        log("DS4Demo: architettura GGUF non supportata: \(detectedArchitecture.id.rawValue)")
+        exit(2)
+    }
+    log("DS4Demo: architecture=\(detectedArchitecture.id.rawValue) model=\(model.string("general.name") ?? "GGUF")")
     if diag { log(mtpReport(model)) }
     // Quant-format audit (DS4_TYPES_ONLY=1): print the GGUF dtype of the per-layer
     // weights the engine assumes (experts=Q4_K, router=Q8). Mismatch => garbage.
@@ -111,9 +154,12 @@ do {
         for id in ids { log("    \(id) -> '\(String(bytes: tok.tokenText(id), encoding: .utf8) ?? "?")'") }
         exit(0)
     }
-    var dims = DSV4Shape.dims
+    let config = try ModelConfig(model: model)
+    let geometry = DSV4RuntimeGeometry(configuration: config)
+    var dims = geometry.dims
     let mq = GGUFWeights.detectMoEQuant(model)
     dims.gateQuant = mq.gate; dims.upQuant = mq.up; dims.downQuant = mq.down; dims.routerF16 = mq.routerF16
+    log("DS4Demo: profilo=\(config.shape.name) layer=\(geometry.nLayers) esperti=\(dims.nExperts)")
     log("DS4Demo: MoE quant gate=\(mq.gate) up=\(mq.up) down=\(mq.down) routerF16=\(mq.routerF16)")
     // DS4_MTP_GGUF (Fase M1, docs/SELF-SPECULATIVE.md § Fase M): apre il
     // sidecar MTP e stampa inventario + validazione dell'interfaccia draft.
@@ -139,12 +185,12 @@ do {
         dims.activeExperts = max(1, min(kk, dims.k))
         log("DS4Demo: active experts (top-k) = \(dims.activeExperts) of \(dims.k)")
     }
-    let rope = RopeParams(nCtxOrig: 4096, freqBase: 10000, freqScale: 1, extFactor: 0,
-                          attnFactor: 1, betaFast: 32, betaSlow: 1)
+    let rope = geometry.ropeParams(layer: 0)
     // Fast path: non-routed weights resident (memoized), only the 6 selected experts
     // gathered per token (~6/256 of expert IO) — the C --ssd-streaming model.
     let dec = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
-                                                              nLayers: DSV4Shape.nLayer, maxKeys: 4096)
+                                                              nLayers: geometry.nLayers, maxKeys: maxKeys,
+                                                              geometry: geometry)
     log("DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…")
     // Persistenza della usage imatrix TRA i run della demo (l'app la persiste
     // per agente). Senza, i pool della slot-cache nascono al primo token con
@@ -173,7 +219,7 @@ do {
         // "@/percorso/file": il prompt e' il CONTENUTO del file — niente quoting
         // shell per i testi lunghi (benchmark del prefill). Troncato a
         // DS4_PROMPT_MAX_CHARS (default 12000 ≈ 3k token) per stare nel KV
-        // della demo insieme ai token generati.
+        // configurato della demo insieme ai token generati.
         // DS4_PROMPT_FILE: come "@path" ma via env — immune allo splitting
         // della shell sugli argomenti (visto in campo: il prompt arrivava
         // spezzato alla prima parola nonostante le virgolette).
@@ -196,7 +242,26 @@ do {
             prompt = text
         }
         let tok = try Tokenizer(model: model)
-        let ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
+        var ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
+        if let target = syntheticLiveContext {
+            // Exact live-context benchmark: preserve a valid chat frame while
+            // tiling only ordinary user-text tokens. This avoids depending on
+            // bytes/token of an external corpus and makes A/B frontiers exact.
+            let suffix = [Int(tok.assistantId), Int(tok.thinkEndId)]
+            var synthetic = [Int(tok.bosId), Int(tok.userId)]
+            let encodedFiller = tok.tokenize(prompt + " ").map { Int($0) }
+            let filler = encodedFiller.isEmpty ? [Int(tok.eosId)] : encodedFiller
+            let contentEnd = target - suffix.count
+            var i = 0
+            while synthetic.count < contentEnd {
+                synthetic.append(filler[i % filler.count])
+                i += 1
+            }
+            if synthetic.count > contentEnd { synthetic.removeLast(synthetic.count - contentEnd) }
+            synthetic.append(contentsOf: suffix)
+            ids = synthetic
+            log("DS4Demo: contesto sintetico esatto: \(ids.count) token (frame BOS/User/Assistant preservato)")
+        }
         // Sampling defaults remain greedy for benchmark/backward compatibility,
         // but the 2-bit model can fall into a coherent yet unrelated greedy
         // continuation after one quantization flip. Demo-specific env knobs let
@@ -213,8 +278,8 @@ do {
             : String(format: "temp %.2f, top-k %d, top-p %.2f, min-p %.2f, repeat %.2f",
                      sampleTemperature, sampleTopK, sampleTopP, sampleMinP, sampleRepeat)
         log("DS4Demo: prompt '\(shown)' (\(prompt.count) car.) -> \(ids.count) tokens; generating \(maxNew) (\(samplingLabel), streaming)…")
-        if ids.count + maxNew + 1 > 4096 {
-            log("DS4Demo: ERRORE il prompt (\(ids.count) token) + \(maxNew) generati supera il KV della demo (maxKeys 4096) — abbassa DS4_PROMPT_MAX_CHARS")
+        if ids.count + maxNew + 1 > maxKeys {
+            log("DS4Demo: ERRORE il prompt (\(ids.count) token) + \(maxNew) generati supera il KV della demo (maxKeys \(maxKeys)) — abbassa DS4_PROMPT_MAX_CHARS o aumenta DS4_DEMO_CONTEXT")
             exit(2)
         }
         let stdout = FileHandle.standardOutput
@@ -469,7 +534,7 @@ do {
                 log("  allocazione usage-driven: storia insufficiente (~43+ token/layer) -> uniforme \(base); rilancia con più token")
             }
             log("  layer   route  conc(top8)  conc(top16)  slot")
-            for il in 0..<DSV4Shape.nLayer {
+            for il in 0..<geometry.nLayers {
                 let r = usage.routes(layer: il)
                 guard r > 0 else { continue }
                 log(String(format: "  %5d %7d       %.2f        %.2f  %4d", il, r,
@@ -505,4 +570,3 @@ do {
     log("DS4Demo error: \(error)")
     exit(1)
 }
-
