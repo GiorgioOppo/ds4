@@ -35,6 +35,7 @@ utilizzabili come promessa prestazionale per questa app.
 | Tokenizer/chat/tool | implementati con golden test sugli ID reali |
 | Router | oracle CPU e kernel Metal dedicato |
 | DSA/IndexShare | layout, policy, scorer/top-k CPU e prime primitive Metal |
+| Attenzione compatta | oracle CPU doppio (espanso vs assorbito low-rank) come fixture per i kernel |
 | Cache | planner F16 lazy; KV-LoRA norm/store e indexer-K norm/RoPE/store isolati |
 | Decoder | non ancora presente |
 

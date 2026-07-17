@@ -19,3 +19,12 @@ decode path and not a declaration that the GLM runtime is ready. It is kept
 separate from the sibling batch-Metal score contract: this F32 single-token
 oracle owns finite-score validation, deterministic selection and reuse policy,
 whereas the batch contract models F16 cache input and causal `-inf` masking.
+
+`GLM52AttentionCPUReference` is the oracle for the stage after selection: the
+attention core over the compact cache rows. It keeps two evaluation orders —
+`expanded` (upstream's textbook F32 reference: materialize per-head keys and
+values from k_b/v_b, then attend) and `absorbed` (the kernel order: absorb the
+query into k_b, score raw 512-wide cache rows, accumulate softmax in the
+KV-LoRA domain, project through v_b once). Their tolerance-checked agreement is
+the fixture the future `qk_lowrank`/`attention_indexed` Metal kernels must
+match.
