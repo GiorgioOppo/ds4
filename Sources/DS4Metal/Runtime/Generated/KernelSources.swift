@@ -11670,6 +11670,80 @@ kernel void kernel_glm52_value_project_f32(
         attn_out[(uint64_t)head * N_VALUE + d] = partial;
     }
 }
+
+// MARK: - Compact DSA attention core (Q8_0 weights)
+
+// Q8_0 variants of the two projection stages. Row layouts match the F32
+// kernels exactly — [head][kvLora] rows of 192 for attn_k_b, [head][value]
+// rows of 512 for attn_v_b — with each row stored as consecutive block_q8_0
+// blocks (2-byte f16 scale + 32 int8 = 34 bytes, prelude struct). Each of the
+// 32 lanes owns position `lane` of every block, so the block scale multiplies
+// OUTSIDE the int8 product exactly like upstream's dot_q8_0_row_f32_ref; the
+// activation stays F32 (the bit-faithful reference path, not the requantized
+// matvec_q8_0 fast path).
+
+kernel void kernel_glm52_qk_lowrank_q8_0(
+        constant ds4_metal_args_glm52_attention &args,
+        device const float *queries,
+        device const char  *key_b,
+        device float       *q_low,
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint N_HEAD = 64u;
+    constexpr uint N_NOPE = 192u;
+    constexpr uint N_LORA = 512u;
+    constexpr uint QK_DIM = 256u;
+    constexpr uint N_BLOCKS = N_NOPE / QK8_0;             // 6
+    constexpr uint ROW_BYTES = N_BLOCKS * 34u;            // 204
+    const uint j = group.x * 4u + (uint)simd_group;
+    const uint head = group.y;
+    if (j >= N_LORA || head >= N_HEAD) return;
+
+    device const float *q = queries + (uint64_t)head * QK_DIM;
+    device const block_q8_0 *row = (device const block_q8_0 *)
+        (key_b + ((uint64_t)head * N_LORA + j) * ROW_BYTES);
+    float partial = 0.0f;
+    for (uint b = 0u; b < N_BLOCKS; b++) {
+        partial += (float)row[b].d * (float)row[b].qs[lane]
+            * q[b * QK8_0 + lane];
+    }
+    partial = simd_sum(partial);
+    if (lane == 0u) {
+        q_low[(uint64_t)head * N_LORA + j] = partial;
+    }
+}
+
+kernel void kernel_glm52_value_project_q8_0(
+        constant ds4_metal_args_glm52_attention &args,
+        device const float *attn_lora,
+        device const char  *value_b,
+        device float       *attn_out,
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint N_HEAD = 64u;
+    constexpr uint N_LORA = 512u;
+    constexpr uint N_VALUE = 256u;
+    constexpr uint N_BLOCKS = N_LORA / QK8_0;             // 16
+    constexpr uint ROW_BYTES = N_BLOCKS * 34u;            // 544
+    const uint d = group.x * 4u + (uint)simd_group;
+    const uint head = group.y;
+    if (d >= N_VALUE || head >= N_HEAD) return;
+
+    device const float *lora = attn_lora + (uint64_t)head * N_LORA;
+    device const block_q8_0 *row = (device const block_q8_0 *)
+        (value_b + ((uint64_t)head * N_VALUE + d) * ROW_BYTES);
+    float partial = 0.0f;
+    for (uint b = 0u; b < N_BLOCKS; b++) {
+        partial += (float)row[b].d * (float)row[b].qs[lane]
+            * lora[b * QK8_0 + lane];
+    }
+    partial = simd_sum(partial);
+    if (lane == 0u) {
+        attn_out[(uint64_t)head * N_VALUE + d] = partial;
+    }
+}
 """###,
         "argsort": ###"""
 struct ds4_metal_args_argsort {

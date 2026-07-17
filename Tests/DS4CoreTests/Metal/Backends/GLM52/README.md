@@ -38,3 +38,8 @@ path — and that `-INFINITY` causal rows are never selected.
 The DSA-chain suite composes the GPU primitives end to end (indexer scores →
 top-k → staged compact attention) against the same chain run through the CPU
 oracles: selections must match exactly, attention output within tolerance.
+
+The Q8_0 suite quantizes the projection weights with the shared test
+quantizer, dequantizes the same bytes, and requires the Q8 kernels to match
+the F32 baselines on those dequantized values — quantization error belongs to
+the fixture, never to the kernel.

@@ -227,4 +227,94 @@ extension MetalRuntime {
             qLow: qLow, query: query, cacheBits: cacheBits, selection: selection)
         return try glm52ValueProject(attnLora: attnLora, valueB: valueB)
     }
+
+    // MARK: - Q8_0 weight variants
+
+    /// GGUF Q8_0 row bytes for `elements` values: consecutive 34-byte blocks
+    /// of 32 (2-byte f16 scale + 32 signed int8).
+    static func glm52Q8RowBytes(_ elements: Int) -> Int {
+        precondition(elements.isMultiple(of: 32))
+        return (elements / 32) * 34
+    }
+
+    private func glm52AttentionByteBuffer(_ bytes: [UInt8]) throws -> MTLBuffer {
+        guard let buffer = device.makeBuffer(
+            bytes: bytes, length: bytes.count, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        return buffer
+    }
+
+    /// Stage 1 on quantized weights — `attn_k_b` exactly as stored in the
+    /// GGUF: Q8_0 rows of 192 (204 bytes) indexed `[head][kvLora]`.
+    public func glm52QKLowRankQ8(query: [Float], keyBQ8: [UInt8]) throws -> [Float] {
+        let g = GLM52AttentionGeometry.v5_2
+        let rowBytes = Self.glm52Q8RowBytes(g.nopeDimension)
+        guard query.count == g.headCount * g.qkDimension,
+              keyBQ8.count == g.headCount * g.kvLoraRank * rowBytes else {
+            throw MetalError.unsupported(
+                "GLM 5.2 qk_lowrank Q8_0 expects v5_2 query/key_b geometry")
+        }
+        let outputCount = g.headCount * g.kvLoraRank
+        let queryBuffer = try glm52AttentionBuffer(query)
+        let keyBBuffer = try glm52AttentionByteBuffer(keyBQ8)
+        guard let outputBuffer = device.makeBuffer(
+            length: outputCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        try glm52AttentionDispatch(
+            pipelineName: "kernel_glm52_qk_lowrank_q8_0",
+            arguments: [0, 0, 0, 0],
+            buffers: [queryBuffer, keyBBuffer, outputBuffer],
+            threadgroups: MTLSize(width: g.kvLoraRank / 4,
+                                  height: g.headCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        return glm52AttentionReadback(outputBuffer, count: outputCount)
+    }
+
+    /// Stage 3 on quantized weights — `attn_v_b` exactly as stored in the
+    /// GGUF: Q8_0 rows of 512 (544 bytes) indexed `[head][value]`.
+    public func glm52ValueProjectQ8(attnLora: [Float],
+                                    valueBQ8: [UInt8]) throws -> [Float] {
+        let g = GLM52AttentionGeometry.v5_2
+        let rowBytes = Self.glm52Q8RowBytes(g.kvLoraRank)
+        guard attnLora.count == g.headCount * g.kvLoraRank,
+              valueBQ8.count == g.headCount * g.valueDimension * rowBytes else {
+            throw MetalError.unsupported(
+                "GLM 5.2 value projection Q8_0 expects v5_2 attn_lora/value_b geometry")
+        }
+        let outputCount = g.headCount * g.valueDimension
+        let loraBuffer = try glm52AttentionBuffer(attnLora)
+        let valueBBuffer = try glm52AttentionByteBuffer(valueBQ8)
+        guard let outputBuffer = device.makeBuffer(
+            length: outputCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        try glm52AttentionDispatch(
+            pipelineName: "kernel_glm52_value_project_q8_0",
+            arguments: [0, 0, 0, 0],
+            buffers: [loraBuffer, valueBBuffer, outputBuffer],
+            threadgroups: MTLSize(width: g.valueDimension / 4,
+                                  height: g.headCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
+        return glm52AttentionReadback(outputBuffer, count: outputCount)
+    }
+
+    /// Chained validation path on quantized projections: Q8_0 absorb, F16
+    /// softmax accumulation, Q8_0 value projection. Comparable to the F32
+    /// oracle run on the DEQUANTIZED weights within float tolerance.
+    public func glm52CompactAttentionQ8(query: [Float],
+                                        keyBQ8: [UInt8],
+                                        valueBQ8: [UInt8],
+                                        cacheBits: [UInt16],
+                                        selection: [UInt32]) throws -> [Float] {
+        _ = try GLM52CompactAttentionPlan(
+            query: query, cacheBits: cacheBits, selection: selection)
+        let qLow = try glm52QKLowRankQ8(query: query, keyBQ8: keyBQ8)
+        let attnLora = try glm52AttentionIndexed(
+            qLow: qLow, query: query, cacheBits: cacheBits, selection: selection)
+        return try glm52ValueProjectQ8(attnLora: attnLora, valueBQ8: valueBQ8)
+    }
 }

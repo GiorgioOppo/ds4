@@ -27,7 +27,11 @@ The currently validated atomic boundaries are:
   `attention_indexed` (softmax over the selected rows, accumulated in the
   KV-LoRA domain, selection capped at the architecture's top-2048) and
   `value_project` (`attn_v_b`), each dispatched in isolation plus a chained
-  validation path compared against `GLM52AttentionCPUReference`;
+  validation path compared against `GLM52AttentionCPUReference`. The two
+  projections also exist as Q8_0 variants reading the GGUF weight bytes
+  directly (34-byte blocks, scale outside the int8 product like upstream's
+  `dot_q8_0_row_f32_ref`); their baseline is the F32 oracle on the
+  dequantized weights;
 - `GLM52IndexerTopK`: multi-block descending top-k over token-major score rows
   (the `ds4_gpu_indexer_topk_tensor` dispatch: per-block bitonic argsort, then
   iterative binary-search merges), reusing the vendored DeepSeek argsort
