@@ -30,3 +30,7 @@ The compact-attention suite compares the staged kernels (`qk_lowrank`,
 `attention_indexed`, `value_project`) stage by stage against scalar dots and
 chained end to end against `GLM52AttentionCPUReference` on the same
 F16-rounded cache, plus the selection/geometry rejection paths.
+
+The top-k suite proves the multi-block argsort+merge dispatch equal to
+`GLM52IndexerReference.causalTopK` on distinct scores — single-pass and merge
+path — and that `-INFINITY` causal rows are never selected.

@@ -27,7 +27,12 @@ The currently validated atomic boundaries are:
   `attention_indexed` (softmax over the selected rows, accumulated in the
   KV-LoRA domain, selection capped at the architecture's top-2048) and
   `value_project` (`attn_v_b`), each dispatched in isolation plus a chained
-  validation path compared against `GLM52AttentionCPUReference`.
+  validation path compared against `GLM52AttentionCPUReference`;
+- `GLM52IndexerTopK`: multi-block descending top-k over token-major score rows
+  (the `ds4_gpu_indexer_topk_tensor` dispatch: per-block bitonic argsort, then
+  iterative binary-search merges), reusing the vendored DeepSeek argsort
+  kernels. Causal future rows arrive as `-INFINITY` scores and sink to the
+  end; ties follow the bitonic network, not the oracle's lowest-index rule.
 
 The compact-store input is intentionally *cache-ready*: its first 512 values
 have already passed through `GLM52KVLoRANorm` and its final 64 values are the
@@ -37,6 +42,5 @@ LayerNorm rather than RMSNorm. Likewise, the GLM indexer rotates the first 64
 columns; this deliberately follows upstream even though one generic query-side
 helper calls its operation `rope_tail`.
 
-Top-K selection on GPU remains a separate future primitive (the CPU oracle is
-`GLM52IndexerReference.causalTopK`). These wrappers allocate shared buffers for
-deterministic tests; they do not make the GLM backend runnable.
+These wrappers allocate shared buffers for deterministic tests; they do not
+make the GLM backend runnable.
