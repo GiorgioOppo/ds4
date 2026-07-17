@@ -9,10 +9,11 @@ through the geometry-driven pipeline and expert-shard paths; real-model
 multi-Mac numerical validation is still pending. The source tree and model loader are being
 prepared for an independent Qwen backend. Qwen GGUF files are recognized but
 intentionally refused until their tokenizer, tensor mapping and decoder are
-implemented. GLM 5.2 is in an earlier, explicitly download-only stage: the
-three monolithic GGUF variants from `antirez/glm-5.2-gguf` are cataloged with
-pinned sizes and SHA-256 digests, but this build does not yet recognize or run
-the `glm-dsa` backend. The DeepSeek engine is a faithful
+implemented. GLM 5.2 is in a staged native-port phase: the three monolithic
+GGUF variants from `antirez/glm-5.2-gguf` are cataloged with pinned sizes and
+SHA-256 digests; this build recognizes `glm-dsa`, validates its shape/tensors
+and provides its tokenizer/chat frontend, but still refuses inference until the
+complete Metal decoder passes end-to-end logits tests. The DeepSeek engine is a faithful
 port of upstream `ds4.c` / `ds4_metal.m`: no C runtime engine, prebuilt static
 library or external process for normal inference. The Flash 2-bit GGUF runs on
 a 16 GB MacBook by streaming routed expert weights from SSD; that memory claim
@@ -144,8 +145,9 @@ GUI. The three DeepSeek V4 Flash variants and the single-file DeepSeek V4 Pro
 Q2 model can be downloaded, selected and run locally. The two-file Pro Q4
 package remains download-only because the local loader does not assemble split
 GGUF shards. The three GLM 5.2 variants from `antirez/glm-5.2-gguf` are also
-downloadable, resumable and integrity-checked, but remain non-selectable until
-the native GLM backend is implemented. Downloads live
+downloadable, resumable and integrity-checked. Their metadata and frontend can
+be inspected, but they remain non-selectable until the native GLM decoder is
+complete. Downloads live
 under `~/Library/Application Support/DwarfStar/models/`, resume from `.part`
 files and reuse an already present regular file instead of downloading it
 again; entries with a pinned byte count, including GLM 5.2, require an exact
@@ -748,7 +750,8 @@ local-model selection. Pro Q4 remains visible in the download sheet with its
 explicit unavailable reason; downloading that split package never changes the
 active model. The three GLM 5.2 variants follow the same download-only rule:
 they are shown in the sheet but excluded from automatic discovery and model
-selection until the `glm-dsa` runtime is implemented. The MTP
+selection until the `glm-dsa` runtime is implemented. Detector, tokenizer and
+schema support do not override this gate. The MTP
 companion is deliberately outside the main-model GUI catalog and is not shown
 as a selectable/downloadable model row.
 

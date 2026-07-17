@@ -20,7 +20,7 @@ principali e regole di modifica.
 ## Motore e inferenza
 
 - [`architectures/`](architectures/README.md) — documentazione separata per
-  DeepSeek V4, Qwen e la tranche download-only GLM 5.2.
+  DeepSeek V4, Qwen e il port progressivo GLM 5.2.
 - [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md) — ciclo completo da prompt a
   token, ownership dello stato, prefill, decode e tool loop.
 - [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md) — dettagli del modello,

@@ -10,7 +10,8 @@ backend DeepSeek sono approfondite in
 ## Livelli del backend
 
 ```text
-Backend concreto (oggi DeepSeekV4/StreamingDecoder)
+Backend concreto (oggi DeepSeekV4/StreamingDecoder;
+GLM52 resta in tranche isolate non collegate)
              |
              v
 decoder, stato KV e provider dei pesi del backend

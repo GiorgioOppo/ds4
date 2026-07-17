@@ -42,6 +42,8 @@ final class ModelArchitectureTests: XCTestCase {
 
     func testArchitectureIDNormalization() {
         XCTAssertEqual(ModelArchitectureID("  DeepSeek-V4\n"), .deepSeekV4)
+        XCTAssertEqual(ModelArchitectureID("GLM_DSA"), .glmDSA)
+        XCTAssertEqual(ModelArchitectureID.glmDSA.ggufMetadataNamespace, "glm-dsa")
         XCTAssertEqual(ModelArchitectureID("QWEN_2.MOE").rawValue, "qwen2moe")
         XCTAssertEqual(ModelArchitectureID.normalize(" Qwen 3 "), "qwen3")
     }
@@ -94,6 +96,23 @@ final class ModelArchitectureTests: XCTestCase {
                 }
                 XCTAssertEqual(id, ModelArchitectureID(value))
                 XCTAssertEqual(family, .qwen)
+            }
+        }
+    }
+
+    func testRecognizesGLMDSAWithoutClaimingRuntimeSupport() throws {
+        for value in ["glm-dsa", "GLM_DSA", "glm.dsa"] {
+            let detected = try ModelArchitectureDetector.detect(generalArchitecture: value)
+            XCTAssertEqual(detected.id, .glmDSA, value)
+            XCTAssertEqual(detected.family, .glm, value)
+            XCTAssertEqual(detected.backendAvailability, .recognizedButNotImplemented, value)
+
+            XCTAssertThrowsError(try ModelArchitectureDetector.requireImplemented(detected)) { error in
+                guard case ModelArchitectureError.backendNotImplemented(let id, let family) = error else {
+                    return XCTFail("unexpected error for \(value): \(error)")
+                }
+                XCTAssertEqual(id, .glmDSA)
+                XCTAssertEqual(family, .glm)
             }
         }
     }

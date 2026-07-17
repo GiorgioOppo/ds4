@@ -7,16 +7,23 @@ kept separate from the frontend of each model backend.
   BPE with DeepSeek-V4 control tokens such as BOS/EOS, `<｜User｜>`, `<think>`,
   and `｜DSML｜`. Important entry points include `tokenizeRenderedChat` and
   `tokenText`; `Tokenizer` remains a compatibility alias.
+- **`Tokenization/Backends/GLM52/GLM52Tokenizer.swift`** implements GPT-2 BPE,
+  the `glm4` pretokenizer, GLM control tokens and stop policy. The API factory
+  selects it without implying that the GLM numerical runtime is available.
 - **`Conversation/Models/ConversationModels.swift`** defines `ToolSpec`,
   `ToolCall`, and `ChatTurn`; the files under
   `Conversation/Backends/DeepSeekV4/DSML` render chat/tool prompts and extract
   calls from generated DSML.
+- **`Conversation/Backends/GLM52`** owns GLM role framing, reasoning effort,
+  native tool XML and its strict/incremental parser.
 - **`Generation/Sampler.swift`** implements temperature, top-k/top-p, min-p, and repetition
   penalty sampling.
 - **`Model/Common/ModelArchitecture.swift`** detects and describes the model
   family without constructing a decoder.
 - **`Model/Backends/DeepSeekV4/DeepSeekV4Configuration.swift`** validates the
   DeepSeek profiles consumed by the current runtime.
+- **`Model/Backends/GLM52/GLM52Configuration.swift`** validates the exact
+  `glm-dsa` geometry while keeping runtime availability explicit.
 - **`Diagnostics/LoadProgress.swift`** is a thread-safe singleton progress reporter: the
   model-load path writes milestones and per-unit advances, and the UI polls
   `snapshot` to render a determinate bar.

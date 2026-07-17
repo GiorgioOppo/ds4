@@ -18,8 +18,24 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
     }
 
     public static let deepSeekV4 = ModelArchitectureID("deepseek4")
+    public static let glmDSA = ModelArchitectureID("glm-dsa")
 
     public var description: String { rawValue }
+
+    /// Namespace used by architecture-specific GGUF metadata keys.
+    ///
+    /// `ModelArchitectureID` deliberately removes separators so spelling
+    /// variants compare deterministically. GGUF namespaces are not canonical
+    /// identifiers, however: GLM 5.2 publishes keys under `glm-dsa.*`, not
+    /// `glmdsa.*`. Keep that wire-format spelling explicit instead of deriving
+    /// it from `rawValue`.
+    public var ggufMetadataNamespace: String {
+        switch self {
+        case .deepSeekV4: return "deepseek4"
+        case .glmDSA: return "glm-dsa"
+        default: return rawValue
+        }
+    }
 
     /// Lowercase canonical form used by detection and registry keys.
     public static func normalize(_ value: String) -> String {
@@ -40,6 +56,7 @@ public struct ModelArchitectureID: RawRepresentable, Hashable, Sendable, Codable
 /// recognizing a Qwen GGUF must not imply that a Qwen decoder exists yet.
 public enum ModelFamily: String, Sendable, Codable, Equatable {
     case deepSeek
+    case glm
     case qwen
     case unknown
 }
@@ -158,6 +175,7 @@ public enum ModelArchitectureDetector {
 
     public static func family(for id: ModelArchitectureID) -> ModelFamily {
         if id == .deepSeekV4 || id.rawValue.hasPrefix("deepseek4") { return .deepSeek }
+        if id == .glmDSA { return .glm }
         if id.rawValue.hasPrefix("qwen") { return .qwen }
         return .unknown
     }
@@ -167,7 +185,7 @@ public enum ModelArchitectureDetector {
         -> ModelBackendAvailability {
         if id == .deepSeekV4 { return .implemented }
         switch family ?? self.family(for: id) {
-        case .qwen: return .recognizedButNotImplemented
+        case .glm, .qwen: return .recognizedButNotImplemented
         case .deepSeek, .unknown: return .unknown
         }
     }

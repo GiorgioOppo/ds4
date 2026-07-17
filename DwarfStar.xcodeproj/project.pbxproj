@@ -27,6 +27,7 @@
 		0E6C5A9603384D5CABF0F277 /* MetalGetRowsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9B434F53D557A84EAD908F /* MetalGetRowsTests.swift */; };
 		0F2E8B0741C57E88F8350DD0 /* GraphRopeKV.swift in Sources */ = {isa = PBXBuildFile; fileRef = 392945AB0232DAB0D8E3C7E9 /* GraphRopeKV.swift */; };
 		0FC6323D20E2B25E67F7A262 /* MetalBin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 372832F5BB813751C0917EE5 /* MetalBin.swift */; };
+		10017626739869F6EDBC0577 /* GLM52ConversationProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95B335E1067439AD785A8150 /* GLM52ConversationProtocol.swift */; };
 		1040CEE69CA9F7FB4D96A07E /* ModelDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9EC598B853D720E4112267 /* ModelDiagnostics.swift */; };
 		10DE8FC438FB3C4936C5CE6B /* MetalCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AC3E6E56608452C79C5B205 /* MetalCopyTests.swift */; };
 		125303DFF6EDB46EA9B48087 /* ExpertBundle+Layout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40304B0B62129B48E3C95C9A /* ExpertBundle+Layout.swift */; };
@@ -51,6 +52,7 @@
 		21465530A46304B6814D27BF /* AgentsList.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD6D5A1F9CD6CD3BB6ECF5EF /* AgentsList.swift */; };
 		2176A77164A2B5376BCE042C /* ProjectCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C1069CB87B70D1484D7F09 /* ProjectCacheTests.swift */; };
 		21D280A88824CD15F6D965E4 /* ExpertBundle+Usage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E8B856FCEB507D2CE06F755 /* ExpertBundle+Usage.swift */; };
+		21D5A5D703C08781E519A56D /* GLM52CompactDSA.swift in Sources */ = {isa = PBXBuildFile; fileRef = D148F99DD85E66033EFCE2AB /* GLM52CompactDSA.swift */; };
 		224521FA1579C5EC7218BD34 /* MetalMatmulMM.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2216810DFACCBE17CBBD486 /* MetalMatmulMM.swift */; };
 		231514E92888996E46D7243E /* DSV4Shape.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCFFF7CD410EC7FEB3EDFF54 /* DSV4Shape.swift */; };
 		235C9EE1ED53B29EB8160173 /* SimulatedMemoryLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A32733C4758177EFF35F60A7 /* SimulatedMemoryLock.swift */; };
@@ -76,6 +78,7 @@
 		333F77E95AF9D7F76C6CD618 /* MetalScatterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98B276318C750CF84428E31F /* MetalScatterTests.swift */; };
 		34353A646BB3973F133D926D /* MetalUnaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EC709C21AAE07FEFD31100A /* MetalUnaryTests.swift */; };
 		343D9F84AED691AF91DB18A4 /* MetalSumRowsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F8370E6365A182E45C86047 /* MetalSumRowsTests.swift */; };
+		34FA962CF9D123CEC1A0AF89 /* GLM52WeightMapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88F709B7A5BFCF722E6E04E0 /* GLM52WeightMapTests.swift */; };
 		35001F7CDA758E8031CBF2F6 /* StreamingDecoder+Prefill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A5A21F495E692CD76D2874E /* StreamingDecoder+Prefill.swift */; };
 		35930A5A3D89C0C27F0996B4 /* DenseStreamer+CompressorQ8.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2A8894C3D300A8EC05C1D37 /* DenseStreamer+CompressorQ8.swift */; };
 		367F6C35AFBC6D8A19961EB6 /* DistWorker+Assignment.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCCC706A092BE066CC483A66 /* DistWorker+Assignment.swift */; };
@@ -95,6 +98,8 @@
 		3CF956331BB626D69B1C5628 /* GraphTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222AB13980D8A80A87CD3E89 /* GraphTests.swift */; };
 		3EC045EC3E97A902D8ED3993 /* MetalArgsortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D71DDB280D173937A38AD22A /* MetalArgsortTests.swift */; };
 		3F031832514A98DBBCCE54F0 /* DownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3770186B2A83314A7E0477 /* DownloadView.swift */; };
+		3F4BFD6724BB3913C89C11E6 /* GLM52ToolCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CB67575EE9D87AA9D1B33E2 /* GLM52ToolCodec.swift */; };
+		3F6ED94E14CC733C0EB0B391 /* ModelInspectorGLM52Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC5A7A0995562AE736FF3B12 /* ModelInspectorGLM52Tests.swift */; };
 		403DF8EDD683E150FCA1ABE3 /* DistFrameHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5A43BA5DE36783B471282CD /* DistFrameHeader.swift */; };
 		407F43B8FDC0D2E4FBF1C48A /* DenseStreamer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5C68D82CE395CB25BEBA58C /* DenseStreamer.swift */; };
 		4091F42B02D39C4933B8CD2C /* GGUFTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = FACCE8212CFE3490478E8133 /* GGUFTypes.swift */; };
@@ -114,8 +119,10 @@
 		4C685AF9E144FCAB50BA5F7D /* DecodeLayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 252CD6BBFD0DEB702F749EFD /* DecodeLayer.swift */; };
 		4C8110FE1B0BF5D31B7B7D20 /* KVCFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47E6AE05A1CF523F17B31393 /* KVCFile.swift */; };
 		4CBD67B820365C93E049D316 /* GGUFWeights.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F8E6FD230117C2139E1255C /* GGUFWeights.swift */; };
+		4CCADEF2240B859B65937EE5 /* GLM52ExpertStreamPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30DA0E6D89D3D4794B46D95E /* GLM52ExpertStreamPlannerTests.swift */; };
 		4FA9357F0BB77F4B81338855 /* BackendSelectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D3CDBAD6E49494CCDE5FF5D /* BackendSelectorTests.swift */; };
 		4FEE5368987AE7B8B80A6C69 /* SubagentSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DA21CCCF780EA1F9CADBB29 /* SubagentSearch.swift */; };
+		51BA6FD4E1D0CA8AE309A390 /* GLM52RealHeaderIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21DEAFF4D6781CDDCF59DFF3 /* GLM52RealHeaderIntegrationTests.swift */; };
 		51FAE8DB3852E35930790D9D /* QwenBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4DB725980E5A8074AB67BF /* QwenBackend.swift */; };
 		52B03F2C23BF3F792DC0A868 /* Clock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A1A1FE88D8923FD5F2CEFD3 /* Clock.swift */; };
 		541B920538CC2737997D14D9 /* DeepSeekV4TokenizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 606ABB4F156CD94B8C8DCF0E /* DeepSeekV4TokenizerTests.swift */; };
@@ -147,10 +154,12 @@
 		6633B8AB418B65171A86A881 /* DiskKVStore+Lookup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43FB88F98368430ADDFA3ECB /* DiskKVStore+Lookup.swift */; };
 		6692D281F896DA78279DA648 /* ModelDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52DBD0EB57C5179C91AB45B9 /* ModelDownloader.swift */; };
 		675F2EF5DE8F5608066D5C8E /* MetalRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D710E1561877DA19910B6F6A /* MetalRouterTests.swift */; };
+		67736C87B3B59FBFEE7388C3 /* GLM52IndexerKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE8AA4955782C86D31E67DB8 /* GLM52IndexerKeyStoreTests.swift */; };
 		67AC53D292C3B3F288A0B92A /* DiskKVStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88C1BDE574432B21D2216399 /* DiskKVStore.swift */; };
 		67FDC5DF78C5DCEEF91FAF67 /* GraphUnary.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFB5BAD85C9703E09F6FDB61 /* GraphUnary.swift */; };
 		6838683866B5BC83E62AD81D /* GraphHCReduceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60FDA6097E7E3D20D80502A6 /* GraphHCReduceTests.swift */; };
 		68AA10F1E36B757BA87EBA62 /* ContextCapacityPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C68111E6E71425F4ABC0F0 /* ContextCapacityPolicyTests.swift */; };
+		68C295FE719D00A749899158 /* GLM52IndexerScoresTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 112F1643CE842FF44199637C /* GLM52IndexerScoresTests.swift */; };
 		6912FC78C1B6EECC6D6D1E8D /* GGUFWeights+Validation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81714418B6F5230A47AE71A3 /* GGUFWeights+Validation.swift */; };
 		6930D753ADFDAB5B40438835 /* Add.swift in Sources */ = {isa = PBXBuildFile; fileRef = 565EEEB2173DE1FA8FD5581B /* Add.swift */; };
 		69A1EE45D12CEB194BE3B08B /* KernelSources.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69281EB2C4DFC15ACBC26935 /* KernelSources.swift */; };
@@ -171,16 +180,20 @@
 		71CF852758D2A2FEC9A5B853 /* GraphTwoSpanAttnTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A48CA7E9C1E5157A52DED3D1 /* GraphTwoSpanAttnTests.swift */; };
 		730197DF7E9FC7AB85938007 /* WebFetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72CDEB8BA56E51030CFB5AC5 /* WebFetch.swift */; };
 		73EFC817206754837D4CB019 /* GraphAttnTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E5EA6AB42FE7673BA97D32F /* GraphAttnTests.swift */; };
+		741D8D0C09BB7BD8798077E6 /* GLM52ChatRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B190251B4AB272B762B97556 /* GLM52ChatRenderer.swift */; };
+		75313EF181C3412051D996CE /* GLM52Backend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC26D813DB9CF90A7DB5A33 /* GLM52Backend.swift */; };
 		764C93A1E5CFBDE2C5BA896E /* MetalMoE.swift in Sources */ = {isa = PBXBuildFile; fileRef = 452BEE38DA81C4476EC2F526 /* MetalMoE.swift */; };
 		76FB63CF4CB35D87F750BF6D /* GraphAttentionOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68A4D9B881558AB3CBB80656 /* GraphAttentionOutput.swift */; };
 		779E20614C58F52738E19EE0 /* MetalIndexerScore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FDF45E12C5958C152843BD3 /* MetalIndexerScore.swift */; };
 		77DF22554621A7AA5070FA1D /* ChatStore+MachineAutoTune.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD681EF1237424D4EF370C1 /* ChatStore+MachineAutoTune.swift */; };
 		788A11A76CBFCDFAE02702BF /* HalfTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C63E0FD806A7EF3833BD53FF /* HalfTests.swift */; };
 		78BACF4E9383EC364E9D0D56 /* ToolMarkup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41AB687AF9AABE14CFC3199E /* ToolMarkup.swift */; };
+		799C4D22A01413FD23E61D73 /* ConversationBackendPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82274656D67E3426EDC89DF1 /* ConversationBackendPolicy.swift */; };
 		7AFBBFDDB52E0B68B52FF752 /* LocalServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC2790E1D918527EED58F2FA /* LocalServer.swift */; };
 		7B24301F993E0D410E567DC1 /* AgentProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB436540A4B21D5F18ECCB33 /* AgentProfileTests.swift */; };
 		7BB73C969CF43C47B8003CB0 /* MetalConcatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFB475C8CBB9CD8012BA9B13 /* MetalConcatTests.swift */; };
 		7C77C09C7F0E9CAA4E95BA0B /* MetalIOCircuitBreakerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19A150EAE306F4D72BC65FD9 /* MetalIOCircuitBreakerTests.swift */; };
+		7CD428E0F47C4932C807206D /* GLM52KVLoRANormTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A679EDD4CE21B7B2B3840E /* GLM52KVLoRANormTests.swift */; };
 		7D364192D663962FF21910A1 /* MetalIndexerPool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71BBA008B9F22097EB94652A /* MetalIndexerPool.swift */; };
 		7F61703FFFD4120357BF7D05 /* DeepSeekV4ConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBDAE9EB41149B6282599A3E /* DeepSeekV4ConfigurationTests.swift */; };
 		80E3086911B31C86E372CD86 /* DistHandshake.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C3C860E7A17A917C69747B7 /* DistHandshake.swift */; };
@@ -196,7 +209,11 @@
 		872EA12B9081D59BE6D95E34 /* BackendSelector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A595B9F52E0EAAAE5297804 /* BackendSelector.swift */; };
 		874D1BEB19157533AD723090 /* KVSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7FE6E2A511F636A6E2F89E5 /* KVSnapshot.swift */; };
 		877378D0658D457C5419588E /* MetalFlashAttnTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B72C747BAF71971EB6EB399 /* MetalFlashAttnTests.swift */; };
+		87CE3EB405BEFD9E02E9C3BC /* TokenizerFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1038D07B88AC031195EBDF0 /* TokenizerFactory.swift */; };
+		888B1FA44CB2A41403F36BA5 /* GLM52ConversationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F982196E52C8B441F9C1D91 /* GLM52ConversationTests.swift */; };
+		88CD84D5A05B51FAEA3F1222 /* GLM52TensorSchemaTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D4229AA0E66CBB512EA3444 /* GLM52TensorSchemaTests.swift */; };
 		89244C8915108B697A27ADA0 /* GraphDecodeLayerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91465BE822FB4443E496AA51 /* GraphDecodeLayerTests.swift */; };
+		8A0E2F36E4B6B624EE10D4A5 /* GLM52CompactKVTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99CA4772320EE6B0FF89EDDB /* GLM52CompactKVTests.swift */; };
 		8A6525C48B1A3CF50B952054 /* ToolSheets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7ECAB7B4B7A9C1DBF5577D1F /* ToolSheets.swift */; };
 		8A6F6E1E1FFCEF6D43C2B431 /* DistCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB4552AD0A3259AAB04D8394 /* DistCoordinator.swift */; };
 		8A99E026126CA69181AEA0B8 /* StreamingDecoder+TensorIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC4C5D9A572B161623B77621 /* StreamingDecoder+TensorIO.swift */; };
@@ -214,12 +231,14 @@
 		90D4EE6C2F4ABEBA3A911699 /* ModelPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = C172193ED7BF5F1F003927B0 /* ModelPicker.swift */; };
 		9134BC21883A966185F03954 /* FileModify.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0C737D512243B91012599A9 /* FileModify.swift */; };
 		916477A8FDA437FB145B6ACC /* LocalServer+JSON.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCE47A67C61F57702ED6473F /* LocalServer+JSON.swift */; };
+		91AA83340FB528FAFFCB5DB0 /* GLM52ConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2394819EC28C70CE8CA59EF5 /* GLM52ConfigurationTests.swift */; };
 		92FFEFF0883DD9CCF45DE4DC /* DiskKVStore+Streaming.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9456F4FD5EE971F841FD827 /* DiskKVStore+Streaming.swift */; };
 		93298475BFDBC27DC70E61E2 /* InferenceService+Conversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4D74E90606741DA38705858 /* InferenceService+Conversation.swift */; };
 		9422CC3B791DEEA3A8B64E10 /* GGUFWeights+Layers.swift in Sources */ = {isa = PBXBuildFile; fileRef = F887F8123772779929281AD9 /* GGUFWeights+Layers.swift */; };
 		94FEA68F53980722452B3C7F /* ProjectWrite.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFE669818F81B61FEEA475BD /* ProjectWrite.swift */; };
 		953B724A8DE894039AA84703 /* ProjectCache+Indexing.swift in Sources */ = {isa = PBXBuildFile; fileRef = F578C26A8572AD4C9BC01E3A /* ProjectCache+Indexing.swift */; };
 		95C304D24A5BBC46ECA2C2D6 /* DiagnosticsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D6741E18DD4ECFF68B1A3EC /* DiagnosticsController.swift */; };
+		962F9B3E1B5220726617794B /* GLM52ExpertStreamPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1218F4F02CCB6E7C81AFEA6 /* GLM52ExpertStreamPlanner.swift */; };
 		96F78404CD32AB5DFC0062EF /* DistWorker+ExpertAssignment.swift in Sources */ = {isa = PBXBuildFile; fileRef = F71910B4085319327D3AFAE8 /* DistWorker+ExpertAssignment.swift */; };
 		984A4C9C7C7E4AFEA79A91B5 /* DistCoordinator+VerticalChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8B2B6827FF46CD681753802 /* DistCoordinator+VerticalChat.swift */; };
 		9866732C3CBE25841D46BE8B /* ServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2784CEC964730991A855AAD8 /* ServerView.swift */; };
@@ -269,6 +288,7 @@
 		B03B461281F93DF1286A3A1B /* DSV4RuntimeGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D739E72B192DCCBC3A49BCF /* DSV4RuntimeGeometry.swift */; };
 		B0BB35C94A4E89ABF6B5F9A0 /* ModelDownloaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F7C5DB83CF7E026FDB44F65 /* ModelDownloaderTests.swift */; };
 		B17E03A5A7A1D467E85F1063 /* DSV4Decoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 010F041653895E0BDAFDB5EF /* DSV4Decoder.swift */; };
+		B3CDA22DED503CDE6AA3F056 /* GLM52IndexerReferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A96C42770A68627AE89E027F /* GLM52IndexerReferenceTests.swift */; };
 		B42ABA8B653CD2C7627A414B /* AttachmentViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A570B14832FFFA612C8AC86E /* AttachmentViews.swift */; };
 		B46509FC25CF05F20BDBD1F6 /* MetalHCSplit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D1BC4A19A1D4FF1AAE85FBB /* MetalHCSplit.swift */; };
 		B96488E8DA7E6B4DC4336E1D /* DSV4RuntimeGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8E90EBAC8D58CE96BCE2508 /* DSV4RuntimeGeometryTests.swift */; };
@@ -282,7 +302,9 @@
 		BC0E764E09D2D0AC21220475 /* ChatStore+Tuning.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5FB551B3B8F22FF2EE9E1E7 /* ChatStore+Tuning.swift */; };
 		BD2F127303970202B5F38FE2 /* DistGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E139E8D68E9E5A78D0D687C /* DistGate.swift */; };
 		BD7D803EE051328421C5650E /* ExpertBundle+Read.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CDCF79EF9852BFBCB59324F /* ExpertBundle+Read.swift */; };
+		BE249EA55752A25625735380 /* GLM52KVLoRANorm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 162C39C4D3F63EA64FA2669E /* GLM52KVLoRANorm.swift */; };
 		BF7EED9CA897C39CB1EB1EF6 /* DenseStreamer+Types.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDBE787F18FCFCEBC1955AF4 /* DenseStreamer+Types.swift */; };
+		BFF186DAA6DC6DCB6C01A9BA /* GLM52IndexerReference.swift in Sources */ = {isa = PBXBuildFile; fileRef = B311FCA2879C701D8D929452 /* GLM52IndexerReference.swift */; };
 		C088F88A9C265085C7C61706 /* DistCoordinator+Files.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94F4FE07FBC63B34D74F4390 /* DistCoordinator+Files.swift */; };
 		C08BBA0E535989D65D99BC3A /* ExpertBundle+MetalIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBCAB1AC76BB0D76219B01 /* ExpertBundle+MetalIO.swift */; };
 		C0B044C9ECF7D73A3D849DDD /* DistTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12E5D4A8AAA2C785256F1737 /* DistTransport.swift */; };
@@ -296,6 +318,8 @@
 		C4DCE65F28629A6CEBACB602 /* TuningView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE222006D1A1007D8A6254E8 /* TuningView.swift */; };
 		C551FAC19E359A53D42F43FF /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFD7D66077782DB84FD7C4F9 /* SettingsView.swift */; };
 		C5C573A0338729028A903BC8 /* DistEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8812E3BC79FBB42F25503F61 /* DistEngine.swift */; };
+		C62FB986E385781ECCDCC7D3 /* GLM52TokenizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDAE596E4D815E2BEF672D4D /* GLM52TokenizerTests.swift */; };
+		C6E8985F5AF66FB9829ED137 /* GLM52CompactKV.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC53781FFE55DA7D25F018D /* GLM52CompactKV.swift */; };
 		C70CAE325660EFD3ED344425 /* MetalNorm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16E2A2210E3B09396329001B /* MetalNorm.swift */; };
 		C90E874F8BBADD80796E9FC4 /* DSV4Dims.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC31562F8ED73DC6DE443D48 /* DSV4Dims.swift */; };
 		C996A702790893861A28BCAA /* MetalGLUTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3E7E1520B40786CE9181F3 /* MetalGLUTests.swift */; };
@@ -305,10 +329,14 @@
 		CBECC83ED7D7CEA86186E566 /* InferenceService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDC13ADE6BC2D00910A6F979 /* InferenceService.swift */; };
 		CDC3DA8CAFAC43354BD008E6 /* MetalRepeat.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF2455A5B6BBEA12585BF687 /* MetalRepeat.swift */; };
 		CEFBB29340B1BE78F990F0E5 /* GraphAttnOutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6660905811EF4C665437BDE2 /* GraphAttnOutTests.swift */; };
+		CEFE3D89CCBD3509440DEFA1 /* GLM52Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13F9F430C06F40155F0779D /* GLM52Router.swift */; };
 		CF0AEFDCD4AB00492C543849 /* DistKV.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9688D9B8AF6B9E7FC30E71BD /* DistKV.swift */; };
 		CF3365C6245987D40BCBECA2 /* DistributedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CA61837065296F5BBF64B79 /* DistributedView.swift */; };
 		CF60897D48DA6D908480B574 /* GraphOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FFEDDBECE45D1587F578F58 /* GraphOutput.swift */; };
+		CF69A4502FCF707278CEFDFD /* GLM52TensorSchema.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E30D55027AF7ED1E1FB2ACF /* GLM52TensorSchema.swift */; };
 		CFE109F508871A1DFDD65AEA /* DistProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2897D2B25882C04D36C09E7 /* DistProtocolTests.swift */; };
+		D0AF30AC9D43B09167374900 /* GLM52RouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06EF364D0991CF7640953F91 /* GLM52RouterTests.swift */; };
+		D10C4CE7BCC9120682CBEB09 /* GLM52CompactDSATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 679E0BFB1735B072C057A8C2 /* GLM52CompactDSATests.swift */; };
 		D116F638BA9D22A815781E29 /* MetalBinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E98044D52362306CB18B476 /* MetalBinTests.swift */; };
 		D1A089C82F712B62BA38B37D /* ChatStore+Sessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91409794F50014E8163619F6 /* ChatStore+Sessions.swift */; };
 		D1F685D4127A7F31613DC872 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83FCB846F88F1BAA2375773B /* Diagnostics.swift */; };
@@ -318,8 +346,10 @@
 		D3EBCA691FE534EB7F9E1980 /* InferenceTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A0311C28E4481B6324CCEEA /* InferenceTypes.swift */; };
 		D6F4F260558D32D2A2127564 /* libDS4Core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */; };
 		D7166F9F83ACBFCC47860CC3 /* ProjectFind.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5D3A0B93CF51F551C826EAD /* ProjectFind.swift */; };
+		D741B80131A041FB84E1B22C /* GLM52Configuration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC0533929BF3F31309C0E23 /* GLM52Configuration.swift */; };
 		D790EFA51A46C3282E0D2834 /* MetalSetRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = 496029602328F6106CCA7E4F /* MetalSetRows.swift */; };
 		D7A05CEEC71EDA61143E8FF9 /* LocalServer+Networking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CED68C11B11F63AC10A91CD /* LocalServer+Networking.swift */; };
+		D7EEFFCA53EB4892FA3DB540 /* GLM52IndexerKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA2BC33BE954962A7D0B5E55 /* GLM52IndexerKeyStore.swift */; };
 		D9230458EDC596C7B5EFC8B3 /* GraphCompressor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70C492C8BC58723E64C32946 /* GraphCompressor.swift */; };
 		DB901412110560049EE10174 /* MetalKVCompress2Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D98BCD9F0FC4D53BE9E6CD0 /* MetalKVCompress2Tests.swift */; };
 		DBA6A2176CD309A72B62F61A /* InferenceService+Tuning.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFC9327F38648ED56CB7C8E3 /* InferenceService+Tuning.swift */; };
@@ -327,6 +357,7 @@
 		DBD779CCFF1400BFF7EA899D /* DeepSeekV4Backend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 002E6E6040A21BABE8FCA2B6 /* DeepSeekV4Backend.swift */; };
 		DC55121F3BA7A9FE21B10C04 /* ExpertBundle+Builder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F49E52C6B26377DE4DED7AA /* ExpertBundle+Builder.swift */; };
 		DC681A66DE884BD3E2420D62 /* MetalDenseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09C0044DBC374AA6504218E7 /* MetalDenseTests.swift */; };
+		DCD9BE8FD2FB13A3D9DF3B5E /* TokenizerFactoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB76082DB7E5E259900F63DA /* TokenizerFactoryTests.swift */; };
 		DE0CBBF8FCB67E846E0B46D5 /* SubagentRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8152D3EC335AE274094B077C /* SubagentRun.swift */; };
 		DE2D48489A370F8000CD6FBA /* MetalKVCompressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 112C747CA862CFC9D5696438 /* MetalKVCompressTests.swift */; };
 		DEC7CF45F3859BBAF11FAAB9 /* GGUFWeights+ExpertIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D74C19D1C0E85ABED304986 /* GGUFWeights+ExpertIO.swift */; };
@@ -363,6 +394,7 @@
 		F68603F3E96CC8B212AE3490 /* StreamingDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90FC1F1A116E06151E6C01A8 /* StreamingDecoder.swift */; };
 		F76C9CFB0E92ACA1C42FFE16 /* ProjectRead.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7ED640CB2CBE554263A44C7 /* ProjectRead.swift */; };
 		F7EC7CCA4615F05FFE08EE16 /* MachineAutoTune.swift in Sources */ = {isa = PBXBuildFile; fileRef = C29956207CA6FB4A221261CB /* MachineAutoTune.swift */; };
+		F7F8534A99572F1528FFD12D /* GLM52WeightMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5877B4FAA808EAEDEAEC0A7B /* GLM52WeightMap.swift */; };
 		F875521AF8A98563B5182580 /* HFTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30E9CDCD9326F9DBB11888D /* HFTokenStore.swift */; };
 		F92DDA11F9E67C397D27FE21 /* DiskBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FC442764DEB1E4C721539D2 /* DiskBenchmark.swift */; };
 		F963020406ADD025ABE98EB9 /* ChatStore+PerformanceSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 407F2D650B9A5D185C518A92 /* ChatStore+PerformanceSettings.swift */; };
@@ -371,10 +403,12 @@
 		FA976C23E1CA3576A2B7611C /* MetalHCSplitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22D9C77BCE2DCA96925DAED6 /* MetalHCSplitTests.swift */; };
 		FAABA8DE1DAC03EE890F5018 /* BenchController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D048D74398834A2960A2135 /* BenchController.swift */; };
 		FAABA9C5880FB7DE3F09E6E8 /* ChatStore+ToolLoop.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AAD84F4EBDDC22BA4CFEAA0 /* ChatStore+ToolLoop.swift */; };
+		FB276FF4A22B6359559CCE3A /* GLM52IndexerScores.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9C6953888608CA6BADC4AD6 /* GLM52IndexerScores.swift */; };
 		FB584EF0AB58A365D9A955C9 /* DecodeProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFC66E5F7E81E72733E9244D /* DecodeProfile.swift */; };
 		FBA01E5DBBB0EC16D0B4EC0A /* DeepSeekV4Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BFBDC60B08CDBDBAD65AB71 /* DeepSeekV4Tokenizer.swift */; };
 		FC9ECF8F46920EAC32DE7887 /* MetalSoftmax.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC3A77F90ACAF3BA045F0F8A /* MetalSoftmax.swift */; };
 		FCD41393E76143FB34B00559 /* DistWorker+Serving.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9227EFBB232F5692809DFFAE /* DistWorker+Serving.swift */; };
+		FD8ACC47E18952E4EE97AF29 /* GLM52Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3E326E6DD9F7C3FCD40E379 /* GLM52Tokenizer.swift */; };
 		FE5FAE26A55EF2FBC67CC25C /* ProjectCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17665B6CA2C693B766B4593B /* ProjectCache.swift */; };
 		FECA5A67BC450A11B675BDA9 /* GraphMoE.swift in Sources */ = {isa = PBXBuildFile; fileRef = C848750AA4CABE5FAE7537A0 /* GraphMoE.swift */; };
 		FF1DEF4CA790A1CECCEC1F34 /* MetalKVCompress.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86E0DACD7CB784C9209968BD /* MetalKVCompress.swift */; };
@@ -468,19 +502,24 @@
 		010F041653895E0BDAFDB5EF /* DSV4Decoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSV4Decoder.swift; sourceTree = "<group>"; };
 		040EC035A315B4655E728F9D /* RuntimeModelDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeModelDescriptor.swift; sourceTree = "<group>"; };
 		051A34AB7CF42B660CBD1A3F /* MoEQuant.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MoEQuant.swift; sourceTree = "<group>"; };
+		06EF364D0991CF7640953F91 /* GLM52RouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52RouterTests.swift; sourceTree = "<group>"; };
 		07590FD51C1139A8D6ED37FB /* dense.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = dense.metal; sourceTree = "<group>"; };
 		09C0044DBC374AA6504218E7 /* MetalDenseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDenseTests.swift; sourceTree = "<group>"; };
 		0B617F4CEA5E25BF1DA43071 /* softmax.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = softmax.metal; sourceTree = "<group>"; };
+		0BC53781FFE55DA7D25F018D /* GLM52CompactKV.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52CompactKV.swift; sourceTree = "<group>"; };
 		0BD209BB6C4DAD02A27A2C6A /* DiskKVStore+Store.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DiskKVStore+Store.swift"; sourceTree = "<group>"; };
 		0C3C860E7A17A917C69747B7 /* DistHandshake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistHandshake.swift; sourceTree = "<group>"; };
 		0C71C292CD554963ADB3E543 /* BackendCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendCapabilities.swift; sourceTree = "<group>"; };
+		0CB67575EE9D87AA9D1B33E2 /* GLM52ToolCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ToolCodec.swift; sourceTree = "<group>"; };
 		0D048D74398834A2960A2135 /* BenchController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchController.swift; sourceTree = "<group>"; };
 		0EA845E5657B47937CC0331B /* MCPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPClient.swift; sourceTree = "<group>"; };
 		0F2C0E7C7DD7D738B29C3D3D /* FileWrite.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileWrite.swift; sourceTree = "<group>"; };
 		0FBE8CD04FFEBF89965D022D /* HTTPRangeFileTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPRangeFileTransfer.swift; sourceTree = "<group>"; };
+		0FC0533929BF3F31309C0E23 /* GLM52Configuration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52Configuration.swift; sourceTree = "<group>"; };
 		1000B0404D25B66E1AEEEB73 /* ProjectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectView.swift; sourceTree = "<group>"; };
 		106679B2E98BB7E08AE00B9A /* bin.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = bin.metal; sourceTree = "<group>"; };
 		112C747CA862CFC9D5696438 /* MetalKVCompressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalKVCompressTests.swift; sourceTree = "<group>"; };
+		112F1643CE842FF44199637C /* GLM52IndexerScoresTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerScoresTests.swift; sourceTree = "<group>"; };
 		113922C98C3C47AAAC5A54B9 /* LayerWeights.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayerWeights.swift; sourceTree = "<group>"; };
 		1164FFB36BDF1AE2A7A150F3 /* TokenizerProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TokenizerProtocol.swift; sourceTree = "<group>"; };
 		11A599BF631BFF79666E0AF2 /* SSDCachePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSDCachePlan.swift; sourceTree = "<group>"; };
@@ -488,6 +527,7 @@
 		12E5D4A8AAA2C785256F1737 /* DistTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistTransport.swift; sourceTree = "<group>"; };
 		14449F01AF3E461D7442BDC4 /* MetalCompressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCompressor.swift; sourceTree = "<group>"; };
 		1458C4C436153CBA6A6C8458 /* MetalRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRuntime.swift; sourceTree = "<group>"; };
+		162C39C4D3F63EA64FA2669E /* GLM52KVLoRANorm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52KVLoRANorm.swift; sourceTree = "<group>"; };
 		168238F02F3D58128F027A53 /* MessageRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageRow.swift; sourceTree = "<group>"; };
 		16E2A2210E3B09396329001B /* MetalNorm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalNorm.swift; sourceTree = "<group>"; };
 		17665B6CA2C693B766B4593B /* ProjectCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectCache.swift; sourceTree = "<group>"; };
@@ -510,10 +550,12 @@
 		1FDF45E12C5958C152843BD3 /* MetalIndexerScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerScore.swift; sourceTree = "<group>"; };
 		211AB4B369422542ACE9F898 /* Subtract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Subtract.swift; sourceTree = "<group>"; };
 		216CA155A6B64AFB447015A1 /* LocalServer+OpenAIChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalServer+OpenAIChat.swift"; sourceTree = "<group>"; };
+		21DEAFF4D6781CDDCF59DFF3 /* GLM52RealHeaderIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52RealHeaderIntegrationTests.swift; sourceTree = "<group>"; };
 		222AB13980D8A80A87CD3E89 /* GraphTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphTests.swift; sourceTree = "<group>"; };
 		22D9C77BCE2DCA96925DAED6 /* MetalHCSplitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalHCSplitTests.swift; sourceTree = "<group>"; };
 		231E55BAE0C7AFCFF9AE01BB /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		236E64715ABC1038C1C3506E /* moe.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = moe.metal; sourceTree = "<group>"; };
+		2394819EC28C70CE8CA59EF5 /* GLM52ConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ConfigurationTests.swift; sourceTree = "<group>"; };
 		252CD6BBFD0DEB702F749EFD /* DecodeLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecodeLayer.swift; sourceTree = "<group>"; };
 		260F2C3B9F74246D8196D723 /* DistCoordinator+HorizontalChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+HorizontalChat.swift"; sourceTree = "<group>"; };
 		2784CEC964730991A855AAD8 /* ServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerView.swift; sourceTree = "<group>"; };
@@ -529,11 +571,13 @@
 		2C80E629F9751A189F3A8E7F /* ToolMessageViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolMessageViews.swift; sourceTree = "<group>"; };
 		2C9DED4861CF229CB898D0C0 /* ByteLevel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ByteLevel.swift; sourceTree = "<group>"; };
 		2CCDC6C175CE654B368B5AA2 /* DistFileMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistFileMessages.swift; sourceTree = "<group>"; };
+		2D4229AA0E66CBB512EA3444 /* GLM52TensorSchemaTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52TensorSchemaTests.swift; sourceTree = "<group>"; };
 		2EB6ED16921717BCAA938AB2 /* ChatMessageMapping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessageMapping.swift; sourceTree = "<group>"; };
 		2EC709C21AAE07FEFD31100A /* MetalUnaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalUnaryTests.swift; sourceTree = "<group>"; };
 		2F49E52C6B26377DE4DED7AA /* ExpertBundle+Builder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ExpertBundle+Builder.swift"; sourceTree = "<group>"; };
 		30866A4D015991DAB5DA8716 /* MCPTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPTransport.swift; sourceTree = "<group>"; };
 		30D2048F71C73DEA752F8FAE /* InferenceService+Generation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "InferenceService+Generation.swift"; sourceTree = "<group>"; };
+		30DA0E6D89D3D4794B46D95E /* GLM52ExpertStreamPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ExpertStreamPlannerTests.swift; sourceTree = "<group>"; };
 		31A1A3BD6F60788FF38AB97F /* MetalGetRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGetRows.swift; sourceTree = "<group>"; };
 		31EA2956AA7ECFE2C6EAF8BB /* set_rows.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = set_rows.metal; sourceTree = "<group>"; };
 		36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -552,6 +596,7 @@
 		3DC7C27728FF328CA0D0E0EE /* MetalMoEQ4KTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoEQ4KTests.swift; sourceTree = "<group>"; };
 		3F43C196E6EB3E1096571191 /* Calculator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Calculator.swift; sourceTree = "<group>"; };
 		3F7C5DB83CF7E026FDB44F65 /* ModelDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloaderTests.swift; sourceTree = "<group>"; };
+		3F982196E52C8B441F9C1D91 /* GLM52ConversationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ConversationTests.swift; sourceTree = "<group>"; };
 		40304B0B62129B48E3C95C9A /* ExpertBundle+Layout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ExpertBundle+Layout.swift"; sourceTree = "<group>"; };
 		407F2D650B9A5D185C518A92 /* ChatStore+PerformanceSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+PerformanceSettings.swift"; sourceTree = "<group>"; };
 		40ECA45DAF95BEA6E5738282 /* ProjectList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectList.swift; sourceTree = "<group>"; };
@@ -588,6 +633,7 @@
 		565EEEB2173DE1FA8FD5581B /* Add.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Add.swift; sourceTree = "<group>"; };
 		5669D1D33C81F9EFBDF92909 /* GitHubClone.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubClone.swift; sourceTree = "<group>"; };
 		578819CD951BCA7FC62A6FE4 /* FileRead.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileRead.swift; sourceTree = "<group>"; };
+		5877B4FAA808EAEDEAEC0A7B /* GLM52WeightMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52WeightMap.swift; sourceTree = "<group>"; };
 		598262623A27040210112382 /* ChatModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModels.swift; sourceTree = "<group>"; };
 		5A1A1FE88D8923FD5F2CEFD3 /* Clock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Clock.swift; sourceTree = "<group>"; };
 		5A39752FB2C8F380AAD989E8 /* libDS4Metal.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Metal.a; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -600,6 +646,7 @@
 		5D35EA66234250A938B34F86 /* Data+LittleEndian.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Data+LittleEndian.swift"; sourceTree = "<group>"; };
 		5D6653AE4732839A16892145 /* Sampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sampler.swift; sourceTree = "<group>"; };
 		5DF3ADAE0B4E0A04346000D7 /* MCPServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPServersView.swift; sourceTree = "<group>"; };
+		5E30D55027AF7ED1E1FB2ACF /* GLM52TensorSchema.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52TensorSchema.swift; sourceTree = "<group>"; };
 		5E660CE1E3AC8BBE87B36ED0 /* flash_attn.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = flash_attn.metal; sourceTree = "<group>"; };
 		5E98044D52362306CB18B476 /* MetalBinTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalBinTests.swift; sourceTree = "<group>"; };
 		5EAA95348C4C36551B473036 /* EngineActivityGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineActivityGate.swift; sourceTree = "<group>"; };
@@ -619,6 +666,7 @@
 		6660905811EF4C665437BDE2 /* GraphAttnOutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttnOutTests.swift; sourceTree = "<group>"; };
 		670378DA47F1CF2DA78EB07A /* PrefillGather.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrefillGather.swift; sourceTree = "<group>"; };
 		67257572F7FFF7B5A6A73135 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
+		679E0BFB1735B072C057A8C2 /* GLM52CompactDSATests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52CompactDSATests.swift; sourceTree = "<group>"; };
 		6844E243D7239CC8B98D7C71 /* DemoLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoLog.swift; sourceTree = "<group>"; };
 		686D2B322FA9F54AE8C99747 /* DecodeScratch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DecodeScratch.swift; sourceTree = "<group>"; };
 		68A4D9B881558AB3CBB80656 /* GraphAttentionOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttentionOutput.swift; sourceTree = "<group>"; };
@@ -629,6 +677,7 @@
 		6A595B9F52E0EAAAE5297804 /* BackendSelector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendSelector.swift; sourceTree = "<group>"; };
 		6C9CBC2E3B82E5FC6D670FF9 /* MetalRoPE.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRoPE.swift; sourceTree = "<group>"; };
 		6CA61837065296F5BBF64B79 /* DistributedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistributedView.swift; sourceTree = "<group>"; };
+		6CC26D813DB9CF90A7DB5A33 /* GLM52Backend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52Backend.swift; sourceTree = "<group>"; };
 		6D74C19D1C0E85ABED304986 /* GGUFWeights+ExpertIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GGUFWeights+ExpertIO.swift"; sourceTree = "<group>"; };
 		6DABBE8A8036E32415CC64FF /* DistCoordinator+KV.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+KV.swift"; sourceTree = "<group>"; };
 		6F71819B5EFDBBB27D548663 /* DenseStreamer+Q4Cache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DenseStreamer+Q4Cache.swift"; sourceTree = "<group>"; };
@@ -658,6 +707,7 @@
 		8152D3EC335AE274094B077C /* SubagentRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentRun.swift; sourceTree = "<group>"; };
 		81714418B6F5230A47AE71A3 /* GGUFWeights+Validation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GGUFWeights+Validation.swift"; sourceTree = "<group>"; };
 		81B0F7914C178C9CEB2015CA /* MetalIndexerPoolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPoolTests.swift; sourceTree = "<group>"; };
+		82274656D67E3426EDC89DF1 /* ConversationBackendPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationBackendPolicy.swift; sourceTree = "<group>"; };
 		833C77B8E9D773AA3D010F97 /* ToolRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRegistry.swift; sourceTree = "<group>"; };
 		83FCB846F88F1BAA2375773B /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		84CB5380A9D181C9C0E64F65 /* argsort.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = argsort.metal; sourceTree = "<group>"; };
@@ -669,6 +719,7 @@
 		8745A6A73847D523C964B071 /* DiskKVStore+Serialization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DiskKVStore+Serialization.swift"; sourceTree = "<group>"; };
 		8812E3BC79FBB42F25503F61 /* DistEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistEngine.swift; sourceTree = "<group>"; };
 		88C1BDE574432B21D2216399 /* DiskKVStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskKVStore.swift; sourceTree = "<group>"; };
+		88F709B7A5BFCF722E6E04E0 /* GLM52WeightMapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52WeightMapTests.swift; sourceTree = "<group>"; };
 		89FFF409AAE32382D565A0AC /* MetalNormTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalNormTests.swift; sourceTree = "<group>"; };
 		8A0311C28E4481B6324CCEEA /* InferenceTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InferenceTypes.swift; sourceTree = "<group>"; };
 		8A3A92CD31E52D0FEA8A7BDF /* GGUFWeights+Output.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GGUFWeights+Output.swift"; sourceTree = "<group>"; };
@@ -690,11 +741,13 @@
 		933E7E9F2401E8A657B29BF5 /* StreamingDecoder+Factories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StreamingDecoder+Factories.swift"; sourceTree = "<group>"; };
 		94C669A65835A7979E614D5C /* MachineAutoTuneTransactionStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineAutoTuneTransactionStoreTests.swift; sourceTree = "<group>"; };
 		94F4FE07FBC63B34D74F4390 /* DistCoordinator+Files.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+Files.swift"; sourceTree = "<group>"; };
+		95B335E1067439AD785A8150 /* GLM52ConversationProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ConversationProtocol.swift; sourceTree = "<group>"; };
 		9688D9B8AF6B9E7FC30E71BD /* DistKV.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistKV.swift; sourceTree = "<group>"; };
 		97C63105C53D2AE9BB807F5C /* StreamingDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingDecoderTests.swift; sourceTree = "<group>"; };
 		97F511E6992D655C8FADC80D /* ProjectEdit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectEdit.swift; sourceTree = "<group>"; };
 		98B276318C750CF84428E31F /* MetalScatterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalScatterTests.swift; sourceTree = "<group>"; };
 		995062952C10403845BC7283 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		99CA4772320EE6B0FF89EDDB /* GLM52CompactKVTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52CompactKVTests.swift; sourceTree = "<group>"; };
 		9AC3E6E56608452C79C5B205 /* MetalCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCopyTests.swift; sourceTree = "<group>"; };
 		9AEFA70C09C14418ADA57DD2 /* MachineAutoTuneSwapCounterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineAutoTuneSwapCounterTests.swift; sourceTree = "<group>"; };
 		9CED68C11B11F63AC10A91CD /* LocalServer+Networking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalServer+Networking.swift"; sourceTree = "<group>"; };
@@ -711,12 +764,14 @@
 		9F8A75C972B7F09788F5C0C2 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		9FC442764DEB1E4C721539D2 /* DiskBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskBenchmark.swift; sourceTree = "<group>"; };
 		9FFEDDBECE45D1587F578F58 /* GraphOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphOutput.swift; sourceTree = "<group>"; };
+		A13F9F430C06F40155F0779D /* GLM52Router.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52Router.swift; sourceTree = "<group>"; };
 		A23E249B37D249B192D7CABB /* Half.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Half.swift; sourceTree = "<group>"; };
 		A2ED669257A621E1FCE97A57 /* DwarfStarApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DwarfStarApp.swift; sourceTree = "<group>"; };
 		A32733C4758177EFF35F60A7 /* SimulatedMemoryLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimulatedMemoryLock.swift; sourceTree = "<group>"; };
 		A403B4CEE74B1F2605284C5C /* repeat.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = repeat.metal; sourceTree = "<group>"; };
 		A4276DADBFB6CAFEA39DDDB0 /* ChatSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatSession.swift; sourceTree = "<group>"; };
 		A48CA7E9C1E5157A52DED3D1 /* GraphTwoSpanAttnTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphTwoSpanAttnTests.swift; sourceTree = "<group>"; };
+		A4A679EDD4CE21B7B2B3840E /* GLM52KVLoRANormTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52KVLoRANormTests.swift; sourceTree = "<group>"; };
 		A570B14832FFFA612C8AC86E /* AttachmentViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentViews.swift; sourceTree = "<group>"; };
 		A5A43BA5DE36783B471282CD /* DistFrameHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistFrameHeader.swift; sourceTree = "<group>"; };
 		A5E43CA0AD3734BB75314681 /* GitHubToolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubToolTests.swift; sourceTree = "<group>"; };
@@ -726,6 +781,7 @@
 		A8AB80F335746580F38A4BC8 /* MTPSidecar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MTPSidecar.swift; sourceTree = "<group>"; };
 		A8B2B6827FF46CD681753802 /* DistCoordinator+VerticalChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+VerticalChat.swift"; sourceTree = "<group>"; };
 		A8DD39BD103F01DC3D188AFD /* MetalMoEFusedDecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMoEFusedDecodeTests.swift; sourceTree = "<group>"; };
+		A96C42770A68627AE89E027F /* GLM52IndexerReferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerReferenceTests.swift; sourceTree = "<group>"; };
 		AABA42799A5FD7C7AE30866E /* dsv4_hc.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = dsv4_hc.metal; sourceTree = "<group>"; };
 		AB3A9B096F037F33D037A7A1 /* LoadProgress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadProgress.swift; sourceTree = "<group>"; };
 		ABD0DDFC659908DFDB667097 /* FileDelete.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileDelete.swift; sourceTree = "<group>"; };
@@ -735,10 +791,13 @@
 		AD6D5A1F9CD6CD3BB6ECF5EF /* AgentsList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsList.swift; sourceTree = "<group>"; };
 		AE55E668DADBC37930F51C9C /* libDS4Engine.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Engine.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		AF2D18DD898FCE7E682FA0C6 /* PrefillStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrefillStage.swift; sourceTree = "<group>"; };
+		AF5D0A470C70621EA23FF2C2 /* glm52.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = glm52.metal; sourceTree = "<group>"; };
 		AFE669818F81B61FEEA475BD /* ProjectWrite.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectWrite.swift; sourceTree = "<group>"; };
 		B0D9D47C68C0EEADBF9F5819 /* GraphMoETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphMoETests.swift; sourceTree = "<group>"; };
 		B0E8D4CE8497E9B17FBD6E3F /* MCPProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPProtocol.swift; sourceTree = "<group>"; };
+		B190251B4AB272B762B97556 /* GLM52ChatRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ChatRenderer.swift; sourceTree = "<group>"; };
 		B2216810DFACCBE17CBBD486 /* MetalMatmulMM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMatmulMM.swift; sourceTree = "<group>"; };
+		B311FCA2879C701D8D929452 /* GLM52IndexerReference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerReference.swift; sourceTree = "<group>"; };
 		B3C61E7E2FCA95867B5B6018 /* MetalMatmulMMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalMatmulMMTests.swift; sourceTree = "<group>"; };
 		B43486BAE0299D6F90104A92 /* ModelDownloadTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadTypes.swift; sourceTree = "<group>"; };
 		B52D7AB14224469345DAD054 /* GraphKVStageABTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphKVStageABTests.swift; sourceTree = "<group>"; };
@@ -759,11 +818,13 @@
 		BFD7D66077782DB84FD7C4F9 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		C02CB092BF38074BE1B2B211 /* GraphCompressor+Indexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GraphCompressor+Indexer.swift"; sourceTree = "<group>"; };
 		C0C737D512243B91012599A9 /* FileModify.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileModify.swift; sourceTree = "<group>"; };
+		C1218F4F02CCB6E7C81AFEA6 /* GLM52ExpertStreamPlanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ExpertStreamPlanner.swift; sourceTree = "<group>"; };
 		C172193ED7BF5F1F003927B0 /* ModelPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelPicker.swift; sourceTree = "<group>"; };
 		C29956207CA6FB4A221261CB /* MachineAutoTune.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineAutoTune.swift; sourceTree = "<group>"; };
 		C30E9CDCD9326F9DBB11888D /* HFTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HFTokenStore.swift; sourceTree = "<group>"; };
 		C33B22E66841DF4F6949AB31 /* MetalDense.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDense.swift; sourceTree = "<group>"; };
 		C3DB394FA9E6CBD73406D270 /* GraphCompressor+Execution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GraphCompressor+Execution.swift"; sourceTree = "<group>"; };
+		C3E326E6DD9F7C3FCD40E379 /* GLM52Tokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52Tokenizer.swift; sourceTree = "<group>"; };
 		C4D74E90606741DA38705858 /* InferenceService+Conversation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "InferenceService+Conversation.swift"; sourceTree = "<group>"; };
 		C558665529CCE0226C7F67D8 /* MetalArgsort.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalArgsort.swift; sourceTree = "<group>"; };
 		C63E0FD806A7EF3833BD53FF /* HalfTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HalfTests.swift; sourceTree = "<group>"; };
@@ -777,6 +838,7 @@
 		CA42134584A9542349688BE4 /* MetalSoftmaxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSoftmaxTests.swift; sourceTree = "<group>"; };
 		CA889187DFFE1AC80235A31D /* DiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsTests.swift; sourceTree = "<group>"; };
 		CB4552AD0A3259AAB04D8394 /* DistCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistCoordinator.swift; sourceTree = "<group>"; };
+		CB76082DB7E5E259900F63DA /* TokenizerFactoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TokenizerFactoryTests.swift; sourceTree = "<group>"; };
 		CBF1799470CA92F86FB87DF1 /* ServerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerController.swift; sourceTree = "<group>"; };
 		CC31562F8ED73DC6DE443D48 /* DSV4Dims.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSV4Dims.swift; sourceTree = "<group>"; };
 		CCCC706A092BE066CC483A66 /* DistWorker+Assignment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistWorker+Assignment.swift"; sourceTree = "<group>"; };
@@ -787,15 +849,19 @@
 		CF0FB9856870589119AD4A7A /* EngineLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineLog.swift; sourceTree = "<group>"; };
 		CFB5BAD85C9703E09F6FDB61 /* GraphUnary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphUnary.swift; sourceTree = "<group>"; };
 		D1448CB098230A1E0E377DE9 /* ChatStore+Agents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+Agents.swift"; sourceTree = "<group>"; };
+		D148F99DD85E66033EFCE2AB /* GLM52CompactDSA.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52CompactDSA.swift; sourceTree = "<group>"; };
 		D1FFD25EBD4D7B4BBFC7FC76 /* GraphRawRingAttnTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphRawRingAttnTests.swift; sourceTree = "<group>"; };
 		D270D230B2F2F9EDF446E897 /* ProjectCache+Files.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ProjectCache+Files.swift"; sourceTree = "<group>"; };
 		D3AEF9B5E04563976DB579FC /* RequestGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RequestGate.swift; sourceTree = "<group>"; };
 		D4DCB53A949477E48E4B50F7 /* LocalServer+Responses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalServer+Responses.swift"; sourceTree = "<group>"; };
 		D710E1561877DA19910B6F6A /* MetalRouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRouterTests.swift; sourceTree = "<group>"; };
 		D71DDB280D173937A38AD22A /* MetalArgsortTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalArgsortTests.swift; sourceTree = "<group>"; };
+		D9C6953888608CA6BADC4AD6 /* GLM52IndexerScores.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerScores.swift; sourceTree = "<group>"; };
 		DA284F856F5338A05B81FD62 /* ToolCallParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCallParser.swift; sourceTree = "<group>"; };
+		DA2BC33BE954962A7D0B5E55 /* GLM52IndexerKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerKeyStore.swift; sourceTree = "<group>"; };
 		DB235726DD8CFB53A0DFB2D5 /* HTTPRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTTPRequest.swift; sourceTree = "<group>"; };
 		DBD2CCBC149076590C9C7FD8 /* FileLines.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileLines.swift; sourceTree = "<group>"; };
+		DC5A7A0995562AE736FF3B12 /* ModelInspectorGLM52Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelInspectorGLM52Tests.swift; sourceTree = "<group>"; };
 		DD225BFAE99493AADEF1ACD5 /* MetalSparseSelect.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSparseSelect.swift; sourceTree = "<group>"; };
 		DFC9327F38648ED56CB7C8E3 /* InferenceService+Tuning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "InferenceService+Tuning.swift"; sourceTree = "<group>"; };
 		E00D175DCDC651EF04D8D5D8 /* GPUTensor+Compressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GPUTensor+Compressor.swift"; sourceTree = "<group>"; };
@@ -817,12 +883,14 @@
 		ECB707A1393DBCA7AA6B0F4A /* MetalGLU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGLU.swift; sourceTree = "<group>"; };
 		ECCBCAB1AC76BB0D76219B01 /* ExpertBundle+MetalIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ExpertBundle+MetalIO.swift"; sourceTree = "<group>"; };
 		ED8F11DB099681E8A45AE1A1 /* GraphAttnSplitKTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttnSplitKTests.swift; sourceTree = "<group>"; };
+		EDAE596E4D815E2BEF672D4D /* GLM52TokenizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52TokenizerTests.swift; sourceTree = "<group>"; };
 		EDE6492D25BA4C8DC74C83D8 /* IndexerSelectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IndexerSelectTests.swift; sourceTree = "<group>"; };
 		EE41DEC6EF0CD83F10E91484 /* DistWorker+KV.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistWorker+KV.swift"; sourceTree = "<group>"; };
 		EE66760C0FA2E09DDD88F221 /* StreamingDecoder+LayerExecution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StreamingDecoder+LayerExecution.swift"; sourceTree = "<group>"; };
 		EF2455A5B6BBEA12585BF687 /* MetalRepeat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRepeat.swift; sourceTree = "<group>"; };
 		EFFB96721484229AFF7F47DC /* DistCoordinator+ExpertParallelism.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+ExpertParallelism.swift"; sourceTree = "<group>"; };
 		F090691230172492751923DB /* IndexerSelect.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IndexerSelect.swift; sourceTree = "<group>"; };
+		F1038D07B88AC031195EBDF0 /* TokenizerFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TokenizerFactory.swift; sourceTree = "<group>"; };
 		F20161E8EC3211270A3E070A /* DistWorker+Lifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistWorker+Lifecycle.swift"; sourceTree = "<group>"; };
 		F27F2CC997228A571FF6A9C0 /* GraphDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphDecoderTests.swift; sourceTree = "<group>"; };
 		F2897D2B25882C04D36C09E7 /* DistProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistProtocolTests.swift; sourceTree = "<group>"; };
@@ -849,6 +917,7 @@
 		FDBE787F18FCFCEBC1955AF4 /* DenseStreamer+Types.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DenseStreamer+Types.swift"; sourceTree = "<group>"; };
 		FDF02E4A83995DFB9DB2300F /* Quantize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Quantize.swift; sourceTree = "<group>"; };
 		FE7180B9003DABD04DCC5087 /* ExpertCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExpertCacheTests.swift; sourceTree = "<group>"; };
+		FE8AA4955782C86D31E67DB8 /* GLM52IndexerKeyStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerKeyStoreTests.swift; sourceTree = "<group>"; };
 		FF06E25BCD32E72CA2E941D9 /* DistWorkMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistWorkMessages.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -908,6 +977,7 @@
 			isa = PBXGroup;
 			children = (
 				277565CC999D4A94077FA5E4 /* DeepSeekV4 */,
+				8559919AE2AE363B131C400F /* GLM52 */,
 				F2FC9BA02BC3951FFF5070B5 /* Qwen */,
 			);
 			path = Backends;
@@ -1124,6 +1194,7 @@
 			isa = PBXGroup;
 			children = (
 				613317125E3E858DB7D7615D /* DeepSeekV4 */,
+				4B8A467539A1DF5F25BB448A /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -1199,6 +1270,17 @@
 				AFE669818F81B61FEEA475BD /* ProjectWrite.swift */,
 			);
 			path = Projects;
+			sourceTree = "<group>";
+		};
+		2D83C38FF2058E17B059C4A4 /* TensorSchema */ = {
+			isa = PBXGroup;
+			children = (
+				30DA0E6D89D3D4794B46D95E /* GLM52ExpertStreamPlannerTests.swift */,
+				21DEAFF4D6781CDDCF59DFF3 /* GLM52RealHeaderIntegrationTests.swift */,
+				2D4229AA0E66CBB512EA3444 /* GLM52TensorSchemaTests.swift */,
+				88F709B7A5BFCF722E6E04E0 /* GLM52WeightMapTests.swift */,
+			);
+			path = TensorSchema;
 			sourceTree = "<group>";
 		};
 		2D98E8DE2FF44D4A4C7752B1 /* Handshake */ = {
@@ -1310,6 +1392,14 @@
 			path = Dense;
 			sourceTree = "<group>";
 		};
+		3C20BAA30B7130953B6EB5C7 /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				2394819EC28C70CE8CA59EF5 /* GLM52ConfigurationTests.swift */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
 		3E04EFEBFC1608A23F747DD9 /* Agents */ = {
 			isa = PBXGroup;
 			children = (
@@ -1362,6 +1452,7 @@
 		461F7F7B47851348BDA0A5CF /* Tokenization */ = {
 			isa = PBXGroup;
 			children = (
+				843FEE999165657BFA97492A /* API */,
 				CC7FFB53BF51656582741A13 /* Backends */,
 			);
 			path = Tokenization;
@@ -1385,6 +1476,7 @@
 			isa = PBXGroup;
 			children = (
 				75852C74E68DC3B1DCCC26F0 /* DeepSeekV4 */,
+				589206A2BB79FE84627D7D32 /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -1445,6 +1537,16 @@
 				F6A4346903BDA5A9B26E3A56 /* Runtime */,
 			);
 			path = DS4Metal;
+			sourceTree = "<group>";
+		};
+		4B8A467539A1DF5F25BB448A /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				B190251B4AB272B762B97556 /* GLM52ChatRenderer.swift */,
+				95B335E1067439AD785A8150 /* GLM52ConversationProtocol.swift */,
+				0CB67575EE9D87AA9D1B33E2 /* GLM52ToolCodec.swift */,
+			);
+			path = GLM52;
 			sourceTree = "<group>";
 		};
 		4CAFABDABF3CE1DBE7D993D8 /* Benchmark */ = {
@@ -1554,6 +1656,20 @@
 			path = Codec;
 			sourceTree = "<group>";
 		};
+		589206A2BB79FE84627D7D32 /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				99CA4772320EE6B0FF89EDDB /* GLM52CompactKVTests.swift */,
+				FE8AA4955782C86D31E67DB8 /* GLM52IndexerKeyStoreTests.swift */,
+				112F1643CE842FF44199637C /* GLM52IndexerScoresTests.swift */,
+				A4A679EDD4CE21B7B2B3840E /* GLM52KVLoRANormTests.swift */,
+				06EF364D0991CF7640953F91 /* GLM52RouterTests.swift */,
+				B4E691CB3868AB555E3F0286 /* DSA */,
+				2D83C38FF2058E17B059C4A4 /* TensorSchema */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
 		59272C0BD4939F0003AABA58 /* Agents */ = {
 			isa = PBXGroup;
 			children = (
@@ -1640,6 +1756,8 @@
 		61DC04B5A7B71233AED32281 /* API */ = {
 			isa = PBXGroup;
 			children = (
+				82274656D67E3426EDC89DF1 /* ConversationBackendPolicy.swift */,
+				F1038D07B88AC031195EBDF0 /* TokenizerFactory.swift */,
 				1164FFB36BDF1AE2A7A150F3 /* TokenizerProtocol.swift */,
 			);
 			path = API;
@@ -1845,6 +1963,14 @@
 			path = MoE;
 			sourceTree = "<group>";
 		};
+		762FAD7DBC658AEAE5371596 /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				0FC0533929BF3F31309C0E23 /* GLM52Configuration.swift */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
 		77876424CA17933B39C95177 /* Concurrency */ = {
 			isa = PBXGroup;
 			children = (
@@ -1880,6 +2006,30 @@
 			path = Graph;
 			sourceTree = "<group>";
 		};
+		843FEE999165657BFA97492A /* API */ = {
+			isa = PBXGroup;
+			children = (
+				CB76082DB7E5E259900F63DA /* TokenizerFactoryTests.swift */,
+			);
+			path = API;
+			sourceTree = "<group>";
+		};
+		8559919AE2AE363B131C400F /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				6CC26D813DB9CF90A7DB5A33 /* GLM52Backend.swift */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
+		85C991231D841B1EDA7021E1 /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				C3E326E6DD9F7C3FCD40E379 /* GLM52Tokenizer.swift */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
 		87B232AE201803421F88E676 /* metal */ = {
 			isa = PBXGroup;
 			children = (
@@ -1894,6 +2044,7 @@
 				FC87244BF2639D4D13A1E6D2 /* dsv4_rope.metal */,
 				5E660CE1E3AC8BBE87B36ED0 /* flash_attn.metal */,
 				9EBB270A4D21F5330A23A872 /* get_rows.metal */,
+				AF5D0A470C70621EA23FF2C2 /* glm52.metal */,
 				762FA618813B7745AF5EBF71 /* glu.metal */,
 				236E64715ABC1038C1C3506E /* moe.metal */,
 				6341283A0E582969322FE3CD /* norm.metal */,
@@ -1992,6 +2143,15 @@
 			path = GGUF;
 			sourceTree = "<group>";
 		};
+		902205275240FC969555F623 /* DSA */ = {
+			isa = PBXGroup;
+			children = (
+				D148F99DD85E66033EFCE2AB /* GLM52CompactDSA.swift */,
+				B311FCA2879C701D8D929452 /* GLM52IndexerReference.swift */,
+			);
+			path = DSA;
+			sourceTree = "<group>";
+		};
 		9042FC2DAF2F336FD206C0B2 /* Decode */ = {
 			isa = PBXGroup;
 			children = (
@@ -2056,10 +2216,19 @@
 			path = API;
 			sourceTree = "<group>";
 		};
+		A08D2D3AD6E367A6142807BD /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				3F982196E52C8B441F9C1D91 /* GLM52ConversationTests.swift */,
+			);
+			path = GLM52;
+			sourceTree = "<group>";
+		};
 		A17B1B734DD5684777CC4E9F /* Runtime */ = {
 			isa = PBXGroup;
 			children = (
 				8D3CDBAD6E49494CCDE5FF5D /* BackendSelectorTests.swift */,
+				DC5A7A0995562AE736FF3B12 /* ModelInspectorGLM52Tests.swift */,
 			);
 			path = Runtime;
 			sourceTree = "<group>";
@@ -2184,6 +2353,15 @@
 			path = Model;
 			sourceTree = "<group>";
 		};
+		B4E691CB3868AB555E3F0286 /* DSA */ = {
+			isa = PBXGroup;
+			children = (
+				679E0BFB1735B072C057A8C2 /* GLM52CompactDSATests.swift */,
+				A96C42770A68627AE89E027F /* GLM52IndexerReferenceTests.swift */,
+			);
+			path = DSA;
+			sourceTree = "<group>";
+		};
 		B5CA9F99B18AD999060C4A1F /* Chat */ = {
 			isa = PBXGroup;
 			children = (
@@ -2270,6 +2448,7 @@
 			isa = PBXGroup;
 			children = (
 				33B5E8FECDABEA16BA49DD4E /* DeepSeekV4 */,
+				762FAD7DBC658AEAE5371596 /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -2311,8 +2490,19 @@
 			isa = PBXGroup;
 			children = (
 				14ABF2B24438C56B50C3C3B4 /* DeepSeekV4 */,
+				C365F23FB24C3D3FDA4D7936 /* GLM52 */,
 			);
 			path = Backends;
+			sourceTree = "<group>";
+		};
+		C116351D8262E08DFB12341C /* TensorSchema */ = {
+			isa = PBXGroup;
+			children = (
+				C1218F4F02CCB6E7C81AFEA6 /* GLM52ExpertStreamPlanner.swift */,
+				5E30D55027AF7ED1E1FB2ACF /* GLM52TensorSchema.swift */,
+				5877B4FAA808EAEDEAEC0A7B /* GLM52WeightMap.swift */,
+			);
+			path = TensorSchema;
 			sourceTree = "<group>";
 		};
 		C304550EA5539F4AF77AB751 /* Compression */ = {
@@ -2331,6 +2521,16 @@
 				A7FE6E2A511F636A6E2F89E5 /* KVSnapshot.swift */,
 			);
 			path = KV;
+			sourceTree = "<group>";
+		};
+		C365F23FB24C3D3FDA4D7936 /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				902205275240FC969555F623 /* DSA */,
+				CFAD6D2D431921D182AFA0DC /* Kernels */,
+				C116351D8262E08DFB12341C /* TensorSchema */,
+			);
+			path = GLM52;
 			sourceTree = "<group>";
 		};
 		C4308CAC8AAFC82D3CA2E20A /* Storage */ = {
@@ -2426,6 +2626,7 @@
 			isa = PBXGroup;
 			children = (
 				530D7BD0AE11937177261B4C /* DeepSeekV4 */,
+				D09ED381A975F3D2E28A6EDC /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -2434,8 +2635,21 @@
 			isa = PBXGroup;
 			children = (
 				E18715F47DC49BA94CF338BA /* DeepSeekV4 */,
+				A08D2D3AD6E367A6142807BD /* GLM52 */,
 			);
 			path = Backends;
+			sourceTree = "<group>";
+		};
+		CFAD6D2D431921D182AFA0DC /* Kernels */ = {
+			isa = PBXGroup;
+			children = (
+				0BC53781FFE55DA7D25F018D /* GLM52CompactKV.swift */,
+				DA2BC33BE954962A7D0B5E55 /* GLM52IndexerKeyStore.swift */,
+				D9C6953888608CA6BADC4AD6 /* GLM52IndexerScores.swift */,
+				162C39C4D3F63EA64FA2669E /* GLM52KVLoRANorm.swift */,
+				A13F9F430C06F40155F0779D /* GLM52Router.swift */,
+			);
+			path = Kernels;
 			sourceTree = "<group>";
 		};
 		D02EA9FB1175C198C15D3B60 /* Shared */ = {
@@ -2444,6 +2658,14 @@
 				D2E174162FF5C42F9BE9ECBA /* Support */,
 			);
 			path = Shared;
+			sourceTree = "<group>";
+		};
+		D09ED381A975F3D2E28A6EDC /* GLM52 */ = {
+			isa = PBXGroup;
+			children = (
+				EDAE596E4D815E2BEF672D4D /* GLM52TokenizerTests.swift */,
+			);
+			path = GLM52;
 			sourceTree = "<group>";
 		};
 		D2E174162FF5C42F9BE9ECBA /* Support */ = {
@@ -2478,6 +2700,7 @@
 			isa = PBXGroup;
 			children = (
 				DB21D3BF148D244B7EFAC6E2 /* DeepSeekV4 */,
+				3C20BAA30B7130953B6EB5C7 /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -2788,6 +3011,7 @@
 			isa = PBXGroup;
 			children = (
 				4FF600A93358E36F9B714F7F /* DeepSeekV4 */,
+				85C991231D841B1EDA7021E1 /* GLM52 */,
 			);
 			path = Backends;
 			sourceTree = "<group>";
@@ -3047,12 +3271,18 @@
 			files = (
 				988535E1C3492FEFB65AF52A /* ByteLevel.swift in Sources */,
 				C2B4B256F62BC4757A1E962C /* ChatRenderer.swift in Sources */,
+				799C4D22A01413FD23E61D73 /* ConversationBackendPolicy.swift in Sources */,
 				E8AEEA5D2948F35F1E5B81C0 /* ConversationModels.swift in Sources */,
 				F563A8323E0776D4D36BDBF8 /* DeepSeekV4Configuration.swift in Sources */,
 				FBA01E5DBBB0EC16D0B4EC0A /* DeepSeekV4Tokenizer.swift in Sources */,
 				9E286C897E0EBE9B93F519D1 /* GGUFCursor.swift in Sources */,
 				7017B9764A8F0FED41CDB092 /* GGUFModel.swift in Sources */,
 				4091F42B02D39C4933B8CD2C /* GGUFTypes.swift in Sources */,
+				741D8D0C09BB7BD8798077E6 /* GLM52ChatRenderer.swift in Sources */,
+				D741B80131A041FB84E1B22C /* GLM52Configuration.swift in Sources */,
+				10017626739869F6EDBC0577 /* GLM52ConversationProtocol.swift in Sources */,
+				FD8ACC47E18952E4EE97AF29 /* GLM52Tokenizer.swift in Sources */,
+				3F4BFD6724BB3913C89C11E6 /* GLM52ToolCodec.swift in Sources */,
 				AC21D1689CDF1A57CE006AC2 /* Half.swift in Sources */,
 				4C8110FE1B0BF5D31B7B7D20 /* KVCFile.swift in Sources */,
 				45CC6BCFAA8E0C5497ACD8B6 /* LoadProgress.swift in Sources */,
@@ -3063,6 +3293,7 @@
 				A05D0C9A8AB31C728171C70C /* Sampler.swift in Sources */,
 				235C9EE1ED53B29EB8160173 /* SimulatedMemoryLock.swift in Sources */,
 				5C54D217714D5E65F247B515 /* ThinkMode.swift in Sources */,
+				87CE3EB405BEFD9E02E9C3BC /* TokenizerFactory.swift in Sources */,
 				5889744CABE5CA20E9352701 /* TokenizerProtocol.swift in Sources */,
 				A56F30F60AF36BBE7851A830 /* ToolCallParser.swift in Sources */,
 				78BACF4E9383EC364E9D0D56 /* ToolMarkup.swift in Sources */,
@@ -3176,6 +3407,16 @@
 				9EBC1C4E2FECCA7671FF9214 /* GGUFWeights+Output.swift in Sources */,
 				6912FC78C1B6EECC6D6D1E8D /* GGUFWeights+Validation.swift in Sources */,
 				4CBD67B820365C93E049D316 /* GGUFWeights.swift in Sources */,
+				21D5A5D703C08781E519A56D /* GLM52CompactDSA.swift in Sources */,
+				C6E8985F5AF66FB9829ED137 /* GLM52CompactKV.swift in Sources */,
+				962F9B3E1B5220726617794B /* GLM52ExpertStreamPlanner.swift in Sources */,
+				D7EEFFCA53EB4892FA3DB540 /* GLM52IndexerKeyStore.swift in Sources */,
+				BFF186DAA6DC6DCB6C01A9BA /* GLM52IndexerReference.swift in Sources */,
+				FB276FF4A22B6359559CCE3A /* GLM52IndexerScores.swift in Sources */,
+				BE249EA55752A25625735380 /* GLM52KVLoRANorm.swift in Sources */,
+				CEFE3D89CCBD3509440DEFA1 /* GLM52Router.swift in Sources */,
+				CF69A4502FCF707278CEFDFD /* GLM52TensorSchema.swift in Sources */,
+				F7F8534A99572F1528FFD12D /* GLM52WeightMap.swift in Sources */,
 				F1E43DA8DE5A403805D024B2 /* GPUTensor+Compressor.swift in Sources */,
 				A68EF9E879B3C2B4A239E2D8 /* GPUTensor.swift in Sources */,
 				C3A848240C8745EDF86C5C90 /* GraphAttention.swift in Sources */,
@@ -3296,6 +3537,7 @@
 				9134BC21883A966185F03954 /* FileModify.swift in Sources */,
 				0861BE7218B44C98626C36B9 /* FileRead.swift in Sources */,
 				BB61A5FCF7EF988B88066F8D /* FileWrite.swift in Sources */,
+				75313EF181C3412051D996CE /* GLM52Backend.swift in Sources */,
 				DF25DA1ABDD4ACAF7D3A790A /* Git.swift in Sources */,
 				A4BF117E9FF36F9112A07A2C /* GitHubClone.swift in Sources */,
 				42A57AE519979B2FC5901ED1 /* GitHubTool.swift in Sources */,
@@ -3370,6 +3612,20 @@
 				32A0F441DA4D151765090E7A /* GGUFLoaderTests.swift in Sources */,
 				64D7D9A198CF998BC87640F9 /* GGUFTests.swift in Sources */,
 				C36EE075F7DE1B800A8545FE /* GGUFWeightMapTests.swift in Sources */,
+				D10C4CE7BCC9120682CBEB09 /* GLM52CompactDSATests.swift in Sources */,
+				8A0E2F36E4B6B624EE10D4A5 /* GLM52CompactKVTests.swift in Sources */,
+				91AA83340FB528FAFFCB5DB0 /* GLM52ConfigurationTests.swift in Sources */,
+				888B1FA44CB2A41403F36BA5 /* GLM52ConversationTests.swift in Sources */,
+				4CCADEF2240B859B65937EE5 /* GLM52ExpertStreamPlannerTests.swift in Sources */,
+				67736C87B3B59FBFEE7388C3 /* GLM52IndexerKeyStoreTests.swift in Sources */,
+				B3CDA22DED503CDE6AA3F056 /* GLM52IndexerReferenceTests.swift in Sources */,
+				68C295FE719D00A749899158 /* GLM52IndexerScoresTests.swift in Sources */,
+				7CD428E0F47C4932C807206D /* GLM52KVLoRANormTests.swift in Sources */,
+				51BA6FD4E1D0CA8AE309A390 /* GLM52RealHeaderIntegrationTests.swift in Sources */,
+				D0AF30AC9D43B09167374900 /* GLM52RouterTests.swift in Sources */,
+				88CD84D5A05B51FAEA3F1222 /* GLM52TensorSchemaTests.swift in Sources */,
+				C62FB986E385781ECCDCC7D3 /* GLM52TokenizerTests.swift in Sources */,
+				34FA962CF9D123CEC1A0AF89 /* GLM52WeightMapTests.swift in Sources */,
 				4B5EA1999CAE1B345A47C540 /* GitHubToolTests.swift in Sources */,
 				415388CCE4FF344166E10965 /* GraphAttnOutLowTests.swift in Sources */,
 				CEFBB29340B1BE78F990F0E5 /* GraphAttnOutTests.swift in Sources */,
@@ -3432,12 +3688,14 @@
 				34353A646BB3973F133D926D /* MetalUnaryTests.swift in Sources */,
 				84878A1E224AF6BEAA07A32C /* ModelArchitectureTests.swift in Sources */,
 				B0BB35C94A4E89ABF6B5F9A0 /* ModelDownloaderTests.swift in Sources */,
+				3F6ED94E14CC733C0EB0B391 /* ModelInspectorGLM52Tests.swift in Sources */,
 				2176A77164A2B5376BCE042C /* ProjectCacheTests.swift in Sources */,
 				EB565C6F4A6B197EC9E95224 /* PromptLookupTests.swift in Sources */,
 				995C919B2993D3FC716C712D /* QuantizeTests.swift in Sources */,
 				E04E09D427713B83B41F60E0 /* SSDCachePlanTests.swift in Sources */,
 				E471EC28BE02D19A01D59441 /* SamplerTests.swift in Sources */,
 				A271A50771F0929EF0D74E4D /* StreamingDecoderTests.swift in Sources */,
+				DCD9BE8FD2FB13A3D9DF3B5E /* TokenizerFactoryTests.swift in Sources */,
 				AD3172F5D26E0EF5C171513E /* ToolRegistryTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -3566,7 +3824,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 8;
+				CURRENT_PROJECT_VERSION = 9;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -3596,7 +3854,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 8;
+				CURRENT_PROJECT_VERSION = 9;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;

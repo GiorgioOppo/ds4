@@ -8,12 +8,14 @@ Contratto comune e implementazioni di tokenizzazione specifiche dei backend.
 - [`Common/`](Common/README.md): primitive byte-level riutilizzabili.
 - [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): BPE JoyAI/DeepSeek,
   token speciali e reasoning; conserva l'alias storico `Tokenizer`.
+- [`Backends/GLM52/`](Backends/GLM52/README.md): GPT-2 byte-level BPE,
+  pretokenizer `glm4`, controlli GLM e stop policy.
 - [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione, senza
   implementazione fittizia.
 
 ## Flusso
 
-`DeepSeekV4Tokenizer` legge le tabelle tramite
+I tokenizer concreti leggono le tabelle tramite
 [`GGUFModel`](../Formats/GGUF/README.md).
 Il testo semplice attraversa pre-tokenizzazione e merge BPE; una chat già resa
 riconosce prima i token speciali indicizzati per byte iniziale. Gli id generati
@@ -23,7 +25,7 @@ alimentano prefill e decode; gli id in uscita vengono ricomposti in byte/testo.
 sequenze letterali che il modello classifica come token di controllo quando
 provengono da dati non fidati. Va applicato ai singoli campi prima del rendering
 (system, user, storico, risultati e schemi tool), mai alla chat già renderizzata:
-BOS, ruoli e DSML aggiunti dal renderer devono restare token atomici.
+BOS, ruoli e delimitatori aggiunti dal renderer devono restare token atomici.
 La variante `inJSON:` decodifica e visita ricorsivamente chiavi e valori prima
 di riserializzare: anche un delimitatore occultato con escape `\uXXXX` viene
 neutralizzato prima che il renderer degli schemi o degli argomenti lo espanda.

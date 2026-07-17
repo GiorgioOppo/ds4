@@ -23,5 +23,5 @@ famiglia.
   e Pro Q2 singolo; Pro Q4 split resta download-only.
 - [`qwen/`](qwen/README.md): architettura riconosciuta, backend ancora in
   preparazione.
-- [`glm-5.2/`](glm-5.2/README.md): manifest dei tre GGUF acquisibili e roadmap;
-  stato corrente download-only, senza detector o runtime GLM.
+- [`glm-5.2/`](glm-5.2/README.md): manifest, contratto GGUF e port progressivo;
+  detector/frontend disponibili, decoder ancora non eseguibile.

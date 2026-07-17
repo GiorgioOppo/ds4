@@ -11,13 +11,15 @@ decoder sia già disponibile.
 |---|---:|---:|---:|---:|---:|---|
 | DeepSeek V4 Flash | sì | sì | sì | sì | sì | Tre quantizzazioni complete sono scaricabili, selezionabili ed eseguibili. |
 | DeepSeek V4 Pro | sì | sì | sì, Q2 singolo | sì, Q2 singolo | sì, Q2 singolo | Il percorso distribuito è implementato e testato sul protocollo; la prova numerica con il GGUF Pro reale resta da eseguire. Il package Q4 split resta download-only. |
-| GLM 5.2 (`glm-dsa`) | noto, non registrato | sì | no | no | no | Tre GGUF monolitici sono scaricabili con size/SHA fissati; backend, tokenizer e kernel non sono ancora implementati. |
+| GLM 5.2 (`glm-dsa`) | sì | sì | no | no, rifiuto esplicito | no | Detector, shape/schema, tokenizer/chat/tool e prime primitive DSA/Metal sono implementati; il decoder end-to-end non è ancora disponibile. |
 | Qwen | sì | no | no | no, rifiuto esplicito | no | Struttura predisposta; decoder e template non sono ancora implementati. |
 | Sconosciuta | sì | no | no | no, rifiuto esplicito | no | L'identificatore GGUF viene riportato senza tentare un caricamento DeepSeek. |
 
 La selezione usa `general.architecture` del GGUF, normalizzato come
-identificatore stabile. Un file Qwen non deve mai raggiungere il validatore
-DeepSeek e produrre un errore fuorviante sui metadati `deepseek4.*`.
+identificatore stabile. Un file Qwen o GLM non deve mai raggiungere il
+validatore DeepSeek e produrre un errore fuorviante sui metadati
+`deepseek4.*`. GLM dispone già del proprio frontend, ma ciò non cambia la
+disponibilità del runtime.
 
 ## Catalogo GUI e supporto runtime
 
@@ -88,7 +90,8 @@ Il caricamento segue questa sequenza:
 
 Un'architettura riconosciuta ma non implementata genera un errore distinto da
 un file corrotto o da un profilo della stessa famiglia non supportato. Questo è
-il comportamento previsto per Qwen durante la fase preparatoria. Un DeepSeek V4
+il comportamento previsto per Qwen e GLM durante le rispettive fasi
+preparatorie. Un DeepSeek V4
 Pro Q2 valido attraversa invece lo stesso backend concreto di Flash, ma con una
 `DSV4RuntimeGeometry` costruita dai metadati: 61 layer, 7168 canali, 128 head,
 384 esperti, indexer top-1024 e scala router 2,5 non vengono sostituiti dalle
@@ -126,12 +129,13 @@ da un file GGUF e da una variante dichiarati, non dal solo nome commerciale.
 
 ## Requisiti prima del backend GLM 5.2
 
-Il catalogo GLM fissa già repository, revisione, filename, byte count e SHA-256,
-ma non registra ancora `glm-dsa` nel selettore. Prima di rendere una voce
-`runnable` servono audit del GGUF reale, tokenizer e template con golden test,
-schema tensori, DSA/IndexShare, routing MoE ed esperto condiviso, KV, MTP,
-kernel Metal e confronti numerici di prefill/decode. I knob DeepSeek non devono
-essere riutilizzati implicitamente. La checklist dettagliata è nel
+Il catalogo GLM fissa repository, revisione, filename, byte count e SHA-256.
+`glm-dsa` è ora registrato, l'header IQ2_XXS reale è stato validato e frontend,
+schema, router e policy DSA/IndexShare hanno test dedicati. Prima di rendere una
+voce `runnable` restano il grafo completo MLA/DSA, MoE routed/shared, loader e
+streaming pesi, KV runtime, output logits e confronti numerici di
+prefill/decode. MTP non fa parte del primo percorso autoregressivo. I knob
+DeepSeek non devono essere riutilizzati implicitamente. La checklist è nel
 [README GLM 5.2](architectures/glm-5.2/README.md).
 
 ## Documenti per famiglia
@@ -140,6 +144,6 @@ essere riutilizzati implicitamente. La checklist dettagliata è nel
   descrive il backend operativo e i suoi vincoli.
 - [`architectures/qwen/README.md`](architectures/qwen/README.md) descrive la
   predisposizione e ciò che resta da implementare.
-- [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.md) fissa il
-  manifest download-only e la roadmap del backend GLM.
+- [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.md) descrive
+  contratto verificato, tranche implementate e gate del backend GLM.
 - [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.md) indica dove collocare i file.

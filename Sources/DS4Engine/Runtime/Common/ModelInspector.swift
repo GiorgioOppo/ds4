@@ -7,7 +7,7 @@ import DS4Core
 public enum ModelInspector {
     public static func inspect(_ model: GGUFModel) throws -> RuntimeModelDescriptor {
         let detected = try ModelArchitectureDetector.detect(in: model)
-        let prefix = detected.id.rawValue
+        let prefix = detected.id.ggufMetadataNamespace
         let name = model.string("general.name").flatMap { $0.isEmpty ? nil : $0 }
             ?? fallbackName(for: detected)
 
@@ -51,6 +51,8 @@ public enum ModelInspector {
         switch detected.family {
         case .deepSeek:
             return DeepSeekV4BackendDefinition.modelCapabilities
+        case .glm:
+            return GLM52BackendDefinition.modelCapabilities
         case .qwen:
             return QwenBackendDefinition.modelCapabilities(for: detected.id)
         case .unknown:
@@ -63,6 +65,8 @@ public enum ModelInspector {
         switch detected.backendAvailability {
         case .implemented where detected.id == .deepSeekV4:
             return DeepSeekV4BackendDefinition.runtimeCapabilities
+        case .recognizedButNotImplemented where detected.family == .glm:
+            return GLM52BackendDefinition.runtimeCapabilities
         case .implemented, .recognizedButNotImplemented, .unknown:
             return QwenBackendDefinition.runtimeCapabilities
         }
@@ -71,6 +75,7 @@ public enum ModelInspector {
     private static func fallbackName(for detected: DetectedModelArchitecture) -> String {
         switch detected.family {
         case .deepSeek: return "DeepSeek V4"
+        case .glm: return "GLM 5.2"
         case .qwen: return "Qwen (\(detected.id.rawValue))"
         case .unknown: return detected.id.rawValue.isEmpty ? "Modello GGUF" : detected.id.rawValue
         }

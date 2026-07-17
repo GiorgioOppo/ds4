@@ -38,7 +38,7 @@ public enum BackendSelector {
             }
             return .deepSeekV4
         }
-        if descriptor.family == .qwen {
+        if descriptor.family == .glm || descriptor.family == .qwen {
             throw BackendSelectionError.backendNotImplemented(descriptor.architecture)
         }
         throw BackendSelectionError.unsupportedArchitecture(descriptor.architecture)

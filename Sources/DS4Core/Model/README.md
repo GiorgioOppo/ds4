@@ -8,6 +8,8 @@ Rilevamento portabile dell'architettura e configurazioni isolate per backend.
   descriptor e rilevamento da `general.architecture`.
 - [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): forma e validazione
   dei metadata DeepSeek V4, con alias compatibili delle API storiche.
+- [`Backends/GLM52/`](Backends/GLM52/README.md): geometria GLM 5.2 e
+  validazione stretta del namespace `glm-dsa`.
 - [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione documentato;
   il backend Qwen non è ancora implementato.
 

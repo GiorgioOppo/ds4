@@ -71,6 +71,8 @@ layout, token speciali e semantica devono essere realmente compatibili.
   pesi densi ed esperti, sidecar e streaming specifici DeepSeek.
 - `Backends/DeepSeekV4/Decode`: esecuzione, generazione, attenzione, cache,
   KV, prefill, diagnostica, riferimento e stato del decoder concreto.
+- `Backends/GLM52`: schema tensoriale, riferimenti DSA/IndexShare e primitive
+  Metal progressive; il decoder non è ancora eseguibile.
 - `Backends/Qwen`: placeholder documentato; nessun kernel o decoder fittizio.
 
 Una struttura dati che contiene buffer o risorse Metal appartiene a questo

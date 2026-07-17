@@ -41,6 +41,7 @@ DS4Core/
     Models/             chat turns, tool calls and shared conversation data
     Backends/
       DeepSeekV4/DSML/  DeepSeek template, markup and tool-call parser
+      GLM52/            GLM roles, reasoning and native XML tool protocol
       Qwen/             documented placeholder, not implemented
   Diagnostics/          load/progress reporting without UI dependencies
   Formats/
@@ -52,6 +53,7 @@ DS4Core/
     Common/             architecture id, family, descriptor and capabilities
     Backends/
       DeepSeekV4/       Flash/Pro shape and metadata validation
+      GLM52/            strict GLM 5.2 shape and metadata validation
       Qwen/             documented placeholder, not implemented
   Storage/              SSD/cache planning and memory-lock simulation
   Tokenization/
@@ -59,6 +61,7 @@ DS4Core/
     Common/             byte-level helpers
     Backends/
       DeepSeekV4/       concrete tokenizer, special tokens and thinking mode
+      GLM52/            GPT-2/glm4 tokenizer and GLM special tokens
       Qwen/             documented placeholder, not implemented
 
 DS4Metal/
@@ -75,6 +78,8 @@ DS4Metal/
       Streaming/        dense-weight streaming and requant caches
       Decode/           Execution, Generation, Attention, Cache, KV, Prefill,
                         State, Diagnostics and Reference
+    GLM52/              tensor schema, compact DSA references and staged kernels;
+                        no executable decoder yet
     Qwen/               documented placeholder, no decoder or fake kernels
   Graph/
     Core/                graph context
@@ -88,6 +93,7 @@ DS4Engine/
     Common/             model inspection, descriptor, capabilities and selector
     Backends/
       DeepSeekV4/       registration of the operational concrete backend
+      GLM52/            recognized backend definition, deliberately unavailable
       Qwen/             recognized but deliberately unavailable backend
   Inference/
     API/                 public request/result/event data structures
@@ -159,7 +165,7 @@ DS4Demo/
 See [`../docs/STRUTTURA-PROGETTO.md`](../docs/STRUTTURA-PROGETTO.md) for the
 dependency rules, contribution workflow and build commands.
 See [`../docs/ARCHITETTURE-SUPPORTATE.md`](../docs/ARCHITETTURE-SUPPORTATE.md)
-for the support matrix and the checklist for adding Qwen.
+for the support matrix and the checklists for GLM 5.2 and Qwen.
 
 ## Local Documentation Rule
 

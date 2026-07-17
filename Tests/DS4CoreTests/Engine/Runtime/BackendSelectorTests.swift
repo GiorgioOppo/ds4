@@ -40,6 +40,30 @@ final class BackendSelectorTests: XCTestCase {
         }
     }
 
+    func testGLM52IsInspectedButRejectedUntilItsMetalBackendIsReady() throws {
+        let descriptor = try ModelInspector.inspect(
+            generalArchitecture: "glm-dsa",
+            displayName: "GLM 5.2",
+            layerCount: 79
+        )
+
+        XCTAssertEqual(descriptor.architecture, .glmDSA)
+        XCTAssertEqual(descriptor.family, .glm)
+        XCTAssertEqual(descriptor.backendAvailability, .recognizedButNotImplemented)
+        XCTAssertTrue(descriptor.model.capabilities.contains(.chat))
+        XCTAssertTrue(descriptor.model.capabilities.contains(.tools))
+        XCTAssertTrue(descriptor.model.capabilities.contains(.reasoning))
+        XCTAssertTrue(descriptor.model.capabilities.contains(.mixtureOfExperts))
+        XCTAssertTrue(descriptor.capabilities.isEmpty)
+
+        XCTAssertThrowsError(try BackendSelector.select(descriptor)) { error in
+            guard case BackendSelectionError.backendNotImplemented(let id) = error else {
+                return XCTFail("errore inatteso: \(error)")
+            }
+            XCTAssertEqual(id, .glmDSA)
+        }
+    }
+
     func testUnknownArchitectureHasDistinctUnsupportedError() throws {
         let descriptor = try ModelInspector.inspect(
             generalArchitecture: "future-transformer",

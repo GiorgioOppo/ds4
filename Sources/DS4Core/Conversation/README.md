@@ -8,16 +8,18 @@ backend.
 - [`Models/`](Models/README.md): `ToolSpec`, `ToolCall` e `ChatTurn`.
 - [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): template e protocollo
   tool DSML di DeepSeek V4.
+- [`Backends/GLM52/`](Backends/GLM52/README.md): ruoli GLM, reasoning,
+  tool-call XML piatto e parser incrementale contenuto.
 - [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione documentato,
   senza renderer o parser fittizi.
 
 ## Flusso e dipendenze
 
-Il livello applicativo crea una sequenza di `ChatTurn`; il backend DeepSeek usa
-`ChatRenderer` e `ToolMarkup` per produrre il proprio template, che passa a
-[`Tokenizer`](../Tokenization/README.md). L'output del modello viene esaminato da
-`ToolCallParser` per ricostruire eventuali chiamate. La cartella dipende solo dai
-tipi di `DS4Core` e da Foundation.
+Il livello applicativo crea una sequenza di `ChatTurn`; la policy frontend
+seleziona DSML per DeepSeek oppure il protocollo nativo GLM. Il testo reso passa
+al tokenizer della stessa architettura e il parser corrispondente ricostruisce
+eventuali chiamate. La cartella dipende solo dai tipi di `DS4Core` e da
+Foundation.
 
 ## Regole di modifica
 

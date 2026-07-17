@@ -42,11 +42,12 @@ public final class MetalRuntime {
     /// Cache for pipelines specialized by function constants (see MetalDense).
     var mulMVPipelineCache: [String: MTLComputePipelineState] = [:]
 
-    /// The 19 kernel files in the exact concatenation order used by
-    /// ds4_gpu_full_source in ds4_metal.m (order can affect compilation).
+    /// Kernel files in deterministic concatenation order (order can affect
+    /// compilation). Architecture-owned additions such as `glm52` remain
+    /// separate from the DeepSeek source even though Metal compiles one library.
     public static let kernelFiles = [
         "flash_attn", "dense", "moe", "dsv4_hc", "unary", "dsv4_kv", "dsv4_rope",
-        "dsv4_misc", "argsort", "cpy", "concat", "get_rows", "sum_rows",
+        "dsv4_misc", "glm52", "argsort", "cpy", "concat", "get_rows", "sum_rows",
         "softmax", "repeat", "glu", "norm", "bin", "set_rows",
     ]
 
