@@ -23,8 +23,18 @@ public struct DecodeProfile: Sendable {
     public var layers = 0         // total per-layer iterations
     public var expertHits = 0     // expert slot-cache hits (persistent experts)
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
+    public var expertHitBytes = 0 // bytes not gathered because of cache hits
+    public var expertMissBytes = 0 // bytes gathered for cacheable misses
+    public var expertWarmed = 0    // synchronous history-driven pool warm fills
+    public var expertWarmedBytes = 0 // critical-path bytes read by those fills
+    /// Routed selections that could not use the slot cache (cache disabled or
+    /// unsupported layer/layout). Kept separate so a mixed-quant bypass cannot
+    /// inflate the displayed hit-rate by disappearing from its denominator.
+    public var expertBypasses = 0
     public var expertPrefilled = 0  // slabs filled by the look-ahead (I/O hidden under compute)
+    public var expertPrefilledBytes = 0 // physical look-ahead I/O omitted from gatherS/gatherBytes
     public var gatherBytes = 0    // expert bytes copied from the mmap (EXPERT I/O volume)
+    public var expertBypassBytes = 0 // subset of gatherBytes caused by bypass selections
 
     public init() {}
 
@@ -32,6 +42,26 @@ public struct DecodeProfile: Sendable {
     /// calls "totale"). Wall-clock minus this = time spent OUTSIDE the engine
     /// (sampler, streaming, UI) — the GUI logs that split per turn.
     public var totalS: Double { embedS + routeS + gatherS + expertsS + layerOtherS + headS }
+
+    public var expertCacheableHitRate: Double? {
+        let total = expertHits + expertMisses
+        return total > 0 ? Double(expertHits) / Double(total) : nil
+    }
+
+    public var expertGlobalHitRate: Double? {
+        let total = expertHits + expertMisses + expertBypasses
+        return total > 0 ? Double(expertHits) / Double(total) : nil
+    }
+
+    public var expertCacheableByteHitRate: Double? {
+        let total = expertHitBytes + expertMissBytes
+        return total > 0 ? Double(expertHitBytes) / Double(total) : nil
+    }
+
+    public var expertGlobalByteHitRate: Double? {
+        let total = expertHitBytes + expertMissBytes + expertBypassBytes
+        return total > 0 ? Double(expertHitBytes) / Double(total) : nil
+    }
 
     public func report(title: String = "Profilo decode") -> String {
         guard forwards > 0 else { return "\(title): nessun forward registrato." }
@@ -41,10 +71,36 @@ public struct DecodeProfile: Sendable {
         func pct(_ s: Double) -> String { String(format: "%2.0f%%", total > 0 ? s / total * 100 : 0) }
         let tps = total > 0 ? f / total : 0
         var cacheLine = ""
-        if expertHits + expertMisses > 0 {
-            let rate = Double(expertHits) / Double(expertHits + expertMisses) * 100
-            let ahead = expertPrefilled > 0 ? " — \(expertPrefilled) slab da look-ahead" : ""
-            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate))% hit)\(ahead)"
+        if let rate = expertCacheableHitRate {
+            let ahead: String
+            if expertPrefilled > 0, expertPrefilledBytes > 0 {
+                ahead = String(format: " — %d slab da look-ahead, %.1f MB/token I/O nascosti",
+                               expertPrefilled, Double(expertPrefilledBytes) / f / 1_048_576)
+            } else if expertPrefilled > 0 {
+                ahead = " — \(expertPrefilled) slab da look-ahead"
+            } else {
+                ahead = ""
+            }
+            cacheLine = "\n  cache expert \(expertHits) hit / \(expertMisses) miss  (\(String(format: "%.0f", rate * 100))% sui cacheabili)\(ahead)"
+        }
+        if expertBypasses > 0, let globalRate = expertGlobalHitRate {
+            let bypassVolume: String
+            if expertBypassBytes > 0 {
+                bypassVolume = String(format: ", %.1f MB/token",
+                                      Double(expertBypassBytes) / f / 1_048_576)
+            } else {
+                bypassVolume = ""
+            }
+            cacheLine += "\n  cache bypass \(expertBypasses) selezioni\(bypassVolume) — \(String(format: "%.0f", globalRate * 100))% hit globale"
+        }
+        if expertWarmed > 0 {
+            cacheLine += String(format: "\n  cache warm   %d slab iniziali, %.1f MB/token I/O sincroni",
+                                expertWarmed, Double(expertWarmedBytes) / f / 1_048_576)
+        }
+        if let cacheableBytes = expertCacheableByteHitRate {
+            let globalBytes = expertGlobalByteHitRate ?? cacheableBytes
+            cacheLine += String(format: "\n  cache byte    %.0f%% hit sui cacheabili / %.0f%% globale",
+                                cacheableBytes * 100, globalBytes * 100)
         }
         // Effective gather bandwidth: how fast the expert slabs actually leave the
         // SSD/page cache. Compare against the raw sequential bandwidth of the disk

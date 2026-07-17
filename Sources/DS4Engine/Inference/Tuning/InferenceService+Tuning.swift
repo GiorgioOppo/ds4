@@ -21,7 +21,7 @@ extension InferenceService {
     /// (its file is written at every generation as before). Without this, a
     /// fresh agent paid dozens of cold-cache turns that the demo (one big
     /// warm usage file) never saw.
-    nonisolated static func usageDataSeeded(modelName: String, agentId: String) -> Data? {
+    public nonisolated static func usageDataSeeded(modelName: String, agentId: String) -> Data? {
         if let own = try? Data(contentsOf: usageURL(modelName: modelName, agentId: agentId)) {
             return own
         }
@@ -77,6 +77,30 @@ extension InferenceService {
                           cacheMisses: decoder.slotCache?.misses ?? 0,
                           totalRoutes: usage?.totalRoutes ?? 0,
                           layerSummaries: summaries)
+    }
+
+    /// Physical expert-cache budget contributed by one configured base slot,
+    /// derived from the already-open GGUF and its resolved runtime geometry.
+    /// The GUI auto-tuner uses it before tearing down the current service to
+    /// reject RAM-unsafe slot growth without guessing from the model filename.
+    public func expertCacheBudgetBytesPerBaseSlot() -> UInt64 {
+        UInt64(max(0, StreamingDecoder.expertCacheBudgetBytesPerBaseSlot(
+            model: model,
+            dims: dims,
+            nLayers: runtimeGeometry.nLayers
+        )))
+    }
+
+    /// Exact MTLBuffer bytes added by one increment of dense read-ahead for the
+    /// currently loaded model and quantization configuration.
+    public func denseStagingBytesPerAheadSlot() -> UInt64 {
+        UInt64(max(0, decoder.denseStagingBytesPerAheadSlot))
+    }
+
+    /// Whether DS4_PREAD_SPLIT reaches at least one routed-layer fill in the
+    /// current load (including GGUF fallback layers beside a valid bundle).
+    public func expertPreadSplitIsEffective() -> Bool {
+        decoder.usesDirectExpertPread
     }
 
     public func modelInfo() -> ModelInfo {

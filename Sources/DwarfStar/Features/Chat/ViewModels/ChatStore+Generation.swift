@@ -50,7 +50,9 @@ extension ChatStore {
     /// model; the transcript shows just the typed text and the filenames.
     func send() {
         let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let service, !isGenerating, !(typed.isEmpty && attachments.isEmpty) else { return }
+        guard EngineActivityGate.shared.activeOwner == nil,
+              let service, !isGenerating,
+              !(typed.isEmpty && attachments.isEmpty) else { return }
         let epoch = beginConversationWork()
         let atts = attachments
         let text = Self.composeUserText(typed: typed, attachments: atts)

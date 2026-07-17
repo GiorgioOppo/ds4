@@ -60,28 +60,54 @@ struct RootView: View {
             .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
             .navigationTitle("DwarfStar")
         } detail: {
-            switch selection ?? .chat {
-            case .chat:
-                ChatTabView(store: store, dist: distributed, settings: settings,
-                            openSettings: { selection = .settings })
-            case .settings:
-                SettingsView(settings: settings, store: store, dist: distributed)
-            case .agents:
-                AgentsView(store: store)
-            case .mcp:
-                MCPServersView(store: mcp)
-            case .project:
-                ProjectView(store: store)
-            case .tuning:
-                TuningView(store: store)
-            case .server:
-                ServerView(controller: server, modelLoadedInProcess: store.isReady)
-            case .distributed:
-                WorkerView(controller: distributed)
-            case .benchmark:
-                BenchView(controller: bench)
-            case .diagnostics:
-                DiagnosticsView(controller: diagnostics)
+            VStack(spacing: 0) {
+                if store.benchRunning {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(store.benchStatus ?? "Operazione esclusiva sul motore in corso…")
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Apri Settings") { selection = .settings }
+                            .font(.caption)
+                        Button("Stop", role: .destructive) { store.cancelAutoTune() }
+                            .font(.caption)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.orange.opacity(0.13))
+                    Divider()
+                }
+
+                Group {
+                    switch selection ?? .chat {
+                    case .chat:
+                        ChatTabView(store: store, dist: distributed, settings: settings,
+                                    openSettings: { selection = .settings })
+                    case .settings:
+                        SettingsView(settings: settings, store: store, dist: distributed)
+                    case .agents:
+                        AgentsView(store: store)
+                    case .mcp:
+                        MCPServersView(store: mcp)
+                    case .project:
+                        ProjectView(store: store)
+                    case .tuning:
+                        TuningView(store: store)
+                    case .server:
+                        ServerView(controller: server, modelLoadedInProcess: store.isReady)
+                    case .distributed:
+                        WorkerView(controller: distributed)
+                    case .benchmark:
+                        BenchView(controller: bench)
+                    case .diagnostics:
+                        DiagnosticsView(controller: diagnostics)
+                    }
+                }
+                // Navigation remains available, but no other screen may retain
+                // or mutate the single engine while the tuner swaps services.
+                .allowsHitTesting(!store.benchRunning || selection == .settings)
             }
         }
     }

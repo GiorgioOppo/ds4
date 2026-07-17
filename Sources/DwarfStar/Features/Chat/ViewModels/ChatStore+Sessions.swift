@@ -13,6 +13,7 @@ extension ChatStore {
     /// chat if it's still empty (so flipping the agent before sending anything
     /// doesn't pile up blank chats).
     func startNewChat() {
+        guard EngineActivityGate.shared.activeOwner == nil else { return }
         invalidateConversationWork()
         isGenerating = false
         status = ""
@@ -38,12 +39,14 @@ extension ChatStore {
 
     /// Switch to an existing chat: persist the current one, then restore the target.
     func switchSession(_ id: String) {
+        guard EngineActivityGate.shared.activeOwner == nil else { return }
         guard id != activeSessionId else { return }
         persistActiveSession()
         activate(id)
     }
 
     func deleteSession(_ id: String) {
+        guard EngineActivityGate.shared.activeOwner == nil else { return }
         let wasActive = (id == activeSessionId)
         ChatSessionStore.delete(id)
         sessions.removeAll { $0.id == id }

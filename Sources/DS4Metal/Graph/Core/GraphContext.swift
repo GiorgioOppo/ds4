@@ -22,13 +22,12 @@ public final class GraphContext {
     /// grouped attn-output low-rank matvec, which shares the same K-split kernel).
     /// Default 4 — exactly the reference `ds4_gpu_make_q8_0_mv_dispatch()` config.
     ///
-    /// This is a *pure work-partition* lever, not a math change: the kernel splits the
-    /// reduction (K) dimension across NSG simdgroups and `helper_mv_reduce_and_write`
-    /// sums across exactly NSG of them; the threadgroup-memory size (NW*NR0*4) and the
-    /// grid width ((outDim+NR0-1)/NR0) are both independent of NSG. So any value in
-    /// 1...8 produces identical results — only occupancy / DRAM-latency hiding changes.
-    /// Exposed because the optimal NSG is hardware-specific (M1 Pro vs M5 Max have
-    /// very different core counts) and can only be found by sweeping on-device.
+    /// This is a work-partition lever, but it splits the K reduction across a
+    /// different number of partial sums. All values compute the same operation,
+    /// yet Float32 association can change the last bits. Therefore the exact GUI
+    /// tuner leaves it fixed; only the opt-in numeric process profile sweeps it.
+    /// Threadgroup-memory size and grid width remain independent of NSG, so the
+    /// useful effect is occupancy / DRAM-latency hiding on different Apple GPUs.
     ///
     /// Re-read from the env at every DECODER creation (StreamingDecoder.init calls
     /// `refreshQ8NSG`), NOT at every dispatch: a model reload — e.g. the Settings
@@ -54,6 +53,8 @@ public final class GraphContext {
         denseQ4NSG = readDenseQ4NSG()
         fusedCompressorProj = ProcessInfo.processInfo.environment["DS4_FUSED_COMP_PROJ"] != "0"
         adaptiveSplitK = ProcessInfo.processInfo.environment["DS4_ADAPTIVE_SPLITK"] != "0"
+        vectorCopies = ProcessInfo.processInfo.environment["DS4_VECTOR_COPY"] == "1"
+        fusedFlashKVStage = ProcessInfo.processInfo.environment["DS4_FLASH_KV_STAGE"] == "1"
     }
 
     /// DS4_ADAPTIVE_SPLITK (default on; `=0` restores the fixed dispatch):
@@ -67,6 +68,23 @@ public final class GraphContext {
     /// refresh discipline as q8NSG (re-read per decoder creation).
     nonisolated(unsafe) static var adaptiveSplitK =
         ProcessInfo.processInfo.environment["DS4_ADAPTIVE_SPLITK"] != "0"
+
+    /// DS4_VECTOR_COPY (`=1` opt-in): use
+    /// packed four-element kernels for contiguous F32/F16 conversion.  This is
+    /// an exact layout specialization: only index reconstruction and dispatch
+    /// width change. The M1 Pro end-to-end A/B was decode-neutral/slightly
+    /// negative, so the measured generic path remains the default.
+    nonisolated(unsafe) static var vectorCopies =
+        ProcessInfo.processInfo.environment["DS4_VECTOR_COPY"] == "1"
+
+    /// DS4_FLASH_KV_STAGE (`=1` opt-in): gather the raw circular KV window and
+    /// compressed F32 rows into FlashAttention's contiguous F16 scratch in one
+    /// dispatch; a partial final block is padded by the same dispatch.  Kept
+    /// opt-in because the order-balanced M1 Pro A/B found a small prefill gain
+    /// but decode within run-order noise. Re-read once per decoder creation with
+    /// the other tuning knobs.
+    nonisolated(unsafe) static var fusedFlashKVStage =
+        ProcessInfo.processInfo.environment["DS4_FLASH_KV_STAGE"] == "1"
 
     /// DS4_MOE_NSG: simdgroups-per-threadgroup for the MoE id-kernels — the
     /// routed FFN (pair_swiglu/sum6, ~100 ms/token measured on M1 Pro, the

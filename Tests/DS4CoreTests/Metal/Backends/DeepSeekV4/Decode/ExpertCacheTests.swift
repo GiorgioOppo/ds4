@@ -95,6 +95,77 @@ final class ExpertCacheTests: XCTestCase {
         }
     }
 
+    func testSlotCacheLayerAwareGeometryAndByteCounters() throws {
+        let rt = try makeRuntime()
+        let smallSlab = 64, largeSlab = 128
+        func slab(_ layer: Int) -> Int { layer == 0 ? smallSlab : largeSlab }
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 22,
+            bytesPerExpert: smallSlab * 3,
+            bytesPerExpertForLayer: { slab($0) * 3 },
+            expertStrideForLayer: { slab($0) * 3 },
+            supportsLayer: { $0 == 0 || $0 == 1 },
+            makePoolForLayer: { layer, slots in
+                let b = slab(layer), record = b * 3
+                let all = try GPUTensor.zerosBytes(rt, byteLength: slots * record)
+                let up = GPUTensor(buffer: all.buffer, byteLength: slots * record - b,
+                                   count: slots * record - b, byteOffset: b)
+                let down = GPUTensor(buffer: all.buffer, byteLength: slots * record - 2 * b,
+                                     count: slots * record - 2 * b, byteOffset: 2 * b)
+                return (gate: all, up: up, down: down)
+            },
+            fill: { layer, id, pool, slot in
+                let p = pool.gate.buffer.contents()
+                    .advanced(by: pool.gate.byteOffset + slot * pool.bytesPerExpert)
+                p.storeBytes(of: Int32(layer * 1000) + id, as: Int32.self)
+            },
+            slotsPlan: { [0: 9, 1: 8] })
+
+        let ids: [Int32] = [1, 2, 3, 4, 5, 6]
+        let (small, _) = try cache.acquire(layer: 0, ids: ids)
+        let (large, _) = try cache.acquire(layer: 1, ids: ids)
+        _ = try cache.acquire(layer: 1, ids: ids)
+
+        XCTAssertTrue(cache.supports(layer: 1))
+        XCTAssertFalse(cache.supports(layer: 2))
+        XCTAssertEqual(small.bytesPerExpert, smallSlab * 3)
+        XCTAssertEqual(large.bytesPerExpert, largeSlab * 3)
+        XCTAssertEqual(small.expertStride, smallSlab * 3)
+        XCTAssertEqual(large.expertStride, largeSlab * 3)
+        XCTAssertEqual(cache.configuredSlots(layer: 0), 9)
+        XCTAssertEqual(cache.configuredSlots(layer: 1), 8)
+        XCTAssertEqual(cache.configuredSlots(layer: 2), 8, "partial plans fail closed at the floor")
+        XCTAssertEqual(cache.misses, 12)
+        XCTAssertEqual(cache.hits, 6)
+        XCTAssertEqual(cache.missBytes, 6 * smallSlab * 3 + 6 * largeSlab * 3)
+        XCTAssertEqual(cache.hitBytes, 6 * largeSlab * 3)
+        XCTAssertEqual(cache.allocatedSlotsByLayer, [0: 9, 1: 8])
+        XCTAssertEqual(cache.allocatedBytesByLayer[0], 9 * smallSlab * 3)
+        XCTAssertEqual(cache.allocatedBytesByLayer[1], 8 * largeSlab * 3)
+    }
+
+    func testSlotCacheAccountsForSynchronousWarmFillSeparately() throws {
+        let rt = try makeRuntime()
+        let slab = 64
+        let cache = ExpertSlotCache(
+            slotsPerLayer: 8, bytesPerExpert: slab * 3,
+            makePool: { slots in
+                (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * slab),
+                 up: try GPUTensor.zerosBytes(rt, byteLength: slots * slab),
+                 down: try GPUTensor.zerosBytes(rt, byteLength: slots * slab))
+            },
+            fill: { _, _, _, _ in },
+            warm: { _ in [1, 2, 3] })
+
+        _ = try cache.acquire(layer: 0, ids: [1, 4])
+
+        XCTAssertEqual(cache.warmed, 3)
+        XCTAssertEqual(cache.warmedBytes, 3 * slab * 3)
+        XCTAssertEqual(cache.hits, 1, "warm residency is still a demand hit")
+        XCTAssertEqual(cache.misses, 1, "warm fills are not mislabeled as demand misses")
+        XCTAssertEqual(cache.prefilled, 0, "synchronous warm fill is not look-ahead")
+    }
+
     /// ExpertSlotCache look-ahead: prefill(ids) fills the pool off the decode
     /// path (counted as `prefilled`, not misses); the demand acquire then
     /// reports HITS with the prefilled bytes in the right slots. A prefill

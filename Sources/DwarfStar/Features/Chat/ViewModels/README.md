@@ -10,7 +10,28 @@ separate responsibilities:
 - `+ToolLoop` and `+Agents`: tool execution and sub-agent coordination.
 - `+Sessions`: saved-chat lifecycle and history restoration.
 - `+Attachments`: file selection and context preparation.
-- `+PerformanceSettings`, `+Tuning`, and `+Benchmark`: runtime knobs and metrics.
+- `+PerformanceSettings`, `+Tuning`, and `+Benchmark`: runtime knobs, cache
+  metrics, and the short prefill-setting benchmarks. The measured fast preset
+  owns the persisted `DS4MultiQuantCache` choice here and exports it as
+  `DS4_MULTI_QUANT_CACHE` before the next model load.
+- `+MachineAutoTune`: the GUI adapter for the pure `DS4Engine` auto-tune core.
+  It freezes usage data, measures the loaded warm root once, then performs at
+  most one fully awaited reload/warmup measurement per unique configuration.
+  A run-local cache retains the complete highest valid decode observation;
+  revisits are cache hits. Expert-cache slots use a sequential upward-first
+  walk, lock direction after a win, and stop on the first loss instead of
+  sweeping the whole grid. Promotion requires a strictly higher decode result,
+  exact root quality, prefill, stability, RAM and swap gates. Swap accounting keeps cold
+  init, warmup and the discarded
+  primer in a diagnostic setup window; a fail-closed settling barrier anchors
+  the subsequent measured steady window, whose 128 MiB limit alone feeds the
+  promotion gate. A root already below the normal 10% RAM floor uses one
+  immutable baseline-relative envelope; only memory-neutral/reducing resident
+  geometries may then be measured. Candidate configurations must remain
+  environment-only; persist the record-holder finalist only after its active-agent
+  warmup and final steady swap probe succeed, never an intermediate trial.
+  Adoption is a durable transaction whose startup recovery rolls an interrupted
+  install/commit back to the full initial snapshot.
 
 Views call this layer; this layer calls `InferenceService`. Keep all published
 mutation on the main actor, avoid a second engine instance, and put new behavior

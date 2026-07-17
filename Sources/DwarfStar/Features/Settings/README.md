@@ -25,17 +25,40 @@ The panel also selects execution mode:
   the Worker cluster.
 
 The Memory section controls the runtime profile used on the next model load:
-expert cache slots, direct expert `pread`, expert-bundle sidecar, dense-weight
-streaming, best-effort `mlock`, Q4 attention-projection cache, disk KV plus
-budget, and raw-KV ring. Most defaults are RAM-aware; the current low-RAM path
+expert cache slots, byte-budgeted mixed-quant expert pools, direct expert
+`pread`, expert-bundle sidecar, dense-weight streaming, best-effort `mlock`, Q4
+attention-projection cache, disk KV plus budget, and raw-KV ring. Most defaults
+are RAM-aware; the current low-RAM path
 prefers streaming and pinned hot buffers over keeping every dense weight
-resident. Every setting's UserDefaults key and default value is documented in
+resident. The fast preset enables `DS4MultiQuantCache` by default after the
+exact 2026-07-16 A/B; its toggle can restore the legacy off-class bypass.
+Every setting's UserDefaults key and default value is documented in
 the root [Configuration Reference](../../../../README.md#configuration-reference).
 
 Model inspection runs without loading Metal. Benchmark and Memory controls are
 shown only when `ModelInfo`/`RuntimeModelDescriptor` advertises
 `deepSeekPerformanceTuning`; a recognized Qwen model therefore never receives
 DeepSeek-only expert, NSA, bundle or requantization settings.
+
+The **Auto-tune record-holder** action uses the pure decision layer in
+`DS4Engine/Inference/Autotuning`. It measures the loaded warm root once and each
+unique candidate at most once; a repeated configuration is a cache hit without
+reload. The whole valid observation with the highest decode median remains the
+record. Expert-cache slots are walked upward one manifest step at a time; after
+a promotion the first loss ends the knob, while a lower-neighbour fallback is
+used only when the initial upward step loses. Promotion requires a strictly
+higher decode result, immutable bit-exact full-logit quality, prefill within
+−8%, tail/head stability ≥0.75, the run RAM floor and at most 128 MiB of steady swapout. A loaded root below 10% enters constrained mode with
+an immutable root-relative floor, a 512 MiB reserve and no positive resident
+deltas. Skipping repetitions trades away ABBA noise estimation, so a lucky
+record can cause conservative false negatives but cannot bypass any guard.
+The usage profile is frozen and Raw-KV ring stays on.
+Candidate values remain process-local; Settings persists only the finalist after
+successful active-agent warmup and a final steady-state swap probe. A durable
+adoption transaction restores the
+complete initial preference snapshot after a crash or interrupted commit. The
+panel owns progress and Stop, and exposes the generated Markdown/JSON report in
+Finder.
 
 **Browse** is the advanced path for an external GGUF. It validates the runtime
 descriptor before updating `DS4ModelPath` and persists a security-scoped

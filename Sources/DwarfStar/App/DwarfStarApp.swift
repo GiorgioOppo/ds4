@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import DS4Engine
 
 @main
 struct DwarfStarApp: App {
@@ -10,6 +11,13 @@ struct DwarfStarApp: App {
     init() {
         // Capture the C engine's stderr so Metal/kernel errors are visible.
         EngineLog.shared.install()
+        // Recover before AppSettings/ChatStore stored-property initializers read
+        // UserDefaults. A crash during the multi-key auto-tune commit can then
+        // never expose a half-winner/half-baseline configuration to this launch.
+        let recovery = MachineAutoTuneTransactionStore.recoverAtLaunch()
+        if let message = recovery.logMessage {
+            FileHandle.standardError.write(Data(("DS4: \(message)\n").utf8))
+        }
         let settings = AppSettings()
         _settings = State(initialValue: settings)
         _store = State(initialValue: ChatStore(settings: settings))

@@ -81,6 +81,8 @@ throughput.
 | `DS4_ACTIVE_EXPERTS` | `1...6` | `6` | Reduces how many routed MoE experts are actually used per token. This lowers I/O and gather time but changes quality because both supported DeepSeek profiles use top-6. Useful as a degraded low-RAM mode or to estimate expert-I/O cost. |
 | `DS4_USAGE_FILE` | path or `off` | `<gguf-path>.usage.json` | JSON file for the usage imatrix, i.e. the historical expert choices made by the router. Keeping it enabled lets the next run pre-warm the cache with historically hot experts. Use a dedicated path for repeatable benchmarks; use `off` for cold runs. |
 | `DS4_WARMUP` | integer `>=0` | `0`; with `DS4_DIAG`, `min(4, maxNew-1)` | Excludes the first N generated tokens from the decode profile. Early tokens often pay one-time costs such as cold cache, buffer wiring, and memory settling. |
+| `DS4_AB_TRACE` | output prefix | unset | Writes `<prefix>.json` metadata and `<prefix>.f32` full-vocabulary logits for the A/B harness. Logits are retained copy-on-write and serialized only after the timed prefill/decode region. Intended for `scripts/metal_ab.sh`, not normal generation. |
+| `DS4_AB_TRACE_FRAMES` | `1...64` | `9` | Maximum retained logit frames: one prefill result followed by decode-forward results. The hard cap bounds extra RAM to roughly 32 MiB on the Flash vocabulary even if `maxNew` is accidentally very large. |
 
 ### Engine Knobs
 
@@ -101,6 +103,10 @@ knobs are documented from the app's point of view in the root README's
 | `DS4_PREFILL_ROUTE_BATCH` | integer (`0`/`1` = off) | `32` | Batched prefill route phase: up to N consecutive tokens' route/attention are encoded into ONE command buffer — each token's scratch snapshot (FFN inputs + router selection) is blit-copied GPU-side before the next token overwrites it, and the CPU reads all the selections after a single wait. Cuts phase-A syncs N×. Serial encoder ⇒ identical numerics. The app's full benchmark tests 16/32/64/128 live. |
 | `DS4_GPU_INDEXER_TOPK` | `0` disables | on | Long-context decode keeps indexer scores, exact heap-equivalent top-K mask, and attention in one command buffer. `0` restores the historical CPU selection for parity checks. |
 | `DS4_ADAPTIVE_SPLITK` | `0` disables | on | Chooses exactly `min(32, max(1, ceil((rawRows + compressedRows)/32)))` FlashAttention workgroups. There is no power-of-two rounding: 128 rows use 4 workgroups and 129 use 5, avoiding the old 4→8 cliff. `0` restores the historical fixed depth of 32 for A/B. |
+| `DS4_VECTOR_COPY` | `=1` enables | off | Experimental packed-four F32/F16 contiguous copies. Exact on M1 Pro, including scalar tails and F16 bit transport, but the order-balanced full-model A/B was decode-neutral/slightly negative; the generic copy remains the default. |
+| `DS4_FLASH_KV_STAGE` | `=1` enables | off | Fuses raw-ring gather, compressed-cache F32→F16 staging and partial K/V/mask padding into one dispatch. Exact across wrapped/non-wrapped tests and 2,197,760 full-model logits. On M1 Pro it measured roughly neutral in decode and about +2% prefill, so it remains opt-in for other chips/context frontiers. |
+| `DS4_ROPE_PAIR` | `=1` enables | off | In-place pair-only RoPE specialization; decode also reconstructs affine positions on the GPU unless `DS4_ROPE_AFFINE=0`. Baseline/pair/affine are bit-identical on tested normal/YaRN/inverse shapes. The M1 Pro end-to-end A/B showed no decode gain, therefore the generic kernel remains the measured default. |
+| `DS4_ROPE_AFFINE` | `=0` disables affine positions | on when `DS4_ROPE_PAIR=1` | Keeps the pair kernel but restores the host-provided position array. It has no effect while `DS4_ROPE_PAIR` is off. |
 | `DS4_DENSE_Q4_KERNEL` | `0` disables | on | Dedicated resident dense-Q4 matvec. It reuses the exact Q4_K row implementation but removes the synthetic single-expert ID wrapper. Set `0` for bit-parity/performance A/B. |
 | `DS4_FUSED_ROUTER_PROBS` | `0` disables | on | Computes the router's `sqrt(softplus(logit))` in one vector dispatch instead of two scalar passes. Set `0` for parity A/B. |
 | `DS4_FUSED_ROUTER_FINALIZE` | `0` disables | on | Combines top-6 selection and bit-identical route-weight normalization, saving one dispatch on every routed layer. |
@@ -112,6 +118,7 @@ knobs are documented from the app's point of view in the root README's
 | `DS4_DEMO_REPEAT_LAST_N` | integer | `64` | Recent-token window used by repetition penalty. |
 | `DS4_EXPERT_CACHE_SLOTS` | integer | `0` (off) | Enables a per-layer LRU GPU cache for MoE experts. Each slot costs about 6.9 MB wired per layer on the 2-bit model. `8` is the effective minimum when enabled. If hit-rate rises, SSD gather drops; if RAM pressure rises, performance may worsen. |
 | `DS4_EXPERT_CACHE_UNIFORM` | `=1` | off | Disables usage-driven slot redistribution. By default, layers with concentrated routing receive more slots at the same total budget. Use this for A/B comparisons. |
+| `DS4_MULTI_QUANT_CACHE` | `=1` | off | Gives mixed IQ2/Q4 expert layers correctly sized per-layer pools instead of bypassing the legacy single-size-class cache. Slot counts are allocated against the legacy cache's actual byte budget, so enabling it does not silently increase the planned cache RAM. Exact numerics; keep off/on as an A/B pair until validated on the target Mac. |
 | `DS4_EXPERT_BUNDLE` | `=1` | off | Sidecar `<gguf>.expbundle` with each routed expert's gate/up/down slabs CONTIGUOUS: a slot-cache miss becomes one ~7 MB sequential burst instead of three scattered ~2 MB reads. Same bytes, same numerics. The FIRST run builds it next to the model (duplicates the expert region on disk — tens of GB, skipped if space is short); later runs open it in milliseconds. Invalidated automatically when the model changes. |
 | `DS4_MTLIO` | `=1` | off | Apple Metal fast resource loading for expert slot-cache misses during decode. An interleaved expert is loaded with one contiguous command directly into its destination `MTLBuffer`; prefill remains on parallel `pread`. Any failure permanently falls back to `pread`. Same bytes and numerics; A/B on the target Mac because MetalIO is not consistently faster on M1 Pro. |
 | `DS4_MTLIO_MIN_GBS` | float | `1.5` | Automatic circuit-breaker threshold. Timings are aggregated into 64 MiB windows; two consecutive slow windows switch the model load to `pread`. Small batches and isolated stalls are ignored. |
@@ -223,7 +230,32 @@ Useful A/B comparisons with `DS4_DIAG=1`:
 - `DS4_EXPERT_CACHE_SLOTS=8/12/16/20/22`;
 - `DS4_Q8_NSG=2/4/6/8`.
 
-### 8. Clean steady-state profile
+### 8. Correctness + performance A/B for one Metal knob
+
+Use a prompt file so both child processes receive exactly the same bytes. The
+harness overrides the chosen knob, forces greedy sampling, disables speculative
+decode and prevents the baseline run from mutating usage history consumed by
+the candidate:
+
+```sh
+scripts/metal_ab.sh /path/model.gguf prompt.txt DS4_ADAPTIVE_SPLITK 0 1 8
+```
+
+The report distinguishes bit-exact parity from tolerance-based numerical
+parity, compares generated token ids and every retained logit, then reports
+prefill and decode tok/s. Trace files are bounded and analyzed through `mmap`;
+the comparator never loads all vectors into Python RAM. For an optimization
+that promises exact numerics use:
+
+```sh
+DS4_AB_ATOL=0 DS4_AB_RTOL=0 \
+  scripts/metal_ab.sh /path/model.gguf prompt.txt DS4_FUSED_ROUTER_FINALIZE 0 1 8
+```
+
+Repeat once with `DS4_AB_ORDER=candidate-first` before promoting a result: page
+cache warmth, thermal state and memory pressure can favor either process.
+
+### 9. Clean steady-state profile
 
 ```sh
 DS4_WARMUP=4 DS4_USAGE_FILE=/tmp/ds4-demo-usage.json \

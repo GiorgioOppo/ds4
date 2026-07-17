@@ -107,6 +107,37 @@ usage profile e stato delle cache. Registrare separatamente:
 Cambiare un solo knob per prova. `DS4_PROFILE_ROUTE` altera il timing e non va
 usato per il throughput finale.
 
+### Gate A/B per ottimizzazioni Metal
+
+Per un nuovo percorso selezionabile tramite `DS4_*`, usare il runner di processo
+prima di promuoverlo nei default:
+
+```sh
+scripts/metal_ab.sh model.gguf prompt.txt DS4_NUOVO_KNOB 0 1 8
+```
+
+Il runner usa due processi separati con prompt identico, greedy decode e
+persistenza usage disabilitata. Confronta gli id generati e un numero limitato
+di vettori logits completi: i vettori vengono trattenuti copy-on-write durante
+la misura, scritti soltanto dopo i timer e analizzati via `mmap`. Il report
+distingue `PASS_EXACT`, `PASS_NUMERIC` e `FAIL` e include tok/s di prefill,
+profilo decode e regime. Impostare `DS4_AB_ATOL=0 DS4_AB_RTOL=0` per percorsi
+che promettono parità bit-per-bit; tolleranze maggiori devono essere motivate
+per fusioni con diverso ordine di riduzione o percorsi dichiaratamente lossy.
+
+Page cache, temperatura e pressione di memoria possono favorire uno dei due
+processi: ripetere con `DS4_AB_ORDER=candidate-first` e non promuovere variazioni
+sotto il rumore della macchina. `python3 scripts/metal_ab_compare.py --self-test`
+valida l'analizzatore senza richiedere Metal o un GGUF.
+
+Per cercare una configurazione composta su più knob usare
+`scripts/metal_autotune.py`: esegue sweep monodimensionali/coordinate ascent,
+conferma i candidati in ordine ABBA, confronta anche ogni finalista con la root
+iniziale e respinge run contaminati da pressione RAM o swap. Il formato trace è
+validato fail-closed e top-3, hash e conteggio dei valori finiti vengono
+ricalcolati dai `.f32`, non accettati sulla fiducia dal JSON. Procedura e
+comandi completi sono in [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md).
+
 ## Benchmark di correttezza next-token
 
 Il benchmark di correttezza misura la **top-1/top-2/top-3 accuracy in teacher

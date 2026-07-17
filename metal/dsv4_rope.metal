@@ -24,6 +24,26 @@ struct ds4_metal_args_dsv4_rope_tail {
     bool     src2;
 };
 
+// Compact ABI for the optimized in-place path. Positions in every DS4 RoPE
+// dispatch are affine, so the GPU can reconstruct them without a host array or
+// an extra buffer binding. Keep this layout in sync with ropeAffinePairArgs().
+struct ds4_metal_args_dsv4_rope_affine_pair {
+    uint64_t row_bytes;
+    uint64_t token_bytes;
+    int32_t head_dim;
+    int32_t n_dims;
+    int32_t n_ctx_orig;
+    int32_t inverse;
+    uint32_t pos0;
+    uint32_t pos_step;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+};
+
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -161,5 +181,139 @@ kernel void kernel_dsv4_rope_tail_f32(
             *((device float *) (dst_base + j0*args.nb0)) = x0*cos_theta - x1*sin_theta;
             *((device float *) (dst_base + j1*args.nb0)) = x0*sin_theta + x1*cos_theta;
         }
+    }
+}
+
+// DS4 uses mode-0 adjacent pairs and aliases source/destination. The generic
+// kernel still visits and copies the unchanged no-position prefix. This exact
+// specialization dispatches only the rotational tail and leaves the prefix
+// untouched. Preserve the generic lane mapping and arithmetic order so the
+// result remains bit-identical on Apple GPUs, including M1.
+kernel void kernel_dsv4_rope_tail_f32_inplace_pair(
+        constant ds4_metal_args_dsv4_rope_tail & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        uint  tid   [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    if (args.mode != 0) {
+        return;
+    }
+
+    const int i1 = tgpig[0];
+    const int i2 = tgpig[1];
+    const int i3 = tgpig[2];
+    const int n_nope = args.ne00 - args.n_dims;
+    if (n_nope < 0) {
+        return;
+    }
+
+    device const int32_t * pos = (device const int32_t *) src1;
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base,
+                        args.beta_fast, args.beta_slow, corr_dims);
+
+    const float theta_base = (float) pos[i2];
+    const float inv_ndims = -1.f/args.n_dims;
+    device const char * src_base =
+        src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01;
+    device char * dst_base =
+        dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1;
+
+    // With the supported DS4 shapes n_nope is 32-aligned. Keeping r on lane
+    // r%32 matches the generic kernel's fast-math instruction mapping.
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+        const int ic = r/2;
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base *
+            exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims*r);
+#endif
+        const float freq_factor = args.src2 ?
+            ((device const float *) src2)[ic] : 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, r,
+                  args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = *((device const float *) (src_base + j0*args.nb00));
+        const float x1 = *((device const float *) (src_base + j1*args.nb00));
+        *((device float *) (dst_base + j0*args.nb0)) =
+            x0*cos_theta - x1*sin_theta;
+        *((device float *) (dst_base + j1*args.nb0)) =
+            x0*sin_theta + x1*cos_theta;
+    }
+}
+
+// Affine-position version of the same pair specialization. It removes the
+// position array entirely; unsigned arithmetic intentionally reproduces the
+// int32 wrapping used by the reference path before conversion to float.
+kernel void kernel_dsv4_rope_tail_f32_inplace_pair_affine(
+        constant ds4_metal_args_dsv4_rope_affine_pair & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device       char * dst  [[buffer(4)]],
+        uint  tid   [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int i1 = tgpig[0];
+    const int i2 = tgpig[1];
+    const int n_nope = args.head_dim - args.n_dims;
+    if (n_nope < 0) {
+        return;
+    }
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base,
+                        args.beta_fast, args.beta_slow, corr_dims);
+
+    const uint raw_pos = args.pos0 + (uint)i2 * args.pos_step;
+    const float theta_base = (float)as_type<int>(raw_pos);
+    const float inv_ndims = -1.f/args.n_dims;
+    device const char * src_base =
+        src0 + (uint64_t)i2*args.token_bytes + (uint64_t)i1*args.row_bytes;
+    device char * dst_base =
+        dst + (uint64_t)i2*args.token_bytes + (uint64_t)i1*args.row_bytes;
+
+    for (int r = tid; r < args.n_dims; r += ntg.x) {
+        if ((r & 1) != 0) {
+            continue;
+        }
+#ifdef DS4_METAL_ROPE_EXP2_LOG2
+        const float theta = theta_base *
+            exp2(inv_ndims * (float)r * log2(args.freq_base));
+#else
+        const float theta = theta_base * pow(args.freq_base, inv_ndims*r);
+#endif
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn(theta, args.freq_scale, corr_dims, r, args.ext_factor,
+                  args.attn_factor, &cos_theta, &sin_theta);
+        if (args.inverse) {
+            sin_theta = -sin_theta;
+        }
+
+        const int j0 = n_nope + r;
+        const int j1 = j0 + 1;
+        const float x0 = *((device const float *)
+                           (src_base + j0*sizeof(float)));
+        const float x1 = *((device const float *)
+                           (src_base + j1*sizeof(float)));
+        *((device float *) (dst_base + j0*sizeof(float))) =
+            x0*cos_theta - x1*sin_theta;
+        *((device float *) (dst_base + j1*sizeof(float))) =
+            x0*sin_theta + x1*cos_theta;
     }
 }

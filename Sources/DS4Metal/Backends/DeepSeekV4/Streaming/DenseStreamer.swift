@@ -50,6 +50,9 @@ public final class DenseStreamer: @unchecked Sendable {
     /// layer's read finishes before its compute, the SSD starts the next one
     /// instead of idling. Costs one extra staging slot (~max-layer bytes).
     let ahead: Int
+    /// Exact allocation added by each increment of `DS4_DENSE_AHEAD` for this
+    /// model/configuration. The ring owns `ahead + 1` equally sized buffers.
+    public let stagingBytesPerAheadSlot: Int
     let slots: [MTLBuffer]                  // ahead+1 staging slots
     var slotLayer: [Int]                    // slot -> layer currently staged (-1 = none/being written)
     var pending: [Pending] = []             // decode-thread-owned (≤ ahead in flight)
@@ -379,6 +382,7 @@ public final class DenseStreamer: @unchecked Sendable {
         }
         let aheadEnv = ProcessInfo.processInfo.environment["DS4_DENSE_AHEAD"].flatMap(Int.init) ?? 1
         self.ahead = min(max(1, aheadEnv), max(1, min(3, layers.count - 1)))
+        self.stagingBytesPerAheadSlot = maxSlot
         var made: [MTLBuffer] = []
         for _ in 0...ahead {
             guard let b = rt.device.makeBuffer(length: maxSlot, options: .storageModeShared) else {

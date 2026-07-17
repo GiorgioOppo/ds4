@@ -26,6 +26,10 @@ do {
         log("DS4Demo: no GGUF path given — bring-up only. Pass a .gguf to stream tokens.")
         exit(ok ? 0 : 1)
     }
+    let abTrace = ABLogitTrace.fromEnvironment()
+    if let trace = abTrace {
+        log("DS4Demo: A/B logit trace attiva — max \(trace.frameLimit) frame, output \(trace.prefix).{json,f32}")
+    }
     let ggufPath = args[1]
     let maxNew = args.count >= 3 ? (Int(args[2]) ?? 4) : 4
     let maxKeys: Int
@@ -293,6 +297,7 @@ do {
         let pfS = Date().timeIntervalSince(pf0)
         log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.2f tok/s)",
                    ids.count, pfS, pfS > 0 ? Double(ids.count) / pfS : 0))
+        abTrace?.capture(phase: "prefill", step: 0, inputToken: ids.last, logits: last)
         // Per-phase prefill breakdown (route/attn vs gather IO vs experts): the
         // phases are timed by the same counters as the decode profile, reset at
         // the prefill boundary above. gather IO is the EXPOSED (non-overlapped)
@@ -314,6 +319,8 @@ do {
         var rng: UInt64 = 1
         var recent = ids
         var genTokens = 0
+        var generatedTraceTokens: [Int] = []
+        generatedTraceTokens.reserveCapacity(maxNew)
         let genStart = Date()
         var steadyStart = genStart
         // DS4_SPEC_K=N (≥2): decode SELF-SPECULATIVE greedy (docs/SELF-SPECULATIVE.md).
@@ -345,6 +352,7 @@ do {
                 let tP = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
                 if Int32(tP) == tok.eosId { break }
                 stdout.write(Data(tok.tokenText(Int32(tP))))
+                generatedTraceTokens.append(tP)
                 history.append(tP)
                 genTokens += 1
                 if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
@@ -385,6 +393,7 @@ do {
                     for c in window[1...j] {
                         if Int32(c) == tok.eosId { break ngramLoop }
                         stdout.write(Data(tok.tokenText(Int32(c))))
+                        generatedTraceTokens.append(c)
                         history.append(c)
                         genTokens += 1
                         if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
@@ -416,6 +425,7 @@ do {
                 let tP = Sampler.sample(last, temperature: 0, topK: 0, topP: 1, minP: 0, rng: &rng)
                 if Int32(tP) == tok.eosId { break }
                 stdout.write(Data(tok.tokenText(Int32(tP))))
+                generatedTraceTokens.append(tP)
                 genTokens += 1
                 if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
                 if genTokens >= maxNew { break }
@@ -463,6 +473,7 @@ do {
                     for c in window[1...j] {
                         if Int32(c) == tok.eosId { break specLoop }
                         stdout.write(Data(tok.tokenText(Int32(c))))
+                        generatedTraceTokens.append(c)
                         genTokens += 1
                         if genTokens == warmup { dec.resetProfile(); steadyStart = Date() }
                         if genTokens >= maxNew { break }
@@ -490,12 +501,15 @@ do {
                                       recent: recent[recentLo...], rng: &rng)
             if Int32(next) == tok.eosId { break }
             stdout.write(Data(tok.tokenText(Int32(next))))   // stream immediately (unbuffered)
+            generatedTraceTokens.append(next)
             recent.append(next)
             let t0 = Date()
             last = try dec.forward(token: next, pos: pos, nKeys: pos + 1); pos += 1
             genTokens += 1
             let dt = Date().timeIntervalSince(t0)
             log(String(format: "  [tok %d  %.1fs  %.2f tok/s]", genTokens, dt, dt > 0 ? 1.0 / dt : 0))
+            abTrace?.capture(phase: "decode", step: genTokens,
+                             inputToken: next, logits: last)
             if genTokens == warmup {
                 dec.resetProfile()
                 steadyStart = Date()
@@ -515,32 +529,44 @@ do {
         }
         log("")
         log(dec.profile.report())
+        if let trace = abTrace {
+            try trace.finish(generatedTokens: generatedTraceTokens)
+            log("DS4Demo: A/B logit trace scritta: \(trace.prefix).json + .f32")
+        }
 
         // ── Diagnosi post-run: routing, allocazione slot, verdetto gather ──
         if diag, let usage = dec.usage {
             log("")
             log("── Diagnosi cache esperti ──")
-            let envSlots = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_SLOTS"].flatMap(Int.init) ?? 0
-            if envSlots == 0 {
+            let liveCache = dec.slotCache
+            if liveCache == nil {
                 log("  slot-cache OFF (imposta DS4_EXPERT_CACHE_SLOTS=8.. per misurare gli hit)")
+            } else if let liveCache {
+                // These are the pools that actually served this run. Do not
+                // recompute usage.slotAllocation here: usage changed during
+                // generation, while the cache froze its plan at first use.
+                let slots = liveCache.allocatedSlotsByLayer
+                let bytes = liveCache.allocatedBytesByLayer
+                let totalBytes = bytes.values.reduce(0, +)
+                log(String(format: "  pool effettivi: %d layer, %.2f GiB residenti (piano congelato alla creazione)",
+                           slots.count, Double(totalBytes) / 1_073_741_824))
             }
-            let base = max(8, envSlots)
-            let alloc = usage.slotAllocation(base: base)
-            if base <= 8 {
-                // 8 = floor LRU (k+2): nessun layer può scendere sotto, quindi
-                // non c'è budget da spostare sui layer concentrati.
-                log("  allocazione usage-driven: S=8 è il floor LRU — nulla da ridistribuire; usa DS4_EXPERT_CACHE_SLOTS≥10")
-            } else if alloc == nil {
-                log("  allocazione usage-driven: storia insufficiente (~43+ token/layer) -> uniforme \(base); rilancia con più token")
-            }
-            log("  layer   route  conc(top8)  conc(top16)  slot")
+            let actualSlots = liveCache?.allocatedSlotsByLayer ?? [:]
+            let actualBytes = liveCache?.allocatedBytesByLayer ?? [:]
+            log("  layer   route  conc(top8)  conc(top16)  slot(pool)  pool MiB")
             for il in 0..<geometry.nLayers {
                 let r = usage.routes(layer: il)
                 guard r > 0 else { continue }
-                log(String(format: "  %5d %7d       %.2f        %.2f  %4d", il, r,
-                           usage.concentration(layer: il, n: 8),
-                           usage.concentration(layer: il, n: 16),
-                           alloc?[il] ?? base))
+                if let slots = actualSlots[il] {
+                    log(String(format: "  %5d %7d       %.2f        %.2f       %4d  %8.1f", il, r,
+                               usage.concentration(layer: il, n: 8),
+                               usage.concentration(layer: il, n: 16), slots,
+                               Double(actualBytes[il] ?? 0) / 1_048_576))
+                } else {
+                    log(String(format: "  %5d %7d       %.2f        %.2f          -         -", il, r,
+                               usage.concentration(layer: il, n: 8),
+                               usage.concentration(layer: il, n: 16)))
+                }
             }
             // Verdetto: banda effettiva del gather vs tetto sequenziale del disco.
             // Sotto ~60% del tetto il sidecar expert-bundle (slab contigui) può

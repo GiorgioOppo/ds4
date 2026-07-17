@@ -32,6 +32,12 @@ public final class ExpertSlotCache: @unchecked Sendable {
         public let gate: GPUTensor    // S x gateExpertBytes, packed by slot
         public let up: GPUTensor      // S x upExpertBytes
         public let down: GPUTensor    // S x downExpertBytes
+        /// Physical bytes occupied by one gate+up+down expert record in this
+        /// layer. Mixed-precision GGUFs can use a different value per layer.
+        public let bytesPerExpert: Int
+        /// Common slot stride for an interleaved gate|up|down pool. nil means
+        /// the three historical tightly-packed buffers.
+        public let expertStride: Int?
         var owner: [Int32]            // slot -> expert id (-1 = free)
         var lastUse: [UInt64]         // slot -> LRU tick
         var slotOf: [Int32: Int]      // expert id -> slot
@@ -45,14 +51,30 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// gate+up+down bytes of one expert — stats only (the decode profile turns
     /// miss counts into gathered bytes / effective SSD bandwidth).
     public let bytesPerExpert: Int
+    /// True when pool geometry (record bytes/stride/allocation) is resolved per
+    /// layer. The decoder uses this as the capability bit for mixed-quant layers;
+    /// the factory only creates such a cache behind DS4_MULTI_QUANT_CACHE=1.
+    public let isLayerAware: Bool
     private var _hits = 0
     private var _misses = 0
+    private var _hitBytes = 0
+    private var _missBytes = 0
+    /// Synchronous history-driven warm fill performed while a layer pool is
+    /// first materialized. It is critical-path I/O, unlike look-ahead prefill.
+    private var _warmed = 0
+    private var _warmedBytes = 0
     /// Slabs filled by the speculative look-ahead (they don't count as misses:
     /// their I/O ran hidden under compute, not on the decode critical path).
     private var _prefilled = 0
+    private var _prefilledBytes = 0
     public var hits: Int { stateLock.lock(); defer { stateLock.unlock() }; return _hits }
     public var misses: Int { stateLock.lock(); defer { stateLock.unlock() }; return _misses }
     public var prefilled: Int { stateLock.lock(); defer { stateLock.unlock() }; return _prefilled }
+    public var hitBytes: Int { stateLock.lock(); defer { stateLock.unlock() }; return _hitBytes }
+    public var missBytes: Int { stateLock.lock(); defer { stateLock.unlock() }; return _missBytes }
+    public var warmed: Int { stateLock.lock(); defer { stateLock.unlock() }; return _warmed }
+    public var warmedBytes: Int { stateLock.lock(); defer { stateLock.unlock() }; return _warmedBytes }
+    public var prefilledBytes: Int { stateLock.lock(); defer { stateLock.unlock() }; return _prefilledBytes }
     private var pools: [Int: LayerPool] = [:]
     private var tick: UInt64 = 0
     /// Bumped by invalidate(): an operation that started against a dropped
@@ -68,7 +90,15 @@ public final class ExpertSlotCache: @unchecked Sendable {
     /// once per layer at pool creation — so also after every invalidate().
     /// nil (or a nil provider) = the uniform slotsPerLayer.
     private let slotsFor: ((_ layer: Int) -> Int)?
-    private let makePool: (_ slots: Int) throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
+    /// Optional all-layer allocation provider. It is evaluated atomically once
+    /// per cache generation, unlike `slotsFor`, so a byte-balanced plan cannot
+    /// observe a partially changing usage profile while pools are created.
+    private let slotsPlan: (() -> [Int: Int])?
+    private var resolvedSlotsPlan: [Int: Int]?
+    private let bytesFor: ((_ layer: Int) -> Int)?
+    private let strideFor: ((_ layer: Int) -> Int?)?
+    private let supportsFor: ((_ layer: Int) -> Bool)?
+    private let makePool: (_ layer: Int, _ slots: Int) throws -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
     /// Copy expert `id` of layer `layer` into pool slot `slot` (all 3 matrices).
     /// MUST be safe to call concurrently for distinct slots (misses are filled
     /// in parallel — each fill writes only its own slot's slabs).
@@ -95,21 +125,117 @@ public final class ExpertSlotCache: @unchecked Sendable {
                              _ pool: LayerPool) throws -> Void)? = nil,
                 prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
                 warm: ((_ layer: Int) -> [Int32])? = nil,
-                slotsFor: ((_ layer: Int) -> Int)? = nil) {
+                slotsFor: ((_ layer: Int) -> Int)? = nil,
+                slotsPlan: (() -> [Int: Int])? = nil) {
         self.slotsPerLayer = max(8, slotsPerLayer)   // ≥ k+2 so this tick's ids never starve eviction
         self.bytesPerExpert = bytesPerExpert
-        self.makePool = makePool
+        self.isLayerAware = false
+        self.makePool = { _, slots in try makePool(slots) }
         self.fill = fill
         self.fillBatch = fillBatch
         self.prefetch = prefetch
         self.warm = warm
         self.slotsFor = slotsFor
+        self.slotsPlan = slotsPlan
+        self.bytesFor = nil
+        self.strideFor = nil
+        self.supportsFor = nil
+    }
+
+    /// Layer-aware variant used by mixed-precision expert pools. The legacy
+    /// initializer above remains source-compatible and keeps its exact behavior.
+    public init(slotsPerLayer: Int,
+                bytesPerExpert: Int = 0,
+                bytesPerExpertForLayer: @escaping (_ layer: Int) -> Int,
+                expertStrideForLayer: ((_ layer: Int) -> Int?)? = nil,
+                supportsLayer: ((_ layer: Int) -> Bool)? = nil,
+                makePoolForLayer: @escaping (_ layer: Int, _ slots: Int) throws
+                    -> (gate: GPUTensor, up: GPUTensor, down: GPUTensor),
+                fill: @escaping (_ layer: Int, _ id: Int32, _ pool: LayerPool, _ slot: Int) throws -> Void,
+                fillBatch: ((_ layer: Int, _ pairs: [(id: Int32, slot: Int)],
+                             _ pool: LayerPool) throws -> Void)? = nil,
+                prefetch: ((_ layer: Int, _ ids: [Int32]) -> Void)? = nil,
+                warm: ((_ layer: Int) -> [Int32])? = nil,
+                slotsFor: ((_ layer: Int) -> Int)? = nil,
+                slotsPlan: (() -> [Int: Int])? = nil) {
+        self.slotsPerLayer = max(8, slotsPerLayer)
+        self.bytesPerExpert = bytesPerExpert
+        self.isLayerAware = true
+        self.makePool = makePoolForLayer
+        self.fill = fill
+        self.fillBatch = fillBatch
+        self.prefetch = prefetch
+        self.warm = warm
+        self.slotsFor = slotsFor
+        self.slotsPlan = slotsPlan
+        self.bytesFor = bytesPerExpertForLayer
+        self.strideFor = expertStrideForLayer
+        self.supportsFor = supportsLayer
     }
 
     /// Slot count for a layer's pool: per-layer override, floored at 8 (≥ k+2,
     /// so one acquire's ids can never starve the LRU eviction).
     private func slotCount(_ layer: Int) -> Int {
-        max(8, slotsFor?(layer) ?? slotsPerLayer)
+        if let slotsPlan {
+            while true {
+                stateLock.lock()
+                if let plan = resolvedSlotsPlan {
+                    let n = plan[layer]
+                    stateLock.unlock()
+                    // A partial plan must fail closed at the LRU floor. Falling
+                    // back to base S could silently exceed the byte budget.
+                    return max(8, n ?? 8)
+                }
+                let planEpoch = epoch
+                stateLock.unlock()
+
+                // Provider work can consult ExpertUsageStats and must not execute
+                // under stateLock. Publish one complete snapshot for this epoch.
+                let candidate = slotsPlan()
+                stateLock.lock()
+                if epoch == planEpoch {
+                    if resolvedSlotsPlan == nil { resolvedSlotsPlan = candidate }
+                    let n = resolvedSlotsPlan?[layer]
+                    stateLock.unlock()
+                    return max(8, n ?? 8)
+                }
+                // invalidate() won while the provider ran: discard the stale
+                // usage snapshot and resolve the new generation instead.
+                stateLock.unlock()
+            }
+        }
+        return max(8, slotsFor?(layer) ?? slotsPerLayer)
+    }
+
+    /// Configured bytes/stride for a layer, available before its lazy pool is
+    /// materialized (diagnostics and exact gather-byte accounting).
+    public func bytesPerExpert(layer: Int) -> Int {
+        max(0, bytesFor?(layer) ?? bytesPerExpert)
+    }
+
+    public func expertStride(layer: Int) -> Int? {
+        strideFor?(layer) ?? nil
+    }
+
+    /// Capability used in addition to the legacy global-quant match. A legacy
+    /// cache returns false; a layer-aware cache supports every layer unless its
+    /// factory supplied a narrower predicate.
+    public func supports(layer: Int) -> Bool {
+        isLayerAware && (supportsFor?(layer) ?? true)
+    }
+
+    public func configuredSlots(layer: Int) -> Int { slotCount(layer) }
+
+    /// Actual lazy pools, not a post-run recomputation from a changing usage
+    /// profile. Snapshots are safe while look-ahead fills another layer.
+    public var allocatedSlotsByLayer: [Int: Int] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return pools.mapValues { $0.owner.count }
+    }
+
+    public var allocatedBytesByLayer: [Int: Int] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return pools.mapValues { $0.owner.count * $0.bytesPerExpert }
     }
 
     private func lockFor(layer: Int) -> NSLock {
@@ -161,6 +287,12 @@ public final class ExpertSlotCache: @unchecked Sendable {
         _hits = 0
         _misses = 0
         _prefilled = 0
+        _hitBytes = 0
+        _missBytes = 0
+        _warmed = 0
+        _warmedBytes = 0
+        _prefilledBytes = 0
+        resolvedSlotsPlan = nil
         epoch += 1
     }
 
@@ -207,8 +339,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
 
         if poolOpt == nil {
             let S = slotCount(layer)
-            let p = try makePool(S)
+            let p = try makePool(layer, S)
             var fresh = LayerPool(gate: p.gate, up: p.up, down: p.down,
+                                  bytesPerExpert: bytesPerExpert(layer: layer),
+                                  expertStride: strideFor?(layer) ?? nil,
                                   owner: Array(repeating: -1, count: S),
                                   lastUse: Array(repeating: 0, count: S),
                                   slotOf: [:])
@@ -222,6 +356,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
                     fresh.owner[s] = id
                     fresh.slotOf[id] = s
                 }
+                stateLock.lock()
+                _warmed += warmIds.count
+                _warmedBytes += warmIds.count * fresh.bytesPerExpert
+                stateLock.unlock()
             }
             poolOpt = fresh
         }
@@ -303,7 +441,10 @@ public final class ExpertSlotCache: @unchecked Sendable {
             }
             abandon(toFill[idx...])
             publish(pool)
-            stateLock.lock(); _prefilled += filled; stateLock.unlock()
+            stateLock.lock()
+            _prefilled += filled
+            _prefilledBytes += filled * pool.bytesPerExpert
+            stateLock.unlock()
             return (pool, slots)
         }
         do {
@@ -315,8 +456,11 @@ public final class ExpertSlotCache: @unchecked Sendable {
         }
         publish(pool)
         stateLock.lock()
-        _hits += ids.count - missIdx.count
+        let hitCount = ids.count - missIdx.count
+        _hits += hitCount
         _misses += missIdx.count
+        _hitBytes += hitCount * pool.bytesPerExpert
+        _missBytes += missIdx.count * pool.bytesPerExpert
         stateLock.unlock()
         return (pool, slots)
     }

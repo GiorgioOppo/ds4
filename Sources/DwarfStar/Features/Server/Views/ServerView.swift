@@ -30,7 +30,7 @@ struct ServerView: View {
                                    ? "shared with Chat (loaded)" : "not loaded")
                     Stepper("Max tokens per response: \(controller.maxTokens)",
                             value: $controller.maxTokens, in: 64...8192, step: 64)
-                        .disabled(controller.isRunning)
+                        .disabled(controller.isRunning || controller.isLoading || controller.isStopping)
                 }
 
                 Section("Network") {
@@ -39,18 +39,22 @@ struct ServerView: View {
                         TextField("Port", value: $controller.port, format: .number.grouping(.never))
                             .frame(width: 80)
                     }
-                    .disabled(controller.isRunning)
+                    .disabled(controller.isRunning || controller.isLoading || controller.isStopping)
                     Toggle("CORS (Access-Control-Allow-Origin: *)", isOn: $controller.cors)
-                        .disabled(controller.isRunning)
+                        .disabled(controller.isRunning || controller.isLoading || controller.isStopping)
                     TextField("API key (optional)", text: $controller.apiKey)
-                        .disabled(controller.isRunning)
+                        .disabled(controller.isRunning || controller.isLoading || controller.isStopping)
                     Text("When set, requests must send `Authorization: Bearer <key>` (OpenAI) or `x-api-key: <key>` (Anthropic). Traffic is plaintext HTTP — keep the host on 127.0.0.1, or put TLS in front.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section {
                     HStack(spacing: 12) {
-                        if controller.isRunning {
+                        if controller.isStopping {
+                            ProgressView().controlSize(.small)
+                            Text("Stopping server and draining requests…")
+                                .font(.callout).foregroundStyle(.secondary)
+                        } else if controller.isRunning {
                             Button(role: .destructive) { controller.stop() } label: {
                                 Label("Stop Server", systemImage: "stop.fill")
                             }

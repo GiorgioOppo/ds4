@@ -119,8 +119,9 @@ extension ChatStore {
 
     /// Apply the agent to the running service: fresh chat with its role + tools,
     /// per-agent usage profile swapped in, slot-cache re-warmed.
-    func applyAgent() {
-        guard let service else { return }
+    @discardableResult
+    func applyAgent() -> Task<Bool, Never>? {
+        guard let service else { return nil }
         let agent = resolvedAgent()
         toolsEnabled = !agent.toolNames.isEmpty
         enabledToolNames = Set(agent.toolNames)
@@ -128,18 +129,59 @@ extension ChatStore {
         activeConversationToolNames = Set(tools.map(\.name))
         activeConversationDelegatedToolNames = Set(agent.delegatedToolNames ?? [])
             .intersection(ToolRegistry.subAgentGrantable)
-        Task {
+        let previous = engineSetupTask
+        engineSetupEpoch &+= 1
+        let epoch = engineSetupEpoch
+        let setupTask = Task { [weak self] in
+            // Role changes and reload finalization are strictly serialized.
+            // Cancelling a Task does not necessarily cancel an actor message
+            // already enqueued, so waiting is safer than overlapping engines.
+            _ = await previous?.value
             await service.setAgent(agent, tools: tools)
-            await service.setCompactTools(compactTools)
-            refreshTuningInfo()
+            guard let self else { return false }
+            await service.setCompactTools(self.compactTools)
             // Se il CAMBIO di agente ha invalidato la slot-cache (profilo
             // usage nuovo), i pool si riscaldano ORA in background invece che
             // dentro il primo messaggio. No-op quando l'agente non è cambiato.
-            await service.warmup()
+            let warmupSucceeded = await service.warmup()
+            let info = await service.tuningInfo()
+            if self.engineSetupEpoch == epoch {
+                self.tuningInfo = info
+                self.engineSetupCompletedEpoch = epoch
+                self.engineSetupWarmupSucceeded = warmupSucceeded
+                self.engineSetupTask = nil
+            }
+            return warmupSucceeded
+        }
+        engineSetupTask = setupTask
+        return setupTask
+    }
+
+    /// Barrier used before tearing down or exposing an engine as ready.
+    @discardableResult
+    func waitForEngineSetup() async -> Bool {
+        while true {
+            let targetEpoch = engineSetupEpoch
+            if let task = engineSetupTask {
+                _ = await task.value
+                // `await` yields the main actor: a new applyAgent may have
+                // installed a later task while this one was completing. Only
+                // the latest stable epoch is a valid readiness result.
+                guard engineSetupEpoch == targetEpoch else { continue }
+                guard engineSetupTask == nil,
+                      engineSetupCompletedEpoch == targetEpoch else { continue }
+                return engineSetupWarmupSucceeded
+            }
+
+            // No suspension between this snapshot and return, so another
+            // main-actor caller cannot advance the epoch underneath us.
+            guard engineSetupCompletedEpoch == targetEpoch else { return false }
+            return engineSetupWarmupSucceeded
         }
     }
 
     func selectAgent(_ id: String) {
+        guard EngineActivityGate.shared.activeOwner == nil else { return }
         selectedAgentId = id
         startNewChat()   // a role switch starts a fresh persisted chat with that role
     }

@@ -38,9 +38,9 @@ extension LocalServer {
     /// Acquisisce il gate MISURANDO l'attesa: se il motore è occupato (altra
     /// richiesta o turno chat in corso) la richiesta resta in coda in silenzio —
     /// senza questa riga il tempo di coda sembra un hang del server.
-    func acquireGate() async {
+    func acquireGate() async throws {
         let t0 = Date()
-        await gate.acquire()
+        try await gate.acquire()
         let dt = Date().timeIntervalSince(t0)
         if dt > 0.5 {
             onLog(String(format: "… richiesta rimasta in coda %.1fs (motore occupato)\n", dt))
@@ -82,8 +82,8 @@ extension LocalServer {
         onLog("→ transcript: \(Self.turnsSummary(parsed.turns))\n")
 
         // Serialize: only one generation runs against the single-model engine.
-        await acquireGate()
-        defer { Task { await gate.release() } }
+        try await acquireGate()
+        defer { gate.release() }
 
         let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
                                            think: parsed.think, sampling: parsed.sampling,
@@ -208,4 +208,3 @@ extension LocalServer {
                                            cors: config.cors))
     }
 }
-

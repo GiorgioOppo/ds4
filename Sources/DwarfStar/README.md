@@ -19,8 +19,8 @@ The app is organized by **feature**, with one folder per tab or area under
   single-file Pro Q2 are runnable; the two-file Pro Q4 package is download-only.
 - **`Features/Project/`**: project library, with sandbox-bookmarked folders indexed for
   agent tools.
-- **`Features/Tuning/`**: expert-cache slots, hit-rate, routing concentration, and agent
-  editor.
+- **`Features/Tuning/`**: expert-cache slots, mixed-quant pool policy, hit-rate,
+  routing concentration, and agent editor.
 - **`Features/Server/`**: API adapters, networking, concurrency and UI for the
   native in-process HTTP server compatible with OpenAI and
   Anthropic-style endpoints, exposing the shared Settings-loaded engine.
@@ -29,8 +29,8 @@ The app is organized by **feature**, with one folder per tab or area under
   context sizes.
 - **`Features/Diagnostics/`**: token and chat-template dumps.
 - **`Features/Settings/`**: global model, context, execution mode, and memory/I/O
-  settings such as expert bundle, dense streaming, Q4 dense cache, disk KV, and
-  raw-KV ring.
+  settings such as layer-aware mixed-quant expert cache, expert bundle, dense
+  streaming, Q4 dense cache, disk KV, and raw-KV ring.
 - **`Shared/Support/`**: cross-cutting utilities such as engine logs and process streams.
 - **`Assets.xcassets/`**: app icon assets.
 

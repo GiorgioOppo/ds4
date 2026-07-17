@@ -7,7 +7,9 @@ import DS4Core
 extension ChatStore {
     func applyFastDemoDefaults(persistExplicitly: Bool = false) {
         expertCacheSlots = 22      // +3,8% regime vs 20, senza collasso su 16 GB
-        rawRingEnabled = false
+        multiQuantCacheEnabled = true // +28,9% decode, logits esatti, stesso budget RAM
+        expertCacheUniform = false // usage-driven; l'auto-tune confronta entrambe
+        rawRingEnabled = true       // necessario su questa macchina: KV RAM costante
         willNeedEnabled = true
         expertPreadEnabled = true
         denseStreamEnabled = true
@@ -25,10 +27,14 @@ extension ChatStore {
         asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         q8NSG = 4
         moeNSG = 4
+        preadSplit = 4
+        denseQ4NSG = 4
         if persistExplicitly {
             let d = UserDefaults.standard
             d.set(22, forKey: "DS4ExpertCacheSlots")
-            d.set(false, forKey: "DS4RawRing")
+            d.set(true, forKey: "DS4MultiQuantCache")
+            d.set(false, forKey: "DS4ExpertCacheUniform")
+            d.set(true, forKey: "DS4RawRing")
             d.set(true, forKey: "DS4WillNeed")
             d.set(true, forKey: "DS4ExpertPread")
             d.set(true, forKey: "DS4DenseStream")
@@ -46,7 +52,11 @@ extension ChatStore {
             d.set(true, forKey: "DS4AsyncFFN")
             d.set(4, forKey: "DS4Q8NSG")
             d.set(4, forKey: "DS4MoeNSG")
-            _ = setenv("DS4_RAW_RING", "0", 1)
+            d.set(4, forKey: "DS4PreadSplit")
+            d.set(4, forKey: "DS4DenseQ4NSG")
+            _ = setenv("DS4_RAW_RING", "1", 1)
+            _ = setenv("DS4_MULTI_QUANT_CACHE", "1", 1)
+            _ = setenv("DS4_EXPERT_CACHE_UNIFORM", "0", 1)
             _ = setenv("DS4_WILLNEED_EXPERTS", "1", 1)
             _ = setenv("DS4_EXPERT_PREAD", "1", 1)
             _ = setenv("DS4_DENSE_STREAM", "1", 1)
@@ -72,6 +82,7 @@ extension ChatStore {
             _ = setenv("DS4_ASYNC_FFN", "1", 1)
             _ = setenv("DS4_Q8_NSG", "4", 1)
             _ = setenv("DS4_MOE_NSG", "4", 1)
+            _ = setenv("DS4_PREAD_SPLIT", "4", 1)
             _ = setenv("DS4_DENSE_Q4_NSG", "4", 1)
         }
     }

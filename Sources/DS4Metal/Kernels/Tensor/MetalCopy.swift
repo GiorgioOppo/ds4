@@ -27,6 +27,64 @@ extension MetalRuntime {
         return out.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
 
+    /// Exact packed-four variants used by the optimized decode staging path.
+    /// Kept as explicit methods so tests can compare them to the generic tensor
+    /// copy without relying on process-global environment variables.
+    public func cpyF32toF16Vectorized(_ x: [Float]) throws -> [UInt16] {
+        let out = try cpyContiguous4(kernel: "kernel_cpy_contig_f32_f16_4",
+                                     srcBytes: x.withUnsafeBytes { Array($0) },
+                                     n: x.count, outElemBytes: 2)
+        return out.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+    }
+
+    public func cpyF16toF32Vectorized(_ x: [UInt16]) throws -> [Float] {
+        let out = try cpyContiguous4(kernel: "kernel_cpy_contig_f16_f32_4",
+                                     srcBytes: x.withUnsafeBytes { Array($0) },
+                                     n: x.count, outElemBytes: 4)
+        return out.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    public func cpyF16BitsVectorized(_ x: [UInt16]) throws -> [UInt16] {
+        let out = try cpyContiguous4(kernel: "kernel_cpy_contig_f16_f16_bits_4",
+                                     srcBytes: x.withUnsafeBytes { Array($0) },
+                                     n: x.count, outElemBytes: 2)
+        return out.withUnsafeBytes { Array($0.bindMemory(to: UInt16.self)) }
+    }
+
+    private func cpyContiguous4(kernel: String, srcBytes: [UInt8], n: Int,
+                                outElemBytes: Int) throws -> [UInt8] {
+        guard n > 0 else { return [] }
+        guard n <= Int(UInt32.max) else {
+            throw MetalError.unsupported("contiguous Metal copy exceeds UInt32 element count")
+        }
+        guard let sbuf = device.makeBuffer(bytes: srcBytes, length: srcBytes.count,
+                                           options: .storageModeShared),
+              let dbuf = device.makeBuffer(length: n * outElemBytes,
+                                           options: .storageModeShared),
+              let cb = queue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+
+        let pso = try pipeline(kernel)
+        var count = UInt32(n)
+        enc.setComputePipelineState(pso)
+        enc.setBytes(&count, length: 4, index: 0)
+        enc.setBuffer(sbuf, offset: 0, index: 1)
+        enc.setBuffer(dbuf, offset: 0, index: 2)
+        let threads = (n + 3) / 4
+        let width = min(256, pso.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        if let error = cb.error { throw error }
+
+        let p = dbuf.contents().bindMemory(to: UInt8.self, capacity: n * outElemBytes)
+        return Array(UnsafeBufferPointer(start: p, count: n * outElemBytes))
+    }
+
     private func cpy1D(kernel: String, srcElem: UInt64, dstElem: UInt64,
                        srcBytes: [UInt8], n: Int, outElemBytes: Int) throws -> [UInt8] {
         let args = Self.cpyArgs(n: n, srcElem: srcElem, dstElem: dstElem)

@@ -442,39 +442,78 @@ persists the fastest combination:
 
 The applied values are shown in the "Attivi (prefill)" row.
 
-### Per-Machine Auto-Tune (~15-25 min)
+### Record-Holder Per-Machine Auto-Tune
 
-**Auto-tune macchina** finds the best LOAD-time knobs for this chip and RAM —
-expert cache slots, dense-stream ahead depth, async FFN pipeline, expert
-look-ahead, and `DS4_Q8_NSG` (Q8 matvec reduction partitioning, the one knob
-tied to GPU core count) — with a coordinate descent: one model reload per
-candidate, measured with a short warmed-up decode.
+**Auto-tune macchina** uses up to two coordinate-ascent passes to search the
+exact-quality load-time controls for this chip, RAM and SSD. The manifest covers
+mixed-quant cache policy, RAM-gated expert slots, usage-driven versus uniform
+allocation, expert-`pread` queue depth, dense read-ahead, async FFN, expert
+look-ahead and the row-partition MoE/dense-Q4 NSG occupancies. Q8 NSG remains
+fixed because changing its K-reduction partition can change low Float32 bits;
+only the process tuner’s opt-in numeric profile explores it. Ordered controls
+use an upward-first directional walk. In particular, expert-cache slots advance
+one manifest step at a time: after a win the lower neighbour is skipped and the
+walk continues upward; the first loss stops that parameter without probing any
+larger value. The lower neighbour is tried only if the initial upward step loses.
+Non-monotonic hardware grids are still swept in full.
 
-- Candidates are RAM-gated (a 16 GB machine never tries 32 slots; a 96 GB Max
-  does), and after the first memory-pressure collapse larger candidates are
-  skipped.
-- The metric is the steady-state p99 decode speed, but a candidate only counts
-  if it is STABLE. Stability is judged from the temporal profile of per-token
-  speeds: a swap spiral has a tail slower than its head (progressive
-  degradation), which is exactly what separates "more slots = more hits" from
-  "more slots = swap spiral". A cold start has the opposite signature and does
-  not disqualify a configuration.
-- A candidate must beat the incumbent by more than 2% (anti-noise margin);
-  otherwise the persisted value stays.
+- The already loaded warm root is measured once with a prompt-restoring probe.
+  Because its synthetic KV replaces conversation KV, a non-empty chat is marked
+  for automatic history re-prefill on the next send.
+  Every unique candidate is independently loaded, warmed and measured at most
+  once; later visits reuse the run-local cache without another reload.
+- Decode is greedy. The primary metric is the median steady-state token speed,
+  not a per-token p99. The complete valid observation with the highest decode
+  median is the record. A candidate must be strictly faster, and prefill may not
+  regress by more than 8%; fields from separate runs are never combined.
+- Generated token ids and every captured full-vocabulary logit frame must be
+  bit-exact against both the current incumbent and the immutable initial root.
+  This cumulative root gate prevents small numerical changes from accumulating
+  over successive promotions.
+- Stability must remain at least 0.75 by the decode tail/head ratio. A trial is
+  rejected after more than 128 MiB of swapout in its measured steady-state
+  window. Cold init, warmup and the discarded primer form a separate diagnostic
+  setup window and do not consume that steady-state budget. A fail-closed
+  settling barrier after the primer anchors the measured window; missing,
+  reset or invalid swap-counter samples invalidate the observation. The normal
+  free-RAM floor is 10%; when the already loaded root is below it but retains at
+  least 512 MiB, constrained mode fixes the floor to the greater of 512 MiB and
+  root minus one percentage point, and forbids positive estimated resident
+  deltas. Root restore and those bounded candidates retain the 512 MiB
+  known-loadable reserve after teardown; unknown or memory-growing candidates
+  still require 12%/1.5 GiB before init. The per-model/per-agent usage profile
+  is frozen for the whole run, and the Raw-KV ring remains enabled as a fixed
+  low-RAM constraint.
 
-The winners are applied, persisted per chip/RAM, and summarized in the
-"Attivi (load)" row (slots, dense-ahead, async FFN, look-ahead, q8nsg). On
-error the knobs are restored to their starting values.
+There is no baseline repeatability loop or final throughput rerun. This removes
+the expensive A→B→B→A reload sequence and makes a revisited configuration a
+`CACHE HIT`. The first full-logit quality signature and the run RAM floor remain
+immutable. Removing repetitions also removes order-bias/noise estimation: a
+lucky high record can produce conservative false negatives, but the exact-root
+quality, prefill, stability, RAM and swap gates remain fail-closed.
+
+Candidate settings are applied only to the process environment during search;
+they do not touch UserDefaults. The final configuration is persisted once, only
+after its cached record is validated and the winner completes a successful
+warmup with the active agent. Before commit, the fully ready engine must
+also pass a post-warmup steady probe with the same 128 MiB limit; its setup swap
+is logged separately. Adoption is transaction-backed: startup recovery restores
+the complete initial snapshot if install or commit is interrupted. **Stop**
+cancels the run and restores the initial engine. Completed and partial runs
+write `report.md` and `results.json` under
+`Application Support/DwarfStar/autotune`, and Settings can reveal the report in
+Finder.
 
 ### "Align to fast demo config" and One-Time Migrations
 
 The **Align to fast demo config** button applies the measured preset snapshot of
-**2026-07-13**: 22 expert slots/layer; pread, dense streaming, `mlock`, bundle
-and MetalIO ON; full Q4 (`DS4_DENSE_Q4`, `DS4_QKV_Q4`, `DS4_SHARED_Q4`) ON;
-prefill union/chunk/route-batch `256/512/32`; dense-ahead 2; look-ahead 0; Q8
-and MoE NSG 4; raw ring OFF. The app also runs one-time migrations that move
-defaults persisted by older experimental builds to that snapshot. Later manual
-changes and machine-specific auto-tune results remain authoritative.
+**2026-07-13**, with the later low-RAM alignment: 22 expert slots/layer; pread,
+dense streaming, `mlock`, bundle and MetalIO ON; full Q4 (`DS4_DENSE_Q4`,
+`DS4_QKV_Q4`, `DS4_SHARED_Q4`) ON; prefill union/chunk/route-batch
+`256/512/32`; pread split 4; dense-ahead 2; look-ahead 0; Q8, MoE and dense-Q4
+NSG 4; raw ring ON. The app also runs one-time migrations that move defaults
+persisted by older experimental builds to that snapshot. Later manual changes
+and fully validated machine-specific auto-tune results remain authoritative.
 
 ## 8. Memory, Streaming, and GUI Defaults
 
@@ -493,7 +532,7 @@ that the same values are optimal on every Apple GPU or SSD:
 | Full Q4 | `DENSE_Q4`, `QKV_Q4`, `SHARED_Q4` ON | Deliberately lossy preset covering large attention, q_a/kv and shared-expert projections. |
 | Prefill grouping | union `256`, chunk `512`, route batch `32` | Measured grouping snapshot; the Settings benchmark can replace these hot-reloadable values. |
 | Disk KV | ON | Reuses known prefixes across chats, reloads, and server requests. |
-| Raw-KV ring | OFF | Available as an experiment; full KV is the conservative default. |
+| Raw-KV ring | ON | Fixed low-RAM GUI constraint: raw KV remains bounded to the NSA sliding window. This does not change the bare-engine default. |
 | Async FFN pipeline | ON | Commits the routed FFN asynchronously so the GPU no longer drains between layers; parity was checked for the cited snapshot, not promised as a universal bit-exact contract. |
 | Dense-stream ahead | `2` | Staging ring reads one layer ahead of compute. |
 | Expert look-ahead | `0` | Speculative prefill measured neutral; the hash layers are always prefetched exactly. |
@@ -899,7 +938,7 @@ sign with a Developer ID and notarize.
 | Distributed chat cannot connect | Route incomplete or workers not started | Start workers first and ensure slices cover every layer contiguously. |
 | Distributed connect fails with a version mismatch | Coordinator and worker run different builds | Update every Mac to the same DwarfStar build; the protocol version must match exactly. |
 | Distributed file transfer interrupted | Network hiccup mid-transfer | Nothing to do: the worker keeps its `.part`, setup retries up to 3 times, and each retry resumes from the last 256 MB checkpoint. |
-| Auto-tune reports an unstable baseline or progressive collapse | Memory pressure from other apps or too-large candidates | Free RAM (close other apps) and rerun; collapsing candidates are skipped automatically. |
+| Auto-tune rejects the single warm baseline or a candidate record | Memory pressure, swap/stability gate, or too-large candidate | Free RAM (close other apps) and rerun the whole tuner; within one run a configuration is deliberately never measured twice. |
 | Server works but chat slows down | Shared GPU/SSD resources | Avoid simultaneous chat and server generation on the same Mac. |
 | Build cannot write Swift/clang cache in sandbox | Toolchain cache outside writable roots | Build outside the managed sandbox or configure writable cache paths. |
 

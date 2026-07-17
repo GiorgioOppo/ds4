@@ -22,6 +22,9 @@ struct TuningView: View {
                             value: $store.expertCacheSlots, in: 0...64, step: 8)
                     Text("Each slot keeps one expert resident on the GPU. On the 43-layer Flash 2-bit model it is about 7 MB/slot/layer (8 slots ≈ 2.4 GB wired); Pro has 61 layers and larger experts, so its cost is substantially higher. Hot experts stay in RAM (hit = zero copies); cold experts rotate out via LRU. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Cache mixed IQ2/Q4 layers", isOn: $store.multiQuantCacheEnabled)
+                    Text("Recommended and exact: uses each layer's real expert size while preserving the legacy total RAM budget. OFF is the single-class fallback. Applies on the next model load.")
+                        .font(.caption).foregroundStyle(.secondary)
                     if let info = store.tuningInfo, info.cacheHits + info.cacheMisses > 0 {
                         let rate = Double(info.cacheHits) / Double(info.cacheHits + info.cacheMisses) * 100
                         LabeledContent("Hit rate",
@@ -86,6 +89,11 @@ struct TuningView: View {
             .background(Color.black.opacity(0.05))
             }
             .onAppear { store.refreshTuningInfo() }
+            // This screen binds directly to persisted load-time knobs. Freeze
+            // every control for the whole benchmark/auto-tune lease so a tab
+            // switch cannot create a hybrid candidate or mutate UserDefaults
+            // behind the run journal.
+            .disabled(store.benchRunning || EngineActivityGate.shared.activeOwner == .autoTune)
         } else {
             ContentUnavailableView(
                 "Tuning esperti non disponibile",

@@ -62,6 +62,10 @@ public actor InferenceService {
     /// generations and restores matching prefixes on cold starts.
     var diskKV: DiskKVStore?
     var lastDiskStoreCount = 0
+    /// Background checkpoint writers own large exported snapshots. Track them
+    /// explicitly so an in-process model reload can join their RAM/SSD work
+    /// instead of contaminating the following benchmark trial.
+    var diskKVWriterTasks: [UUID: Task<Void, Never>] = [:]
     /// Content-keyed KV cache for sub-agents: one entry per file/project context
     /// (key = the content prefix tokens), built lazily on first use and reused.
     var subKV: DiskKVStore?
@@ -79,21 +83,23 @@ public actor InferenceService {
     var warmedUp = false
     var lastPrefillProfile = "Profilo prefill: nessun prefill registrato."
 
-    public static let engineRevision = "2026-07-16 dynamic Flash/Pro geometry + router384"
+    public static let engineRevision = "2026-07-16 mixed-quant expert cache + exact cache diagnostics"
 
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
-                expertCacheSlots: Int? = nil) throws {
+                expertCacheSlots: Int? = nil,
+                frozenUsageSeed: Data? = nil) throws {
         FileHandle.standardError.write(Data("DS4 engine: revisione \(Self.engineRevision)\n".utf8))
         // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
         // the app even see the env vars?" must be answerable from the log alone.
-        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_EXPERT_PREAD",
+        let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_MULTI_QUANT_CACHE", "DS4_EXPERT_PREAD",
                      "DS4_EXPERT_BUNDLE", "DS4_BUNDLE_DIR", "DS4_WILLNEED_EXPERTS",
-                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN", "DS4_PREFILL_UNION",
+                     "DS4_PREFETCH", "DS4_PREFETCH_EXPERTS", "DS4_EXPERT_LOOKAHEAD", "DS4_ASYNC_FFN", "DS4_ASYNC_ROUTE", "DS4_PREFILL_UNION",
                      "DS4_PREFILL_FFN_BATCH", "DS4_PREFILL_ROUTE_BATCH", "DS4_PREFILL_CHUNK",
                      "DS4_PREFILL_MM", "DS4_POOL_INTERLEAVE", "DS4_Q8_NSG", "DS4_MOE_NSG", "DS4_DENSE_Q4_NSG",
                      "DS4_ACTIVE_EXPERTS", "DS4_RAW_RING", "DS4_RESIDENT_DENSE",
                      "DS4_DENSE_STREAM", "DS4_DENSE_AHEAD", "DS4_DENSE_Q4", "DS4_SHARED_Q4",
-                     "DS4_QKV_Q4", "DS4_LAZY_IDX", "DS4_GPU_INDEXER_TOPK", "DS4_DENSE_Q4_KERNEL", "DS4_FUSED_ROUTER_PROBS", "DS4_FUSED_ROUTER_FINALIZE", "DS4_FUSED_COMP_PROJ",
+                     "DS4_QKV_Q4", "DS4_COMP_Q8", "DS4_LAZY_IDX", "DS4_GPU_INDEXER_TOPK", "DS4_ADAPTIVE_SPLITK", "DS4_DENSE_Q4_KERNEL", "DS4_FUSED_ROUTER_PROBS", "DS4_FUSED_ROUTER_FINALIZE", "DS4_FUSED_COMP_PROJ",
+                     "DS4_VECTOR_COPY", "DS4_FLASH_KV_STAGE", "DS4_ROPE_PAIR", "DS4_ROPE_AFFINE",
                      "DS4_MTLIO", "DS4_RESIDENT_COMP", "DS4_FUSED_HC",
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
         let env = ProcessInfo.processInfo.environment
@@ -123,13 +129,17 @@ public actor InferenceService {
         let mq = GGUFWeights.detectMoEQuant(model)
         configuredDims.gateQuant = mq.gate; configuredDims.upQuant = mq.up
         configuredDims.downQuant = mq.down; configuredDims.routerF16 = mq.routerF16
-        // Mixed-precision GGUFs (some routed layers upcast, e.g. to Q4_K): those
-        // layers decode per-layer and bypass the single-class expert slot-cache,
-        // reading experts via the mmap gather. Uniform models report 0 (no-op).
+        // Mixed-precision GGUFs (some routed layers upcast, e.g. to Q4_K) always
+        // decode with their real per-layer geometry. The opt-in cache gives each
+        // size class a byte-budgeted pool; the legacy path keeps bypassing them.
         let mixed = GGUFWeights.mixedPrecisionLayerCount(model, nLayers: geometry.nLayers)
         if mixed > 0 {
+            let multiQuantCache = env["DS4_MULTI_QUANT_CACHE"] == "1"
+            let cacheMode = multiQuantCache
+                ? "served by byte-budgeted per-layer expert pools"
+                : "bypassing legacy single-class expert cache"
             FileHandle.standardError.write(Data(
-                "ds4: mixed-precision GGUF: \(mixed)/\(geometry.nLayers) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); decoded per-layer, bypassing expert cache\n".utf8))
+                "ds4: mixed-precision GGUF: \(mixed)/\(geometry.nLayers) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); \(cacheMode)\n".utf8))
         }
         // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
         // per token = less expert I/O, lower quality. Honored by the streaming path.
@@ -139,7 +149,8 @@ public actor InferenceService {
         self.dims = configuredDims
         self.runtimeGeometry = geometry
         self.contextSize = contextSize
-        self.modelName = (modelPath as NSString).lastPathComponent
+        let loadedModelName = (modelPath as NSString).lastPathComponent
+        self.modelName = loadedModelName
         self.markup = ToolMarkup.discover(in: tok)
         self.systemPrompt = (systemPrompt?.isEmpty == false) ? systemPrompt : nil
         let rope = geometry.ropeParams(layer: 0)
@@ -152,14 +163,23 @@ public actor InferenceService {
         // Load the persisted usage stats ("usage imatrix") BEFORE any generation,
         // so the slot-cache warms with the historically hottest experts. The
         // profile is PER-AGENT: different roles route to different experts.
-        if let data = Self.usageDataSeeded(modelName: modelName, agentId: "generale") {
+        let usageData: Data?
+        if let frozenUsageSeed {
+            usageData = frozenUsageSeed
+        } else {
+            usageData = InferenceService.usageDataSeeded(
+                modelName: loadedModelName,
+                agentId: "generale"
+            )
+        }
+        if let data = usageData {
             decoder.usage?.load(data)
         }
         // Sub-agent KV cache (separate directory from the chat disk-KV; content-
         // keyed). Same 1M-token total budget as the chat store default: prefix
         // snapshots for big files/projects are exactly where reuse pays most.
         let subBits: UInt8 = configuredDims.gateQuant == .iq2_xxs ? 2 : 4
-        self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: modelName),
+        self.subKV = try? DiskKVStore(directory: Self.subAgentKVDir(modelName: loadedModelName),
                                       budgetMB: 0, quantBits: subBits, contextSize: contextSize,
                                       budgetTokens: 1_000_000)
     }
@@ -169,6 +189,16 @@ public actor InferenceService {
     /// architecture such as Qwen.
     public nonisolated static func inspectModel(path: String) throws -> RuntimeModelDescriptor {
         try RuntimeBackendFactory.inspect(modelPath: path)
+    }
+
+    /// Drain model-owned GPU/I/O background work before an in-process reload.
+    /// The actor executor serializes this with every benchmark/generation call.
+    public func quiesceForTeardown() async {
+        decoder.quiesceForTeardown()
+        while !diskKVWriterTasks.isEmpty {
+            let writers = Array(diskKVWriterTasks.values)
+            for writer in writers { await writer.value }
+        }
     }
 
     /// Directory holding the per-file / per-project sub-agent KV caches.

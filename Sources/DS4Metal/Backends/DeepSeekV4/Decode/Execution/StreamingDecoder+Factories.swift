@@ -3,6 +3,73 @@ import Metal
 import DS4Core
 
 extension StreamingDecoder {
+    /// Exact physical record geometry of one routed expert in one layer. The
+    /// GGUF can upcast selected layers (for example IQ2/Q2 -> Q4/Q4/Q4), so a
+    /// model-global byte count is insufficient for persistent pools.
+    private struct ExpertPoolLayout {
+        let gate: Int
+        let up: Int
+        let down: Int
+        var record: Int { gate + up + down }
+    }
+
+    private static func expertPoolLayouts(_ model: GGUFModel, dims: DSV4Dims,
+                                          nLayers: Int) -> [ExpertPoolLayout] {
+        let fallback = ExpertPoolLayout(
+            gate: (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn,
+            up: (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn,
+            down: (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd)
+        func slab(_ il: Int, _ name: String, inDim: Int, rows: Int, fallback: Int) -> Int {
+            guard let t = model.findTensor("blk.\(il).\(name)"),
+                  let q = MoEQuant.from(ggufType: t.type) else { return fallback }
+            return (inDim / 256) * q.blockBytes * rows
+        }
+        return (0..<nLayers).map { il in
+            ExpertPoolLayout(
+                gate: slab(il, "ffn_gate_exps.weight", inDim: dims.nEmbd,
+                           rows: dims.expertFfn, fallback: fallback.gate),
+                up: slab(il, "ffn_up_exps.weight", inDim: dims.nEmbd,
+                         rows: dims.expertFfn, fallback: fallback.up),
+                down: slab(il, "ffn_down_exps.weight", inDim: dims.expertFfn,
+                           rows: dims.nEmbd, fallback: fallback.down))
+        }
+    }
+
+    /// Exact byte budget added by one base expert-cache slot. Both the legacy
+    /// single-quant cache and the mixed-quant allocator use this same budget:
+    /// one physical expert record for every routed layer matching the model's
+    /// base quantization class. Exposed so the GUI auto-tuner can predict a
+    /// slot candidate from the GGUF's real Pro/Flash geometry before reload,
+    /// instead of relying on a filename or a fixed MiB estimate.
+    public static func expertCacheBudgetBytesPerBaseSlot(
+        model: GGUFModel,
+        dims: DSV4Dims,
+        nLayers: Int
+    ) -> Int {
+        guard nLayers > 0 else { return 0 }
+        let base = ExpertPoolLayout(
+            gate: (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn,
+            up: (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn,
+            down: (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd)
+        let layouts = expertPoolLayouts(model, dims: dims, nLayers: nLayers)
+        var compatibleLayers = 0
+        for il in 0..<nLayers {
+            let prefix = "blk.\(il)."
+            guard model.findTensor(prefix + "ffn_gate_exps.weight") != nil,
+                  model.findTensor(prefix + "ffn_up_exps.weight") != nil,
+                  model.findTensor(prefix + "ffn_down_exps.weight") != nil else {
+                continue
+            }
+            let layout = layouts[il]
+            if layout.gate == base.gate,
+               layout.up == base.up,
+               layout.down == base.down {
+                compatibleLayers += 1
+            }
+        }
+        return compatibleLayers * base.record
+    }
+
     /// Resolve every model-owned runtime field at the GGUF boundary. Callers may
     /// tune execution knobs in `dims`, but routed-expert formats and router
     /// precision must always come from the tensors actually being opened.
@@ -105,11 +172,31 @@ extension StreamingDecoder {
         // Routing-frequency stats ("usage imatrix"): always collected (cheap);
         // the service persists them across sessions and they pre-warm the cache.
         let usage = ExpertUsageStats(nLayers: nLayers, nExperts: dims.nExperts)
-        // Per-expert slab sizes in the mmap (expert e at absOffset + e*bytes); shared
-        // by the slot-cache fill and the read-ahead prefetch.
-        let gateBytes = (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn
-        let upBytes = (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn
-        let downBytes = (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd
+        // Per-layer expert geometry. `baseLayout` is the legacy/global class;
+        // layouts carries the actual GGUF type of every layer for the opt-in
+        // multi-quant cache.
+        let baseLayout = ExpertPoolLayout(
+            gate: (dims.nEmbd / 256) * dims.gateQuant.blockBytes * dims.expertFfn,
+            up: (dims.nEmbd / 256) * dims.upQuant.blockBytes * dims.expertFfn,
+            down: (dims.expertFfn / 256) * dims.downQuant.blockBytes * dims.nEmbd)
+        let layouts = expertPoolLayouts(model, dims: dims, nLayers: nLayers)
+        let gateBytes = baseLayout.gate, upBytes = baseLayout.up, downBytes = baseLayout.down
+        var offClass = Set<Int>()
+        var routedLayers = Set<Int>()
+        for il in 0..<nLayers {
+            let l = layouts[il]
+            let p = "blk.\(il)."
+            if model.findTensor(p + "ffn_gate_exps.weight") == nil
+                || model.findTensor(p + "ffn_up_exps.weight") == nil
+                || model.findTensor(p + "ffn_down_exps.weight") == nil {
+                offClass.insert(il)
+                continue
+            }
+            routedLayers.insert(il)
+            if l.gate != gateBytes || l.up != upBytes || l.down != downBytes {
+                offClass.insert(il)
+            }
+        }
         // DS4_EXPERT_BUNDLE=1: sidecar with each expert's gate|up|down slabs
         // CONTIGUOUS — a miss becomes one ~7 MB sequential burst instead of
         // three scattered ~2 MB reads (measured gather at ~49% of the SSD's
@@ -120,6 +207,9 @@ extension StreamingDecoder {
             ? ExpertBundle.openOrBuild(model: model, layers: 0..<nLayers, nExpert: dims.nExperts,
                                        gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes)
             : nil
+        // Pread splitting still matters when the sidecar is unavailable or
+        // when mixed-precision/off-class layers must fall back to the GGUF.
+        let usesDirectExpertPread = uncachedFD != nil && (bundle == nil || !offClass.isEmpty)
         // The bundle STATE must be visible in the engine log at EVERY load —
         // silence ("is it even on?") is the one outcome that cannot be triaged.
         if !bundleEnabled {
@@ -135,7 +225,8 @@ extension StreamingDecoder {
             }
         }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
-            if let b = bundle, let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
+            if !offClass.contains(il), let b = bundle,
+               let packed = b.gatherPacked(rt, layer: il, ids: ids) { return packed }
             return try GGUFWeights.gatherLayerExperts(rt, model, il, ids: ids, dims: dims,
                                                       willNeed: willNeed, uncachedFD: uncachedFD)
         }
@@ -151,8 +242,25 @@ extension StreamingDecoder {
         /// Stride fra gli slot del pool quando il layout e' interleaved
         /// (record gate|up|down) — nil = layout storico a 3 buffer stretti.
         var slotStride: Int? = nil
+        var multiCacheActive = false
         if nSlots > 0 {
             let S = max(8, nSlots)
+            let requestedMulti = ProcessInfo.processInfo.environment["DS4_MULTI_QUANT_CACHE"] == "1"
+            // Preserve the RAM actually used by the old single-class cache, not
+            // S × every model layer: off-class layers previously had no pool.
+            let legacyLayerCount = routedLayers.subtracting(offClass).count
+            let legacyBudget = S * legacyLayerCount * baseLayout.record
+            let byteCosts = Dictionary(uniqueKeysWithValues: routedLayers.map { ($0, layouts[$0].record) })
+            let allLayers = routedLayers
+            let floorLayers = Set((0..<min(3, nLayers)).filter { routedLayers.contains($0) })
+            let fallbackPlan = ExpertUsageStats.byteBalancedSlotAllocation(
+                budgetBytes: legacyBudget, bytesPerSlot: byteCosts,
+                cacheableLayers: allLayers)
+            multiCacheActive = requestedMulti && fallbackPlan != nil
+            if requestedMulti && !multiCacheActive {
+                FileHandle.standardError.write(Data(
+                    "DS4 multi-quant cache: budget legacy insufficiente per il floor di tutti i layer; uso cache mono-classe\n".utf8))
+            }
             // Readahead every missing slab (3 matrices × N ids) BEFORE the
             // copies: the NVMe serves all the regions concurrently. With
             // DS4_EXPERT_PREAD the fill bypasses the page cache, so the
@@ -160,10 +268,11 @@ extension StreamingDecoder {
             var fillPrefetch: ((Int, [Int32]) -> Void)? = nil
             if uncachedFD == nil {
                 fillPrefetch = { il, ids in
+                    let layout = multiCacheActive ? layouts[il] : baseLayout
                     for id in ids {
-                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: gateBytes)
-                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: upBytes)
-                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: downBytes)
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_gate_exps.weight", id: id, expertBytes: layout.gate)
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_up_exps.weight", id: id, expertBytes: layout.up)
+                        GGUFWeights.adviseExpert(model, "blk.\(il).ffn_down_exps.weight", id: id, expertBytes: layout.down)
                     }
                 }
             }
@@ -174,26 +283,24 @@ extension StreamingDecoder {
             // coda). I kernel non cambiano: gate/up/down sono tre VISTE dello
             // stesso buffer e lo stride fra esperti (nb02) e' il record.
             let interleave = ProcessInfo.processInfo.environment["DS4_POOL_INTERLEAVE"] != "0"
-            let recordBytes = gateBytes + upBytes + downBytes
+            let recordBytes = baseLayout.record
             typealias Pool = (gate: GPUTensor, up: GPUTensor, down: GPUTensor)
-            let makePool: (Int) throws -> Pool
-            if interleave {
-                makePool = { slots in
-                    let buf = try GPUTensor.zerosBytes(rt, byteLength: slots * recordBytes)
+            let makePoolForLayer: (Int, Int) throws -> Pool = { il, slots in
+                let layout = multiCacheActive ? layouts[il] : baseLayout
+                if interleave {
+                    let buf = try GPUTensor.zerosBytes(rt, byteLength: slots * layout.record)
                     if lockResident { buf.lockResident() }   // pin ONCE: covers all three views
-                    let up = GPUTensor(buffer: buf.buffer, byteLength: slots * recordBytes - gateBytes,
-                                       count: slots * recordBytes - gateBytes, byteOffset: gateBytes)
+                    let up = GPUTensor(buffer: buf.buffer, byteLength: slots * layout.record - layout.gate,
+                                       count: slots * layout.record - layout.gate, byteOffset: layout.gate)
                     let down = GPUTensor(buffer: buf.buffer,
-                                         byteLength: slots * recordBytes - gateBytes - upBytes,
-                                         count: slots * recordBytes - gateBytes - upBytes,
-                                         byteOffset: gateBytes + upBytes)
+                                         byteLength: slots * layout.record - layout.gate - layout.up,
+                                         count: slots * layout.record - layout.gate - layout.up,
+                                         byteOffset: layout.gate + layout.up)
                     return (gate: buf, up: up, down: down)
-                }
-            } else {
-                makePool = { slots in
-                    let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * gateBytes),
-                             up: try GPUTensor.zerosBytes(rt, byteLength: slots * upBytes),
-                             down: try GPUTensor.zerosBytes(rt, byteLength: slots * downBytes))
+                } else {
+                    let p = (gate: try GPUTensor.zerosBytes(rt, byteLength: slots * layout.gate),
+                             up: try GPUTensor.zerosBytes(rt, byteLength: slots * layout.up),
+                             down: try GPUTensor.zerosBytes(rt, byteLength: slots * layout.down))
                     if lockResident {
                         // DS4_MLOCK: a hit must cost zero I/O — pin the pool so the
                         // compressor can't steal cold slots between reuses.
@@ -202,14 +309,15 @@ extension StreamingDecoder {
                     return p
                 }
             }
-            slotStride = interleave ? recordBytes : nil
+            slotStride = !multiCacheActive && interleave ? recordBytes : nil
             let fillOne: (Int, Int32, ExpertSlotCache.LayerPool, Int) throws -> Void = { il, id, pool, slot in
+                let layout = multiCacheActive ? layouts[il] : baseLayout
                 // Sidecar bundle first: layout del record == layout dello slot
                 // interleaved -> UNA pread; col layout storico restano i 3
                 // pread adiacenti (comunque un burst sequenziale).
-                if let b = bundle {
+                if let b = bundle, !offClass.contains(il) {
                     if interleave, b.copyExpertInterleaved(layer: il, id: id, dst: pool.gate,
-                                                           slot: slot, stride: recordBytes) {
+                                                           slot: slot, stride: layout.record) {
                         return
                     }
                     if !interleave, b.copyExpert(layer: il, id: id, gateDst: pool.gate,
@@ -225,9 +333,9 @@ extension StreamingDecoder {
                 // nonisolated(unsafe): i 3 job scrivono slab DISGIUNTI dello slot,
                 // model e' letto e basta, l'errore e' protetto dal lock.
                 nonisolated(unsafe) let jobs: [(name: String, bytes: Int, dst: GPUTensor)] = [
-                    ("blk.\(il).ffn_gate_exps.weight", gateBytes, pool.gate),
-                    ("blk.\(il).ffn_up_exps.weight", upBytes, pool.up),
-                    ("blk.\(il).ffn_down_exps.weight", downBytes, pool.down)]
+                    ("blk.\(il).ffn_gate_exps.weight", layout.gate, pool.gate),
+                    ("blk.\(il).ffn_up_exps.weight", layout.up, pool.up),
+                    ("blk.\(il).ffn_down_exps.weight", layout.down, pool.down)]
                 let lock = NSLock()
                 nonisolated(unsafe) var firstError: Error? = nil
                 nonisolated(unsafe) let modelRef = model
@@ -235,7 +343,7 @@ extension StreamingDecoder {
                     do {
                         try GGUFWeights.copyExpert(modelRef, jobs[j].name, id: id, expertBytes: jobs[j].bytes,
                                                    into: jobs[j].dst, slot: slot, uncachedFD: uncachedFD,
-                                                   slotStride: interleave ? recordBytes : nil)
+                                                   slotStride: interleave ? layout.record : nil)
                     } catch {
                         lock.lock()
                         if firstError == nil { firstError = error }
@@ -246,23 +354,45 @@ extension StreamingDecoder {
             }
             let fillBatch: ((Int, [(id: Int32, slot: Int)], ExpertSlotCache.LayerPool) throws -> Void)? =
                 metalIORequested && bundle != nil ? { il, pairs, pool in
-                    if bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
+                    let layout = multiCacheActive ? layouts[il] : baseLayout
+                    if !offClass.contains(il), bundle!.copyExpertsMetalIO(layer: il, pairs: pairs,
                                                    gateDst: pool.gate, upDst: pool.up, downDst: pool.down,
-                                                   slotStride: interleave ? recordBytes : nil) {
+                                                   slotStride: interleave ? layout.record : nil) {
                         return
                     }
                     // Backend unavailable/failed: preserve the exact historical
                     // fallback for every slot (bundle pread, then GGUF pread).
                     for pair in pairs { try fillOne(il, pair.id, pool, pair.slot) }
                 } : nil
-            cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes, makePool: makePool,
-                                    fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
-               warm: { il in   // acquire trims to the pool's size; the range filter makes a
-                               // corrupt profile degrade to "entry ignored", never a pool
-                               // whose creation throws forever (copyExpert bounds-check)
+            let warm: (Int) -> [Int32] = { il in
                 usage.top(layer: il, n: 128).filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
-            },
-               slotsFor: { il in
+            }
+            if multiCacheActive, let fallbackPlan {
+                let slotsPlan: () -> [Int: Int] = {
+                    if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" {
+                        return fallbackPlan
+                    }
+                    return usage.slotAllocation(
+                        budgetBytes: legacyBudget, bytesPerSlot: byteCosts,
+                        cacheableLayers: allLayers, fixedFloorLayers: floorLayers) ?? fallbackPlan
+                }
+                cache = ExpertSlotCache(
+                    slotsPerLayer: S, bytesPerExpert: recordBytes,
+                    bytesPerExpertForLayer: { layouts[$0].record },
+                    expertStrideForLayer: interleave ? { layouts[$0].record } : nil,
+                    supportsLayer: { routedLayers.contains($0) },
+                    makePoolForLayer: makePoolForLayer,
+                    fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
+                    warm: warm, slotsPlan: slotsPlan)
+                let allocated = fallbackPlan.values.reduce(0, +)
+                let bytes = fallbackPlan.reduce(0) { $0 + ($1.value * layouts[$1.key].record) }
+                FileHandle.standardError.write(Data(
+                    "DS4 multi-quant cache: attiva, \(allocated) slot su \(routedLayers.count) layer, \(bytes >> 20) MiB / budget legacy \(legacyBudget >> 20) MiB\n".utf8))
+            } else {
+                cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes,
+                                        makePool: { try makePoolForLayer(0, $0) },
+                                        fill: fillOne, fillBatch: fillBatch, prefetch: fillPrefetch,
+                                        warm: warm, slotsFor: { il in
                 // Usage-driven allocation: same total wired budget (S × routed
                 // layers) but more slots where the routing concentrates, fewer
                 // where it's flat. Recomputed at pool creation — i.e. at load
@@ -271,7 +401,8 @@ extension StreamingDecoder {
                 // enough history to trust. Opt-out: DS4_EXPERT_CACHE_UNIFORM=1.
                 if ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_UNIFORM"] == "1" { return S }
                 return usage.slotAllocation(base: S)?[il] ?? S
-            })
+                })
+            }
         }
         // Expert look-ahead (kickLookahead): EXACT tid2eid ids for the hash
         // layers — their selection depends only on the token id, so their
@@ -279,25 +410,12 @@ extension StreamingDecoder {
         // C engine's begin_selected_load trick) — and usage-prior top-N for
         // the other layers (speculative: a wrong guess wastes idle-window
         // bandwidth only; opt-in with DS4_EXPERT_LOOKAHEAD=N, try 6..12).
-        // Ids resolve on the decode thread; mixed-precision layers (outside
-        // the slot cache's size class) are excluded.
-        var offClass = Set<Int>()
-        for il in 0..<nLayers {
-            let pfx = "blk.\(il)."
-            guard model.findTensor(pfx + "ffn_gate_exps.weight") != nil else {
-                offClass.insert(il); continue
-            }
-            func q(_ n: String) -> MoEQuant? {
-                model.findTensor(pfx + n).flatMap { MoEQuant.from(ggufType: $0.type) }
-            }
-            if q("ffn_gate_exps.weight") != dims.gateQuant || q("ffn_up_exps.weight") != dims.upQuant
-                || q("ffn_down_exps.weight") != dims.downQuant {
-                offClass.insert(il)
-            }
-        }
+        // Ids resolve on the decode thread. The legacy cache excludes mixed
+        // layers; the opt-in layer-aware cache can prefill all of them safely.
         let lookN = ProcessInfo.processInfo.environment["DS4_EXPERT_LOOKAHEAD"].flatMap(Int.init) ?? 0
         let lookahead: ((Int, Int) -> [Int32])? = cache == nil ? nil : { il, token in
-            if offClass.contains(il) { return [] }
+            if !routedLayers.contains(il) { return [] }
+            if !multiCacheActive && offClass.contains(il) { return [] }
             if token >= 0, let exact = GGUFWeights.hashSelectedIds(model, il, token: token) {
                 return exact.filter { $0 >= 0 && $0 < Int32(dims.nExperts) }
             }
@@ -329,8 +447,6 @@ extension StreamingDecoder {
             }
             return names
         }()
-        let expertTensors = [("ffn_gate_exps.weight", gateBytes), ("ffn_up_exps.weight", upBytes),
-                             ("ffn_down_exps.weight", downBytes)]
         let mapBaseAddr = Int(bitPattern: model.mapBase)   // Sendable: cross into the bg queue as an int
         let prefetchQ = DispatchQueue(label: "ds4.prefetch", qos: .utility)
         let prefetch: ((Int) -> Void)? = prefetchOn ? { il in
@@ -341,6 +457,10 @@ extension StreamingDecoder {
             }
             if prefetchExperts > 0 {
                 let hot = usage.top(layer: il, n: prefetchExperts)   // decode thread (same as record)
+                let layout = layouts[il]
+                let expertTensors = [("ffn_gate_exps.weight", layout.gate),
+                                     ("ffn_up_exps.weight", layout.up),
+                                     ("ffn_down_exps.weight", layout.down)]
                 for (name, ebytes) in expertTensors {
                     if let t = model.findTensor(p + name) {
                         for e in hot { ranges.append((offset: t.absOffset + UInt64(e) * UInt64(ebytes),
@@ -373,6 +493,11 @@ extension StreamingDecoder {
         // DS4_RESIDENT_DENSE. Same bytes → identical numerics.
         let denseProvider: (Int) throws -> LayerWeights
         var activateIndexerScoring: (() throws -> Void)?
+        var denseStagingBytesPerAheadSlot = 0
+        var teardownDrains: [() -> Void] = []
+        if prefetchOn {
+            teardownDrains.append { prefetchQ.sync {} }
+        }
         if denseStream {
             // DS4_DENSE_Q4=1 (requires the stream): the two giant plain-matvec
             // projections (q_b, output_b — Q8, 71 of ~145 MB/layer) are
@@ -396,7 +521,9 @@ extension StreamingDecoder {
                                              lockResident: lockResident, q4Dense: q4Dense,
                                              lazyIndexerScoring: lazyIndexerScoring,
                                              residentComp: residentComp)
+            denseStagingBytesPerAheadSlot = streamer.stagingBytesPerAheadSlot
             denseProvider = { try streamer.weights($0) }
+            teardownDrains.append { streamer.quiesceForTeardown() }
             if lazyIndexerScoring, indexerCanActivate {
                 activateIndexerScoring = { try streamer.activateIndexerScoring() }
                 FileHandle.standardError.write(Data(
@@ -417,12 +544,18 @@ extension StreamingDecoder {
             activateIndexerScoring = nil
         }
         LoadProgress.shared.set(0.95, "Allocazione KV e scratch…")
+        let teardownIODrain: (() -> Void)? = teardownDrains.isEmpty ? nil : {
+            for drain in teardownDrains { drain() }
+        }
         let dec = try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
                                        layerProvider: denseProvider,
                                        embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps, hcEps: hcEps,
                                        expertGather: gather, slotCache: cache, usage: usage,
                                        prefetch: prefetch, lookahead: lookahead, kvLayers: kvLayers,
                                        activateIndexerScoring: activateIndexerScoring,
+                                       teardownIODrain: teardownIODrain,
+                                       denseStagingBytesPerAheadSlot: denseStagingBytesPerAheadSlot,
+                                       usesDirectExpertPread: usesDirectExpertPread,
                                        slotCacheStride: slotStride, geometry: geometry)
         LoadProgress.shared.set(1.0, "Pronto")
         return dec

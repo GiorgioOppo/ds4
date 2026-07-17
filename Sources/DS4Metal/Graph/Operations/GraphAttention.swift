@@ -12,15 +12,19 @@ extension GraphContext {
     }
 
     /// Decode FlashAttention core (MLA dk=dv=512), encode form. Converts the F32
-    /// latent `kvF32` (nKeys x 512) to F16 (`kvF16` scratch) via cpy, then the
-    /// vec + reduce kernels, all into the shared command buffer. K==V==latent,
-    /// no mask. A partial final 32-row block is padded internally. `mask` must
-    /// be zeroed; sinks/pad/tmp are scratch sized per the C dispatch.
+    /// latent `kvF32` (nKeys x 512) and optional compressed F32 rows to the F16
+    /// `kvF16` scratch, then runs vec + reduce in the shared command buffer.
+    /// K==V==latent. `mask` may carry the NSA indexer's compressed-key selection.
+    /// A partial final 32-row block is padded internally.
+    ///
+    /// `fusedStage` / `vectorCopy` are explicit A/B overrides used by numerical
+    /// tests and the benchmark harness. nil selects the decoder-level env knobs.
     public func flashAttnCore(q: GPUTensor, kvF32: GPUTensor, kvF16: GPUTensor,
                               mask: GPUTensor, sinks: GPUTensor, pad: GPUTensor, tmp: GPUTensor,
                               heads: GPUTensor, nHead: Int, nKeys: Int, rawStartRow: Int = 0,
                               hasSinks: Bool = false,
-                              comp: GPUTensor? = nil, nComp: Int = 0) throws {
+                              comp: GPUTensor? = nil, nComp: Int = 0,
+                              fusedStage: Bool? = nil, vectorCopy: Bool? = nil) throws {
         let headDim = 512
         let ncpsg = 32
         // Two-span attention: raw SWA rows (nKeys) followed by compressed rows (nComp),
@@ -43,56 +47,104 @@ extension GraphContext {
         while 2 * 32 * nsg * ncpsg < total && nsg < 4 { nsg *= 2 }
         let e = encoder
 
-        // 1) cpy F32 -> F16: raw rows (kvF32 -> kvF16[0..]) then comp rows (comp -> kvF16[nKeys..]).
-        let cpyPso = try rt.pipeline("kernel_cpy_f32_f16")
-        func cpyF32toF16(_ src: GPUTensor, srcOff: Int, dstOff: Int, count: Int) {
-            let a = MetalRuntime.cpyArgs(n: count, srcElem: 4, dstElem: 2)
-            var cnth = 32; let cmaxT = cpyPso.maxTotalThreadsPerThreadgroup
-            while cnth < count && cnth < cmaxT { cnth *= 2 }
-            if cnth > cmaxT { cnth = cmaxT }; if cnth > count { cnth = count }; if cnth == 0 { cnth = 1 }
-            e.setComputePipelineState(cpyPso)
-            a.withUnsafeBytes { e.setBytes($0.baseAddress!, length: a.count, index: 0) }
-            e.setBuffer(src.buffer, offset: srcOff, index: 1)
-            e.setBuffer(kvF16.buffer, offset: dstOff, index: 2)
-            e.dispatchThreadgroups(MTLSize(width: (count + cnth - 1) / cnth, height: 1, depth: 1),
-                                   threadsPerThreadgroup: MTLSize(width: cnth, height: 1, depth: 1))
-        }
+        precondition(nKeys > 0 && nComp >= 0 && total > 0)
+        precondition(nComp == 0 || comp != nil)
+
         // Raw span: only the SWA window starting at `rawStartRow` (rows hold their
         // absolute-RoPE'd values, so a shifted span is exactly the C slid cache).
-        // With a ring-buffer raw cache (count < contextSize) the window can wrap.
-        // A dedicated kernel de-rotates and converts that window in ONE dispatch;
-        // the full-cache/non-wrapped path remains the historical contiguous cpy.
         let rawRows = kvF32.count / headDim
+        precondition(rawRows > 0 && nKeys <= rawRows)
         let physStart = ((rawStartRow % rawRows) + rawRows) % rawRows
-        if physStart + nKeys <= rawRows {
-            cpyF32toF16(kvF32, srcOff: physStart * headDim * 4, dstOff: 0, count: nKeys * headDim)
-        } else {
-            let ringPso = try rt.pipeline("kernel_dsv4_raw_ring_cpy_f32_f16")
-            let args = [UInt32(nKeys), UInt32(headDim), UInt32(rawRows), UInt32(physStart)]
-            e.setComputePipelineState(ringPso)
+
+        let useFusedStage = fusedStage ?? GraphContext.fusedFlashKVStage
+        let useVectorCopy = vectorCopy ?? GraphContext.vectorCopies
+
+        if useFusedStage {
+            // One shape-specialized dispatch: circular gather + both F32->F16
+            // spans + optional final-block K/V/mask padding.
+            let stagePso = try rt.pipeline("kernel_dsv4_flash_kv_stage_f32")
+            let args = [UInt32(rawRows), UInt32(physStart), UInt32(nKeys), UInt32(nComp),
+                        UInt32(ncpsg), UInt32(kvpad ? 1 : 0)]
+            e.setComputePipelineState(stagePso)
             args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: $0.count, index: 0) }
             e.setBuffer(kvF32.buffer, offset: kvF32.byteOffset, index: 1)
-            e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 2)
-            let width = min(headDim, max(1, ringPso.threadExecutionWidth))
-            e.dispatchThreads(MTLSize(width: headDim, height: nKeys, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
-        }
-        if let comp = comp, nComp > 0 {
-            cpyF32toF16(comp, srcOff: comp.byteOffset, dstOff: nKeys * headDim * 2, count: nComp * headDim)
-        }
+            let compTensor = comp ?? kvF32 // never read when nComp == 0
+            e.setBuffer(compTensor.buffer, offset: compTensor.byteOffset, index: 2)
+            e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 3)
+            e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 4)
+            e.setBuffer(pad.buffer, offset: pad.byteOffset, index: 5)
+            let rowVectors = headDim / 4
+            let stageThreads = total * rowVectors + (kvpad ? ncpsg * rowVectors + ncpsg : 0)
+            let stageWidth = min(256, stagePso.maxTotalThreadsPerThreadgroup)
+            e.dispatchThreads(MTLSize(width: stageThreads, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: stageWidth, height: 1, depth: 1))
+        } else {
+            // Exact fallback graph. Contiguous spans may still use the simpler
+            // packed conversion kernel; DS4_VECTOR_COPY=0 restores the original
+            // generic tensor-indexing kernel for a clean three-way A/B.
+            let cpyPso = try rt.pipeline(useVectorCopy
+                                         ? "kernel_cpy_contig_f32_f16_4"
+                                         : "kernel_cpy_f32_f16")
+            func cpyF32toF16(_ src: GPUTensor, srcOff: Int,
+                             dstOff: Int, count: Int) {
+                e.setComputePipelineState(cpyPso)
+                if useVectorCopy {
+                    var count32 = UInt32(count)
+                    e.setBytes(&count32, length: 4, index: 0)
+                    e.setBuffer(src.buffer, offset: srcOff, index: 1)
+                    e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset + dstOff, index: 2)
+                    let threads = (count + 3) / 4
+                    let width = min(256, cpyPso.maxTotalThreadsPerThreadgroup)
+                    e.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
+                                      threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+                } else {
+                    let a = MetalRuntime.cpyArgs(n: count, srcElem: 4, dstElem: 2)
+                    var width = 32
+                    let maxWidth = cpyPso.maxTotalThreadsPerThreadgroup
+                    while width < count && width < maxWidth { width *= 2 }
+                    width = max(1, min(width, maxWidth, count))
+                    a.withUnsafeBytes { e.setBytes($0.baseAddress!, length: a.count, index: 0) }
+                    e.setBuffer(src.buffer, offset: srcOff, index: 1)
+                    e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset + dstOff, index: 2)
+                    e.dispatchThreadgroups(MTLSize(width: (count + width - 1) / width,
+                                                   height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: width,
+                                                                          height: 1, depth: 1))
+                }
+            }
 
-        // 1b) pad the partial last block when total % 32 != 0 (K==V==kvF16, mask all-zero)
-        if kvpad {
-            let pArgs = MetalRuntime.flashPadArgs(nKeys: total, headDim: headDim)
-            let padPso = try rt.flashPadPipeline(ncpsg: Int32(ncpsg))
-            e.setComputePipelineState(padPso)
-            pArgs.withUnsafeBytes { e.setBytes($0.baseAddress!, length: pArgs.count, index: 0) }
-            e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 1)
-            e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 2)
-            e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 3)
-            e.setBuffer(pad.buffer, offset: pad.byteOffset, index: 4)
-            e.dispatchThreadgroups(MTLSize(width: ncpsg, height: 1, depth: 1),
-                                   threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            if physStart + nKeys <= rawRows {
+                cpyF32toF16(kvF32,
+                            srcOff: kvF32.byteOffset + physStart * headDim * 4,
+                            dstOff: 0, count: nKeys * headDim)
+            } else {
+                let ringPso = try rt.pipeline("kernel_dsv4_raw_ring_cpy_f32_f16")
+                let args = [UInt32(nKeys), UInt32(headDim), UInt32(rawRows), UInt32(physStart)]
+                e.setComputePipelineState(ringPso)
+                args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+                e.setBuffer(kvF32.buffer, offset: kvF32.byteOffset, index: 1)
+                e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 2)
+                let width = min(headDim, max(1, ringPso.threadExecutionWidth))
+                e.dispatchThreads(MTLSize(width: headDim, height: nKeys, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+            }
+            if let comp, nComp > 0 {
+                cpyF32toF16(comp, srcOff: comp.byteOffset,
+                            dstOff: nKeys * headDim * 2, count: nComp * headDim)
+            }
+
+            if kvpad {
+                let pArgs = MetalRuntime.flashPadArgs(nKeys: total, headDim: headDim)
+                let padPso = try rt.flashPadPipeline(ncpsg: Int32(ncpsg))
+                e.setComputePipelineState(padPso)
+                pArgs.withUnsafeBytes { e.setBytes($0.baseAddress!, length: pArgs.count, index: 0) }
+                e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 1)
+                e.setBuffer(kvF16.buffer, offset: kvF16.byteOffset, index: 2)
+                e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 3)
+                e.setBuffer(pad.buffer, offset: pad.byteOffset, index: 4)
+                e.dispatchThreadgroups(MTLSize(width: ncpsg, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
         }
 
         // 2) flash vec

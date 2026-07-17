@@ -20,8 +20,8 @@ extension LocalServer {
         let respId = rid("resp_"), msgId = rid("msg_"), rsId = rid("rs_")
         onLog("POST /v1/responses (\(parsed.turns.count) item, stream=\(parsed.stream))\n")
 
-        await acquireGate()
-        defer { Task { await gate.release() } }
+        try await acquireGate()
+        defer { gate.release() }
 
         let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
                                            think: parsed.think, sampling: parsed.sampling,
@@ -188,4 +188,3 @@ extension LocalServer {
         return "{\"id\":\"\(it.fcId)\",\"type\":\"function_call\",\"status\":\"\(status)\",\"name\":\(jsonString(it.name)),\"call_id\":\(jsonString(it.callId)),\"arguments\":\(args)}"
     }
 }
-

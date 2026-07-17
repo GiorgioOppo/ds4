@@ -124,6 +124,7 @@ final class BenchController {
     private var accuracyObservationTask: Task<Void, Never>?
     private var accuracyResultTask: Task<Void, Never>?
     private var accuracyLiveObservationStride = 1
+    private var engineLease: EngineActivityGate.Lease?
 
     func run() {
         guard !isRunning else { return }
@@ -135,6 +136,13 @@ final class BenchController {
             log = "Paste or enter a text corpus before starting the Correctness benchmark.\n"
             return
         }
+        let activityGate = EngineActivityGate.shared
+        guard let lease = activityGate.acquire(.benchmark) else {
+            let owner = activityGate.activeOwner?.displayName ?? "another engine operation"
+            log = "The engine is busy with \(owner). Stop it before starting a benchmark.\n"
+            return
+        }
+        engineLease = lease
 
         log = ""; isRunning = true; runningMode = mode; runningKind = kind
         switch kind {
@@ -434,9 +442,16 @@ final class BenchController {
     }
 
     private func clearRunningState() {
+        releaseEngineLease()
         isRunning = false
         runningMode = nil
         runningKind = nil
+    }
+
+    private func releaseEngineLease() {
+        guard let lease = engineLease else { return }
+        engineLease = nil
+        EngineActivityGate.shared.release(lease)
     }
 
     func stop() {

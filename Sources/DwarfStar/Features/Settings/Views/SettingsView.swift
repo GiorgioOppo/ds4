@@ -36,10 +36,14 @@ struct SettingsView: View {
                          : "This Mac coordinates a worker cluster. Start workers from the Worker tab, on this Mac or other Macs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                switch settings.mode {
-                case .local:       localSection
-                case .distributed: distributedSection
+                .disabled(store.benchRunning)
+                Group {
+                    switch settings.mode {
+                    case .local:       localSection
+                    case .distributed: distributedSection
+                    }
                 }
+                .disabled(store.benchRunning)
             }
             .formStyle(.grouped)
 
@@ -153,6 +157,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
+            .disabled(store.benchRunning || store.bundleBuildRunning)
             if store.supportsDeepSeekPerformanceTuning {
                 Section("Benchmark DeepSeek V4") {
                 HStack(spacing: 8) {
@@ -164,17 +169,40 @@ struct SettingsView: View {
                         store.runSettingsBenchmark(quick: false)
                     }
                     .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
-                    Button("Auto-tune macchina (~15-25 min)") {
-                        store.runAutoTune()
+                    Button("Auto-tune record-holder (ore)") {
+                        store.runAutoTune(
+                            distributedRuntimeActive: dist.workerRunning || dist.connected
+                                || dist.coordLoading || dist.isGenerating || dist.benchmarkActive
+                        )
                     }
                     .disabled(store.benchRunning || store.phase != .ready || store.isGenerating)
-                    if store.benchRunning { ProgressView().controlSize(.small) }
+                    if store.benchRunning {
+                        Button("Stop", role: .destructive) { store.cancelAutoTune() }
+                        ProgressView(
+                            value: Double(store.benchProgressDone),
+                            total: Double(max(store.benchProgressTotal, 1))
+                        )
+                        .frame(width: 100)
+                        .controlSize(.small)
+                    }
                 }
-                Text("Misura sul modello caricato i knob del prefill regolabili a caldo e applica/salva la combinazione più veloce. Rapido: solo unione esperti (192/256). Completo: anche chunk (512/1024) e route batch (16/32/64/128); quest’ultimo riduce i round-trip CPU↔GPU senza cambiare la numerica. Auto-tune macchina: trova i migliori knob di CARICAMENTO per questo chip/RAM (slot cache, dense-ahead, async FFN, look-ahead) con un reload del modello per candidato — candidati adattati alla RAM, scarto automatico delle configurazioni che collassano per pressione di memoria; i vincitori vengono applicati e salvati.")
+                Text("Rapido/Completo regolano i knob del prefill sul motore già caricato. Auto-tune record-holder misura una sola volta la baseline calda e ogni configurazione unica; se una configurazione ricompare riusa il risultato in cache senza reload. Per gli expert-cache slot prova un gradino alla volta verso l'alto: dopo una promozione continua soltanto in quella direzione e si ferma al primo peggioramento; prova il vicino inferiore solo se il primo gradino superiore non vince. Il campione completo col decode valido più alto resta il confronto: lo sostituisce qualsiasi decode strettamente superiore che mantenga hash bit-esatto di tutti i logits, prefill entro −8%, stabilità ≥0,75, RAM sopra il floor immutabile e non più di 128 MiB di swap steady. Congela l'usage profile, mantiene Raw-KV ring ON e salva i parametri soltanto dopo warmup dell'agente attivo e probe steady conclusivo. Un journal transazionale ripristina i valori iniziali dopo un'interruzione.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = store.benchStatus {
-                    Label(status, systemImage: store.benchRunning ? "hourglass" : "checkmark.circle")
+                    Label(status, systemImage: store.benchRunning ? "hourglass" :
+                          (store.benchSucceeded == false ? "xmark.circle" : "checkmark.circle"))
                         .font(.caption)
+                }
+                if let reportURL = store.autoTuneReportURL {
+                    HStack(spacing: 8) {
+                        Text(reportURL.deletingLastPathComponent().path)
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                        Button("Mostra report") {
+                            NSWorkspace.shared.activateFileViewerSelecting([reportURL])
+                        }
+                        .font(.caption)
+                    }
                 }
                 if !store.benchResults.isEmpty {
                     Text(store.benchResults)
@@ -189,30 +217,49 @@ struct SettingsView: View {
                 // async FFN e q8nsg non hanno un controllo — senza questa riga
                 // il valore applicato sarebbe visibile solo nel referto.
                 LabeledContent("Attivi (load)",
-                               value: "slot \(store.expertCacheSlots) · ahead \(store.denseAhead) · " +
+                               value: "slot \(store.expertCacheSlots) · mixed-cache \(store.multiQuantCacheEnabled ? "on" : "off") · " +
+                                      "alloc \(store.expertCacheUniform ? "uniforme" : "usage") · pread×\(store.preadSplit) · " +
+                                      "ahead \(store.denseAhead) · " +
                                       "asyncFFN \(store.asyncFFNEnabled ? "on" : "off") · " +
-                                      "look \(store.expertLookahead) · q8nsg \(store.q8NSG) · " +
+                                      "look \(store.expertLookahead) · q8/moe/denseNSG \(store.q8NSG)/\(store.moeNSG)/\(store.denseQ4NSG) · " +
+                                      "raw-ring \(store.rawRingEnabled ? "on" : "off") · " +
                                       "MetalIO \(store.metalIOEnabled ? "on" : "off")")
                     .font(.caption)
             }
                 Section("Memory · DeepSeek V4") {
                 HStack(spacing: 8) {
                     Button("Align to fast demo config") { store.applyFastDemoDefaults() }
-                    Text("Resets performance controls to the measured M1 Pro 16 GB preset (2026-07-13): slots 20, full Q4, prefill 256/512/32, pread + dense stream + mlock + bundle + MetalIO ON, dense-ahead 2, look-ahead 0, NSG 4, ring OFF. MetalIO falls back automatically if slower. Applies on the next model load.")
+                    Text("Resets performance controls to the measured M1 Pro 16 GB preset: 22 slots, mixed-quant cache ON, full Q4, prefill 256/512/32, pread×4 + dense stream + mlock + bundle + MetalIO ON, dense-ahead 2, look-ahead 0, NSG 4, Raw-KV ring ON. MetalIO falls back automatically if slower. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                         value: $store.expertCacheSlots, in: 0...64, step: 4)
                 if store.expertCacheSlots > 20 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                    Label("The measured 16 GB Flash preset uses 20 slots. On Flash each extra slot costs ~0.3 GB across 43 layers; Pro has 61 layers and larger experts, so do not reuse this RAM estimate. Excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
+                    Label("The measured 16 GB Flash preset uses 22 slots. On Flash each extra legacy-size slot costs ~0.25 GB across the IQ2 layers; Pro has 61 layers and larger experts, so do not reuse this RAM estimate. Excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
+                Toggle("Mixed-quant expert cache (recommended)", isOn: $store.multiQuantCacheEnabled)
+                Text("Caches every routed IQ2/Q4 layer with its real record size under the same total byte budget as the legacy cache. The M1 Pro A/B improved decode by 28.9% and cut expert reads by 31.1%, with all 64 tokens and 2,068,480 logits bit-identical. Turn OFF to restore the legacy off-class bypass. Applies on the next model load.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Toggle("Uniform expert-cache allocation (A/B option)", isOn: $store.expertCacheUniform)
+                Text(store.expertCacheUniform
+                     ? "Every routed layer receives the same slot allocation."
+                     : "The frozen usage profile distributes the same byte budget toward the layers that benefit most.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Stepper("Expert look-ahead: \(store.expertLookahead == 0 ? "hash layers only" : "\(store.expertLookahead) speculative/layer")",
                         value: $store.expertLookahead, in: 0...12, step: 2)
                 Text("Prefills the NEXT layer's cache slots while the current one computes: exact for the hash layers (always on), top-N from the usage prior when > 0. Speculative I/O runs in the SSD-idle window and yields to the real gather; a wrong guess only wastes idle bandwidth. Applies on the next model load — A/B the tok/s.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
+                if store.expertPreadEnabled {
+                    Stepper("Pread split: \(store.preadSplit)", value: $store.preadSplit,
+                            in: 1...8, step: 1)
+                    Text(store.expertBundleEnabled
+                         ? "Il bundle/MetalIO bypassa questo split durante il decode; l'auto-tune lo salta finché il bundle è ON."
+                         : "Queue depth NVMe per slab; stessi byte e stessa numerica.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Toggle("Expert bundle sidecar (contiguous slabs, ~+25% tok/s)", isOn: $store.expertBundleEnabled)
                 if store.expertBundleEnabled {
                     Toggle("MetalIO direct SSD → GPU buffers (recommended preset)", isOn: $store.metalIOEnabled)
@@ -232,8 +279,13 @@ struct SettingsView: View {
                         .font(.caption2)
                     }
                     HStack(spacing: 8) {
-                        Button("Generate expert bundle now") { store.buildExpertBundleNow() }
-                            .font(.caption)
+                        Button(store.bundleBuildRunning
+                               ? "Generating expert bundle…"
+                               : "Generate expert bundle now") {
+                            store.buildExpertBundleNow()
+                        }
+                        .disabled(store.bundleBuildRunning || store.phase == .loading)
+                        .font(.caption)
                         if let status = store.bundleBuildStatus {
                             Text(status).font(.caption2).foregroundStyle(.secondary)
                                 .lineLimit(2)
@@ -279,6 +331,7 @@ struct SettingsView: View {
                 Text("Applies on the next model load.")
                     .font(.caption).foregroundStyle(.tertiary)
                 }
+                .disabled(store.benchRunning)
             } else if let descriptor = store.inspectedModelDescriptor {
                 Section("Backend settings") {
                     Label("\(descriptor.displayName) · \(descriptor.architecture.rawValue)",
@@ -307,7 +360,7 @@ struct SettingsView: View {
                     }
                     Spacer()
                     Button("Reload") { store.load() }
-                        .disabled(store.isGenerating)
+                        .disabled(store.isGenerating || store.benchRunning)
                         .help(store.isGenerating
                               ? "Stop generation before reloading the model."
                               : "Reload the model with the current settings.")

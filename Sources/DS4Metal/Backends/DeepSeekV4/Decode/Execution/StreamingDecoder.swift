@@ -80,6 +80,12 @@ public final class StreamingDecoder {
     /// DECODE path serves hits from resident GPU pools (zero copies) and gathers
     /// only the misses; the matvec runs on the pool with slot-index ids.
     public let slotCache: ExpertSlotCache?
+    /// Exact per-step resident allocation of the dense staging ring. Zero when
+    /// dense streaming is disabled.
+    public let denseStagingBytesPerAheadSlot: Int
+    /// True when at least one routed layer of this load can fill experts from
+    /// the GGUF F_NOCACHE descriptor, where DS4_PREAD_SPLIT is effective.
+    public let usesDirectExpertPread: Bool
     /// Stride in byte fra gli slot del pool quando il layout e' INTERLEAVED
     /// (record gate|up|down contigui, come nel bundle): passato come nb02 ai
     /// dispatch MoE del percorso slot-cache. nil = layout storico (3 buffer
@@ -110,6 +116,10 @@ public final class StreamingDecoder {
     /// when the configured context can never reach the frontier, and after a
     /// successful activation.
     var activateIndexerScoring: (() throws -> Void)?
+    /// Factory-owned queues/read-ahead objects that can outlive the last
+    /// synchronous forward unless explicitly joined before an in-process
+    /// benchmark reload.
+    let teardownIODrain: (() -> Void)?
     /// Serial queue for the speculative prefills (one layer ahead at a time —
     /// a backlog would just re-touch already-resident ids and skip).
     let lookaheadQ = DispatchQueue(label: "ds4.expert-lookahead", qos: .userInitiated)
@@ -319,6 +329,9 @@ public final class StreamingDecoder {
          lookahead: ((_ layer: Int, _ token: Int) -> [Int32])? = nil,
          kvLayers: Range<Int>? = nil,
          activateIndexerScoring: (() throws -> Void)? = nil,
+         teardownIODrain: (() -> Void)? = nil,
+         denseStagingBytesPerAheadSlot: Int = 0,
+         usesDirectExpertPread: Bool = false,
          slotCacheStride: Int? = nil,
          geometry: DSV4RuntimeGeometry? = nil) throws {
         if let geometry {
@@ -333,11 +346,14 @@ public final class StreamingDecoder {
         self.layerProvider = layerProvider; self.embedTable = embedTable; self.out = out
         self.rmsEps = rmsEps; self.hcEps = hcEps; self.expertGather = expertGather
         self.slotCache = slotCache
+        self.denseStagingBytesPerAheadSlot = max(0, denseStagingBytesPerAheadSlot)
+        self.usesDirectExpertPread = usesDirectExpertPread
         self.slotCacheStride = slotCacheStride
         self.usage = usage
         self.prefetch = prefetch
         self.lookahead = lookahead
         self.activateIndexerScoring = activateIndexerScoring
+        self.teardownIODrain = teardownIODrain
         let hcDim = dims.nHC * dims.nEmbd
         // Distributed slice: allocate KV/compressor state ONLY for `kvLayers`
         // (a worker never runs the other layers — dummy 1-float buffers there).

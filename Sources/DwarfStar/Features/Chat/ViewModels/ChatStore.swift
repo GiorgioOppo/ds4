@@ -4,6 +4,17 @@ import UniformTypeIdentifiers
 import DS4Engine
 import DS4Core
 
+/// Immutable identity of the load-time state that actually constructed the
+/// visible inference service. Settings remain editable for the next load, so
+/// the rigorous tuner must compare against this snapshot rather than assuming
+/// that today's controls describe the engine already resident in memory.
+struct LoadedEngineSignature: Equatable, Sendable {
+    let modelPath: String
+    let contextSize: Int
+    let tuning: MachineAutoTuneConfiguration
+    let fixedEnvironment: [String: String]
+}
+
 /// Main-thread view model. Owns the `InferenceService` actor and mirrors its
 /// streamed output into observable UI state.
 @MainActor
@@ -51,12 +62,11 @@ final class ChatStore {
                 self.syncTools()
             }
         }
-        // Migrazione UNA TANTUM alla configurazione veloce misurata (2026-07,
-        // demo A/B sul campo: slot 16 + ring off + bundle = 2.3-2.6 tok/s
-        // contro ~1 con slot 6/ring on/contesto 302k). Applica i valori buoni
-        // ai default persistiti da vecchi esperimenti; le modifiche manuali
-        // FUTURE dell'utente restano sovrane (il flag impedisce di ripeterla).
-        // NB: dentro init i didSet non scattano — persistenza esplicita.
+        // Migrazione storica v1 del preset 2026-07. Mantiene i valori di quella
+        // release per compatibilità, ma NON descrive il profilo GUI corrente: la
+        // migrazione v8 più sotto rende il raw-KV ring obbligatoriamente ON e
+        // allinea i nuovi knob persistibili. Dentro init i didSet non scattano,
+        // quindi ogni migrazione scrive esplicitamente i propri valori.
         if !UserDefaults.standard.bool(forKey: "DS4FastConfig2026_07") {
             UserDefaults.standard.set(true, forKey: "DS4FastConfig2026_07")
             expertCacheSlots = 16
@@ -114,9 +124,32 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4MeasuredSlots22_2026_07_13")
             applyFastDemoDefaults(persistExplicitly: true)
         }
+        // Migrazione v8: questa macchina usa obbligatoriamente il ring KV a
+        // dimensione costante. Allinea anche la queue depth pread al vincitore
+        // A/B e rende persistibile l'occupancy Q4 densa per l'auto-tune GUI.
+        if !UserDefaults.standard.bool(forKey: "DS4RigorousAutoTune2026_07_16") {
+            UserDefaults.standard.set(true, forKey: "DS4RigorousAutoTune2026_07_16")
+            rawRingEnabled = true
+            preadSplit = 4
+            denseQ4NSG = 4
+            UserDefaults.standard.set(true, forKey: "DS4RawRing")
+            UserDefaults.standard.set(4, forKey: "DS4PreadSplit")
+            UserDefaults.standard.set(4, forKey: "DS4DenseQ4NSG")
+        }
+        // The mixed-quant cache was promoted after an exact-logit A/B on the
+        // 37/43-layer IQ2/Q4 Flash GGUF (2026-07-16): +28.9% decode, -31.1%
+        // expert bytes/token, same planned cache RAM. Persist the new default
+        // for existing installs only when they have not already made an
+        // explicit choice; OFF remains available as the legacy fallback.
+        if UserDefaults.standard.object(forKey: "DS4MultiQuantCache") == nil {
+            UserDefaults.standard.set(true, forKey: "DS4MultiQuantCache")
+        }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        _ = setenv("DS4_MULTI_QUANT_CACHE", multiQuantCacheEnabled ? "1" : "0", 1) // default ON; exact mixed IQ2/Q4 pools
+        _ = setenv("DS4_EXPERT_CACHE_UNIFORM", expertCacheUniform ? "1" : "0", 1) // auto-tune: usage-driven vs uniforme
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
         _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)    // default ON <24GB RAM
+        _ = setenv("DS4_PREAD_SPLIT", String(preadSplit), 1)                   // NVMe queue depth, auto-tune
         _ = setenv("DS4_DENSE_STREAM", denseStreamEnabled ? "1" : "0", 1)    // default ON <24GB RAM
         _ = setenv("DS4_MLOCK", mlockEnabled ? "1" : "0", 1)                 // default ON (misurato: -38% ms/token)
         _ = setenv("DS4_DENSE_Q4", denseQ4Enabled ? "1" : "0", 1)            // default ON (lossy, disattivabile)
@@ -125,9 +158,9 @@ final class ChatStore {
         _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)          // 0 = solo layer hash (esatto)
         _ = setenv("DS4_DENSE_AHEAD", "\(denseAhead)", 1)                    // 2 = staging un layer avanti (misurato)
         _ = setenv("DS4_ASYNC_FFN", asyncFFNEnabled ? "1" : "0", 1)           // pipeline FFN asincrona (+10% misurato)
-        _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // partizione K matvec Q8 (auto-tune)
+        _ = setenv("DS4_Q8_NSG", String(q8NSG), 1)                            // K-split Q8; escluso dal tuner exact
         _ = setenv("DS4_MOE_NSG", String(moeNSG), 1)                          // occupancy kernel MoE/Q4 (auto-tune)
-        _ = setenv("DS4_DENSE_Q4_NSG", "4", 1)                              // sweep M1 Pro: 4 batte 2/8
+        _ = setenv("DS4_DENSE_Q4_NSG", String(denseQ4NSG), 1)                 // occupancy Q4 densa, auto-tune
         _ = setenv("DS4_EXPERT_BUNDLE", expertBundleEnabled ? "1" : "0", 1)  // opt-in (duplica gli esperti su disco)
         _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)              // Metal fast resource loading (A/B sperimentale)
         _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)                           // M1 Pro: pread arriva a ~5 GB/s
@@ -191,6 +224,29 @@ final class ChatStore {
     var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 22 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
+    /// Layer-aware expert-cache layout for mixed-quant GGUFs. Each routed layer
+    /// gets a pool with its real IQ2/Q4 record size, while the allocator keeps
+    /// the total byte budget at or below the legacy 22-slot plan. Exact: it only
+    /// changes where identical expert bytes are retained. OFF restores the old
+    /// single-size-class cache and bypasses off-class routed layers. Applied on
+    /// the NEXT model load.
+    var multiQuantCacheEnabled: Bool =
+        (UserDefaults.standard.object(forKey: "DS4MultiQuantCache") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(multiQuantCacheEnabled, forKey: "DS4MultiQuantCache")
+            _ = setenv("DS4_MULTI_QUANT_CACHE", multiQuantCacheEnabled ? "1" : "0", 1)
+        }
+    }
+    /// `false` distribuisce il budget cache in base al profilo di routing;
+    /// `true` assegna lo stesso numero di slot a ogni layer. Entrambi conservano
+    /// gli stessi byte e sono confrontati con usage profile congelato.
+    var expertCacheUniform: Bool =
+        (UserDefaults.standard.object(forKey: "DS4ExpertCacheUniform") as? Bool) ?? false {
+        didSet {
+            UserDefaults.standard.set(expertCacheUniform, forKey: "DS4ExpertCacheUniform")
+            _ = setenv("DS4_EXPERT_CACHE_UNIFORM", expertCacheUniform ? "1" : "0", 1)
+        }
+    }
     /// Look-ahead speculativo della slot-cache (DS4_EXPERT_LOOKAHEAD): mentre il
     /// layer i calcola, il pool del layer i+1 viene PREriempito con i top-N
     /// esperti del prior d'uso (I/O reale nella finestra in cui l'SSD è idle;
@@ -227,10 +283,12 @@ final class ChatStore {
     }
 
     /// DS4_Q8_NSG: simdgroup per threadgroup nei matvec Q8 (partizione della
-    /// riduzione K — stesso risultato numerico, cambia solo l'occupancy).
+    /// riduzione K). Cambia l'occupancy ma puo' cambiare gli ultimi bit Float32:
+    /// il manifest exact della GUI NON lo modifica; l'autotuner di processo lo
+    /// include solo con --allow-numeric e un gate logits esplicito.
     /// L'ottimo dipende dai core GPU: 4 = riferimento (migliore su M1 Pro);
-    /// su GPU più larghe (Max/Ultra) possono vincere 6-8. Il motore lo
-    /// rilegge a ogni load del modello: l'auto-tune lo esplora con un reload.
+    /// su GPU più larghe (Max/Ultra) possono vincere 6-8. Il motore lo rilegge
+    /// a ogni load per consentire A/B espliciti senza riavviare l'app.
     var q8NSG: Int = (UserDefaults.standard.object(forKey: "DS4Q8NSG") as? Int) ?? 4 {
         didSet {
             UserDefaults.standard.set(q8NSG, forKey: "DS4Q8NSG")
@@ -267,7 +325,7 @@ final class ChatStore {
     /// Raw-KV ring buffer (experimental): keep only the nSWA attention window in RAM
     /// instead of the full context, so the KV RAM is constant. Sets the engine env
     /// var; applied on the NEXT model load.
-    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? false {
+    var rawRingEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4RawRing") as? Bool) ?? true {
         didSet {
             UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
             _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
@@ -297,6 +355,15 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(expertPreadEnabled, forKey: "DS4ExpertPread")
             _ = setenv("DS4_EXPERT_PREAD", expertPreadEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Numero di range pread concorrenti per slab esperto. Stessi byte e stessa
+    /// numerica; cambia soltanto la queue depth NVMe. Il punto migliore dipende
+    /// dall'SSD e viene cercato dall'auto-tune record-holder.
+    var preadSplit: Int = (UserDefaults.standard.object(forKey: "DS4PreadSplit") as? Int) ?? 4 {
+        didSet {
+            UserDefaults.standard.set(preadSplit, forKey: "DS4PreadSplit")
+            _ = setenv("DS4_PREAD_SPLIT", String(preadSplit), 1)
         }
     }
     /// Streaming double-buffered dei pesi densi (DS4_DENSE_STREAM): invece di
@@ -356,6 +423,14 @@ final class ChatStore {
             _ = setenv("DS4_SHARED_Q4", sharedQ4Enabled ? "1" : "0", 1)
         }
     }
+    /// Occupancy indipendente dei kernel Q4 densi. È una partizione per righe,
+    /// quindi il gate dell'auto-tune deve risultare bit-identico.
+    var denseQ4NSG: Int = (UserDefaults.standard.object(forKey: "DS4DenseQ4NSG") as? Int) ?? 4 {
+        didSet {
+            UserDefaults.standard.set(denseQ4NSG, forKey: "DS4DenseQ4NSG")
+            _ = setenv("DS4_DENSE_Q4_NSG", String(denseQ4NSG), 1)
+        }
+    }
     /// Sidecar expert-bundle (DS4_EXPERT_BUNDLE): gli slab gate/up/down di ogni
     /// esperto riimpacchettati CONTIGUI in <gguf>.expbundle — un miss della
     /// cache diventa un burst sequenziale da ~7 MB invece di 3 letture sparse.
@@ -381,16 +456,6 @@ final class ChatStore {
             _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)
         }
     }
-    /// Riporta TUTTI i toggle di performance ai valori della demo veloce
-    /// misurata su M1 Pro 16 GB (A/B 2026-07-13: 3.2-3.4 tok/s di regime):
-    /// slot 22 (70% hit misurato), ring off, MetalIO+willneed+pread+dense
-    /// stream+mlock+Q4 completo+bundle ON. Usato dalla migrazione una-tantum
-    /// in init e dal bottone in Settings ("i toggle persistiti derivano dai
-    /// vecchi esperimenti e restano incollati per sempre").
-    /// Con `persistExplicitly` scrive anche UserDefaults/env a mano — dentro
-    /// init i didSet delle stored property NON scattano.
-
-
     /// Unione massima di esperti per gruppo nel prefill (DS4_PREFILL_UNION) e
     /// token per chunk (DS4_PREFILL_CHUNK): gli unici knob del prefill letti a
     /// OGNI chiamata dal motore, quindi regolabili senza ricaricare il modello.
@@ -425,11 +490,21 @@ final class ChatStore {
     var benchRunning = false
     var benchStatus: String?
     var benchResults: String = ""
+    var benchSucceeded: Bool?
+    var benchProgressDone = 0
+    var benchProgressTotal = 0
+    var autoTuneReportURL: URL?
+    var benchTask: Task<Void, Never>?
 
 
 
     /// Esito dell'ultima generazione manuale dell'expert-bundle (bottone Settings).
     var bundleBuildStatus: String?
+    /// A bundle build can stream tens of gigabytes from the same GGUF/SSD used by
+    /// inference. Keep its task visible and hold the engine-activity lease until
+    /// the underlying synchronous builder has really returned.
+    var bundleBuildRunning = false
+    var bundleBuildTask: Task<Void, Never>?
 
 
     /// mlock dei buffer residenti caldi (DS4_MLOCK): pool della cache esperti,
@@ -586,7 +661,16 @@ final class ChatStore {
     var enginePrimed = true
 
     var service: InferenceService?
+    /// Full load signature of `service`, including fixed knobs and context.
+    var loadedEngineSignature: LoadedEngineSignature?
     var generation: Task<Void, Never>?
+    /// Serialized role/tool setup for the live engine. The Bool is the result of
+    /// the post-role-change warmup. Reload and auto-tune await the stable latest
+    /// epoch before publishing, persisting, or releasing the current engine.
+    var engineSetupTask: Task<Bool, Never>?
+    var engineSetupEpoch: UInt64 = 0
+    var engineSetupCompletedEpoch: UInt64 = 0
+    var engineSetupWarmupSucceeded = true
     /// Monotonic ownership token for all asynchronous chat work. Every fresh user
     /// turn, Stop, new chat, or session activation advances it. Stream/tool tasks
     /// may mutate UI state only while the captured value still matches.

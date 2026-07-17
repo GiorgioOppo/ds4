@@ -231,7 +231,8 @@ extension StreamingDecoder {
                     if i + 1 < nLayers { prefetch?(i + 1) }
                     let layerRope = ropeParams(layer: i)
                     if let stage, let cache = slotCache,
-                       w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant,
+                       ((w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant)
+                        || cache.supports(layer: i)),
                        specWindowIndexerInactive(i, startPos: startPos, n: n) {
                         try specVerifyBatchedLayer(i, w: w, layerRope: layerRope, cur: cur, other: other,
                                                    n: n, startPos: startPos, tokens: tokens,
@@ -321,7 +322,9 @@ extension StreamingDecoder {
             // ancora il pool di questo layer.
             prev?.waitCompleted()
             t = Date()
-            let h0 = cache.hits, m0 = cache.misses, p0 = cache.prefilled
+            let h0 = cache.hits, m0 = cache.misses, w0 = cache.warmed, p0 = cache.prefilled
+            let hb0 = cache.hitBytes, mb0 = cache.missBytes
+            let wb0 = cache.warmedBytes, pb0 = cache.prefilledBytes
             let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
             do { acquired = try cache.acquire(layer: i, ids: ids) }
             catch { c1.waitCompleted(); throw error }
@@ -329,8 +332,13 @@ extension StreamingDecoder {
             profile.gatherS += Date().timeIntervalSince(t)
             profile.expertHits += cache.hits - h0
             profile.expertMisses += cache.misses - m0
+            profile.expertWarmed += cache.warmed - w0
             profile.expertPrefilled += cache.prefilled - p0
-            profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
+            profile.expertHitBytes += cache.hitBytes - hb0
+            profile.expertMissBytes += cache.missBytes - mb0
+            profile.expertWarmedBytes += cache.warmedBytes - wb0
+            profile.expertPrefilledBytes += cache.prefilledBytes - pb0
+            profile.gatherBytes += (cache.missBytes - mb0) + (cache.warmedBytes - wb0)
             _ = slots.withUnsafeBytes {
                 memcpy(stage.ids[j].buffer.contents() + stage.ids[j].byteOffset,
                        $0.baseAddress!, $0.count)
@@ -344,7 +352,7 @@ extension StreamingDecoder {
                                            ids: stage.ids[j], outHc: other[j],
                                            cur: stage.cur[j], afterAttn: stage.attn[j],
                                            split: stage.split[j], rw: stage.rw[j],
-                                           expertStride: slotCacheStride)
+                                           expertStride: pool.expertStride ?? slotCacheStride)
             } catch { c1.waitCompleted(); throw error }
             commitFFN(c2)
             prev = c2

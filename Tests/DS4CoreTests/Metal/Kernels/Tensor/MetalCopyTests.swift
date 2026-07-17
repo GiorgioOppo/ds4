@@ -4,12 +4,8 @@ import XCTest
 /// Phase 9 (utility): validates the real metal/cpy.metal kernels
 /// (kernel_cpy_f32_f16 / kernel_cpy_f16_f32) via a F32 -> F16 -> F32 round-trip.
 final class MetalCopyTests: XCTestCase {
-    static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
-
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/cpy.metal"),
-                          "vendored metal kernels not present")
-        do { return try MetalRuntime(metalDir: Self.metalDir) }
+        do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
     }
 
@@ -34,5 +30,33 @@ final class MetalCopyTests: XCTestCase {
         for i in 0..<n {
             XCTAssertEqual(back[i], Float(Float16(bitPattern: half[i])), "f16->f32 mismatch at \(i)")
         }
+    }
+
+    func testVectorizedContiguousCopiesMatchGenericIncludingScalarTails() throws {
+        let rt = try makeRuntime()
+        for n in [1, 3, 4, 5, 31, 32, 1025] {
+            var values = [Float](repeating: 0, count: n)
+            for i in values.indices {
+                values[i] = Float((i * 7919 + n * 17) % 65521 - 32760) / 97.0
+            }
+
+            let genericHalf = try rt.cpyF32toF16(values)
+            let vectorHalf = try rt.cpyF32toF16Vectorized(values)
+            XCTAssertEqual(vectorHalf, genericHalf, "F32->F16 vector mismatch for n=\(n)")
+
+            let genericFloat = try rt.cpyF16toF32(genericHalf)
+            let vectorFloat = try rt.cpyF16toF32Vectorized(genericHalf)
+            XCTAssertEqual(vectorFloat.map(\.bitPattern), genericFloat.map(\.bitPattern),
+                           "F16->F32 vector mismatch for n=\(n)")
+        }
+    }
+
+    func testVectorizedF16BitCopyPreservesEveryEncodingUsedByCaches() throws {
+        let rt = try makeRuntime()
+        let patterns: [UInt16] = [
+            0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0xbc00,
+            0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x7e01, 0x7fff,
+        ]
+        XCTAssertEqual(try rt.cpyF16BitsVectorized(patterns), patterns)
     }
 }

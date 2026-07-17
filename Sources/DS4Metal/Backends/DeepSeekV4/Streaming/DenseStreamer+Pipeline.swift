@@ -3,6 +3,17 @@ import Metal
 import DS4Core
 
 extension DenseStreamer {
+    /// Join every read-ahead `pread` before the decoder releases its staging
+    /// buffers/model mapping. `pending` is decode-thread-owned, so callers must
+    /// invoke this from the same serialized engine executor as `weights(_:)`.
+    public func quiesceForTeardown() {
+        for item in pending {
+            item.sem.wait()
+            if item.error == nil { slotLayer[item.slot] = item.layer }
+        }
+        pending.removeAll(keepingCapacity: false)
+    }
+
     /// The next `count` layers of the pass after `il` (wrapping to the range
     /// start), i.e. the layers whose staging slots must not be overwritten.
     private func upcoming(after il: Int, count: Int) -> [Int] {

@@ -19,8 +19,8 @@ extension LocalServer {
         let created = Int(Date().timeIntervalSince1970)
         onLog("POST /v1/completions (stream=\(parsed.stream))\n")
 
-        await acquireGate()
-        defer { Task { await gate.release() } }
+        try await acquireGate()
+        defer { gate.release() }
 
         let stream = await startCompletion(turns: parsed.turns, tools: [],
                                            think: parsed.think, sampling: parsed.sampling,
@@ -53,4 +53,3 @@ extension LocalServer {
         }
     }
 }
-

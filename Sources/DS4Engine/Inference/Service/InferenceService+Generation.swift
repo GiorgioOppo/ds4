@@ -136,9 +136,8 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 let idsSnap = resumablePrefill ? committedIds
                                                : committedIds + Array(suffixIds[0..<pfDone])
                 let name = modelName
-                Task.detached(priority: .utility) {
-                    store.store(tokens: idsSnap, modelName: name, box: box, reason: .cold)
-                }
+                scheduleDiskKVWrite(store: store, tokens: idsSnap, modelName: name,
+                                    box: box, reason: .cold)
                 lastDiskStoreCount = startPos + pfDone
             }
             if pfDone < suffixIds.count {
@@ -347,11 +346,31 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             // tempo di generazione). DiskKVStore è Sendable: la scrittura
             // F_NOCACHE prosegue in background.
             let ids = committedIds, name = modelName
-            Task.detached(priority: .utility) {
-                store.store(tokens: ids, modelName: name, box: box, reason: reason)
-            }
+            scheduleDiskKVWrite(store: store, tokens: ids, modelName: name,
+                                box: box, reason: reason)
             lastDiskStoreCount = committedIds.count   // gate even on dedup/failure
         }
         continuation.yield(.progress(""))
+    }
+
+    /// Launch a non-blocking checkpoint while retaining an actor-visible task
+    /// handle. `quiesceForTeardown()` waits these handles before a model swap.
+    private func scheduleDiskKVWrite(
+        store: DiskKVStore,
+        tokens: [Int],
+        modelName: String,
+        box: DiskKVStore.SnapshotBox,
+        reason: KVCFile.Reason
+    ) {
+        let id = UUID()
+        let writer = Task.detached(priority: .utility) { [weak self] in
+            store.store(tokens: tokens, modelName: modelName, box: box, reason: reason)
+            await self?.diskKVWriterFinished(id)
+        }
+        diskKVWriterTasks[id] = writer
+    }
+
+    private func diskKVWriterFinished(_ id: UUID) {
+        diskKVWriterTasks.removeValue(forKey: id)
     }
 }

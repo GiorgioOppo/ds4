@@ -27,6 +27,16 @@ extension StreamingDecoder {
         inflightFFN = nil
     }
 
+    /// Establish a hard trial boundary for the in-process machine tuner.
+    /// Besides the tracked GPU command buffer, expert look-ahead, mmap hints
+    /// and dense-stream reads all run on background queues and may retain the
+    /// old model. Draining them makes the following A/B load independent.
+    public func quiesceForTeardown() {
+        drainFFN()
+        lookaheadQ.sync {}
+        teardownIODrain?()
+    }
+
     /// Speculative look-ahead: prefill layer i+1's slot pool while the GPU
     /// computes layer i (its own gather just finished, so the SSD is idle until
     /// the next layer's demand fill). The id list is resolved on the DECODE
@@ -131,16 +141,18 @@ extension StreamingDecoder {
                 writeFloats(rw, into: scratch.rw)
                 zeroDown6(from: K)
             }
-            // The slot cache is a single size-class (the model-global/first-layer
-            // quant). A mixed-precision layer (different expert bytes) can't share
-            // the pool, so it falls through to the per-layer-correct gather path.
+            // Legacy caches support only the model-global quant class. The
+            // DS4_MULTI_QUANT_CACHE factory builds a layer-aware cache whose
+            // pools carry their own bytes and interleaved stride.
             let onClass = w.gateQuant == d.gateQuant && w.upQuant == d.upQuant && w.downQuant == d.downQuant
-            if let cache = slotCache, onClass {
+            if let cache = slotCache, onClass || cache.supports(layer: i) {
                 // Persistent + changing experts: hits are already resident in the
                 // layer's GPU pool (zero copies); only misses are filled from the
                 // mmap. The matvec indexes the pool with slot ids.
                 t = Date()
-                let h0 = cache.hits, m0 = cache.misses, p0 = cache.prefilled
+                let h0 = cache.hits, m0 = cache.misses, w0 = cache.warmed, p0 = cache.prefilled
+                let hb0 = cache.hitBytes, mb0 = cache.missBytes
+                let wb0 = cache.warmedBytes, pb0 = cache.prefilledBytes
                 let acquired: (pool: ExpertSlotCache.LayerPool, slots: [Int32])
                 do { acquired = try cache.acquire(layer: i, ids: ids) }
                 catch { c1.waitCompleted(); throw error }
@@ -150,8 +162,13 @@ extension StreamingDecoder {
                 // the profile since resetProfile().
                 profile.expertHits += cache.hits - h0
                 profile.expertMisses += cache.misses - m0
+                profile.expertWarmed += cache.warmed - w0
                 profile.expertPrefilled += cache.prefilled - p0
-                profile.gatherBytes += (cache.misses - m0) * cache.bytesPerExpert
+                profile.expertHitBytes += cache.hitBytes - hb0
+                profile.expertMissBytes += cache.missBytes - mb0
+                profile.expertWarmedBytes += cache.warmedBytes - wb0
+                profile.expertPrefilledBytes += cache.prefilledBytes - pb0
+                profile.gatherBytes += (cache.missBytes - mb0) + (cache.warmedBytes - wb0)
                 // Persistent staging (no per-layer alloc), A/B by layer parity:
                 // with the async FFN the PREVIOUS layer's command buffer may
                 // still be reading its ids buffer while this layer stages its own.
@@ -173,7 +190,7 @@ extension StreamingDecoder {
                     try c2.decodeRoutedExperts(w: w, s: scratch, d: d, gateExp: pool.gate,
                                                upExp: pool.up, downExp: pool.down,
                                                ids: slotsBuf, outHc: other, activeK: K,
-                                               expertStride: slotCacheStride)
+                                               expertStride: pool.expertStride ?? slotCacheStride)
                 } catch { c1.waitCompleted(); throw error }
                 commitFFN(c2)
                 profile.expertsS += Date().timeIntervalSince(t)
@@ -185,7 +202,10 @@ extension StreamingDecoder {
                 catch { c1.waitCompleted(); throw error }
                 let (g, u, dn) = gathered
                 profile.gatherS += Date().timeIntervalSince(t)
-                profile.gatherBytes += g.byteLength + u.byteLength + dn.byteLength
+                let bytes = g.byteLength + u.byteLength + dn.byteLength
+                profile.gatherBytes += bytes
+                profile.expertBypasses += ids.count
+                profile.expertBypassBytes += bytes
                 t = Date()
                 if profileRoute || !asyncRoute { c1.waitCompleted() }   // vedi sopra
                 let c2 = GraphContext(rt)

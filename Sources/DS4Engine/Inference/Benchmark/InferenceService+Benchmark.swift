@@ -19,12 +19,18 @@ public struct BenchPoint: Sendable {
         /// dopo un reload) dal degrado progressivo da pressione di memoria
         /// (coda più lenta della testa) — media e p99 da soli non li separano.
         public let genSpeeds: [Double]
+        /// Optional deterministic quality trace used by the in-app machine
+        /// autotuner. It is deliberately bounded to the generated decisions:
+        /// token ids, full-vocabulary Float32 hashes and the ordered top-3.
+        public let qualitySignature: MachineAutoTuneQualitySignature?
         public init(contextTokens: Int, prefillTps: Double, genTps: Double, kvBytes: UInt64,
-                    genTpsP99: Double = 0, genSpeeds: [Double] = []) {
+                    genTpsP99: Double = 0, genSpeeds: [Double] = [],
+                    qualitySignature: MachineAutoTuneQualitySignature? = nil) {
             self.contextTokens = contextTokens; self.prefillTps = prefillTps
             self.genTps = genTps; self.kvBytes = kvBytes
             self.genTpsP99 = genTpsP99 > 0 ? genTpsP99 : genTps
             self.genSpeeds = genSpeeds
+            self.qualitySignature = qualitySignature
         }
     }
 
@@ -902,7 +908,9 @@ public struct BenchPoint: Sendable {
     /// synthetic prompt of `contextTokens` tokens and decode `genTokens` from it,
     /// returning prefill/generation throughput at that context frontier. Resets
     /// the conversation; `contextTokens` is clamped to fit the loaded context.
-    public func benchmark(contextTokens: Int, genTokens: Int) throws -> BenchPoint {
+    public func benchmark(contextTokens: Int, genTokens: Int,
+                          greedy: Bool = false,
+                          captureQuality: Bool = false) throws -> BenchPoint {
         resetConversation(systemPrompt: nil)
         let ctx = max(8, min(contextTokens, contextSize - genTokens - 4))
         // Synthetic prompt: BOS + a tiled filler tokenization (output quality is
@@ -923,10 +931,28 @@ public struct BenchPoint: Sendable {
         var produced = 0
         var tokenSpeeds: [Double] = []          // 1/durata di OGNI token generato
         tokenSpeeds.reserveCapacity(genTokens)
+        var generatedTokens: [Int] = []
+        var capturedLogits: [[Float]] = []
+        if captureQuality {
+            generatedTokens.reserveCapacity(genTokens)
+            capturedLogits.reserveCapacity(genTokens)
+        }
         let g0 = Date()
         while produced < genTokens {
             try Task.checkCancellation()
-            let next = Sampler.sample(lastLogits, temperature: 0.6, topK: 0, topP: 0.95, minP: 0.05, rng: &rng)
+            // Keep trace construction outside the timed forward interval. Array
+            // uses copy-on-write, so retaining each immutable logits frame is a
+            // bounded snapshot rather than work charged to the kernel timing.
+            if captureQuality { capturedLogits.append(lastLogits) }
+            let next = Sampler.sample(
+                lastLogits,
+                temperature: greedy ? 0 : 0.6,
+                topK: 0,
+                topP: greedy ? 1 : 0.95,
+                minP: greedy ? 0 : 0.05,
+                rng: &rng
+            )
+            if captureQuality { generatedTokens.append(next) }
             let t0 = Date()
             lastLogits = try decoder.forward(token: next, pos: pos, nKeys: pos + 1)
             let dt = Date().timeIntervalSince(t0)
@@ -944,12 +970,75 @@ public struct BenchPoint: Sendable {
             let sorted = tokenSpeeds.sorted()
             p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
         }
+        let signature: MachineAutoTuneQualitySignature? = captureQuality
+            ? MachineAutoTuneQualitySignature(
+                generatedTokens: generatedTokens,
+                frames: capturedLogits.map(Self.machineAutoTuneQualityFrame)
+            )
+            : nil
         return BenchPoint(contextTokens: ctx,
                           prefillTps: prefillDt > 0 ? Double(ctx) / prefillDt : 0,
                           genTps: genDt > 0 && produced > 0 ? Double(produced) / genDt : 0,
                           kvBytes: kv,
                           genTpsP99: p99,
-                          genSpeeds: tokenSpeeds)
+                          genSpeeds: tokenSpeeds,
+                          qualitySignature: signature)
+    }
+
+    /// Small prompt-restoring inference probe used by the machine auto-tuner
+    /// after the selected agent and DiskKV are installed. `benchmark` resets
+    /// the conversation to a synthetic prompt and deliberately leaves its KV
+    /// dirty; the probe restores the active system prompt even when execution
+    /// throws. Callers must still mark any non-empty conversation for history
+    /// re-prefill because synthetic inference intentionally replaces its KV.
+    @discardableResult
+    public func machineAutoTuneProbe(
+        contextTokens: Int = 96,
+        genTokens: Int = 32,
+        captureQuality: Bool = false
+    ) throws -> BenchPoint {
+        let savedSystemPrompt = systemPrompt
+        defer { resetConversation(systemPrompt: savedSystemPrompt) }
+        return try benchmark(
+            contextTokens: contextTokens,
+            genTokens: genTokens,
+            greedy: true,
+            captureQuality: captureQuality
+        )
+    }
+
+    /// Compact but fail-closed summary of one complete logits frame. The hash
+    /// includes every Float32 bit pattern (NaNs included); finiteCount and top-3
+    /// make malformed/non-finite output explicit in reports.
+    private nonisolated static func machineAutoTuneQualityFrame(
+        _ logits: [Float]
+    ) -> MachineAutoTuneQualityFrame {
+        var hash: UInt64 = 0xcbf29ce484222325
+        var finiteCount = 0
+        var top: [(token: Int, value: Float)] = []
+        top.reserveCapacity(3)
+
+        for (token, value) in logits.enumerated() {
+            var bits = value.bitPattern
+            for _ in 0..<4 {
+                hash ^= UInt64(bits & 0xff)
+                hash &*= 0x100000001b3
+                bits >>= 8
+            }
+            guard value.isFinite else { continue }
+            finiteCount += 1
+            top.append((token, value))
+            top.sort {
+                $0.value == $1.value ? $0.token < $1.token : $0.value > $1.value
+            }
+            if top.count > 3 { top.removeLast() }
+        }
+        return MachineAutoTuneQualityFrame(
+            count: logits.count,
+            finiteCount: finiteCount,
+            bitHash: String(format: "%016llx", hash),
+            top3TokenIds: top.map(\.token)
+        )
     }
 
     /// Riscalda il motore subito dopo il load. La slot-cache degli esperti crea
@@ -960,21 +1049,29 @@ public struct BenchPoint: Sendable {
     /// primo token. Un mini giro sintetico (12 token di prefill + 3 di decode)
     /// sposta quel costo al load. Idempotente; preserva il system prompt attivo
     /// e lascia lo stato pulito (il benchmark lo sporca di proposito).
-    public func warmup() {
-        guard !warmedUp else { return }
-        warmedUp = true
+    @discardableResult
+    public func warmup() -> Bool {
+        guard !warmedUp else { return true }
         let saved = systemPrompt
         let t0 = Date()
         do {
             _ = try benchmark(contextTokens: 12, genTokens: 3)
+            // Mark the engine warm only after every synthetic token completed.
+            // A cancelled auto-tune restoration must be allowed to retry this
+            // work instead of publishing a cold engine as already warmed.
+            warmedUp = true
             FileHandle.standardError.write(Data(String(
                 format: "DS4 engine: warmup completato in %.1fs (pool esperti + kernel caldi)\n",
                 Date().timeIntervalSince(t0)).utf8))
+            resetConversation(systemPrompt: saved)
+            return true
         } catch {
             // Best-effort: un warmup fallito non deve bloccare nulla — il primo
             // messaggio reale pagherà la partenza fredda come prima.
+            warmedUp = false
             FileHandle.standardError.write(Data("DS4 engine: warmup fallito: \(error)\n".utf8))
+            resetConversation(systemPrompt: saved)
+            return false
         }
-        resetConversation(systemPrompt: saved)
     }
 }

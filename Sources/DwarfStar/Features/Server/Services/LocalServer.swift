@@ -47,7 +47,18 @@ final class LocalServer: @unchecked Sendable {
     let onLog: @Sendable (String) -> Void
     let queue = DispatchQueue(label: "ds4.localserver", qos: .userInitiated)
     let gate = RequestGate()
-    var listener: NWListener?
+
+    /// Listener and accepted-request ownership are protected together so a
+    /// connection is either rejected after shutdown begins, or is present in
+    /// the exact task snapshot that `stop()` cancels and awaits.
+    private struct ActiveRequest {
+        let connection: NWConnection
+        let task: Task<Void, Never>
+    }
+    private let lifecycleLock = NSLock()
+    private var acceptingConnections = false
+    private var listener: NWListener?
+    private var activeRequests: [UUID: ActiveRequest] = [:]
 
     init(engine: InferenceService, modelName: String, config: Config,
          onLog: @escaping @Sendable (String) -> Void) {
@@ -88,18 +99,73 @@ final class LocalServer: @unchecked Sendable {
             }
         }
         l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
-        l.start(queue: queue)
+
+        lifecycleLock.lock()
+        acceptingConnections = true
         listener = l
+        l.start(queue: queue)
+        lifecycleLock.unlock()
     }
 
-    func stop() {
-        listener?.cancel()
-        listener = nil
+    /// Stop accepting work and wait until every accepted request, its inference
+    /// task, and model-owned GPU/I/O work have drained.  This is the hard
+    /// barrier used before `ServerController` releases the shared-engine lease.
+    func stop() async {
+        let (listenerToCancel, requests): (NWListener?, [ActiveRequest]) = lifecycleLock.withLock {
+            acceptingConnections = false
+            let listenerToCancel = listener
+            listener = nil
+            return (listenerToCancel, Array(activeRequests.values))
+        }
+
+        listenerToCancel?.cancel()
+        if !requests.isEmpty {
+            onLog("arresto server: annullo e dreno \(requests.count) richiesta/e attive…\n")
+        }
+        for request in requests {
+            request.connection.cancel()
+            request.task.cancel()
+        }
+        for request in requests {
+            await request.task.value
+        }
+
+        // `InferenceService.run` owns the actual generation task behind an
+        // AsyncThrowingStream. Dropping/cancelling the stream requests its
+        // cancellation; this actor hop waits for that synchronous Metal loop
+        // and all decoder/disk-KV background work to finish as well.
+        await engine.quiesceForTeardown()
     }
 
     func accept(_ conn: NWConnection) {
+        lifecycleLock.lock()
+        guard acceptingConnections else {
+            lifecycleLock.unlock()
+            conn.cancel()
+            return
+        }
+
+        let id = UUID()
         conn.start(queue: queue)
-        Task { [weak self] in await self?.serve(conn) }
+        let task = Task(priority: .userInitiated) { [weak self] in
+            guard let self else {
+                conn.cancel()
+                return
+            }
+            await self.serve(conn)
+            self.requestDidFinish(id)
+        }
+        // The lock remains held from the acceptance check through insertion.
+        // A very short request may finish immediately, but its removal waits
+        // for this insertion before taking the same lock.
+        activeRequests[id] = ActiveRequest(connection: conn, task: task)
+        lifecycleLock.unlock()
+    }
+
+    private func requestDidFinish(_ id: UUID) {
+        lifecycleLock.lock()
+        activeRequests.removeValue(forKey: id)
+        lifecycleLock.unlock()
     }
 
     // MARK: Connection handling
@@ -112,6 +178,8 @@ final class LocalServer: @unchecked Sendable {
             // stalled client: the read already cancelled the connection
         } catch ServerError.bodyTooLarge {
             try? await send(conn, Self.httpError(413, "request body too large", cors: config.cors))
+        } catch is CancellationError {
+            // Expected during the async shutdown barrier.
         } catch is NWError {
             // client went away mid-response (SSE disconnects land here) — the
             // broken `for try await` already cancelled the generation via
@@ -187,4 +255,3 @@ final class LocalServer: @unchecked Sendable {
         try await send(conn, Self.httpError(404, "unknown endpoint", cors: config.cors))
     }
 }
-

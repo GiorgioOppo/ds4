@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Resolves default paths so the same code works both when run from SwiftPM
 /// during development and when packaged into a .app bundle.
@@ -126,6 +127,50 @@ enum HardwarePresets {
 /// killed (OOM) if the configuration cannot fit; this lets the UI warn first.
 enum MemoryInfo {
     static var physicalBytes: UInt64 { ProcessInfo.processInfo.physicalMemory }
+
+    struct PressureSnapshot: Sendable {
+        /// Approximate reclaimable/free share of physical memory. Nil means the
+        /// Mach counters were unavailable, in which case the autotuner fails
+        /// closed only on the metrics it can actually observe.
+        let freePercent: Double?
+        /// Cumulative bytes swapped out since boot.
+        let swapoutsBytes: UInt64?
+    }
+
+    /// Lightweight, allocation-free pressure snapshot for in-process tuning.
+    /// Reading Mach VM counters avoids spawning `memory_pressure`/`vm_stat`,
+    /// which is not reliable from an App-Sandboxed GUI.
+    static func pressureSnapshot() -> PressureSnapshot {
+        var pageSize: vm_size_t = 0
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS else {
+            return PressureSnapshot(freePercent: nil, swapoutsBytes: nil)
+        }
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let status = withUnsafeMutablePointer(to: &stats) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard status == KERN_SUCCESS, pageSize > 0 else {
+            return PressureSnapshot(freePercent: nil, swapoutsBytes: nil)
+        }
+
+        let availablePages = UInt64(stats.free_count)
+            + UInt64(stats.inactive_count)
+            + UInt64(stats.speculative_count)
+        // `purgeable_count` is not an independent VM class: purgeable pages
+        // can already be represented by the inactive/speculative counters.
+        // Adding it here can double-count headroom and make the auto-tune RAM
+        // gate optimistic exactly when the machine is under pressure.
+        let totalPages = max(UInt64(1), physicalBytes / UInt64(pageSize))
+        let freePercent = min(100, Double(availablePages) / Double(totalPages) * 100)
+        let swapoutsBytes = UInt64(stats.swapouts) * UInt64(pageSize)
+        return PressureSnapshot(freePercent: freePercent,
+                                swapoutsBytes: swapoutsBytes)
+    }
 
     static func fileSize(_ path: String) -> UInt64? {
         guard !path.isEmpty else { return nil }

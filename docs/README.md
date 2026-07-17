@@ -40,6 +40,10 @@ principali e regole di modifica.
   momento di lettura, profili qualità/prestazioni e regole per nuovi knob.
 - [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.md) — misure storiche della
   demo, colli di bottiglia e runbook A/B.
+- [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md) — ricerca multi-parametro con
+  coordinate ascent, confronto ABBA, gate logits e checkpoint riprendibile.
+- [METAL-AB-M1-PRO-2026-07-16.md](METAL-AB-M1-PRO-2026-07-16.md) — risultati
+  bit-exact e prestazionali dei nuovi staging KV, copy packed e RoPE specializzati.
 - [SELF-SPECULATIVE.md](SELF-SPECULATIVE.md) — design e misure datate del
   decode self-speculative, attualmente opt-in sperimentale.
 

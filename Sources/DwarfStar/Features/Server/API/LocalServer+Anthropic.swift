@@ -18,8 +18,8 @@ extension LocalServer {
         let id = "msg_" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))
         onLog("POST /v1/messages (\(parsed.turns.count) msg, stream=\(parsed.stream))\n")
 
-        await acquireGate()
-        defer { Task { await gate.release() } }
+        try await acquireGate()
+        defer { gate.release() }
 
         let stream = await startCompletion(turns: parsed.turns, tools: parsed.tools,
                                            think: parsed.think, sampling: parsed.sampling,
@@ -129,4 +129,3 @@ extension LocalServer {
         try await send(conn, Self.response(200, contentType: "application/json", body: body, cors: config.cors))
     }
 }
-

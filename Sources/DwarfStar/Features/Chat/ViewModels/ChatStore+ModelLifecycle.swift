@@ -25,21 +25,41 @@ extension ChatStore {
     }
 
     /// A path change cannot keep advertising the old in-memory engine as ready.
-    /// Stop in-flight work, persist the transcript and release the old backend;
-    /// Settings will then offer Load Model for the newly selected GGUF.
+    /// Stop in-flight work and hide it immediately, but retain the service until
+    /// its GPU/I/O/DiskKV work has drained. A following `load()` either observes
+    /// that completed teardown or joins the same service before allocating.
     private func commitModelSelection(path: String) {
         guard modelPath != path else { return }
         if isGenerating { stop() }
-        if service != nil {
+        let serviceToRetire = service
+        if serviceToRetire != nil {
             persistActiveSession()
         }
-        service = nil
+        loadedEngineSignature = nil
         info = nil
         inspectedModelDescriptor = nil
         phase = .needsModel
         enginePrimed = messages.isEmpty
         contextUsed = 0
         modelPath = path
+
+        if let serviceToRetire {
+            Task { [weak self] in
+                guard let self else {
+                    await serviceToRetire.quiesceForTeardown()
+                    return
+                }
+                // A role-specific warmup may already have captured the service.
+                // Join it first, then establish the final teardown boundary.
+                _ = await self.waitForEngineSetup()
+                await serviceToRetire.quiesceForTeardown()
+                // A new load may have installed another service while this task
+                // was suspended; never clear a newer owner.
+                if self.service === serviceToRetire {
+                    self.service = nil
+                }
+            }
+        }
     }
 
     /// Refresh architecture/capability metadata without allocating Metal or
@@ -117,7 +137,8 @@ extension ChatStore {
         // Rebuilding a decoder while it is generating keeps the old model and
         // its Metal buffers alive during the new allocation. On memory-bound
         // Macs that can exhaust swap and make the app appear to crash.
-        guard phase != .loading, !isGenerating else { return }
+        guard phase != .loading, !isGenerating, !benchRunning,
+              EngineActivityGate.shared.activeOwner == nil else { return }
         phase = .loading
         loadFraction = 0
         loadStage = ""
@@ -133,11 +154,26 @@ extension ChatStore {
         }
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
+        let loadEngineSignature = machineAutoTuneEngineSignature()
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudgetTokens = diskKVBudgetKTok * 1000
         Task.detached(priority: .userInitiated) {
             defer { poller.cancel() }
             do {
+                // A role change/warmup may still retain the current service.
+                // Drain it before dropping the last store reference, then give
+                // Metal/VM a short window to release wired buffers. This avoids
+                // ever constructing two model-sized engines at once.
+                _ = await self.waitForEngineSetup()
+                let previousService = await MainActor.run { self.service }
+                await previousService?.quiesceForTeardown()
+                await MainActor.run {
+                    self.service = nil
+                    self.loadedEngineSignature = nil
+                    self.info = nil
+                }
+                try await Task.sleep(nanoseconds: 4_000_000_000)
+
                 // Populate capability-driven UI even when backend construction
                 // subsequently fails (for example a recognized Qwen GGUF).
                 let inspected = try InferenceService.inspectModel(path: path)
@@ -167,21 +203,41 @@ extension ChatStore {
                 }
                 await svc.setDiskKV(directory: kvDir, budgetTokens: kvBudgetTokens)
                 let info = await svc.modelInfo()
+                // Warm the default profile while the UI is still in `.loading`.
+                // The active role may replace the profile below and perform one
+                // additional, awaited warmup before `.ready` is published.
+                await svc.warmup()
                 await MainActor.run {
                     self.service = svc
+                    self.loadedEngineSignature = loadEngineSignature
                     self.info = info
-                    self.phase = .ready
                     self.activate(self.activeSessionId)   // load the active chat + apply its role
                 }
-                // Warmup in background A UI GIÀ PRONTA: paga ORA il costo
-                // una-tantum della prima generazione (creazione pool esperti
-                // + fill top-usage, ~GB da SSD, kernel Metal freddi) invece
-                // che sul primo messaggio. Un send immediato si accoda al
-                // warmup sull'actor: mai più lento di prima, di norma il
-                // primo token passa da ~5-7s a ~1s.
-                await svc.warmup()
+                guard await self.waitForEngineSetup() else {
+                    await svc.quiesceForTeardown()
+                    await MainActor.run {
+                        if self.service === svc {
+                            self.service = nil
+                            self.loadedEngineSignature = nil
+                            self.info = nil
+                        }
+                    }
+                    throw NSError(
+                        domain: "DwarfStar.EngineSetup",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "warmup del ruolo attivo fallito"]
+                    )
+                }
+                await MainActor.run {
+                    guard self.modelPath == path, self.service === svc else { return }
+                    self.phase = .ready
+                }
             } catch {
-                await MainActor.run { self.phase = .failed("\(error)") }
+                await MainActor.run {
+                    self.loadedEngineSignature = nil
+                    self.phase = .failed("\(error)")
+                }
             }
         }
     }
@@ -190,6 +246,7 @@ extension ChatStore {
     /// Also re-run when an MCP server (dis)connects: the declared set includes
     /// MCP specs, which exist only while their server is connected.
     func syncTools() {
+        guard EngineActivityGate.shared.activeOwner == nil else { return }
         guard let service else { return }
         let tools = toolsEnabled ? ToolRegistry.autoSpecs(enabled: enabledToolNames) : []
         // Before the first prompt (also when a persisted chat still needs to be
