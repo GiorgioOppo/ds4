@@ -34,3 +34,7 @@ F16-rounded cache, plus the selection/geometry rejection paths.
 The top-k suite proves the multi-block argsort+merge dispatch equal to
 `GLM52IndexerReference.causalTopK` on distinct scores — single-pass and merge
 path — and that `-INFINITY` causal rows are never selected.
+
+The DSA-chain suite composes the GPU primitives end to end (indexer scores →
+top-k → staged compact attention) against the same chain run through the CPU
+oracles: selections must match exactly, attention output within tolerance.
