@@ -7,7 +7,9 @@ Primitive CPU portabili per conversione e requantizzazione dei pesi.
 - [`Half.swift`](Half.swift): conversioni f32/f16, inclusa la via software
   indipendente dall'architettura.
 - [`Quantize.swift`](Quantize.swift): dequantizzazione Q8_0 e quantizzazione
-  f32 -> Q4_K coerenti con i quantizzatori di riferimento ggml.
+  f32 -> Q4_K coerenti con i quantizzatori di riferimento ggml; dequant di
+  riferimento Q2_K/Q5_K/Q6_K (esperti routed GLM 5.2) senza quantizzatore
+  locale — i byte GGUF sono la fixture.
 
 ## Flusso
 

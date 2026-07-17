@@ -10,6 +10,11 @@ import Foundation
 // Block layouts (identical to ggml):
 //   Q8_0  = blocks of 32:  [f16 d][32 × int8]                      → 34 B
 //   Q4_K  = super-blocks of 256: [f16 d][f16 dmin][12 B scales][128 B qs] → 144 B
+//   Q2_K  = super-blocks of 256: [16 B scales][64 B qs][f16 d][f16 dmin]  →  84 B
+//   Q5_K  = super-blocks of 256: [f16 d][f16 dmin][12 B scales][32 B qh][128 B qs] → 176 B
+//   Q6_K  = super-blocks of 256: [128 B ql][64 B qh][16 × int8 scales][f16 d] → 210 B
+// Q2_K/Q5_K/Q6_K exist as DEQUANT references only (GLM 5.2 routed experts);
+// their quantizers are not needed by this app and are deliberately absent.
 public enum Quantize {
     // MARK: F16 → Q8_0
 
@@ -98,6 +103,102 @@ public enum Quantize {
                     let qb = qs[chunk * 32 + i]
                     let q = hi ? (qb >> 4) : (qb & 0xF)
                     dst[sb * 256 + j * 32 + i] = dj * Float(q) - mj
+                }
+            }
+        }
+    }
+
+    // MARK: Q2_K → F32 (dequant reference — GLM routed experts)
+
+    /// Dequantize `count` elements of Q2_K (count % 256 == 0). Per super-block:
+    /// 16 scale bytes (low nibble = 6-bit-free scale, high nibble = min), 64
+    /// packed 2-bit bytes, then f16 d and dmin. Element order follows the ggml
+    /// reference: per 128-half, per 2-bit shift plane, 32 consecutive bytes.
+    public static func dequantQ2_K(_ src: UnsafeRawPointer, count: Int,
+                                   into dst: UnsafeMutablePointer<Float>) {
+        let nsb = count / 256
+        for sb in 0..<nsb {
+            let base = src + sb * 84
+            let scales = base.assumingMemoryBound(to: UInt8.self)
+            let qs = (base + 16).assumingMemoryBound(to: UInt8.self)
+            let d = Half.float((base + 80).loadUnaligned(as: UInt16.self))
+            let dmin = Half.float((base + 82).loadUnaligned(as: UInt16.self))
+            for half in [0, 128] {
+                for plane in 0..<4 {
+                    let shift = UInt8(plane * 2)
+                    for l in 0..<32 {
+                        let sc = scales[half / 16 + plane * 2 + l / 16]
+                        let q = (qs[half / 4 + l] >> shift) & 3
+                        dst[sb * 256 + half + plane * 32 + l] =
+                            d * Float(sc & 0xF) * Float(q) - dmin * Float(sc >> 4)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Q5_K → F32 (dequant reference — GLM routed experts)
+
+    /// Dequantize `count` elements of Q5_K (count % 256 == 0). Q4_K layout plus
+    /// 32 high-bit bytes: element l of sub-block j adds bit j of qh[l] as +16.
+    public static func dequantQ5_K(_ src: UnsafeRawPointer, count: Int,
+                                   into dst: UnsafeMutablePointer<Float>) {
+        let nsb = count / 256
+        for sb in 0..<nsb {
+            let base = src + sb * 176
+            let d = Half.float(base.loadUnaligned(as: UInt16.self))
+            let dmin = Half.float((base + 2).loadUnaligned(as: UInt16.self))
+            let scales = (base + 4).assumingMemoryBound(to: UInt8.self)
+            let qh = (base + 16).assumingMemoryBound(to: UInt8.self)
+            let qs = (base + 48).assumingMemoryBound(to: UInt8.self)
+            for j in 0..<8 {
+                let (sc, m) = scaleMinK4(j, scales)
+                let dj = d * Float(sc), mj = dmin * Float(m)
+                let chunk = j / 2
+                let hi = (j % 2) == 1
+                let highBit = UInt8(j)
+                for l in 0..<32 {
+                    let qb = qs[chunk * 32 + l]
+                    let low = hi ? (qb >> 4) : (qb & 0xF)
+                    let q = low + ((qh[l] >> highBit) & 1) * 16
+                    dst[sb * 256 + j * 32 + l] = dj * Float(q) - mj
+                }
+            }
+        }
+    }
+
+    // MARK: Q6_K → F32 (dequant reference — GLM routed experts)
+
+    /// Dequantize `count` elements of Q6_K (count % 256 == 0). Per super-block:
+    /// 128 low-nibble bytes, 64 two-high-bit bytes, 16 SIGNED int8 scales (one
+    /// per 16-element sub-block), f16 d at the end. q = 6-bit value − 32, no
+    /// min term. Element order: per 128-half, four 32-wide quarters sharing
+    /// qh[l], exactly the ggml reference emission.
+    public static func dequantQ6_K(_ src: UnsafeRawPointer, count: Int,
+                                   into dst: UnsafeMutablePointer<Float>) {
+        let nsb = count / 256
+        for sb in 0..<nsb {
+            let base = src + sb * 210
+            let ql = base.assumingMemoryBound(to: UInt8.self)
+            let qh = (base + 128).assumingMemoryBound(to: UInt8.self)
+            let scales = (base + 192).assumingMemoryBound(to: Int8.self)
+            let d = Half.float((base + 208).loadUnaligned(as: UInt16.self))
+            for half in [0, 128] {
+                let qlHalf = half / 2
+                let qhHalf = half / 4
+                let scHalf = half / 16
+                for l in 0..<32 {
+                    let sub = l / 16
+                    let high = qh[qhHalf + l]
+                    let q1 = Int(ql[qlHalf + l] & 0xF | ((high << 4) & 0x30)) - 32
+                    let q2 = Int(ql[qlHalf + l + 32] & 0xF | ((high << 2) & 0x30)) - 32
+                    let q3 = Int(ql[qlHalf + l] >> 4 | (high & 0x30)) - 32
+                    let q4 = Int(ql[qlHalf + l + 32] >> 4 | ((high >> 2) & 0x30)) - 32
+                    let out = dst + sb * 256 + half + l
+                    out[0] = d * Float(scales[scHalf + sub]) * Float(q1)
+                    out[32] = d * Float(scales[scHalf + sub + 2]) * Float(q2)
+                    out[64] = d * Float(scales[scHalf + sub + 4]) * Float(q3)
+                    out[96] = d * Float(scales[scHalf + sub + 6]) * Float(q4)
                 }
             }
         }
