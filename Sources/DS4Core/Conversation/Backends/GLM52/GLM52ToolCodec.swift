@@ -42,20 +42,18 @@ public enum GLM52ToolCodec {
     public static func toolsPrompt(_ tools: [ToolSpec]) throws -> String {
         guard !tools.isEmpty else { return "" }
         let schemas = try tools.map(functionSchemaJSON).joined(separator: "\n")
+        // Keep this wording and whitespace aligned with the GGUF
+        // `tokenizer.chat_template`; agent-specific guidance belongs in a
+        // separate system message, not in the model-native protocol prefix.
         return """
-        ## Tools
 
-        You may call one or more functions to help answer the user question.
-
+        You may call one or more functions to assist with the user query.
         You are provided with function signatures within <tools></tools> XML tags:
         <tools>
         \(schemas)
         </tools>
-
-        For each function call, use exactly this XML format:
-        <tool_call>{function-name}<arg_key>{argument-name}</arg_key><arg_value>{argument-value}</arg_value></tool_call>
-
-        Emit one <tool_call> block per function call. Use the exact tool and argument names from the schemas.
+        For each function call, output the function name and arguments within the following XML format:
+        <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>
         """
     }
 
