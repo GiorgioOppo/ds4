@@ -31,6 +31,7 @@ utilizzabili come promessa prestazionale per questa app.
 | Detector e blocco backend | registrato `glm-dsa`, rifiuto esplicito finché non runnable |
 | Metadata/shape | validazione stretta dei 31 campi usati dal grafo |
 | Tensor directory | schema completo, mappa payload-free e planner letture top-8 |
+| Lettura pesi | `pread` bounded su descrittori e piani top-8; MetalIO e slot-cache da collegare |
 | Tokenizer/chat/tool | implementati con golden test sugli ID reali |
 | Router | oracle CPU e kernel Metal dedicato |
 | DSA/IndexShare | layout, policy, scorer/top-k CPU e prime primitive Metal |

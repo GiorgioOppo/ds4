@@ -51,5 +51,21 @@ final class GLM52RealHeaderIntegrationTests: XCTestCase {
         XCTAssertEqual(plan.experts.count, 8)
         XCTAssertEqual(plan.ranges.count, 24)
         XCTAssertTrue(plan.totalBytes > 0)
+
+        // Payload reader on the exact-size sparse fixture: the whole validated
+        // directory must fit the file, and a real top-8 plan must execute end
+        // to end (sparse holes read as zeros — the point here is bounds and
+        // packing, not weight content).
+        let reader = try GLM52PayloadReader(path: path, weightMap: weights)
+        XCTAssertEqual(reader.fileSize, 211_075_856_448)
+        let layout = try reader.packedLayout(of: plan)
+        XCTAssertEqual(UInt64(layout.totalBytes), plan.totalBytes)
+        var packed = [UInt8](repeating: 1, count: layout.totalBytes)
+        try packed.withUnsafeMutableBytes {
+            try reader.read(plan: plan, into: $0)
+        }
+
+        let outputNorm = try reader.bytes(of: weights.global(.outputNorm))
+        XCTAssertEqual(outputNorm.count, 6_144 * 4)
     }
 }

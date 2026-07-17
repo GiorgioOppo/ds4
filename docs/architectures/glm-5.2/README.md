@@ -15,6 +15,7 @@ ancora selezionare GLM.
 | Selezione frontend/tokenizer | sì |
 | Configurazione e schema GGUF | sì, geometria stretta e 1.809 tensori |
 | Mappa pesi e piano letture top-8 | sì, payload-free e quant-block-aware |
+| Lettura payload dal GGUF | sì, `pread` bounded su descrittori e piani top-8 (record gate\|up\|down) |
 | Tokenizer GPT-2 + pretokenizer `glm4` | sì |
 | Template chat, reasoning e tool XML nativi | sì |
 | Oracle CPU di router, DSA/IndexShare e cache compatta | sì |
@@ -79,7 +80,10 @@ GGUF in RAM.
 
 La sequenza di abilitazione è vincolante:
 
-1. collegare la mappa pesi validata alle letture SSD/MetalIO top-8 e alle cache;
+1. collegare la mappa pesi validata alle letture SSD/MetalIO top-8 e alle cache
+   — avviato: `GLM52PayloadReader` esegue descrittori e piani top-8 con `pread`
+   bounded (doppia prova dei limiti, rifiuto dei GGUF troncati all'apertura);
+   restano MetalIO, slot-cache e residency;
 2. completare Q/KV-LoRA, RoPE, indexer, attenzione DSA e IndexShare;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;

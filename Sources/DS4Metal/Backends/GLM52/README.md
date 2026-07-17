@@ -14,6 +14,11 @@ compact F16 KV placement, centered indexer-key LayerNorm/affine/RoPE placement,
 and fixed-geometry indexer scoring. These remain validation primitives rather
 than an executable graph.
 
+`Streaming/` starts roadmap step 1: `GLM52PayloadReader` executes the validated
+weight map and expert stream plans against the real GGUF payload with bounded
+`pread`s — descriptors and top-8 plans become bytes, packed as gate|up|down
+records in router rank order.
+
 The backend is not registered as runnable yet. Compact DSA attention, tensor
 loading, dense/MoE execution and complete prefill/decode must pass their fixtures
 before `BackendCapabilities.generation` or catalog selection is enabled.

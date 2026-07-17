@@ -21,3 +21,7 @@ The indexer suite covers the fixed 32x128 geometry, F16 key-cache reads,
 per-head ReLU before weighting, positive scale, token-major output and causal
 `-infinity` masking. Metal comparisons skip when no device is available; the
 independent scalar oracles and validation tests remain device-free.
+
+The streaming suite (`Streaming/`) proves the payload reader byte-faithful on
+synthetic pattern files and that its bound checks reject truncated files and
+malformed plans before any byte moves.

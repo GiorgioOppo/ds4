@@ -187,4 +187,23 @@ public struct GLM52WeightMap: Sendable {
             down: try self.layer(layer, .routedDown)
         )
     }
+
+    /// The descriptor whose payload ends farthest into the file. A reader can
+    /// prove the whole validated directory fits the real file by checking this
+    /// single end offset against the file size.
+    public var farthestDescriptor: GLM52WeightDescriptor? {
+        var farthest: GLM52WeightDescriptor?
+        var farthestEnd: UInt64 = 0
+        for descriptor in globals.values {
+            let end = descriptor.absOffset + descriptor.bytes
+            if end > farthestEnd { farthest = descriptor; farthestEnd = end }
+        }
+        for layer in layers {
+            for descriptor in layer.values {
+                let end = descriptor.absOffset + descriptor.bytes
+                if end > farthestEnd { farthest = descriptor; farthestEnd = end }
+            }
+        }
+        return farthest
+    }
 }
