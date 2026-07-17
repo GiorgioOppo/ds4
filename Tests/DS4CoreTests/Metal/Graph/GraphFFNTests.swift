@@ -9,8 +9,10 @@ final class GraphFFNTests: XCTestCase {
     static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
 
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/dense.metal"),
-                          "vendored metal kernels not present")
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: Self.metalDir + "/deepseek/dense.metal")
+                || FileManager.default.fileExists(atPath: Self.metalDir + "/dense.metal"),
+            "vendored metal kernels not present")
         do { return try MetalRuntime(metalDir: Self.metalDir) }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
     }

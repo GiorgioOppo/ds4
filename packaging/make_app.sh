@@ -4,7 +4,7 @@
 # Produces build/DwarfStar.app with:
 #   Contents/MacOS/DwarfStar          the release executable
 #   Contents/Info.plist               bundle metadata
-#   Contents/Resources/metal/*.metal  optional fallback Metal kernel sources
+#   Contents/Resources/metal/**/*.metal  optional fallback Metal kernel sources
 #   Contents/Resources/bin/ds4*       helper binaries, if already built (optional)
 #   Contents/Resources/download_model.sh, speed-bench/   optional helpers
 #

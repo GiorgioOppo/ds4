@@ -1,4 +1,4 @@
-// AUTO-GENERATED from metal/*.metal — do not edit by hand.
+// AUTO-GENERATED from the vendored metal/ kernels — do not edit by hand.
 // Regenerate with: make embed-kernels  (scripts/embed_kernels.sh).
 // Embeds the kernel sources in the binary so the Metal runtime needs no
 // on-disk kernel folder (works in SwiftPM, the .xcodeproj, and a shipped .app).

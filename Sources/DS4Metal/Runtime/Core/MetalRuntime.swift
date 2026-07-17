@@ -98,14 +98,26 @@ public final class MetalRuntime {
         return p
     }
 
+    /// Architecture subdirectories of the vendored metal/ folder, searched in
+    /// order by the on-disk loader. The flat legacy layout stays accepted so an
+    /// older checkout keeps working.
+    public static let kernelSubdirectories = ["deepseek", "glm5.2", ""]
+
     /// Build the full kernel source: the ds4_metal.m prelude plus every vendored
     /// kernel file, concatenated in order.
     static func buildSource(metalDir: String) throws -> String {
         var s = prelude
         for name in kernelFiles {
-            let path = (metalDir as NSString).appendingPathComponent(name + ".metal")
-            guard let body = try? String(contentsOfFile: path, encoding: .utf8) else {
-                throw MetalError.kernelRead(path)
+            let candidates = kernelSubdirectories.map { subdirectory -> String in
+                let base = subdirectory.isEmpty
+                    ? metalDir
+                    : (metalDir as NSString).appendingPathComponent(subdirectory)
+                return (base as NSString).appendingPathComponent(name + ".metal")
+            }
+            guard let body = candidates.lazy.compactMap({ path in
+                try? String(contentsOfFile: path, encoding: .utf8)
+            }).first else {
+                throw MetalError.kernelRead(candidates[0])
             }
             s += body
             s += "\n"

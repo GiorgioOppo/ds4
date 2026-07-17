@@ -18,7 +18,7 @@ test:
 	swift test
 
 # Regenerate the embedded kernel sources (Sources/DS4Metal/Runtime/Generated/KernelSources.swift)
-# from metal/*.metal. Run after editing any kernel.
+# from the vendored metal/ kernels (deepseek/, glm5.2/). Run after editing any kernel.
 embed-kernels:
 	sh scripts/embed_kernels.sh
 

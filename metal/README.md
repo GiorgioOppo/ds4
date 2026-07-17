@@ -14,13 +14,28 @@ That command runs `scripts/embed_kernels.sh` and regenerates
 kernel directory on disk. The same embedded source path works under SwiftPM, the
 generated `.xcodeproj`, and a shipped `.app`.
 
+## Layout
+
+Kernels are grouped by architecture, one directory each:
+
+- [`deepseek/`](deepseek/): the DeepSeek V4 kernels plus the shared generic ops
+  (norm, softmax, argsort, copy/cast, …) that the DeepSeek graph drives today.
+- [`glm5.2/`](glm5.2/): the GLM 5.2 (`glm-dsa`) kernels.
+
+Metal still compiles ONE library from the concatenation of every file, so
+kernel names remain globally unique across directories. The embedded key and
+the `MetalRuntime.kernelFiles` entry stay the file basename; the on-disk loader
+(`MetalRuntime(metalDir:)`) searches `MetalRuntime.kernelSubdirectories` and
+also accepts the flat legacy layout.
+
 Main files by runtime weight:
 
-- `moe.metal`: MoE matvec kernels for all supported quantization formats.
-- `flash_attn.metal`: attention kernels.
-- `dense.metal`: dense projection helpers.
-- `dsv4_misc.metal`, `dsv4_hc.metal`, `dsv4_kv.metal`, `dsv4_rope.metal`:
+- `deepseek/moe.metal`: MoE matvec kernels for all supported quantization formats.
+- `deepseek/flash_attn.metal`: attention kernels.
+- `deepseek/dense.metal`: dense projection helpers.
+- `deepseek/dsv4_misc.metal`, `dsv4_hc.metal`, `dsv4_kv.metal`, `dsv4_rope.metal`:
   DeepSeek-V4-specific helpers.
+- `glm5.2/glm52.metal`: GLM 5.2 router and compact-DSA primitives.
 - utility kernels for normalization, softmax, argsort, unary operations, and
   related glue.
 

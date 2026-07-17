@@ -84,7 +84,9 @@ attivare, quale prompt elaborare o quale strategia di cache usare.
 
 ## Sorgenti incorporati
 
-I file modificabili sono `metal/*.metal`. Il file
+I file modificabili sono i kernel vendored raggruppati per architettura:
+`metal/deepseek/*.metal` (DeepSeek V4 più le op generiche condivise) e
+`metal/glm5.2/*.metal` (GLM 5.2). Il file
 `Sources/DS4Metal/Runtime/Generated/KernelSources.swift` è generato e non deve
 essere editato manualmente.
 
