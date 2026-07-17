@@ -11,7 +11,9 @@ DwarfStar is both:
   used by the app, the CLI demo, the
   native HTTP server, the benchmark panel, diagnostics, and distributed workers.
 
-Qwen is currently recognized from GGUF metadata but not executable. See the
+Qwen is currently recognized from GGUF metadata but not executable. GLM 5.2 is
+cataloged only for resumable, integrity-checked download: `glm-dsa` is not yet
+registered as a runtime backend and its files remain non-selectable. See the
 [support matrix](ARCHITETTURE-SUPPORTATE.md) for the precise distinction
 between recognized and supported models.
 
@@ -42,6 +44,8 @@ DwarfStar currently runs DeepSeek V4 Flash and the single-file Pro Q2 profile
 locally on Apple Silicon by streaming routed MoE weights from SSD. Only a small
 routed subset of the selected model is touched for each token. Pro Q4 remains
 download-only because its catalog artifact is split across two GGUF shards;
+three monolithic GLM 5.2 quantizations are also download-only while their
+tokenizer, tensor mapping, DSA/MoE decoder and Metal kernels are developed;
 distributed Pro Q2 uses geometry-aware horizontal and expert-shard paths, with
 real-model multi-Mac numerical validation still pending. Backend selection is
 explicit, so a future Qwen
@@ -874,7 +878,8 @@ downloads from Hugging Face, `.part` resume files, and catalog-pinned SHA-256
 verification for new transfers. GUI downloads go to the writable
 `~/Library/Application Support/DwarfStar/models/` directory. Exact catalog files
 already present as regular, non-empty files in known model directories are
-reused without a network request; interrupted `.part` files are resumed.
+reused without a network request; entries with a pinned exact size must also
+match that byte count. Interrupted `.part` files are resumed.
 
 Authentication is configured in **Settings → Hugging Face**: paste a read-only
 token from `huggingface.co/settings/tokens` and press Save. The token is stored
@@ -888,7 +893,9 @@ download sheet shows which source, if any, is active.
 The catalog exposes three Flash entries and the single-file Pro Q2 entry as
 downloadable, selectable and runnable locally. The two-shard Pro Q4 package is
 visible/downloadable but explicitly `downloadOnly`; neither shard becomes an
-independent local model. Pro distribution remains under verification. MTP is
+independent local model. The GLM 5.2 IQ2_XXS, Q2_K and Q4_K entries from
+`antirez/glm-5.2-gguf` are downloadable with pinned revision, byte count and
+SHA-256, but remain non-selectable. Pro distribution remains under verification. MTP is
 an accessory outside the main-model GUI catalog, and no current load path
 consumes it. Manual **Browse** remains available, but validates the GGUF with
 the runtime selector before changing the active model.

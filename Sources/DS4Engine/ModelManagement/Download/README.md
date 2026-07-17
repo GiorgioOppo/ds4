@@ -39,7 +39,10 @@ in un piccolo sidecar e inviati come `If-Range` alla ripresa.
 I nuovi download del catalogo hanno SHA-256 fissati e sono verificati prima
 della rinomina. Un file finale regolare e non vuoto già presente produce subito
 `alreadyPresent`: non viene riscaricato né riletto integralmente a ogni apertura.
-Un file finale vuoto non è mai considerato un GGUF valido.
+Quando il target ha `expectedSizeBytes`, il byte count deve coincidere; questa
+guardia permette di riusare i GGUF GLM da centinaia di GB senza hash completo a
+ogni apertura e senza accettare un finale troncato. Un file finale vuoto non è
+mai considerato un GGUF valido.
 
 Il downloader esegue un preflight dello spazio, include un margine per il
 filesystem e considera i byte del `.part` già presenti. Un gate actor impedisce
@@ -60,14 +63,16 @@ host CDN differente. Non inserire token in URL, log o stato non protetto.
 
 ## Estensione
 
-Per aggiungere un target, usare ID e nome file stabili, dimensione indicativa e
-SHA-256 autorevole. Conservare cancellazione, resume e callback
+Per aggiungere un target, usare ID e nome file stabili, sorgente Hugging Face
+con revisione preferibilmente bloccata, dimensione esatta quando disponibile e
+SHA-256 autorevole. `ModelDownloader` costruisce la URL dal `source` del target,
+quindi cataloghi diversi non condividono più un repository globale. Conservare cancellazione, resume e callback
 di avanzamento; evitare buffer proporzionali alla dimensione del modello.
 
 Un target scaricabile non implica compatibilità con il decoder. Il catalogo
 principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
-singolo-file sono selezionabili, mentre il package PRO Q4 resta `downloadOnly`.
-MTP è un accessorio separato e non compare tra i modelli GUI.
+singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
+restano `downloadOnly`. MTP è un accessorio separato e non compare tra i modelli GUI.
 
 Le impostazioni correlate sono nella
 [Configuration Reference](../../../../README.md#configuration-reference).

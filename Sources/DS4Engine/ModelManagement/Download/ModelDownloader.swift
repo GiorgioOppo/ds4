@@ -12,13 +12,16 @@ public enum ModelLocalFileState: Sendable, Hashable {
 /// `hf`, or another process. The final GGUF only appears after a complete,
 /// verified `.part` file is atomically renamed in the same directory.
 public enum ModelDownloader {
-    public static let repo = "antirez/deepseek-v4-gguf"
+    /// Legacy DeepSeek repository identifier retained for source compatibility.
+    /// Canonical downloads resolve the source carried by each target.
+    public static let repo = HuggingFaceSource.deepSeekV4.repository
 
     /// Compatibility view for older callers. New UI code should use
-    /// `DeepSeekV4ModelCatalog.entries`, which preserves package boundaries and
-    /// runtime availability. MTP remains addressable as an optional accessory.
+    /// `ModelCatalogRegistry.entries`, which preserves package boundaries,
+    /// remote repositories and runtime availability. MTP remains addressable
+    /// as an optional accessory.
     public static var targets: [ModelTarget] {
-        DeepSeekV4ModelCatalog.allArtifacts + [DeepSeekV4AccessoryCatalog.mtp]
+        ModelCatalogRegistry.allArtifacts + [DeepSeekV4AccessoryCatalog.mtp]
     }
 
     public static func target(_ id: String) -> ModelTarget? {
@@ -26,10 +29,23 @@ public enum ModelDownloader {
     }
 
     public static func resolveURL(_ file: String) -> URL {
+        // Older clients commonly iterate `targets` and resolve the filename in
+        // a second call. Preserve that pattern now that targets span repos.
+        if let target = targets.first(where: { $0.file == file }) {
+            return resolveURL(target)
+        }
+        return resolveURL(file: file, source: .deepSeekV4)
+    }
+
+    public static func resolveURL(_ target: ModelTarget) -> URL {
+        resolveURL(file: target.file, source: target.source)
+    }
+
+    public static func resolveURL(file: String, source: HuggingFaceSource) -> URL {
         var components = URLComponents()
         components.scheme = "https"
         components.host = "huggingface.co"
-        components.path = "/\(repo)/resolve/main/\(file)"
+        components.path = "/\(source.repository)/resolve/\(source.revision)/\(file)"
         return components.url!
     }
 
@@ -106,7 +122,8 @@ public enum ModelDownloader {
     }
 
     /// Canonical API used by the GUI. A non-empty regular final file is never
-    /// downloaded again: the result explicitly reports `.alreadyPresent`.
+    /// downloaded again when its pinned size, if present, matches: the result
+    /// explicitly reports `.alreadyPresent`.
     public static func acquire(
         target: ModelTarget,
         ggufDirectory: URL,
@@ -298,11 +315,14 @@ public enum ModelDownloader {
         }
         let partialBytes = try partialFileSize(at: partial)
 
-        // For a fresh download the catalog estimate catches an undersized disk
-        // before opening the connection. For a resume, wait for the exact
-        // Content-Range: a fully downloaded `.part` must still be able to receive
-        // 416 and finalize even when very little free space remains.
-        if partialBytes == 0 || target.expectedSizeBytes != nil {
+        // A fresh transfer uses the catalog estimate. A pinned incomplete
+        // resume can use its exact remaining size. Never require the safety
+        // margin for a `.part` already at or beyond the pinned size: it must be
+        // able to receive 416 and finalize even with almost no free space.
+        if shouldPreflightSpace(
+            partialBytes: partialBytes,
+            expectedSizeBytes: target.expectedSizeBytes
+        ) {
             try preflightSpace(
                 directory: directory,
                 totalBytes: target.expectedSizeBytes
@@ -313,7 +333,7 @@ public enum ModelDownloader {
 
         onState(.preparingRequest)
         var request = URLRequest(
-            url: resolveURL(target.file),
+            url: resolveURL(target),
             cachePolicy: .reloadIgnoringLocalCacheData,
             timeoutInterval: 120
         )
@@ -374,6 +394,15 @@ public enum ModelDownloader {
             at: url,
             invalid: DownloadError.partialItemNotRegular(url.path)
         )
+    }
+
+    static func shouldPreflightSpace(
+        partialBytes: Int64,
+        expectedSizeBytes: Int64?
+    ) -> Bool {
+        if partialBytes <= 0 { return true }
+        guard let expectedSizeBytes else { return false }
+        return partialBytes < expectedSizeBytes
     }
 
     private static func regularFileSize(at url: URL, invalid: Error) throws -> Int64 {

@@ -11,6 +11,7 @@ decoder sia già disponibile.
 |---|---:|---:|---:|---:|---:|---|
 | DeepSeek V4 Flash | sì | sì | sì | sì | sì | Tre quantizzazioni complete sono scaricabili, selezionabili ed eseguibili. |
 | DeepSeek V4 Pro | sì | sì | sì, Q2 singolo | sì, Q2 singolo | sì, Q2 singolo | Il percorso distribuito è implementato e testato sul protocollo; la prova numerica con il GGUF Pro reale resta da eseguire. Il package Q4 split resta download-only. |
+| GLM 5.2 (`glm-dsa`) | noto, non registrato | sì | no | no | no | Tre GGUF monolitici sono scaricabili con size/SHA fissati; backend, tokenizer e kernel non sono ancora implementati. |
 | Qwen | sì | no | no | no, rifiuto esplicito | no | Struttura predisposta; decoder e template non sono ancora implementati. |
 | Sconosciuta | sì | no | no | no, rifiuto esplicito | no | L'identificatore GGUF viene riportato senza tentare un caricamento DeepSeek. |
 
@@ -20,8 +21,9 @@ DeepSeek e produrre un errore fuorviante sui metadati `deepseek4.*`.
 
 ## Catalogo GUI e supporto runtime
 
-`DeepSeekV4ModelCatalog` in `DS4Engine/ModelManagement/Catalog` è la fonte
-unica per i modelli remoti mostrati dalla GUI. Il catalogo descrive anche
+`ModelCatalogRegistry` in `DS4Engine/ModelManagement/Catalog` è la fonte
+unica cross-family per i modelli remoti mostrati dalla GUI. Mantiene i cataloghi
+famiglia-specifici `DeepSeekV4ModelCatalog` e `GLM52ModelCatalog`. Il registro descrive anche
 artefatti che questa build può scaricare ma non eseguire: la presenza di una
 riga non equivale quindi al supporto del decoder.
 
@@ -33,13 +35,15 @@ Le voci correnti sono:
   runtime locale;
 - DeepSeek V4 Pro Q4: package `downloadOnly` di due shard; gli shard non sono
   presentati come modelli locali indipendenti;
+- GLM 5.2 IQ2_XXS, Q2_K e Q4_K: tre GGUF monolitici alternativi dal repository
+  `antirez/glm-5.2-gguf`, tutti `downloadOnly`;
 - MTP: accessorio separato, escluso dal catalogo dei modelli principali e dalla
   selezione GUI.
 
 La scansione automatica della GUI filtra sui filename delle tre voci Flash e
 del Pro Q2 singolo selezionabili. **Browse** consente un file esterno, ma esegue
 prima l'ispezione metadata-only e la selezione del backend: uno shard Pro Q4,
-MTP, Qwen e architetture sconosciute non possono sostituire silenziosamente il
+un GGUF GLM 5.2, MTP, Qwen e architetture sconosciute non possono sostituire silenziosamente il
 modello attivo.
 
 Il supporto Pro Q2 copre sia il decoder locale sia pipeline ed
@@ -120,10 +124,22 @@ Non viene scelto in anticipo un generico “Qwen”: Qwen2, Qwen2-MoE, Qwen3 e l
 relative varianti possono avere contratti diversi. L'implementazione inizierà
 da un file GGUF e da una variante dichiarati, non dal solo nome commerciale.
 
+## Requisiti prima del backend GLM 5.2
+
+Il catalogo GLM fissa già repository, revisione, filename, byte count e SHA-256,
+ma non registra ancora `glm-dsa` nel selettore. Prima di rendere una voce
+`runnable` servono audit del GGUF reale, tokenizer e template con golden test,
+schema tensori, DSA/IndexShare, routing MoE ed esperto condiviso, KV, MTP,
+kernel Metal e confronti numerici di prefill/decode. I knob DeepSeek non devono
+essere riutilizzati implicitamente. La checklist dettagliata è nel
+[README GLM 5.2](architectures/glm-5.2/README.md).
+
 ## Documenti per famiglia
 
 - [`architectures/deepseek-v4/README.md`](architectures/deepseek-v4/README.md)
   descrive il backend operativo e i suoi vincoli.
 - [`architectures/qwen/README.md`](architectures/qwen/README.md) descrive la
   predisposizione e ciò che resta da implementare.
+- [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.md) fissa il
+  manifest download-only e la roadmap del backend GLM.
 - [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.md) indica dove collocare i file.

@@ -65,23 +65,27 @@ riceve controlli DeepSeek per cache esperti, NSA, Q4, bundle o MetalIO.
 ## Download e selezione dei modelli
 
 Il pulsante **Scarica…** di Settings apre `DownloadView`. La vista non possiede
-una copia dei nomi remoti: renderizza `DeepSeekV4ModelCatalog.entries`, definito
+una copia dei nomi remoti: renderizza `ModelCatalogRegistry.entries`, definito
 in `DS4Engine`, e usa `DownloadRunner` soltanto come adattatore `@MainActor` fra
 eventi del downloader e stato SwiftUI.
 
-Il catalogo principale presenta cinque scelte logiche:
+Il catalogo principale presenta otto scelte logiche provenienti da due
+repository Hugging Face:
 
 | Edizione | Varianti | Download | Selezione/esecuzione |
 |---|---|---:|---:|
 | DeepSeek V4 Flash | Q2, mixed Q2/Q4, Q4 | sì | sì |
-| DeepSeek V4 Pro | Q2 singolo, Q4 split a due shard | sì | no |
+| DeepSeek V4 Pro | Q2 singolo | sì | sì |
+| DeepSeek V4 Pro | Q4 split a due shard | sì | no |
+| GLM 5.2 | IQ2_XXS, Q2_K, Q4_K monolitici | sì | no |
 
 La GUI espone per ogni voce dimensione indicativa, stato locale, spazio libero,
-progresso aggregato e disponibilità del runtime. Una voce Flash completa può
-essere selezionata; al termine del download diventa il modello attivo e la
+progresso aggregato e disponibilità del runtime. Una voce Flash completa o Pro
+Q2 singolo può essere selezionata; al termine del download diventa il modello attivo e la
 scelta persiste senza security-scoped bookmark, perché il file appartiene al
-container dell'app. Una voce Pro resta `downloadOnly`: il pulsante di selezione
-non compare e il download non cambia il modello attivo. MTP è un accessorio e
+container dell'app. Pro Q4 split e tutte le voci GLM restano `downloadOnly`: il
+pulsante di selezione non compare e il download non cambia il modello attivo.
+MTP è un accessorio e
 non appare nel catalogo principale.
 
 ### Percorsi e riuso
@@ -95,9 +99,11 @@ La destinazione scrivibile è:
 Prima della rete, il runner cerca il filename esatto del catalogo nella
 destinazione, nella root di sviluppo e nella sua sottocartella `gguf/`, oltre
 alla directory del modello attualmente configurato. Un file finale regolare e
-non vuoto viene riusato in posizione e non viene scaricato di nuovo. Le scansioni
-automatiche del menu modelli includono solo le tre varianti Flash dichiarate
-selezionabili dal catalogo.
+non vuoto viene riusato in posizione e non viene scaricato di nuovo; quando il
+catalogo conosce la dimensione esatta, come per GLM, anche il byte count deve
+coincidere. Le scansioni automatiche del menu modelli includono soltanto le tre
+varianti Flash e Pro Q2 dichiarati selezionabili dal catalogo. I file GLM
+completi restano visibili nella sheet download, non nel menu di caricamento.
 
 Un trasferimento incompleto resta come `<nome>.part`; **Riprendi** usa HTTP
 Range. La UI permette di annullare e conserva il parziale. Il downloader

@@ -4,8 +4,8 @@ Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
 
 ## Componenti
 
-- [`Catalog`](Catalog/README.md): modelli DeepSeek V4 ammessi, artefatti e
-  disponibilità nel runtime corrente.
+- [`Catalog`](Catalog/README.md): registro cross-family, cataloghi DeepSeek V4
+  e GLM 5.2, artefatti e disponibilità nel runtime corrente.
 - [`Download`](Download/README.md): credenziali, download GGUF riprendibile e
   stato consumato dalla GUI.
 - `ExpertBundleTool.swift`: verifica o costruisce il sidecar degli esperti senza
@@ -29,4 +29,6 @@ non sostituire un file finale prima che download/verifica siano completi.
 
 Essere presenti nel catalogo significa essere acquisibili, non necessariamente
 eseguibili. Le tre voci DeepSeek V4 Flash e il Pro Q2 in un singolo GGUF sono
-`runnable`; il Pro Q4 resta `downloadOnly` perché è un package multi-shard.
+`runnable`; il Pro Q4 resta `downloadOnly` perché è un package multi-shard. I
+tre GGUF monolitici GLM 5.2 sono anch'essi `downloadOnly` finché non esiste un
+backend `glm-dsa` verificato.

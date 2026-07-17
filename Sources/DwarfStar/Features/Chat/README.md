@@ -35,13 +35,14 @@ Chat view model and UI.
 ## Model selection lifecycle
 
 `ChatStore+ModelLifecycle` scans the app-managed download directory and the
-development model folders for the three catalog Flash filenames declared
-selectable by `DS4Engine`. Pro downloads, split shards, MTP and unknown GGUFs do
-not appear as one-click load candidates. Manual files remain reachable through
-the validated **Browse** picker in Settings.
+development model folders for catalog entries declared selectable by
+`DS4Engine`: the three Flash variants and the single-file Pro Q2. Pro Q4 split,
+GLM 5.2 download-only artifacts, MTP and unknown GGUFs do not appear as
+one-click load candidates. Manual files remain reachable through the validated
+**Browse** picker in Settings.
 
-Selecting a Flash file downloaded into Application Support persists its plain
-managed path and removes an older external bookmark. On restart,
+Selecting a runnable catalog file downloaded into Application Support persists
+its plain managed path and removes an older external bookmark. On restart,
 `restoreModelBookmark` preserves that managed choice; a stale bookmark must not
 replace it. Model download progress and network policy do not belong to
 `ChatStore`: they remain in the ModelManagement feature and `DS4Engine`.

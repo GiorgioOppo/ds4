@@ -16,7 +16,8 @@ The app is organized by **feature**, with one folder per tab or area under
   attachments, and the `ChatStore` view model.
 - **`Features/ModelManagement/`**: catalog-backed GGUF discovery, validated
   manual selection, resumable downloads and progress UI. Flash and the
-  single-file Pro Q2 are runnable; the two-file Pro Q4 package is download-only.
+  single-file Pro Q2 are runnable; the two-file Pro Q4 package and the three
+  GLM 5.2 variants are download-only.
 - **`Features/Project/`**: project library, with sandbox-bookmarked folders indexed for
   agent tools.
 - **`Features/Tuning/`**: expert-cache slots, mixed-quant pool policy, hit-rate,

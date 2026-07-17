@@ -6,6 +6,11 @@ artifact nelle directory locali note e scarica in Application Support soltanto
 quelli mancanti. Per i package multi-file esegue gli artifact in sequenza e li
 considera installati solo quando sono presenti tutti.
 
+Il runner itera `ModelCatalogRegistry`, quindi può mostrare repository diversi.
+Un file finale viene riusato senza rete; per i target con dimensione esatta
+fissata deve coincidere anche il byte count. Le voci GLM completate restano
+installate ma non vengono passate alla selezione del modello.
+
 Le callback molto frequenti vengono coalesciate con un `AsyncStream` bounded a
 circa 8 aggiornamenti UI al secondo. La continuation viene chiusa con `defer`
 anche su errore/cancellazione, evitando uno stato bloccato. Networking, SHA-256,

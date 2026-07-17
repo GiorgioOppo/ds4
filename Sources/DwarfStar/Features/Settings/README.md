@@ -10,7 +10,9 @@
   The Model section also opens **Scarica…**, whose sheet is owned by
   `Features/ModelManagement`: the three catalog Flash variants and the
   single-file Pro Q2 may be selected after download, while Pro Q4 split remains
-  visibly download-only.
+  visibly download-only. The three GLM 5.2 quantizations are downloadable from
+  their pinned repository revision but remain download-only until their runtime
+  is implemented.
 - **`Views/MCPServersView.swift`** renders the MCP panel: `MCPStore` persists the
   configured MCP servers (UserDefaults, `mcpServers`-JSON import/export) and
   pushes them to `MCPManager.shared` (in `DS4Engine/Tools/MCP/`), which owns

@@ -35,12 +35,14 @@ private final class DownloadCallbackRelay: @unchecked Sendable {
 enum CatalogInstallState: Equatable {
     case notDownloaded
     case partial
+    case invalidLocalFile
     case installed
 
     var title: String {
         switch self {
         case .notDownloaded: "Non scaricato"
         case .partial: "Parziale"
+        case .invalidLocalFile: "File non valido"
         case .installed: "Installato"
         }
     }
@@ -49,9 +51,15 @@ enum CatalogInstallState: Equatable {
         switch self {
         case .notDownloaded: "icloud.and.arrow.down"
         case .partial: "arrow.clockwise.circle"
+        case .invalidLocalFile: "exclamationmark.octagon.fill"
         case .installed: "checkmark.circle.fill"
         }
     }
+}
+
+struct InvalidCatalogArtifact {
+    let path: String
+    let reason: String
 }
 
 struct CatalogInstallation {
@@ -61,6 +69,7 @@ struct CatalogInstallation {
     let localBytes: Int64
     let partialBytes: Int64
     let pathsByTargetID: [String: String]
+    let invalidArtifacts: [String: InvalidCatalogArtifact]
 
     static let missing = CatalogInstallation(
         state: .notDownloaded,
@@ -68,7 +77,8 @@ struct CatalogInstallation {
         artifactCount: 0,
         localBytes: 0,
         partialBytes: 0,
-        pathsByTargetID: [:]
+        pathsByTargetID: [:],
+        invalidArtifacts: [:]
     )
 }
 
@@ -140,7 +150,7 @@ final class DownloadRunner {
 
     func refresh() {
         var next: [String: CatalogInstallation] = [:]
-        for entry in DeepSeekV4ModelCatalog.entries {
+        for entry in ModelCatalogRegistry.entries {
             next[entry.id.rawValue] = inspect(entry)
         }
         installations = next
@@ -148,9 +158,10 @@ final class DownloadRunner {
     }
 
     /// Acquire every artifact in a catalog entry. Existing non-empty files in
-    /// any known model directory are reused in place; only missing files are
-    /// downloaded into Application Support. A selectable single-file model is handed
-    /// back to the caller after either the reuse or download path succeeds.
+    /// any known model directory are reused in place when their pinned size, if
+    /// present, also matches; only missing files are downloaded into Application
+    /// Support. A selectable single-file model is handed back to the caller
+    /// after either the reuse or download path succeeds.
     func acquire(_ entry: ModelCatalogEntry,
                  onSelectableModel: @escaping @MainActor (String) -> Bool) {
         guard task == nil else { return }
@@ -160,6 +171,7 @@ final class DownloadRunner {
 
         let initial = inspect(entry)
         installations[key] = initial
+        guard initial.state != .invalidLocalFile else { return }
         if initial.state == .installed {
             if let path = selectablePath(for: entry, installation: initial) {
                 notices[key] = onSelectableModel(path)
@@ -196,7 +208,7 @@ final class DownloadRunner {
                 var downloaded = false
                 for (index, target) in entry.artifacts.enumerated() {
                     try Task.checkCancellation()
-                    if self.existingFile(named: target.file) != nil {
+                    if self.existingFile(for: target) != nil {
                         self.updateSkippedArtifact(entry: entry, target: target, index: index)
                         continue
                     }
@@ -353,11 +365,14 @@ final class DownloadRunner {
         var paths: [String: String] = [:]
         var installedBytes: Int64 = 0
         var partialBytes: Int64 = 0
+        var invalidArtifacts: [String: InvalidCatalogArtifact] = [:]
 
         for target in entry.artifacts {
-            if let existing = existingFile(named: target.file) {
+            if let existing = existingFile(for: target) {
                 paths[target.id] = existing.path
                 installedBytes += Self.fileSize(existing)
+            } else if let invalid = invalidManagedArtifact(for: target) {
+                invalidArtifacts[target.id] = invalid
             } else {
                 partialBytes += Self.fileSize(
                     destination.appendingPathComponent(target.file + ".part")
@@ -368,7 +383,9 @@ final class DownloadRunner {
         let installed = paths.count
         let count = entry.artifacts.count
         let state: CatalogInstallState
-        if count > 0, installed == count {
+        if !invalidArtifacts.isEmpty {
+            state = .invalidLocalFile
+        } else if count > 0, installed == count {
             state = .installed
         } else if installed > 0 || partialBytes > 0 {
             state = .partial
@@ -381,7 +398,8 @@ final class DownloadRunner {
             artifactCount: count,
             localBytes: installedBytes,
             partialBytes: partialBytes,
-            pathsByTargetID: paths
+            pathsByTargetID: paths,
+            invalidArtifacts: invalidArtifacts
         )
     }
 
@@ -392,19 +410,52 @@ final class DownloadRunner {
         return installation.pathsByTargetID[target.id]
     }
 
-    private func existingFile(named name: String) -> URL? {
+    private func existingFile(for target: ModelTarget) -> URL? {
         for directory in searchDirectories {
-            let candidate = directory.appendingPathComponent(name, isDirectory: false)
-            guard FileManager.default.isReadableFile(atPath: candidate.path),
-                  Self.fileSize(candidate) > 0 else { continue }
+            let candidate = directory.appendingPathComponent(target.file, isDirectory: false)
+            guard FileManager.default.isReadableFile(atPath: candidate.path) else { continue }
+            let size = Self.fileSize(candidate)
+            guard size > 0 else { continue }
+            if let expected = target.expectedSizeBytes,
+               size != expected {
+                continue
+            }
             return candidate
         }
         return nil
     }
 
+    /// A non-empty final file in the managed destination is user-owned. If it
+    /// cannot satisfy the pinned catalog metadata, expose it to the UI instead
+    /// of overwriting it or offering a retry loop that can never succeed.
+    private func invalidManagedArtifact(for target: ModelTarget) -> InvalidCatalogArtifact? {
+        let candidate = destination.appendingPathComponent(target.file, isDirectory: false)
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: candidate.path)) != nil {
+            return .init(path: candidate.path, reason: "il percorso è un link simbolico")
+        }
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else {
+            return .init(path: candidate.path, reason: "il percorso non è un file regolare")
+        }
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0 else { return nil } // the Engine safely removes empty sentinels
+        if let expected = target.expectedSizeBytes, size != expected {
+            let actualText = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+            let expectedText = ByteCountFormatter.string(fromByteCount: expected, countStyle: .file)
+            return .init(
+                path: candidate.path,
+                reason: "dimensione \(actualText), attesi \(expectedText)"
+            )
+        }
+        return nil
+    }
+
     private static func fileSize(_ url: URL) -> Int64 {
-        let resolved = url.resolvingSymlinksInPath()
-        let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil else {
+            return 0
+        }
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard values?.isRegularFile == true else { return 0 }
         return Int64(values?.fileSize ?? 0)
     }

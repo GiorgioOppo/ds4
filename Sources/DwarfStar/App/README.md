@@ -24,7 +24,8 @@ Application shell and shared state.
 Catalog models inside that directory are app-managed and do not need a
 security-scoped bookmark. When one is selected, the old external-model bookmark
 must not override it on the next launch. Remote model identities and support
-policy remain in `DS4Engine.DeepSeekV4ModelCatalog`, not in `AppEnvironment`.
+policy remain in `DS4Engine.ModelCatalogRegistry` and its family catalogs, not
+in `AppEnvironment`.
 
 ## Change rules
 

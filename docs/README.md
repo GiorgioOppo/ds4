@@ -13,14 +13,14 @@ principali e regole di modifica.
 - [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md) — moduli, dipendenze e mappa
   delle cartelle.
 - [ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md) — matrice dei
-  backend, rilevamento GGUF, capacità e regole per introdurre Qwen.
+  backend, rilevamento GGUF, capacità e regole per introdurre Qwen e GLM 5.2.
 - [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) — workflow per modificare codice,
   documentazione, kernel e progetto Xcode.
 
 ## Motore e inferenza
 
 - [`architectures/`](architectures/README.md) — documentazione separata per
-  DeepSeek V4 e per il backend Qwen ancora in preparazione.
+  DeepSeek V4, Qwen e la tranche download-only GLM 5.2.
 - [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md) — ciclo completo da prompt a
   token, ownership dello stato, prefill, decode e tool loop.
 - [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md) — dettagli del modello,

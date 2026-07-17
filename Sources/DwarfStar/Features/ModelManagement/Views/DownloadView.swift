@@ -15,9 +15,9 @@ struct DownloadView: View {
 
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(DeepSeekV4ModelCatalog.entries) { entry in
+                    ForEach(ModelCatalogRegistry.entries) { entry in
                         catalogRow(entry)
-                        if entry.id != DeepSeekV4ModelCatalog.entries.last?.id {
+                        if entry.id != ModelCatalogRegistry.entries.last?.id {
                             Divider()
                         }
                     }
@@ -43,9 +43,9 @@ struct DownloadView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Modelli DeepSeek V4")
+                    Text("Modelli GGUF")
                         .font(.title2.bold())
-                    Text("Scarica o riprendi un GGUF senza comandi esterni. I file già presenti vengono riutilizzati.")
+                    Text("Scarica o riprendi i modelli catalogati senza comandi esterni. I file completi già presenti vengono riutilizzati.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -97,7 +97,8 @@ struct DownloadView: View {
                 VStack(alignment: .trailing, spacing: 5) {
                     Label(installation.state.title, systemImage: installation.state.symbol)
                         .foregroundStyle(installStateColor(installation.state))
-                    Text("circa \(entry.approximateSizeGB) GB")
+                    Text(entry.expectedSizeBytes.map(formatBytes)
+                         ?? "circa \(entry.approximateSizeGB) GB")
                         .foregroundStyle(.secondary)
                 }
                 .font(.caption)
@@ -132,19 +133,33 @@ struct DownloadView: View {
                 Text("\(installation.artifactCount) file · \(formatBytes(installation.localBytes)) su disco")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else if installation.state == .invalidLocalFile {
+                ForEach(installation.invalidArtifacts.keys.sorted(), id: \.self) { targetID in
+                    if let invalid = installation.invalidArtifacts[targetID] {
+                        Label(
+                            "\(URL(fileURLWithPath: invalid.path).lastPathComponent): \(invalid.reason). "
+                                + "Sposta, rinomina o rimuovi il file; DwarfStar non lo sovrascrive automaticamente.",
+                            systemImage: "exclamationmark.octagon.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                    }
+                }
             }
 
-            let estimatedRemaining = max(
-                0,
-                Int64(entry.approximateSizeGB) * 1_000_000_000
-                    - installation.localBytes
-                    - installation.partialBytes
+            let packageBytes = entry.expectedSizeBytes
+                ?? Int64(entry.approximateSizeGB) * 1_000_000_000
+            let estimatedRequired = ModelDownloader.requiredFreeSpace(
+                totalBytes: packageBytes,
+                existingPartialBytes: installation.localBytes + installation.partialBytes
             )
             if installation.state != .installed,
+               installation.state != .invalidLocalFile,
                runner.availableBytes > 0,
-               estimatedRemaining > runner.availableBytes {
+               estimatedRequired > runner.availableBytes {
                 Label(
-                    "Spazio probabilmente insufficiente: restano circa \(formatBytes(estimatedRemaining)), disponibili \(formatBytes(runner.availableBytes)).",
+                    "Spazio probabilmente insufficiente: servono circa \(formatBytes(estimatedRequired)) inclusa la riserva, disponibili \(formatBytes(runner.availableBytes)).",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
@@ -223,6 +238,16 @@ struct DownloadView: View {
                   systemImage: "checkmark.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        } else if installation.state == .invalidLocalFile,
+                  let invalid = installation.invalidArtifacts.values.first {
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([
+                    URL(fileURLWithPath: invalid.path),
+                ])
+            } label: {
+                Label("Mostra file non valido", systemImage: "folder.badge.questionmark")
+            }
+            .disabled(runner.isRunning)
         } else {
             Button {
                 runner.acquire(entry, onSelectableModel: selectCatalogPath)
@@ -294,6 +319,7 @@ struct DownloadView: View {
         switch state {
         case .notDownloaded: .secondary
         case .partial: .orange
+        case .invalidLocalFile: .red
         case .installed: .green
         }
     }

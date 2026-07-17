@@ -16,12 +16,12 @@ final class ModelDownloaderTests: XCTestCase {
             "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
         )
         XCTAssertEqual(
-            ModelDownloader.resolveURL(q4.file).absoluteString,
+            ModelDownloader.resolveURL(q4).absoluteString,
             "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main/\(q4.file)"
         )
         XCTAssertNil(ModelDownloader.target("does-not-exist"))
 
-        for target in DeepSeekV4ModelCatalog.allArtifacts {
+        for target in ModelCatalogRegistry.allArtifacts {
             XCTAssertEqual(ModelDownloader.target(target.id), target)
         }
         XCTAssertEqual(ModelDownloader.target("mtp")?.role, .optionalComponent)
@@ -29,13 +29,15 @@ final class ModelDownloaderTests: XCTestCase {
 
     func testTypedCatalogSelectsFlashAndSingleFileProQ2() {
         XCTAssertEqual(DeepSeekV4ModelCatalog.entries.count, 5)
+        XCTAssertEqual(GLM52ModelCatalog.entries.count, 3)
+        XCTAssertEqual(ModelCatalogRegistry.entries.count, 8)
         XCTAssertEqual(
-            Set(DeepSeekV4ModelCatalog.selectableEntries.map(\.id)),
+            Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
             Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix])
         )
 
         let proQ2 = DeepSeekV4ModelCatalog.entry(.proQ2Imatrix)
-        XCTAssertEqual(proQ2?.edition, .pro)
+        XCTAssertEqual(proQ2?.profile, .deepSeekV4(.pro))
         XCTAssertTrue(proQ2?.isSelectable ?? false)
         XCTAssertTrue(proQ2?.runtimeAvailability.isRunnable ?? false)
         XCTAssertNil(proQ2?.runtimeAvailability.unavailableReason)
@@ -55,13 +57,65 @@ final class ModelDownloaderTests: XCTestCase {
             "MTP is an accessory, not a main-model catalog entry"
         )
 
-        let artifacts = DeepSeekV4ModelCatalog.allArtifacts
+        let artifacts = ModelCatalogRegistry.allArtifacts
         XCTAssertEqual(Set(artifacts.map(\.id)).count, artifacts.count)
         XCTAssertEqual(Set(artifacts.map(\.file)).count, artifacts.count)
         XCTAssertTrue(artifacts.allSatisfy { target in
             guard let digest = target.sha256, digest.count == 64 else { return false }
             return digest.allSatisfy { $0.isHexDigit && !$0.isUppercase }
         }, "every downloadable main-model artifact must have a pinned lowercase SHA-256")
+    }
+
+    func testGLM52CatalogIsPinnedDownloadOnlyAndUsesItsOwnRepository() throws {
+        let expected: [(ModelCatalogID, String, Int64, String)] = [
+            (
+                .glm52IQ2XXS,
+                "GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf",
+                211_075_856_448,
+                "a49de64c5020432bdae23de36a423a9660a5621bc0db8d12b66bd8814b07fea0"
+            ),
+            (
+                .glm52Q2K,
+                "GLM-5.2-UD-Q2_K_RoutedQ2K.gguf",
+                262_036_650_048,
+                "b9fa49d010dad35b96418c45831c212a746715b0646c1121ccfc414455bd6fe5"
+            ),
+            (
+                .glm52Q4K,
+                "GLM-5.2-UD-Q4_K_RoutedQ4K.gguf",
+                434_170_886_208,
+                "7160879c87756236eea16ec6bfeb19288d16fa94dcfcef3a5ed5f38b1383d3a5"
+            ),
+        ]
+
+        for (id, file, byteCount, digest) in expected {
+            let entry = try XCTUnwrap(ModelCatalogRegistry.entry(id))
+            let target = try XCTUnwrap(entry.artifacts.first)
+            XCTAssertEqual(entry.profile, .glm52)
+            XCTAssertFalse(entry.isSelectable)
+            XCTAssertFalse(entry.runtimeAvailability.isRunnable)
+            XCTAssertEqual(entry.expectedSizeBytes, byteCount)
+            XCTAssertEqual(target.file, file)
+            XCTAssertEqual(target.expectedSizeBytes, byteCount)
+            XCTAssertEqual(target.sha256, digest)
+            XCTAssertEqual(target.source, .glm52)
+            XCTAssertEqual(
+                ModelDownloader.resolveURL(target).absoluteString,
+                "https://huggingface.co/antirez/glm-5.2-gguf/resolve/" +
+                    "2638b3b878f5c6cc3ae7334b8dbea1275025f52e/\(file)"
+            )
+            XCTAssertEqual(
+                ModelDownloader.resolveURL(file),
+                ModelDownloader.resolveURL(target),
+                "the legacy filename resolver must retain the target repository"
+            )
+        }
+
+        XCTAssertTrue(GLM52ModelCatalog.entries.allSatisfy { !$0.isSelectable })
+        XCTAssertTrue(
+            Set(GLM52ModelCatalog.entries.map(\.id))
+                .isDisjoint(with: Set(DeepSeekV4ModelCatalog.entries.map(\.id)))
+        )
     }
 
     func testTokenResolution() {
@@ -102,6 +156,64 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: final.path + ".part"))
         XCTAssertEqual(recorder.states, [.checkingLocalFile, .completed(.alreadyPresent)])
         XCTAssertEqual(recorder.progress.last?.fractionCompleted, 1)
+    }
+
+    func testExistingPinnedFileWithWrongSizeIsRejectedWithoutNetwork() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let target = ModelTarget(
+            id: "pinned-size",
+            file: "pinned-size.gguf",
+            approxGB: 1,
+            note: "test only",
+            expectedSizeBytes: 4
+        )
+        try Data([1, 2, 3]).write(to: directory.appendingPathComponent(target.file))
+
+        do {
+            _ = try await ModelDownloader.acquire(target: target, ggufDirectory: directory)
+            XCTFail("a wrong-size final file must not be reused")
+        } catch let error as ModelDownloader.DownloadError {
+            guard case .existingFileSizeMismatch(let expected, let actual) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(expected, 4)
+            XCTAssertEqual(actual, 3)
+        }
+    }
+
+    func testExistingPinnedFileWithExactSizeReturnsAlreadyPresentWithoutNetwork() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let bytes = Data([1, 2, 3, 4])
+        let target = ModelTarget(
+            id: "pinned-size-match",
+            file: "pinned-size-match.gguf",
+            approxGB: 1,
+            note: "test only",
+            expectedSizeBytes: Int64(bytes.count),
+            source: .init(repository: "invalid.example/repository", revision: "missing")
+        )
+        let final = directory.appendingPathComponent(target.file)
+        try bytes.write(to: final)
+        let recorder = DownloadStateRecorder()
+
+        let result = try await ModelDownloader.acquire(
+            target: target,
+            ggufDirectory: directory,
+            onProgress: { recorder.record(progress: $0) },
+            onState: { recorder.record(state: $0) }
+        )
+
+        XCTAssertEqual(result.disposition, .alreadyPresent)
+        XCTAssertEqual(result.fileURL, final.standardizedFileURL)
+        XCTAssertEqual(result.byteCount, Int64(bytes.count))
+        XCTAssertEqual(recorder.states, [.checkingLocalFile, .completed(.alreadyPresent)])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: final.path + ".part"))
     }
 
     func testLocalStateDistinguishesMissingEmptyAndPresent() throws {
@@ -172,6 +284,39 @@ final class ModelDownloaderTests: XCTestCase {
                 minimumMarginBytes: 10
             ),
             10
+        )
+    }
+
+    func testSpacePreflightDoesNotBlockACompletePinnedPartial() {
+        XCTAssertTrue(
+            ModelDownloader.shouldPreflightSpace(
+                partialBytes: 0,
+                expectedSizeBytes: 100
+            )
+        )
+        XCTAssertTrue(
+            ModelDownloader.shouldPreflightSpace(
+                partialBytes: 99,
+                expectedSizeBytes: 100
+            )
+        )
+        XCTAssertFalse(
+            ModelDownloader.shouldPreflightSpace(
+                partialBytes: 100,
+                expectedSizeBytes: 100
+            )
+        )
+        XCTAssertFalse(
+            ModelDownloader.shouldPreflightSpace(
+                partialBytes: 101,
+                expectedSizeBytes: 100
+            )
+        )
+        XCTAssertFalse(
+            ModelDownloader.shouldPreflightSpace(
+                partialBytes: 50,
+                expectedSizeBytes: nil
+            )
         )
     }
 

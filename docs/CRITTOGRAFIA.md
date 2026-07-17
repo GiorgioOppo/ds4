@@ -52,18 +52,20 @@ Important notes:
   Security framework is used for the operating-system Keychain.
 - **Hashing is not encryption** for export-compliance purposes. It does not hide
   data; it identifies or verifies data.
-- **Why content SHA-256 instead of TLS pinning.** Hugging Face `resolve/main/...`
-  URLs redirect to an LFS CDN whose public keys are outside this app's control and
+- **Why content SHA-256 instead of TLS pinning.** Hugging Face
+  `resolve/<revision>/...` URLs (`main` for DeepSeek, a pinned commit for GLM)
+  redirect to an LFS CDN whose public keys are outside this app's control and
   may rotate. ATS public-key pinning would be fragile. Hashing the final content
   protects against corruption or tampering regardless of CDN key rotation.
 - **What is verified.** A newly transferred catalog artifact is checked against
-  the response byte count and its SHA-256 fixed in `DeepSeekV4ModelCatalog`
+  the response byte count and its SHA-256 fixed in `ModelCatalogRegistry`
   before the `.part` file is renamed to `.gguf`. Resumed transfers are hashed
   with a bounded-memory pass over the complete file, not only the appended
   suffix.
 - **Existing-file policy.** A final regular, non-empty file with the exact
   catalog filename is treated as user-owned installed content and is not read
-  again merely to hash hundreds of gigabytes. This is an explicit performance
+  again merely to hash hundreds of gigabytes. If `expectedSizeBytes` is pinned,
+  as for GLM 5.2, the size must also match. This is an explicit performance
   policy, not a cryptographic assertion about that pre-existing file. Remove or
   rename it to force a fresh, verified acquisition if its provenance is
   uncertain.

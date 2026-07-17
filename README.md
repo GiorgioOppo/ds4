@@ -9,7 +9,10 @@ through the geometry-driven pipeline and expert-shard paths; real-model
 multi-Mac numerical validation is still pending. The source tree and model loader are being
 prepared for an independent Qwen backend. Qwen GGUF files are recognized but
 intentionally refused until their tokenizer, tensor mapping and decoder are
-implemented. The DeepSeek engine is a faithful
+implemented. GLM 5.2 is in an earlier, explicitly download-only stage: the
+three monolithic GGUF variants from `antirez/glm-5.2-gguf` are cataloged with
+pinned sizes and SHA-256 digests, but this build does not yet recognize or run
+the `glm-dsa` backend. The DeepSeek engine is a faithful
 port of upstream `ds4.c` / `ds4_metal.m`: no C runtime engine, prebuilt static
 library or external process for normal inference. The Flash 2-bit GGUF runs on
 a 16 GB MacBook by streaming routed expert weights from SSD; that memory claim
@@ -140,10 +143,13 @@ In **Settings**, use **Scarica…** to acquire a catalog model directly from the
 GUI. The three DeepSeek V4 Flash variants and the single-file DeepSeek V4 Pro
 Q2 model can be downloaded, selected and run locally. The two-file Pro Q4
 package remains download-only because the local loader does not assemble split
-GGUF shards. Downloads live
+GGUF shards. The three GLM 5.2 variants from `antirez/glm-5.2-gguf` are also
+downloadable, resumable and integrity-checked, but remain non-selectable until
+the native GLM backend is implemented. Downloads live
 under `~/Library/Application Support/DwarfStar/models/`, resume from `.part`
-files and reuse an already present non-empty regular file instead of downloading
-it again.
+files and reuse an already present regular file instead of downloading it
+again; entries with a pinned byte count, including GLM 5.2, require an exact
+size match before reuse.
 
 **Browse** remains available for an advanced/manual GGUF. The picker inspects
 the file and accepts it only when the current runtime can execute its
@@ -706,7 +712,8 @@ built-ins, in the chat Tool sheet and in agent tool lists.
 The **Scarica…** sheet in Settings (and in the pre-load view) reads the single
 typed catalog owned by `DS4Engine`; filenames, package boundaries, SHA-256
 digests and runtime availability are not duplicated in SwiftUI. It downloads
-natively from `huggingface.co/antirez/deepseek-v4-gguf` into
+natively from the per-target Hugging Face repositories
+`antirez/deepseek-v4-gguf` and `antirez/glm-5.2-gguf` into
 `~/Library/Application Support/DwarfStar/models/`, without `curl`, `hf` or a
 helper process.
 
@@ -714,7 +721,8 @@ The sheet reports **Non scaricato**, **Parziale** or **Installato**, free space,
 per-file/package progress and whether an entry is runnable. An exact catalog
 filename already found as a readable, non-empty regular file in the managed
 directory, the configured development model directories or the current model
-directory is reused in place. A cancelled or interrupted transfer retains
+directory is reused in place; when the catalog pins an exact size, that byte
+count must also match. A cancelled or interrupted transfer retains
 `<filename>.part` and resumes it with HTTP Range; a server that ignores Range
 causes a safe restart rather than appending incompatible bytes. New transfers
 are accepted only after their final byte count and the catalog-pinned SHA-256
@@ -731,11 +739,16 @@ Authentication precedence is: token saved in **Settings → Hugging Face**
 | `q4-imatrix` | DeepSeek V4 Flash, Q4_K experts | selectable and runnable | 165 GB |
 | `pro-q2-imatrix` | DeepSeek V4 Pro, single Q2 GGUF | selectable and runnable locally | 465 GB |
 | `pro-q4-split` | DeepSeek V4 Pro, two Q4 shards (`00…30` and `31…output`) | download only; neither shard is a local selectable model | 900 GB |
+| `glm-5.2-iq2-xxs` | GLM 5.2, IQ2_XXS routed experts | download only; GLM runtime not implemented yet | 211 GB |
+| `glm-5.2-q2-k` | GLM 5.2, Q2_K routed experts | download only; GLM runtime not implemented yet | 262 GB |
+| `glm-5.2-q4-k` | GLM 5.2, Q4_K routed experts | download only; GLM runtime not implemented yet | 434 GB |
 
 The three Flash entries and the single-file Pro Q2 entry appear in automatic
 local-model selection. Pro Q4 remains visible in the download sheet with its
 explicit unavailable reason; downloading that split package never changes the
-active model. The MTP
+active model. The three GLM 5.2 variants follow the same download-only rule:
+they are shown in the sheet but excluded from automatic discovery and model
+selection until the `glm-dsa` runtime is implemented. The MTP
 companion is deliberately outside the main-model GUI catalog and is not shown
 as a selectable/downloadable model row.
 

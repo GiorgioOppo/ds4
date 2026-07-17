@@ -15,13 +15,12 @@ struct DiscoveredModel: Identifiable, Hashable {
 
 enum ModelCatalog {
     /// Scan the given directories for runnable catalog models. Custom GGUFs
-    /// remain available through Browse, but optional components, PRO downloads,
-    /// split shards and future unsupported architectures never appear as a
-    /// one-click load choice.
+    /// remain available through Browse, but optional components, split packages
+    /// and download-only architectures never appear as a one-click load choice.
     static func scan(directories: [String]) -> [DiscoveredModel] {
         let fm = FileManager.default
         let supportedFiles = Set(
-            DeepSeekV4ModelCatalog.selectableEntries
+            ModelCatalogRegistry.selectableEntries
                 .compactMap { $0.primaryArtifact?.file }
         )
         var seen = Set<String>()

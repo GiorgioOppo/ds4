@@ -9,7 +9,8 @@ The Model section presents both **Browse** and **Scarica…**. Browse validates 
 manual GGUF through the Engine selector; Scarica opens the catalog sheet from
 `Features/ModelManagement`. The view must not infer runtime support from a
 filename: Flash and single-file Pro Q2 selectability, plus Pro Q4's
-download-only state, come from the Engine catalog.
+download-only state and the three GLM 5.2 download-only entries, come from the
+Engine catalog.
 
 Settings that change engine memory layout apply on the next model load. Keep
 UserDefaults keys centralized and stable, store credentials through engine
