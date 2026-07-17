@@ -7,6 +7,9 @@ Buffer temporanei riutilizzati lungo il forward per evitare allocazioni per toke
 - [`DecodeScratch.swift`](DecodeScratch.swift): tensor scratch per proiezioni,
   attention, router, MoE, output e indici; include viste speciali per i percorsi
   densi quantizzati.
+- [`LayerWeights.swift`](LayerWeights.swift): pesi residenti di un layer come
+  GPUTensor, con i flag per-layer di quantizzazione (routed, denso Q4, compressori
+  Q8) letti dai dispatch di `DecodeLayer` e degli streamer.
 
 ## Flusso e dipendenze
 

@@ -15,6 +15,8 @@ Implementazione principale del decoder streaming e del forward per layer.
 - [`StreamingDecoder+TensorIO.swift`](StreamingDecoder+TensorIO.swift): upload,
   readback e accesso controllato ai tensor.
 - [`DecodeLayer.swift`](DecodeLayer.swift): sequenza matematica di un layer.
+- [`CachedLayerProvider.swift`](CachedLayerProvider.swift): cache per-layer dei
+  `LayerWeights` caricati una volta e riusati tra i token.
 - [`SpecDecode.swift`](SpecDecode.swift): stato e percorso per decode speculativo.
 
 ## Flusso
