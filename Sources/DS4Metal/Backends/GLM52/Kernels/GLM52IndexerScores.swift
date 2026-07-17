@@ -118,8 +118,8 @@ public enum GLM52IndexerScoresReference {
                     let queryOffset = (token * headCount + head) * headDimension
                     var dotProduct: Float = 0
                     for column in 0..<headDimension {
-                        dotProduct += queries[queryOffset + column]
-                            * Half.float(keyCacheBits[keyOffset + column])
+                        dotProduct += queries[queryOffset + column] *
+                            Half.float(keyCacheBits[keyOffset + column])
                     }
                     let activated = max(dotProduct * scale, 0)
                     score += activated * headWeights[token * headCount + head]

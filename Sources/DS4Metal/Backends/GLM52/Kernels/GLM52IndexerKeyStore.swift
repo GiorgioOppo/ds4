@@ -104,8 +104,8 @@ public enum GLM52IndexerKeyStoreReference {
             var normalized = [Float](repeating: 0, count: headDimension)
             for column in 0..<headDimension {
                 normalized[column] =
-                    (rawKeys[source + column] - mean)
-                    * inverseDeviation * weight[column] + bias[column]
+                    (rawKeys[source + column] - mean) *
+                    inverseDeviation * weight[column] + bias[column]
             }
             let position = Float(pos0 + token)
             for column in stride(from: 0, to: rotationDimension, by: 2) {

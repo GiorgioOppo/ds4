@@ -70,8 +70,8 @@ public struct GLM52CompactDSALayout: Sendable, Equatable {
     }
 
     public var indexerKeyBytesPerToken: UInt64 {
-        UInt64(fullIndexerLayers.count) * UInt64(shape.nIndexerHeadDim)
-            * precision.bytesPerElement
+        UInt64(fullIndexerLayers.count) * UInt64(shape.nIndexerHeadDim) *
+            precision.bytesPerElement
     }
 
     public var bytesPerToken: UInt64 {

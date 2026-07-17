@@ -60,8 +60,8 @@ public enum GLM52KVLoRANormReference {
                 sumSquares / Float(kvLoRAWidth) + epsilon
             )
             for column in 0..<kvLoRAWidth {
-                output[row + column] = rawRows[row + column]
-                    * inverseRMS * weight[column]
+                output[row + column] = rawRows[row + column] *
+                    inverseRMS * weight[column]
             }
         }
         return output
