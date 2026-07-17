@@ -25,3 +25,8 @@ independent scalar oracles and validation tests remain device-free.
 The streaming suite (`Streaming/`) proves the payload reader byte-faithful on
 synthetic pattern files and that its bound checks reject truncated files and
 malformed plans before any byte moves.
+
+The compact-attention suite compares the staged kernels (`qk_lowrank`,
+`attention_indexed`, `value_project`) stage by stage against scalar dots and
+chained end to end against `GLM52AttentionCPUReference` on the same
+F16-rounded cache, plus the selection/geometry rejection paths.
