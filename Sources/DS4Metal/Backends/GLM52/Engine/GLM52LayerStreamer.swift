@@ -79,6 +79,41 @@ public final class GLM52LayerStreamer {
     private let fillQueue = DispatchQueue(
         label: "glm52.layer.streamer", qos: .userInitiated)
     private let stateLock = NSLock()
+    /// Optional Metal fast-resource-loading path (DS4_GLM_MTLIO=1): SSD →
+    /// MTLBuffer without the CPU pread copy, mirroring the DeepSeek
+    /// ExpertBundle backend. Any failure permanently falls back to pread —
+    /// only touched from the serial fill queue after init.
+    private var metalIO: (queue: MTLIOCommandQueue,
+                          handle: MTLIOFileHandle)?
+
+    private static func makeMetalIO(runtime: MetalRuntime, path: String)
+        -> (queue: MTLIOCommandQueue, handle: MTLIOFileHandle)? {
+        guard ProcessInfo.processInfo.environment["DS4_GLM_MTLIO"] == "1"
+        else { return nil }
+        do {
+            let descriptor = MTLIOCommandQueueDescriptor()
+            descriptor.type = .concurrent
+            descriptor.priority = .high
+            descriptor.maxCommandBufferCount = 2
+            descriptor.maxCommandsInFlight = 16
+            let queue = try runtime.device.makeIOCommandQueue(
+                descriptor: descriptor)
+            let handle = try runtime.device.makeIOFileHandle(
+                url: URL(fileURLWithPath: path))
+            // Warm-up: pay first-use cost at load and prove the handle reads.
+            guard let scratch = runtime.device.makeBuffer(
+                length: 4_096, options: .storageModeShared) else { return nil }
+            let warm = queue.makeCommandBuffer()
+            warm.load(scratch, offset: 0, size: 4_096,
+                      sourceHandle: handle, sourceHandleOffset: 0)
+            warm.commit()
+            warm.waitUntilCompleted()
+            guard warm.status == .complete else { return nil }
+            return (queue, handle)
+        } catch {
+            return nil
+        }
+    }
 
     /// Allocates the two staging sets from a template layer's descriptor
     /// sizes (uniform across sparse layers — the schema fixes every type).
@@ -109,6 +144,7 @@ public final class GLM52LayerStreamer {
                 sharedDown: try buffer(template.sharedDown))))
         }
         slots = built
+        metalIO = Self.makeMetalIO(runtime: runtime, path: reader.path)
     }
 
     /// Async fill of the next staging slot with one layer's big tensors.
@@ -122,7 +158,46 @@ public final class GLM52LayerStreamer {
         slot.fillError = nil
         pending.append(slot)
         stateLock.unlock()
-        fillQueue.async { [reader] in
+        fillQueue.async { [weak self, reader] in
+            // Fast path: MetalIO SSD→MTLBuffer loads, one IO command buffer
+            // per slot. Any anomaly disables it permanently and the pread
+            // path below repeats the fill from scratch.
+            if let self, let io = self.metalIO {
+                let commandBuffer = io.queue.makeCommandBuffer()
+                var sized = true
+                func load(_ descriptor: GLM52WeightDescriptor?,
+                          _ buffer: MTLBuffer) {
+                    guard let descriptor else { return }
+                    guard Int(descriptor.bytes) <= buffer.length else {
+                        sized = false
+                        return
+                    }
+                    commandBuffer.load(
+                        buffer, offset: 0, size: Int(descriptor.bytes),
+                        sourceHandle: io.handle,
+                        sourceHandleOffset: Int(descriptor.absOffset))
+                }
+                load(tensors.qA, slot.buffers.qA)
+                load(tensors.qB, slot.buffers.qB)
+                load(tensors.kvA, slot.buffers.kvA)
+                load(tensors.keyB, slot.buffers.keyB)
+                load(tensors.valueB, slot.buffers.valueB)
+                load(tensors.attnOutput, slot.buffers.attnOutput)
+                load(tensors.indexerKey, slot.buffers.indexerKey)
+                load(tensors.indexerQueryB, slot.buffers.indexerQueryB)
+                load(tensors.sharedGate, slot.buffers.sharedGate)
+                load(tensors.sharedUp, slot.buffers.sharedUp)
+                load(tensors.sharedDown, slot.buffers.sharedDown)
+                if sized {
+                    commandBuffer.commit()
+                    commandBuffer.waitUntilCompleted()
+                    if commandBuffer.status == .complete {
+                        slot.ready.signal()
+                        return
+                    }
+                }
+                self.metalIO = nil
+            }
             do {
                 func fill(_ descriptor: GLM52WeightDescriptor?,
                           _ buffer: MTLBuffer) throws {

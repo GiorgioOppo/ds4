@@ -44,3 +44,14 @@ the decode thread). Honest arithmetic: a fully streamed 78-layer pass reads
 ~36 GiB/token — the resident budget, the expert-record coalescing already
 done by `read(plan:)`, and the future MTLIO/bundle paths are what make the
 16-32 GiB machines viable.
+
+MetalIO (`DS4_GLM_MTLIO=1`): the streamer fills its staging slots through an
+`MTLIOCommandQueue` (SSD → MTLBuffer, no CPU pread copy), with a load-time
+warm-up probe and permanent per-run fallback to pread on any anomaly — the
+same discipline as the DeepSeek ExpertBundle backend.
+
+Expert BUNDLES are a deliberate non-goal for now: repacking gate|up|down
+records contiguously would duplicate ~190 GiB on disk to turn three adjacent
+preads into one, and `read(plan:)` already coalesces each expert's reads
+into one packed destination. Revisit only if profiling shows the expert
+path seek-bound rather than bandwidth-bound.
