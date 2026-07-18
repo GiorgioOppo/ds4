@@ -37,8 +37,8 @@ public enum ExpertBundleTool {
                         weightMap: map, reader: reader)
                     if built { created += 1 } else { skipped += 1 }
                     FileHandle.standardError.write(Data(
-                        "DS4 expbundle: GLM blk\(layer) "
-                        + "(\(created + skipped)/\(sparse.count))\n".utf8))
+                        ("DS4 expbundle: GLM blk\(layer) "
+                         + "(\(created + skipped)/\(sparse.count))\n").utf8))
                 }
                 return "Bundle GLM pronti in \(directory): "
                     + "\(created) creati, \(skipped) già validi."
