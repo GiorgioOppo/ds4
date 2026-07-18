@@ -12216,11 +12216,11 @@ kernel void kernel_glm52_moe_pair_swiglu_sg(
         device const uchar *gate_rows,
         device const uchar *up_rows,
         device float       *mid,
-        uint   tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
         uint3  ntg   [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint row = tgpig * ntg.y + (uint)sgitg;
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
     if (row >= args.row_count) return;
     const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
                                                   args.input_width);
@@ -12246,11 +12246,11 @@ kernel void kernel_glm52_moe_down_sg(
         device const float *mid,
         device const uchar *down_rows,
         device float       *out,
-        uint   tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
         uint3  ntg   [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint row = tgpig * ntg.y + (uint)sgitg;
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
     if (row >= args.row_count) return;
     const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
                                                   args.input_width);
