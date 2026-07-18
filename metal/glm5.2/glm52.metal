@@ -627,11 +627,13 @@ kernel void kernel_glm52_value_project_q8_0(
 
 // MARK: - Routed expert FFN (K-quant weights)
 
-// Validation kernels for the routed expert stages: one thread owns one output
-// row and dequantizes its K-quant row serially with the exact reference
+// Validation kernels for the quantized FFN matvec stages: one thread owns one
+// output row and dequantizes its row serially with the exact reference
 // pairing (same element order as the CPU dequant references), so the GPU path
-// is comparable to the FFN oracle on dequantized weights. Correctness only —
-// the tuned per-quant families come later, beside these fixtures.
+// is comparable to the FFN oracle on dequantized weights. Q8_0 covers the
+// dense blocks, the shared expert and the output head; the K-quants cover the
+// routed experts. Correctness only — the tuned per-quant families come later,
+// beside these fixtures.
 
 struct ds4_metal_args_glm52_moe {
     uint32_t weight_type;    // GGUF id: 10=q2_K, 12=q4_K, 13=q5_K, 14=q6_K
@@ -760,13 +762,28 @@ static inline float glm52_dot_q6_K_row(device const uchar *row,
     return acc;
 }
 
+static inline float glm52_dot_q8_0_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint b = 0u; b < width / 32u; b++) {
+        device const uchar *base = row + b * 34u;
+        const float d = glm52_half_at(base);
+        device const char *qs = (device const char *)(base + 2u);
+        for (uint i = 0u; i < 32u; i++) {
+            acc += d * (float)qs[i] * x[b * 32u + i];
+        }
+    }
+    return acc;
+}
+
 static inline uint glm52_kquant_row_bytes(uint type, uint width) {
-    const uint blocks = width / 256u;
     switch (type) {
-        case 10u: return blocks * 84u;
-        case 12u: return blocks * 144u;
-        case 13u: return blocks * 176u;
-        case 14u: return blocks * 210u;
+        case 8u:  return (width / 32u) * 34u;
+        case 10u: return (width / 256u) * 84u;
+        case 12u: return (width / 256u) * 144u;
+        case 13u: return (width / 256u) * 176u;
+        case 14u: return (width / 256u) * 210u;
         default:  return 0u;
     }
 }
@@ -776,6 +793,7 @@ static inline float glm52_dot_kquant_row(uint type,
                                          device const float *x,
                                          uint width) {
     switch (type) {
+        case 8u:  return glm52_dot_q8_0_row(row, x, width);
         case 10u: return glm52_dot_q2_K_row(row, x, width);
         case 12u: return glm52_dot_q4_K_row(row, x, width);
         case 13u: return glm52_dot_q5_K_row(row, x, width);

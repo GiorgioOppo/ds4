@@ -37,12 +37,15 @@ The currently validated atomic boundaries are:
   iterative binary-search merges), reusing the vendored DeepSeek argsort
   kernels. Causal future rows arrive as `-INFINITY` scores and sink to the
   end; ties follow the bitonic network, not the oracle's lowest-index rule;
-- `GLM52MoE`: validation kernels for the routed expert stages — fused
-  gate/up SwiGLU (route weight on the mid, before down) and the down
-  projection — reading Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored in the
-  GGUF with one thread per output row and the reference element pairing.
-  Baseline: `GLM52FFNCPUReference` on the dequantized weights. The tuned
-  per-quant families (slots/addr/masked batches) come later beside these.
+- `GLM52MoE`: validation kernels for the quantized FFN matvec stages —
+  fused gate/up SwiGLU (route weight on the mid, before down) and the down
+  projection — reading Q8_0 and Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored
+  in the GGUF with one thread per output row and the reference element
+  pairing. Q8_0 covers the dense blocks, the shared expert and the
+  output-head matvec (`glm52FFNBlock`, `glm52OutputHeadLogits`); the
+  K-quants cover the routed experts (`glm52RoutedFFN`). Baseline:
+  `GLM52FFNCPUReference` on the dequantized weights. The tuned per-quant
+  families (slots/addr/masked batches) come later beside these.
 
 The compact-store input is intentionally *cache-ready*: its first 512 values
 have already passed through `GLM52KVLoRANorm` and its final 64 values are the

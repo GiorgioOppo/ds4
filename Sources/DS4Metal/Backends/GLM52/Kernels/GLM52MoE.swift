@@ -29,15 +29,18 @@ public struct GLM52QuantizedExpert: Sendable {
 }
 
 extension MetalRuntime {
-    /// K-quant row bytes for `width` elements (multiple of 256), or nil for a
-    /// type outside the routed contract.
+    /// Quantized row bytes for `width` elements (multiple of the type's block
+    /// size), or nil for a type outside the GLM FFN contract: Q8_0 for
+    /// dense/shared/output-head weights, the four K-quants for routed experts.
     static func glm52KQuantRowBytes(type: UInt32, width: Int) -> Int? {
-        guard width > 0, width.isMultiple(of: 256),
-              let info = GGUF.typeInfo(type), info.blockElems == 256,
-              [GLM52TensorSchema.q2_K, GLM52TensorSchema.q4_K,
-               GLM52TensorSchema.q5_K, GLM52TensorSchema.q6_K].contains(type)
+        guard width > 0,
+              let info = GGUF.typeInfo(type),
+              width.isMultiple(of: Int(info.blockElems)),
+              [GLM52TensorSchema.q8_0, GLM52TensorSchema.q2_K,
+               GLM52TensorSchema.q4_K, GLM52TensorSchema.q5_K,
+               GLM52TensorSchema.q6_K].contains(type)
         else { return nil }
-        return (width / 256) * Int(info.blockBytes)
+        return (width / Int(info.blockElems)) * Int(info.blockBytes)
     }
 
     private func glm52MoEDispatch(pipelineName: String,
@@ -144,6 +147,35 @@ extension MetalRuntime {
             routeWeight: 1,
             input: mid,
             weightBuffers: [downRows])
+    }
+
+    /// One dense or shared-expert FFN block on quantized weights (Q8_0 in the
+    /// real model): fused pair-SwiGLU (route weight 1) then down. Comparable
+    /// to `GLM52FFNCPUReference.ffnBlock` on the dequantized weights.
+    public func glm52FFNBlock(input: [Float],
+                              gateRows: [UInt8],
+                              upRows: [UInt8],
+                              downRows: [UInt8],
+                              weightType: UInt32,
+                              hiddenWidth: Int) throws -> [Float] {
+        let mid = try glm52MoEPairSwiGLU(
+            input: input, gateRows: gateRows, upRows: upRows,
+            weightType: weightType, hiddenWidth: hiddenWidth, routeWeight: 1)
+        return try glm52MoEDown(
+            mid: mid, downRows: downRows, weightType: weightType,
+            outputWidth: input.count)
+    }
+
+    /// Output-head logits from an ALREADY-normalized hidden state (the RMSNorm
+    /// stays with the CPU oracle in this validation path): one quantized
+    /// matvec over the vocabulary rows.
+    public func glm52OutputHeadLogits(normalized: [Float],
+                                      headRows: [UInt8],
+                                      weightType: UInt32,
+                                      vocabularySize: Int) throws -> [Float] {
+        try glm52MoEDown(
+            mid: normalized, downRows: headRows, weightType: weightType,
+            outputWidth: vocabularySize)
     }
 
     /// Chained validation path over the selected experts (router rank order):

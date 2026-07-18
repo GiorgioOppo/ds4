@@ -244,6 +244,78 @@ final class GLM52MoETests: XCTestCase {
         assertClose(gpu, oracle, label: "chained routed FFN")
     }
 
+    // MARK: - Q8_0 dense/shared/output-head paths
+
+    /// Shared Q8_0 test quantizer (same as the attention Q8 suite).
+    private func quantQ8(_ row: [Float]) -> [UInt8] {
+        var out: [UInt8] = []
+        var b = 0
+        while b < row.count {
+            let block = Array(row[b..<b + 32])
+            let amax = block.map { abs($0) }.max() ?? 0
+            let d = amax / 127.0
+            withUnsafeBytes(of: Half.bits(d).littleEndian) {
+                out.append(contentsOf: $0)
+            }
+            for x in block {
+                out.append(UInt8(bitPattern: Int8(
+                    clamping: d != 0 ? Int((x / d).rounded()) : 0)))
+            }
+            b += 32
+        }
+        return out
+    }
+
+    private func dequantQ8(_ bytes: [UInt8]) -> [Float] {
+        var out = [Float](repeating: 0, count: (bytes.count / 34) * 32)
+        bytes.withUnsafeBytes {
+            Quantize.dequantQ8_0($0.baseAddress!, count: out.count, into: &out)
+        }
+        return out
+    }
+
+    func testFFNBlockQ8MatchesOracleOnDequantizedWeights() throws {
+        let runtime = try makeRuntime()
+        // Widths that are multiples of 32 but NOT of 256: pins the per-type
+        // block-size generalization.
+        let embd = 64, ffnHidden = 96
+        var generator = Generator(seed: 61)
+        let gateQ = quantQ8((0..<ffnHidden * embd).map { _ in generator.float(0.1) })
+        let upQ = quantQ8((0..<ffnHidden * embd).map { _ in generator.float(0.1) })
+        let downQ = quantQ8((0..<embd * ffnHidden).map { _ in generator.float(0.1) })
+        let x = (0..<embd).map { _ in generator.float(0.2) }
+
+        let gpu = try runtime.glm52FFNBlock(
+            input: x, gateRows: gateQ, upRows: upQ, downRows: downQ,
+            weightType: GLM52TensorSchema.q8_0, hiddenWidth: ffnHidden)
+
+        let expected = try GLM52FFNCPUReference.ffnBlock(
+            input: x,
+            gate: dequantQ8(gateQ), up: dequantQ8(upQ), down: dequantQ8(downQ),
+            hiddenWidth: ffnHidden)
+        assertClose(gpu, expected, label: "Q8_0 FFN block")
+    }
+
+    func testOutputHeadQ8MatchesOracle() throws {
+        let runtime = try makeRuntime()
+        let embd = 64, vocab = 40
+        var generator = Generator(seed: 71)
+        let hidden = (0..<embd).map { _ in generator.float(0.5) }
+        let normWeight = (0..<embd).map { _ in generator.float(0.5) + 1 }
+        let headQ = quantQ8((0..<vocab * embd).map { _ in generator.float(0.1) })
+
+        let normalized = try GLM52FFNCPUReference.rmsNorm(
+            hidden, weight: normWeight)
+        let gpu = try runtime.glm52OutputHeadLogits(
+            normalized: normalized, headRows: headQ,
+            weightType: GLM52TensorSchema.q8_0, vocabularySize: vocab)
+
+        let expected = try GLM52FFNCPUReference.outputHead(
+            hidden: hidden, normWeight: normWeight,
+            head: dequantQ8(headQ), vocabularySize: vocab)
+        assertClose(gpu, expected, label: "Q8_0 output head")
+    }
+
     func testValidationRejectsBadTypesAndSizes() throws {
         let runtime = try makeRuntime()
         let x = input(seed: 51)
@@ -251,7 +323,7 @@ final class GLM52MoETests: XCTestCase {
                                  rows: hidden, seed: 52)
 
         XCTAssertThrowsError(try runtime.glm52MoEPairSwiGLU(
-            input: x, gateRows: rows, upRows: rows, weightType: 8,
+            input: x, gateRows: rows, upRows: rows, weightType: 11,   // q3_K
             hiddenWidth: hidden, routeWeight: 1))
         XCTAssertThrowsError(try runtime.glm52MoEPairSwiGLU(
             input: x, gateRows: Array(rows.dropLast()), upRows: rows,

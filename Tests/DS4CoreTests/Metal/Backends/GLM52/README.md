@@ -44,7 +44,8 @@ quantizer, dequantizes the same bytes, and requires the Q8 kernels to match
 the F32 baselines on those dequantized values — quantization error belongs to
 the fixture, never to the kernel.
 
-The MoE suite applies the same discipline to the routed expert kernels:
+The MoE suite applies the same discipline to the quantized FFN kernels:
 Q4_K fixtures from the real quantizer, synthesized Q2_K/Q5_K/Q6_K blocks
-decoded by the `Quantize` references, stage and chained comparisons against
+decoded by the `Quantize` references, Q8_0 dense/output-head paths on widths
+that are multiples of 32 but not 256, stage and chained comparisons against
 `GLM52FFNCPUReference`, and contract rejections (types, sizes, widths).
