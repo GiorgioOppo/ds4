@@ -97,6 +97,12 @@ public enum GLM52AttentionReferenceError: Error, Sendable, Equatable,
 /// - `cache`: `[row][kvLora + rope]` — the compact layout `GLM52CompactKV`
 ///   stores: normalized KV-LoRA prefix, then the raw-bit RoPE tail;
 /// - `selection`: unique cache row indices, any order (the indexer's top-k).
+///
+/// `rotateTailByRowPosition` selects the tail semantics. False consumes the
+/// tail as stored (pre-rotated fixtures — the isolated kernel tests). True is
+/// the upstream decode wiring: the compact cache keeps RAW tails and each row
+/// is rotated here, at attention time, with its own absolute position
+/// (pos = row index) — never with the query's position.
 public enum GLM52AttentionCPUReference {
     /// Textbook order: expand keys/values per head, then attend.
     /// Returns `[head][value]`.
@@ -105,9 +111,12 @@ public enum GLM52AttentionCPUReference {
                                 keyB: [Float],
                                 valueB: [Float],
                                 cache: [Float],
-                                selection: [Int]) throws -> [Float] {
+                                selection: [Int],
+                                rotateTailByRowPosition: Bool = false) throws
+        -> [Float] {
         try validate(geometry: geometry, query: query, keyB: keyB,
-                     valueB: valueB, cache: cache, selection: selection)
+                     valueB: valueB, cache: cache, selection: selection,
+                     rotateTailByRowPosition: rotateTailByRowPosition)
         let g = geometry
         var output = [Float](repeating: 0, count: g.headCount * g.valueDimension)
 
@@ -128,8 +137,12 @@ public enum GLM52AttentionCPUReference {
                         expandedKey[i] += x * keyB[rowBase + i]
                     }
                 }
+                let tail = attentionTail(
+                    cache: cache, tailBase: cacheBase + g.kvLoraRank,
+                    ropeDimension: g.ropeDimension, row: row,
+                    rotateByRowPosition: rotateTailByRowPosition)
                 for i in 0..<g.ropeDimension {
-                    expandedKey[g.nopeDimension + i] = cache[cacheBase + g.kvLoraRank + i]
+                    expandedKey[g.nopeDimension + i] = tail[i]
                 }
                 var dot: Float = 0
                 for i in 0..<g.qkDimension {
@@ -176,9 +189,12 @@ public enum GLM52AttentionCPUReference {
                                 keyB: [Float],
                                 valueB: [Float],
                                 cache: [Float],
-                                selection: [Int]) throws -> [Float] {
+                                selection: [Int],
+                                rotateTailByRowPosition: Bool = false) throws
+        -> [Float] {
         try validate(geometry: geometry, query: query, keyB: keyB,
-                     valueB: valueB, cache: cache, selection: selection)
+                     valueB: valueB, cache: cache, selection: selection,
+                     rotateTailByRowPosition: rotateTailByRowPosition)
         let g = geometry
         var output = [Float](repeating: 0, count: g.headCount * g.valueDimension)
 
@@ -205,9 +221,12 @@ public enum GLM52AttentionCPUReference {
                 for j in 0..<g.kvLoraRank {
                     dot += lowRankQuery[j] * cache[cacheBase + j]
                 }
+                let tail = attentionTail(
+                    cache: cache, tailBase: cacheBase + g.kvLoraRank,
+                    ropeDimension: g.ropeDimension, row: row,
+                    rotateByRowPosition: rotateTailByRowPosition)
                 for i in 0..<g.ropeDimension {
-                    dot += query[queryBase + g.nopeDimension + i] *
-                        cache[cacheBase + g.kvLoraRank + i]
+                    dot += query[queryBase + g.nopeDimension + i] * tail[i]
                 }
                 scores[rank] = dot * g.scale
                 if scores[rank] > maxScore { maxScore = scores[rank] }
@@ -245,6 +264,32 @@ public enum GLM52AttentionCPUReference {
         return output
     }
 
+    // MARK: - Decode tail rotation
+
+    /// One cache row's RoPE tail as attention consumes it: raw when the
+    /// fixture pre-rotated the cache, or rotated with the ROW's absolute
+    /// position (iterative theta, matching `GLM52RopeTailReference`) when the
+    /// cache keeps raw tails — the upstream decode semantics.
+    private static func attentionTail(cache: [Float], tailBase: Int,
+                                      ropeDimension: Int, row: Int,
+                                      rotateByRowPosition: Bool) -> [Float] {
+        var tail = Array(cache[tailBase..<tailBase + ropeDimension])
+        guard rotateByRowPosition else { return tail }
+        let thetaScale = pow(GLM52RopeTailReference.frequencyBase,
+                             -2 / Float(ropeDimension))
+        var theta = Float(row)
+        for i in stride(from: 0, to: ropeDimension, by: 2) {
+            let c = cos(theta)
+            let s = sin(theta)
+            let x0 = tail[i]
+            let x1 = tail[i + 1]
+            tail[i] = x0 * c - x1 * s
+            tail[i + 1] = x0 * s + x1 * c
+            theta *= thetaScale
+        }
+        return tail
+    }
+
     // MARK: - Validation
 
     private static func validate(geometry: GLM52AttentionGeometry,
@@ -252,8 +297,11 @@ public enum GLM52AttentionCPUReference {
                                  keyB: [Float],
                                  valueB: [Float],
                                  cache: [Float],
-                                 selection: [Int]) throws {
-        guard geometry.isValid else {
+                                 selection: [Int],
+                                 rotateTailByRowPosition: Bool = false) throws {
+        guard geometry.isValid,
+              !rotateTailByRowPosition
+                  || geometry.ropeDimension.isMultiple(of: 2) else {
             throw GLM52AttentionReferenceError.invalidGeometry(geometry)
         }
         let g = geometry

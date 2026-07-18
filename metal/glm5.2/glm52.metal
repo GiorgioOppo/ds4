@@ -392,7 +392,11 @@ struct ds4_metal_args_glm52_attention {
     uint32_t n_rows;
     uint32_t n_selected;
     float    scale;
-    uint32_t pad0;
+    // Decode semantics: the compact cache keeps RAW K-RoPE tails and each
+    // selected row is rotated at attention time with its own absolute
+    // position (pos = row index). Zero reads the tail as stored — the
+    // pre-rotated fixture path of the isolated kernel tests.
+    uint32_t rotate_k_tail;
 };
 
 // q_low[h][j] = dot(q_nope[h][0..192), attn_k_b[h][j][0..192)).
@@ -463,14 +467,31 @@ kernel void kernel_glm52_attention_indexed_f16(
 
     // Phase A: raw scaled scores of every selected row.
     for (uint s = tid; s < args.n_selected; s += N_THREADS) {
+        const uint row_index = selected[s];
         device const half *row = compact_cache +
-            (uint64_t)selected[s] * ROW_WIDTH;
+            (uint64_t)row_index * ROW_WIDTH;
         float dot_product = 0.0f;
         for (uint j = 0u; j < N_LORA; j++) {
             dot_product += q_low_head[j] * (float)row[j];
         }
-        for (uint i = 0u; i < ROT_DIM; i++) {
-            dot_product += q_rope[i] * (float)row[N_LORA + i];
+        if (args.rotate_k_tail != 0u) {
+            // Upstream decode: theta = row_pos * 8e6^(-2t/64) on adjacent
+            // pairs of the raw tail, recomputed per row from the F16 cache.
+            const float row_position = (float)row_index;
+            for (uint pair = 0u; pair < ROT_DIM / 2u; pair++) {
+                const float theta = row_position *
+                    pow(8000000.0f, -2.0f * (float)pair / (float)ROT_DIM);
+                const float c = cos(theta);
+                const float sn = sin(theta);
+                const float x0 = (float)row[N_LORA + pair * 2u];
+                const float x1 = (float)row[N_LORA + pair * 2u + 1u];
+                dot_product += q_rope[pair * 2u] * (x0 * c - x1 * sn)
+                    + q_rope[pair * 2u + 1u] * (x0 * sn + x1 * c);
+            }
+        } else {
+            for (uint i = 0u; i < ROT_DIM; i++) {
+                dot_product += q_rope[i] * (float)row[N_LORA + i];
+            }
         }
         scores[s] = dot_product * args.scale;
     }
@@ -882,4 +903,28 @@ kernel void kernel_glm52_rope_tail_f32(
     const float x1 = tail[1];
     tail[0] = x0 * c - x1 * s;
     tail[1] = x0 * s + x1 * c;
+}
+
+// Rotate the n_rot-wide PREFIX of every head in place — the indexer-side
+// convention: upstream forces rot_offset = 0 for the 128-wide indexer
+// queries and keys, while the MLA query rotates its tail. Same adjacent-pair
+// linear GLM RoPE as the tail kernel; only the span origin differs.
+kernel void kernel_glm52_rope_prefix_f32(
+        constant ds4_metal_args_glm52_rope_tail &args,
+        device float *values,
+        uint tid [[thread_position_in_grid]]) {
+    constexpr float FREQ_BASE = 8000000.0f;
+    const uint pairs = args.n_rot / 2u;
+    if (tid >= args.n_head * pairs) return;
+    const uint head = tid / pairs;
+    const uint pair = tid % pairs;
+    device float *span = values + (uint64_t)head * args.head_dim + pair * 2u;
+    const float theta = (float)args.pos
+        * pow(FREQ_BASE, -2.0f * (float)pair / (float)args.n_rot);
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const float x0 = span[0];
+    const float x1 = span[1];
+    span[0] = x0 * c - x1 * s;
+    span[1] = x0 * s + x1 * c;
 }

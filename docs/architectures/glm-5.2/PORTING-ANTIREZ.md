@@ -34,11 +34,11 @@ utilizzabili come promessa prestazionale per questa app.
 | Lettura pesi | `pread` bounded su descrittori e piani top-8 e slot-cache LRU con pinning del batch e hit byte-identici; MetalIO da collegare |
 | Tokenizer/chat/tool | implementati con golden test sugli ID reali |
 | Router | oracle CPU e kernel Metal dedicato |
-| DSA/IndexShare | layout, policy, scorer/top-k CPU, primitive Metal, top-k GPU multi-blocco e RoPE della coda (query e K) |
+| DSA/IndexShare | layout, policy, scorer/top-k CPU, primitive Metal, top-k GPU multi-blocco, RoPE coda (query MLA) e prefisso (query/chiavi indexer), rotazione K per-riga all'attenzione |
 | Attenzione compatta | oracle CPU doppio (espanso vs assorbito) e kernel Metal staged qk_lowrank/indexed/value_project (F32 e Q8_0) confrontati con l'oracle |
 | FFN/MoE/output head | oracle CPU F32-ref, dequant K-quant di riferimento e kernel Metal di validazione per tutte le fasi (routed K-quant, denso/shared/output head Q8_0); famiglie ottimizzate per-quant mancanti |
 | Cache | planner F16 lazy; KV-LoRA norm/store e indexer-K norm/RoPE/store isolati |
-| Decoder | oracle CPU first-token e composizione GPU del layer (matvec quantizzate sui kernel validati, glue CPU) confrontata con l'oracle; grafo persistente, cache/prefill/decode mancanti |
+| Decoder | oracle CPU first-token E decode step (cablaggio esatto di `glm_graph_forward_token`: store cache prima di selezione/attenzione, fill-range/top-k con `visible = pos+1`, IndexShare verbatim), composizioni GPU di entrambi sui kernel validati confrontate con gli oracle; grafo persistente e prefill su prompt reali mancanti |
 
 ## Scelte deliberate diverse da upstream
 

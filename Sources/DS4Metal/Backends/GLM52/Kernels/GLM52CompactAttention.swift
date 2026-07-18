@@ -16,12 +16,16 @@ private struct GLM52CompactAttentionPlan {
 
     let rowCount: Int
     let selection: [UInt32]
+    /// Upstream decode semantics: the cache keeps RAW K-RoPE tails and the
+    /// kernel rotates each selected row with its own absolute position.
+    let rotateTailByRowPosition: Bool
 
     var geometry: GLM52AttentionGeometry { Self.geometry }
 
     init(query: [Float],
          cacheBits: [UInt16],
-         selection: [UInt32]) throws {
+         selection: [UInt32],
+         rotateTailByRowPosition: Bool = false) throws {
         let g = Self.geometry
         guard query.count == g.headCount * g.qkDimension else {
             throw MetalError.unsupported(
@@ -54,11 +58,13 @@ private struct GLM52CompactAttentionPlan {
         }
         self.rowCount = rowCount
         self.selection = selection
+        self.rotateTailByRowPosition = rotateTailByRowPosition
     }
 
     var arguments: [UInt32] {
         [UInt32(rowCount), UInt32(selection.count),
-         Self.geometry.scale.bitPattern, 0]
+         Self.geometry.scale.bitPattern,
+         rotateTailByRowPosition ? 1 : 0]
     }
 }
 
@@ -145,17 +151,22 @@ extension MetalRuntime {
     /// Stage 2 — softmax attention over the selected compact-cache rows,
     /// accumulated in the KV-LoRA domain: returns `attn_lora` as `[64][512]`,
     /// already divided by the clamped softmax denominator.
+    /// `rotateTailByRowPosition` is the decode semantics: raw cache tails,
+    /// rotated in the kernel with each selected row's own absolute position.
     public func glm52AttentionIndexed(qLow: [Float],
                                       query: [Float],
                                       cacheBits: [UInt16],
-                                      selection: [UInt32]) throws -> [Float] {
+                                      selection: [UInt32],
+                                      rotateTailByRowPosition: Bool = false)
+        throws -> [Float] {
         let g = GLM52AttentionGeometry.v5_2
         guard qLow.count == g.headCount * g.kvLoraRank else {
             throw MetalError.unsupported(
                 "GLM 5.2 attention q_low must be [\(g.headCount)][\(g.kvLoraRank)]")
         }
         let plan = try GLM52CompactAttentionPlan(
-            query: query, cacheBits: cacheBits, selection: selection)
+            query: query, cacheBits: cacheBits, selection: selection,
+            rotateTailByRowPosition: rotateTailByRowPosition)
         let outputCount = g.headCount * g.kvLoraRank
         let qLowBuffer = try glm52AttentionBuffer(qLow)
         let queryBuffer = try glm52AttentionBuffer(query)
@@ -219,12 +230,16 @@ extension MetalRuntime {
                                       keyB: [Float],
                                       valueB: [Float],
                                       cacheBits: [UInt16],
-                                      selection: [UInt32]) throws -> [Float] {
+                                      selection: [UInt32],
+                                      rotateTailByRowPosition: Bool = false)
+        throws -> [Float] {
         _ = try GLM52CompactAttentionPlan(
             query: query, cacheBits: cacheBits, selection: selection)
         let qLow = try glm52QKLowRank(query: query, keyB: keyB)
         let attnLora = try glm52AttentionIndexed(
-            qLow: qLow, query: query, cacheBits: cacheBits, selection: selection)
+            qLow: qLow, query: query, cacheBits: cacheBits,
+            selection: selection,
+            rotateTailByRowPosition: rotateTailByRowPosition)
         return try glm52ValueProject(attnLora: attnLora, valueB: valueB)
     }
 
@@ -309,12 +324,16 @@ extension MetalRuntime {
                                         keyBQ8: [UInt8],
                                         valueBQ8: [UInt8],
                                         cacheBits: [UInt16],
-                                        selection: [UInt32]) throws -> [Float] {
+                                        selection: [UInt32],
+                                        rotateTailByRowPosition: Bool = false)
+        throws -> [Float] {
         _ = try GLM52CompactAttentionPlan(
             query: query, cacheBits: cacheBits, selection: selection)
         let qLow = try glm52QKLowRankQ8(query: query, keyBQ8: keyBQ8)
         let attnLora = try glm52AttentionIndexed(
-            qLow: qLow, query: query, cacheBits: cacheBits, selection: selection)
+            qLow: qLow, query: query, cacheBits: cacheBits,
+            selection: selection,
+            rotateTailByRowPosition: rotateTailByRowPosition)
         return try glm52ValueProjectQ8(attnLora: attnLora, valueBQ8: valueBQ8)
     }
 }

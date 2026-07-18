@@ -76,9 +76,22 @@ extension MetalRuntime {
             mid: heads, downRows: attention.attnOutput,
             weightType: q8, outputWidth: g.embeddingWidth)
         let afterAttn = (0..<input.count).map { input[$0] + attnOut[$0] }
+        return try glm52LayerFFNStage(
+            geometry: g, afterAttention: afterAttn, ffnNorm: ffnNorm, ffn: ffn)
+    }
 
-        // FFN: CPU norm, GPU quantized blocks.
-        let ffnIn = try GLM52FFNCPUReference.rmsNorm(afterAttn, weight: ffnNorm)
+    /// The residual FFN half of a layer on GPU quantized blocks (CPU norm and
+    /// router glue), shared by the first-token and decode compositions.
+    func glm52LayerFFNStage(
+        geometry: GLM52LayerGeometry,
+        afterAttention: [Float],
+        ffnNorm: [Float],
+        ffn: GLM52QuantizedLayerFFN) throws
+        -> (output: [Float], routing: GLM52RouterOutput?) {
+        let g = geometry
+        let q8 = GLM52TensorSchema.q8_0
+        let ffnIn = try GLM52FFNCPUReference.rmsNorm(
+            afterAttention, weight: ffnNorm)
         let ffnOut: [Float]
         var routing: GLM52RouterOutput?
         switch ffn {
@@ -106,7 +119,8 @@ extension MetalRuntime {
                 hiddenWidth: g.expertHiddenWidth)
             ffnOut = (0..<routedOut.count).map { routedOut[$0] + sharedOut[$0] }
         }
-        return ((0..<input.count).map { afterAttn[$0] + ffnOut[$0] }, routing)
+        return ((0..<afterAttention.count).map { afterAttention[$0] + ffnOut[$0] },
+                routing)
     }
 
     /// The first-token forward chain on GPU matvecs: embedded token through

@@ -31,16 +31,23 @@ The currently validated atomic boundaries are:
   projections also exist as Q8_0 variants reading the GGUF weight bytes
   directly (34-byte blocks, scale outside the int8 product like upstream's
   `dot_q8_0_row_f32_ref`); their baseline is the F32 oracle on the
-  dequantized weights;
+  dequantized weights. `rotateTailByRowPosition` selects the decode tail
+  semantics: the compact cache keeps RAW K-RoPE tails and the kernel rotates
+  each selected row with the ROW's own absolute position at attention time
+  (upstream `kernel_glm_attention_indexed_decode`); without the flag the
+  tail is consumed as stored — the pre-rotated fixture path;
 - `GLM52IndexerTopK`: multi-block descending top-k over token-major score rows
   (the `ds4_gpu_indexer_topk_tensor` dispatch: per-block bitonic argsort, then
   iterative binary-search merges), reusing the vendored DeepSeek argsort
   kernels. Causal future rows arrive as `-INFINITY` scores and sink to the
   end; ties follow the bitonic network, not the oracle's lowest-index rule;
-- `GLM52RopeTail`: the linear GLM tail RoPE (adjacent pairs, freq base 8e6,
-  no YaRN — upstream `rope_tail_ext_inplace` with GLM constants) for the
-  per-head query tails and the single K row before its compact-cache store;
-  iterative-theta CPU oracle, closed-form-theta kernel, forward only;
+- `GLM52RopeTail`: the linear GLM RoPE (adjacent pairs, freq base 8e6, no
+  YaRN — upstream `rope_tail_ext_inplace` with GLM constants) in both span
+  conventions: `glm52RopeTail` rotates the LAST `n_rot` of each head (the
+  MLA query tails), `glm52RopePrefix` rotates the FIRST `n_rot` (the indexer
+  queries — upstream forces `rot_offset = 0` there). Iterative-theta CPU
+  oracle (`rotate`/`rotatePrefix`), closed-form-theta kernels, forward only
+  on GPU;
 - `GLM52MoE`: validation kernels for the quantized FFN matvec stages —
   fused gate/up SwiGLU (route weight on the mid, before down) and the down
   projection — reading Q8_0 and Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored

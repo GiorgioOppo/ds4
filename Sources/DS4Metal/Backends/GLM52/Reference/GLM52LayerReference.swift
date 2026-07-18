@@ -133,8 +133,20 @@ public enum GLM52LayerCPUReference {
         let attnOut = try firstTokenAttention(
             geometry: geometry, input: input, weights: attention)
         let afterAttn = (0..<input.count).map { input[$0] + attnOut[$0] }
+        return try ffnStage(geometry: geometry, afterAttention: afterAttn,
+                            ffnNorm: ffnNorm, ffn: ffn)
+    }
+
+    /// The residual FFN half of a layer, shared by the first-token and decode
+    /// paths: `out = afterAttention + ffn(rmsNorm(afterAttention))`.
+    static func ffnStage(
+        geometry: GLM52LayerGeometry,
+        afterAttention: [Float],
+        ffnNorm: [Float],
+        ffn: GLM52LayerFFNWeightsF32) throws
+        -> (output: [Float], routing: GLM52RouterOutput?) {
         let ffnIn = try GLM52FFNCPUReference.rmsNorm(
-            afterAttn, weight: ffnNorm)
+            afterAttention, weight: ffnNorm)
 
         let ffnOut: [Float]
         var routing: GLM52RouterOutput?
@@ -160,7 +172,8 @@ public enum GLM52LayerCPUReference {
                 sharedGate: shared.gate, sharedUp: shared.up,
                 sharedDown: shared.down)
         }
-        return ((0..<input.count).map { afterAttn[$0] + ffnOut[$0] }, routing)
+        return ((0..<afterAttention.count).map { afterAttention[$0] + ffnOut[$0] },
+                routing)
     }
 
     /// The first-token forward chain: the embedded token through every

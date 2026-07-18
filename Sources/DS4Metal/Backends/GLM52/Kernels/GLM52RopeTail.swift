@@ -16,29 +16,58 @@ public enum GLM52RopeTailReference {
                               rotationDimension: Int,
                               position: Int,
                               inverse: Bool = false) throws -> [Float] {
+        try rotateSpan(values: values, headCount: headCount,
+                       headDimension: headDimension,
+                       rotationDimension: rotationDimension,
+                       spanOffset: headDimension - rotationDimension,
+                       position: position, inverse: inverse)
+    }
+
+    /// The indexer-side convention: upstream forces rot_offset = 0 for the
+    /// 128-wide indexer queries and keys, so the rotated span is the head
+    /// PREFIX and the tail half is left untouched.
+    public static func rotatePrefix(values: [Float],
+                                    headCount: Int,
+                                    headDimension: Int,
+                                    rotationDimension: Int,
+                                    position: Int,
+                                    inverse: Bool = false) throws -> [Float] {
+        try rotateSpan(values: values, headCount: headCount,
+                       headDimension: headDimension,
+                       rotationDimension: rotationDimension,
+                       spanOffset: 0,
+                       position: position, inverse: inverse)
+    }
+
+    private static func rotateSpan(values: [Float],
+                                   headCount: Int,
+                                   headDimension: Int,
+                                   rotationDimension: Int,
+                                   spanOffset: Int,
+                                   position: Int,
+                                   inverse: Bool) throws -> [Float] {
         guard headCount > 0, rotationDimension > 0,
               rotationDimension.isMultiple(of: 2),
               rotationDimension <= headDimension,
               values.count == headCount * headDimension,
               position >= 0, position <= Int(UInt32.max) else {
             throw MetalError.unsupported(
-                "GLM 5.2 rope tail expects [\(headCount)][\(headDimension)] "
-                + "values with an even tail of \(rotationDimension)")
+                "GLM 5.2 rope expects [\(headCount)][\(headDimension)] "
+                + "values with an even rotated span of \(rotationDimension)")
         }
-        let nope = headDimension - rotationDimension
         let thetaScale = pow(frequencyBase, -2 / Float(rotationDimension))
         let sinSign: Float = inverse ? -1 : 1
         var output = values
         for head in 0..<headCount {
-            let tail = head * headDimension + nope
+            let span = head * headDimension + spanOffset
             var theta = Float(position)
             for i in stride(from: 0, to: rotationDimension, by: 2) {
                 let c = cos(theta)
                 let s = sinSign * sin(theta)
-                let x0 = output[tail + i]
-                let x1 = output[tail + i + 1]
-                output[tail + i] = x0 * c - x1 * s
-                output[tail + i + 1] = x0 * s + x1 * c
+                let x0 = output[span + i]
+                let x1 = output[span + i + 1]
+                output[span + i] = x0 * c - x1 * s
+                output[span + i + 1] = x0 * s + x1 * c
                 theta *= thetaScale
             }
         }
@@ -55,11 +84,39 @@ extension MetalRuntime {
                               headDimension: Int,
                               rotationDimension: Int,
                               position: Int) throws -> [Float] {
-        // Reuse the oracle's validation so both paths reject identically.
+        try glm52RopeDispatch(
+            pipelineName: "kernel_glm52_rope_tail_f32",
+            values: values, headCount: headCount,
+            headDimension: headDimension,
+            rotationDimension: rotationDimension, position: position)
+    }
+
+    /// Dispatch the prefix RoPE kernel (forward only) — the indexer query
+    /// convention with the rotated span at the head start.
+    public func glm52RopePrefix(values: [Float],
+                                headCount: Int,
+                                headDimension: Int,
+                                rotationDimension: Int,
+                                position: Int) throws -> [Float] {
+        try glm52RopeDispatch(
+            pipelineName: "kernel_glm52_rope_prefix_f32",
+            values: values, headCount: headCount,
+            headDimension: headDimension,
+            rotationDimension: rotationDimension, position: position)
+    }
+
+    private func glm52RopeDispatch(pipelineName: String,
+                                   values: [Float],
+                                   headCount: Int,
+                                   headDimension: Int,
+                                   rotationDimension: Int,
+                                   position: Int) throws -> [Float] {
+        // Reuse the oracle's validation so both paths reject identically;
+        // the position bound is part of that shared guard set.
         _ = try GLM52RopeTailReference.rotate(
             values: values, headCount: headCount,
             headDimension: headDimension,
-            rotationDimension: rotationDimension, position: 0)
+            rotationDimension: rotationDimension, position: position)
 
         guard let buffer = device.makeBuffer(
             bytes: values, length: values.count * MemoryLayout<Float>.stride,
@@ -72,7 +129,7 @@ extension MetalRuntime {
         arguments[2] = UInt32(rotationDimension)
         arguments[3] = UInt32(position)
 
-        let pipeline = try pipeline("kernel_glm52_rope_tail_f32")
+        let pipeline = try pipeline(pipelineName)
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw MetalError.bufferAlloc

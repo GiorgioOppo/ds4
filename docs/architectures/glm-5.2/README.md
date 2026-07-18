@@ -19,7 +19,7 @@ ancora selezionare GLM.
 | Tokenizer GPT-2 + pretokenizer `glm4` | sì |
 | Template chat, reasoning e tool XML nativi | sì |
 | Oracle CPU di router, DSA/IndexShare e cache compatta | sì |
-| Kernel Metal GLM | tutte le fasi come primitive validate; composizione GPU del layer first-token contro l'oracle |
+| Kernel Metal GLM | tutte le fasi come primitive validate; composizione GPU del layer first-token e del decode step contro gli oracle |
 | Prefill, decode e output logits end-to-end | no |
 | Selezione GUI o `DS4Demo` | no |
 | Server, benchmark, KV checkpoint e distribuzione | no |
@@ -85,7 +85,14 @@ La sequenza di abilitazione è vincolante:
    bounded (doppia prova dei limiti, rifiuto dei GGUF troncati all'apertura) e
    `GLM52ExpertSlotCache` fornisce la cache LRU per-esperto con hit
    byte-identici e pinning del batch; restano MetalIO e residency;
-2. completare Q/KV-LoRA, RoPE, indexer, attenzione DSA e IndexShare;
+2. completare Q/KV-LoRA, RoPE, indexer, attenzione DSA e IndexShare
+   — fatto a livello di validazione: il decode step è composto su GPU
+   (`glm52DecodeLayer`) con il cablaggio esatto upstream — store delle cache
+   PRIMA di selezione/attenzione (prefisso KV-LoRA normato + coda K-RoPE
+   grezza), chiave indexer con LayerNorm centrata e RoPE sul prefisso,
+   `visible = pos+1` con fill-range o score+top-k, IndexShare verbatim, e
+   rotazione della coda K per-riga al momento dell'attenzione — giudicato
+   dall'oracle `GLM52DecodeCPUReference`; manca il grafo persistente;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;
 5. verificare prefill e decode su prompt reali, incluse chat e tool call;
