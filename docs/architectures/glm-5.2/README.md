@@ -19,7 +19,7 @@ ancora selezionare GLM.
 | Tokenizer GPT-2 + pretokenizer `glm4` | sì |
 | Template chat, reasoning e tool XML nativi | sì |
 | Oracle CPU di router, DSA/IndexShare e cache compatta | sì |
-| Kernel Metal GLM | parziali e non collegati a un decoder |
+| Kernel Metal GLM | tutte le fasi come primitive validate; composizione GPU del layer first-token contro l'oracle |
 | Prefill, decode e output logits end-to-end | no |
 | Selezione GUI o `DS4Demo` | no |
 | Server, benchmark, KV checkpoint e distribuzione | no |
