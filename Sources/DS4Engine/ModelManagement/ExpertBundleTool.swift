@@ -34,9 +34,8 @@ public enum ExpertBundleTool {
                 let summary = try GLM52LayerQuantSidecar.buildAvailable(
                     directory: directory, weightMap: map, reader: reader,
                     legacyBundleDirectory: legacyBundles) { layer, built in
-                    FileHandle.standardError.write(Data(
-                        ("DS4 expbundle: GLM pack blk\(layer) "
-                         + (built ? "creato" : "già valido") + "\n").utf8))
+                    DS4Log.info("expbundle", "GLM pack blk\(layer) "
+                        + (built ? "creato" : "già valido"))
                 }
                 var outcome = "Sidecar GLM unificati in \(directory): "
                     + "\(summary.created) creati, "

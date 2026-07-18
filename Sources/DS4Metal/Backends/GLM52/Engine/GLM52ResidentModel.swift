@@ -358,10 +358,9 @@ public final class GLM52ResidentModel {
         }
         streamedLayers = streamed
         if !sidecarReaders.isEmpty {
-            FileHandle.standardError.write(Data(
-                ("DS4 glm: sidecar Q4 layer attivo su \(sidecarReaders.count)"
-                 + "/\(streamed.count) layer streamati "
-                 + "(\(unifiedExpertLayers) con esperti unificati)\n").utf8))
+            DS4Log.info("glm", "sidecar Q4 layer attivo su "
+                + "\(sidecarReaders.count)/\(streamed.count) layer "
+                + "streamati (\(unifiedExpertLayers) con esperti unificati)")
         }
         // The template always sizes the indexer slots (every layer stores
         // indexer tensors in the schema, so the descriptors exist even for
@@ -641,8 +640,7 @@ public final class GLM52ResidentModel {
             .reduce(UInt64(0)) { total, counts in
                 total + counts.reduce(UInt64(0)) { $0 + UInt64($1) }
             }
-        FileHandle.standardError.write(Data(
-            "DS4 glm: usage profile caricato (\(routes) route)\n".utf8))
+        DS4Log.info("glm", "usage profile caricato (\(routes) route)")
     }
 
     // MARK: - Disk KV checkpoints

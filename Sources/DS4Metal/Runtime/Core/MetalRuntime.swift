@@ -46,6 +46,9 @@ public final class MetalRuntime {
     /// compilation). Architecture-owned additions such as `glm52` remain
     /// separate from the DeepSeek source even though Metal compiles one library.
     public static let kernelFiles = [
+        // metal/common/ apre l'ordine: le tabelle condivise (griglie IQ2)
+        // devono precedere ogni kernel che le usa, DeepSeek e GLM.
+        "quant_tables",
         "flash_attn", "dense", "moe", "dsv4_hc", "unary", "dsv4_kv", "dsv4_rope",
         "dsv4_misc", "glm52", "argsort", "cpy", "concat", "get_rows", "sum_rows",
         "softmax", "repeat", "glu", "norm", "bin", "set_rows",
@@ -101,7 +104,7 @@ public final class MetalRuntime {
     /// Architecture subdirectories of the vendored metal/ folder, searched in
     /// order by the on-disk loader. The flat legacy layout stays accepted so an
     /// older checkout keeps working.
-    public static let kernelSubdirectories = ["deepseek", "glm5.2", ""]
+    public static let kernelSubdirectories = ["common", "deepseek", "glm5.2", ""]
 
     /// Build the full kernel source: the ds4_metal.m prelude plus every vendored
     /// kernel file, concatenated in order.

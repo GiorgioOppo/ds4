@@ -2,18 +2,20 @@
 # Regenerate Sources/DS4Metal/Runtime/Generated/KernelSources.swift from the vendored kernels —
 # embeds the kernel sources in the binary so MetalRuntime() needs no on-disk
 # kernel folder. metal/ stays the source of truth; this file is generated.
-# Kernels are grouped by architecture: metal/deepseek/ (DeepSeek V4 plus the
-# shared generic ops) and metal/glm5.2/ (GLM 5.2). The embedded key stays the
-# file basename. Keep the order in sync with MetalRuntime.kernelFiles.
+# Kernels are grouped by architecture: metal/common/ (shared quant tables and
+# helpers — FIRST in the order so its symbols are visible to every backend),
+# metal/deepseek/ (DeepSeek V4 plus the shared generic ops) and metal/glm5.2/
+# (GLM 5.2). The embedded key stays the file basename. Keep the order in sync
+# with MetalRuntime.kernelFiles.
 set -e
 cd "$(dirname "$0")/.."
 out=Sources/DS4Metal/Runtime/Generated/KernelSources.swift
-order="flash_attn dense moe dsv4_hc unary dsv4_kv dsv4_rope dsv4_misc glm52 argsort cpy concat get_rows sum_rows softmax repeat glu norm bin set_rows"
+order="quant_tables flash_attn dense moe dsv4_hc unary dsv4_kv dsv4_rope dsv4_misc glm52 argsort cpy concat get_rows sum_rows softmax repeat glu norm bin set_rows"
 
 # Resolve a kernel name to its file: architecture subdirectories first, then
 # the flat legacy location.
 kernel_path() {
-  for candidate in "metal/deepseek/$1.metal" "metal/glm5.2/$1.metal" "metal/$1.metal"; do
+  for candidate in "metal/common/$1.metal" "metal/deepseek/$1.metal" "metal/glm5.2/$1.metal" "metal/$1.metal"; do
     if [ -f "$candidate" ]; then
       echo "$candidate"
       return 0

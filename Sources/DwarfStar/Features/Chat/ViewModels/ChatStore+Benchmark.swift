@@ -170,8 +170,7 @@ extension ChatStore {
                     contextTokens, numbers.prefillTps,
                     genTokens, numbers.genTps)
                 benchResults = summary + "\n" + numbers.report
-                FileHandle.standardError.write(Data(
-                    ("DS4 bench GLM: " + summary + "\n").utf8))
+                DS4Log.info("bench", "GLM " + summary)
                 benchStatus = "Fatto: " + summary
                 benchSucceeded = true
             } catch is CancellationError {
