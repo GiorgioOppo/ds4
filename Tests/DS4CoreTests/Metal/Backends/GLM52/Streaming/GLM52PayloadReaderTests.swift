@@ -64,7 +64,7 @@ final class GLM52PayloadReaderTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("glm52-payload-\(UUID().uuidString).bin")
         var data = Data(count: byteCount)
-        data.withUnsafeMutableBytes { raw in
+        data.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             for i in 0..<byteCount { raw[i] = patternByte(i) }
         }
         try data.write(to: url)
