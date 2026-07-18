@@ -96,7 +96,7 @@ final class GLM52DSAChainTests: XCTestCase {
             headWeights: f.headWeights,
             keyCacheBits: f.indexerKeyBits,
             pos0: rowCount - 1)
-        let oracleSelection = try GLM52IndexerReference.causalTopK(
+        let oracleSelection = try GLM52IndexerCPUReference.causalTopK(
             scores: oracleScores.scores,
             queryPosition: rowCount - 1,
             topK: topK)

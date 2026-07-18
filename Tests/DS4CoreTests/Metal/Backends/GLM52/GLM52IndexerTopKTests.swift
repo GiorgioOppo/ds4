@@ -3,7 +3,7 @@ import XCTest
 @testable import DS4Metal
 
 /// The multi-block GPU top-k must reproduce the CPU oracle
-/// (`GLM52IndexerReference.causalTopK`) on distinct scores — single-pass and
+/// (`GLM52IndexerCPUReference.causalTopK`) on distinct scores — single-pass and
 /// merge path — and must never select causal -infinity rows. Distinct scores
 /// sidestep the one intended divergence: the bitonic network does not promise
 /// the oracle's lowest-index tie order.
@@ -36,7 +36,7 @@ final class GLM52IndexerTopKTests: XCTestCase {
 
         let gpu = try runtime.glm52IndexerTopK(
             scores: scores, rowCount: rowCount, tokenCount: 1, topK: topK)
-        let oracle = try GLM52IndexerReference.causalTopK(
+        let oracle = try GLM52IndexerCPUReference.causalTopK(
             scores: scores, queryPosition: rowCount - 1, topK: topK)
 
         XCTAssertEqual(gpu.map(Int.init), oracle)
@@ -61,7 +61,7 @@ final class GLM52IndexerTopKTests: XCTestCase {
 
         for token in 0..<tokenCount {
             let row = Array(scores[token * rowCount..<(token + 1) * rowCount])
-            let oracle = try GLM52IndexerReference.causalTopK(
+            let oracle = try GLM52IndexerCPUReference.causalTopK(
                 scores: row, queryPosition: rowCount - 1, topK: topK)
             XCTAssertEqual(
                 Array(gpu[token * topK..<(token + 1) * topK]).map(Int.init),
@@ -84,7 +84,7 @@ final class GLM52IndexerTopKTests: XCTestCase {
         XCTAssertTrue(gpu.allSatisfy { Int($0) < visible },
                       "selected a causal future row: \(gpu)")
 
-        let oracle = try GLM52IndexerReference.causalTopK(
+        let oracle = try GLM52IndexerCPUReference.causalTopK(
             scores: Array(scores[0..<visible]),
             queryPosition: visible - 1,
             topK: topK)
