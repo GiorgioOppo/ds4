@@ -27,21 +27,25 @@ public enum ExpertBundleTool {
                 let directory = ProcessInfo.processInfo
                     .environment["DS4_GLM_BUNDLE_DIR"]
                     ?? (modelPath + ".glm-experts")
-                let shape = map.configuration.shape
-                let sparse = Int(shape.nLeadingDense)..<Int(shape.inferenceLayerCount)
-                var created = 0
-                var skipped = 0
-                for layer in sparse {
-                    let built = try GLM52ExpertBundle.build(
-                        directory: directory, layer: layer,
-                        weightMap: map, reader: reader)
-                    if built { created += 1 } else { skipped += 1 }
+                let summary = try GLM52ExpertBundle.buildAvailable(
+                    directory: directory, weightMap: map,
+                    reader: reader) { layer, built in
                     FileHandle.standardError.write(Data(
                         ("DS4 expbundle: GLM blk\(layer) "
-                         + "(\(created + skipped)/\(sparse.count))\n").utf8))
+                         + (built ? "creato" : "già valido") + "\n").utf8))
                 }
-                return "Bundle GLM pronti in \(directory): "
-                    + "\(created) creati, \(skipped) già validi."
+                var outcome = "Bundle GLM in \(directory): "
+                    + "\(summary.created) creati, "
+                    + "\(summary.alreadyValid) già validi"
+                if summary.remaining > 0 {
+                    outcome += ", \(summary.remaining) mancanti (serviti dal "
+                        + "GGUF)"
+                }
+                if let reason = summary.stoppedBecause {
+                    outcome += " — interrotto: \(reason). Libera spazio e "
+                        + "ripremi per continuare."
+                }
+                return outcome + "."
             }
             let geometry = DSV4RuntimeGeometry(configuration: try ModelConfig(model: model))
             var dims = geometry.dims

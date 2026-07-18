@@ -165,21 +165,25 @@ do {
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: ggufPath,
                                                     weightMap: map)
-                let shape = map.configuration.shape
                 let start = Date()
-                for layer in Int(shape.nLeadingDense)..<Int(shape.inferenceLayerCount) {
-                    let built = try GLM52ExpertBundle.build(
-                        directory: bundleDir, layer: layer,
-                        weightMap: map, reader: reader) { done, total in
-                        if done % 64 == 0 {
-                            log("DS4Demo: bundle blk\(layer): \(done)/\(total)")
-                        }
-                    }
+                // Parziale-friendly: DS4_GLM_BUNDLE_LAYERS limita i bundle
+                // nuovi; senza limite si ferma comunque con grazia quando
+                // lo spazio scende sotto la riserva. I layer senza bundle
+                // continuano a servire dal GGUF.
+                let summary = try GLM52ExpertBundle.buildAvailable(
+                    directory: bundleDir, weightMap: map, reader: reader,
+                    maxNewBundles: environment["DS4_GLM_BUNDLE_LAYERS"]
+                        .flatMap(Int.init)) { layer, built in
                     log("DS4Demo: bundle blk\(layer) "
                         + (built ? "creato" : "già valido"))
                 }
-                log(String(format: "DS4Demo: bundle completati in %.0f s in %@",
-                           Date().timeIntervalSince(start), bundleDir))
+                log(String(
+                    format: "DS4Demo: bundle in %.0f s — %d creati, "
+                        + "%d già validi, %d mancanti%@ (dir %@)",
+                    Date().timeIntervalSince(start), summary.created,
+                    summary.alreadyValid, summary.remaining,
+                    summary.stoppedBecause.map { " — stop: \($0)" } ?? "",
+                    bundleDir))
                 exit(0)
             }
 

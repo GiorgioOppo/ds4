@@ -173,6 +173,76 @@ public final class GLM52ExpertBundle {
                   reader: reader, progress: progress)
     }
 
+    public struct BuildSummary: Sendable {
+        public let created: Int
+        public let alreadyValid: Int
+        public let remaining: Int
+        /// Non-nil when the run stopped early (disk space / layer cap).
+        public let stoppedBecause: String?
+    }
+
+    /// PARTIAL-friendly bulk build: bundles are per layer and the provider
+    /// falls back to the GGUF wherever one is missing, so ANY prefix of
+    /// bundles is useful (each covers 1/75 of the per-token expert seeks).
+    /// This walks the sparse layers and stops GRACEFULLY — never mid-file —
+    /// when the free space would drop under `minFreeBytes` (default 8 GiB)
+    /// or after `maxNewBundles` fresh builds; a partially written .part is
+    /// removed on error. Rerunning resumes where it stopped.
+    public static func buildAvailable(directory: String,
+                                      weightMap: GLM52WeightMap,
+                                      reader: GLM52PayloadReader,
+                                      maxNewBundles: Int? = nil,
+                                      minFreeBytes: UInt64 = 8 << 30,
+                                      layerProgress: ((Int, Bool) -> Void)?
+                                          = nil) throws -> BuildSummary {
+        let shape = weightMap.configuration.shape
+        let sparse = Int(shape.nLeadingDense)..<Int(shape.inferenceLayerCount)
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true)
+        var created = 0
+        var valid = 0
+        var stopped: String?
+        for layer in sparse {
+            if let cap = maxNewBundles, created >= cap {
+                stopped = "raggiunto il limite di \(cap) bundle nuovi"
+                break
+            }
+            let weights = try weightMap.routedExperts(layer: layer)
+            let perLayer = weights.gate.bytes + weights.up.bytes
+                + weights.down.bytes
+            let free = ((try? FileManager.default.attributesOfFileSystem(
+                forPath: directory))?[.systemFreeSize] as? UInt64) ?? 0
+            let existing = (try? open(
+                directory: directory, layer: layer, weights: weights,
+                expertCount: Int(shape.nExpert),
+                sourceFileSize: reader.fileSize)) ?? nil
+            if existing == nil, free < perLayer + minFreeBytes {
+                stopped = "spazio disco insufficiente (liberi "
+                    + "\(free >> 30) GiB, servono "
+                    + "\((perLayer + minFreeBytes) >> 30) GiB)"
+                break
+            }
+            do {
+                let built = try build(
+                    directory: directory, layer: layer,
+                    weights: weights, expertCount: Int(shape.nExpert),
+                    reader: reader)
+                if built { created += 1 } else { valid += 1 }
+                layerProgress?(layer, built)
+            } catch {
+                try? FileManager.default.removeItem(
+                    atPath: path(directory: directory, layer: layer)
+                        + ".part")
+                stopped = "errore su blk\(layer): \(error)"
+                break
+            }
+        }
+        return BuildSummary(
+            created: created, alreadyValid: valid,
+            remaining: sparse.count - created - valid,
+            stoppedBecause: stopped)
+    }
+
     /// Build one layer's bundle (skip if a valid one exists). Atomic:
     /// written to `.part`, fsynced, then renamed. Returns whether a build
     /// happened (false = valid bundle already present).
