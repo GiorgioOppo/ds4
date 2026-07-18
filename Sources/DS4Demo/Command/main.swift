@@ -138,6 +138,7 @@ do {
             // DS4_GLM_EXPERT_SLOTS (slot cache esperti per layer sparse).
             let environment = ProcessInfo.processInfo.environment
             var glmOptions = GLM52ResidentModelOptions()
+            glmOptions.cacheCapacity = maxKeys
             glmOptions.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
                 .flatMap(Int.init)
                 ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
@@ -146,6 +147,12 @@ do {
             if let slots = environment["DS4_GLM_EXPERT_SLOTS"]
                 .flatMap(Int.init) {
                 glmOptions.expertSlotCount = slots
+            }
+            // DS4_GLM_STREAM_SLOTS: slot di staging del layer streamer
+            // (default 3 = due fill SSD in volo mentre un layer computa).
+            if let slots = environment["DS4_GLM_STREAM_SLOTS"]
+                .flatMap(Int.init) {
+                glmOptions.streamSlotCount = slots
             }
             if let resident = glmOptions.residentLayerCount {
                 log("DS4Demo: GLM streaming — \(resident) layer residenti, "
@@ -185,6 +192,35 @@ do {
                     summary.alreadyValid, summary.remaining,
                     summary.stoppedBecause.map { " — stop: \($0)" } ?? "",
                     bundleDir))
+                exit(0)
+            }
+            // Prepass sidecar Q4 layer: DS4_GLM_BUILD_LAYERQ4=1 riquantizza
+            // Q8_0→Q4_K i tensori grossi streamati di ogni layer sparse
+            // (~metà dei byte SSD per token; perdita di qualità contenuta e
+            // dichiarata). DS4_GLM_LAYERQ4_LAYERS è il tetto sui sidecar
+            // TOTALI (come i bundle); parziale-friendly: i layer senza
+            // sidecar streammano Q8 dal GGUF.
+            if environment["DS4_GLM_BUILD_LAYERQ4"] == "1" {
+                let sidecarDir = environment["DS4_GLM_LAYERQ4_DIR"]
+                    ?? (ggufPath + ".glm-layers-q4")
+                let map = try GLM52WeightMap(model: model)
+                let reader = try GLM52PayloadReader(path: ggufPath,
+                                                    weightMap: map)
+                let start = Date()
+                let summary = try GLM52LayerQuantSidecar.buildAvailable(
+                    directory: sidecarDir, weightMap: map, reader: reader,
+                    maxSidecars: environment["DS4_GLM_LAYERQ4_LAYERS"]
+                        .flatMap(Int.init)) { layer, built in
+                    log("DS4Demo: layerq4 blk\(layer) "
+                        + (built ? "creato" : "già valido"))
+                }
+                log(String(
+                    format: "DS4Demo: layerq4 in %.0f s — %d creati, "
+                        + "%d già validi, %d mancanti%@ (dir %@)",
+                    Date().timeIntervalSince(start), summary.created,
+                    summary.alreadyValid, summary.remaining,
+                    summary.stoppedBecause.map { " — stop: \($0)" } ?? "",
+                    sidecarDir))
                 exit(0)
             }
 

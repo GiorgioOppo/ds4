@@ -30,6 +30,10 @@ public struct GLM52ResidentModelOptions: Sendable {
     /// Cap on routed experts executed per token (rank order, weights
     /// untouched): less expert I/O, lower quality. nil runs the full top-8.
     public var activeExperts: Int?
+    /// Staging slots of the layer streamer (min 2). With N slots, N-1
+    /// prefetch fills run CONCURRENTLY while one slot computes — deeper SSD
+    /// queue on the dominant stream at ~250 MiB of RAM per extra slot.
+    public var streamSlotCount: Int
 
     /// RAM-adaptive resident budget: half the physical memory minus a 6 GiB
     /// reserve (output head, dense layers, caches, staging, OS), at ~230 MiB
@@ -49,12 +53,14 @@ public struct GLM52ResidentModelOptions: Sendable {
                 cacheCapacity: Int = 4_096,
                 expertSlotCount: Int = 16,
                 residentLayerCount: Int? = nil,
-                activeExperts: Int? = nil) {
+                activeExperts: Int? = nil,
+                streamSlotCount: Int = 3) {
         self.layerCount = layerCount
         self.cacheCapacity = cacheCapacity
         self.expertSlotCount = expertSlotCount
         self.residentLayerCount = residentLayerCount
         self.activeExperts = activeExperts
+        self.streamSlotCount = max(2, streamSlotCount)
     }
 }
 
@@ -79,6 +85,24 @@ public final class GLM52ResidentModel {
         let routerBias: [Float]
         let provider: GLM52StreamedExpertProvider
         let caches: GLM52ResidentDecodeCaches
+
+        /// Kernel weight types straight from the descriptors — Q8_0 on the
+        /// GGUF path, the requantized types when a Q4_K sidecar serves the
+        /// layer.
+        var weightTypes: GLM52StreamedWeightTypes {
+            var types = GLM52StreamedWeightTypes()
+            types.qA = tensors.qA.type
+            types.qB = tensors.qB.type
+            types.kvA = tensors.kvA.type
+            types.attnOutput = tensors.attnOutput.type
+            if let key = tensors.indexerKey { types.indexerKey = key.type }
+            if let queryB = tensors.indexerQueryB {
+                types.indexerQueryB = queryB.type
+            }
+            types.sharedGateUp = tensors.sharedGate.type
+            types.sharedDown = tensors.sharedDown.type
+            return types
+        }
     }
 
     private let runtime: MetalRuntime
@@ -96,6 +120,8 @@ public final class GLM52ResidentModel {
     private let vocabulary: Int
     private let embeddingWidth: Int
     private let counters: GLM52StreamingCounters
+    /// Prefetches kept in flight on the layer streamer (slots - 1).
+    private let prefetchDepth: Int
     /// Per-layer staged zero-copy expert fetch (shared staging buffer,
     /// concurrent reads); layers whose record layout cannot be offset-bound
     /// are simply absent and keep the copying provider path.
@@ -230,9 +256,15 @@ public final class GLM52ResidentModel {
         stack = layers
 
         // Streamed tail: sparse layers whose big tensors arrive per token
-        // through the double-buffered staging slots. Small per-layer state
-        // (norms, router, proj, caches) stays resident.
+        // through the concurrent staging slots. Small per-layer state
+        // (norms, router, proj, caches) stays resident. Layers with a valid
+        // Q4_K sidecar (convenzione: accanto al GGUF, DS4_GLM_LAYERQ4_DIR
+        // per spostarlo) stream the requantized tensors — about half the
+        // bytes; the others stream Q8_0 from the GGUF.
         LoadProgress.shared.set(0.82, "GLM: stato streaming per layer")
+        let layerQ4Directory = ProcessInfo.processInfo
+            .environment["DS4_GLM_LAYERQ4_DIR"] ?? (path + ".glm-layers-q4")
+        var sidecarReaders: [Int: GLM52PayloadReader] = [:]
         var streamed: [StreamedLayer] = []
         for index in residentCount..<count {
             let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(
@@ -242,8 +274,13 @@ public final class GLM52ResidentModel {
                 slotCount: options.expertSlotCount,
                 bundleDirectory: bundleDirectory)
             providers[index] = provider
-            let tensors = try GLM52StreamedLayerTensors(
+            let ggufTensors = try GLM52StreamedLayerTensors(
                 index: index, map: map, fullIndexer: isFull)
+            let sidecar = try GLM52LayerQuantSidecar.open(
+                directory: layerQ4Directory, layer: index,
+                source: ggufTensors, sourceFileSize: reader.fileSize)
+            if let sidecar { sidecarReaders[index] = sidecar.reader }
+            let tensors = sidecar?.tensors ?? ggufTensors
             streamed.append(StreamedLayer(
                 tensors: tensors,
                 bigTensorBytes: tensors.all.reduce(0) {
@@ -271,14 +308,23 @@ public final class GLM52ResidentModel {
                     capacity: options.cacheCapacity, fullIndexer: isFull)))
         }
         streamedLayers = streamed
+        if !sidecarReaders.isEmpty {
+            FileHandle.standardError.write(Data(
+                ("DS4 glm: sidecar Q4 layer attivo su \(sidecarReaders.count)"
+                 + "/\(streamed.count) layer streamati\n").utf8))
+        }
         // The template always sizes the indexer slots (every layer stores
         // indexer tensors in the schema, so the descriptors exist even for
-        // IndexShare layers).
+        // IndexShare layers) and always uses the FULL Q8_0 GGUF sizes —
+        // sidecar tensors are smaller and share the same slots.
         streamer = streamed.isEmpty ? nil : try GLM52LayerStreamer(
             runtime: runtime, reader: reader,
             template: try GLM52StreamedLayerTensors(
                 index: streamed[0].tensors.index, map: map,
-                fullIndexer: true))
+                fullIndexer: true),
+            slotCount: options.streamSlotCount,
+            sidecarReaders: sidecarReaders)
+        prefetchDepth = max(1, options.streamSlotCount - 1)
 
         self.providers = providers
         scratch = try GLM52DecodeScratch(
@@ -381,8 +427,10 @@ public final class GLM52ResidentModel {
         var lastSelection: (source: Int, rows: [UInt32])?
         counters.tokens += 1
 
-        if let streamer, let first = streamedLayers.first {
-            streamer.prefetch(first.tensors)
+        if let streamer {
+            for ahead in 0..<min(prefetchDepth, streamedLayers.count) {
+                streamer.prefetch(streamedLayers[ahead].tensors)
+            }
         }
         func reuse(for index: Int, isFull: Bool) throws -> [UInt32]? {
             if isFull { return nil }
@@ -411,8 +459,9 @@ public final class GLM52ResidentModel {
             let buffers = try streamer!.wait(for: index)
             counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
             counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
-            if rank + 1 < streamedLayers.count {
-                streamer!.prefetch(streamedLayers[rank + 1].tensors)
+            if rank + prefetchDepth < streamedLayers.count {
+                streamer!.prefetch(
+                    streamedLayers[rank + prefetchDepth].tensors)
             }
             let isFull = streamedLayer.proj != nil
             let weights = GLM52ResidentDecodeWeights(
@@ -427,7 +476,8 @@ public final class GLM52ResidentModel {
                     keyNorm: streamedLayer.indexerKeyNorm!,
                     keyNormBias: streamedLayer.indexerKeyNormBias!,
                     queryB: buffers.indexerQueryB,
-                    proj: streamedLayer.proj!) : nil)
+                    proj: streamedLayer.proj!) : nil,
+                types: streamedLayer.weightTypes)
             let ffn = GLM52ResidentFFN(
                 ffnNorm: streamedLayer.ffnNorm,
                 kind: .sparse(
@@ -440,6 +490,8 @@ public final class GLM52ResidentModel {
                         try provider.expert($0)
                     }))
             ffn.stagedSelection = stagedFetch[index]
+            ffn.sharedWeightTypes = (streamedLayer.tensors.sharedGate.type,
+                                     streamedLayer.tensors.sharedDown.type)
             let result = try runtime.glm52ChainedDecodeLayer(
                 weights: weights, ffn: ffn, caches: streamedLayer.caches,
                 scratch: scratch,
@@ -506,8 +558,10 @@ public final class GLM52ResidentModel {
             }
         }
 
-        if let streamer, let first = streamedLayers.first {
-            streamer.prefetch(first.tensors)
+        if let streamer {
+            for ahead in 0..<min(prefetchDepth, streamedLayers.count) {
+                streamer.prefetch(streamedLayers[ahead].tensors)
+            }
         }
         for layer in stack {
             try sweep(index: layer.index,
@@ -522,8 +576,9 @@ public final class GLM52ResidentModel {
             let buffers = try streamer!.wait(for: index)
             counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
             counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
-            if rank + 1 < streamedLayers.count {
-                streamer!.prefetch(streamedLayers[rank + 1].tensors)
+            if rank + prefetchDepth < streamedLayers.count {
+                streamer!.prefetch(
+                    streamedLayers[rank + prefetchDepth].tensors)
             }
             let isFull = streamedLayer.proj != nil
             let weights = GLM52ResidentDecodeWeights(
@@ -538,7 +593,8 @@ public final class GLM52ResidentModel {
                     keyNorm: streamedLayer.indexerKeyNorm!,
                     keyNormBias: streamedLayer.indexerKeyNormBias!,
                     queryB: buffers.indexerQueryB,
-                    proj: streamedLayer.proj!) : nil)
+                    proj: streamedLayer.proj!) : nil,
+                types: streamedLayer.weightTypes)
             let ffn = GLM52ResidentFFN(
                 ffnNorm: streamedLayer.ffnNorm,
                 kind: .sparse(
@@ -551,6 +607,8 @@ public final class GLM52ResidentModel {
                         try provider.expert($0)
                     }))
             ffn.stagedSelection = stagedFetch[index]
+            ffn.sharedWeightTypes = (streamedLayer.tensors.sharedGate.type,
+                                     streamedLayer.tensors.sharedDown.type)
             try sweep(index: index, isFull: isFull, weights: weights,
                       ffn: ffn, caches: streamedLayer.caches)
         }

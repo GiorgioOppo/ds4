@@ -42,6 +42,10 @@ public actor GLM52ChatService {
         if let slots = environment["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {
             options.expertSlotCount = slots
         }
+        if let slots = environment["DS4_GLM_STREAM_SLOTS"]
+            .flatMap(Int.init) {
+            options.streamSlotCount = slots
+        }
         service = try GLM52InferenceService(modelPath: modelPath,
                                             options: options)
         self.contextSize = max(256, contextSize)

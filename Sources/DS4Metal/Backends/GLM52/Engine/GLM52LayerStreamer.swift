@@ -14,6 +14,9 @@ import Metal
 /// The streamable big-tensor descriptors of one sparse layer.
 public struct GLM52StreamedLayerTensors: Sendable {
     public let index: Int
+    /// True when the descriptors point into a Q4_K layer sidecar file (the
+    /// streamer then reads through that layer's sidecar reader).
+    public let fromSidecar: Bool
     let qA: GLM52WeightDescriptor
     let qB: GLM52WeightDescriptor
     let kvA: GLM52WeightDescriptor
@@ -28,6 +31,7 @@ public struct GLM52StreamedLayerTensors: Sendable {
 
     init(index: Int, map: GLM52WeightMap, fullIndexer: Bool) throws {
         self.index = index
+        fromSidecar = false
         qA = try map.layer(index, .attentionQueryA)
         qB = try map.layer(index, .attentionQueryB)
         kvA = try map.layer(index, .attentionKVA)
@@ -39,6 +43,32 @@ public struct GLM52StreamedLayerTensors: Sendable {
         sharedGate = try map.layer(index, .sharedGate)
         sharedUp = try map.layer(index, .sharedUp)
         sharedDown = try map.layer(index, .sharedDown)
+    }
+
+    /// Synthetic view built by the layer sidecar (descriptors carry the
+    /// requantized types and sidecar-file offsets).
+    init(index: Int, fromSidecar: Bool,
+         qA: GLM52WeightDescriptor, qB: GLM52WeightDescriptor,
+         kvA: GLM52WeightDescriptor, keyB: GLM52WeightDescriptor,
+         valueB: GLM52WeightDescriptor, attnOutput: GLM52WeightDescriptor,
+         indexerKey: GLM52WeightDescriptor?,
+         indexerQueryB: GLM52WeightDescriptor?,
+         sharedGate: GLM52WeightDescriptor,
+         sharedUp: GLM52WeightDescriptor,
+         sharedDown: GLM52WeightDescriptor) {
+        self.index = index
+        self.fromSidecar = fromSidecar
+        self.qA = qA
+        self.qB = qB
+        self.kvA = kvA
+        self.keyB = keyB
+        self.valueB = valueB
+        self.attnOutput = attnOutput
+        self.indexerKey = indexerKey
+        self.indexerQueryB = indexerQueryB
+        self.sharedGate = sharedGate
+        self.sharedUp = sharedUp
+        self.sharedDown = sharedDown
     }
 
     var all: [GLM52WeightDescriptor] {
@@ -73,18 +103,39 @@ public final class GLM52LayerStreamer {
     }
 
     private let reader: GLM52PayloadReader
+    /// Per-layer sidecar readers (Q4_K layer files); layers absent here
+    /// stream from the main GGUF.
+    private let sidecarReaders: [Int: GLM52PayloadReader]
     private let slots: [Slot]
     private var nextSlot = 0
     private var pending: [Slot] = []
+    /// CONCURRENT on purpose: with 3+ slots two layers' fills overlap,
+    /// doubling the SSD queue depth of the dominant stream. Ordering is
+    /// preserved by the pending FIFO plus per-slot semaphores.
     private let fillQueue = DispatchQueue(
-        label: "glm52.layer.streamer", qos: .userInitiated)
+        label: "glm52.layer.streamer", qos: .userInitiated,
+        attributes: .concurrent)
     private let stateLock = NSLock()
     /// Optional Metal fast-resource-loading path (DS4_GLM_MTLIO=1): SSD →
     /// MTLBuffer without the CPU pread copy, mirroring the DeepSeek
-    /// ExpertBundle backend. Any failure permanently falls back to pread —
-    /// only touched from the serial fill queue after init.
+    /// ExpertBundle backend. Any failure permanently falls back to pread.
+    /// Guarded by `stateLock` (fills are concurrent); serves the MAIN GGUF
+    /// only — sidecar layers read via pread.
     private var metalIO: (queue: MTLIOCommandQueue,
                           handle: MTLIOFileHandle)?
+
+    private func metalIOSnapshot() -> (queue: MTLIOCommandQueue,
+                                       handle: MTLIOFileHandle)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return metalIO
+    }
+
+    private func disableMetalIO() {
+        stateLock.lock()
+        metalIO = nil
+        stateLock.unlock()
+    }
 
     private static func makeMetalIO(runtime: MetalRuntime, path: String)
         -> (queue: MTLIOCommandQueue, handle: MTLIOFileHandle)? {
@@ -97,8 +148,10 @@ public final class GLM52LayerStreamer {
             let descriptor = MTLIOCommandQueueDescriptor()
             descriptor.type = .concurrent
             descriptor.priority = .high
-            descriptor.maxCommandBufferCount = 2
-            descriptor.maxCommandsInFlight = 16
+            // Sized for the concurrent fill pipeline: with 3+ staging slots
+            // two layers' IO command buffers can be in flight together.
+            descriptor.maxCommandBufferCount = 4
+            descriptor.maxCommandsInFlight = 32
             let queue = try runtime.device.makeIOCommandQueue(
                 descriptor: descriptor)
             let handle = try runtime.device.makeIOFileHandle(
@@ -118,12 +171,20 @@ public final class GLM52LayerStreamer {
         }
     }
 
-    /// Allocates the two staging sets from a template layer's descriptor
-    /// sizes (uniform across sparse layers — the schema fixes every type).
+    /// Prefetches the caller can keep in flight without racing the slot
+    /// being consumed (one slot is always "in use").
+    var prefetchDepth: Int { slots.count - 1 }
+
+    /// Allocates `slotCount` staging sets from a template layer's descriptor
+    /// sizes (uniform across sparse layers — the schema fixes every type;
+    /// sidecar tensors are smaller and fit the same slots).
     init(runtime: MetalRuntime,
          reader: GLM52PayloadReader,
-         template: GLM52StreamedLayerTensors) throws {
+         template: GLM52StreamedLayerTensors,
+         slotCount: Int = 3,
+         sidecarReaders: [Int: GLM52PayloadReader] = [:]) throws {
         self.reader = reader
+        self.sidecarReaders = sidecarReaders
         func buffer(_ descriptor: GLM52WeightDescriptor?) throws -> MTLBuffer {
             let length = Int(descriptor?.bytes ?? 0)
             guard let buffer = runtime.device.makeBuffer(
@@ -133,7 +194,7 @@ public final class GLM52LayerStreamer {
             return buffer
         }
         var built: [Slot] = []
-        for _ in 0..<2 {
+        for _ in 0..<max(2, slotCount) {
             built.append(Slot(buffers: GLM52StreamedBigTensors(
                 qA: try buffer(template.qA), qB: try buffer(template.qB),
                 kvA: try buffer(template.kvA),
@@ -151,8 +212,9 @@ public final class GLM52LayerStreamer {
     }
 
     /// Async fill of the next staging slot with one layer's big tensors.
-    /// Safe to call while the OTHER slot's layer computes: fills alternate
-    /// and the caller consumes them strictly in prefetch order.
+    /// Callers may keep up to `prefetchDepth` prefetches outstanding (one
+    /// slot is always the one being consumed); fills run CONCURRENTLY and
+    /// the caller consumes them strictly in prefetch order.
     func prefetch(_ tensors: GLM52StreamedLayerTensors) {
         stateLock.lock()
         let slot = slots[nextSlot]
@@ -161,11 +223,24 @@ public final class GLM52LayerStreamer {
         slot.fillError = nil
         pending.append(slot)
         stateLock.unlock()
-        fillQueue.async { [weak self, reader] in
+        // Sidecar layers read from their own Q4_K file via pread; the main
+        // GGUF keeps the MetalIO fast path.
+        let fillReader = tensors.fromSidecar
+            ? sidecarReaders[tensors.index] : reader
+        guard let fillReader else {
+            slot.fillError = MetalError.unsupported(
+                "GLM 5.2 streamer: sidecar reader mancante per blk"
+                + "\(tensors.index)")
+            slot.ready.signal()
+            return
+        }
+        fillQueue.async { [weak self] in
+            let reader = fillReader
             // Fast path: MetalIO SSD→MTLBuffer loads, one IO command buffer
             // per slot. Any anomaly disables it permanently and the pread
             // path below repeats the fill from scratch.
-            if let self, let io = self.metalIO {
+            if let self, !tensors.fromSidecar,
+               let io = self.metalIOSnapshot() {
                 let commandBuffer = io.queue.makeCommandBuffer()
                 var sized = true
                 func load(_ descriptor: GLM52WeightDescriptor?,
@@ -199,7 +274,7 @@ public final class GLM52LayerStreamer {
                         return
                     }
                 }
-                self.metalIO = nil
+                self.disableMetalIO()
             }
             do {
                 func fill(_ descriptor: GLM52WeightDescriptor?,

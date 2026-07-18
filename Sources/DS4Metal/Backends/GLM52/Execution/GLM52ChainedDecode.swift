@@ -176,11 +176,13 @@ extension MetalRuntime {
         try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.normed,
                                 weights: weights.qA, output: scratch.qRank,
                                 rowCount: g.qLoraRank,
-                                inputWidth: layer.embeddingWidth)
+                                inputWidth: layer.embeddingWidth,
+                                weightType: weights.types.qA)
         try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.normed,
                                 weights: weights.kvA, output: scratch.kvRaw,
                                 rowCount: layer.kvRawWidth,
-                                inputWidth: layer.embeddingWidth)
+                                inputWidth: layer.embeddingWidth,
+                                weightType: weights.types.kvA)
         try glm52EncodeRMSNorm(into: commandBuffer, input: scratch.qRank,
                                weight: weights.qANorm,
                                output: scratch.qRankNorm,
@@ -204,7 +206,8 @@ extension MetalRuntime {
                                 input: scratch.qRankNorm,
                                 weights: weights.qB, output: scratch.query,
                                 rowCount: g.queryWidth,
-                                inputWidth: g.qLoraRank)
+                                inputWidth: g.qLoraRank,
+                                weightType: weights.types.qB)
         try glm52EncodeRope(into: commandBuffer,
                             pipelineName: "kernel_glm52_rope_tail_f32",
                             values: scratch.query,
@@ -220,7 +223,8 @@ extension MetalRuntime {
                                     weights: indexer.key,
                                     output: scratch.indexerRaw,
                                     rowCount: g.indexerHeadDimension,
-                                    inputWidth: layer.embeddingWidth)
+                                    inputWidth: layer.embeddingWidth,
+                                    weightType: weights.types.indexerKey)
             try glm52GraphEncode(
                 into: commandBuffer,
                 pipelineName: "kernel_glm52_store_indexer_k_f16",
@@ -235,12 +239,14 @@ extension MetalRuntime {
             } else {
                 // Score on GPU (indexer proj included), then the single
                 // host tap of the branch: the top-k over the score row.
-                try glm52EncodeMatvecQ8(into: commandBuffer,
-                                        input: scratch.qRankNorm,
-                                        weights: indexer.queryB,
-                                        output: scratch.indexerQuery,
-                                        rowCount: g.indexerQueryWidth,
-                                        inputWidth: g.qLoraRank)
+                try glm52EncodeMatvecQ8(
+                    into: commandBuffer,
+                    input: scratch.qRankNorm,
+                    weights: indexer.queryB,
+                    output: scratch.indexerQuery,
+                    rowCount: g.indexerQueryWidth,
+                    inputWidth: g.qLoraRank,
+                    weightType: weights.types.indexerQueryB)
                 try glm52EncodeRope(
                     into: commandBuffer,
                     pipelineName: "kernel_glm52_rope_prefix_f32",
@@ -331,7 +337,8 @@ extension MetalRuntime {
                                 weights: weights.attnOutput,
                                 output: scratch.attnOut,
                                 rowCount: layer.embeddingWidth,
-                                inputWidth: headsWidth)
+                                inputWidth: headsWidth,
+                                weightType: weights.types.attnOutput)
         try glm52EncodeAdd(into: commandBuffer, a: scratch.hidden,
                            b: scratch.attnOut, output: scratch.hidden,
                            count: layer.embeddingWidth)
@@ -376,12 +383,14 @@ extension MetalRuntime {
             try glm52EncodePairSwiGLU(
                 into: ffnBuffer, input: scratch.ffnIn, gate: sharedGate,
                 up: sharedUp, mid: scratch.mid, hiddenWidth: hidden,
-                inputWidth: layer.embeddingWidth, routeWeight: 1)
+                inputWidth: layer.embeddingWidth, routeWeight: 1,
+                weightType: ffn.sharedWeightTypes.gateUp)
             try glm52EncodeMatvecQ8(into: ffnBuffer, input: scratch.mid,
                                     weights: sharedDown,
                                     output: scratch.contribution,
                                     rowCount: layer.embeddingWidth,
-                                    inputWidth: hidden)
+                                    inputWidth: hidden,
+                                    weightType: ffn.sharedWeightTypes.down)
             try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
                                b: scratch.contribution,
                                output: scratch.hidden,

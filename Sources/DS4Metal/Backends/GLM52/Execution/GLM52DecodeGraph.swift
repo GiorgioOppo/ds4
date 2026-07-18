@@ -14,10 +14,29 @@ import Metal
 // the 32-row F32 indexer-proj matvec. Correctness anchor: parity with
 // glm52DecodeAttention, which is itself judged by GLM52DecodeCPUReference.
 
+/// Quantization types of the big streamed tensors consumed by the chained
+/// decode's type-parametric matvec kernels. Q8_0 everywhere on the plain
+/// GGUF path; the Q4_K layer sidecar overrides the requantized ones.
+/// keyB/valueB have no entry by contract: their kernels are Q8-hardwired
+/// and the sidecar carries them verbatim.
+public struct GLM52StreamedWeightTypes: Sendable {
+    public var qA = GLM52TensorSchema.q8_0
+    public var qB = GLM52TensorSchema.q8_0
+    public var kvA = GLM52TensorSchema.q8_0
+    public var attnOutput = GLM52TensorSchema.q8_0
+    public var indexerKey = GLM52TensorSchema.q8_0
+    public var indexerQueryB = GLM52TensorSchema.q8_0
+    public var sharedGateUp = GLM52TensorSchema.q8_0
+    public var sharedDown = GLM52TensorSchema.q8_0
+    public init() {}
+}
+
 /// One layer's decode weights resident on the GPU. Upload happens once at
 /// construction; the buffers are shared-storage so fixtures stay comparable.
 public final class GLM52ResidentDecodeWeights {
     public let geometry: GLM52DecodeGeometry
+    /// Per-tensor quantization the chained decode passes to the kernels.
+    let types: GLM52StreamedWeightTypes
     let attnNorm: MTLBuffer
     let qA: MTLBuffer
     let qANorm: MTLBuffer
@@ -47,8 +66,10 @@ public final class GLM52ResidentDecodeWeights {
          attnNorm: MTLBuffer, qA: MTLBuffer, qANorm: MTLBuffer,
          qB: MTLBuffer, kvA: MTLBuffer, kvANorm: MTLBuffer,
          keyB: MTLBuffer, valueB: MTLBuffer, attnOutput: MTLBuffer,
-         indexer: ResidentIndexer?) {
+         indexer: ResidentIndexer?,
+         types: GLM52StreamedWeightTypes = GLM52StreamedWeightTypes()) {
         self.geometry = geometry
+        self.types = types
         self.attnNorm = attnNorm
         self.qA = qA
         self.qANorm = qANorm
@@ -69,6 +90,7 @@ public final class GLM52ResidentDecodeWeights {
             geometry: geometry, attention: attention,
             indexer: quantizedIndexer)
         self.geometry = geometry
+        types = GLM52StreamedWeightTypes()
         attnNorm = try runtime.glm52GraphBuffer(attention.attnNorm)
         qA = try runtime.glm52GraphBuffer(attention.qA)
         qANorm = try runtime.glm52GraphBuffer(attention.qANorm)
@@ -195,6 +217,10 @@ public final class GLM52ResidentFFN {
     /// `expertProvider` serially with per-expert copies. The provider stays
     /// as constructed — it remains the reference and fallback path.
     var stagedSelection: (([UInt32]) throws -> GLM52StagedExpertSelection)?
+    /// Shared-expert quantization (Q8_0 unless the Q4_K layer sidecar
+    /// requantized this layer's shared tensors).
+    var sharedWeightTypes: (gateUp: UInt32, down: UInt32) =
+        (GLM52TensorSchema.q8_0, GLM52TensorSchema.q8_0)
 
     /// Compose an FFN view over EXISTING buffers (streaming path — see the
     /// weights counterpart). No validation and no copies.
