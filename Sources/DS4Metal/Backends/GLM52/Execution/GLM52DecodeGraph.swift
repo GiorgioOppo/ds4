@@ -15,6 +15,20 @@ enum GLM52MatvecDispatch {
             .flatMap(Int.init) ?? 4))
 }
 
+/// Telemetry of the synchronous graph commits — splits REAL GPU execution
+/// from host overhead (encode, sync round-trips, router, readbacks) in the
+/// streaming report. Accumulated on the decode thread that owns the graph;
+/// nonisolated(unsafe) is acceptable for counters read only by the report.
+enum GLM52GraphTelemetry {
+    nonisolated(unsafe) static var gpuSeconds = 0.0
+    nonisolated(unsafe) static var commits = 0
+
+    static func reset() {
+        gpuSeconds = 0
+        commits = 0
+    }
+}
+
 // Resident decode graph — the persistent form of glm52DecodeAttention. The
 // per-dispatch executor re-uploads every weight array on every call; here the
 // quantized weights are uploaded ONCE into MTLBuffers, the compact and
@@ -427,6 +441,9 @@ extension MetalRuntime {
     func glm52GraphCommit(_ commandBuffer: MTLCommandBuffer) throws {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        GLM52GraphTelemetry.gpuSeconds += max(
+            0, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
+        GLM52GraphTelemetry.commits += 1
         if let error = commandBuffer.error { throw error }
     }
 

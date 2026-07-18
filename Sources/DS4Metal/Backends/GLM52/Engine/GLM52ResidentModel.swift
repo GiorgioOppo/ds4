@@ -131,10 +131,13 @@ public final class GLM52ResidentModel {
     private let stagedFetch:
         [Int: ([UInt32]) throws -> GLM52StagedExpertSelection]
     /// Last token's routed selection per layer — the speculative warm-up's
-    /// guess. DS4_GLM_SPEC_EXPERTS=0 turns speculation off.
+    /// guess. OPT-IN (DS4_GLM_SPEC_EXPERTS=1): measured on the M1 Pro it
+    /// read the full selection to serve ~40% hits, and on a saturated SSD
+    /// the extra traffic stole exactly the bandwidth the demand reads
+    /// needed — net zero. Worth retrying on machines with SSD headroom.
     private var lastRouted: [Int: [UInt32]] = [:]
     private let speculationEnabled = ProcessInfo.processInfo
-        .environment["DS4_GLM_SPEC_EXPERTS"] != "0"
+        .environment["DS4_GLM_SPEC_EXPERTS"] == "1"
     private let speculationQueue = DispatchQueue(
         label: "glm52.expert.speculation", qos: .userInitiated,
         attributes: .concurrent)
@@ -691,12 +694,15 @@ public final class GLM52ResidentModel {
             expertBytes: arenaStats.readBytes,
             expertStallSeconds: counters.expertStallSeconds,
             expertHitBytes: arenaStats.hitBytes,
-            expertSpeculativeBytes: arenaStats.speculativeBytes)
+            expertSpeculativeBytes: arenaStats.speculativeBytes,
+            gpuSeconds: GLM52GraphTelemetry.gpuSeconds,
+            gpuCommits: GLM52GraphTelemetry.commits)
     }
 
     public func resetStreamingStats() {
         counters.reset()
         arena?.resetStats()
+        GLM52GraphTelemetry.reset()
     }
 
     /// One-line human report of where the token time goes on the SSD path.
@@ -723,7 +729,8 @@ public final class GLM52ResidentModel {
             format: "streaming: %d token · layer %.1f GiB "
                 + "(%.2f GiB/token, stallo %.1fs, %.1f GB/s) · esperti "
                 + "%.2f GiB letti (stallo %.1fs, %.1f GB/s) · riuso arena "
-                + "%.2f GiB · speculativi %.2f GiB",
+                + "%.2f GiB · speculativi %.2f GiB · gpu %.1fs "
+                + "(%d commit)",
             stats.tokens, gib(stats.layerBytes),
             gib(stats.layerBytes) / Double(stats.tokens),
             stats.layerStallSeconds,
@@ -732,7 +739,8 @@ public final class GLM52ResidentModel {
             stats.expertStallSeconds,
             rate(stats.expertBytes, stats.expertStallSeconds),
             gib(stats.expertHitBytes),
-            gib(stats.expertSpeculativeBytes))
+            gib(stats.expertSpeculativeBytes),
+            stats.gpuSeconds, stats.gpuCommits)
     }
 }
 
@@ -748,6 +756,11 @@ public struct GLM52StreamingStats: Sendable {
     public let expertHitBytes: UInt64
     /// Expert bytes read in the background by the speculative warm-up.
     public let expertSpeculativeBytes: UInt64
+    /// REAL GPU execution time of the graph's synchronous commits — the
+    /// gap between this and (wall − stalls) is host overhead: encode,
+    /// commit round-trips, router, readbacks.
+    public let gpuSeconds: Double
+    public let gpuCommits: Int
 }
 
 /// Mutable accumulator behind the snapshot — touched only from the decode
