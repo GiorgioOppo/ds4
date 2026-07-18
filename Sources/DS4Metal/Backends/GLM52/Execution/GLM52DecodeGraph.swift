@@ -2,6 +2,19 @@ import DS4Core
 import Foundation
 import Metal
 
+/// Cooperative-matvec dispatch policy: one SIMD group per row with lanes
+/// striding the row's quant groups — the memory-bandwidth-friendly path the
+/// telemetry demanded once I/O stalls stopped dominating. DS4_GLM_SG=0
+/// reverts to the per-thread reference kernels; DS4_GLM_NSG picks the rows
+/// (simdgroups) per threadgroup, default 4 = 128 threads.
+enum GLM52MatvecDispatch {
+    static let cooperative =
+        ProcessInfo.processInfo.environment["DS4_GLM_SG"] != "0"
+    static let rowsPerThreadgroup = max(1, min(8,
+        ProcessInfo.processInfo.environment["DS4_GLM_NSG"]
+            .flatMap(Int.init) ?? 4))
+}
+
 // Resident decode graph — the persistent form of glm52DecodeAttention. The
 // per-dispatch executor re-uploads every weight array on every call; here the
 // quantized weights are uploaded ONCE into MTLBuffers, the compact and
@@ -427,6 +440,21 @@ extension MetalRuntime {
         output: MTLBuffer, rowCount: Int, inputWidth: Int,
         weightType: UInt32 = GLM52TensorSchema.q8_0,
         weightsOffset: Int = 0) throws {
+        if GLM52MatvecDispatch.cooperative {
+            let rows = GLM52MatvecDispatch.rowsPerThreadgroup
+            try glm52GraphEncode(
+                into: commandBuffer,
+                pipelineName: "kernel_glm52_moe_down_sg",
+                arguments: [weightType, UInt32(rowCount),
+                            UInt32(inputWidth), Float(1).bitPattern],
+                buffers: [input, weights, output],
+                offsets: [0, weightsOffset, 0],
+                threadgroups: MTLSize(width: (rowCount + rows - 1) / rows,
+                                      height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                               depth: 1))
+            return
+        }
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer, pipelineName: "kernel_glm52_moe_down",
@@ -445,6 +473,22 @@ extension MetalRuntime {
         hiddenWidth: Int, inputWidth: Int, routeWeight: Float,
         weightType: UInt32 = GLM52TensorSchema.q8_0,
         gateOffset: Int = 0, upOffset: Int = 0) throws {
+        if GLM52MatvecDispatch.cooperative {
+            let rows = GLM52MatvecDispatch.rowsPerThreadgroup
+            try glm52GraphEncode(
+                into: commandBuffer,
+                pipelineName: "kernel_glm52_moe_pair_swiglu_sg",
+                arguments: [weightType, UInt32(hiddenWidth),
+                            UInt32(inputWidth), routeWeight.bitPattern],
+                buffers: [input, gate, up, mid],
+                offsets: [0, gateOffset, upOffset, 0],
+                threadgroups: MTLSize(
+                    width: (hiddenWidth + rows - 1) / rows,
+                    height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                               depth: 1))
+            return
+        }
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer,
