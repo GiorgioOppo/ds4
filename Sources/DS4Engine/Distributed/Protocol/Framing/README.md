@@ -1,16 +1,16 @@
 # Protocol/Framing
 
-`DistFrameHeader.swift` definisce l'involucro di ogni messaggio: magic, tipo e
-numero di byte del payload.
+`DistFrameHeader.swift` defines the envelope of every message: magic, type
+and payload byte count.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-[`Transport`](../../Transport/README.md) legge prima l'header, valida magic e
-tipo e poi richiede esattamente la lunghezza dichiarata. La serializzazione usa
-le primitive di [`Serialization`](../Serialization/README.md).
+[`Transport`](../../Transport/README.md) reads the header first, validates
+magic and type and then requests exactly the declared length. Serialization
+uses the primitives in [`Serialization`](../Serialization/README.md).
 
-## Estensione
+## Extension
 
-L'header deve restare piccolo e deterministico. Un cambiamento di layout è
-sempre incompatibile e richiede bump di versione più test per frame vuoti,
-troncati, sovradimensionati e con magic errato.
+The header must stay small and deterministic. A layout change is always
+incompatible and requires a version bump plus tests for empty, truncated,
+oversized and wrong-magic frames.

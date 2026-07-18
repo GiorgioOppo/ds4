@@ -1,22 +1,23 @@
 # Builtins/Arithmetic
 
-Strumenti locali, deterministici e senza side effect esterni.
+Local, deterministic tools with no external side effects.
 
-## Tool
+## Tools
 
-- `Add.swift`, `Subtract.swift`, `Multiply.swift`: operazioni binarie condivise
-  dall'helper `binaryTool`.
-- `Calculator.swift`: espressioni con operatori, parentesi, costanti e funzioni.
-- `Clock.swift`: data e ora ISO-8601 (`now`).
+- `Add.swift`, `Subtract.swift`, `Multiply.swift`: binary operations shared
+  through the `binaryTool` helper.
+- `Calculator.swift`: expressions with operators, parentheses, constants, and
+  functions.
+- `Clock.swift`: ISO-8601 date and time (`now`).
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-Le closure ricevono JSON, usano gli helper di
-[`Tools/Core`](../../Core/README.md) e restituiscono `ToolOutput`. Non accedono a
-progetto, rete o decoder.
+The closures receive JSON, use the helpers from
+[`Tools/Core`](../../Core/README.md), and return `ToolOutput`. They do not
+access the project, the network, or the decoder.
 
-## Estensione
+## Extension
 
-Imporre domini numerici e messaggi chiari per input non validi. Le funzioni
-aggiunte al parser devono avere arità deterministica e test per precedenza,
-parentesi, NaN/infinito e divisione per zero.
+Enforce numeric domains and clear messages for invalid input. Functions added
+to the parser must have deterministic arity and tests for precedence,
+parentheses, NaN/infinity, and division by zero.

@@ -1,21 +1,21 @@
 # DeepSeekV4/Decode/Generation
 
-Operazioni che trasformano token in input del decoder e stato finale in logits.
+Operations that turn tokens into decoder input and final state into logits.
 
-## File principali
+## Main files
 
 - [`StreamingDecoder+Generation.swift`](StreamingDecoder+Generation.swift):
-  embedding, normalizzazione/output head e primitive usate dal ciclo di
-  generazione.
+  embedding, normalization/output head and primitives used by the generation
+  loop.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-L'id del token seleziona la riga di embedding; il risultato entra nel forward.
-All'ultimo layer, output norm e matrice di output producono logits leggibili dal
-[`Sampler`](../../../../../DS4Core/Generation/README.md). Il ciclo e le policy di stop
-sono orchestrati da `DS4Engine`.
+The token id selects the embedding row; the result enters the forward. At the
+last layer, output norm and output matrix produce logits readable by the
+[`Sampler`](../../../../../DS4Core/Generation/README.md). The loop and the stop
+policies are orchestrated by `DS4Engine`.
 
-## Regole di modifica
+## Modification rules
 
-Mantenere coerenti dimensione vocabolario, dtype e scala dell'output. Evitare
-readback intermedi: solo i logits necessari devono attraversare il confine GPU/CPU.
+Keep vocabulary size, dtype and output scale consistent. Avoid intermediate
+readbacks: only the necessary logits should cross the GPU/CPU boundary.

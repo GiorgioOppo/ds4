@@ -1,21 +1,22 @@
 # Worker/Lifecycle
 
-Possiede il ciclo di vita del listener e lo stato di sessione del worker.
+Owns the listener's lifecycle and the worker's session state.
 
-## Componente
+## Component
 
-`DistWorker+Lifecycle.swift` crea la directory dello shard, persiste l'usage,
-avvia/ferma `NWListener`, accetta connessioni, costruisce `HELLO` e risolve il
-modello locale o trasferito.
+`DistWorker+Lifecycle.swift` creates the shard directory, persists usage,
+starts/stops `NWListener`, accepts connections, builds `HELLO` and resolves
+the local or transferred model.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-`start` apre il listener; ogni connessione passa a
-[`Serving`](../Serving/README.md). `admit` impedisce che turni concorrenti
-resettino la KV attiva. `stop` chiude listener, task e risorse persistenti.
+`start` opens the listener; each connection is handed to
+[`Serving`](../Serving/README.md). `admit` prevents concurrent turns from
+resetting the active KV. `stop` closes listener, tasks and persistent
+resources.
 
-## Estensione
+## Extension
 
-Start e stop devono essere idempotenti. Non mantenere una sessione dopo errori
-terminali e non usare un percorso modello ricevuto senza fallback al file
-sanitizzato nell'archivio gestito.
+Start and stop must be idempotent. Do not keep a session after terminal
+errors, and do not use a received model path without falling back to the
+sanitized file in the managed archive.

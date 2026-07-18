@@ -1,22 +1,22 @@
 # DeepSeekV4/Decode/KV
 
-Esportazione e ripristino dello stato ricorrente del decoder.
+Export and restore of the decoder's recurrent state.
 
-## File principali
+## Main files
 
-- [`KVSnapshot.swift`](KVSnapshot.swift): `CompSnapshot`, `KVLayerSnapshot` e
-  `KVSnapshot`, più le estensioni di `StreamingDecoder` per capture/restore.
-- `KVSnapshotError`: segnala incompatibilità di forma durante il ripristino.
+- [`KVSnapshot.swift`](KVSnapshot.swift): `CompSnapshot`, `KVLayerSnapshot` and
+  `KVSnapshot`, plus the `StreamingDecoder` extensions for capture/restore.
+- `KVSnapshotError`: reports shape incompatibilities during restore.
 
-## Flusso
+## Flow
 
-Il decoder copia in uno snapshot CPU finestra raw KV, righe compresse e stato
-dell'indexer. `DS4Engine` può conservarlo in memoria o codificarlo con
-[`KVCFile`](../../../../../DS4Core/Formats/KVCheckpoint/README.md), quindi ripristinarlo
-in un decoder con la stessa architettura.
+The decoder copies the raw KV window, compressed rows and indexer state into a
+CPU snapshot. `DS4Engine` can keep it in memory or encode it with
+[`KVCFile`](../../../../../DS4Core/Formats/KVCheckpoint/README.md), then restore it
+into a decoder with the same architecture.
 
-## Regole di modifica
+## Modification rules
 
-Uno snapshot deve essere autoconsistente e indipendente dai buffer temporanei.
-Validare layer, dimensioni, contatori e capacità prima di scrivere sulla GPU.
-Aggiornare insieme snapshot e formato KVC quando cambia lo stato persistito.
+A snapshot must be self-consistent and independent of temporary buffers.
+Validate layers, dimensions, counters and capacity before writing to the GPU.
+Update snapshot and KVC format together when the persisted state changes.

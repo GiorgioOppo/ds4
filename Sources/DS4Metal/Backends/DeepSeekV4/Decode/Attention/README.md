@@ -1,21 +1,21 @@
 # DeepSeekV4/Decode/Attention
 
-Logica CPU di supporto alla selezione sparsa dell'attenzione NSA.
+CPU support logic for NSA sparse attention selection.
 
-## File principali
+## Key files
 
-- [`IndexerSelect.swift`](IndexerSelect.swift): top-k a heap con ordinamento
-  deterministico per punteggio decrescente e indice crescente a parità.
+- [`IndexerSelect.swift`](IndexerSelect.swift): heap-based top-k with
+  deterministic ordering by decreasing score and increasing index on ties.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-I kernel producono gli score dell'indexer; quando è usato il fallback CPU, gli
-score vengono letti e `IndexerSelect` restituisce gli indici delle righe KV da
-passare all'attenzione sparsa. Il percorso GPU equivalente si trova nei wrapper
-[`Kernels/Attention`](../../../../Kernels/Attention/README.md).
+The kernels produce the indexer scores; when the CPU fallback is used, the
+scores are read back and `IndexerSelect` returns the indices of the KV rows to
+pass to sparse attention. The equivalent GPU path lives in the
+[`Kernels/Attention`](../../../../Kernels/Attention/README.md) wrappers.
 
-## Regole di modifica
+## Modification rules
 
-Conservare lo stesso insieme e tie-break del sort completo, inclusi NaN e
-contesti più corti di k. Misurare separatamente complessità CPU, sincronizzazione
-GPU e costo di readback.
+Preserve the same result set and tie-breaking as the full sort, including NaN
+and contexts shorter than k. Measure CPU complexity, GPU synchronization, and
+readback cost separately.
