@@ -156,6 +156,17 @@ extension ChatStore {
         let cacheSlots = expertCacheSlots
         let glmResident = glmResidentLayers
         let glmExperts = glmActiveExperts
+        // Knob GLM aggiuntivi: il motore li legge dall'ambiente (stessa
+        // strada della demo CLI), quindi la GUI li fissa QUI, prima della
+        // costruzione del servizio. 0 = default del motore.
+        _ = setenv("DS4_GLM_EXPERT_ARENA",
+                   glmExpertArena > 0 ? String(glmExpertArena) : "24", 1)
+        _ = setenv("DS4_GLM_STREAM_SLOTS",
+                   glmStreamSlots > 0 ? String(glmStreamSlots) : "3", 1)
+        _ = setenv("DS4_GLM_MTLIO", glmMetalIOEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_SPEC_EXPERTS",
+                   glmSpeculativeExperts ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_LAYERQ4", glmUseQ4Sidecar ? "1" : "0", 1)
         let loadEngineSignature = machineAutoTuneEngineSignature()
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudgetTokens = diskKVBudgetKTok * 1000

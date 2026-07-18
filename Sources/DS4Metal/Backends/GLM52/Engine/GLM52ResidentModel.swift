@@ -293,6 +293,11 @@ public final class GLM52ResidentModel {
         LoadProgress.shared.set(0.82, "GLM: stato streaming per layer")
         let layerQ4Directory = ProcessInfo.processInfo
             .environment["DS4_GLM_LAYERQ4_DIR"] ?? (path + ".glm-layers-q4")
+        // DS4_GLM_LAYERQ4=0: ignora i TENSORI Q4 del sidecar (lossy) e
+        // streamma i layer Q8 dal GGUF; la sezione esperti unificata
+        // (lossless) resta comunque in uso.
+        let useQ4Tensors = ProcessInfo.processInfo
+            .environment["DS4_GLM_LAYERQ4"] != "0"
         var sidecarReaders: [Int: GLM52PayloadReader] = [:]
         var streamed: [StreamedLayer] = []
         var unifiedExpertLayers = 0
@@ -320,8 +325,11 @@ public final class GLM52ResidentModel {
                     bundleDirectory: bundleDirectory)
             }
             providers[index] = provider
-            if let sidecar { sidecarReaders[index] = sidecar.reader }
-            let tensors = sidecar?.tensors ?? ggufTensors
+            if let sidecar, useQ4Tensors {
+                sidecarReaders[index] = sidecar.reader
+            }
+            let tensors = (useQ4Tensors ? sidecar?.tensors : nil)
+                ?? ggufTensors
             streamed.append(StreamedLayer(
                 tensors: tensors,
                 bigTensorBytes: tensors.all.reduce(0) {

@@ -74,6 +74,56 @@ public actor GLM52ChatService {
 
     public func quiesceForTeardown() async {}
 
+    public struct BenchmarkNumbers: Sendable {
+        public let prefillTps: Double
+        public let genTps: Double
+        public let report: String
+    }
+
+    /// Synthetic MEASUREMENT benchmark — the DeepSeek analog sweeps prefill
+    /// knobs, but GLM v1 has none worth tuning in place, so this reports
+    /// prefill/decode tok/s plus the per-phase streaming profile. Resets
+    /// the engine context before and after (the next chat re-prefills).
+    public func benchmark(contextTokens: Int, genTokens: Int) async throws
+        -> BenchmarkNumbers {
+        let service = self.service
+        let limit = max(8, min(contextTokens, contextSize - genTokens - 1))
+        primedTokens = []
+        return try await Task.detached(priority: .userInitiated) {
+            var tokens = service.tokenizer.tokenizeRenderedChat(
+                "benchmark sintetico DwarfStar — misura di prefill e decode ")
+            if tokens.isEmpty { tokens = [1] }
+            while tokens.count < limit { tokens += tokens }
+            tokens = Array(tokens.prefix(limit))
+            service.engine.resetContext()
+            service.engine.resetStreamingStats()
+            let prefillStart = Date()
+            var logits = try service.engine.prefill(tokens)
+            let prefillSeconds = max(
+                Date().timeIntervalSince(prefillStart), 0.001)
+            let prefillReport = service.engine.streamingReport()
+            service.engine.resetStreamingStats()
+            let decodeStart = Date()
+            var produced = 0
+            for _ in 0..<genTokens {
+                guard let token = GLM52GreedyDecoding.argmax(logits) else {
+                    break
+                }
+                logits = try service.engine.forwardNext(token)
+                produced += 1
+            }
+            let decodeSeconds = max(
+                Date().timeIntervalSince(decodeStart), 0.001)
+            let decodeReport = service.engine.streamingReport()
+            service.engine.resetContext()
+            return BenchmarkNumbers(
+                prefillTps: Double(tokens.count) / prefillSeconds,
+                genTps: Double(produced) / decodeSeconds,
+                report: "prefill: " + prefillReport
+                    + "\ndecode: " + decodeReport)
+        }.value
+    }
+
     public func setAgent(systemPrompt: String?) {
         self.systemPrompt = systemPrompt
     }

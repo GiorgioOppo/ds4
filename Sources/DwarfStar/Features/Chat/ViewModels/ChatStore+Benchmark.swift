@@ -17,12 +17,12 @@ extension ChatStore {
     /// richiede prefill > 512 token per esistere e resta nella modalità
     /// completa (che usa 512 + 1024 token, ~10 min).
     func runSettingsBenchmark(quick: Bool = false) {
-        guard let service else { benchStatus = "Carica prima il modello."; return }
-        guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
-        guard glmService == nil else {
-            benchStatus = "Benchmark non disponibile col backend GLM 5.2 (v1)."
+        if glmService != nil {
+            runGLMBenchmark(quick: quick)
             return
         }
+        guard let service else { benchStatus = "Carica prima il modello."; return }
+        guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
         guard !isGenerating else { benchStatus = "Ferma la generazione prima del benchmark."; return }
         guard !benchRunning else { return }
         let activityGate = EngineActivityGate.shared
@@ -121,6 +121,63 @@ extension ChatStore {
                 _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
                 _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
                 _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)
+                benchStatus = "Benchmark fallito: \(error)"
+                benchSucceeded = false
+            }
+            benchRunning = false
+            benchTask = nil
+            activityGate.release(lease)
+        }
+    }
+
+    /// Benchmark di MISURA per GLM 5.2 (il tuning DeepSeek dei knob di
+    /// prefill non si applica): prefill sintetico + decode greedy, con il
+    /// profilo streaming per fase nel referto. Rapido: 64+8 token (~2-3
+    /// min); completo: 192+16 (~6-10 min alla velocità attuale).
+    private func runGLMBenchmark(quick: Bool) {
+        guard let glm = glmService else { return }
+        guard phase == .ready else {
+            benchStatus = "Attendi che il modello sia pronto."
+            return
+        }
+        guard !isGenerating else {
+            benchStatus = "Ferma la generazione prima del benchmark."
+            return
+        }
+        guard !benchRunning else { return }
+        let activityGate = EngineActivityGate.shared
+        guard let lease = activityGate.acquire(.benchmark) else {
+            let owner = activityGate.activeOwner?.displayName
+                ?? "un'altra operazione"
+            benchStatus = "Motore occupato da \(owner)."
+            return
+        }
+        benchRunning = true
+        benchSucceeded = nil
+        benchResults = ""
+        let contextTokens = quick ? 64 : 192
+        let genTokens = quick ? 8 : 16
+        benchStatus = quick
+            ? "Benchmark GLM rapido in corso… (~2-3 min, non usare la chat)"
+            : "Benchmark GLM in corso… (~6-10 min, non usare la chat)"
+        benchTask = Task {
+            do {
+                let numbers = try await glm.benchmark(
+                    contextTokens: contextTokens, genTokens: genTokens)
+                let summary = String(
+                    format: "prefill %d token: %.2f tok/s · decode %d "
+                        + "token: %.2f tok/s",
+                    contextTokens, numbers.prefillTps,
+                    genTokens, numbers.genTps)
+                benchResults = summary + "\n" + numbers.report
+                FileHandle.standardError.write(Data(
+                    ("DS4 bench GLM: " + summary + "\n").utf8))
+                benchStatus = "Fatto: " + summary
+                benchSucceeded = true
+            } catch is CancellationError {
+                benchStatus = "Benchmark annullato."
+                benchSucceeded = false
+            } catch {
                 benchStatus = "Benchmark fallito: \(error)"
                 benchSucceeded = false
             }

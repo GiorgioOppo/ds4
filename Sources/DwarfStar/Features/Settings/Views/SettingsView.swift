@@ -247,7 +247,22 @@ struct SettingsView: View {
                         + (store.glmActiveExperts == 0
                            ? "8 (tutti)" : "\(store.glmActiveExperts)"),
                         value: $store.glmActiveExperts, in: 0...8, step: 1)
-                Text("Parametri del backend GLM 5.2, applicati al prossimo caricamento. Layer residenti 0 = adattivo alla RAM fisica; ogni layer residente in più toglie ~230 MiB di SSD da ogni token. Esperti attivi sotto 8 riduce l'I/O per token al costo di qualità.")
+                Stepper("GLM 5.2 · arena esperti: "
+                        + (store.glmExpertArena == 0
+                           ? "24 slot (default)"
+                           : "\(store.glmExpertArena) slot"),
+                        value: $store.glmExpertArena, in: 0...96, step: 8)
+                Stepper("GLM 5.2 · slot streaming layer: "
+                        + (store.glmStreamSlots == 0
+                           ? "3 (default)" : "\(store.glmStreamSlots)"),
+                        value: $store.glmStreamSlots, in: 0...6, step: 1)
+                Toggle("GLM 5.2 · MetalIO SSD → GPU (fallback pread automatico)",
+                       isOn: $store.glmMetalIOEnabled)
+                Toggle("GLM 5.2 · staging speculativo esperti (serve banda SSD di riserva)",
+                       isOn: $store.glmSpeculativeExperts)
+                Toggle("GLM 5.2 · tensori Q4 dal sidecar (LOSSY, ~2× meno I/O layer)",
+                       isOn: $store.glmUseQ4Sidecar)
+                Text("Parametri del backend GLM 5.2, applicati al prossimo caricamento. Layer residenti 0 = adattivo alla RAM fisica (~230 MiB di SSD in meno per token ciascuno). Arena esperti: ~10 MiB per slot, più riuso nel prefill. Slot streaming: ~250 MiB l'uno, più fill SSD in volo. Tensori Q4 OFF = layer Q8 dal GGUF (gli esperti unificati del sidecar restano attivi: sono lossless).")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Mixed-quant expert cache (recommended)", isOn: $store.multiQuantCacheEnabled)
                 Text("Caches every routed IQ2/Q4 layer with its real record size under the same total byte budget as the legacy cache. The M1 Pro A/B improved decode by 28.9% and cut expert reads by 31.1%, with all 64 tokens and 2,068,480 logits bit-identical. Turn OFF to restore the legacy off-class bypass. Applies on the next model load.")

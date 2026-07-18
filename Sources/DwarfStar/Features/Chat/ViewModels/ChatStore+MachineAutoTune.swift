@@ -307,7 +307,9 @@ extension ChatStore {
         }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
         guard glmService == nil else {
-            benchStatus = "Auto-tune non disponibile col backend GLM 5.2 (v1)."
+            benchStatus = "Auto-tune non necessario per GLM 5.2: la "
+                + "residenza layer è già adattiva alla RAM; usa il "
+                + "Benchmark per misurare, e gli stepper GLM per regolare."
             return
         }
         guard !isGenerating else { benchStatus = "Ferma la generazione prima dell'auto-tune."; return }

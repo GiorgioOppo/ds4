@@ -235,6 +235,31 @@ final class ChatStore {
     var glmActiveExperts: Int = (UserDefaults.standard.object(forKey: "GLMActiveExperts") as? Int) ?? 0 {
         didSet { UserDefaults.standard.set(glmActiveExperts, forKey: "GLMActiveExperts") }
     }
+    /// GLM 5.2: slot dell'arena esperti (0 = default 24; ~10 MiB l'uno).
+    /// Più slot = più riuso keyed nel prefill e più margine speculativo.
+    var glmExpertArena: Int = (UserDefaults.standard.object(forKey: "GLMExpertArena") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmExpertArena, forKey: "GLMExpertArena") }
+    }
+    /// GLM 5.2: slot di staging del layer streamer (0 = default 3; ogni
+    /// slot extra ≈ 250 MiB di RAM e un fill SSD in più in volo).
+    var glmStreamSlots: Int = (UserDefaults.standard.object(forKey: "GLMStreamSlots") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmStreamSlots, forKey: "GLMStreamSlots") }
+    }
+    /// GLM 5.2: MetalIO SSD→GPU per i tensori layer (fallback pread
+    /// automatico e permanente su qualunque anomalia).
+    var glmMetalIOEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMMetalIO") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmMetalIOEnabled, forKey: "GLMMetalIO") }
+    }
+    /// GLM 5.2: staging speculativo degli esperti (misurato su M1 Pro:
+    /// paga solo con banda SSD di riserva — default OFF).
+    var glmSpeculativeExperts: Bool = (UserDefaults.standard.object(forKey: "GLMSpecExperts") as? Bool) ?? false {
+        didSet { UserDefaults.standard.set(glmSpeculativeExperts, forKey: "GLMSpecExperts") }
+    }
+    /// GLM 5.2: usa i tensori Q4_K del sidecar (lossy, ~2× meno I/O layer).
+    /// OFF = layer Q8 dal GGUF; gli esperti unificati restano attivi.
+    var glmUseQ4Sidecar: Bool = (UserDefaults.standard.object(forKey: "GLMUseQ4Sidecar") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmUseQ4Sidecar, forKey: "GLMUseQ4Sidecar") }
+    }
     /// Layer-aware expert-cache layout for mixed-quant GGUFs. Each routed layer
     /// gets a pool with its real IQ2/Q4 record size, while the allocator keeps
     /// the total byte budget at or below the legacy 22-slot plan. Exact: it only
