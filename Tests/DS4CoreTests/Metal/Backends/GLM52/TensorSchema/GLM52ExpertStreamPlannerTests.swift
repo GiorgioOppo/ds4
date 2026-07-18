@@ -134,10 +134,20 @@ final class GLM52ExpertStreamPlannerTests: XCTestCase {
             weights: weights(gateType: GLM52TensorSchema.iq2_XXS)
         )
 
-        XCTAssertThrowsError(try planner.plan(selectedExperts: [0, 1])) { error in
+        // Shorter plans are legitimate (the per-expert provider fetches one
+        // record at a time); empty and over-width plans are refused.
+        XCTAssertEqual(try planner.plan(selectedExperts: [0, 1]).experts.count, 2)
+        XCTAssertThrowsError(try planner.plan(selectedExperts: [])) { error in
             XCTAssertEqual(
                 error as? GLM52ExpertStreamPlannerError,
-                .wrongSelectionCount(expected: 8, got: 2)
+                .wrongSelectionCount(expected: 8, got: 0)
+            )
+        }
+        XCTAssertThrowsError(try planner.plan(
+            selectedExperts: [0, 1, 2, 3, 4, 5, 6, 7, 8])) { error in
+            XCTAssertEqual(
+                error as? GLM52ExpertStreamPlannerError,
+                .wrongSelectionCount(expected: 8, got: 9)
             )
         }
 

@@ -167,8 +167,12 @@ public struct GLM52ExpertStreamPlanner: Sendable {
 
     /// Build exactly one independent gate/up/down triplet per selected expert.
     /// Input order is router rank order and is not sorted or coalesced.
+    /// A full router batch never exceeds the selection width; SHORTER plans
+    /// are legitimate — the per-expert streaming provider fetches records
+    /// one at a time into its slot cache.
     public func plan(selectedExperts: [UInt32]) throws -> GLM52ExpertStreamPlan {
-        guard selectedExperts.count == selectionWidth else {
+        guard !selectedExperts.isEmpty,
+              selectedExperts.count <= selectionWidth else {
             throw GLM52ExpertStreamPlannerError.wrongSelectionCount(
                 expected: selectionWidth, got: selectedExperts.count)
         }
