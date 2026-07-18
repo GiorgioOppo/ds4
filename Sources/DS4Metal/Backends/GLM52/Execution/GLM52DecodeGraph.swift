@@ -161,6 +161,24 @@ public final class GLM52ResidentDecodeCaches {
 /// weights uploaded once. Routed experts stay a per-token stream (the
 /// provider yields the selected experts' bytes); the F32 router rows stay
 /// host-side beside the CPU router matvec.
+/// One routed selection staged for the GPU: every selected record resident
+/// in ONE shared buffer (rank-strided packed gate|up|down), ready to bind
+/// with offsets — no per-expert allocations, no copies.
+public struct GLM52StagedExpertSelection {
+    public let buffer: MTLBuffer
+    public let layout: GLM52ExpertPackedRecordLayout
+    public let gateUpType: UInt32
+    public let downType: UInt32
+
+    public init(buffer: MTLBuffer, layout: GLM52ExpertPackedRecordLayout,
+                gateUpType: UInt32, downType: UInt32) {
+        self.buffer = buffer
+        self.layout = layout
+        self.gateUpType = gateUpType
+        self.downType = downType
+    }
+}
+
 public final class GLM52ResidentFFN {
     enum Kind {
         case dense(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
@@ -171,6 +189,12 @@ public final class GLM52ResidentFFN {
     }
     let ffnNorm: MTLBuffer
     let kind: Kind
+    /// Optional batched zero-copy expert path: when set, the chained decode
+    /// stages the WHOLE selection through this closure (one concurrent read
+    /// into one reusable buffer, bound by offsets) instead of walking
+    /// `expertProvider` serially with per-expert copies. The provider stays
+    /// as constructed — it remains the reference and fallback path.
+    var stagedSelection: (([UInt32]) throws -> GLM52StagedExpertSelection)?
 
     /// Compose an FFN view over EXISTING buffers (streaming path — see the
     /// weights counterpart). No validation and no copies.
@@ -323,6 +347,7 @@ extension MetalRuntime {
         pipelineName: String,
         arguments: [UInt32],
         buffers: [MTLBuffer],
+        offsets: [Int]? = nil,
         threadgroups: MTLSize,
         threadsPerThreadgroup: MTLSize,
         threadgroupMemoryLength: Int? = nil) throws {
@@ -335,7 +360,8 @@ extension MetalRuntime {
             encoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
         }
         for (index, buffer) in buffers.enumerated() {
-            encoder.setBuffer(buffer, offset: 0, index: index + 1)
+            encoder.setBuffer(buffer, offset: offsets?[index] ?? 0,
+                              index: index + 1)
         }
         if let length = threadgroupMemoryLength {
             // Metal API validation aborts on lengths that are not multiples
@@ -373,13 +399,15 @@ extension MetalRuntime {
         into commandBuffer: MTLCommandBuffer,
         input: MTLBuffer, weights: MTLBuffer,
         output: MTLBuffer, rowCount: Int, inputWidth: Int,
-        weightType: UInt32 = GLM52TensorSchema.q8_0) throws {
+        weightType: UInt32 = GLM52TensorSchema.q8_0,
+        weightsOffset: Int = 0) throws {
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer, pipelineName: "kernel_glm52_moe_down",
             arguments: [weightType, UInt32(rowCount),
                         UInt32(inputWidth), Float(1).bitPattern],
             buffers: [input, weights, output],
+            offsets: [0, weightsOffset, 0],
             threadgroups: MTLSize(width: (rowCount + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
@@ -389,7 +417,8 @@ extension MetalRuntime {
         into commandBuffer: MTLCommandBuffer,
         input: MTLBuffer, gate: MTLBuffer, up: MTLBuffer, mid: MTLBuffer,
         hiddenWidth: Int, inputWidth: Int, routeWeight: Float,
-        weightType: UInt32 = GLM52TensorSchema.q8_0) throws {
+        weightType: UInt32 = GLM52TensorSchema.q8_0,
+        gateOffset: Int = 0, upOffset: Int = 0) throws {
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer,
@@ -397,6 +426,7 @@ extension MetalRuntime {
             arguments: [weightType, UInt32(hiddenWidth),
                         UInt32(inputWidth), routeWeight.bitPattern],
             buffers: [input, gate, up, mid],
+            offsets: [0, gateOffset, upOffset, 0],
             threadgroups: MTLSize(width: (hiddenWidth + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))

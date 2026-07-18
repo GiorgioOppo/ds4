@@ -65,6 +65,9 @@ public final class GLM52ResidentModel {
 
     private struct StreamedLayer {
         let tensors: GLM52StreamedLayerTensors
+        /// Sum of the streamed big-tensor bytes — the per-token SSD cost of
+        /// this layer, precomputed for the telemetry counters.
+        let bigTensorBytes: Int
         let attnNorm: MTLBuffer
         let qANorm: MTLBuffer
         let kvANorm: MTLBuffer
@@ -92,6 +95,12 @@ public final class GLM52ResidentModel {
     private let geometry = GLM52DecodeGeometry.v5_2
     private let vocabulary: Int
     private let embeddingWidth: Int
+    private let counters: GLM52StreamingCounters
+    /// Per-layer staged zero-copy expert fetch (shared staging buffer,
+    /// concurrent reads); layers whose record layout cannot be offset-bound
+    /// are simply absent and keep the copying provider path.
+    private let stagedFetch:
+        [Int: ([UInt32]) throws -> GLM52StagedExpertSelection]
 
     public init(runtime: MetalRuntime,
                 path: String,
@@ -187,9 +196,13 @@ public final class GLM52ResidentModel {
                     up: try reader.bytes(of: map.layer(index, .denseUp)),
                     down: try reader.bytes(of: map.layer(index, .denseDown)))
             } else {
+                // Resident layers stream their EXPERTS too (the routed bank
+                // never fits) — and deserve the bundle exactly like the
+                // streamed tail.
                 let provider = try GLM52StreamedExpertProvider(
                     reader: reader, weightMap: map, layer: index,
-                    slotCount: options.expertSlotCount)
+                    slotCount: options.expertSlotCount,
+                    bundleDirectory: bundleDirectory)
                 providers[index] = provider
                 quantizedFFN = .sparse(
                     routerRows: try f32(map.layer(index, .router)),
@@ -229,9 +242,13 @@ public final class GLM52ResidentModel {
                 slotCount: options.expertSlotCount,
                 bundleDirectory: bundleDirectory)
             providers[index] = provider
+            let tensors = try GLM52StreamedLayerTensors(
+                index: index, map: map, fullIndexer: isFull)
             streamed.append(StreamedLayer(
-                tensors: try GLM52StreamedLayerTensors(
-                    index: index, map: map, fullIndexer: isFull),
+                tensors: tensors,
+                bigTensorBytes: tensors.all.reduce(0) {
+                    $0 + Int($1.bytes)
+                },
                 attnNorm: try runtime.glm52GraphBuffer(
                     try f32(map.layer(index, .attentionNorm))),
                 qANorm: try runtime.glm52GraphBuffer(
@@ -273,6 +290,54 @@ public final class GLM52ResidentModel {
             outputNorm: try f32(map.global(.outputNorm)),
             outputHead: try reader.bytes(of: map.global(.output)),
             vocabularySize: vocabulary)
+
+        // Staged zero-copy expert path: ONE shared staging buffer (a full
+        // top-8 selection of packed records) reused by EVERY sparse layer —
+        // each layer's records are consumed inside its own synchronous
+        // command buffer before the next layer stages, so a single buffer
+        // is race-free. Installed only where the record layout binds with
+        // 4-byte-aligned offsets; elsewhere the copying per-expert provider
+        // path stays in charge.
+        let counters = GLM52StreamingCounters()
+        self.counters = counters
+        var staged:
+            [Int: ([UInt32]) throws -> GLM52StagedExpertSelection] = [:]
+        if let maxRecord = providers.values.map(\.recordBytes).max(),
+           maxRecord > 0 {
+            let capacity = maxRecord * Int(shape.nExpertUsed)
+            guard let stagingBuffer = runtime.device.makeBuffer(
+                length: capacity, options: .storageModeShared) else {
+                throw MetalError.bufferAlloc
+            }
+            for (index, provider) in providers
+                where provider.bindableRecordLayout {
+                staged[index] = { [stagingBuffer, counters] ids in
+                    let bytes = provider.recordBytes * ids.count
+                    guard bytes <= stagingBuffer.length else {
+                        throw MetalError.unsupported(
+                            "GLM 5.2 expert staging: \(ids.count) record da "
+                            + "\(provider.recordBytes) B oltre la capienza "
+                            + "di \(stagingBuffer.length) B")
+                    }
+                    let destination = UnsafeMutableRawBufferPointer(
+                        start: stagingBuffer.contents(), count: bytes)
+                    let start = Date()
+                    let layout = try provider.stageRecords(
+                        ids, into: destination)
+                    let stall = Date().timeIntervalSince(start)
+                    counters.expertStallSeconds += stall
+                    counters.expertBytes += UInt64(bytes)
+                    return GLM52StagedExpertSelection(
+                        buffer: stagingBuffer, layout: layout,
+                        gateUpType: provider.gateUpType,
+                        downType: provider.downType)
+                }
+            }
+        }
+        stagedFetch = staged
+        for layer in stack {
+            layer.ffn.stagedSelection = staged[layer.index]
+        }
     }
 
     /// Forget the whole conversation: every layer cache back to zero rows,
@@ -304,14 +369,17 @@ public final class GLM52ResidentModel {
 
     /// Advance the model by one token; returns the full logits row. The
     /// resident prefix computes first; the streamed tail overlaps each
-    /// layer's compute with the SSD prefetch of the next one, and after the
-    /// step the expert lookahead warms the slot caches with this token's
-    /// selections (consecutive tokens reselect often).
+    /// layer's compute with the SSD prefetch of the next one. Routed experts
+    /// arrive through the staged zero-copy path (one concurrent read burst
+    /// per selection) — the old post-token lookahead is gone on purpose:
+    /// with per-token traffic far beyond RAM the page cache cannot retain
+    /// speculative reads until the next token, so they only stole SSD
+    /// bandwidth from the real ones.
     public func forwardNext(_ token: Int32) throws -> [Float] {
         let embedded = try embeddingRow(token)
         scratch.loadHidden(embedded)
         var lastSelection: (source: Int, rows: [UInt32])?
-        var routings: [Int: [Int32]] = [:]
+        counters.tokens += 1
 
         if let streamer, let first = streamedLayers.first {
             streamer.prefetch(first.tensors)
@@ -336,13 +404,13 @@ public final class GLM52ResidentModel {
                 reusedSelection: try reuse(for: layer.index, isFull: isFull),
                 position: position, activeExperts: activeExperts)
             if isFull { lastSelection = (layer.index, result.selection) }
-            if let routing = result.routing {
-                routings[layer.index] = routing.selected
-            }
         }
         for (rank, streamedLayer) in streamedLayers.enumerated() {
             let index = streamedLayer.tensors.index
+            let waitStart = Date()
             let buffers = try streamer!.wait(for: index)
+            counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
+            counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
             if rank + 1 < streamedLayers.count {
                 streamer!.prefetch(streamedLayers[rank + 1].tensors)
             }
@@ -371,20 +439,15 @@ public final class GLM52ResidentModel {
                     expertProvider: { [provider = streamedLayer.provider] in
                         try provider.expert($0)
                     }))
+            ffn.stagedSelection = stagedFetch[index]
             let result = try runtime.glm52ChainedDecodeLayer(
                 weights: weights, ffn: ffn, caches: streamedLayer.caches,
                 scratch: scratch,
                 reusedSelection: try reuse(for: index, isFull: isFull),
                 position: position, activeExperts: activeExperts)
             if isFull { lastSelection = (index, result.selection) }
-            if let routing = result.routing {
-                routings[index] = routing.selected
-            }
         }
         position += 1
-        for (index, selected) in routings {
-            providers[index]?.prefetch(selected.map { UInt32(bitPattern: $0) })
-        }
         return try runtime.glm52ResidentLogits(
             outputHead: head,
             hidden: scratch.readHidden(count: embeddingWidth))
@@ -407,6 +470,7 @@ public final class GLM52ResidentModel {
 
         var hiddens: [[Float]] = try tokens.map { try embeddingRow($0) }
         let basePosition = position
+        counters.tokens += tokens.count
         var lastSelections: [(source: Int, rows: [UInt32])?] =
             Array(repeating: nil, count: tokens.count)
 
@@ -454,7 +518,10 @@ public final class GLM52ResidentModel {
         }
         for (rank, streamedLayer) in streamedLayers.enumerated() {
             let index = streamedLayer.tensors.index
+            let waitStart = Date()
             let buffers = try streamer!.wait(for: index)
+            counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
+            counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
             if rank + 1 < streamedLayers.count {
                 streamer!.prefetch(streamedLayers[rank + 1].tensors)
             }
@@ -483,6 +550,7 @@ public final class GLM52ResidentModel {
                     expertProvider: { [provider = streamedLayer.provider] in
                         try provider.expert($0)
                     }))
+            ffn.stagedSelection = stagedFetch[index]
             try sweep(index: index, isFull: isFull, weights: weights,
                       ffn: ffn, caches: streamedLayer.caches)
         }
@@ -500,5 +568,78 @@ public final class GLM52ResidentModel {
         return try GLM52GreedyDecoding.generate(
             logitsAfterPrompt: logits, maxNewTokens: maxNewTokens,
             endTokens: endTokens) { try self.forwardNext($0) }
+    }
+
+    // MARK: - Streaming telemetry
+
+    /// Counters since the last reset. Prefill and decode both accumulate;
+    /// reset between the phases to report them apart.
+    public func streamingStats() -> GLM52StreamingStats {
+        GLM52StreamingStats(
+            tokens: counters.tokens,
+            layerBytes: counters.layerBytes,
+            layerStallSeconds: counters.layerStallSeconds,
+            expertBytes: counters.expertBytes,
+            expertStallSeconds: counters.expertStallSeconds)
+    }
+
+    public func resetStreamingStats() { counters.reset() }
+
+    /// One-line human report of where the token time goes on the SSD path.
+    /// Layer "stallo" is the time decode WAITED on the double-buffered
+    /// prefetch (0 = perfect overlap, its GB/s can legitimately exceed the
+    /// SSD); expert stallo is fully synchronous, so its GB/s is the true
+    /// effective read throughput of the staged expert path.
+    public func streamingReport() -> String {
+        let stats = streamingStats()
+        guard stats.tokens > 0,
+              stats.layerBytes + stats.expertBytes > 0 else {
+            return "streaming: nessun byte streamato (stack residente)"
+        }
+        func gib(_ bytes: UInt64) -> Double {
+            Double(bytes) / 1_073_741_824
+        }
+        func rate(_ bytes: UInt64, _ seconds: Double) -> Double {
+            seconds > 0.001 ? Double(bytes) / 1e9 / seconds : 0
+        }
+        return String(
+            format: "streaming: %d token · layer %.1f GiB "
+                + "(%.2f GiB/token, stallo %.1fs, %.1f GB/s) · esperti "
+                + "%.2f GiB (%.3f GiB/token, stallo %.1fs, %.1f GB/s)",
+            stats.tokens, gib(stats.layerBytes),
+            gib(stats.layerBytes) / Double(stats.tokens),
+            stats.layerStallSeconds,
+            rate(stats.layerBytes, stats.layerStallSeconds),
+            gib(stats.expertBytes),
+            gib(stats.expertBytes) / Double(stats.tokens),
+            stats.expertStallSeconds,
+            rate(stats.expertBytes, stats.expertStallSeconds))
+    }
+}
+
+/// Snapshot of the engine's streaming counters.
+public struct GLM52StreamingStats: Sendable {
+    public let tokens: Int
+    public let layerBytes: UInt64
+    public let layerStallSeconds: Double
+    public let expertBytes: UInt64
+    public let expertStallSeconds: Double
+}
+
+/// Mutable accumulator behind the snapshot — touched only from the decode
+/// thread (forwardNext/prefill and the staged fetch they invoke run there).
+final class GLM52StreamingCounters {
+    var tokens = 0
+    var layerBytes: UInt64 = 0
+    var layerStallSeconds = 0.0
+    var expertBytes: UInt64 = 0
+    var expertStallSeconds = 0.0
+
+    func reset() {
+        tokens = 0
+        layerBytes = 0
+        layerStallSeconds = 0
+        expertBytes = 0
+        expertStallSeconds = 0
     }
 }

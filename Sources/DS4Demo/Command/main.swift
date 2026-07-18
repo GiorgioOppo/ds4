@@ -203,6 +203,8 @@ do {
             log(String(format: "DS4Demo: prefill %d token in %.1f s (%.2f tok/s, layer-major)",
                        tokens.count, prefillSeconds,
                        Double(tokens.count) / max(prefillSeconds, 0.001)))
+            log("DS4Demo: prefill " + glm.streamingReport())
+            glm.resetStreamingStats()
 
             let decodeStart = Date()
             var produced = 0
@@ -222,6 +224,7 @@ do {
                        produced, decodeSeconds,
                        Double(produced) / max(decodeSeconds, 0.001),
                        Date().timeIntervalSince(loadStart)))
+            log("DS4Demo: decode " + glm.streamingReport())
             exit(0)
         }
         if detectedArchitecture.family == .qwen

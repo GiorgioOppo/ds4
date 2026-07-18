@@ -150,6 +150,22 @@ public final class GLM52PayloadReader: @unchecked Sendable {
     public func bytes(of descriptor: GLM52WeightDescriptor,
                       byteOffset: UInt64,
                       byteCount: UInt64) throws -> [UInt8] {
+        var payload = [UInt8](repeating: 0, count: Int(byteCount))
+        try payload.withUnsafeMutableBytes {
+            try read(descriptor, byteOffset: byteOffset,
+                     byteCount: byteCount, into: $0)
+        }
+        return payload
+    }
+
+    /// Zero-copy variant of the ranged read: the sub-range lands straight in
+    /// `destination` (an MTLBuffer's contents on the expert staging path — no
+    /// intermediate arrays). Same double validation, and safe for concurrent
+    /// calls into disjoint destinations (stateless pread).
+    public func read(_ descriptor: GLM52WeightDescriptor,
+                     byteOffset: UInt64,
+                     byteCount: UInt64,
+                     into destination: UnsafeMutableRawBufferPointer) throws {
         guard byteCount > 0,
               byteOffset <= descriptor.bytes,
               byteCount <= descriptor.bytes - byteOffset else {
@@ -162,16 +178,16 @@ public final class GLM52PayloadReader: @unchecked Sendable {
         let bytes = try checkedRange(name: descriptor.name,
                                      offset: absolute,
                                      byteCount: byteCount)
-        var payload = [UInt8](repeating: 0, count: bytes)
-        let ok = payload.withUnsafeMutableBytes { buffer in
-            GGUFWeights.preadFull(fd, into: buffer.baseAddress!,
-                                  bytes: bytes, offset: Int(absolute))
+        guard destination.count == bytes else {
+            throw GLM52PayloadReaderError.destinationSizeMismatch(
+                expected: byteCount, got: destination.count)
         }
-        guard ok else {
+        guard let base = destination.baseAddress,
+              GGUFWeights.preadFull(fd, into: base, bytes: bytes,
+                                    offset: Int(absolute)) else {
             throw GLM52PayloadReaderError.readFailed(
                 name: descriptor.name, offset: absolute, bytes: byteCount)
         }
-        return payload
     }
 
     /// Execute one expert stream plan: the 24 planned ranges land as packed

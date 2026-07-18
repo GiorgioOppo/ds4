@@ -389,28 +389,66 @@ extension MetalRuntime {
             let usedExperts = min(routed.selected.count,
                                   max(1, activeExperts
                                           ?? routed.selected.count))
-            for rank in 0..<usedExperts {
-                let record = try expertProvider(
-                    UInt32(bitPattern: routed.selected[rank]))
-                let gate = try glm52GraphBuffer(record.gate)
-                let up = try glm52GraphBuffer(record.up)
-                let down = try glm52GraphBuffer(record.down)
-                try glm52EncodePairSwiGLU(
-                    into: ffnBuffer, input: scratch.ffnIn, gate: gate,
-                    up: up, mid: scratch.mid, hiddenWidth: hidden,
-                    inputWidth: layer.embeddingWidth,
-                    routeWeight: routed.weights[rank],
-                    weightType: record.gateUpType)
-                try glm52EncodeMatvecQ8(into: ffnBuffer, input: scratch.mid,
-                                        weights: down,
-                                        output: scratch.contribution,
-                                        rowCount: layer.embeddingWidth,
-                                        inputWidth: hidden,
-                                        weightType: record.downType)
-                try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
-                                   b: scratch.contribution,
-                                   output: scratch.hidden,
-                                   count: layer.embeddingWidth)
+            if let stage = ffn.stagedSelection {
+                // Zero-copy path: the WHOLE selection lands in one reusable
+                // staging buffer with ONE concurrent read burst, and each
+                // record is bound by offset — no per-expert allocations or
+                // copies. Byte-identical to the provider path by
+                // construction (same packed record layout).
+                let ids = (0..<usedExperts).map {
+                    UInt32(bitPattern: routed.selected[$0])
+                }
+                let staged = try stage(ids)
+                let recordLayout = staged.layout
+                for rank in 0..<usedExperts {
+                    let base = recordLayout.recordOffset(rank: rank)
+                    try glm52EncodePairSwiGLU(
+                        into: ffnBuffer, input: scratch.ffnIn,
+                        gate: staged.buffer, up: staged.buffer,
+                        mid: scratch.mid, hiddenWidth: hidden,
+                        inputWidth: layer.embeddingWidth,
+                        routeWeight: routed.weights[rank],
+                        weightType: staged.gateUpType,
+                        gateOffset: base + recordLayout.gateOffset,
+                        upOffset: base + recordLayout.upOffset)
+                    try glm52EncodeMatvecQ8(
+                        into: ffnBuffer, input: scratch.mid,
+                        weights: staged.buffer,
+                        output: scratch.contribution,
+                        rowCount: layer.embeddingWidth,
+                        inputWidth: hidden,
+                        weightType: staged.downType,
+                        weightsOffset: base + recordLayout.downOffset)
+                    try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
+                                       b: scratch.contribution,
+                                       output: scratch.hidden,
+                                       count: layer.embeddingWidth)
+                }
+            } else {
+                for rank in 0..<usedExperts {
+                    let record = try expertProvider(
+                        UInt32(bitPattern: routed.selected[rank]))
+                    let gate = try glm52GraphBuffer(record.gate)
+                    let up = try glm52GraphBuffer(record.up)
+                    let down = try glm52GraphBuffer(record.down)
+                    try glm52EncodePairSwiGLU(
+                        into: ffnBuffer, input: scratch.ffnIn, gate: gate,
+                        up: up, mid: scratch.mid, hiddenWidth: hidden,
+                        inputWidth: layer.embeddingWidth,
+                        routeWeight: routed.weights[rank],
+                        weightType: record.gateUpType)
+                    try glm52EncodeMatvecQ8(into: ffnBuffer,
+                                            input: scratch.mid,
+                                            weights: down,
+                                            output: scratch.contribution,
+                                            rowCount: layer.embeddingWidth,
+                                            inputWidth: hidden,
+                                            weightType: record.downType)
+                    try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
+                                       b: scratch.contribution,
+                                       output: scratch.hidden,
+                                       count: layer.embeddingWidth)
+                }
             }
             try glm52GraphCommit(ffnBuffer)
         }

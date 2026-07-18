@@ -145,6 +145,17 @@ public final class GLM52ExpertBundle {
         self.payload = payload
     }
 
+    /// One expert's record read straight into `destination` (the zero-copy
+    /// staging path: destination is an MTLBuffer slice). Single bounded
+    /// contiguous pread; safe concurrently for disjoint destinations.
+    public func read(_ id: UInt32,
+                     into destination: UnsafeMutableRawBufferPointer) throws {
+        try reader.read(payload,
+                        byteOffset: UInt64(Int(id) * recordBytes),
+                        byteCount: UInt64(recordBytes),
+                        into: destination)
+    }
+
     /// One expert's record in a single bounded contiguous read.
     public func expert(_ id: UInt32) throws -> GLM52QuantizedExpert {
         let record = try reader.bytes(

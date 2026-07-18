@@ -31,9 +31,10 @@ public final class GLM52StreamedExpertProvider {
 
     public let layer: Int
     private let planner: GLM52ExpertStreamPlanner
+    private let reader: GLM52PayloadReader
     private let cache: GLM52ExpertSlotCache
-    private let gateUpType: UInt32
-    private let downType: UInt32
+    public let gateUpType: UInt32
+    public let downType: UInt32
 
     public var stats: GLM52ExpertSlotCacheStats { cache.stats }
 
@@ -73,6 +74,7 @@ public final class GLM52StreamedExpertProvider {
         gateUpType = weights.gate.type
         downType = weights.down.type
         self.bundle = bundle
+        self.reader = reader
         planner = try GLM52ExpertStreamPlanner(layer: layer, weights: weights)
         let probe = try planner.plan(selectedExperts: [0])
         let layout = try reader.packedLayout(of: probe)
@@ -81,17 +83,88 @@ public final class GLM52StreamedExpertProvider {
             slotBytes: layout.recordBytes)
     }
 
+    /// Packed gate|up|down record size — the unit the staging buffer is
+    /// sized in.
+    public var recordBytes: Int {
+        Int(planner.gateLayout.expertBytes + planner.upLayout.expertBytes
+            + planner.downLayout.expertBytes)
+    }
+
+    /// Whether the packed record can be bound with Metal buffer offsets:
+    /// every offset in the record (and the record stride) must stay 4-byte
+    /// aligned. True for the schema's quantizations at GLM shapes; a foreign
+    /// layout falls back to the copying per-expert path instead of binding
+    /// misaligned.
+    public var bindableRecordLayout: Bool {
+        planner.gateLayout.expertBytes % 4 == 0
+            && planner.upLayout.expertBytes % 4 == 0
+            && planner.downLayout.expertBytes % 4 == 0
+    }
+
     /// Per-layer contiguous bundle; nil serves from the GGUF's three
     /// scattered tensors through the LRU slot cache.
     private let bundle: GLM52ExpertBundle?
 
     private let lock = NSLock()
 
+    /// The zero-copy hot path: the whole selection's packed records land in
+    /// `destination` (rank-strided gate|up|down — an MTLBuffer's contents on
+    /// the staged decode path), read CONCURRENTLY. With a bundle each record
+    /// is one contiguous pread; without, one multi-expert plan drives the
+    /// reader's concurrent scattered reads. No lock on either path — both
+    /// are stateless pread into disjoint ranges. `destination` must hold
+    /// exactly `ids.count * recordBytes`.
+    public func stageRecords(_ ids: [UInt32],
+                             into destination: UnsafeMutableRawBufferPointer)
+        throws -> GLM52ExpertPackedRecordLayout {
+        guard let bundle else {
+            let plan = try planner.plan(selectedExperts: ids)
+            return try reader.read(plan: plan, into: destination,
+                                   concurrent: true)
+        }
+        let layout = GLM52ExpertPackedRecordLayout(
+            expertCount: ids.count,
+            gateBytes: Int(planner.gateLayout.expertBytes),
+            upBytes: Int(planner.upLayout.expertBytes),
+            downBytes: Int(planner.downLayout.expertBytes))
+        guard destination.count == layout.totalBytes,
+              bundle.recordBytes == layout.recordBytes,
+              let base = destination.baseAddress else {
+            throw GLM52PayloadReaderError.destinationSizeMismatch(
+                expected: UInt64(layout.totalBytes),
+                got: destination.count)
+        }
+        nonisolated(unsafe) let destinationBase = base
+        nonisolated(unsafe) var failure: Error?
+        let lock = NSLock()
+        let recordBytes = layout.recordBytes
+        DispatchQueue.concurrentPerform(iterations: ids.count) { rank in
+            let slice = UnsafeMutableRawBufferPointer(
+                start: destinationBase + rank * recordBytes,
+                count: recordBytes)
+            do {
+                try bundle.read(ids[rank], into: slice)
+            } catch {
+                lock.lock()
+                if failure == nil { failure = error }
+                lock.unlock()
+            }
+        }
+        if let failure { throw failure }
+        return layout
+    }
+
     /// Speculative warm-up of the slot cache off-thread — the DeepSeek
     /// expert-lookahead analog: consecutive tokens reselect experts often,
     /// so the previous token's selection is a cheap bet. Errors are
     /// swallowed on purpose (a failed prefetch just means a cold read later).
+    ///
+    /// Bundle path: a NO-OP on purpose. There the only retention is the OS
+    /// page cache, and at ~20 GiB of streaming per token it is churned long
+    /// before the layer comes around again — the speculative reads were pure
+    /// extra SSD traffic competing with the real ones.
     public func prefetch(_ ids: [UInt32]) {
+        guard bundle == nil else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             for id in ids { _ = try? self.expert(id) }
