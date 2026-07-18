@@ -109,6 +109,9 @@ public actor InferenceService {
         // Inspect and select BEFORE constructing the DeepSeek tokenizer/config.
         // A recognized Qwen GGUF must fail as "backend non ancora implementato",
         // never as a missing deepseek4.* key after an expensive Metal bring-up.
+        if let issue = ModelFileDiagnostics.openabilityIssue(path: modelPath) {
+            throw GGUFError.cannotOpen(issue)
+        }
         let openedModel = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         let selection = try RuntimeBackendFactory.prepare(model: openedModel)
         self.model = openedModel

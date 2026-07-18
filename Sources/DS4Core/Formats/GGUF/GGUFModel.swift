@@ -79,10 +79,16 @@ public final class GGUFModel {
     /// buffers); otherwise MAP_PRIVATE.
     public init(path: String, metalMapping: Bool = true, prefetchCPU: Bool = false) throws {
         let fd = open(path, O_RDONLY)
-        if fd == -1 { throw GGUFError.cannotOpen(path) }
+        if fd == -1 {
+            throw GGUFError.cannotOpen("\(path) — \(String(cString: strerror(errno)))")
+        }
 
         var st = stat()
-        if fstat(fd, &st) == -1 { close(fd); throw GGUFError.cannotOpen(path) }
+        if fstat(fd, &st) == -1 {
+            let detail = String(cString: strerror(errno))
+            close(fd)
+            throw GGUFError.cannotOpen("\(path) — \(detail)")
+        }
         if st.st_size < 32 { close(fd); throw GGUFError.tooSmall }
 
         let flags = metalMapping ? MAP_SHARED : MAP_PRIVATE

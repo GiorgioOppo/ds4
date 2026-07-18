@@ -10,6 +10,10 @@ Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
   stato consumato dalla GUI.
 - `ExpertBundleTool.swift`: verifica o costruisce il sidecar degli esperti senza
   caricare il decoder completo.
+- `ModelFileDiagnostics.swift`: pre-flight del percorso modello — spiega la
+  causa reale di un open fallito (file assente, `.part` orfano da riprendere,
+  file nella Application Support legacy invisibile alla sandbox) con il rimedio
+  nel messaggio; usato da `InferenceService` prima di aprire il GGUF.
 
 La procedura operativa è descritta in
 [`GESTIONE-MODELLI.md`](GESTIONE-MODELLI.md).
