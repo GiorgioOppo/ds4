@@ -166,13 +166,14 @@ do {
                 let reader = try GLM52PayloadReader(path: ggufPath,
                                                     weightMap: map)
                 let start = Date()
-                // Parziale-friendly: DS4_GLM_BUNDLE_LAYERS limita i bundle
-                // nuovi; senza limite si ferma comunque con grazia quando
-                // lo spazio scende sotto la riserva. I layer senza bundle
-                // continuano a servire dal GGUF.
+                // Parziale-friendly: DS4_GLM_BUNDLE_LAYERS è il tetto sui
+                // bundle TOTALI (esistenti inclusi — rilanciare non ne
+                // aggiunge); senza limite si ferma comunque con grazia
+                // quando lo spazio scende sotto la riserva. I layer senza
+                // bundle continuano a servire dal GGUF.
                 let summary = try GLM52ExpertBundle.buildAvailable(
                     directory: bundleDir, weightMap: map, reader: reader,
-                    maxNewBundles: environment["DS4_GLM_BUNDLE_LAYERS"]
+                    maxBundles: environment["DS4_GLM_BUNDLE_LAYERS"]
                         .flatMap(Int.init)) { layer, built in
                     log("DS4Demo: bundle blk\(layer) "
                         + (built ? "creato" : "già valido"))

@@ -186,12 +186,14 @@ public final class GLM52ExpertBundle {
     /// bundles is useful (each covers 1/75 of the per-token expert seeks).
     /// This walks the sparse layers and stops GRACEFULLY — never mid-file —
     /// when the free space would drop under `minFreeBytes` (default 8 GiB)
-    /// or after `maxNewBundles` fresh builds; a partially written .part is
-    /// removed on error. Rerunning resumes where it stopped.
+    /// or when `maxBundles` TOTAL bundles exist (created now or already
+    /// valid): rerunning with the same cap builds nothing more. A partially
+    /// written .part is removed on error; rerunning resumes at the first
+    /// missing layer.
     public static func buildAvailable(directory: String,
                                       weightMap: GLM52WeightMap,
                                       reader: GLM52PayloadReader,
-                                      maxNewBundles: Int? = nil,
+                                      maxBundles: Int? = nil,
                                       minFreeBytes: UInt64 = 8 << 30,
                                       layerProgress: ((Int, Bool) -> Void)?
                                           = nil) throws -> BuildSummary {
@@ -203,8 +205,8 @@ public final class GLM52ExpertBundle {
         var valid = 0
         var stopped: String?
         for layer in sparse {
-            if let cap = maxNewBundles, created >= cap {
-                stopped = "raggiunto il limite di \(cap) bundle nuovi"
+            if let cap = maxBundles, created + valid >= cap {
+                stopped = "raggiunto il tetto di \(cap) bundle totali"
                 break
             }
             let weights = try weightMap.routedExperts(layer: layer)
