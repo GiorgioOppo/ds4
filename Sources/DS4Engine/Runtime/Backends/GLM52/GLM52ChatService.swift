@@ -22,13 +22,32 @@ public actor GLM52ChatService {
     /// Tokens the engine's caches currently hold, in order.
     private var primedTokens: [Int32] = []
 
+    /// Disk-KV checkpoint file (nil = disabled): per-model scoped like the
+    /// DeepSeek store, one live checkpoint holding the LAST conversation's
+    /// caches — reopening a chat restores the longest matching prefix
+    /// instead of re-prefilling from zero.
+    private let checkpointURL: URL?
+
     /// `residentLayers`/`activeExperts` are the GUI settings (nil = env,
     /// then RAM-adaptive / full top-8).
     public init(modelPath: String,
                 contextSize: Int,
                 systemPrompt: String?,
                 residentLayers: Int? = nil,
-                activeExperts: Int? = nil) throws {
+                activeExperts: Int? = nil,
+                diskKVDirectory: String? = nil) throws {
+        if let diskKVDirectory {
+            let file = (modelPath as NSString).lastPathComponent
+            let attributes = try? FileManager.default
+                .attributesOfItem(atPath: modelPath)
+            let size = (attributes?[.size] as? UInt64) ?? 0
+            checkpointURL = URL(fileURLWithPath: diskKVDirectory)
+                .appendingPathComponent("\(file)-\(size)",
+                                        isDirectory: true)
+                .appendingPathComponent("state.glmkv")
+        } else {
+            checkpointURL = nil
+        }
         let environment = ProcessInfo.processInfo.environment
         var options = GLM52ResidentModelOptions()
         options.cacheCapacity = max(256, contextSize)
@@ -92,7 +111,9 @@ public actor GLM52ChatService {
         }.value
     }
 
-    public func quiesceForTeardown() async {}
+    public func quiesceForTeardown() async {
+        service.engine.saveUsageProfile()
+    }
 
     public struct BenchmarkNumbers: Sendable {
         public let prefillTps: Double
@@ -264,6 +285,7 @@ public actor GLM52ChatService {
         let contextSize = self.contextSize
         let primed = self.primedTokens
         let declaredTools = self.tools
+        let checkpoint = self.checkpointURL
         return AsyncThrowingStream { continuation in
             // Detached: the engine blocks on GPU/SSD waits and must not
             // occupy the cooperative pool (same discipline as the DeepSeek
@@ -324,9 +346,25 @@ public actor GLM52ChatService {
                             + "(+\(common) in cache)"))
                     } else {
                         service.engine.resetContext()
-                        suffix = tokens
+                        // Disk KV: il checkpoint dell'ultima conversazione
+                        // viene ripristinato quando è un PREFISSO stretto
+                        // della nuova — si prefilla solo il resto.
+                        var restored = 0
+                        if let checkpoint,
+                           let saved = service.engine.peekKVCheckpoint(
+                               at: checkpoint),
+                           saved.count >= 32, saved.count < tokens.count,
+                           Array(tokens.prefix(saved.count)) == saved,
+                           (try? service.engine.restoreKVCheckpoint(
+                               from: checkpoint)) != nil {
+                            restored = saved.count
+                            continuation.yield(.progress(
+                                "KV da disco: \(restored) token "
+                                + "ripristinati"))
+                        }
+                        suffix = Array(tokens[restored...])
                         continuation.yield(.progress(
-                            "prefill \(tokens.count) token (layer-major)"))
+                            "prefill \(suffix.count) token (layer-major)"))
                     }
                     let prefillStart = Date()
                     var logits = try service.engine.prefill(suffix)
@@ -389,6 +427,13 @@ public actor GLM52ChatService {
                     await self.noteGeneration(fedTokens: fed,
                                               assistant: parsed.visibleText,
                                               calls: parsed.calls)
+                    // Checkpoint disk-KV a fine generazione (best-effort,
+                    // ~96 KB/token): la prossima riapertura riparte da qui.
+                    if let checkpoint, fed.count >= 64 {
+                        try? service.engine.saveKVCheckpoint(
+                            to: checkpoint, tokens: fed)
+                    }
+                    service.engine.saveUsageProfile()
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

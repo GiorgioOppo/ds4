@@ -295,6 +295,10 @@ do {
             log(String(format: "DS4Demo: totale %.1fs (load %.1f + prefill %.1f + decode %.1f)",
                        Date().timeIntervalSince(loadStart), loadSeconds,
                        prefillSeconds, decodeSeconds))
+            // Usage imatrix persistita tra i run (come la .usage.json di
+            // DeepSeek): <gguf>.glm-usage.json, DS4_GLM_USAGE_FILE=off per
+            // disattivare.
+            glm.saveUsageProfile()
             exit(0)
         }
         if detectedArchitecture.family == .qwen

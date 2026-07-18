@@ -211,7 +211,8 @@ extension ChatStore {
                                     residentLayers: glmResident > 0
                                         ? glmResident : nil,
                                     activeExperts: glmExperts > 0
-                                        ? glmExperts : nil))
+                                        ? glmExperts : nil,
+                                    diskKVDirectory: kvDir?.path))
                             } catch {
                                 cont.resume(throwing: error)
                             }

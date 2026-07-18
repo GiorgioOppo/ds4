@@ -433,6 +433,7 @@ public final class GLM52ResidentModel {
         for layer in stack {
             layer.ffn.stagedSelection = staged[layer.index]
         }
+        loadUsageProfile()
     }
 
     /// Kick a background warm-up of `layer`'s arena slots with the LAST
@@ -583,13 +584,178 @@ public final class GLM52ResidentModel {
     }
 
     /// Remember this token's routed selection (clamped to the experts the
-    /// FFN actually runs) as the next token's speculative guess.
+    /// FFN actually runs) as the next token's speculative guess, and feed
+    /// the persistent usage profile.
     private func noteRouting(_ index: Int, _ routing: GLM52RouterOutput?) {
         guard let routing else { return }
         let used = min(routing.selected.count,
                        max(1, activeExperts ?? routing.selected.count))
-        lastRouted[index] = routing.selected.prefix(used)
+        let selected = routing.selected.prefix(used)
             .map { UInt32(bitPattern: $0) }
+        lastRouted[index] = selected
+        var counts = usageCounts[index] ?? [UInt32](
+            repeating: 0, count: GLM52RouterReference.expertCount)
+        for id in selected where Int(id) < counts.count {
+            counts[Int(id)] += 1
+        }
+        usageCounts[index] = counts
+        usageDirty = true
+    }
+
+    // MARK: - Persistent expert-usage profile
+
+    private var usageCounts: [Int: [UInt32]] = [:]
+    private var usageDirty = false
+
+    private var usageProfilePath: String {
+        ProcessInfo.processInfo.environment["DS4_GLM_USAGE_FILE"]
+            ?? (reader.path + ".glm-usage.json")
+    }
+
+    /// Persist the per-layer expert selection counts (the GLM usage
+    /// imatrix): future loads start with the routing history instead of a
+    /// blank slate. "off" disables.
+    public func saveUsageProfile() {
+        let path = usageProfilePath
+        guard path != "off", usageDirty else { return }
+        var object: [String: [UInt32]] = [:]
+        for (layer, counts) in usageCounts {
+            object[String(layer)] = counts
+        }
+        if let data = try? JSONEncoder().encode(object) {
+            try? data.write(to: URL(fileURLWithPath: path))
+            usageDirty = false
+        }
+    }
+
+    private func loadUsageProfile() {
+        let path = usageProfilePath
+        guard path != "off",
+              let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONDecoder().decode(
+                  [String: [UInt32]].self, from: data) else { return }
+        for (key, counts) in object {
+            if let layer = Int(key) { usageCounts[layer] = counts }
+        }
+        let routes = usageCounts.values
+            .reduce(UInt64(0)) { total, counts in
+                total + counts.reduce(UInt64(0)) { $0 + UInt64($1) }
+            }
+        FileHandle.standardError.write(Data(
+            "DS4 glm: usage profile caricato (\(routes) route)\n".utf8))
+    }
+
+    // MARK: - Disk KV checkpoints
+
+    static let kvMagic: UInt32 = 0x3156_4B47   // "GKV1"
+
+    private var allCaches: [GLM52ResidentDecodeCaches] {
+        stack.map(\.caches) + streamedLayers.map(\.caches)
+    }
+
+    /// Persist the LIVE caches plus the tokens they hold (~96 KB/token).
+    /// Atomic: `.part` then rename; identity = GGUF size + layer count.
+    public func saveKVCheckpoint(to url: URL, tokens: [Int32]) throws {
+        guard tokens.count == position, position > 0 else {
+            throw MetalError.unsupported(
+                "GLM 5.2 disk-KV: i token (\(tokens.count)) non combaciano "
+                + "con la position (\(position))")
+        }
+        var data = Data()
+        func u32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        func u64(_ value: UInt64) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        u32(Self.kvMagic); u32(1)
+        u64(reader.fileSize)
+        u32(UInt32(loadedLayerCount)); u32(UInt32(position))
+        tokens.withUnsafeBufferPointer {
+            data.append(Data(buffer: $0))
+        }
+        for caches in allCaches {
+            let snapshot = caches.checkpointData()
+            data.append(snapshot.compact)
+            if let indexer = snapshot.indexer { data.append(indexer) }
+        }
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let part = url.appendingPathExtension("part")
+        try data.write(to: part)
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: part)
+    }
+
+    /// Header-only peek: the tokens a checkpoint holds — nil when absent,
+    /// foreign (different GGUF/layer count) or malformed.
+    public func peekKVCheckpoint(at url: URL) -> [Int32]? {
+        guard let handle = FileHandle(forReadingAtPath: url.path) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 24),
+              header.count == 24 else { return nil }
+        func u32(_ offset: Int) -> UInt32 {
+            header.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+            }
+        }
+        func u64(_ offset: Int) -> UInt64 {
+            header.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self)
+            }
+        }
+        guard u32(0) == Self.kvMagic, u32(4) == 1,
+              u64(8) == reader.fileSize,
+              u32(16) == UInt32(loadedLayerCount) else { return nil }
+        let count = Int(u32(20))
+        guard count > 0, count <= 1_000_000,
+              let tokenData = try? handle.read(upToCount: count * 4),
+              tokenData.count == count * 4 else { return nil }
+        return tokenData.withUnsafeBytes {
+            Array($0.bindMemory(to: Int32.self))
+        }
+    }
+
+    /// Full restore of caches + position. Returns the restored tokens; the
+    /// caller has already verified they prefix the new conversation.
+    @discardableResult
+    public func restoreKVCheckpoint(from url: URL) throws -> [Int32] {
+        guard let tokens = peekKVCheckpoint(at: url) else {
+            throw MetalError.unsupported(
+                "GLM 5.2 disk-KV: checkpoint assente o estraneo")
+        }
+        let count = tokens.count
+        guard let handle = FileHandle(forReadingAtPath: url.path) else {
+            throw MetalError.unsupported(
+                "GLM 5.2 disk-KV: checkpoint non leggibile")
+        }
+        defer { try? handle.close() }
+        try handle.seek(toOffset: UInt64(24 + count * 4))
+        for caches in allCaches {
+            let compactBytes = count * caches.compactRowBytes
+            guard let compactData = try handle.read(
+                      upToCount: compactBytes),
+                  compactData.count == compactBytes else {
+                throw MetalError.unsupported(
+                    "GLM 5.2 disk-KV: checkpoint troncato")
+            }
+            var indexerData: Data?
+            if caches.indexerKeys != nil {
+                let indexerBytes = count * caches.indexerRowBytes
+                guard let data = try handle.read(upToCount: indexerBytes),
+                      data.count == indexerBytes else {
+                    throw MetalError.unsupported(
+                        "GLM 5.2 disk-KV: checkpoint troncato (indexer)")
+                }
+                indexerData = data
+            }
+            try caches.restoreCheckpoint(
+                compact: compactData, indexer: indexerData, rows: count)
+        }
+        position = count
+        return tokens
     }
 
     /// Feed a whole prompt; returns the logits after the final prompt token

@@ -187,6 +187,49 @@ public final class GLM52ResidentDecodeCaches {
     /// the live count are never read, so no clearing is needed.
     public func reset() { rows = 0 }
 
+    var compactRowBytes: Int {
+        let rowWidth = geometry.layer.kvLoraRank + geometry.layer.ropeDimension
+        return rowWidth * MemoryLayout<UInt16>.stride
+    }
+
+    var indexerRowBytes: Int {
+        geometry.indexerHeadDimension * MemoryLayout<UInt16>.stride
+    }
+
+    /// Live rows as raw bytes (disk-KV checkpoint payload).
+    func checkpointData() -> (compact: Data, indexer: Data?) {
+        let compactData = Data(bytes: compact.contents(),
+                               count: rows * compactRowBytes)
+        let indexerData = indexerKeys.map {
+            Data(bytes: $0.contents(), count: rows * indexerRowBytes)
+        }
+        return (compactData, indexerData)
+    }
+
+    /// Restore `rowCount` rows from checkpoint bytes (sizes validated).
+    func restoreCheckpoint(compact compactData: Data, indexer: Data?,
+                           rows rowCount: Int) throws {
+        guard rowCount <= capacity,
+              compactData.count == rowCount * compactRowBytes,
+              (indexerKeys == nil) == (indexer == nil),
+              indexer.map({ $0.count == rowCount * indexerRowBytes })
+                  ?? true else {
+            throw MetalError.unsupported(
+                "GLM 5.2 disk-KV: checkpoint incompatibile con le cache")
+        }
+        compactData.withUnsafeBytes {
+            compact.contents().copyMemory(
+                from: $0.baseAddress!, byteCount: $0.count)
+        }
+        if let indexer, let indexerKeys {
+            indexer.withUnsafeBytes {
+                indexerKeys.contents().copyMemory(
+                    from: $0.baseAddress!, byteCount: $0.count)
+            }
+        }
+        rows = rowCount
+    }
+
     /// The live compact rows as F16 bits — for tests and checkpoints.
     public func compactSnapshot() -> [UInt16] {
         let count = rows * (geometry.layer.kvLoraRank
