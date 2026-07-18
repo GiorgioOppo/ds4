@@ -7,7 +7,14 @@ import Foundation
 /// or state is shared with the DeepSeek hot loop. Greedy-only and
 /// validation-grade (per-dispatch executor speed); the optimization tranches
 /// come after the full-model parity gate.
-public final class GLM52InferenceService {
+/// @unchecked Sendable: the stored references are immutable (`tokenizer`,
+/// `engine`) and the USAGE contract serializes mutation — one generation at
+/// a time, enforced by the GLM52ChatService actor (its producer tasks run
+/// strictly one per send, and ChatStore additionally gates on
+/// `isGenerating`); the engine's internal prefetch paths take their own
+/// locks. This mirrors the discipline of the DeepSeek service's GCD-serial
+/// executor rather than adding a second serialization layer.
+public final class GLM52InferenceService: @unchecked Sendable {
     public let tokenizer: GLM52Tokenizer
     public let engine: GLM52ResidentModel
 
