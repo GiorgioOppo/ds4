@@ -152,10 +152,23 @@ do {
             } else {
                 log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
             }
+            let loadStart = Date()
             let glm = try GLM52ResidentModel(
                 runtime: runtime, path: ggufPath, options: glmOptions)
+            let loadSeconds = Date().timeIntervalSince(loadStart)
+            log(String(format: "DS4Demo: GLM caricato in %.1f s (%d layer, %d residenti)",
+                       loadSeconds, glm.loadedLayerCount,
+                       glmOptions.residentLayerCount ?? glm.loadedLayerCount))
+
             let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
+            let prefillStart = Date()
             var logits = try glm.prefill(tokens)
+            let prefillSeconds = Date().timeIntervalSince(prefillStart)
+            log(String(format: "DS4Demo: prefill %d token in %.1f s (%.2f tok/s, layer-major)",
+                       tokens.count, prefillSeconds,
+                       Double(tokens.count) / max(prefillSeconds, 0.001)))
+
+            let decodeStart = Date()
             var produced = 0
             while produced < maxNew {
                 guard let token = GLM52GreedyDecoding.argmax(logits) else {
@@ -168,6 +181,11 @@ do {
                 logits = try glm.forwardNext(token)
             }
             print("")
+            let decodeSeconds = Date().timeIntervalSince(decodeStart)
+            log(String(format: "DS4Demo: decode %d token in %.1f s (%.2f tok/s) · totale %.1f s",
+                       produced, decodeSeconds,
+                       Double(produced) / max(decodeSeconds, 0.001),
+                       Date().timeIntervalSince(loadStart)))
             exit(0)
         }
         if detectedArchitecture.family == .qwen
