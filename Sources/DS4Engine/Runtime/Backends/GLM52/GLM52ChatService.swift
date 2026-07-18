@@ -169,6 +169,14 @@ public actor GLM52ChatService {
         self.systemPrompt = systemPrompt
     }
 
+    /// DS-shaped agent application (the `ChatBackend` contract): system
+    /// prompt + declared tools from the profile, like the DeepSeek service.
+    public func setAgent(_ agent: AgentProfile, tools: [ToolSpec]) {
+        systemPrompt = agent.systemPrompt.isEmpty
+            ? nil : agent.systemPrompt
+        self.tools = tools
+    }
+
     /// Tools declared to the model (rendered into the native GLM XML tool
     /// prompt). The compact form is a DeepSeek-only optimization: accepted
     /// and ignored here.
