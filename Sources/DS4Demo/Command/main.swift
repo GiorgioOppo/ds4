@@ -236,17 +236,26 @@ do {
                        loadSeconds, glm.loadedLayerCount,
                        glmOptions.residentLayerCount ?? glm.loadedLayerCount))
 
+            // Output standard della demo (stesse etichette del ramo
+            // DeepSeek): prefill layer-major, "Risposta:", righe per-token
+            // "[tok N ...]", totale, riga REGIME con DS4_WARMUP e profilo
+            // streaming come rapporto per-fase.
             let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
             let prefillStart = Date()
             var logits = try glm.prefill(tokens)
             let prefillSeconds = Date().timeIntervalSince(prefillStart)
-            log(String(format: "DS4Demo: prefill %d token in %.1f s (%.2f tok/s, layer-major)",
+            log(String(format: "DS4Demo: prefill %d token (layer-major) in %.1fs (%.2f tok/s)",
                        tokens.count, prefillSeconds,
                        Double(tokens.count) / max(prefillSeconds, 0.001)))
-            log("DS4Demo: prefill " + glm.streamingReport())
+            log("")
+            log("DS4Demo: profilo prefill — " + glm.streamingReport())
             glm.resetStreamingStats()
 
+            let stdout = FileHandle.standardOutput
+            stdout.write(Data("\nRisposta: ".utf8))
+            let warmup = environment["DS4_WARMUP"].flatMap(Int.init) ?? 0
             let decodeStart = Date()
+            var steadyStart = decodeStart
             var produced = 0
             while produced < maxNew {
                 guard let token = GLM52GreedyDecoding.argmax(logits) else {
@@ -254,17 +263,38 @@ do {
                 }
                 produced += 1
                 if tokenizer.isStopToken(token, reasoning: .none) { break }
-                FileHandle.standardOutput.write(Data(tokenizer.tokenText(token)))
+                stdout.write(Data(tokenizer.tokenText(token)))
                 if produced == maxNew { break }
+                let t0 = Date()
                 logits = try glm.forwardNext(token)
+                let dt = Date().timeIntervalSince(t0)
+                log(String(format: "  [tok %d  %.1fs  %.2f tok/s]",
+                           produced, dt, dt > 0 ? 1.0 / dt : 0))
+                if produced == warmup {
+                    // I primi token pagano costi una-tantum (arena fredda,
+                    // page cache, wiring): il profilo riparte da qui e la
+                    // media di regime è riportata a parte, come in DeepSeek.
+                    glm.resetStreamingStats()
+                    steadyStart = Date()
+                }
             }
-            print("")
+            stdout.write(Data("\n".utf8))
             let decodeSeconds = Date().timeIntervalSince(decodeStart)
-            log(String(format: "DS4Demo: decode %d token in %.1f s (%.2f tok/s) · totale %.1f s",
+            log(String(format: "DS4Demo: %d tokens in %.1fs (%.2f tok/s)",
                        produced, decodeSeconds,
-                       Double(produced) / max(decodeSeconds, 0.001),
-                       Date().timeIntervalSince(loadStart)))
-            log("DS4Demo: decode " + glm.streamingReport())
+                       Double(produced) / max(decodeSeconds, 0.001)))
+            if warmup > 0, produced > warmup {
+                let steadyTokens = produced - warmup
+                let steadySeconds = Date().timeIntervalSince(steadyStart)
+                log(String(format: "DS4Demo: REGIME (dal token %d): %d token in %.1fs (%.2f tok/s) — profilo sotto = solo regime",
+                           warmup + 1, steadyTokens, steadySeconds,
+                           Double(steadyTokens) / max(steadySeconds, 0.001)))
+            }
+            log("")
+            log("DS4Demo: profilo decode — " + glm.streamingReport())
+            log(String(format: "DS4Demo: totale %.1fs (load %.1f + prefill %.1f + decode %.1f)",
+                       Date().timeIntervalSince(loadStart), loadSeconds,
+                       prefillSeconds, decodeSeconds))
             exit(0)
         }
         if detectedArchitecture.family == .qwen
