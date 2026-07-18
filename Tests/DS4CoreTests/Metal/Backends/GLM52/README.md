@@ -44,6 +44,11 @@ quantizer, dequantizes the same bytes, and requires the Q8 kernels to match
 the F32 baselines on those dequantized values — quantization error belongs to
 the fixture, never to the kernel.
 
+The rope-tail suite pins identity at position 0, untouched nope prefixes,
+per-pair norm preservation, inverse composition, and GPU-vs-oracle parity on
+query heads and the single K row at moderate positions (fp32 trigonometry of
+huge angles diverges by argument reduction — the documented rope caveat).
+
 The MoE suite applies the same discipline to the quantized FFN kernels:
 Q4_K fixtures from the real quantizer, synthesized Q2_K/Q5_K/Q6_K blocks
 decoded by the `Quantize` references, Q8_0 dense/output-head paths on widths

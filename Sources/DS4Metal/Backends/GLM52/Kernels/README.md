@@ -37,6 +37,10 @@ The currently validated atomic boundaries are:
   iterative binary-search merges), reusing the vendored DeepSeek argsort
   kernels. Causal future rows arrive as `-INFINITY` scores and sink to the
   end; ties follow the bitonic network, not the oracle's lowest-index rule;
+- `GLM52RopeTail`: the linear GLM tail RoPE (adjacent pairs, freq base 8e6,
+  no YaRN — upstream `rope_tail_ext_inplace` with GLM constants) for the
+  per-head query tails and the single K row before its compact-cache store;
+  iterative-theta CPU oracle, closed-form-theta kernel, forward only;
 - `GLM52MoE`: validation kernels for the quantized FFN matvec stages —
   fused gate/up SwiGLU (route weight on the mid, before down) and the down
   projection — reading Q8_0 and Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored

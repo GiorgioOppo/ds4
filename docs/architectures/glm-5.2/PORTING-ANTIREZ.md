@@ -34,7 +34,7 @@ utilizzabili come promessa prestazionale per questa app.
 | Lettura pesi | `pread` bounded su descrittori e piani top-8 e slot-cache LRU con pinning del batch e hit byte-identici; MetalIO da collegare |
 | Tokenizer/chat/tool | implementati con golden test sugli ID reali |
 | Router | oracle CPU e kernel Metal dedicato |
-| DSA/IndexShare | layout, policy, scorer/top-k CPU, primitive Metal e top-k GPU multi-blocco (argsort+merge) |
+| DSA/IndexShare | layout, policy, scorer/top-k CPU, primitive Metal, top-k GPU multi-blocco e RoPE della coda (query e K) |
 | Attenzione compatta | oracle CPU doppio (espanso vs assorbito) e kernel Metal staged qk_lowrank/indexed/value_project (F32 e Q8_0) confrontati con l'oracle |
 | FFN/MoE/output head | oracle CPU F32-ref, dequant K-quant di riferimento e kernel Metal di validazione per tutte le fasi (routed K-quant, denso/shared/output head Q8_0); famiglie ottimizzate per-quant mancanti |
 | Cache | planner F16 lazy; KV-LoRA norm/store e indexer-K norm/RoPE/store isolati |
