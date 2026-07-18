@@ -722,6 +722,14 @@ final class ChatStore {
     /// memory and OOM-crashes on 16 GB. `InferenceService` is an actor, so
     /// concurrent callers are serialized safely. nil until a model is ready.
     var sharedEngine: InferenceService? { isReady ? service : nil }
+    /// Il backend chat attivo dietro il contratto comune `ChatBackend` —
+    /// DeepSeek o GLM, uno solo alla volta. I punti che servono capacità
+    /// specifiche (profili, disk-KV DeepSeek, sub-agent) continuano a usare
+    /// `service`/`glmService` concreti.
+    var chatBackend: (any ChatBackend)? {
+        if let service { return service }
+        return glmService
+    }
     /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
     /// KV, so it's refused while the chat is mid-generation.
     var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }

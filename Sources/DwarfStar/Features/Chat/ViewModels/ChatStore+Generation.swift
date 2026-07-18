@@ -51,10 +51,8 @@ extension ChatStore {
     func send() {
         let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard EngineActivityGate.shared.activeOwner == nil,
-              service != nil || glmService != nil, !isGenerating,
+              let backend = chatBackend, !isGenerating,
               !(typed.isEmpty && attachments.isEmpty) else { return }
-        let service = self.service
-        let glm = self.glmService
         let epoch = beginConversationWork()
         let atts = attachments
         let text = Self.composeUserText(typed: typed, attachments: atts)
@@ -82,20 +80,14 @@ extension ChatStore {
         // the app decodes slower than the foreground CLI demo. Match the model-load
         // task's priority (and the CLI's foreground QoS) explicitly.
         generation = Task(priority: .userInitiated) { [weak self] in
-            let stream: AsyncThrowingStream<GenEvent, Error>
-            if let glm {
-                stream = primed
-                    ? await glm.send(userText: text, thinkMode: mode,
+            // Un solo percorso per entrambi i motori: il contratto
+            // ChatBackend copre send e sendWithHistory.
+            let stream = primed
+                ? await backend.send(userText: text, thinkMode: mode,
                                      sampling: params, maxTokens: 4096)
-                    : await glm.sendWithHistory(
-                        history, userText: text, systemPrompt: sys,
-                        thinkMode: mode, sampling: params, maxTokens: 4096)
-            } else if let service {
-                stream = primed
-                    ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
-                    : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
-                                                    thinkMode: mode, sampling: params, maxTokens: 4096)
-            } else { return }
+                : await backend.sendWithHistory(
+                    history, userText: text, systemPrompt: sys,
+                    thinkMode: mode, sampling: params, maxTokens: 4096)
             guard let self, self.ownsConversationWork(epoch) else { return }
             await self.consume(stream, into: index, epoch: epoch)
             guard self.ownsConversationWork(epoch) else { return }
@@ -106,7 +98,7 @@ extension ChatStore {
 
     /// Submit manually-entered results for the pending (non-built-in) tool calls.
     func submitManualResults(_ contents: [String: String]) {
-        guard service != nil || glmService != nil, !pendingManualCalls.isEmpty,
+        guard let backend = chatBackend, !pendingManualCalls.isEmpty,
               let epoch = pendingManualEpoch,
               conversationEpoch == epoch,
               pendingManualCalls.count == pendingManualOutputIndices.count else { return }
@@ -127,11 +119,7 @@ extension ChatStore {
         pendingManualOutputIndices = []
         pendingManualEpoch = nil
         awaitingManualResults = false
-        if let service {
-            continueWithToolOutputs(outputs, service: service, epoch: epoch)
-        } else if let glm = glmService {
-            continueWithGLMToolOutputs(outputs, glm: glm, epoch: epoch)
-        }
+        continueWithToolOutputs(outputs, backend: backend, epoch: epoch)
     }
 
     /// Abandon the pending manual tool calls without answering them. The calls

@@ -121,7 +121,10 @@ extension ChatStore {
     /// per-agent usage profile swapped in, slot-cache re-warmed.
     @discardableResult
     func applyAgent() -> Task<Bool, Never>? {
-        guard let service else { return nil }
+        // Contratto comune: ruolo + tool si applicano a ENTRAMBI i backend;
+        // il tuningInfo resta una capacità DeepSeek (nil su GLM).
+        guard let backend = chatBackend else { return nil }
+        let concreteService = service
         let agent = resolvedAgent()
         toolsEnabled = !agent.toolNames.isEmpty
         enabledToolNames = Set(agent.toolNames)
@@ -137,14 +140,14 @@ extension ChatStore {
             // Cancelling a Task does not necessarily cancel an actor message
             // already enqueued, so waiting is safer than overlapping engines.
             _ = await previous?.value
-            await service.setAgent(agent, tools: tools)
+            await backend.setAgent(agent, tools: tools)
             guard let self else { return false }
-            await service.setCompactTools(self.compactTools)
+            await backend.setCompactTools(self.compactTools)
             // Se il CAMBIO di agente ha invalidato la slot-cache (profilo
             // usage nuovo), i pool si riscaldano ORA in background invece che
             // dentro il primo messaggio. No-op quando l'agente non è cambiato.
-            let warmupSucceeded = await service.warmup()
-            let info = await service.tuningInfo()
+            let warmupSucceeded = await backend.warmup()
+            let info = await concreteService?.tuningInfo()
             if self.engineSetupEpoch == epoch {
                 self.tuningInfo = info
                 self.engineSetupCompletedEpoch = epoch

@@ -92,9 +92,9 @@ extension ChatStore {
 
     /// Refresh the committed-token count (context usage) from the engine.
     private func refreshContextUsage(epoch: UInt64) {
-        guard let service else { contextUsed = 0; return }
+        guard let backend = chatBackend else { contextUsed = 0; return }
         Task { [weak self] in
-            let tokens = await service.committedTokens()
+            let tokens = await backend.committedTokens()
             guard let self, self.conversationEpoch == epoch else { return }
             self.contextUsed = tokens
         }
@@ -157,8 +157,7 @@ extension ChatStore {
     /// continues (a continuation was spawned or we're awaiting manual input) — in
     /// which case the caller must NOT mark generation finished.
     func handleToolCalls(assistantIndex index: Int, epoch: UInt64) async -> Bool {
-        guard ownsConversationWork(epoch),
-              service != nil || glmService != nil,
+        guard ownsConversationWork(epoch), chatBackend != nil,
               index < messages.count else { return false }
         let calls = messages[index].toolCalls
         guard !calls.isEmpty else { return false }
@@ -323,44 +322,18 @@ extension ChatStore {
                                       text: "✗ internal tool-result alignment error; continuation stopped"))
             return false
         }
-        if let service {
-            return continueWithToolOutputs(outputSlots.compactMap { $0 },
-                                           service: service, epoch: epoch)
-        }
-        guard let glm = glmService else { return false }
-        return continueWithGLMToolOutputs(outputSlots.compactMap { $0 },
-                                          glm: glm, epoch: epoch)
+        guard let backend = chatBackend else { return false }
+        return continueWithToolOutputs(outputSlots.compactMap { $0 },
+                                       backend: backend, epoch: epoch)
     }
 
-    /// GLM counterpart of `continueWithToolOutputs`: same loop shape over
-    /// the GLM chat service's native observation turns.
+    /// Feed tool outputs back and stream the model's continuation (which may
+    /// emit further tool calls — the loop repeats, bounded by maxToolRounds).
+    /// One path for both engines: `provideToolResults` is part of the
+    /// `ChatBackend` contract.
     @discardableResult
-    func continueWithGLMToolOutputs(_ outputs: [ToolOutput],
-                                    glm: GLM52ChatService,
-                                    epoch: UInt64) -> Bool {
-        guard ownsConversationWork(epoch) else { return false }
-        let index = appendAssistant()
-        isGenerating = true
-        let mode = thinkMode
-        let params = sampling
-        generation = Task(priority: .userInitiated) { [weak self] in
-            let stream = await glm.provideToolResults(outputs, thinkMode: mode,
-                                                      sampling: params,
-                                                      maxTokens: 4096)
-            guard let self, self.ownsConversationWork(epoch) else { return }
-            await self.consume(stream, into: index, epoch: epoch)
-            guard self.ownsConversationWork(epoch) else { return }
-            let continued = await self.handleToolCalls(assistantIndex: index,
-                                                       epoch: epoch)
-            if !continued { self.finishIfIdle(epoch: epoch) }
-        }
-        return true
-    }
-
-    /// Feed tool outputs back and stream the model's continuation (which may emit
-    /// further tool calls — the loop repeats, bounded by maxToolRounds).
-    @discardableResult
-    func continueWithToolOutputs(_ outputs: [ToolOutput], service: InferenceService,
+    func continueWithToolOutputs(_ outputs: [ToolOutput],
+                                 backend: any ChatBackend,
                                  epoch: UInt64) -> Bool {
         guard ownsConversationWork(epoch) else { return false }
         let index = appendAssistant()
@@ -368,7 +341,7 @@ extension ChatStore {
         let mode = thinkMode
         let params = sampling             // capture: `self` is weak inside the Task
         generation = Task(priority: .userInitiated) { [weak self] in   // see send(): keep decode QoS high
-            let stream = await service.provideToolResults(outputs, thinkMode: mode,
+            let stream = await backend.provideToolResults(outputs, thinkMode: mode,
                                                           sampling: params, maxTokens: 4096)
             guard let self, self.ownsConversationWork(epoch) else { return }
             await self.consume(stream, into: index, epoch: epoch)

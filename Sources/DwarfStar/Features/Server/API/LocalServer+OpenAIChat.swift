@@ -54,19 +54,10 @@ extension LocalServer {
                                  sampling: SamplingParams, maxTokens: Int) async
         -> AsyncThrowingStream<GenEvent, Error> {
         let t0 = Date()
-        let stream: AsyncThrowingStream<GenEvent, Error>
-        if let engine {
-            stream = await engine.complete(turns: turns, tools: tools, thinkMode: think,
-                                           sampling: sampling, maxTokens: maxTokens)
-        } else if let glmEngine {
-            stream = await glmEngine.complete(turns: turns, tools: tools, thinkMode: think,
-                                              sampling: sampling, maxTokens: maxTokens)
-        } else {
-            stream = AsyncThrowingStream { continuation in
-                continuation.finish(throwing: GGUFError.cannotOpen(
-                    "nessun motore caricato per il server"))
-            }
-        }
+        let stream = await backend.complete(turns: turns, tools: tools,
+                                            thinkMode: think,
+                                            sampling: sampling,
+                                            maxTokens: maxTokens)
         let dt = Date().timeIntervalSince(t0)
         if dt > 0.5 {
             onLog(String(format: "· preparazione prompt %.1fs (render+tokenizzazione, attesa motore inclusa)\n", dt))

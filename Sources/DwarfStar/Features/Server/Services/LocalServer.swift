@@ -37,10 +37,9 @@ final class LocalServer: @unchecked Sendable {
     /// connection is dropped — stalled sockets can't accumulate forever.
     static let readTimeout: UInt64 = 60 * 1_000_000_000
 
-    /// Exactly one of the two engines is non-nil: the server wraps whatever
-    /// backend the chat loaded (DeepSeek InferenceService or GLM 5.2).
-    let engine: InferenceService?
-    let glmEngine: GLM52ChatService?
+    /// Il motore che la chat ha caricato, dietro il contratto comune —
+    /// DeepSeek o GLM, indifferente per il server.
+    let backend: any ChatBackend
     let modelName: String         // display name (the GGUF file)
     /// The ONE model id the API advertises: the loaded GGUF's basename. There
     /// is no model choice — the server wraps the single engine loaded in
@@ -63,11 +62,9 @@ final class LocalServer: @unchecked Sendable {
     private var listener: NWListener?
     private var activeRequests: [UUID: ActiveRequest] = [:]
 
-    init(engine: InferenceService?, glmEngine: GLM52ChatService? = nil,
-         modelName: String, config: Config,
+    init(backend: any ChatBackend, modelName: String, config: Config,
          onLog: @escaping @Sendable (String) -> Void) {
-        self.engine = engine
-        self.glmEngine = glmEngine
+        self.backend = backend
         self.modelName = modelName
         self.modelId = (modelName as NSString).deletingPathExtension
         self.config = config
@@ -139,8 +136,7 @@ final class LocalServer: @unchecked Sendable {
         // AsyncThrowingStream. Dropping/cancelling the stream requests its
         // cancellation; this actor hop waits for that synchronous Metal loop
         // and all decoder/disk-KV background work to finish as well.
-        await engine?.quiesceForTeardown()
-        await glmEngine?.quiesceForTeardown()
+        await backend.quiesceForTeardown()
     }
 
     func accept(_ conn: NWConnection) {
