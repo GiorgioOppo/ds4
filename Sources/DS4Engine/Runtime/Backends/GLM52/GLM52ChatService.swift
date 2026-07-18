@@ -99,13 +99,19 @@ public actor GLM52ChatService {
         return await Task.detached(priority: .userInitiated) {
             let probe = service.tokenizer
                 .tokenizeRenderedChat("ciao").first ?? 1
+            // Il reset di ripristino DEVE correre anche su errore: un
+            // prefill fallito a metà lascia righe appese in alcuni layer
+            // (position 0, rows 1) e avvelenerebbe il primo prefill vero.
+            defer {
+                service.engine.resetContext()
+                service.engine.resetStreamingStats()
+            }
             do {
                 service.engine.resetContext()
                 _ = try service.engine.prefill([probe])
-                service.engine.resetContext()
-                service.engine.resetStreamingStats()
                 return true
             } catch {
+                DS4Log.info("glm", "warmup fallito: \(error)")
                 return false
             }
         }.value
@@ -136,6 +142,8 @@ public actor GLM52ChatService {
             if tokens.isEmpty { tokens = [1] }
             while tokens.count < limit { tokens += tokens }
             tokens = Array(tokens.prefix(limit))
+            // Come nel warmup: cache coerenti anche quando il run fallisce.
+            defer { service.engine.resetContext() }
             service.engine.resetContext()
             service.engine.resetStreamingStats()
             let prefillStart = Date()
@@ -359,7 +367,11 @@ public actor GLM52ChatService {
                     // rendered conversation extends what the caches hold.
                     let common = zip(primed, tokens)
                         .prefix { $0 == $1 }.count
-                    let incremental = common == primed.count
+                    // primed vuoto NON è incrementale: uno stato ignoto
+                    // (warmup fallito, generazione interrotta) deve sempre
+                    // passare dal reset, che riporta le cache a zero righe.
+                    let incremental = !primed.isEmpty
+                        && common == primed.count
                         && common == service.engine.position
                         && common < tokens.count
                     let suffix: [Int32]
