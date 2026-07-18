@@ -2,11 +2,6 @@ import DS4Core
 import DS4Metal
 
 /// Registration record for the GLM 5.2 (`glm-dsa`) family.
-///
-/// The portable model contract, tokenizer and conversation grammar can be
-/// validated before numerical inference exists. Runtime capabilities remain
-/// empty until the resident Metal graph passes the GLM correctness fixtures;
-/// this prevents the GUI or demo from dispatching a GLM file into DeepSeek V4.
 public enum GLM52BackendDefinition {
     public static let supportedArchitecture: ModelArchitectureID = .glmDSA
     public static let expectedBlockCount = 79
@@ -16,7 +11,14 @@ public enum GLM52BackendDefinition {
         .chat, .tools, .reasoning, .mixtureOfExperts, .compressedAttention,
     ]
 
-    public static let runtimeCapabilities: BackendCapabilities = []
+    /// What the GLM runtime SERVES today — the GUI mostra i controlli
+    /// (think, tool, disk KV, knob esperti, bottone sidecar) in base a
+    /// questo set. Fuori restano solo le capacità DeepSeek-specifiche
+    /// (tuning misurato, distribuito).
+    public static let runtimeCapabilities: BackendCapabilities = [
+        .generation, .reasoning, .tools, .diskKV, .expertRouting,
+        .expertBundle,
+    ]
 
     /// The enablement switch, forwarded from the target-visible gate in
     /// DS4Metal (`GLM52RuntimeGate.enabled`): selector routing, catalog
