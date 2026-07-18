@@ -104,7 +104,12 @@ La sequenza di abilitazione è vincolante:
    routed via slot cache), esegue prefill token-per-token e greedy decode;
    il kernel IQ2_XXS (formato routed del file pubblicato) è validato
    contro il dequant di riferimento, quindi l'intero stack di 78 layer è
-   caricabile dal GGUF reale; resta la parità logits full-model;
+   caricabile dal GGUF reale. Il gate di parità è pronto in forma opt-in:
+   `GLM52LogitsParityIntegrationTests` confronta motore e oracle CPU sui
+   pesi reali dequantizzati (stack troncato 4 layer: densi + primo sparse
+   con IndexShare ed esperti IQ2_XXS), selezioni e router esatti e tutti i
+   154.880 logits entro |delta| <= 0,05 + 1% con argmax identico; resta
+   l'estensione allo stack completo di 78 layer;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;
 5. verificare prefill e decode su prompt reali, incluse chat e tool call;
