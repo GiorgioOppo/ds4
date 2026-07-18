@@ -21,6 +21,13 @@ public actor GLM52ChatService {
     private var transcript: [ChatTurn] = []
     /// Tokens the engine's caches currently hold, in order.
     private var primedTokens: [Int32] = []
+    /// The engine is SINGLE-DRIVER: producer, warmup e benchmark girano
+    /// detached (bloccano su GPU/SSD) e quindi FUORI dall'actor — ogni
+    /// nuovo passo attende qui il completamento del precedente. Senza
+    /// questa catena, un warmup lanciato durante una generazione (visto in
+    /// campo: il toggle think ri-applica l'agente) interleava le prefetch
+    /// di due passi nello stesso streamer.
+    private var lastEnginePass: Task<Void, Never>?
 
     /// Disk-KV checkpoint file (nil = disabled): per-model scoped like the
     /// DeepSeek store, one live checkpoint holding the LAST conversation's
@@ -96,7 +103,9 @@ public actor GLM52ChatService {
     public func warmup() async -> Bool {
         let service = self.service
         primedTokens = []
-        return await Task.detached(priority: .userInitiated) {
+        let prior = lastEnginePass
+        let pass = Task.detached(priority: .userInitiated) {
+            await prior?.value
             let probe = service.tokenizer
                 .tokenizeRenderedChat("ciao").first ?? 1
             // Il reset di ripristino DEVE correre anche su errore: un
@@ -114,7 +123,9 @@ public actor GLM52ChatService {
                 DS4Log.info("glm", "warmup fallito: \(error)")
                 return false
             }
-        }.value
+        }
+        lastEnginePass = Task { _ = await pass.value }
+        return await pass.value
     }
 
     public func quiesceForTeardown() async {
@@ -136,6 +147,19 @@ public actor GLM52ChatService {
         let service = self.service
         let limit = max(8, min(contextTokens, contextSize - genTokens - 1))
         primedTokens = []
+        let prior = lastEnginePass
+        let pass = Task.detached(priority: .userInitiated) {
+            await prior?.value
+            return try await Self.benchmarkPass(
+                service: service, limit: limit, genTokens: genTokens)
+        }
+        lastEnginePass = Task { _ = try? await pass.value }
+        return try await pass.value
+    }
+
+    private static func benchmarkPass(service: GLM52InferenceService,
+                                      limit: Int, genTokens: Int)
+        async throws -> BenchmarkNumbers {
         return try await Task.detached(priority: .userInitiated) {
             var tokens = service.tokenizer.tokenizeRenderedChat(
                 "benchmark sintetico DwarfStar — misura di prefill e decode ")
@@ -318,12 +342,16 @@ public actor GLM52ChatService {
         let primed = self.primedTokens
         let declaredTools = self.tools
         let checkpoint = self.checkpointURL
-        return AsyncThrowingStream { continuation in
-            // Detached: the engine blocks on GPU/SSD waits and must not
-            // occupy the cooperative pool (same discipline as the DeepSeek
-            // actor's serial GCD executor).
-            let producer = Task.detached(priority: .userInitiated) {
-                do {
+        let (stream, continuation) =
+            AsyncThrowingStream<GenEvent, Error>.makeStream()
+        let prior = lastEnginePass
+        // Detached: the engine blocks on GPU/SSD waits and must not
+        // occupy the cooperative pool (same discipline as the DeepSeek
+        // actor's serial GCD executor). The await on `prior` keeps the
+        // engine single-driver across producer, warmup e benchmark.
+        let producer = Task.detached(priority: .userInitiated) {
+            await prior?.value
+            do {
                     // FINESTRA SCORREVOLE sull'overflow: quando la
                     // conversazione supera il contesto, i turni più vecchi
                     // (mai il system) vengono scartati dal RENDER — il
@@ -474,8 +502,9 @@ public actor GLM52ChatService {
                 } catch {
                     continuation.finish(throwing: error)
                 }
-            }
-            continuation.onTermination = { _ in producer.cancel() }
         }
+        lastEnginePass = Task { _ = await producer.value }
+        continuation.onTermination = { _ in producer.cancel() }
+        return stream
     }
 }

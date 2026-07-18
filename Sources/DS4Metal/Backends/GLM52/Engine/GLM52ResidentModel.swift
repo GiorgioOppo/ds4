@@ -459,6 +459,9 @@ public final class GLM52ResidentModel {
     public func resetContext() {
         for layer in stack { layer.caches.reset() }
         for streamedLayer in streamedLayers { streamedLayer.caches.reset() }
+        // Anche lo streamer torna vergine: un passo abortito tra prefetch
+        // e wait lascerebbe slot stantii nella FIFO.
+        streamer?.reset()
         position = 0
     }
 

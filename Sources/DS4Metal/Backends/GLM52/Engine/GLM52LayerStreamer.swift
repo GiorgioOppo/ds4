@@ -308,6 +308,18 @@ public final class GLM52LayerStreamer {
         }
     }
 
+    /// Drop every outstanding prefetch — the heal after a pass abortito a
+    /// metà (un errore tra prefetch e wait lascerebbe slot stantii che il
+    /// passo successivo popperebbe al posto dei suoi). Waits for in-flight
+    /// fills to land so no background write outlives the reset.
+    func reset() {
+        stateLock.lock()
+        let outstanding = pending
+        pending.removeAll()
+        stateLock.unlock()
+        for slot in outstanding { slot.ready.wait() }
+    }
+
     /// Block until the OLDEST prefetched slot is filled, verify it carries
     /// the expected layer, and hand its buffers to the caller. The slot is
     /// reusable again as soon as the caller's synchronous GPU work on it
