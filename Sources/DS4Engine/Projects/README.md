@@ -1,33 +1,32 @@
 # Projects
 
-`ProjectCache` indicizza un progetto importato separatamente dalla memoria della
-chat. Il modello esplora soltanto le parti richieste tramite i tool `project_*`
-e `file_*`.
+`ProjectCache` indexes an imported project separately from the chat memory.
+The model explores only the requested parts through the `project_*` and
+`file_*` tools.
 
-## File
+## Files
 
-- `ProjectCache.swift`: singleton thread-safe, limiti, stato dell'indice e
-  validazione centrale dei percorsi componente per componente.
-- `+Indexing`: import, filtri, traversal e reload.
-- `+Queries`: lista, albero, ricerca e letture limitate.
-- `+Editing`: write/edit con rilettura del contenuto corrente.
-- `+Files`: accesso raw, range di linee e operazioni confinate.
+- `ProjectCache.swift`: thread-safe singleton, limits, index state and
+  central component-by-component path validation.
+- `+Indexing`: import, filters, traversal and reload.
+- `+Queries`: listing, tree, search and bounded reads.
+- `+Editing`: write/edit with a re-read of the current content.
+- `+Files`: raw access, line ranges and confined operations.
 
-Le invarianti di sicurezza sono in
+The security invariants are in
 [`SICUREZZA-PERCORSI.md`](SICUREZZA-PERCORSI.md).
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-L'import registra percorsi relativi testuali entro limiti di quantità e
-dimensione. I contenuti sono caricati pigramente sotto un budget LRU-like; una
-ricerca su file freddi non deve espellere inutilmente la cache. I built-in in
-[`Tools/Builtins/Projects`](../Tools/Builtins/Projects/README.md) sono il
-principale consumer.
+Import records textual relative paths within count and size limits. Contents
+are loaded lazily under an LRU-like budget; a search over cold files must not
+needlessly evict the cache. The built-ins in
+[`Tools/Builtins/Projects`](../Tools/Builtins/Projects/README.md) are the
+main consumer.
 
-## Estensione
+## Extension
 
-Limitare sempre output e memoria, preservare thread safety e passare ogni I/O
-tool da `confinedProjectURL`, che rifiuta traversal e symlink in qualunque
-componente esistente. Riconvalidare subito prima dell'I/O; le operazioni
-distruttive richiedono un contratto tool esplicito e non devono operare su
-directory.
+Always bound output and memory, preserve thread safety and route every tool
+I/O through `confinedProjectURL`, which rejects traversal and symlinks in any
+existing component. Revalidate right before the I/O; destructive operations
+require an explicit tool contract and must not operate on directories.

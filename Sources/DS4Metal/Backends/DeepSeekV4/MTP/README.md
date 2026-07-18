@@ -2,7 +2,7 @@
 
 Components for speculative decode with the DeepSeek MTP head. The sidecar
 has the internal accessory id `mtp`, but is excluded from the GUI catalog of
-main models. Plan and status in `docs/SELF-SPECULATIVE.md`, section "Fase M".
+main models. Plan and status in `docs/SELF-SPECULATIVE.md`, section "Phase M".
 
 - `MTPSidecar.swift` — Phase M1: opening the sidecar GGUF, classifying the
   tensors into interface roles (eh_proj, embed_tokens, enorm, hnorm,

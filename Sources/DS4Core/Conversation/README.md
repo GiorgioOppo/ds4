@@ -1,28 +1,27 @@
 # Conversation
 
-Tipi portabili per la conversazione e formati di rendering specifici dei
-backend.
+Portable conversation types and backend-specific rendering formats.
 
-## Contenuto
+## Contents
 
-- [`Models/`](Models/README.md): `ToolSpec`, `ToolCall` e `ChatTurn`.
-- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): template e protocollo
-  tool DSML di DeepSeek V4.
-- [`Backends/GLM52/`](Backends/GLM52/README.md): ruoli GLM, reasoning,
-  tool-call XML piatto e parser incrementale contenuto.
-- [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione documentato,
-  senza renderer o parser fittizi.
+- [`Models/`](Models/README.md): `ToolSpec`, `ToolCall` and `ChatTurn`.
+- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): DeepSeek V4
+  template and DSML tool protocol.
+- [`Backends/GLM52/`](Backends/GLM52/README.md): GLM roles, reasoning, flat
+  XML tool calls and a compact incremental parser.
+- [`Backends/Qwen/`](Backends/Qwen/README.md): documented extension point,
+  with no placeholder renderers or parsers.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il livello applicativo crea una sequenza di `ChatTurn`; la policy frontend
-seleziona DSML per DeepSeek oppure il protocollo nativo GLM. Il testo reso passa
-al tokenizer della stessa architettura e il parser corrispondente ricostruisce
-eventuali chiamate. La cartella dipende solo dai tipi di `DS4Core` e da
+The application layer builds a sequence of `ChatTurn`s; the frontend policy
+selects DSML for DeepSeek or the native GLM protocol. The rendered text goes
+to the tokenizer of the same architecture, and the matching parser
+reconstructs any calls. The folder depends only on `DS4Core` types and
 Foundation.
 
-## Regole di modifica
+## Modification rules
 
-Template e delimitatori sono parte del protocollo addestrato del singolo backend:
-ogni variazione deve essere confrontata con `tokenizer.chat_template`, coperta da
-test e valutata anche per il costo in token di prefill.
+Templates and delimiters are part of each backend's trained protocol: any
+variation must be checked against `tokenizer.chat_template`, covered by
+tests, and also evaluated for its prefill token cost.

@@ -1,9 +1,10 @@
 # Model/Backends
 
-Configurazioni portabili specifiche delle architetture supportate. Ogni backend
-possiede forma, chiavi metadata e validazioni proprie; i contratti condivisi e
-il rilevamento GGUF restano in [`../Common`](../Common/README.md).
+Portable configurations specific to the supported architectures. Each backend
+owns its own shape, metadata keys and validations; the shared contracts and
+GGUF detection stay in [`../Common`](../Common/README.md).
 
-- [`DeepSeekV4/`](DeepSeekV4/README.md): profili Flash/Pro operativi.
-- [`GLM52/`](GLM52/README.md): contratto GLM 5.2 validato, runtime in sviluppo.
-- [`Qwen/`](Qwen/README.md): predisposizione senza decoder.
+- [`DeepSeekV4/`](DeepSeekV4/README.md): operational Flash/Pro profiles.
+- [`GLM52/`](GLM52/README.md): validated GLM 5.2 contract, runtime under
+  development.
+- [`Qwen/`](Qwen/README.md): groundwork without a decoder.

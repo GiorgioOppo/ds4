@@ -1,37 +1,38 @@
-# Sicurezza degli strumenti
+# Tool security
 
-Gli argomenti dei tool sono prodotti dal modello e possono derivare da contenuto
-non fidato. Vanno quindi trattati come input ostile.
+Tool arguments are produced by the model and may derive from untrusted
+content. They must therefore be treated as hostile input.
 
-## File e progetti
+## Files and projects
 
-Tutti i percorsi sono confinati alla root importata, risolti nuovamente prima
-dell'I/O e sottoposti alle regole in
+All paths are confined to the imported root, re-resolved before the I/O and
+subject to the rules in
 [`../Projects/SICUREZZA-PERCORSI.md`](../Projects/SICUREZZA-PERCORSI.md).
-Output di lettura, lista e ricerca hanno limiti di righe, risultati e byte.
+Read, list and search outputs have line, result and byte limits.
 
-## Rete
+## Network
 
-`WebClient` accetta soltanto HTTP(S) verso indirizzi pubblici, ricontrolla ogni
-redirect e impone timeout/dimensione. `GitHubTool` usa un host fisso e convalida
-owner, repository e ref. Il built-in git locale non espone operazioni di rete.
+`WebClient` accepts only HTTP(S) to public addresses, re-checks every
+redirect and enforces timeouts/size limits. `GitHubTool` uses a fixed host
+and validates owner, repository and ref. The local git built-in exposes no
+network operations.
 
-## Sub-agent
+## Sub-agents
 
-Un sub-agent riceve l'intersezione fra tool richiesti e
-`ToolRegistry.subAgentGrantable`. Gli strumenti che cambiano il progetto
-globale o orchestrano altri agenti non devono essere concessi implicitamente.
+A sub-agent receives the intersection of the requested tools and
+`ToolRegistry.subAgentGrantable`. Tools that change the global project or
+orchestrate other agents must not be granted implicitly.
 
 ## MCP
 
-I server MCP sono codice esterno. I nomi vengono namespaced e la mappatura
-inversa è registrata, non dedotta dalla stringa. I processi stdio ereditano il
-sandbox dell'app; i server HTTP richiedono fiducia esplicita nell'endpoint.
+MCP servers are external code. Names are namespaced and the inverse mapping
+is recorded, not inferred from the string. Stdio processes inherit the app
+sandbox; HTTP servers require explicit trust in the endpoint.
 
-## Checklist per un nuovo tool
+## Checklist for a new tool
 
-- schema JSON minimale e validazione di tipo/range;
-- autorizzazione e confine delle risorse dichiarati;
-- cancellazione e timeout per operazioni lente;
-- output limitato e nessun segreto nei log;
-- test per argomenti malformati e percorsi/URL ostili.
+- minimal JSON schema and type/range validation;
+- declared authorization and resource boundary;
+- cancellation and timeouts for slow operations;
+- bounded output and no secrets in logs;
+- tests for malformed arguments and hostile paths/URLs.

@@ -10,13 +10,13 @@ chance".
 |---|---:|
 | `general.architecture` | `glm-dsa` |
 | `glm-dsa.block_count` | 79 |
-| `glm-dsa.context_length` | 1.048.576 |
-| `glm-dsa.embedding_length` | 6.144 |
-| `glm-dsa.vocab_size` | 154.880 |
+| `glm-dsa.context_length` | 1,048,576 |
+| `glm-dsa.embedding_length` | 6,144 |
+| `glm-dsa.vocab_size` | 154,880 |
 | `glm-dsa.attention.head_count` | 64 |
 | `glm-dsa.attention.key_length` | 576 |
 | `glm-dsa.attention.value_length` | 512 |
-| `glm-dsa.attention.q_lora_rank` | 2.048 |
+| `glm-dsa.attention.q_lora_rank` | 2,048 |
 | `glm-dsa.attention.kv_lora_rank` | 512 |
 | `glm-dsa.rope.dimension_count` | 64 |
 | `glm-dsa.expert_count` / `expert_used_count` | 256 / 8 |
@@ -24,7 +24,7 @@ chance".
 | `glm-dsa.nextn_predict_layers` | 1 |
 | `glm-dsa.attention.indexer.head_count` | 32 |
 | `glm-dsa.attention.indexer.key_length` | 128 |
-| `glm-dsa.attention.indexer.top_k` | 2.048 |
+| `glm-dsa.attention.indexer.top_k` | 2,048 |
 
 RMS epsilon, RoPE frequency, router scale/norm, FFN dimensions and MLA
 fields are also checked against `GLM52Shape.v5_2`.

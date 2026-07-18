@@ -1,16 +1,16 @@
 # Worker/Concurrency
 
-`DistGate.swift` definisce l'actor che serializza il calcolo sul decoder del
-worker, anche quando più connessioni TCP vengono servite in parallelo.
+`DistGate.swift` defines the actor that serializes computation on the
+worker's decoder, even when multiple TCP connections are served in parallel.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-[`Serving`](../Serving/README.md) esegue le closure Metal attraverso il gate.
-La proprietà della sessione viene controllata separatamente dal lifecycle; il
-gate protegge l'esecuzione, non la semantica dei frame.
+[`Serving`](../Serving/README.md) runs the Metal closures through the gate.
+Session ownership is checked separately by the lifecycle; the gate protects
+execution, not frame semantics.
 
-## Estensione
+## Extension
 
-Non inserire attese di rete dentro `run`. Un futuro scheduler concorrente deve
-dimostrare che decoder, cache KV e buffer scratch sono indipendenti prima di
-consentire più lavori simultanei.
+Do not put network waits inside `run`. A future concurrent scheduler must
+prove that decoder, KV cache and scratch buffers are independent before
+allowing multiple simultaneous jobs.

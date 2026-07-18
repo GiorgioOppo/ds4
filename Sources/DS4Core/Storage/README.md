@@ -1,24 +1,24 @@
 # Storage
 
-Pianificazione portabile del working set quando il modello è più grande della
-RAM disponibile.
+Portable working-set planning for when the model is larger than the
+available RAM.
 
-## File principali
+## Main files
 
-- [`SSDCachePlan.swift`](SSDCachePlan.swift): calcola budget e numero di expert
-  memorizzabili e interpreta gli argomenti relativi allo streaming SSD.
-- [`SimulatedMemoryLock.swift`](SimulatedMemoryLock.swift): riserva e blocca
-  memoria anonima per testare scenari con RAM ridotta.
+- [`SSDCachePlan.swift`](SSDCachePlan.swift): computes the budget and number
+  of storable experts and interprets the SSD-streaming-related arguments.
+- [`SimulatedMemoryLock.swift`](SimulatedMemoryLock.swift): reserves and
+  locks anonymous memory to test reduced-RAM scenarios.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il piano viene costruito prima del decoder e guida la dimensione delle cache
-concrete di `DS4Metal`. La simulazione è uno strumento diagnostico: non contiene
-policy del decoder e non legge pesi. Le opzioni runtime sono raccolte nella
-[Configuration Reference](../../../README.md#configuration-reference).
+The plan is built before the decoder and drives the size of the concrete
+`DS4Metal` caches. The simulation is a diagnostic tool: it contains no
+decoder policy and reads no weights. The runtime options are collected in
+the [Configuration Reference](../../../README.md#configuration-reference).
 
-## Regole di modifica
+## Modification rules
 
-Usare aritmetica controllata per byte e GiB, distinguere chiaramente stime da
-allocazioni reali e rilasciare sempre le risorse bloccate. Mantenere questo
-livello privo di dipendenze Metal.
+Use checked arithmetic for bytes and GiB, clearly distinguish estimates from
+real allocations, and always release locked resources. Keep this layer free
+of Metal dependencies.

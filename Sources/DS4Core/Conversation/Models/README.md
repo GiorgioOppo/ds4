@@ -15,7 +15,8 @@ The types are `Sendable` and `Equatable`; `ToolSpec` and `ToolCall` are also
 ## Flow and rules
 
 These models do not execute tools and know nothing about the backend. They are
-consumed by [`DSML`](../DSML/README.md) and by the layers above. Add new cases
+consumed by [`DSML`](../Backends/DeepSeekV4/DSML/README.md) and by the layers
+above. Add new cases
 to `ChatTurn` only while updating renderer, parser, persistence and
 exhaustiveness tests; do not put runtime state or application dependencies
 here.

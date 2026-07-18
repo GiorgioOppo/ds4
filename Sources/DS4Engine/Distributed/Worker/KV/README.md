@@ -1,16 +1,16 @@
 # Worker/KV
 
-Gestisce i frame di query, restore e salvataggio della cache KV dello shard.
+Handles the query, restore and save frames for the shard's KV cache.
 
-## Componente e flusso
+## Component and flow
 
-`DistWorker+KV.swift` decodifica la richiesta tramite
-[`Protocol/KV`](../../Protocol/KV/README.md), delega a `DistEngine` e risponde
-con lunghezze o ack. I checkpoint sono separati per modello e intervallo di
-layer, così uno shard non può ripristinare dati di un'altra assegnazione.
+`DistWorker+KV.swift` decodes the request via
+[`Protocol/KV`](../../Protocol/KV/README.md), delegates to `DistEngine` and
+replies with lengths or acks. Checkpoints are separated by model and layer
+range, so a shard cannot restore data from another assignment.
 
-## Estensione
+## Extension
 
-Eseguire import/export sotto il gate di calcolo, mantenere l'I/O persistente
-streaming e restituire un fallimento esplicito quando il motore non è pronto o
-il prefisso non coincide esattamente.
+Run import/export under the compute gate, keep the persistent I/O streaming,
+and return an explicit failure when the engine is not ready or the prefix
+does not match exactly.

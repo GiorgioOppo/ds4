@@ -9,7 +9,7 @@ split loading and Pro distribution are not yet declared operational.
 ## Structure
 
 - [`Architecture/`](Architecture/README.md): shapes, dimensions and RoPE.
-- [`Weights/`](Weights/README.md): tensor schema and GGUF loading.
+- [`Model/`](Model/README.md): tensor schema and GGUF loading.
 - [`Streaming/`](Streaming/README.md): staging of dense weights from SSD.
 - [`Experts/`](Experts/README.md): expert bundle, cache and MetalIO.
 - [`MTP/`](MTP/README.md): Multi-Token Prediction sidecar.

@@ -1,25 +1,25 @@
 # Kernels/Attention
 
-Wrapper delle operazioni di attention standard e sparsa NSA.
+Wrappers for standard and NSA sparse attention operations.
 
-## File principali
+## Main files
 
-- [`MetalFlashAttn.swift`](MetalFlashAttn.swift): attention sul contesto KV.
-- [`MetalAttnOutLow.swift`](MetalAttnOutLow.swift): proiezione low-rank dell'output.
-- [`MetalRoPE.swift`](MetalRoPE.swift): rotazione/inversa delle componenti RoPE.
-- [`MetalIndexerScore.swift`](MetalIndexerScore.swift): score di rilevanza delle righe compresse.
-- [`MetalIndexerPool.swift`](MetalIndexerPool.swift): pooling dell'indexer.
-- [`MetalSparseSelect.swift`](MetalSparseSelect.swift): selezione top-k sul device.
+- [`MetalFlashAttn.swift`](MetalFlashAttn.swift): attention over the KV context.
+- [`MetalAttnOutLow.swift`](MetalAttnOutLow.swift): low-rank output projection.
+- [`MetalRoPE.swift`](MetalRoPE.swift): rotation/inverse of the RoPE components.
+- [`MetalIndexerScore.swift`](MetalIndexerScore.swift): relevance scores for the compressed rows.
+- [`MetalIndexerPool.swift`](MetalIndexerPool.swift): indexer pooling.
+- [`MetalSparseSelect.swift`](MetalSparseSelect.swift): on-device top-k selection.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il decoder proietta query/KV, applica RoPE e aggiorna le cache. L'indexer assegna
-score alle righe compresse; una selezione GPU o il fallback CPU decide il
-sottoinsieme letto da flash attention, poi la proiezione d'uscita torna allo
-spazio residuo.
+The decoder projects query/KV, applies RoPE and updates the caches. The
+indexer scores the compressed rows; a GPU selection or the CPU fallback
+decides the subset read by flash attention, then the output projection
+returns to the residual space.
 
-## Regole di modifica
+## Modification rules
 
-Rispettare stride, numero di head, finestra raw e contatori delle righe compresse.
-Tie-break del top-k GPU e CPU devono coincidere. Verificare contesti vuoti,
-parziali, wrap della ring buffer e offset non allineati del mmap.
+Respect strides, head counts, the raw window and the compressed-row counters.
+GPU and CPU top-k tie-breaks must match. Verify empty and partial contexts,
+ring buffer wrap and unaligned mmap offsets.

@@ -1,13 +1,14 @@
 # Model Management Views
 
-- `ModelPicker.swift` usa `NSOpenPanel` e bookmark security-scoped per GGUF
-  esterni. Prima di accettarli chiama l'ispezione Engine e `BackendSelector`,
-  così profili sconosciuti, GLM 5.2, MTP, shard e Qwen non vengono salvati come runtime locale valido.
-- `DownloadView.swift` rende esclusivamente `ModelCatalogRegistry`: tipo di
-  artifact, disponibilità runtime, stato locale, spazio, fase e progresso. Offre
-  Scarica/Riprendi, Annulla/Riprova e Seleziona per Flash e Pro Q2 runnable; le
-  tre varianti GLM 5.2 mostrano download e resume ma non `Seleziona`.
+- `ModelPicker.swift` uses `NSOpenPanel` and security-scoped bookmarks for
+  external GGUFs. Before accepting them it calls the Engine inspection and
+  `BackendSelector`, so unknown profiles, GLM 5.2, MTP, shards and Qwen are never saved as a valid local runtime.
+- `DownloadView.swift` renders `ModelCatalogRegistry` exclusively: artifact
+  type, runtime availability, local state, disk space, phase and progress. It
+  offers Download/Resume, Cancel/Retry and Select for the runnable Flash and
+  Pro Q2; the three GLM 5.2 variants show download and resume but no
+  `Select`.
 
-La sheet è raggiungibile sia dal preload della Chat sia dalle Settings. Non si
-chiude mentre un download è attivo; la selezione di un file gestito neutralizza
-un vecchio bookmark esterno e persiste il path in `AppSettings`.
+The sheet is reachable both from the Chat preload and from Settings. It does
+not close while a download is active; selecting a managed file neutralizes an
+old external bookmark and persists the path in `AppSettings`.

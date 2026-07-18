@@ -1,24 +1,24 @@
 # Protocol/Files
 
-Definisce il trasferimento resumable di GGUF e sidecar.
+Defines the resumable transfer of GGUFs and sidecars.
 
-## Tipi
+## Types
 
-- `DistFileEntry`: kind, nome, dimensione, SHA-256 e catena di checkpoint.
-- `DistFileOffer`: manifest proposto dal coordinator.
-- `DistFileNeed`: indici mancanti e offset validati di ripresa.
-- `DistFileChunk` / `DistFileDone`: contenuto sequenziale e fine file.
+- `DistFileEntry`: kind, name, size, SHA-256 and checkpoint chain.
+- `DistFileOffer`: manifest proposed by the coordinator.
+- `DistFileNeed`: missing indices and validated resume offsets.
+- `DistFileChunk` / `DistFileDone`: sequential content and end of file.
 
-`FILE_ACK` usa il formato ack condiviso dal flusso di controllo.
+`FILE_ACK` uses the ack format shared with the control flow.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-I metadati sono costruiti in [`../../Files`](../../Files/README.md), inviati dal
-[`Coordinator`](../../Coordinator/README.md) e verificati in
+Metadata is built in [`../../Files`](../../Files/README.md), sent by the
+[`Coordinator`](../../Coordinator/README.md) and verified in
 [`Worker/Files`](../../Worker/Files/README.md).
 
-## Estensione
+## Extension
 
-Limitare numero di entry, dimensione dei chunk e lunghezze dei nomi/hash. Un
-nuovo `Kind` deve specificare se è obbligatorio, come si calcola il percorso e
-come viene attivato nell'assegnazione.
+Bound the number of entries, the chunk size and the name/hash lengths. A new
+`Kind` must specify whether it is mandatory, how its path is computed and how
+it is activated in the assignment.

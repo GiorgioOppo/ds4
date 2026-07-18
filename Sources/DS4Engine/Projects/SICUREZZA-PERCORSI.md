@@ -1,34 +1,34 @@
-# Sicurezza dei percorsi progetto
+# Project path security
 
-## Confine
+## Boundary
 
-La root importata è l'unico spazio autorizzato. Ogni argomento tool è trattato
-come percorso relativo: componenti `..`, path assoluti e destinazioni il cui
-percorso standardizzato/risolto esce dalla root devono essere rifiutati.
+The imported root is the only authorized space. Every tool argument is
+treated as a relative path: `..` components, absolute paths and destinations
+whose standardized/resolved path escapes the root must be rejected.
 
-## Link simbolici
+## Symbolic links
 
-I symlink non vengono indicizzati e non sono mai percorsi validi per i tool,
-anche quando puntano a una destinazione interna. Prima di leggere, scrivere,
-modificare o eliminare si controlla separatamente ogni componente esistente
-sotto la root. Il controllo non si limita a risolvere l'URL finale: se la foglia
-non esiste, Foundation può lasciare irrisolto un symlink in una directory padre.
-Le directory realmente mancanti restano valide per la creazione di nuovi file.
-Le scritture riconvalidano il percorso dopo aver creato le directory intermedie
-e subito prima dell'I/O, così da ridurre la finestra TOCTOU.
+Symlinks are not indexed and are never valid paths for tools, even when they
+point to an internal destination. Before reading, writing, editing or
+deleting, every existing component under the root is checked separately. The
+check does not just resolve the final URL: if the leaf does not exist,
+Foundation may leave a symlink in a parent directory unresolved.
+Genuinely missing directories remain valid for the creation of new files.
+Writes revalidate the path after creating the intermediate directories and
+right before the I/O, so as to shrink the TOCTOU window.
 
-## Indicizzazione
+## Indexing
 
-Directory generate o molto pesanti sono escluse, il numero di file e la
-dimensione indicizzabile sono limitati, e vengono accettate estensioni testuali
-note. File non indicizzati possono essere letti in range soltanto attraverso i
-percorsi raw che applicano gli stessi controlli di confine.
+Generated or very heavy directories are excluded, the number of files and
+the indexable size are capped, and known textual extensions are accepted.
+Non-indexed files can be read in ranges only through the raw paths, which
+apply the same boundary checks.
 
-## Modifiche
+## Edits
 
-Un edit rilegge il file da disco prima di applicare la sostituzione, evitando di
-sovrascrivere silenziosamente cambiamenti effettuati dall'editor o da git. La
-cancellazione è limitata ai file; directory e root non sono target validi.
+An edit re-reads the file from disk before applying the substitution,
+avoiding silently overwriting changes made by the editor or by git.
+Deletion is limited to files; directories and the root are not valid targets.
 
-Ogni nuova API di `ProjectCache` deve mantenere queste invarianti e avere test
-per traversal, symlink, percorsi inesistenti e cambiamenti concorrenti.
+Every new `ProjectCache` API must preserve these invariants and have tests
+for traversal, symlinks, nonexistent paths and concurrent changes.
