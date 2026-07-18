@@ -51,8 +51,10 @@ extension ChatStore {
     func send() {
         let typed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard EngineActivityGate.shared.activeOwner == nil,
-              let service, !isGenerating,
+              service != nil || glmService != nil, !isGenerating,
               !(typed.isEmpty && attachments.isEmpty) else { return }
+        let service = self.service
+        let glm = self.glmService
         let epoch = beginConversationWork()
         let atts = attachments
         let text = Self.composeUserText(typed: typed, attachments: atts)
@@ -80,10 +82,20 @@ extension ChatStore {
         // the app decodes slower than the foreground CLI demo. Match the model-load
         // task's priority (and the CLI's foreground QoS) explicitly.
         generation = Task(priority: .userInitiated) { [weak self] in
-            let stream = primed
-                ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
-                : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
-                                                thinkMode: mode, sampling: params, maxTokens: 4096)
+            let stream: AsyncThrowingStream<GenEvent, Error>
+            if let glm {
+                stream = primed
+                    ? await glm.send(userText: text, thinkMode: mode,
+                                     sampling: params, maxTokens: 4096)
+                    : await glm.sendWithHistory(
+                        history, userText: text, systemPrompt: sys,
+                        thinkMode: mode, sampling: params, maxTokens: 4096)
+            } else if let service {
+                stream = primed
+                    ? await service.send(userText: text, thinkMode: mode, sampling: params, maxTokens: 4096)
+                    : await service.sendWithHistory(history, userText: text, systemPrompt: sys,
+                                                    thinkMode: mode, sampling: params, maxTokens: 4096)
+            } else { return }
             guard let self, self.ownsConversationWork(epoch) else { return }
             await self.consume(stream, into: index, epoch: epoch)
             guard self.ownsConversationWork(epoch) else { return }

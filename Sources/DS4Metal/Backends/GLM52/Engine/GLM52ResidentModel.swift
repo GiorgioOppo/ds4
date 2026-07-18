@@ -248,6 +248,15 @@ public final class GLM52ResidentModel {
             vocabularySize: vocabulary)
     }
 
+    /// Forget the whole conversation: every layer cache back to zero rows,
+    /// position to zero. The chat service uses this before re-prefilling a
+    /// rendered conversation (no incremental KV suffix reuse yet).
+    public func resetContext() {
+        for layer in stack { layer.caches.reset() }
+        for streamedLayer in streamedLayers { streamedLayer.caches.reset() }
+        position = 0
+    }
+
     /// One token's dequantized embedding row, read directly from the GGUF.
     public func embeddingRow(_ token: Int32) throws -> [Float] {
         guard token >= 0, Int(token) < vocabulary else {

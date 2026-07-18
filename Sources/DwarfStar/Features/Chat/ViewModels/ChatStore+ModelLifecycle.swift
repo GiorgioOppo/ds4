@@ -169,6 +169,7 @@ extension ChatStore {
                 await previousService?.quiesceForTeardown()
                 await MainActor.run {
                     self.service = nil
+                    self.glmService = nil
                     self.loadedEngineSignature = nil
                     self.info = nil
                 }
@@ -179,6 +180,36 @@ extension ChatStore {
                 let inspected = try InferenceService.inspectModel(path: path)
                 await MainActor.run {
                     if self.modelPath == path { self.inspectedModelDescriptor = inspected }
+                }
+                // GLM 5.2: chat served by the GLM resident/streaming engine,
+                // not the DeepSeek loop. Deliberately minimal surface: no
+                // disk KV, roles, tools, benchmark or auto-tune — greedy
+                // chat with layer-major prefill.
+                if inspected.architecture
+                       == GLM52BackendDefinition.supportedArchitecture,
+                   GLM52BackendDefinition.runtimeEnabled {
+                    let glm = try await withCheckedThrowingContinuation {
+                        (cont: CheckedContinuation<GLM52ChatService, Error>) in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                cont.resume(returning: try GLM52ChatService(
+                                    modelPath: path, contextSize: ctx,
+                                    systemPrompt: nil))
+                            } catch {
+                                cont.resume(throwing: error)
+                            }
+                        }
+                    }
+                    let glmInfo = await glm.modelInfo()
+                    await MainActor.run {
+                        self.glmService = glm
+                        self.service = nil
+                        self.info = glmInfo
+                        self.enginePrimed = false
+                        self.activate(self.activeSessionId)
+                        self.phase = .ready
+                    }
+                    return
                 }
                 // Il motore si costruisce su un thread GCD CLASSICO, non sul
                 // thread del pool cooperativo di Swift Concurrency di questo

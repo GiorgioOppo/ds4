@@ -661,6 +661,10 @@ final class ChatStore {
     var enginePrimed = true
 
     var service: InferenceService?
+    /// GLM 5.2 chat service — mutually exclusive with `service`. The chat
+    /// send path branches on whichever is live; DeepSeek-only surfaces
+    /// (benchmark, auto-tune, tools) stay disabled while this is set.
+    var glmService: GLM52ChatService?
     /// Full load signature of `service`, including fixed knobs and context.
     var loadedEngineSignature: LoadedEngineSignature?
     var generation: Task<Void, Never>?

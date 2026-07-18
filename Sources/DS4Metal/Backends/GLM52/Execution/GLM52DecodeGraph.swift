@@ -134,6 +134,10 @@ public final class GLM52ResidentDecodeCaches {
 
     func appendedRow() { rows += 1 }
 
+    /// Forget every live row (fresh conversation). Buffer contents beyond
+    /// the live count are never read, so no clearing is needed.
+    public func reset() { rows = 0 }
+
     /// The live compact rows as F16 bits — for tests and checkpoints.
     public func compactSnapshot() -> [UInt16] {
         let count = rows * (geometry.layer.kvLoraRank
