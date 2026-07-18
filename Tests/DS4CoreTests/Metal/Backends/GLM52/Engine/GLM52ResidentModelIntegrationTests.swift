@@ -80,4 +80,41 @@ final class GLM52ResidentModelIntegrationTests: XCTestCase {
             }
         }
     }
+
+    /// Layer-major batched prefill vs the token-by-token path on REAL
+    /// weights: identical kernels per (layer, token) cell in the same causal
+    /// order — the logits must match. Batch is an I/O strategy, never a
+    /// numeric one.
+    func testBatchedPrefillMatchesSequentialOnRealLayout() throws {
+        guard let path = ProcessInfo.processInfo
+                  .environment["DS4_GLM52_SPARSE_GGUF"], !path.isEmpty else {
+            throw XCTSkip("set DS4_GLM52_SPARSE_GGUF to a real or exact-size "
+                          + "sparse GLM 5.2 GGUF")
+        }
+        let runtime: MetalRuntime
+        do { runtime = try MetalRuntime() }
+        catch MetalError.noDevice { throw XCTSkip("Metal device unavailable") }
+
+        let options = GLM52ResidentModelOptions(
+            layerCount: 4, cacheCapacity: 8)
+        let sequential = try GLM52ResidentModel(
+            runtime: runtime, path: path, options: options)
+        let batched = try GLM52ResidentModel(
+            runtime: runtime, path: path, options: options)
+        let prompt: [Int32] = [154_822, 9_333, 21]
+
+        var sequentialLogits: [Float] = []
+        for token in prompt {
+            sequentialLogits = try sequential.forwardNext(token)
+        }
+        let batchedLogits = try batched.prefill(prompt)
+
+        XCTAssertEqual(batched.position, prompt.count)
+        XCTAssertEqual(batchedLogits.count, sequentialLogits.count)
+        for i in 0..<batchedLogits.count {
+            XCTAssertEqual(batchedLogits[i], sequentialLogits[i],
+                           accuracy: 1e-4 + abs(sequentialLogits[i]) * 1e-4,
+                           "batched prefill diverges at \(i)")
+        }
+    }
 }

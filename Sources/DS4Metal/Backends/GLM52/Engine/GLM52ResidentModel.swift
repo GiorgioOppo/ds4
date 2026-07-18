@@ -354,18 +354,105 @@ public final class GLM52ResidentModel {
             hidden: scratch.readHidden(count: embeddingWidth))
     }
 
-    /// Feed a whole prompt token by token; returns the logits after the
-    /// final prompt token (the distribution of the first generated token).
+    /// Feed a whole prompt; returns the logits after the final prompt token
+    /// (the distribution of the first generated token). LAYER-MAJOR batch:
+    /// every layer's weights are visited ONCE for the whole prompt — with
+    /// streaming that turns per-token weight reads into per-prompt reads —
+    /// while each (layer, token) cell runs the exact same chained kernels in
+    /// the exact same causal order as the token-by-token path, so the two
+    /// are numerically identical by construction (the integration suite
+    /// pins that equivalence on real weights).
     public func prefill(_ tokens: [Int32]) throws -> [Float] {
         guard !tokens.isEmpty else {
             throw MetalError.unsupported(
                 "GLM 5.2 prefill requires at least one token")
         }
-        var logits: [Float] = []
-        for token in tokens {
-            logits = try forwardNext(token)
+        if tokens.count == 1 { return try forwardNext(tokens[0]) }
+
+        var hiddens: [[Float]] = try tokens.map { try embeddingRow($0) }
+        let basePosition = position
+        var lastSelections: [(source: Int, rows: [UInt32])?] =
+            Array(repeating: nil, count: tokens.count)
+
+        func sweep(index: Int, isFull: Bool,
+                   weights: GLM52ResidentDecodeWeights,
+                   ffn: GLM52ResidentFFN,
+                   caches: GLM52ResidentDecodeCaches) throws {
+            for t in 0..<tokens.count {
+                scratch.loadHidden(hiddens[t])
+                let reused: [UInt32]?
+                if isFull {
+                    reused = nil
+                } else {
+                    guard let source = GLM52IndexSharePolicy
+                              .selectionSourceLayer(for: index),
+                          let last = lastSelections[t],
+                          last.source == source else {
+                        throw MetalError.unsupported(
+                            "GLM 5.2 IndexShare layer \(index) has no "
+                            + "selection from its source layer")
+                    }
+                    reused = last.rows
+                }
+                let result = try runtime.glm52ChainedDecodeLayer(
+                    weights: weights, ffn: ffn, caches: caches,
+                    scratch: scratch, reusedSelection: reused,
+                    position: basePosition + t,
+                    activeExperts: activeExperts)
+                if isFull {
+                    lastSelections[t] = (index, result.selection)
+                }
+                hiddens[t] = scratch.readHidden(count: embeddingWidth)
+            }
         }
-        return logits
+
+        if let streamer, let first = streamedLayers.first {
+            streamer.prefetch(first.tensors)
+        }
+        for layer in stack {
+            try sweep(index: layer.index,
+                      isFull: GLM52IndexSharePolicy.isFullIndexerLayer(
+                          layer.index),
+                      weights: layer.weights, ffn: layer.ffn,
+                      caches: layer.caches)
+        }
+        for (rank, streamedLayer) in streamedLayers.enumerated() {
+            let index = streamedLayer.tensors.index
+            let buffers = try streamer!.wait(for: index)
+            if rank + 1 < streamedLayers.count {
+                streamer!.prefetch(streamedLayers[rank + 1].tensors)
+            }
+            let isFull = streamedLayer.proj != nil
+            let weights = GLM52ResidentDecodeWeights(
+                geometry: geometry,
+                attnNorm: streamedLayer.attnNorm, qA: buffers.qA,
+                qANorm: streamedLayer.qANorm, qB: buffers.qB,
+                kvA: buffers.kvA, kvANorm: streamedLayer.kvANorm,
+                keyB: buffers.keyB, valueB: buffers.valueB,
+                attnOutput: buffers.attnOutput,
+                indexer: isFull ? GLM52ResidentDecodeWeights.ResidentIndexer(
+                    key: buffers.indexerKey,
+                    keyNorm: streamedLayer.indexerKeyNorm!,
+                    keyNormBias: streamedLayer.indexerKeyNormBias!,
+                    queryB: buffers.indexerQueryB,
+                    proj: streamedLayer.proj!) : nil)
+            let ffn = GLM52ResidentFFN(
+                ffnNorm: streamedLayer.ffnNorm,
+                kind: .sparse(
+                    routerRows: streamedLayer.routerRows,
+                    routerBias: streamedLayer.routerBias,
+                    sharedGate: buffers.sharedGate,
+                    sharedUp: buffers.sharedUp,
+                    sharedDown: buffers.sharedDown,
+                    expertProvider: { [provider = streamedLayer.provider] in
+                        try provider.expert($0)
+                    }))
+            try sweep(index: index, isFull: isFull, weights: weights,
+                      ffn: ffn, caches: streamedLayer.caches)
+        }
+        position = basePosition + tokens.count
+        return try runtime.glm52ResidentLogits(
+            outputHead: head, hidden: hiddens[tokens.count - 1])
     }
 
     /// Prefill plus greedy decode. Returns only the generated tokens (the
