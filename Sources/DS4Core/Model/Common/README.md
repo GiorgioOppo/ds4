@@ -1,13 +1,12 @@
 # Model/Common
 
-Contratti portabili per identificare un'architettura senza selezionare per
-errore il backend di un'altra famiglia.
+Portable contracts for identifying an architecture without accidentally
+selecting the backend of another family.
 
-- `ModelArchitecture.swift` definisce l'identificatore canonico, la famiglia,
-  la disponibilità del backend, le capability minime e il detector GGUF.
+- `ModelArchitecture.swift` defines the canonical identifier, the family,
+  backend availability, the minimum capabilities and the GGUF detector.
 
-Il detector riconosce la famiglia Qwen ma la segnala esplicitamente come priva
-di backend in questa fase. Il fallback sulle chiavi `deepseek4.*` viene usato
-solo per vecchi GGUF privi di `general.architecture`; un valore esplicito resta
-sempre autorevole.
-
+The detector recognizes the Qwen family but explicitly reports it as having
+no backend at this stage. The fallback on the `deepseek4.*` keys is used
+only for old GGUFs lacking `general.architecture`; an explicit value always
+remains authoritative.

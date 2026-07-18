@@ -1,25 +1,25 @@
 # Kernels/Tensor
 
-Wrapper delle operazioni tensor generiche riutilizzate dal grafo.
+Wrappers for the generic tensor operations reused by the graph.
 
-## File principali
+## Main files
 
-- `MetalNorm.swift`, `MetalSoftmax.swift`, `MetalGLU.swift`, `MetalUnary.swift` e
-  `MetalBin.swift`: normalizzazione, attivazioni e operazioni element-wise.
-- `MetalGetRows.swift`, `MetalSetRows.swift`, `MetalSumRows.swift`: accesso e
-  riduzione per righe.
-- `MetalCopy.swift`, `MetalConcat.swift`, `MetalRepeat.swift`: movimento/forma dati.
-- `MetalArgsort.swift`: ordinamento degli indici.
+- `MetalNorm.swift`, `MetalSoftmax.swift`, `MetalGLU.swift`, `MetalUnary.swift` and
+  `MetalBin.swift`: normalization, activations and element-wise operations.
+- `MetalGetRows.swift`, `MetalSetRows.swift`, `MetalSumRows.swift`: row access
+  and row reduction.
+- `MetalCopy.swift`, `MetalConcat.swift`, `MetalRepeat.swift`: data movement/reshaping.
+- `MetalArgsort.swift`: index sorting.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Le operazioni vengono codificate nello stesso command buffer delle fasi del
-modello quando possibile, lavorando su `GPUTensor` condivisi. Sono primitive del
-backend e non contengono policy di decode o caricamento.
+The operations are encoded into the same command buffer as the model phases
+when possible, working on shared `GPUTensor`s. They are backend primitives and
+contain no decode or loading policy.
 
-## Regole di modifica
+## Modification rules
 
-Supportare correttamente tensori vuoti o parziali secondo il contratto della
-funzione e rispettare `byteOffset`. Rendere espliciti broadcasting, inplace e
-intervalli sovrapposti. Aggiungere test piccoli con risultato CPU noto prima di
-usare una primitiva in una fusione complessa.
+Correctly support empty or partial tensors according to the function's
+contract and honor `byteOffset`. Make broadcasting, in-place operation and
+overlapping ranges explicit. Add small tests with a known CPU result before
+using a primitive in a complex fusion.

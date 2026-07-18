@@ -1,27 +1,27 @@
 # Distributed/Coordinator
 
-`DistCoordinator` possiede la configurazione del cluster, il motore locale e le
-connessioni ai worker. Le responsabilità sono separate in estensioni.
+`DistCoordinator` owns the cluster configuration, the local engine and the
+worker connections. Responsibilities are split into extensions.
 
-## File
+## Files
 
-- `DistCoordinator.swift`: stato, `Peer`, `Config` e route attiva.
-- `+Connections`: partizionamento, handshake, transfer e assegnazione.
-- `+Files`: costruzione dell'offerta e streaming dei file.
-- `+KV`: negoziazione e salvataggio dei checkpoint shard.
-- `+HorizontalChat`: pipeline per slice di layer.
-- `+VerticalChat` e `+ExpertParallelism`: backbone locale e shard esperti.
-- `+Benchmark`: misure per entrambe le topologie.
+- `DistCoordinator.swift`: state, `Peer`, `Config` and active route.
+- `+Connections`: partitioning, handshake, transfer and assignment.
+- `+Files`: offer construction and file streaming.
+- `+KV`: negotiation and saving of shard checkpoints.
+- `+HorizontalChat`: pipeline over layer slices.
+- `+VerticalChat` and `+ExpertParallelism`: local backbone and expert shards.
+- `+Benchmark`: measurements for both topologies.
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-Usa [`Protocol`](../Protocol/README.md), [`Transport`](../Transport/README.md),
-[`Execution`](../Execution/README.md) e [`Files`](../Files/README.md). `connect`
-prepara la route orizzontale; `connectVertical` prepara gli shard esperti. Solo
-dopo tutti i `READY` una chat o un benchmark può iniziare.
+Uses [`Protocol`](../Protocol/README.md), [`Transport`](../Transport/README.md),
+[`Execution`](../Execution/README.md) and [`Files`](../Files/README.md).
+`connect` prepares the horizontal route; `connectVertical` prepares the expert
+shards. Only after all `READY`s can a chat or a benchmark start.
 
-## Estensione
+## Extension
 
-Mantenere la configurazione immutabile durante un turno, associare ogni
-risultato alla sessione corrente e chiudere connessioni/return listener in ogni
-percorso di errore. Scheduling e retry restano qui, non nei tipi del protocollo.
+Keep the configuration immutable during a turn, associate every result with
+the current session, and close connections/return listeners on every error
+path. Scheduling and retries stay here, not in the protocol types.

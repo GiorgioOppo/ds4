@@ -1,22 +1,24 @@
 # Graph/Core
 
-Stato condiviso e primitive di dispatch del grafo Metal.
+Shared state and dispatch primitives of the Metal graph.
 
-## File principali
+## Main files
 
-- [`GraphContext.swift`](GraphContext.swift): raccoglie `MetalRuntime`, dimensioni,
-  scratch e opzioni; offre helper per pipeline/command buffer e legge knob come
-  `DS4_Q8_NSG`, `DS4_MOE_NSG`, `DS4_DENSE_Q4_NSG` e fusioni del compressor.
+- [`GraphContext.swift`](GraphContext.swift): gathers `MetalRuntime`,
+  dimensions, scratch and options; provides pipeline/command buffer helpers
+  and reads knobs such as `DS4_Q8_NSG`, `DS4_MOE_NSG`, `DS4_DENSE_Q4_NSG` and
+  the compressor fusions.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il decoder costruisce il contesto; le estensioni in
-[`Operations`](../Operations/README.md) lo usano per codificare fasi consecutive.
-La configurazione delle threadgroup viene validata contro device, forma e
-quantizzazione prima del dispatch.
+The decoder builds the context; the extensions in
+[`Operations`](../Operations/README.md) use it to encode consecutive phases.
+The threadgroup configuration is validated against device, shape and
+quantization before dispatch.
 
-## Regole di modifica
+## Change rules
 
-Non leggere variabili d'ambiente dentro ogni kernel se possono essere congelate
-all'avvio. Validare range e limiti hardware dei valori configurabili. Gli helper
-generici restano qui; la logica di una singola fase va in `Operations`.
+Do not read environment variables inside every kernel if they can be frozen
+at startup. Validate ranges and hardware limits of configurable values.
+Generic helpers stay here; the logic of a single phase belongs in
+`Operations`.

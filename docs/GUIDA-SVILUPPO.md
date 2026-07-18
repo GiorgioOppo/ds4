@@ -1,71 +1,71 @@
-# Guida allo sviluppo
+# Development guide
 
-Questa è la checklist pratica per modificare il repository senza rompere i
-confini fra moduli o i flussi di generazione. La mappa completa è in
+This is the practical checklist for changing the repository without breaking
+module boundaries or generation flows. The full map is in
 [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md).
 
-## Prima di modificare
+## Before making changes
 
-1. Identificare il target proprietario del comportamento.
-2. Leggere il `README.md` della cartella e quello del target.
-3. Controllare se il file è generato.
-4. Individuare i test del dominio speculare.
-5. Separare correttezza, qualità e prestazioni nella proposta.
+1. Identify the target that owns the behavior.
+2. Read the folder's `README.md` and the target's.
+3. Check whether the file is generated.
+4. Locate the tests in the mirrored domain.
+5. Separate correctness, quality and performance in the proposal.
 
-## Confini dei target
+## Target boundaries
 
 ```text
 DS4Core <- DS4Metal <- DS4Engine <- DwarfStar
     \----------- DS4Demo --------/
 ```
 
-- Core non importa Metal, rete o SwiftUI.
-- Metal non conosce Engine, HTTP o GUI.
-- Engine orchestra il modello ma non importa SwiftUI.
-- DwarfStar presenta stato e azioni, senza implementare matematica GPU.
-- DS4Demo usa Core e Metal direttamente per diagnosi e prestazioni.
+- Core does not import Metal, networking or SwiftUI.
+- Metal knows nothing about Engine, HTTP or the GUI.
+- Engine orchestrates the model but does not import SwiftUI.
+- DwarfStar presents state and actions, without implementing GPU math.
+- DS4Demo uses Core and Metal directly for diagnostics and performance.
 
-## Dove collocare il codice
+## Where to place code
 
-| Tipo di modifica | Posizione |
+| Kind of change | Location |
 |---|---|
-| DTO portabile o formato file | `DS4Core` |
-| tensore, cache GPU o dispatch | `DS4Metal` |
-| API d'inferenza, persistenza o rete | `DS4Engine` |
-| stato e vista SwiftUI | `DwarfStar/Features/<Feature>` |
-| CLI e audit | `DS4Demo` |
-| sorgente GPU | `metal` |
-| test | dominio speculare sotto `Tests/DS4CoreTests` |
+| portable DTO or file format | `DS4Core` |
+| tensor, GPU cache or dispatch | `DS4Metal` |
+| inference API, persistence or networking | `DS4Engine` |
+| SwiftUI state and views | `DwarfStar/Features/<Feature>` |
+| CLI and audit | `DS4Demo` |
+| GPU source | `metal` |
+| tests | mirrored domain under `Tests/DS4CoreTests` |
 
-Preferire un tipo principale o un'estensione coesa per file. Le estensioni
-seguono `Tipo+Responsabilita.swift`.
+Prefer one main type or one cohesive extension per file. Extensions
+follow `Type+Responsibility.swift`.
 
-## Politica dei README
+## README policy
 
-Ogni cartella significativa del repository ha un `README.md`. Il file locale
-deve rispondere a quattro domande:
+Every significant folder in the repository has a `README.md`. The local file
+must answer four questions:
 
-1. che cosa possiede la cartella;
-2. quali sono i file o tipi principali;
-3. da che cosa può dipendere;
-4. come si estende e come si verifica.
+1. what the folder owns;
+2. what the main files or types are;
+3. what it may depend on;
+4. how it is extended and how it is verified.
 
-Il README locale non deve duplicare tabelle enormi o dettagli destinati a
-cambiare spesso. Per un sottosistema saliente collega un documento sotto
-`docs/`. Dopo aggiunte o spostamenti verificare che ogni nuova directory abbia
-il proprio README.
+The local README must not duplicate huge tables or details bound to
+change often. For a notable subsystem link a document under
+`docs/`. After additions or moves verify that every new directory has
+its own README.
 
-## File generati
+## Generated files
 
-Non modificare manualmente:
+Do not edit manually:
 
 - `Sources/DS4Metal/Runtime/Generated/KernelSources.swift`;
-- `DwarfStar.xcodeproj/project.pbxproj` come fonte primaria.
+- `DwarfStar.xcodeproj/project.pbxproj` as the primary source.
 
-Per i kernel modificare `metal/*.metal` ed eseguire `make embed-kernels`. Per
-il progetto Xcode modificare `project.yml` ed eseguire `xcodegen generate`.
+For kernels edit `metal/*.metal` and run `make embed-kernels`. For
+the Xcode project edit `project.yml` and run `xcodegen generate`.
 
-## Workflow di compilazione
+## Build workflow
 
 ```sh
 swift build --disable-sandbox
@@ -74,68 +74,68 @@ swift build -c release --product DS4Demo --disable-sandbox
 xcodegen generate
 ```
 
-Su macOS impostare `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
-se `xcrun` non usa l'installazione completa di Xcode.
+On macOS set `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
+if `xcrun` does not use the full Xcode installation.
 
-## Modifiche ai kernel
+## Kernel changes
 
-Seguire [BACKEND-METAL.md](BACKEND-METAL.md): kernel `.metal`, wrapper Swift,
-composizione del grafo, test CPU/GPU, embedding e build Release sono un'unica
-unità di modifica.
+Follow [BACKEND-METAL.md](BACKEND-METAL.md): `.metal` kernel, Swift wrapper,
+graph composition, CPU/GPU tests, embedding and Release build form a single
+unit of change.
 
-## Modifiche alla pipeline
+## Pipeline changes
 
-Tenere separati:
+Keep separate:
 
-- dati e rendering;
-- stato applicativo;
-- stato KV/GPU;
-- I/O dei pesi;
-- sampling e presentazione.
+- data and rendering;
+- application state;
+- KV/GPU state;
+- weight I/O;
+- sampling and presentation.
 
-Consultare [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md). Una nuova modalità
-non deve creare un secondo motore dentro la GUI.
+See [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md). A new mode
+must not create a second engine inside the GUI.
 
-## Modifiche al protocollo distribuito
+## Distributed protocol changes
 
-1. Aggiungere il tipo wire sotto `Distributed/Protocol`.
-2. Definire limiti e decoder bound-checked.
-3. Aggiungere test round-trip e payload malformati.
-4. Aggiornare coordinator e worker separatamente.
-5. Incrementare `Dist.protocolVersion` per cambi incompatibili.
-6. Aggiornare [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
+1. Add the wire type under `Distributed/Protocol`.
+2. Define limits and bound-checked decoders.
+3. Add round-trip tests and malformed payloads.
+4. Update coordinator and worker separately.
+5. Bump `Dist.protocolVersion` for incompatible changes.
+6. Update [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
 
-Non consentire al wire di impostare ambiente arbitrario.
+Never allow the wire to set arbitrary environment.
 
-## Modifiche alla GUI o al server
+## GUI or server changes
 
-Tenere parsing/protocollo, servizi, controller e viste in file distinti. Le
-azioni lunghe devono rispettare cancellazione e actor isolation. Consultare
+Keep parsing/protocol, services, controllers and views in separate files.
+Long-running actions must respect cancellation and actor isolation. See
 [GUI-SERVER-E-API.md](GUI-SERVER-E-API.md).
 
-## Documentazione
+## Documentation
 
-Quando cambia un comportamento:
+When a behavior changes:
 
-- aggiornare il README della cartella proprietaria;
-- aggiornare il documento tematico;
-- correggere esempi e configurazione nel README principale;
-- verificare tutti i link relativi;
-- evitare di presentare design futuri come funzioni già operative.
+- update the owning folder's README;
+- update the thematic document;
+- fix examples and configuration in the main README;
+- verify all relative links;
+- avoid presenting future designs as features that already work.
 
-I documenti sperimentali devono dichiarare chiaramente stato, data delle misure
-e condizioni del benchmark.
+Experimental documents must clearly state status, measurement date
+and benchmark conditions.
 
-## Checklist finale
+## Final checklist
 
-- [ ] Dipendenze orientate nel verso corretto.
-- [ ] Nessun file monolitico cresciuto con responsabilità scollegate.
-- [ ] README presente nelle nuove cartelle.
-- [ ] Manifesto SwiftPM e XcodeGen aggiornati.
-- [ ] Test proporzionati al rischio eseguiti.
-- [ ] Kernel incorporati rigenerati quando necessario.
-- [ ] Nessun percorso documentale obsoleto.
-- [ ] `git diff --check` pulito.
+- [ ] Dependencies pointing in the right direction.
+- [ ] No monolithic file grown with unrelated responsibilities.
+- [ ] README present in new folders.
+- [ ] SwiftPM manifest and XcodeGen up to date.
+- [ ] Tests proportional to the risk executed.
+- [ ] Embedded kernels regenerated when needed.
+- [ ] No stale documentation paths.
+- [ ] `git diff --check` clean.
 
-La strategia di test completa è in
+The full testing strategy is in
 [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md).

@@ -1,13 +1,11 @@
 # Tokenization/Backends/DeepSeekV4
 
-Tokenizer byte-level BPE con pre-tokenizer JoyAI/DeepSeek, token speciali di
-DeepSeek V4 e modalità reasoning.
+Byte-level BPE tokenizer with the JoyAI/DeepSeek pre-tokenizer, DeepSeek V4
+special tokens and reasoning mode.
 
-- `DeepSeekV4Tokenizer.swift` contiene l'implementazione concreta e conserva
-  l'alias pubblico storico `Tokenizer`.
-- `ThinkMode.swift` contiene modalità e prefisso di reasoning DeepSeek.
+- `DeepSeekV4Tokenizer.swift` contains the concrete implementation and keeps
+  the historical public alias `Tokenizer`.
+- `ThinkMode.swift` contains the DeepSeek reasoning mode and prefix.
 
-Il comportamento byte-per-byte e le API esistenti restano invariati; la nuova
-collocazione impedisce di riutilizzare accidentalmente questo tokenizer per un
-GGUF Qwen.
-
+The byte-for-byte behavior and the existing APIs remain unchanged; the new
+location prevents accidentally reusing this tokenizer for a Qwen GGUF.

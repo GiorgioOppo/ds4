@@ -1,29 +1,29 @@
 # Tools/Builtins
 
-Contiene gli strumenti incorporati. Ogni file aggiunge una proprietà
-`BuiltinTool` tramite `extension ToolRegistry`.
+Contains the built-in tools. Each file adds a `BuiltinTool` property via
+`extension ToolRegistry`.
 
-## Gruppi
+## Groups
 
-- [`Arithmetic`](Arithmetic/README.md): tempo e calcolo deterministico.
-- [`Files`](Files/README.md): accesso raw confinato al progetto.
-- [`Projects`](Projects/README.md): navigazione dell'indice `ProjectCache`.
-- [`Web`](Web/README.md): ricerca e fetch protetti.
-- [`Agents`](Agents/README.md): elenco e delega a sub-agent.
-- `Git.swift`: operazioni git locali whitelisted.
-- `GitHubClone.swift`: import di un repository pubblico controllato.
+- [`Arithmetic`](Arithmetic/README.md): time and deterministic computation.
+- [`Files`](Files/README.md): raw access confined to the project.
+- [`Projects`](Projects/README.md): navigation of the `ProjectCache` index.
+- [`Web`](Web/README.md): protected search and fetch.
+- [`Agents`](Agents/README.md): listing and delegation to sub-agents.
+- `Git.swift`: whitelisted local git operations.
+- `GitHubClone.swift`: controlled import of a public repository.
 
-## Registrazione
+## Registration
 
-Un nuovo tool va creato nella cartella del dominio, aggiunto a
-`ToolRegistry.builtins` e classificato come `projectScoped` quando necessario.
-Aggiornare i profili in [`../../Agents`](../../Agents/README.md) che devono
-esporlo. `subAgentGrantable` include soltanto operazioni ammesse nei contesti
-delegati.
+A new tool is created in its domain folder, added to
+`ToolRegistry.builtins` and classified as `projectScoped` when necessary.
+Update the profiles in [`../../Agents`](../../Agents/README.md) that must
+expose it. `subAgentGrantable` includes only operations allowed in delegated
+contexts.
 
-## Regole
+## Rules
 
-Validare sempre il JSON e restituire messaggi brevi. Non implementare client di
-rete o invocazioni di processo direttamente nel file del tool: collocare quella
-logica in [`../Integrations`](../Integrations/README.md). Vedi anche
+Always validate the JSON and return short messages. Do not implement network
+clients or process invocations directly in the tool file: put that logic in
+[`../Integrations`](../Integrations/README.md). See also
 [`../SICUREZZA.md`](../SICUREZZA.md).

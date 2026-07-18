@@ -1,23 +1,24 @@
 # Kernels
 
-Wrapper Swift delle compute pipeline Metal. Ogni file associa una famiglia di
-funzioni `.metal`, valida gli argomenti essenziali e codifica il dispatch.
+Swift wrappers for the Metal compute pipelines. Each file binds a family of
+`.metal` functions, validates the essential arguments and encodes the
+dispatch.
 
-## Struttura
+## Structure
 
-- [`Attention/`](Attention/README.md): flash attention, RoPE e indexer sparso.
-- [`Compression/`](Compression/README.md): compressor KV e HyperConnections.
-- [`Dense/`](Dense/README.md): matvec/matmul densi e quantizzati.
-- [`MoE/`](MoE/README.md): router ed expert FFN.
-- [`Tensor/`](Tensor/README.md): trasformazioni tensor generiche.
+- [`Attention/`](Attention/README.md): flash attention, RoPE and sparse indexer.
+- [`Compression/`](Compression/README.md): KV compressor and HyperConnections.
+- [`Dense/`](Dense/README.md): dense and quantized matvec/matmul.
+- [`MoE/`](MoE/README.md): router and expert FFN.
+- [`Tensor/`](Tensor/README.md): generic tensor transformations.
 
-Le sorgenti autorevoli sono in `metal/*.metal`; la copia incorporata è descritta
-in [`Runtime/Generated`](../Runtime/Generated/README.md).
+The authoritative sources are in `metal/*.metal`; the embedded copy is
+described in [`Runtime/Generated`](../Runtime/Generated/README.md).
 
-## Flusso e regole
+## Flow and rules
 
-Il [`Graph`](../Graph/README.md) chiama questi wrapper con `GPUTensor` e command
-buffer. Un wrapper non decide la sequenza del modello e non deve effettuare
-attese CPU nascoste. Dopo un cambio kernel: modificare la sorgente `.metal`,
-eseguire `make embed-kernels`, aggiornare firma/dispatch Swift e aggiungere test
-su forma, dtype, offset non nullo e limiti delle threadgroup.
+The [`Graph`](../Graph/README.md) calls these wrappers with `GPUTensor` and
+command buffers. A wrapper does not decide the model sequence and must not
+perform hidden CPU waits. After a kernel change: modify the `.metal` source,
+run `make embed-kernels`, update the Swift signature/dispatch and add tests
+for shape, dtype, non-zero offset and threadgroup limits.

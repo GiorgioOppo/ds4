@@ -1,15 +1,16 @@
 # Protocol/Serialization
 
-`Data+LittleEndian.swift` contiene le primitive interne per aggiungere e leggere
-interi little-endian con un cursore esplicito.
+`Data+LittleEndian.swift` contains the internal primitives for appending and
+reading little-endian integers with an explicit cursor.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-È lo strato più basso del protocollo e dipende solo da Foundation/DS4Core. Tutti
-i codec di messaggio lo usano per ottenere lo stesso layout su ogni Mac.
+This is the lowest layer of the protocol and depends only on
+Foundation/DS4Core. All message codecs use it to get the same layout on every
+Mac.
 
-## Estensione
+## Extension
 
-Aggiungere solo primitive wire generiche. Ogni lettura deve avanzare il cursore
-in modo prevedibile ed essere preceduta dal controllo dei byte disponibili nel
-decoder chiamante; non inserire qui logica di uno specifico messaggio.
+Add only generic wire primitives. Every read must advance the cursor
+predictably and be preceded by a check of the available bytes in the calling
+decoder; do not put logic for a specific message here.

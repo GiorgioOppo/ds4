@@ -1,29 +1,28 @@
 # Persistence/KV
 
-`DiskKVStore` conserva checkpoint del decoder indicizzati dal prefisso esatto
-dei token, permettendo a chat, API stateless, sub-agent e worker di evitare un
-prefill completo.
+`DiskKVStore` keeps decoder checkpoints indexed by the exact token prefix,
+allowing chat, stateless API, sub-agents and workers to avoid a full prefill.
 
-## File
+## Files
 
-- `DiskKVStore.swift`: configurazione, budget e stato.
-- `+Index`: scansione entry, hit e strategia di eviction.
-- `+Lookup`: ricerca del prefisso più lungo e restore.
-- `+Store`: snapshot, scrittura atomica e manutenzione budget.
-- `+Streaming`: import/export un layer alla volta.
-- `+Serialization`: primitive del corpo binario.
+- `DiskKVStore.swift`: configuration, budget and state.
+- `+Index`: entry scanning, hits and eviction strategy.
+- `+Lookup`: longest-prefix search and restore.
+- `+Store`: snapshot, atomic write and budget maintenance.
+- `+Streaming`: import/export one layer at a time.
+- `+Serialization`: binary body primitives.
 
-Il layout è documentato in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.md).
+The layout is documented in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.md).
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il lookup confronta modello e token prima del restore. Import e store rilasciano
-ogni layer dopo l'uso, limitando il picco RAM; `F_NOCACHE` evita che i checkpoint
-espellano i pesi caldi dalla page cache. Dipende da `DS4Core` per gli header e
-da `DS4Metal` per `KVSnapshot`.
+The lookup compares model and tokens before the restore. Import and store
+release each layer after use, limiting peak RAM; `F_NOCACHE` prevents the
+checkpoints from evicting the hot weights out of the page cache. Depends on
+`DS4Core` for the headers and on `DS4Metal` for `KVSnapshot`.
 
-## Estensione
+## Extension
 
-Preservare scrittura temporanea più rename, validazione completa prima
-dell'import e budget sia in byte sia in token. Un formato incompatibile deve
-essere versionato e i file vecchi devono fallire in modo sicuro.
+Preserve temporary write plus rename, full validation before import and a
+budget in both bytes and tokens. An incompatible format must be versioned and
+old files must fail safely.

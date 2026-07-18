@@ -1,22 +1,22 @@
 # Model
 
-Tipi di modello condivisi tra i backend Metal. Le descrizioni architetturali,
-gli schemi tensor GGUF, lo streaming e le cache specifiche vivono sotto
+Model types shared across the Metal backends. Architectural descriptions,
+GGUF tensor schemas, streaming and family-specific caches live under
 [`Backends/`](../Backends/README.md).
 
-## Struttura
+## Structure
 
-- [`Quantization/`](Quantization/README.md): metadati dei layout MoE quantizzati.
+- [`Quantization/`](Quantization/README.md): metadata for quantized MoE
+  layouts.
 
-## Flusso
+## Flow
 
-Il codice in questa cartella non deve assumere nomi tensor, forma della KV cache,
-numero di head o strategia di routing di una singola famiglia. Il backend
-DeepSeek-V4 mantiene il proprio modello in
-[`Backends/DeepSeekV4`](../Backends/DeepSeekV4/README.md).
+Code in this folder must not assume tensor names, KV cache shape, head count
+or routing strategy of a single family. The DeepSeek-V4 backend keeps its own
+model in [`Backends/DeepSeekV4`](../Backends/DeepSeekV4/README.md).
 
-## Regole di modifica
+## Modification rules
 
-Promuovere qui un tipo soltanto quando almeno due backend ne condividono davvero
-semantica e layout. Fallire esplicitamente su forme o quantizzazioni non
-supportate; non usare fallback che producano logits plausibili ma errati.
+Promote a type here only when at least two backends genuinely share its
+semantics and layout. Fail explicitly on unsupported shapes or quantizations;
+do not use fallbacks that produce plausible but wrong logits.

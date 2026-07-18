@@ -1,16 +1,18 @@
 # Protocol/Codec
 
-`ActivationCodec.swift` converte vettori `Float` in payload a 32, 16 o 8 bit e
-li ricostruisce alla ricezione. È il percorso caldo del traffico di inferenza.
+`ActivationCodec.swift` converts `Float` vectors into 32-, 16- or 8-bit
+payloads and reconstructs them on reception. It is the hot path of inference
+traffic.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-I messaggi [`Work`](../Work/README.md) e [`Experts`](../Experts/README.md) usano
-il codec per ridurre banda e copie. Il formato a 8 bit include i dati necessari
-alla dequantizzazione; il decoder riceve sempre il conteggio atteso.
+The [`Work`](../Work/README.md) and [`Experts`](../Experts/README.md) messages
+use the codec to reduce bandwidth and copies. The 8-bit format includes the
+data needed for dequantization; the decoder always receives the expected
+count.
 
-## Estensione
+## Extension
 
-Ottimizzare con copie bulk e buffer contigui, mantenendo round-trip e controllo
-della lunghezza. Una nuova precisione cambia il formato wire e richiede test
-numerici con tolleranza dichiarata oltre al bump di protocollo.
+Optimize with bulk copies and contiguous buffers, preserving round-trip and
+length checking. A new precision changes the wire format and requires
+numerical tests with a declared tolerance in addition to the protocol bump.

@@ -1,32 +1,32 @@
 # Inference
 
-Questa area espone l'API applicativa e coordina il ciclo completo di inferenza.
-L'actor `InferenceService` è l'unico proprietario dello stato mutabile del
-decoder, della conversazione e della continuità KV.
+This area exposes the application API and coordinates the complete inference
+cycle. The `InferenceService` actor is the sole owner of the mutable state of
+the decoder, the conversation and KV continuity.
 
-## Struttura
+## Structure
 
-- [`API`](API/README.md): DTO pubblici, parametri di sampling ed eventi.
-- [`Service`](Service/README.md): caricamento, conversazione, prefill e decode.
-- [`Benchmark`](Benchmark/README.md): misurazione e warm-up.
-- [`Diagnostics`](Diagnostics/README.md): ispezione di tokenizer e template.
-- [`Subagents`](Subagents/README.md): contesti isolati per lavori delegati.
-- [`Tuning`](Tuning/README.md): profilo d'uso degli esperti e metriche cache.
+- [`API`](API/README.md): public DTOs, sampling parameters and events.
+- [`Service`](Service/README.md): loading, conversation, prefill and decode.
+- [`Benchmark`](Benchmark/README.md): measurement and warm-up.
+- [`Diagnostics`](Diagnostics/README.md): tokenizer and template inspection.
+- [`Subagents`](Subagents/README.md): isolated contexts for delegated work.
+- [`Tuning`](Tuning/README.md): expert usage profile and cache metrics.
 
-La descrizione passo per passo è in [FLUSSO-INFERENZA.md](FLUSSO-INFERENZA.md).
+The step-by-step description is in [FLUSSO-INFERENZA.md](FLUSSO-INFERENZA.md).
 
-## Dipendenze
+## Dependencies
 
-`DS4Core` fornisce tokenizer, rendering, tool call e sampling; `DS4Metal`
-fornisce runtime e `StreamingDecoder`. La persistenza KV è incapsulata in
+`DS4Core` provides tokenizer, rendering, tool calls and sampling; `DS4Metal`
+provides the runtime and `StreamingDecoder`. KV persistence is encapsulated in
 [`Persistence/KV`](../Persistence/KV/README.md).
 
-## Regole di estensione
+## Extension rules
 
-- Aggiungere un DTO pubblico in `API` solo se deve attraversare il confine del
-  servizio.
-- Aggiungere una responsabilità coesa come estensione di `InferenceService`
-  nella cartella pertinente.
-- Non accedere al decoder fuori dall'isolamento dell'actor.
-- Un'interruzione deve lasciare `kvDirty` coerente, così il turno seguente può
-  ricostruire lo stato senza produrre output numericamente corrotto.
+- Add a public DTO in `API` only if it must cross the service
+  boundary.
+- Add a cohesive responsibility as an `InferenceService` extension
+  in the relevant folder.
+- Do not access the decoder outside the actor's isolation.
+- An interruption must leave `kvDirty` consistent, so the next turn can
+  rebuild the state without producing numerically corrupted output.

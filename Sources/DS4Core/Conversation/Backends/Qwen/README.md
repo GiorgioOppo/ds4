@@ -1,8 +1,8 @@
 # Conversation/Backends/Qwen
 
-Punto di estensione riservato al futuro template conversazionale Qwen.
+Extension point reserved for the future Qwen conversation template.
 
-Non contiene renderer o parser fittizi. Template chat, delimitatori di ruolo,
-stop token, reasoning e formato tool dovranno derivare dal modello supportato e
-avere golden test dedicati prima di essere selezionabili dal runtime.
-
+It contains no placeholder renderers or parsers. Chat template, role
+delimiters, stop tokens, reasoning and tool format will have to derive from
+the supported model and have dedicated golden tests before becoming
+selectable by the runtime.

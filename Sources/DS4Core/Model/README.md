@@ -1,27 +1,28 @@
 # Model
 
-Rilevamento portabile dell'architettura e configurazioni isolate per backend.
+Portable architecture detection and per-backend isolated configurations.
 
-## Struttura
+## Structure
 
-- [`Common/`](Common/README.md): identificatore canonico, famiglia, capability,
-  descriptor e rilevamento da `general.architecture`.
-- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): forma e validazione
-  dei metadata DeepSeek V4, con alias compatibili delle API storiche.
-- [`Backends/GLM52/`](Backends/GLM52/README.md): geometria GLM 5.2 e
-  validazione stretta del namespace `glm-dsa`.
-- [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione documentato;
-  il backend Qwen non è ancora implementato.
+- [`Common/`](Common/README.md): canonical identifier, family, capabilities,
+  descriptor, and detection from `general.architecture`.
+- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): shape and
+  validation of DeepSeek V4 metadata, with compatible aliases for the
+  historical APIs.
+- [`Backends/GLM52/`](Backends/GLM52/README.md): GLM 5.2 geometry and strict
+  validation of the `glm-dsa` namespace.
+- [`Backends/Qwen/`](Backends/Qwen/README.md): documented extension point;
+  the Qwen backend is not yet implemented.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il detector classifica prima l'architettura; solo dopo il backend corrispondente
-può leggere e validare il proprio namespace metadata. Le costanti specifiche dei
-kernel DeepSeek-V4 restano in
+The detector classifies the architecture first; only then may the matching
+backend read and validate its own metadata namespace. The DeepSeek-V4
+kernel-specific constants remain in
 [`DS4Metal/Backends/DeepSeekV4/Architecture`](../../DS4Metal/Backends/DeepSeekV4/Architecture/README.md).
 
-## Regole di modifica
+## Modification rules
 
-Non interpretare un'architettura riconosciuta ma non implementata tramite il
-backend DeepSeek. Nuove varianti devono avere validazione esplicita e valori
-derivati controllati; non duplicare qui costanti già lette dal GGUF.
+Do not interpret a recognized but unimplemented architecture through the
+DeepSeek backend. New variants must have explicit validation and checked
+derived values; do not duplicate here constants already read from the GGUF.

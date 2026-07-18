@@ -1,24 +1,24 @@
 # Kernels/Compression
 
-Wrapper per riduzione/espansione delle HyperConnections e compressione ricorrente
-del contesto NSA.
+Wrappers for HyperConnections reduce/expand and the recurrent compression of
+the NSA context.
 
-## File principali
+## Main files
 
-- [`MetalHCSplit.swift`](MetalHCSplit.swift): separazione dei flussi HC.
-- [`MetalHyperConnections.swift`](MetalHyperConnections.swift): reduce/expand e fusioni HC.
-- [`MetalCompressor.swift`](MetalCompressor.swift): proiezioni e stato del compressor.
-- [`MetalKVCompress.swift`](MetalKVCompress.swift): scrittura delle righe KV compresse.
+- [`MetalHCSplit.swift`](MetalHCSplit.swift): separation of the HC streams.
+- [`MetalHyperConnections.swift`](MetalHyperConnections.swift): HC reduce/expand and fusions.
+- [`MetalCompressor.swift`](MetalCompressor.swift): compressor projections and state.
+- [`MetalKVCompress.swift`](MetalKVCompress.swift): writing of the compressed KV rows.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Prima dell'attention lo stato residuo viene ridotto; compressor e gate aggregano
-token raw in righe NSA persistenti. Dopo attention/FFN, l'uscita viene espansa
-nei flussi HyperConnection. Le operazioni sono composte da
+Before attention the residual state is reduced; compressor and gate aggregate
+raw tokens into persistent NSA rows. After attention/FFN, the output is
+expanded into the HyperConnection streams. The operations are composed by
 [`Graph/Operations`](../../Graph/Operations/README.md).
 
-## Regole di modifica
+## Modification rules
 
-Contatori, rapporto di compressione e ordine degli aggiornamenti sono stato
-ricorrente: una variazione può invalidare KV snapshot e parità prefill/decode.
-Una fusione deve conservare un percorso non fuso per verifica numerica.
+Counters, compression ratio and update order are recurrent state: a change
+can invalidate KV snapshots and prefill/decode parity. A fusion must keep a
+non-fused path for numerical verification.

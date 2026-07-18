@@ -1,22 +1,23 @@
 # DeepSeekV4/Decode/Diagnostics
 
-Misure aggregate del percorso caldo di inferenza.
+Aggregate measurements of the inference hot path.
 
-## File principali
+## Main files
 
-- [`DecodeProfile.swift`](DecodeProfile.swift): accumula tempi di embedding,
-  route/attention, gather expert, FFN e output head; registra hit/miss, byte I/O
-  e produce un report per token.
+- [`DecodeProfile.swift`](DecodeProfile.swift): accumulates embedding,
+  route/attention, expert gather, FFN and output head times; records
+  hits/misses and I/O bytes and produces a per-token report.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il decoder aggiorna il profilo ai confini di command buffer e operazioni I/O.
-Con `DS4_PROFILE_ROUTE=1` scompone ulteriormente la fase di routing; il servizio
-legge il report al termine del turno. Non è una telemetria globale persistente.
+The decoder updates the profile at command buffer and I/O operation
+boundaries. With `DS4_PROFILE_ROUTE=1` it further breaks down the routing
+phase; the service reads the report at the end of the turn. It is not
+persistent global telemetry.
 
-## Regole di modifica
+## Change rules
 
-Specificare se una misura include attese GPU o solo encoding CPU. Evitare
-sincronizzazioni aggiuntive nel profilo normale; i contatori diagnostici non
-devono cambiare i risultati numerici e vanno interpretati sullo stesso numero di
-forward.
+State whether a measurement includes GPU waits or only CPU encoding. Avoid
+extra synchronizations in the normal profile; diagnostic counters must not
+change the numerical results and must be interpreted over the same number of
+forwards.

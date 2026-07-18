@@ -1,9 +1,9 @@
-# Test Runtime multi-backend
+# Multi-backend Runtime tests
 
-Questi test esercitano il confine di selezione senza caricare un modello reale:
-DeepSeek V4 Flash e Pro devono selezionare il backend concreto, i profili DeepSeek
-sconosciuti devono essere rifiutati, Qwen deve essere riconosciuto e
-rifiutato come non ancora implementato, un'architettura sconosciuta deve produrre
-un errore distinto.
+These tests exercise the selection boundary without loading a real model:
+DeepSeek V4 Flash and Pro must select the concrete backend, unknown DeepSeek
+profiles must be rejected, Qwen must be recognized and rejected as not yet
+implemented, and an unknown architecture must produce a distinct error.
 
-I test numerici del decoder DeepSeek rimangono nelle cartelle Metal esistenti.
+The numerical tests of the DeepSeek decoder remain in the existing Metal
+folders.

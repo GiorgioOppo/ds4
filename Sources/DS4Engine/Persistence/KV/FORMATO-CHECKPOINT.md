@@ -1,41 +1,41 @@
-# Formato dei checkpoint KV
+# KV checkpoint format
 
-Il file combina header portabili di `DS4Core` e un corpo Swift esplicito:
+The file combines portable `DS4Core` headers and an explicit Swift body:
 
 ```text
-KVC header (48 byte)
+KVC header (48 bytes)
 u32 modelNameLength + UTF-8 modelName
 u32 tokenCount + tokenCount × u32 tokenId
-DSV4 payload header (52 byte)
-per ogni layer:
+DSV4 payload header (52 bytes)
+per layer:
   u32 rawStart
   u32 rawFloatCount + raw Float32
   u8 hasCompressor
-  se presente:
+  if present:
     u32 stateCount
     u32 stateLength + stateKV Float32
     stateScore Float32
     u32 cacheFloatCount + cache Float32
 ```
 
-Tutti gli interi sono little-endian. L'header identifica quantizzazione,
-contesto, numero token, hit e timestamp; il nome modello e la sequenza completa
-impediscono il riuso fra modelli o prefissi diversi.
+All integers are little-endian. The header identifies quantization, context,
+token count, hits and timestamp; the model name and the full sequence prevent
+reuse across different models or prefixes.
 
-## Lettura
+## Reading
 
-Il reader valida header, conteggi e frontiera token, quindi importa un batch di
-layer per volta e libera i buffer intermedi. Dati troncati, conteggi incoerenti
-o modello diverso invalidano l'intera entry.
+The reader validates header, counts and token frontier, then imports one
+batch of layers at a time and frees the intermediate buffers. Truncated data,
+inconsistent counts or a different model invalidate the entire entry.
 
-## Scrittura
+## Writing
 
-Lo snapshot viene trasferito in un contenitore a proprietà unica; ogni layer è
-scritto e rilasciato. Il file diventa visibile come entry soltanto a conclusione
-della scrittura. Successivi restore aggiornano in-place soltanto i metadati
-dell'header.
+The snapshot is moved into a single-ownership container; each layer is
+written and released. The file becomes visible as an entry only once the
+write completes. Subsequent restores update in place only the header
+metadata.
 
-## Compatibilità
+## Compatibility
 
-Non aggiungere campi senza aggiornare versione/header e test fixture. Un lettore
-nuovo non deve tentare di interpretare euristicamente un corpo incompatibile.
+Do not add fields without updating version/header and test fixtures. A new
+reader must not attempt to heuristically interpret an incompatible body.

@@ -1,192 +1,191 @@
-# Inferenza distribuita
+# Distributed inference
 
-DwarfStar supporta due topologie distinte sullo stesso protocollo TCP nativo:
-pipeline orizzontale per intervalli di layer ed expert parallelism verticale.
-Questo documento descrive il comportamento implementato dal protocollo v11.
+DwarfStar supports two distinct topologies over the same native TCP protocol:
+a horizontal pipeline over layer ranges and vertical expert parallelism. This
+document describes the behavior implemented by protocol v11.
 
-## Quando usarla
+## When to use it
 
-La distribuzione può ridurre il lavoro SSD per nodo o parallelizzare il gather
-degli esperti, ma aggiunge latenza e traffico di rete. Prima di configurarla:
+Distribution can reduce per-node SSD work or parallelize the expert gather,
+but it adds latency and network traffic. Before configuring it:
 
-- usare build identiche su tutti i Mac;
-- preferire Ethernet diretta o bridge Thunderbolt;
-- mantenere la rete fidata: trasporto e server sono in chiaro;
-- verificare localmente modello e impostazioni su ogni classe di hardware.
+- use identical builds on all Macs;
+- prefer direct Ethernet or a Thunderbolt bridge;
+- keep the network trusted: transport and server are cleartext;
+- verify model and settings locally on each hardware class.
 
-## Topologia orizzontale: pipeline di layer
+## Horizontal topology: layer pipeline
 
 ```text
-coordinator -> worker 1 [layer 0...a]
-            -> worker 2 [layer a+1...b]
-            -> worker N [layer ...ultimo + head]
+coordinator -> worker 1 [layers 0...a]
+            -> worker 2 [layers a+1...b]
+            -> worker N [layers ...last + head]
             -> coordinator -> sampling
 ```
 
-Il coordinatore possiede rendering, tokenizer, embedding, sampling, strumenti e
-stato della conversazione. Ogni worker possiede un intervallo contiguo di layer,
-i relativi pesi e lo shard KV. Lo stato HC attraversa i worker per ogni token o
-chunk di prefill.
+The coordinator owns rendering, tokenizer, embedding, sampling, tools and
+conversation state. Each worker owns a contiguous range of layers, the
+corresponding weights and the KV shard. The HC state traverses the workers for
+every token or prefill chunk.
 
-Questa modalità riduce gli esperti letti da ogni SSD a circa una frazione dei
-layer totali. Il tempo per token resta però vicino alla somma dei tempi dei
-worker, più il trasporto. Il forwarding worker-to-worker evita alcuni ritorni
-al coordinatore, ma richiede un indirizzo di ritorno raggiungibile.
+This mode reduces the experts read from each SSD to roughly a fraction of the
+total layers. Per-token time, however, stays close to the sum of the workers'
+times, plus transport. Worker-to-worker forwarding avoids some round trips
+back to the coordinator, but requires a reachable return address.
 
-## Topologia verticale: expert parallelism
+## Vertical topology: expert parallelism
 
 ```text
-                 +-> worker 1: subset esperti di tutti i layer --+
-backbone locale -+-> worker 2: subset esperti di tutti i layer --+-> somma
-                 +-> worker N: subset esperti di tutti i layer --+
+                +-> worker 1: expert subset of all layers --+
+local backbone -+-> worker 2: expert subset of all layers --+-> sum
+                +-> worker N: expert subset of all layers --+
 ```
 
-Il coordinatore esegue l'intero backbone denso: embedding, route/attention, KV,
-compressori, FFN shared e output head. Gli esperti routed di ogni layer — 256
-per Flash o 384 per Pro — sono partizionati fra i worker con mask esplicite.
-Per ciascun layer routed il
-coordinatore invia ai soli proprietari coinvolti attivazione, id e pesi; i
-worker restituiscono una somma parziale.
+The coordinator runs the entire dense backbone: embedding, route/attention,
+KV, compressors, shared FFN and output head. Each layer's routed experts — 256
+for Flash or 384 for Pro — are partitioned across the workers with explicit
+masks. For each routed layer the coordinator sends activation, ids and weights
+only to the owners involved; the workers return a partial sum.
 
-Il gather degli esperti può avvenire in parallelo sugli SSD, ma il percorso
-richiede circa un round-trip per layer routed. È adatto soltanto a collegamenti
-con RTT inferiore a circa 1 ms. Su Wi-Fi la latenza di rete domina per
-costruzione.
+The expert gather can proceed in parallel across the SSDs, but the path
+requires roughly one round-trip per routed layer. It is only suitable for
+links with an RTT below about 1 ms. On Wi-Fi, network latency dominates by
+construction.
 
-Stato attuale:
+Current status:
 
-- protocollo `expertAssign`, `expertWork`, `expertSum` attivo;
-- worker con `ExpertShard` e bundle/cache filtrati dalla mask;
-- backbone locale collegato tramite callback `remoteExperts`;
-- chat verticale e benchmark dedicato disponibili nella GUI;
-- partizione corrente round-robin; il bilanciamento dalla usage imatrix resta
-  un miglioramento possibile.
+- `expertAssign`, `expertWork`, `expertSum` protocol active;
+- workers with `ExpertShard` and bundle/cache filtered by the mask;
+- local backbone wired up through the `remoteExperts` callback;
+- vertical chat and dedicated benchmark available in the GUI;
+- current partition is round-robin; balancing from the usage imatrix remains
+  a possible improvement.
 
-I dettagli prestazionali sono in
+Performance details are in
 [EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.md).
 
-## Ciclo di connessione
+## Connection cycle
 
-1. Il worker avvia un listener senza caricare alcun modello.
-2. Il coordinatore apre la connessione e valida magic e versione.
-3. Offre GGUF e sidecar con nome, dimensione e SHA-256.
-4. Il worker richiede soltanto file o suffissi mancanti.
-5. Il coordinatore invia `ASSIGN` per una slice orizzontale oppure
-   `EXPERT_ASSIGN` per uno shard verticale.
-6. Il worker applica la whitelist dei knob, ispeziona la geometria del GGUF,
-   convalida la slice o la mask, carica il motore assegnato e invia progressi e
-   `READY` con 43 layer per Flash o 61 per Pro.
-7. La route diventa disponibile soltanto quando tutti i peer necessari sono
-   pronti e la copertura è valida.
+1. The worker starts a listener without loading any model.
+2. The coordinator opens the connection and validates magic and version.
+3. It offers GGUF and sidecars with name, size and SHA-256.
+4. The worker requests only missing files or suffixes.
+5. The coordinator sends `ASSIGN` for a horizontal slice or
+   `EXPERT_ASSIGN` for a vertical shard.
+6. The worker applies the knob whitelist, inspects the GGUF geometry,
+   validates the slice or the mask, loads the assigned engine and sends
+   progress and `READY` with 43 layers for Flash or 61 for Pro.
+7. The route becomes available only when all required peers are ready and
+   coverage is valid.
 
-Il setup dei peer procede in parallelo. Una disconnessione durante un file
-transfer conserva il `.part`; alla riconnessione la catena di hash individua
-l'ultimo checkpoint valido e riparte da lì.
+Peer setup proceeds in parallel. A disconnection during a file transfer
+preserves the `.part`; on reconnection the hash chain identifies the last
+valid checkpoint and resumes from there.
 
-## Protocollo v11
+## Protocol v11
 
-Il framing usa magic `DS4D`, header little-endian e payload con limiti espliciti.
-La versione deve coincidere esattamente: non esiste negoziazione fra semantiche
-incompatibili.
+Framing uses magic `DS4D`, little-endian headers and payloads with explicit
+limits. The version must match exactly: there is no negotiation between
+incompatible semantics.
 
-`EXPERT_ASSIGN` contiene una mask a lunghezza prefissata: 32 byte per Flash e
-48 per Pro. Il decoder rifiuta lunghezze errate, bit di padding non nulli e
-payload troncati. Un worker non assegnato annuncia zero layer; dopo `ASSIGN`,
-`READY` deve coincidere con la geometria realmente caricata.
+`EXPERT_ASSIGN` carries a fixed-length mask: 32 bytes for Flash and 48 for
+Pro. The decoder rejects wrong lengths, non-zero padding bits and truncated
+payloads. An unassigned worker announces zero layers; after `ASSIGN`,
+`READY` must match the geometry actually loaded.
 
-Le famiglie di messaggi sono separate per responsabilità:
+Message families are separated by responsibility:
 
-- handshake e assegnazione;
-- work/result della pipeline;
-- checkpoint KV;
-- offerta, richiesta, chunk e conferma dei file;
-- assegnazione e lavoro degli expert shard;
-- errori e avanzamento.
+- handshake and assignment;
+- pipeline work/result;
+- KV checkpoints;
+- file offer, request, chunk and confirmation;
+- expert shard assignment and work;
+- errors and progress.
 
-Le strutture wire vivono in `Distributed/Protocol` e non dipendono da socket,
-coordinator o worker. `DistTransport` gestisce connessione e frame; coordinator
-e worker applicano la semantica.
+The wire structures live in `Distributed/Protocol` and do not depend on
+sockets, coordinator or worker. `DistTransport` handles connection and frames;
+coordinator and worker apply the semantics.
 
-## Continuità KV
+## KV continuity
 
-Nella pipeline orizzontale ogni worker salva soltanto i layer che possiede. Il
-coordinatore può riusare un prefisso in memoria o negoziare un ripristino su
-disco. Il restore è accettato solo se tutti gli shard possiedono lo stesso
-prefisso; in caso contrario l'intera route riparte da prefill freddo.
+In the horizontal pipeline each worker saves only the layers it owns. The
+coordinator can reuse an in-memory prefix or negotiate a restore from disk.
+The restore is accepted only if all shards hold the same prefix; otherwise the
+whole route restarts from a cold prefill.
 
-Session id e `turnStart` impediscono che un risultato rimasto nel socket dopo
-uno stop venga interpretato come risposta del turno successivo.
+Session id and `turnStart` prevent a result left in the socket after a stop
+from being interpreted as the next turn's response.
 
-La topologia verticale mantiene KV e stato ricorrente sul backbone locale; i
-worker expert sono stateless rispetto alla sequenza e servono richieste FFN.
+The vertical topology keeps KV and recurrent state on the local backbone; the
+expert workers are stateless with respect to the sequence and serve FFN
+requests.
 
-## Trasferimento dei file
+## File transfer
 
-I worker usano uno store gestito sotto Application Support. Il protocollo può
-trasferire:
+Workers use a managed store under Application Support. The protocol can
+transfer:
 
 - GGUF;
-- expert bundle;
-- cache Q4 dense;
-- altri sidecar dichiarati nel manifest.
+- expert bundles;
+- dense Q4 caches;
+- other sidecars declared in the manifest.
 
-Per Pro è eseguibile il GGUF Q2 completo a file singolo. Il package Pro Q4
-`Layers00-30`/`Layers31-output` può essere trasferito e scaricato, ma non è una
-route valida: l'assemblaggio multi-shard non è implementato.
+For Pro, the complete single-file Q2 GGUF is runnable. The Pro Q4 package
+`Layers00-30`/`Layers31-output` can be transferred and downloaded, but it is
+not a valid route: multi-shard assembly is not implemented.
 
-I chunk sono da 4 MiB. Ogni file ha SHA-256 finale e checkpoint concatenati
-ogni 256 MiB. Un file derivato viene riutilizzato soltanto se il manifest e le
-dimensioni corrispondono.
+Chunks are 4 MiB. Each file has a final SHA-256 and chained checkpoints every
+256 MiB. A derived file is reused only if the manifest and sizes match.
 
-## Configurazione
+## Configuration
 
-| Impostazione | Pipeline | Verticale |
+| Setting | Pipeline | Vertical |
 |---|---|---|
-| elenco `host:port` | ordine delle slice | elenco degli shard |
-| activation bits | 32/16/8 per stato HC | 32/16 per attivazioni e somme |
-| prefill chunk | token per frame | prefill del backbone locale |
-| forwarding | opzionale | non applicabile |
-| cache esperti worker | cache della slice | cache degli esperti posseduti |
-| expert bundle | consigliato | fortemente consigliato |
+| `host:port` list | slice order | shard list |
+| activation bits | 32/16/8 for HC state | 32/16 for activations and sums |
+| prefill chunk | tokens per frame | local backbone prefill |
+| forwarding | optional | not applicable |
+| worker expert cache | slice cache | cache of owned experts |
+| expert bundle | recommended | strongly recommended |
 
-Il coordinatore propaga solo `Dist.perfKnobKeys`. Le variabili arbitrarie non
-possono essere impostate via rete. Le opzioni che cambiano i numeri, come Q4
-dense, viaggiano in campi tipizzati e con il relativo sidecar.
+The coordinator propagates only `Dist.perfKnobKeys`. Arbitrary variables
+cannot be set over the network. Options that change the numbers, such as dense
+Q4, travel in typed fields together with the corresponding sidecar.
 
-## Concorrenza e fallimenti
+## Concurrency and failures
 
-- Un worker serve una route alla volta tramite `DistGate`.
-- Stop e cancellazione chiudono il turno al prossimo confine sicuro.
-- Errori di versione, payload o copertura sono fatali per il setup.
-- Errori di trasporto durante il setup possono essere ritentati.
-- Un peer verticale mancante invalida la partizione degli esperti.
-- Benchmark e chat non possono usare contemporaneamente la stessa route/KV.
+- A worker serves one route at a time through `DistGate`.
+- Stop and cancellation close the turn at the next safe boundary.
+- Version, payload or coverage errors are fatal for setup.
+- Transport errors during setup can be retried.
+- A missing vertical peer invalidates the expert partition.
+- Benchmark and chat cannot use the same route/KV at the same time.
 
-## Sicurezza
+## Security
 
-Il protocollo non offre TLS né autenticazione. Prompt, token e attivazioni
-viaggiano in chiaro. Usare soltanto una LAN fidata o un tunnel protetto e non
-esporre la porta worker su Internet. Vedere
+The protocol offers neither TLS nor authentication. Prompts, tokens and
+activations travel in cleartext. Use only a trusted LAN or a protected tunnel
+and do not expose the worker port to the Internet. See
 [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 
-## Mappa del codice
+## Code map
 
-- `Sources/DS4Engine/Distributed/Protocol` — dati wire e codec.
-- `Sources/DS4Engine/Distributed/Transport` — connessioni e framing.
-- `Sources/DS4Engine/Distributed/Coordinator` — setup, file, KV e chat.
-- `Sources/DS4Engine/Distributed/Worker` — lifecycle e serving.
-- `Sources/DS4Engine/Distributed/Execution` — slice decoder ed expert shard.
-- `Sources/DwarfStar/Features/Distributed` — controller e viste.
+- `Sources/DS4Engine/Distributed/Protocol` — wire data and codecs.
+- `Sources/DS4Engine/Distributed/Transport` — connections and framing.
+- `Sources/DS4Engine/Distributed/Coordinator` — setup, files, KV and chat.
+- `Sources/DS4Engine/Distributed/Worker` — lifecycle and serving.
+- `Sources/DS4Engine/Distributed/Execution` — slice decoder and expert shard.
+- `Sources/DwarfStar/Features/Distributed` — controllers and views.
 
-## Verifica consigliata
+## Recommended verification
 
-1. test round-trip dei payload e dei limiti;
-2. connessione loopback con file già presenti;
-3. interruzione e ripresa di un file parziale;
-4. parità locale/pipeline con 32 bit;
-5. A/B 16 e 8 bit per qualità e rete;
-6. benchmark verticale solo dopo avere misurato RTT e baseline locale.
-7. per Pro, parità numerica e benchmark multi-Mac sul GGUF Q2 reale prima di
-   considerare conclusa la validazione prestazionale.
+1. round-trip tests of payloads and limits;
+2. loopback connection with files already present;
+3. interruption and resume of a partial file;
+4. local/pipeline parity at 32 bits;
+5. 16- vs 8-bit A/B for quality and network;
+6. vertical benchmark only after measuring RTT and the local baseline.
+7. for Pro, numerical parity and multi-Mac benchmarks on the real Q2 GGUF
+   before considering the performance validation complete.
 
-Non confrontare topologie con modelli, cache o warm-up diversi.
+Do not compare topologies with different models, caches or warm-up.

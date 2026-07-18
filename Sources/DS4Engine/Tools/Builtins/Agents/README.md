@@ -1,24 +1,24 @@
 # Builtins/Agents
 
-Espone il catalogo degli agenti e la delega di lavori isolati.
+Exposes the agent catalog and delegation of isolated work.
 
-## Tool
+## Tools
 
-- `agents_list`: ruoli disponibili e tool associati.
-- `subagent_search`: orientamento/ricerca delegata.
-- `subagent_run`: richiesta completa con target, ruolo e limiti.
+- `agents_list`: available roles and their associated tools.
+- `subagent_search`: delegated orientation/search.
+- `subagent_run`: complete request with target, role, and limits.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Le specifiche leggono [`AgentRegistry`](../../../Agents/README.md); l'esecuzione
-effettiva del sub-agent è gestita da
-[`Inference/Subagents`](../../../Inference/Subagents/README.md), così il tool non
-possiede direttamente il decoder.
-Il ruolo e la lista `tools` sono input del modello e possono soltanto restringere
-lo scope `delegatedToolNames` del profilo padre, mai ampliarlo.
+The specs read [`AgentRegistry`](../../../Agents/README.md); the actual
+sub-agent execution is handled by
+[`Inference/Subagents`](../../../Inference/Subagents/README.md), so the tool
+does not own the decoder directly.
+The role and the `tools` list are model inputs and can only narrow the parent
+profile's `delegatedToolNames` scope, never widen it.
 
-## Estensione
+## Extension
 
-Non rendere grantable a un sub-agent gli strumenti di orchestrazione stessa.
-Limitare profondità, round, token e tool concessi per impedire ricorsione o
-amplificazione non controllata.
+Do not make the orchestration tools themselves grantable to a sub-agent.
+Limit depth, rounds, tokens, and granted tools to prevent recursion or
+uncontrolled amplification.

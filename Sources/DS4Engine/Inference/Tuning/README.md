@@ -1,23 +1,23 @@
 # Inference/Tuning
 
-Raccoglie e persiste il profilo di instradamento degli esperti usato per
-scaldare la slot-cache e osservare hit/miss.
+Collects and persists the expert-routing profile used to warm the
+slot cache and observe hits/misses.
 
-## Componente
+## Component
 
-`InferenceService+Tuning.swift` gestisce file di usage per coppia modello/agente,
-seleziona un profilo iniziale, espone `TuningInfo`, `ModelInfo` e stima la memoria
-della KV in base alla configurazione attiva.
+`InferenceService+Tuning.swift` manages usage files per model/agent pair,
+selects an initial profile, exposes `TuningInfo` and `ModelInfo`, and
+estimates KV memory based on the active configuration.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il profilo viene caricato durante l'inizializzazione del
-[`Service`](../Service/README.md), aggiornato dalla generazione e salvato a fine
-turno. I contatori provengono da `DS4Metal`; i file sono dati applicativi in
-Application Support.
+The profile is loaded during initialization of the
+[`Service`](../Service/README.md), updated by generation and saved at the end
+of a turn. The counters come from `DS4Metal`; the files are application data
+in Application Support.
 
-## Estensione
+## Extension
 
-Versionare formati persistenti incompatibili, separare sempre profili di modelli
-o agenti diversi e non usare queste statistiche per cambiare silenziosamente la
-qualità numerica del modello.
+Version incompatible persistent formats, always keep profiles of different
+models or agents separate, and never use these statistics to silently change
+the model's numerical quality.

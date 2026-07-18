@@ -1,144 +1,144 @@
-# GUI, server locale e API
+# GUI, local server, and API
 
-La GUI SwiftUI e il server HTTP sono due ingressi allo stesso motore. Entrambi
-devono passare da `InferenceService`; nessuna feature deve creare una seconda
-copia del modello per servire una richiesta.
+The SwiftUI GUI and the HTTP server are two entry points into the same engine.
+Both must go through `InferenceService`; no feature may create a second copy of
+the model to serve a request.
 
-## Struttura dell'app
+## App structure
 
-`Sources/DwarfStar/App` contiene soltanto bootstrap, ambiente, impostazioni
-globali e navigazione. Il comportamento è organizzato sotto
-`Sources/DwarfStar/Features`:
+`Sources/DwarfStar/App` contains only bootstrap, environment, global settings,
+and navigation. Behavior is organized under `Sources/DwarfStar/Features`:
 
-| Feature | Responsabilità |
+| Feature | Responsibility |
 |---|---|
-| `Chat` | sessioni, rendering, allegati, tool loop e generazione |
-| `Settings` | modello, ispezione architettura, controlli per capability, MCP e distribuzione |
-| `ModelManagement` | catalogo e download dei GGUF |
-| `Project` | selezione e ispezione del progetto attivo |
-| `Tuning` | cache esperti e profili soltanto per backend con expert routing |
-| `Server` | listener HTTP e adattatori OpenAI/Anthropic |
-| `Distributed` | coordinator, worker e benchmark verticale |
-| `Benchmark` | throughput del motore condiviso |
-| `Diagnostics` | tokenizer, template e stato operativo |
+| `Chat` | sessions, rendering, attachments, tool loop, and generation |
+| `Settings` | model, architecture inspection, capability-gated controls, MCP, and distribution |
+| `ModelManagement` | GGUF catalog and downloads |
+| `Project` | selection and inspection of the active project |
+| `Tuning` | expert cache and profiles, only for backends with expert routing |
+| `Server` | HTTP listener and OpenAI/Anthropic adapters |
+| `Distributed` | coordinator, workers, and vertical benchmark |
+| `Benchmark` | shared engine throughput |
+| `Diagnostics` | tokenizer, templates, and operational status |
 
-`Shared/Support` ospita solo helper usati da più feature. Un helper specifico
-della chat o del server deve restare nella feature proprietaria.
+`Shared/Support` hosts only helpers used by multiple features. A helper
+specific to the chat or the server must stay in its owning feature.
 
-## Dipendenze condivise
+## Shared dependencies
 
-`AppEnvironment` costruisce e distribuisce gli oggetti di lunga durata. Il più
-importante è `InferenceService`, actor che serializza accesso al decoder e allo
-stato KV. Chat, server e benchmark possono presentare interfacce diverse, ma
-non eseguono inferenze concorrenti sullo stesso decoder.
+`AppEnvironment` builds and distributes the long-lived objects. The most
+important is `InferenceService`, an actor that serializes access to the decoder
+and to KV state. Chat, server, and benchmark may present different interfaces,
+but they do not run concurrent inference on the same decoder.
 
-Questo vincolo protegge:
+This constraint protects:
 
-- buffer Metal e cache esperti;
-- posizione KV e stato ricorrente NSA;
-- memoria residente sui sistemi con poca RAM;
-- ordine degli eventi di generazione.
+- Metal buffers and the expert cache;
+- KV position and NSA recurrent state;
+- resident memory on systems with little RAM;
+- the ordering of generation events.
 
 ## ChatStore
 
-`ChatStore` è il view model `@MainActor` della chat. Il file principale contiene
-stato osservabile e inizializzazione; le estensioni separano:
+`ChatStore` is the chat's `@MainActor` view model. The main file contains
+observable state and initialization; extensions separate:
 
-- lifecycle del modello;
-- generazione e cancellazione;
-- sessioni persistenti;
-- allegati;
-- agenti e tool loop;
-- benchmark e tuning;
-- applicazione delle impostazioni prestazionali.
+- model lifecycle;
+- generation and cancellation;
+- persistent sessions;
+- attachments;
+- agents and tool loop;
+- benchmark and tuning;
+- application of performance settings.
 
-Il view model converte gli eventi del servizio in modelli di presentazione. Non
-implementa tokenizer, sampler o parsing wire. Le viste non devono chiamare
-direttamente il backend Metal.
+The view model converts service events into presentation models. It does not
+implement tokenizers, samplers, or wire parsing. Views must not call the Metal
+backend directly.
 
-Prima del load, `ChatStore` usa l'ispezione metadata-only di
-`InferenceService` per ottenere architettura e capacità senza allocare Metal.
-Settings, Chat e Tuning mostrano quindi solo le funzioni dichiarate dal backend:
-un Qwen riconosciuto ma non implementato conserva percorso e contesto, ma non
-riceve controlli DeepSeek per cache esperti, NSA, Q4, bundle o MetalIO.
+Before load, `ChatStore` uses `InferenceService`'s metadata-only inspection to
+obtain architecture and capabilities without allocating Metal. Settings, Chat,
+and Tuning therefore show only the features declared by the backend: a Qwen
+model that is recognized but not implemented keeps its path and context, but
+does not receive DeepSeek controls for expert cache, NSA, Q4, bundles, or
+MetalIO.
 
-## Download e selezione dei modelli
+## Model download and selection
 
-Il pulsante **Scarica…** di Settings apre `DownloadView`. La vista non possiede
-una copia dei nomi remoti: renderizza `ModelCatalogRegistry.entries`, definito
-in `DS4Engine`, e usa `DownloadRunner` soltanto come adattatore `@MainActor` fra
-eventi del downloader e stato SwiftUI.
+The **Download…** button in Settings opens `DownloadView`. The view does not
+own a copy of the remote names: it renders `ModelCatalogRegistry.entries`,
+defined in `DS4Engine`, and uses `DownloadRunner` only as a `@MainActor`
+adapter between downloader events and SwiftUI state.
 
-Il catalogo principale presenta otto scelte logiche provenienti da due
-repository Hugging Face:
+The main catalog presents eight logical choices coming from two Hugging Face
+repositories:
 
-| Edizione | Varianti | Download | Selezione/esecuzione |
+| Edition | Variants | Download | Select/run |
 |---|---|---:|---:|
-| DeepSeek V4 Flash | Q2, mixed Q2/Q4, Q4 | sì | sì |
-| DeepSeek V4 Pro | Q2 singolo | sì | sì |
-| DeepSeek V4 Pro | Q4 split a due shard | sì | no |
-| GLM 5.2 | IQ2_XXS, Q2_K, Q4_K monolitici | sì | no |
+| DeepSeek V4 Flash | Q2, mixed Q2/Q4, Q4 | yes | yes |
+| DeepSeek V4 Pro | single Q2 | yes | yes |
+| DeepSeek V4 Pro | two-shard Q4 split | yes | no |
+| GLM 5.2 | monolithic IQ2_XXS, Q2_K, Q4_K | yes | no |
 
-La GUI espone per ogni voce dimensione indicativa, stato locale, spazio libero,
-progresso aggregato e disponibilità del runtime. Una voce Flash completa o Pro
-Q2 singolo può essere selezionata; al termine del download diventa il modello attivo e la
-scelta persiste senza security-scoped bookmark, perché il file appartiene al
-container dell'app. Pro Q4 split e tutte le voci GLM restano `downloadOnly`: il
-pulsante di selezione non compare e il download non cambia il modello attivo.
-MTP è un accessorio e
-non appare nel catalogo principale.
+For each entry the GUI shows approximate size, local status, free space,
+aggregate progress, and runtime availability. A complete Flash entry or a
+single Pro Q2 can be selected; when the download finishes it becomes the
+active model and the choice persists without a security-scoped bookmark,
+because the file belongs to the app container. Pro Q4 split and all GLM
+entries remain `downloadOnly`: the selection button does not appear and the
+download does not change the active model. MTP is an accessory and does not
+appear in the main catalog.
 
-### Percorsi e riuso
+### Paths and reuse
 
-La destinazione scrivibile è:
+The writable destination is:
 
 ```text
 ~/Library/Application Support/DwarfStar/models/
 ```
 
-Prima della rete, il runner cerca il filename esatto del catalogo nella
-destinazione, nella root di sviluppo e nella sua sottocartella `gguf/`, oltre
-alla directory del modello attualmente configurato. Un file finale regolare e
-non vuoto viene riusato in posizione e non viene scaricato di nuovo; quando il
-catalogo conosce la dimensione esatta, come per GLM, anche il byte count deve
-coincidere. Le scansioni automatiche del menu modelli includono soltanto le tre
-varianti Flash e Pro Q2 dichiarati selezionabili dal catalogo. I file GLM
-completi restano visibili nella sheet download, non nel menu di caricamento.
+Before touching the network, the runner looks for the catalog's exact filename
+in the destination, in the development root and its `gguf/` subfolder, and in
+the directory of the currently configured model. A regular, non-empty final
+file is reused in place and is not downloaded again; when the catalog knows
+the exact size, as for GLM, the byte count must also match. The model menu's
+automatic scans include only the three Flash variants and Pro Q2 declared
+selectable by the catalog. Complete GLM files remain visible in the download
+sheet, not in the load menu.
 
-Un trasferimento incompleto resta come `<nome>.part`; **Riprendi** usa HTTP
-Range. La UI permette di annullare e conserva il parziale. Il downloader
-controlla lo spazio, valida la dimensione restituita dal server, verifica il
-digest SHA-256 fissato nel catalogo e pubblica il filename finale soltanto dopo
-la verifica.
+An incomplete transfer remains as `<name>.part`; **Resume** uses HTTP Range.
+The UI allows cancellation and keeps the partial file. The downloader checks
+disk space, validates the size returned by the server, verifies the SHA-256
+digest pinned in the catalog, and publishes the final filename only after
+verification.
 
-### Browse manuale
+### Manual browse
 
-**Browse** resta il percorso avanzato per GGUF esterni. `ModelPicker` acquisisce
-l'accesso security-scoped, esegue `InferenceService.inspectModel` e passa il
-descrittore a `BackendSelector` prima di salvare la scelta. Se il profilo non è
-eseguibile dalla build corrente, mostra un errore e conserva il modello attivo
-precedente. Il bookmark viene usato solo per file esterni; scegliere un modello
-gestito dall'app elimina un eventuale vecchio bookmark, evitando che torni a
-prevalere al riavvio.
+**Browse** remains the advanced path for external GGUFs. `ModelPicker`
+acquires security-scoped access, runs `InferenceService.inspectModel`, and
+passes the descriptor to `BackendSelector` before saving the choice. If the
+profile is not runnable by the current build, it shows an error and keeps the
+previous active model. The bookmark is used only for external files; choosing
+an app-managed model removes any old bookmark, preventing it from taking
+precedence again at relaunch.
 
-Il token Hugging Face opzionale si configura in Settings, vive nel Keychain e
-viene passato esplicitamente al downloader. Il pannello mostra soltanto la fonte
-attiva o la forma mascherata, mai il segreto completo.
+The optional Hugging Face token is configured in Settings, lives in the
+Keychain, and is passed explicitly to the downloader. The panel shows only the
+active source or the masked form, never the full secret.
 
-## Server locale
+## Local server
 
-`LocalServer` usa `Network.framework` ed espone il motore già caricato. Le
-responsabilità sono divise in:
+`LocalServer` uses `Network.framework` and exposes the already-loaded engine.
+Responsibilities are split into:
 
-- `Networking` — accept, lettura HTTP, JSON e risposte;
-- `API` — adattatori dei diversi contratti;
-- `Concurrency` — limite e serializzazione delle richieste;
-- `Services` — stato condiviso del listener;
-- `Controllers` e `Views` — controllo dalla GUI.
+- `Networking` — accept, HTTP reading, JSON, and responses;
+- `API` — adapters for the various contracts;
+- `Concurrency` — request limiting and serialization;
+- `Services` — shared listener state;
+- `Controllers` and `Views` — control from the GUI.
 
-Endpoint implementati:
+Implemented endpoints:
 
-| Metodo | Percorso | Compatibilità |
+| Method | Path | Compatibility |
 |---|---|---|
 | `GET` | `/v1/models`, `/v1/models/{id}` | OpenAI |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
@@ -146,69 +146,67 @@ Endpoint implementati:
 | `POST` | `/v1/completions` | OpenAI legacy |
 | `POST` | `/v1/messages` | Anthropic Messages |
 
-Gli adattatori traducono la richiesta in tipi di inferenza condivisi e
-riconvertono gli eventi in JSON o SSE. Non devono duplicare il loop di
-generazione.
+The adapters translate the request into shared inference types and convert the
+events back into JSON or SSE. They must not duplicate the generation loop.
 
-## Streaming SSE
+## SSE streaming
 
-Per una risposta streaming il server:
+For a streaming response the server:
 
-1. valida metodo, percorso, autenticazione e limite del body;
-2. costruisce la richiesta normalizzata;
-3. acquisisce il gate del motore;
-4. invia header `text/event-stream`;
-5. traduce ogni evento del servizio nel formato dell'API scelta;
-6. invia il terminatore previsto dal protocollo;
-7. libera il gate anche in caso di cancellazione o errore.
+1. validates method, path, authentication, and body limit;
+2. builds the normalized request;
+3. acquires the engine gate;
+4. sends `text/event-stream` headers;
+5. translates each service event into the chosen API's format;
+6. sends the terminator required by the protocol;
+7. releases the gate even on cancellation or error.
 
-La disconnessione del client deve propagare la cancellazione al task di
-generazione, senza lasciare un turno parzialmente committato come KV valido.
+Client disconnection must propagate cancellation to the generation task,
+without leaving a partially committed turn as valid KV.
 
-## Parametri e precedenza
+## Parameters and precedence
 
-Il server ha impostazioni proprie per host, porta, API key, CORS e limite
-predefinito dei token. Sampling e limite presenti nel body della richiesta
-sovrascrivono i default del server per quel turno. Il nome modello richiesto è
-un identificatore di compatibilità: il server usa sempre il singolo GGUF già
-caricato.
+The server has its own settings for host, port, API key, CORS, and default
+token limit. Sampling parameters and limits present in the request body
+override the server defaults for that turn. The requested model name is a
+compatibility identifier: the server always uses the single GGUF already
+loaded.
 
-La tabella completa dei campi accettati è nella
+The complete table of accepted fields is in the
 [Configuration Reference](../README.md#http-server-server-tab).
 
-## Sicurezza
+## Security
 
-Il listener usa HTTP in chiaro. Il default `127.0.0.1` limita l'accesso alla
-macchina locale; un bind su LAN deve essere protetto esternamente con TLS o
-tunnel. L'API key applicativa evita richieste accidentali ma, senza TLS, non
-protegge il token da intercettazione.
+The listener uses plain HTTP. The default `127.0.0.1` restricts access to the
+local machine; a LAN bind must be protected externally with TLS or a tunnel.
+The application API key prevents accidental requests but, without TLS, does
+not protect the token from interception.
 
-Il body è limitato e il parser rifiuta richieste malformate. CORS è disattivato
-di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
+The body is size-limited and the parser rejects malformed requests. CORS is
+disabled by default. See [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 
-## Aggiungere una feature GUI
+## Adding a GUI feature
 
-1. Creare `Features/<Nome>` con modelli, controller/view model, servizi e viste
-   soltanto quando servono davvero.
-2. Aggiungere un `README.md` che dichiari proprietà e dipendenze.
-3. Esporre dal motore un'API applicativa in `DS4Engine`, non importare
-   `DS4Metal` nella GUI.
-4. Registrare la feature nella navigazione radice.
-5. Persistire solo impostazioni che devono sopravvivere al riavvio.
-6. Testare le parti pure nel target test e verificare manualmente il lifecycle
-   SwiftUI che dipende dal sistema.
+1. Create `Features/<Name>` with models, controllers/view models, services,
+   and views only when they are genuinely needed.
+2. Add a `README.md` declaring ownership and dependencies.
+3. Expose an application-level API from the engine in `DS4Engine`; do not
+   import `DS4Metal` in the GUI.
+4. Register the feature in the root navigation.
+5. Persist only settings that must survive a relaunch.
+6. Test the pure parts in the test target and manually verify the SwiftUI
+   lifecycle that depends on the system.
 
-## Aggiungere o modificare un endpoint
+## Adding or changing an endpoint
 
-1. Mantenere parsing HTTP generico in `Networking`.
-2. Aggiungere il mapping del contratto sotto `API`.
-3. Normalizzare verso i tipi di `DS4Engine/Inference/API`.
-4. Coprire stream e non-stream, errori e cancellazione.
-5. Non introdurre un decoder o una coda di sampling parallela.
-6. Aggiornare questa guida, il README del server e gli esempi del README
-   principale.
+1. Keep generic HTTP parsing in `Networking`.
+2. Add the contract mapping under `API`.
+3. Normalize toward the types in `DS4Engine/Inference/API`.
+4. Cover stream and non-stream, errors, and cancellation.
+5. Do not introduce a parallel decoder or sampling queue.
+6. Update this guide, the server README, and the examples in the main README.
 
-## File principali
+## Key files
 
 - `Sources/DwarfStar/App/AppEnvironment.swift`
 - `Sources/DwarfStar/Features/Chat/ViewModels/ChatStore.swift`
@@ -220,4 +218,4 @@ di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 - `Sources/DwarfStar/Features/Server/Concurrency/RequestGate.swift`
 - `Sources/DS4Engine/Inference/Service/InferenceService.swift`
 
-Per il flusso interno vedere [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md).
+For the internal flow see [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md).

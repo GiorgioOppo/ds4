@@ -1,27 +1,27 @@
 # Distributed/Worker
 
-`DistWorker` è un nodo inizialmente inattivo che ascolta una porta, riceve file
-e carica il lavoro assegnato dal coordinator.
+`DistWorker` is an initially idle node that listens on a port, receives files
+and loads the work assigned by the coordinator.
 
-## Struttura
+## Structure
 
-- `DistWorker.swift`: configurazione e stato condiviso protetto da lock.
-- [`Lifecycle`](Lifecycle/README.md): listener, start/stop e `HELLO`.
-- [`Assignments`](Assignments/README.md): caricamento slice o shard esperti.
-- [`Files`](Files/README.md): ricezione resumable e verifica.
-- [`KV`](KV/README.md): comandi di checkpoint.
-- [`Serving`](Serving/README.md): dispatch dei frame e pipeline.
-- [`Concurrency`](Concurrency/README.md): serializzazione del lavoro Metal.
+- `DistWorker.swift`: configuration and shared state protected by a lock.
+- [`Lifecycle`](Lifecycle/README.md): listener, start/stop and `HELLO`.
+- [`Assignments`](Assignments/README.md): loading slices or expert shards.
+- [`Files`](Files/README.md): resumable reception and verification.
+- [`KV`](KV/README.md): checkpoint commands.
+- [`Serving`](Serving/README.md): frame dispatch and pipeline.
+- [`Concurrency`](Concurrency/README.md): serialization of Metal work.
 
-## Flusso
+## Flow
 
-Ogni connessione è servita in una task, ma `DistGate` consente un solo lavoro
-di calcolo alla volta. L'assegnazione può essere riusata se coincide; altrimenti
-il worker carica il nuovo motore fuori dal lock e pubblica lo stato solo a
-caricamento completato.
+Each connection is served in a task, but `DistGate` allows only one compute
+job at a time. The assignment can be reused if it matches; otherwise
+the worker loads the new engine outside the lock and publishes the state only
+once loading is complete.
 
-## Estensione
+## Extension
 
-Validare frame e sessione prima di accedere all'engine. Non tenere lock durante
-I/O o caricamenti lunghi. Ogni risorsa persistente deve essere identificata da
-modello e responsabilità del nodo per evitare riuso fra shard incompatibili.
+Validate frame and session before touching the engine. Do not hold locks
+during I/O or long loads. Every persistent resource must be identified by
+model and node responsibility to avoid reuse across incompatible shards.

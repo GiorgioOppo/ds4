@@ -1,33 +1,34 @@
 # DeepSeekV4/Decode
 
-Orchestrazione dell'inferenza ricorrente: inizializzazione, prefill, forward di
-un token, gestione KV, output head e diagnostica.
+Orchestration of recurrent inference: initialization, prefill, single-token
+forward, KV management, output head and diagnostics.
 
-## Struttura
+## Structure
 
-- [`Execution/`](Execution/README.md): stato del decoder e percorso per-layer.
-- [`Prefill/`](Prefill/README.md): ingestione layer-major di più token.
-- [`Generation/`](Generation/README.md): embedding/output head e generazione.
-- [`State/`](State/README.md): buffer scratch riutilizzabili.
-- [`KV/`](KV/README.md): snapshot e ripristino dello stato ricorrente.
-- [`Attention/`](Attention/README.md): selezione top-k CPU dell'indexer.
-- [`Cache/`](Cache/README.md): cache LRU e statistiche degli expert.
-- [`Diagnostics/`](Diagnostics/README.md): profilo temporale e I/O.
-- [`Reference/`](Reference/README.md): implementazione di riferimento per parità.
+- [`Execution/`](Execution/README.md): decoder state and per-layer path.
+- [`Prefill/`](Prefill/README.md): layer-major ingestion of multiple tokens.
+- [`Generation/`](Generation/README.md): embedding/output head and generation.
+- [`State/`](State/README.md): reusable scratch buffers.
+- [`KV/`](KV/README.md): snapshot and restore of the recurrent state.
+- [`Attention/`](Attention/README.md): CPU top-k selection of the indexer.
+- [`Cache/`](Cache/README.md): expert LRU cache and statistics.
+- [`Diagnostics/`](Diagnostics/README.md): timing profile and I/O.
+- [`Reference/`](Reference/README.md): reference implementation for parity.
 
-## Flusso
+## Flow
 
-Il factory prepara runtime, pesi e cache. Il prefill attraversa il prompt in
-chunk layer-major, aggiornando lo stesso stato usato dal decode. La generazione
-esegue poi un forward per token: embedding -> layer -> attention/KV -> router e
-FFN -> output head. Gli snapshot permettono di sospendere e riprendere il flusso.
+The factory prepares runtime, weights and caches. Prefill traverses the prompt
+in layer-major chunks, updating the same state used by decode. Generation then
+runs one forward per token: embedding -> layers -> attention/KV -> router and
+FFN -> output head. Snapshots allow suspending and resuming the flow.
 
-Il raw KV è una finestra circolare/lineare limitata a `nSWA`; il contesto più
-vecchio sopravvive nelle righe compresse NSA. Le opzioni runtime sono nella
+The raw KV is a circular/linear window bounded by `nSWA`; older context
+survives in the compressed NSA rows. The runtime options are in the
 [Configuration Reference](../../../../../README.md#configuration-reference).
 
-## Regole di modifica
+## Modification rules
 
-Prefill e decode devono conservare la stessa semantica ricorrente. Ogni percorso
-asincrono deve definire ownership, punto di attesa e cancellazione. Una modifica
-al layout KV richiede aggiornamento coordinato di snapshot, checkpoint e test.
+Prefill and decode must preserve the same recurrent semantics. Every
+asynchronous path must define ownership, wait point and cancellation. A change
+to the KV layout requires a coordinated update of snapshots, checkpoints and
+tests.

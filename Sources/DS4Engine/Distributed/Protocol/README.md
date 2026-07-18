@@ -1,25 +1,25 @@
 # Distributed/Protocol
 
-Raccoglie tutti i tipi serializzati sul wire. Le strutture non aprono socket e
-non conoscono lo stato di coordinator o worker.
+Collects all the types serialized on the wire. These structures open no
+sockets and know nothing about coordinator or worker state.
 
-## Aree
+## Areas
 
-- [`Core`](Core/README.md): versione, tipi messaggio, flag e limiti.
-- [`Framing`](Framing/README.md): header comune dei frame.
-- [`Serialization`](Serialization/README.md): primitive little-endian.
-- [`Handshake`](Handshake/README.md): identità e assegnazione.
-- [`Files`](Files/README.md): offerta e trasferimento artefatti.
-- [`KV`](KV/README.md): controllo dei checkpoint shard.
-- [`Work`](Work/README.md): stati hidden, route e risultati.
-- [`Experts`](Experts/README.md): parallelismo verticale MoE.
-- [`Codec`](Codec/README.md): compressione delle attivazioni.
+- [`Core`](Core/README.md): version, message types, flags and limits.
+- [`Framing`](Framing/README.md): common frame header.
+- [`Serialization`](Serialization/README.md): little-endian primitives.
+- [`Handshake`](Handshake/README.md): identity and assignment.
+- [`Files`](Files/README.md): artifact offer and transfer.
+- [`KV`](KV/README.md): shard checkpoint control.
+- [`Work`](Work/README.md): hidden states, routes and results.
+- [`Experts`](Experts/README.md): vertical MoE parallelism.
+- [`Codec`](Codec/README.md): activation compression.
 
-La sequenza completa è in [`../PROTOCOLLO.md`](../PROTOCOLLO.md).
+The complete sequence is in [`../PROTOCOLLO.md`](../PROTOCOLLO.md).
 
-## Regole
+## Rules
 
-Ogni `encoded()` deve avere un `decode` simmetrico che controlla tutti i limiti
-prima di costruire il valore. Non usare `MemoryLayout` come formato wire:
-campi, ordine e endianess devono essere espliciti. Una modifica incompatibile
-richiede il bump della versione in `Core/Dist.swift`.
+Every `encoded()` must have a symmetric `decode` that checks all limits
+before constructing the value. Do not use `MemoryLayout` as the wire format:
+fields, order and endianness must be explicit. An incompatible change
+requires bumping the version in `Core/Dist.swift`.

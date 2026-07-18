@@ -1,22 +1,22 @@
 # Model/Quantization
 
-Descrizione dei formati quantizzati accettati dai kernel MoE.
+Description of the quantized formats accepted by the MoE kernels.
 
-## File principali
+## Main files
 
-- [`MoEQuant.swift`](MoEQuant.swift): enum delle quantizzazioni supportate e
-  proprietà derivate, tra cui dimensione blocco, byte per riga e parametri di
-  dispatch.
+- [`MoEQuant.swift`](MoEQuant.swift): enum of the supported quantizations and
+  derived properties, including block size, bytes per row and dispatch
+  parameters.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il loader traduce il tipo GGUF in `MoEQuant`; gather, cache e kernel usano lo
-stesso valore per calcolare intervalli gate/up/down e scegliere la pipeline.
-Le conversioni CPU risiedono in
+The loader translates the GGUF type into `MoEQuant`; gather, cache and kernels
+use the same value to compute gate/up/down ranges and pick the pipeline.
+The CPU conversions live in
 [`DS4Core/Formats/Quantization`](../../../DS4Core/Formats/Quantization/README.md).
 
-## Regole di modifica
+## Modification rules
 
-Un nuovo caso richiede supporto coordinato nel parser GGUF, calcolo layout,
-wrapper Swift e kernel `.metal`. Non dedurre il tipo dal solo rapporto byte/elementi;
-fallire su combinazioni non validate.
+A new case requires coordinated support in the GGUF parser, layout
+computation, Swift wrapper and `.metal` kernel. Do not infer the type from the
+bytes/elements ratio alone; fail on unvalidated combinations.

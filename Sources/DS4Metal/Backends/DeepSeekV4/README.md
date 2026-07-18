@@ -1,24 +1,24 @@
-# Backend DeepSeek-V4
+# DeepSeek-V4 backend
 
-Implementazione Metal per DeepSeek V4 Flash e Pro. Il GGUF validato produce una
-geometria runtime instance-based, così decoder, scratch, KV, pesi e router usano
-le dimensioni del profilo senza dispatch dinamico nel loop per-layer. Il runtime
-locale supporta il Pro Q2 a file singolo; il caricamento Pro Q4 split e la
-distribuzione Pro non sono ancora dichiarati operativi.
+Metal implementation for DeepSeek V4 Flash and Pro. The validated GGUF
+produces an instance-based runtime geometry, so decoder, scratch, KV, weights
+and router use the profile's dimensions without dynamic dispatch in the
+per-layer loop. The local runtime supports the single-file Pro Q2; Pro Q4
+split loading and Pro distribution are not yet declared operational.
 
-## Struttura
+## Structure
 
-- [`Architecture/`](Architecture/README.md): shape, dimensioni e RoPE.
-- [`Weights/`](Weights/README.md): schema tensor e caricamento GGUF.
-- [`Streaming/`](Streaming/README.md): staging dei pesi densi da SSD.
-- [`Experts/`](Experts/README.md): expert bundle, cache e MetalIO.
-- [`MTP/`](MTP/README.md): sidecar Multi-Token Prediction.
-- [`Decode/`](Decode/README.md): stato KV/NSA, prefill e generazione.
+- [`Architecture/`](Architecture/README.md): shapes, dimensions and RoPE.
+- [`Weights/`](Weights/README.md): tensor schema and GGUF loading.
+- [`Streaming/`](Streaming/README.md): staging of dense weights from SSD.
+- [`Experts/`](Experts/README.md): expert bundle, cache and MetalIO.
+- [`MTP/`](MTP/README.md): Multi-Token Prediction sidecar.
+- [`Decode/`](Decode/README.md): KV/NSA state, prefill and generation.
 
-## Confine architetturale
+## Architectural boundary
 
-HyperConnections, MLA con KV latente, compressori NSA, indexer DSA e router
-top-6 sono semantica DeepSeek-V4. Non devono essere usati come fallback per
-altre famiglie: un backend incompatibile deve fallire esplicitamente al load.
-Il router supporta 256 esperti/scala 1,5 per Flash e 384 esperti/scala 2,5 per
-Pro; la rete bitonica Pro usa 512 lane e maschera il padding 384...511.
+HyperConnections, MLA with latent KV, NSA compressors, DSA indexer and top-6
+router are DeepSeek-V4 semantics. They must not be used as fallbacks for other
+families: an incompatible backend must fail explicitly at load time.
+The router supports 256 experts/scale 1.5 for Flash and 384 experts/scale 2.5
+for Pro; the Pro bitonic network uses 512 lanes and masks padding 384...511.

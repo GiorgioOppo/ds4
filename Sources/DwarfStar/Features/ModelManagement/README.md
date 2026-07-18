@@ -1,36 +1,37 @@
 # DwarfStar/Features/ModelManagement
 
-Selezione e download nativo dei GGUF supportati dalla GUI.
+Selection and native download of the GGUFs supported by the GUI.
 
 - **`Views/ModelPicker.swift`** provides sandbox-friendly selection through
   `NSOpenPanel` plus security-scoped bookmarks, so the same file can be reopened
   across launches.
-- **`Models/ModelCatalog.swift`** individua i tre DeepSeek V4 Flash e il Pro Q2
-  singolo che il runtime corrente può caricare; **Browse** resta la via esplicita per GGUF
-  custom e li valida prima di memorizzarli.
+- **`Models/ModelCatalog.swift`** identifies the three DeepSeek V4 Flash and the
+  single-file Pro Q2 that the current runtime can load; **Browse** remains the
+  explicit path for custom GGUFs and validates them before storing them.
 - **`Views/DownloadView.swift` / `Services/DownloadRunner.swift`** provide the UI and driver for
-  the native downloader (`DS4Engine.ModelDownloader`). La GUI deriva tutte le
-  righe da `ModelCatalogRegistry`: non mantiene un secondo elenco hardcoded.
-  Mostra stato Installato/Parziale/Non scaricato, spazio, fase, avanzamento,
-  annullamento e ripresa. Il runner passa il token Keychain configurato in
-  Settings → Hugging Face senza mostrarne il valore completo.
+  the native downloader (`DS4Engine.ModelDownloader`). The GUI derives all rows
+  from `ModelCatalogRegistry`: it does not maintain a second hardcoded list.
+  It shows Installed/Partial/Not downloaded state, disk space, phase, progress,
+  cancellation and resume. The runner passes the Keychain token configured in
+  Settings → Hugging Face without ever showing its full value.
 
 Catalog records and scans live in `Models/`, UI adapters in `Services/`, and
 selection/progress rendering in `Views/`. Remote protocol, integrity, resume,
 and credential logic stays in `DS4Engine`; never log or persist a plaintext
 token in this feature.
 
-I nuovi file finiscono in `Application Support/DwarfStar/models`, non nelle
-Resources read-only del bundle. Prima del download vengono cercati anche nelle
-directory di sviluppo e accanto al modello selezionato: un file catalogato già
-presente e non vuoto viene riusato senza rete né copia, purché coincida anche
-l'eventuale dimensione esatta. Un `.part` nella cartella
-gestita viene conservato dopo Cancel e ripreso al tentativo successivo.
+New files end up in `Application Support/DwarfStar/models`, not in the
+bundle's read-only Resources. Before a download they are also looked up in
+the development directories and next to the selected model: a cataloged file
+that is already present and non-empty is reused without network or copy,
+provided any exact size also matches. A `.part` in the managed folder is kept
+after Cancel and resumed on the next attempt.
 
-## Confine di supporto
+## Support boundary
 
-Le tre quantizzazioni Flash e Pro IQ2 singolo sono scaricabili e selezionabili.
-Il package Pro Q4 a due shard è visibile e scaricabile, ma mantiene il badge
-download-only e non diventa automaticamente il modello attivo. Le tre varianti
-GLM 5.2 sono visibili e scaricabili dallo specifico repository HF, ma restano
-download-only. MTP e Qwen non compaiono nel catalogo principale.
+The three Flash quantizations and the single-file Pro IQ2 are downloadable
+and selectable. The two-shard Pro Q4 package is visible and downloadable, but
+keeps the download-only badge and does not automatically become the active
+model. The three GLM 5.2 variants are visible and downloadable from their
+dedicated HF repository, but remain download-only. MTP and Qwen do not appear
+in the main catalog.

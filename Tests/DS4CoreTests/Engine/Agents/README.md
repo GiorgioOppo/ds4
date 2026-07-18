@@ -1,16 +1,16 @@
 # Agent tests
 
-Questa cartella verifica i profili predefiniti di `DS4Engine/Agents` senza
-avviare inferenza o tool reali.
+This folder verifies the predefined profiles of `DS4Engine/Agents` without
+starting inference or real tools.
 
-## Copertura
+## Coverage
 
-- contratto operativo condiviso: lingua dell'utente, dati tool non fidati,
-  round multipli ed effetti collaterali limitati;
-- privilegio minimo del Reviewer, che deve esporre soltanto tool di lettura;
-- assenza del tool `git` mutante dai ruoli che non ne hanno bisogno.
-- scope di delega esplicito dell'Orchestrator, sempre sottoinsieme dei tool
-  concedibili e senza `git`, cancellazione o orchestrazione annidata.
+- shared operational contract: the user's language, untrusted tool data,
+  multiple rounds and limited side effects;
+- least privilege of the Reviewer, which must expose read-only tools only;
+- absence of the mutating `git` tool from roles that do not need it.
+- explicit delegation scope of the Orchestrator, always a subset of the
+  grantable tools and without `git`, cancellation or nested orchestration.
 
-Quando si aggiunge un agente o si cambia il contratto comune, aggiornare questi
-test insieme a `Sources/DS4Engine/Agents/README.md`.
+When adding an agent or changing the shared contract, update these
+tests together with `Sources/DS4Engine/Agents/README.md`.

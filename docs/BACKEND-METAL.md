@@ -1,96 +1,96 @@
-# Backend Metal
+# Metal Backend
 
-Questa guida descrive i confini del runtime GPU condiviso e il percorso
-corretto per modificare un backend, un wrapper o un kernel. Le formule del
-backend DeepSeek sono approfondite in
-[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); la separazione multi-modello
-è definita in
+This guide describes the boundaries of the shared GPU runtime and the correct
+path for modifying a backend, a wrapper, or a kernel. The DeepSeek backend
+formulas are covered in depth in
+[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); the multi-model separation
+is defined in
 [ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md).
 
-## Livelli del backend
+## Backend layers
 
 ```text
-Backend concreto (oggi DeepSeekV4/StreamingDecoder;
-GLM52 resta in tranche isolate non collegate)
+Concrete backend (today DeepSeekV4/StreamingDecoder;
+GLM52 remains in isolated, unconnected tranches)
              |
              v
-decoder, stato KV e provider dei pesi del backend
+decoder, KV state and the backend's weight provider
              |
              v
 Graph/Core + Graph/Operations
              |
              v
-wrapper Swift in Kernels/<Area>
+Swift wrappers in Kernels/<Area>
              |
              v
-funzioni Metal in metal/*.metal
+Metal functions in metal/*.metal
 ```
 
-| Area | Responsabilità |
+| Area | Responsibility |
 |---|---|
-| `Runtime/Core` | device, command queue, compilazione delle pipeline e `GPUTensor` |
-| `Runtime/Generated` | copia generata dei sorgenti Metal incorporati nel binario |
-| `Kernels` | binding Swift, argomenti, dimensioni di dispatch e buffer |
-| `Graph` | composizione delle operazioni e gestione del command buffer |
-| `Model/Quantization` | descrittori di quantizzazione realmente condivisi |
-| `Backends/DeepSeekV4` | forma, tensori, streaming, esperti, MTP, decoder, prefill e KV DeepSeek |
-| `Backends/Qwen` | placeholder documentato; nessuna implementazione GPU corrente |
-| `metal` | implementazione GPU autorevole |
+| `Runtime/Core` | device, command queue, pipeline compilation and `GPUTensor` |
+| `Runtime/Generated` | generated copy of the Metal sources embedded in the binary |
+| `Kernels` | Swift bindings, arguments, dispatch sizes and buffers |
+| `Graph` | operation composition and command buffer management |
+| `Model/Quantization` | genuinely shared quantization descriptors |
+| `Backends/DeepSeekV4` | shape, tensors, streaming, experts, MTP, decoder, prefill and DeepSeek KV |
+| `Backends/Qwen` | documented placeholder; no current GPU implementation |
+| `metal` | authoritative GPU implementation |
 
-La selezione avviene prima di costruire il decoder. Il ciclo per layer usa il
-tipo concreto del backend e non consulta un registro o un protocollo dinamico.
+Selection happens before the decoder is built. The per-layer loop uses the
+backend's concrete type and does not consult a registry or a dynamic protocol.
 
-## Runtime e tensori
+## Runtime and tensors
 
-`MetalRuntime` seleziona il device, crea la coda, compila il sorgente
-incorporato e conserva le pipeline per nome. `GPUTensor` associa un
-`MTLBuffer` a forma, tipo, stride e offset. Un tensore è una vista di memoria:
-chi introduce sottoviste deve verificare che il wrapper usato propaghi
-correttamente `byteOffset`.
+`MetalRuntime` selects the device, creates the queue, compiles the embedded
+source and keeps pipelines by name. `GPUTensor` associates an `MTLBuffer` with
+shape, type, stride and offset. A tensor is a memory view: anyone introducing
+subviews must verify that the wrapper in use correctly propagates
+`byteOffset`.
 
-Le risorse Metal sono gestite da ARC, ma la correttezza temporale resta
-esplicita: un buffer di staging non può essere riutilizzato prima che il
-command buffer che lo legge sia concluso.
+Metal resources are managed by ARC, but temporal correctness remains
+explicit: a staging buffer cannot be reused before the command buffer that
+reads it has completed.
 
-## Command buffer e sincronizzazione
+## Command buffers and synchronization
 
-`GraphContext` accumula dispatch correlati e decide quando eseguire `commit` e
-quando attendere il risultato. Ogni attesa CPU/GPU nel percorso per token è
-potenzialmente costosa. Le fusioni esistenti rimuovono passaggi intermedi senza
-spostare politica applicativa nei kernel.
+`GraphContext` accumulates related dispatches and decides when to `commit` and
+when to wait for the result. Every CPU/GPU wait on the per-token path is
+potentially expensive. The existing fusions remove intermediate passes without
+moving application policy into the kernels.
 
-Prima di eliminare una sincronizzazione verificare:
+Before removing a synchronization, verify:
 
-- quale buffer produce il dispatch precedente;
-- chi lo legge e su quale command buffer;
-- se esiste una lettura CPU dei risultati;
-- quando uno slot di staging o cache può essere sovrascritto;
-- se l'ordine di accumulo numerico deve restare identico.
+- which buffer the previous dispatch produces;
+- who reads it and on which command buffer;
+- whether there is a CPU read of the results;
+- when a staging or cache slot may be overwritten;
+- whether the numeric accumulation order must stay identical.
 
-## Wrapper dei kernel
+## Kernel wrappers
 
-I wrapper sono raggruppati per funzione:
+Wrappers are grouped by function:
 
-- `Kernels/Attention` — RoPE, compressione KV, flash attention e indexer;
-- `Kernels/Compression` — compressori e hyper-connections;
-- `Kernels/Dense` — proiezioni dense e matmul;
-- `Kernels/MoE` — router ed esperti quantizzati;
-- `Kernels/Tensor` — primitive generali, norm, softmax e copie.
+- `Kernels/Attention` — RoPE, KV compression, flash attention and indexer;
+- `Kernels/Compression` — compressors and hyper-connections;
+- `Kernels/Dense` — dense projections and matmul;
+- `Kernels/MoE` — router and quantized experts;
+- `Kernels/Tensor` — general primitives, norms, softmax and copies.
 
-Un wrapper deve validare forma e capacità dei buffer, creare una struttura
-argomenti con layout compatibile Metal, impostare ogni offset e scegliere una
-griglia coerente con i limiti del kernel. Non deve scegliere quanti esperti
-attivare, quale prompt elaborare o quale strategia di cache usare.
+A wrapper must validate buffer shape and capacity, create an argument struct
+with a Metal-compatible layout, set every offset and choose a grid consistent
+with the kernel's limits. It must not decide how many experts to activate,
+which prompt to process, or which cache strategy to use.
 
-## Sorgenti incorporati
+## Embedded sources
 
-I file modificabili sono i kernel vendored raggruppati per architettura:
-`metal/deepseek/*.metal` (DeepSeek V4 più le op generiche condivise) e
-`metal/glm5.2/*.metal` (GLM 5.2). Il file
-`Sources/DS4Metal/Runtime/Generated/KernelSources.swift` è generato e non deve
-essere editato manualmente.
+The editable files are the vendored kernels grouped by architecture:
+`metal/deepseek/*.metal` (DeepSeek V4 plus the shared generic ops) and
+`metal/glm5.2/*.metal` (GLM 5.2). The file
+`Sources/DS4Metal/Runtime/Generated/KernelSources.swift` is generated and must
+not be edited manually.
 
-Workflow obbligatorio:
+Mandatory workflow:
 
 ```sh
 make embed-kernels
@@ -98,84 +98,83 @@ swift test --disable-sandbox
 swift build -c release --product DS4Demo --disable-sandbox
 ```
 
-`make embed-kernels` concatena i sorgenti nello stesso ordine atteso dal
-runtime. Se cambia la firma di una funzione, wrapper Swift e test devono essere
-aggiornati nello stesso intervento.
+`make embed-kernels` concatenates the sources in the same order the runtime
+expects. If a function signature changes, the Swift wrapper and tests must be
+updated in the same change.
 
-## Pesi e quantizzazione
+## Weights and quantization
 
-Il backend usa più rappresentazioni in base al tensore:
+The backend uses several representations depending on the tensor:
 
-- F32/F16 per stato, cache e alcune proiezioni;
-- Q8_0 per molti pesi densi;
-- Q4_K, Q2_K e IQ2_XXS per gli esperti;
-- cache derivate Q4/Q8 abilitate soltanto dai relativi toggle.
+- F32/F16 for state, caches and some projections;
+- Q8_0 for many dense weights;
+- Q4_K, Q2_K and IQ2_XXS for the experts;
+- derived Q4/Q8 caches enabled only by their toggles.
 
-Nel backend DeepSeek, `LayerWeights` porta la quantizzazione effettiva del
-singolo layer. Non bisogna
-dedurre il formato da un'impostazione globale quando il GGUF può essere mixed
-precision. `GGUFWeights` valida tipo, forma, offset e dimensione prima di
-esporre un tensore al grafo.
+In the DeepSeek backend, `LayerWeights` carries the effective quantization of
+each individual layer. Do not
+infer the format from a global setting when the GGUF may be mixed
+precision. `GGUFWeights` validates type, shape, offset and size before
+exposing a tensor to the graph.
 
-## Streaming e memoria unificata
+## Streaming and unified memory
 
-Apple Silicon condivide memoria CPU/GPU, ma ciò non elimina i costi di paging,
-compressione e I/O. Le strategie principali sono:
+Apple Silicon shares CPU/GPU memory, but that does not eliminate the costs of
+paging, compression and I/O. The main strategies are:
 
-- mmap per viste non copiate;
-- staging denso con letture `pread` fuori dalla page cache;
-- `mlock` best-effort per buffer caldi;
-- slot-cache degli esperti;
-- bundle contiguo per ridurre seek e numero di letture;
-- MetalIO con fallback automatico quando la banda reale è insufficiente.
+- mmap for zero-copy views;
+- dense staging with `pread` reads outside the page cache;
+- best-effort `mlock` for hot buffers;
+- expert slot-cache;
+- contiguous bundle to reduce seeks and the number of reads;
+- MetalIO with automatic fallback when the real bandwidth is insufficient.
 
-MetalIO non è accesso arbitrario dell'SSD da parte di uno shader: è caricamento
-di risorse coordinato dal runtime Metal. Il command processor continua a usare
-buffer Metal validi e il percorso mantiene un fallback CPU/`pread`.
+MetalIO is not arbitrary SSD access from a shader: it is resource loading
+coordinated by the Metal runtime. The command processor keeps using valid
+Metal buffers, and the path retains a CPU/`pread` fallback.
 
-## Regole numeriche
+## Numeric rules
 
-Le ottimizzazioni rientrano in tre categorie, che devono essere dichiarate nei
-test e nella documentazione:
+Optimizations fall into three categories, which must be declared in the
+tests and in the documentation:
 
-1. **bit-identiche**, stesso ordine e stessi risultati;
-2. **matematicamente equivalenti**, ma con possibile differenza di pochi ulp;
-3. **lossy**, per requantizzazione o riduzione del lavoro del modello.
+1. **bit-identical**, same order and same results;
+2. **mathematically equivalent**, but with a possible difference of a few ulps;
+3. **lossy**, for requantization or reducing the model's work.
 
-Un aumento di throughput non basta per accettare un kernel. Servono almeno:
+A throughput increase is not enough to accept a kernel. At minimum you need:
 
-- confronto con l'implementazione CPU o il percorso precedente;
-- copertura di dimensioni limite e quantizzazioni supportate;
-- controllo NaN/Inf e bounds;
-- confronto del testo generato con seed e prompt fissati;
-- misura dopo warm-up senza profilazione invasiva.
+- comparison with the CPU implementation or the previous path;
+- coverage of edge sizes and supported quantizations;
+- NaN/Inf and bounds checks;
+- comparison of the generated text with fixed seed and prompt;
+- measurement after warm-up without invasive profiling.
 
-I rischi dormienti già individuati sono elencati in
-[metal/README.md](../metal/README.md); non abilitare un percorso indicato come
-non raggiunto senza risolverne o validarne le precondizioni.
+The dormant risks already identified are listed in
+[metal/README.md](../metal/README.md); do not enable a path marked as
+unreached without first resolving or validating its preconditions.
 
-## Aggiungere una nuova operazione
+## Adding a new operation
 
-1. Stabilire prima se l'operazione è condivisa o appartiene a un solo backend;
-   poi scegliere il dominio (`Attention`, `Compression`, `Dense`, `MoE`,
+1. First establish whether the operation is shared or belongs to a single
+   backend; then choose the domain (`Attention`, `Compression`, `Dense`, `MoE`,
    `Tensor`).
-2. Aggiungere o modificare il kernel nel file `.metal` appropriato.
-3. Creare un wrapper focalizzato sotto `Sources/DS4Metal/Kernels/<Area>`.
-4. Comporlo nel backend proprietario; usare `Graph/Operations` solo per una
-   primitiva con contratto realmente comune, senza stato della GUI o del
-   servizio.
-5. Aggiungere un test kernel con riferimento CPU.
-6. Aggiungere un test di grafo se l'operazione partecipa a una catena.
-7. Rigenerare `KernelSources.swift` e compilare demo e app.
+2. Add or modify the kernel in the appropriate `.metal` file.
+3. Create a focused wrapper under `Sources/DS4Metal/Kernels/<Area>`.
+4. Compose it in the owning backend; use `Graph/Operations` only for a
+   primitive with a genuinely common contract, free of GUI or service
+   state.
+5. Add a kernel test with a CPU reference.
+6. Add a graph test if the operation participates in a chain.
+7. Regenerate `KernelSources.swift` and build the demo and the app.
 
-## Diagnostica
+## Diagnostics
 
-`DecodeProfile` separa I/O esperti, route/attention, FFN e overhead. La
-profilazione fine può aggiungere wait e alterare il throughput; usarla per
-individuare proporzioni e colli di bottiglia, poi misurare la velocità finale
-con la profilazione disattivata.
+`DecodeProfile` separates expert I/O, route/attention, FFN and overhead. Fine
+profiling can add waits and alter throughput; use it to identify proportions
+and bottlenecks, then measure the final speed with profiling disabled.
 
-Vedere anche:
+See also:
 
 - [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.md)
 - [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md)

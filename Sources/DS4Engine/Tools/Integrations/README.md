@@ -1,23 +1,23 @@
 # Tools/Integrations
 
-Contiene implementazioni con side effect riusate dai built-in.
+Contains side-effecting implementations reused by the built-ins.
 
-## Componenti
+## Components
 
-- `WebClient.swift`: HTTP(S), protezione SSRF, redirect, timeout, limite body e
-  conversione HTML in testo.
-- `GitTool.swift`: sottoinsieme whitelisted di comandi git locali.
-- `GitHubTool.swift`: download controllato di repository pubblici come archivio,
-  estrazione e import in `ProjectCache`.
+- `WebClient.swift`: HTTP(S), SSRF protection, redirects, timeouts, body limit
+  and HTML-to-text conversion.
+- `GitTool.swift`: whitelisted subset of local git commands.
+- `GitHubTool.swift`: controlled download of public repositories as archives,
+  extraction and import into `ProjectCache`.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-I built-in in [`Web`](../Builtins/Web/README.md) e `Git.swift` traducono JSON in
-chiamate a queste integrazioni. Le integrazioni restituiscono dati o errori e non
-formattano il prompt del modello.
+The built-ins in [`Web`](../Builtins/Web/README.md) and `Git.swift` translate
+JSON into calls to these integrations. The integrations return data or errors
+and do not format the model's prompt.
 
-## Estensione
+## Extension
 
-Centralizzare qui validazione di rete/processo e limiti condivisi. Non esporre
-shell arbitraria, host privati o argomenti non convalidati. Ogni nuova
-integrazione esterna deve supportare cancellazione e produrre output bounded.
+Centralize network/process validation and shared limits here. Do not expose
+arbitrary shell, private hosts or unvalidated arguments. Every new external
+integration must support cancellation and produce bounded output.

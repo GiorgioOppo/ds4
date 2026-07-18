@@ -1,22 +1,21 @@
 # Protocol/KV
 
-`DistKV.swift` serializza i messaggi di continuità KV per ogni slice.
+`DistKV.swift` serializes the KV continuity messages for each slice.
 
-## Operazioni
+## Operations
 
-- encode/decode delle liste di token per query e restore;
-- lista delle lunghezze di prefisso disponibili;
-- richiesta di salvataggio con indicazione cold/continued;
-- ack con esito e messaggio diagnostico.
+- encode/decode of the token lists for query and restore;
+- list of the available prefix lengths;
+- save request with cold/continued indication;
+- ack with outcome and diagnostic message.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il coordinator interseca le lunghezze restituite da tutti i worker e sceglie un
-prefisso comune; ogni worker inoltra l'operazione al proprio `DistEngine` e
+The coordinator intersects the lengths returned by all workers and picks a
+common prefix; each worker forwards the operation to its own `DistEngine` and
 [`DiskKVStore`](../../../Persistence/KV/README.md).
 
-## Estensione
+## Extension
 
-Un restore è valido soltanto se tutti gli shard confermano la stessa frontiera.
-Imporre limiti al numero di token e non trattare un ack parziale come successo
-globale.
+A restore is valid only if all shards confirm the same frontier. Enforce
+limits on the token count and do not treat a partial ack as global success.

@@ -1,51 +1,53 @@
 # Distributed
 
-Implementa inferenza su più Mac con due strategie:
+Implements inference across multiple Macs with two strategies:
 
-- **pipeline orizzontale**: ogni worker possiede un intervallo contiguo di layer;
-- **parallelismo verticale degli esperti**: il coordinator esegue il backbone e
-  aggrega contributi MoE prodotti da shard remoti.
+- **horizontal pipeline**: each worker owns a contiguous range of layers;
+- **vertical expert parallelism**: the coordinator runs the backbone and
+  aggregates MoE contributions produced by remote shards.
 
-Il protocollo wire corrente è `Dist.protocolVersion = 11` e richiede uguaglianza
-stretta fra i nodi.
+The current wire protocol is `Dist.protocolVersion = 11` and requires strict
+equality between nodes.
 
-La geometria viene letta dal GGUF: la pipeline copre 43 layer/256 esperti per
-Flash e 61 layer/384 esperti per Pro. Il runtime distribuito accetta il GGUF Pro
-Q2 completo; i due file del package Pro Q4 non sono slice eseguibili e restano
-solo scaricabili finché non esisterà un loader multi-shard.
+The geometry is read from the GGUF: the pipeline covers 43 layers/256 experts
+for Flash and 61 layers/384 experts for Pro. The distributed runtime accepts
+the complete Pro Q2 GGUF; the two files of the Pro Q4 package are not runnable
+slices and remain download-only until a multi-shard loader exists.
 
-## Struttura
+## Structure
 
-- [`Protocol`](Protocol/README.md): framing e messaggi serializzabili.
-- [`Transport`](Transport/README.md): connessioni TCP basate su Network.framework.
-- [`Coordinator`](Coordinator/README.md): topologia, chat, KV e distribuzione file.
-- [`Worker`](Worker/README.md): listener, assegnazioni ed esecuzione richieste.
-- [`Execution`](Execution/README.md): adattatori del decoder per slice e shard.
-- [`Files`](Files/README.md): hash, manifest e archivio locale dei modelli.
+- [`Protocol`](Protocol/README.md): framing and serializable messages.
+- [`Transport`](Transport/README.md): TCP connections based on Network.framework.
+- [`Coordinator`](Coordinator/README.md): topology, chat, KV and file distribution.
+- [`Worker`](Worker/README.md): listener, assignments and request execution.
+- [`Execution`](Execution/README.md): decoder adapters for slices and shards.
+- [`Files`](Files/README.md): hashes, manifests and the local model archive.
 
-Il formato e le sequenze wire sono descritti in
+The wire format and sequences are described in
 [`PROTOCOLLO.md`](PROTOCOLLO.md).
 
-## Flusso sintetico
+## Flow at a glance
 
-1. Il coordinator si connette e verifica `HELLO` e versione.
-2. Offre GGUF e sidecar; il worker richiede solo file mancanti o incompleti.
-3. Il coordinator invia `ASSIGN`; il worker carica la responsabilità e risponde
-   `READY`.
-4. I `WORK` attraversano la route e producono `RESULT`, oppure i messaggi expert
-   producono somme parziali.
-5. A fine turno i nodi possono salvare checkpoint KV delle rispettive parti.
+1. The coordinator connects and verifies `HELLO` and the version.
+2. It offers GGUF and sidecars; the worker requests only missing or
+   incomplete files.
+3. The coordinator sends `ASSIGN`; the worker loads its responsibility and
+   replies `READY`.
+4. `WORK` messages traverse the route and produce `RESULT`, or the expert
+   messages produce partial sums.
+5. At the end of a turn the nodes can save KV checkpoints of their
+   respective parts.
 
-## Sicurezza e vincoli
+## Security and constraints
 
-Il traffico è TCP in chiaro e il listener non autentica i peer: usare soltanto
-reti fidate. Lunghezze, route, slice, sessioni e payload devono essere validati
-prima di allocare memoria o invocare Metal. Solo i knob `DS4_*` presenti nella
-whitelist possono attraversare `ASSIGN`.
+Traffic is plain TCP and the listener does not authenticate peers: use only
+trusted networks. Lengths, routes, slices, sessions and payloads must be
+validated before allocating memory or invoking Metal. Only the `DS4_*` knobs
+present in the whitelist may traverse `ASSIGN`.
 
-## Estensione
+## Extension
 
-Una modifica incompatibile al wire richiede incremento di `protocolVersion`,
-codec simmetrici e test con payload troncati/ostili. Il trasporto non deve
-contenere logica di scheduling; i messaggi non devono dipendere da coordinator
-o worker.
+An incompatible wire change requires bumping `protocolVersion`, symmetric
+codecs and tests with truncated/hostile payloads. The transport must not
+contain scheduling logic; messages must not depend on the coordinator
+or the worker.

@@ -1,21 +1,26 @@
 # Kernels/MoE
 
-Wrapper del router e dei feed-forward routed/shared del Mixture-of-Experts.
+Wrappers for the router and the routed/shared feed-forwards of the
+Mixture-of-Experts.
 
-## File principali
+## Main files
 
-- [`MetalRouter.swift`](MetalRouter.swift): logits, probabilità, top-k e pesi del router.
-- [`MetalMoE.swift`](MetalMoE.swift): matvec per expert selezionati e riduzione.
-- [`MetalMoEFused.swift`](MetalMoEFused.swift): gate/up SwiGLU e down-sum fusi.
+- [`MetalRouter.swift`](MetalRouter.swift): logits, probabilities, top-k and
+  router weights.
+- [`MetalMoE.swift`](MetalMoE.swift): matvec for selected experts and reduction.
+- [`MetalMoEFused.swift`](MetalMoEFused.swift): fused gate/up SwiGLU and
+  down-sum.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il router produce id e pesi; la cache traduce gli id modello in slot residenti o
-il loader raccoglie slab contigui. I kernel MoE applicano gate/up, attivazione e
-down, poi sommano i contributi pesati nello stato residuo.
+The router produces ids and weights; the cache translates model ids into
+resident slots or the loader gathers contiguous slabs. The MoE kernels apply
+gate/up, activation and down, then sum the weighted contributions into the
+residual state.
 
-## Regole di modifica
+## Modification rules
 
-Distinguere sempre expert id, slot id e indice nell'unione di prefill. Controllare
-numero attivo, padding a peso zero e layout gate/up/down. Le fusioni devono
-restare confrontabili con i tre passaggi separati e non alterare la selezione.
+Always distinguish expert id, slot id and index into the prefill union. Check
+the active count, zero-weight padding and the gate/up/down layout. Fusions must
+remain comparable with the three separate passes and must not alter the
+selection.

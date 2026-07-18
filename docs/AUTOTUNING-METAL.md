@@ -1,95 +1,97 @@
-# Autotuning multi-parametro Metal
+# Multi-parameter Metal autotuning
 
-`scripts/metal_autotune.py` cerca una configurazione con maggiore throughput
-senza promuovere un candidato che peggiora il controllo numerico. È pensato per
-misure lunghe su un Mac reale, non per CI.
+`scripts/metal_autotune.py` searches for a configuration with higher throughput
+without promoting a candidate that degrades the numerical check. It is meant
+for long measurements on a real Mac, not for CI.
 
-## Cosa garantisce
+## What it guarantees
 
-La ricerca parte da una configurazione completa e cambia un parametro alla
-volta. Per ogni candidato:
+The search starts from a complete configuration and changes one parameter at a
+time. For each candidate it:
 
-1. esegue baseline e candidato in processi `DS4Demo` separati;
-2. confronta token, argmax, top-3 e logits completi delle frame registrate;
-3. scarta subito crash, valori non finiti, trace incomplete e regressioni;
-4. se il risultato è vicino o migliore, ripete nell'ordine inverso;
-5. calcola il rapporto bilanciato geometrico delle coppie AB e BA;
-6. promuove il valore solo oltre il margine minimo, predefinito al 2%;
-7. per i knob ordinati continua nella stessa direzione fino al primo
-   peggioramento; per queue depth, slot cache e NSG prova invece tutta la
-   piccola griglia, perché questi parametri non sono necessariamente unimodali;
-8. ripete tutti i parametri in più passate per misurare le interazioni.
+1. runs baseline and candidate in separate `DS4Demo` processes;
+2. compares tokens, argmax, top-3 and full logits of the recorded frames;
+3. immediately discards crashes, non-finite values, incomplete traces and
+   regressions;
+4. if the result is close or better, repeats in the reverse order;
+5. computes the balanced geometric ratio of the AB and BA pairs;
+6. promotes the value only beyond the minimum margin, 2% by default;
+7. for ordered knobs, keeps going in the same direction until the first
+   regression; for queue depth, cache slots and NSG it instead tries the whole
+   small grid, because these parameters are not necessarily unimodal;
+8. repeats all parameters over multiple passes to measure interactions.
 
-L'ordine complessivo di un finalista è quindi **ABBA**. Il risultato non è una
-griglia cartesiana: non combina ogni valore di ogni parametro con tutti gli
-altri. Le sweep monodimensionali evitano però di fermarsi, per esempio, a
-`PREAD_SPLIT=2` senza misurare il valore `4`. Il coordinate ascent raggiunge un
-massimo locale con un numero trattabile di prove.
+The overall order for a finalist is therefore **ABBA**. The result is not a
+Cartesian grid: it does not combine every value of every parameter with all the
+others. The one-dimensional sweeps do, however, avoid stopping, for example, at
+`PREAD_SPLIT=2` without measuring the value `4`. Coordinate ascent reaches a
+local maximum with a tractable number of trials.
 
-Per i parametri dichiarati lossless il gate è `PASS_EXACT`: ogni bit Float32
-deve coincidere. `PASS_NUMERIC` non è sufficiente, nemmeno con tolleranza zero.
-La modalità `--allow-numeric` è esplicita e aggiunge requisiti conservativi:
-token, argmax e top-3 ordinata identici, zero non finiti, tutti i valori entro
-`atol=1e-4, rtol=1e-5`, errore assoluto massimo `1e-3` e NRMSE aggregato/per
-frame non superiore a `1e-5`.
+For parameters declared lossless the gate is `PASS_EXACT`: every Float32 bit
+must match. `PASS_NUMERIC` is not enough, not even with zero tolerance. The
+`--allow-numeric` mode is explicit and adds conservative requirements:
+identical tokens, argmax and ordered top-3, zero non-finite values, all values
+within `atol=1e-4, rtol=1e-5`, maximum absolute error `1e-3` and
+aggregate/per-frame NRMSE no greater than `1e-5`.
 
-Il comparatore non si fida della top-3 salvata nel JSON: ricalcola direttamente
-dai `.f32` top-3, valori finiti e hash FNV di ogni frame. Offset sovrapposti,
-metadata stale, trace troncate e mapping token/argmax incoerenti sono un errore
-fail-closed. Con i default `max-new=64` e `trace-frames=64` sono coperte tutte le
-decisioni che hanno prodotto i token misurati.
+The comparator does not trust the top-3 saved in the JSON: it recomputes
+directly from the `.f32` files the top-3, finite values and FNV hash of every
+frame. Overlapping offsets, stale metadata, truncated traces and inconsistent
+token/argmax mappings are a fail-closed error. With the defaults `max-new=64`
+and `trace-frames=64`, all the decisions that produced the measured tokens are
+covered.
 
-Questa è parità sui prompt forniti, non una misura semantica universale. Per
-questo il tuner esclude riduzione degli esperti attivi, nuove quantizzazioni,
-`COMP_Q8` e gli altri cambiamenti lossy. Quelli devono usare anche il benchmark
-teacher-forced di correttezza dell'app.
+This is parity on the supplied prompts, not a universal semantic measure. That
+is why the tuner excludes reducing the active experts, new quantizations,
+`COMP_Q8` and the other lossy changes. Those must also use the app's
+teacher-forced correctness benchmark.
 
-## Profili
+## Profiles
 
-| Profilo | Parametri |
+| Profile | Parameters |
 |---|---|
-| `io` | split `pread`, slot cache, allocazione usage-driven, look-ahead esperti e dense-ahead |
-| `standard` | profilo `io` più `MOE_NSG` e `DENSE_Q4_NSG`; è il punto di partenza consigliato |
-| `full` | aggiunge i flag lossless secondari e i knob prefill; può richiedere molte ore |
-| `prefill` | union, chunk, route batch e FFN batch su un prompt lungo |
-| `numeric` | solo knob numerically-close; richiede `--allow-numeric` |
+| `io` | `pread` split, cache slots, usage-driven allocation, expert look-ahead and dense-ahead |
+| `standard` | `io` profile plus `MOE_NSG` and `DENSE_Q4_NSG`; this is the recommended starting point |
+| `full` | adds the secondary lossless flags and the prefill knobs; can take many hours |
+| `prefill` | union, chunk, route batch and FFN batch on a long prompt |
+| `numeric` | only numerically-close knobs; requires `--allow-numeric` |
 
-Il profilo standard non cambia `RAW_RING=1`, le quantizzazioni già scelte o il
-numero degli esperti. Il preset predefinito è quello mixed-Q4/IQ2 per M1 Pro
-16 GB, backend pread con `RAW_RING=1`; valori `DS4_*` già esportati nel
-terminale lo sovrascrivono. `--preset inherit` non inserisce valori impliciti:
-per evitare una falsa baseline richiede che ogni knob selezionato sia già
-esplicitamente presente nell'ambiente.
+The standard profile does not change `RAW_RING=1`, the quantizations already
+chosen or the number of experts. The default preset is the mixed-Q4/IQ2 one for
+M1 Pro 16 GB, pread backend with `RAW_RING=1`; `DS4_*` values already exported
+in the terminal override it. `--preset inherit` inserts no implicit values: to
+avoid a false baseline it requires that every selected knob is already
+explicitly present in the environment.
 
-## Usage-imatrix deterministica
+## Deterministic usage-imatrix
 
-Cache allocation e look-ahead dipendono dalla storia di routing. Con
-`--usage-seed auto`, il tuner cerca il file più ricco per lo stesso nome modello
-nelle cartelle Application Support di DwarfStar, ne congela una copia e crea
-una copia privata per ogni processo. In questo modo ogni A e B parte dalla
-stessa storia e non sovrascrive quella della GUI.
+Cache allocation and look-ahead depend on routing history. With
+`--usage-seed auto`, the tuner looks for the richest file for the same model
+name in the DwarfStar Application Support folders, freezes a copy of it and
+creates a private copy for each process. This way every A and B starts from the
+same history and does not overwrite the GUI's.
 
-Anche `final-env.sh` punta alla copia stabile congelata, così la configurazione
-riproduce davvero i test dei knob usage-dependent.
+`final-env.sh` also points to the frozen stable copy, so the configuration
+truly reproduces the tests of the usage-dependent knobs.
 
-Se non trova un seed, i parametri usage-dependent vengono saltati. È possibile
-passare un file esplicito o usare `--allow-cold-usage`, ma quest'ultima modalità
-non rappresenta il comportamento della GUI dopo più conversazioni.
+If no seed is found, the usage-dependent parameters are skipped. It is possible
+to pass an explicit file or to use `--allow-cold-usage`, but the latter mode
+does not represent the GUI's behavior after multiple conversations.
 
-## Esecuzione consigliata
+## Recommended execution
 
-Chiudere la GUI e le applicazioni che occupano molta memoria. Non eseguire il
-benchmark mentre è attivo un download: un `.part` modificato negli ultimi dieci
-minuti nella directory del modello blocca automaticamente il tuner. Il controllo
-viene ripetuto prima di ogni processo, quindi intercetta anche un download
-iniziato a ricerca già avviata.
+Close the GUI and any applications using a lot of memory. Do not run the
+benchmark while a download is active: a `.part` file modified in the last ten
+minutes in the model directory automatically blocks the tuner. The check is
+repeated before every process, so it also catches a download started after the
+search has already begun.
 
-Ogni run registra inoltre `memory_pressure` e i contatori `vm_stat`: sotto l'8%
-di memoria libera o oltre 128 MiB di nuovi swapout il candidato viene respinto.
-Le soglie sono configurabili, ma non conviene abbassarle per scegliere i default
-di produzione.
+Every run also records `memory_pressure` and the `vm_stat` counters: below 8%
+free memory or beyond 128 MiB of new swapouts the candidate is rejected. The
+thresholds are configurable, but it is not worth lowering them to choose
+production defaults.
 
-Preparare il prompt:
+Prepare the prompt:
 
 ```sh
 printf '%s\n' \
@@ -97,7 +99,7 @@ printf '%s\n' \
   > /tmp/ds4-roma-prompt.txt
 ```
 
-Avviare il profilo standard:
+Start the standard profile:
 
 ```sh
 cd "/Users/oppog/Documents/Project/DeepSeek v4 Metal/DeepSeek-V4-Pro-MacOS"
@@ -110,22 +112,22 @@ python3 scripts/metal_autotune.py \
   --output /tmp/ds4-autotune-standard
 ```
 
-`--context` deve corrispondere alla finestra realmente usata: cache KV e budget
-RAM cambiano l'ottimo degli slot. Per una configurazione da 100k non va
-promosso un risultato misurato soltanto col preset da 4096.
+`--context` must match the window actually used: KV cache and RAM budget change
+the slot optimum. For a 100k configuration, do not promote a result measured
+only with the 4096 preset.
 
-Ogni candidato richiede almeno due caricamenti completi; quelli promettenti ne
-richiedono quattro. Prima di iniziare si può ispezionare lo spazio di ricerca
-senza build o inferenza:
+Every candidate requires at least two full loads; promising ones require four.
+Before starting, the search space can be inspected without building or running
+inference:
 
 ```sh
 python3 scripts/metal_autotune.py MODEL.gguf prompt.txt \
   --profile full --dry-run
 ```
 
-Per il prefill serve un testo che produca almeno 1024–2048 token. Il prompt
-breve di Roma non attraversa i confini di `PREFILL_CHUNK` e non può scegliere
-quel valore. Il profilo completo può usare due workload:
+For prefill you need a text that produces at least 1024–2048 tokens. The short
+Roma prompt does not cross `PREFILL_CHUNK` boundaries and cannot choose that
+value. The full profile can use two workloads:
 
 ```sh
 python3 scripts/metal_autotune.py MODEL.gguf prompt-decode.txt \
@@ -135,18 +137,17 @@ python3 scripts/metal_autotune.py MODEL.gguf prompt-decode.txt \
   --output /tmp/ds4-autotune-full
 ```
 
-Questo è il comando da usare per valutare **tutti i knob lossless** del
-manifest. I due knob numerically-close restano esclusi; aggiungere
-`--allow-numeric` solo in una seconda ricerca separata se si accetta il gate a
-tolleranza.
+This is the command to use to evaluate **all the lossless knobs** of the
+manifest. The two numerically-close knobs stay excluded; add `--allow-numeric`
+only in a second, separate search if the tolerance gate is acceptable.
 
-Il decode resta l'obiettivo dei parametri decode; il prefill diventa l'obiettivo
-dei propri parametri. L'altra metrica è una guardia secondaria e non può
-regredire oltre la soglia configurata.
+Decode remains the objective for the decode parameters; prefill becomes the
+objective for its own parameters. The other metric is a secondary guard and
+cannot regress beyond the configured threshold.
 
-## Interruzione e ripresa
+## Interruption and resume
 
-Ogni processo e ogni decisione vengono salvati con scrittura atomica. Dopo
+Every process and every decision is saved with an atomic write. After
 `Ctrl-C`:
 
 ```sh
@@ -156,54 +157,53 @@ python3 scripts/metal_autotune.py MODEL.gguf prompt.txt \
   --resume
 ```
 
-La ripresa viene rifiutata se sono cambiati binario, modello, prompt, usage
-seed, ambiente iniziale, manifest, script del tuner/comparatore o policy di
-accettazione. Un ID di run viene checkpointato prima di avviare il processo:
-anche un `kill -9` può lasciare soltanto una cartella orfana, mai rompere il
-resume.
+Resume is refused if the binary, model, prompt, usage seed, initial
+environment, manifest, tuner/comparator scripts or acceptance policy have
+changed. A run ID is checkpointed before starting the process: even a
+`kill -9` can at most leave an orphan folder, never break the resume.
 
-## Risultati
+## Results
 
-La directory scelta contiene:
+The chosen directory contains:
 
-- `report.md`: configurazione iniziale/finale e tutte le decisioni;
-- `results.csv` e `results.json`: dati macchina-legibili;
-- `final-env.sh`: ambiente completo da caricare con `source`;
-- `state.json` e `events.jsonl`: checkpoint e journal crash-safe;
-- `runs/*/run.log`: log di ogni processo e ambiente effettivo.
+- `report.md`: initial/final configuration and all decisions;
+- `results.csv` and `results.json`: machine-readable data;
+- `final-env.sh`: complete environment to load with `source`;
+- `state.json` and `events.jsonl`: crash-safe checkpoint and journal;
+- `runs/*/run.log`: log of every process and its effective environment.
 
-Le trace Float32 intermedie vengono eliminate dopo il confronto, salvo
-`--keep-traces`. `final-env.sh` mostra `VALIDATED` soltanto dopo che la
-validazione finale iniziale-vs-finale ha superato il gate.
+The intermediate Float32 traces are deleted after the comparison, unless
+`--keep-traces` is given. `final-env.sh` shows `VALIDATED` only after the
+final initial-vs-final validation has passed the gate.
 
-Applicazione dei vincitori a una demo successiva:
+Applying the winners to a subsequent demo:
 
 ```sh
 source /tmp/ds4-autotune-standard/final-env.sh
 .build/release/DS4Demo MODEL.gguf 256 "@/tmp/ds4-roma-prompt.txt"
 ```
 
-## Opzioni operative principali
+## Main operational options
 
-| Opzione | Effetto |
+| Option | Effect |
 |---|---|
-| `--knobs A,B,C` | usa soltanto i knob elencati |
-| `--min-gain 0.02` | margine minimo ABBA per una promozione |
-| `--max-passes 2` | numero massimo di passate coordinate |
-| `--context 100000` | finestra di contesto della configurazione da ottimizzare |
-| `--cooldown 2` | pausa fra processi per pressione memoria/termica |
-| `--usage-seed auto|off|PATH` | storia routing congelata |
-| `--min-memory-free-percent 8` | respinge run conclusi sotto la soglia RAM |
-| `--max-swapout-mib 128` | respinge run che causano troppo swapout |
-| `--allow-numeric` | abilita il manifest numerically-close |
-| `--keep-traces` | conserva JSON e Float32 di ogni confronto |
-| `--skip-build` | riusa `.build/release/DS4Demo` |
-| `--self-test` | test sintetici senza modello o GPU |
+| `--knobs A,B,C` | use only the listed knobs |
+| `--min-gain 0.02` | minimum ABBA margin for a promotion |
+| `--max-passes 2` | maximum number of coordinate passes |
+| `--context 100000` | context window of the configuration being optimized |
+| `--cooldown 2` | pause between processes for memory/thermal pressure |
+| `--usage-seed auto|off|PATH` | frozen routing history |
+| `--min-memory-free-percent 8` | rejects runs that finish below the RAM threshold |
+| `--max-swapout-mib 128` | rejects runs that cause too much swapout |
+| `--allow-numeric` | enables the numerically-close manifest |
+| `--keep-traces` | keeps the JSON and Float32 of every comparison |
+| `--skip-build` | reuses `.build/release/DS4Demo` |
+| `--self-test` | synthetic tests without model or GPU |
 
-`--no-final-validation` è disponibile soltanto per esplorazioni interrotte: il
-risultato avrà stato `complete_unvalidated` e `final-env.sh` resterà marcato
-`NOT FINAL`.
+`--no-final-validation` is available only for interrupted explorations: the
+result will have state `complete_unvalidated` and `final-env.sh` will stay
+marked `NOT FINAL`.
 
-Non usare `--allow-active-download` per una misura da promuovere: esiste solo
-per diagnosi consapevoli e il report risultante sarebbe contaminato dall'I/O
-esterno.
+Do not use `--allow-active-download` for a measurement meant for promotion: it
+exists only for deliberate diagnostics, and the resulting report would be
+contaminated by the external I/O.

@@ -1,4 +1,4 @@
 # DeepSeekV4/Architecture tests
 
-Verifica la geometria runtime dei profili Flash e Pro, la parità dell'API Flash
-legacy e i default source-compatible di `DSV4Dims`.
+Verifies the runtime geometry of the Flash and Pro profiles, the parity of the
+legacy Flash API and the source-compatible defaults of `DSV4Dims`.

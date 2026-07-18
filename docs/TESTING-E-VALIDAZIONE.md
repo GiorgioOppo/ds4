@@ -1,22 +1,22 @@
-# Testing e validazione
+# Testing and validation
 
-I test verificano livelli diversi: logica pura, formati, protocollo, wrapper
-Metal, composizione del grafo e servizi applicativi. Una build riuscita non
-sostituisce i test numerici; uno skip GPU non equivale a un test superato.
+The tests cover different levels: pure logic, formats, protocol, Metal
+wrappers, graph composition and application services. A successful build is no
+substitute for numerical tests; a GPU skip does not equal a passing test.
 
-## Struttura
+## Structure
 
 ```text
 Tests/DS4CoreTests/
-  Core/      tokenizer, conversazione, formati, sampling, modello, storage
-  Metal/     runtime, kernel, grafo, decode e pesi
-  Engine/    protocollo, persistenza, progetti, download e tool
+  Core/      tokenizer, conversation, formats, sampling, model, storage
+  Metal/     runtime, kernels, graph, decode and weights
+  Engine/    protocol, persistence, projects, download and tools
 ```
 
-Il nome storico del target è `DS4CoreTests`, ma il target dipende da Core,
-Metal ed Engine. Le sottocartelle riflettono il dominio verificato.
+The historical target name is `DS4CoreTests`, but the target depends on Core,
+Metal and Engine. The subfolders reflect the domain under test.
 
-## Comandi principali
+## Main commands
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -36,189 +36,193 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-Usare la build Release per le prestazioni; la Debug serve a correttezza e
-diagnostica.
+Use the Release build for performance; the Debug build is for correctness and
+diagnostics.
 
-## Test puri
+## Pure tests
 
-I test Core e buona parte di Engine non richiedono GPU. Devono coprire:
+The Core tests and most of the Engine tests do not require a GPU. They must
+cover:
 
-- input valido e malformato;
-- limiti di dimensione e overflow;
-- round-trip di serializzazione;
-- compatibilità del formato persistente;
-- errori espliciti, non crash o fallback silenziosi;
-- determinismo quando seed e input sono fissati.
+- valid and malformed input;
+- size limits and overflow;
+- serialization round-trips;
+- persistent-format compatibility;
+- explicit errors, not crashes or silent fallbacks;
+- determinism when seed and input are fixed.
 
-Per i protocolli aggiungere sempre test di payload troncato, conteggio
-impossibile e campo fuori range.
+For protocols, always add tests for truncated payloads, impossible counts and
+out-of-range fields.
 
-## Test Metal
+## Metal tests
 
-Un test kernel tipico prepara un input piccolo, calcola un riferimento CPU,
-esegue il wrapper e confronta output e tolleranza. Coprire almeno:
+A typical kernel test prepares a small input, computes a CPU reference, runs
+the wrapper and compares output within a tolerance. Cover at least:
 
-- dimensione normale;
-- coda non multipla del threadgroup quando supportata;
-- offset o view se il wrapper li accetta;
-- ogni quantizzazione dichiarata;
-- valori estremi rappresentativi.
+- normal size;
+- a tail not a multiple of the threadgroup when supported;
+- offsets or views if the wrapper accepts them;
+- every declared quantization;
+- representative extreme values.
 
-Le tolleranze devono derivare dal tipo e dall'ordine di accumulo, non essere
-allargate finché il test passa.
+Tolerances must derive from the type and accumulation order, not be widened
+until the test passes.
 
-## Skip GPU
+## GPU skips
 
-I test Metal possono essere ignorati quando:
+Metal tests may be skipped when:
 
-- non esiste un `MTLDevice` disponibile nell'ambiente;
-- la sandbox impedisce accesso al compilatore/runtime necessario;
-- un fixture esterno o un vecchio percorso kernel non è presente.
+- no `MTLDevice` is available in the environment;
+- the sandbox blocks access to the required compiler/runtime;
+- an external fixture or a legacy kernel path is missing.
 
-Ogni skip deve includere un motivo leggibile. In CI o su un Mac di validazione
-si deve distinguere fra suite realmente eseguita e suite soltanto scoperta.
+Every skip must include a readable reason. In CI or on a validation Mac,
+distinguish between a suite that actually ran and a suite that was merely
+discovered.
 
-## Parità di grafo e decode
+## Graph and decode parity
 
-I test di grafo confrontano stadi completi, non solo primitive. Per modifiche a
-route, attention, compressore o MoE verificare:
+Graph tests compare full stages, not just primitives. For changes to route,
+attention, compressor or MoE, verify:
 
-1. wrapper singolo;
-2. composizione del grafo;
-3. layer completo;
-4. forward di più token quando interviene stato ricorrente;
-5. testo/argmax su un fixture reale, se disponibile.
+1. the individual wrapper;
+2. the graph composition;
+3. the full layer;
+4. multi-token forward when recurrent state is involved;
+5. text/argmax on a real fixture, if available.
 
-Il prefill e il decode devono convergere allo stesso stato per una sequenza
-equivalente, salvo percorsi esplicitamente approssimati.
+Prefill and decode must converge to the same state for an equivalent sequence,
+except on explicitly approximated paths.
 
-## Benchmark di velocità
+## Speed benchmarks
 
-Un benchmark utile mantiene costanti modello, prompt, contesto, sampling,
-usage profile e stato delle cache. Registrare separatamente:
+A useful benchmark keeps model, prompt, context, sampling, usage profile and
+cache state constant. Record separately:
 
-- tempo di caricamento;
-- tok/s di prefill;
-- tok/s di decode dopo warm-up;
-- byte letti e banda effettiva;
-- pressione memoria e swap;
-- hit-rate della cache esperti.
+- load time;
+- prefill tok/s;
+- decode tok/s after warm-up;
+- bytes read and effective bandwidth;
+- memory pressure and swap;
+- expert cache hit-rate.
 
-Cambiare un solo knob per prova. `DS4_PROFILE_ROUTE` altera il timing e non va
-usato per il throughput finale.
+Change a single knob per run. `DS4_PROFILE_ROUTE` alters timing and must not
+be used for final throughput.
 
-### Gate A/B per ottimizzazioni Metal
+### A/B gate for Metal optimizations
 
-Per un nuovo percorso selezionabile tramite `DS4_*`, usare il runner di processo
-prima di promuoverlo nei default:
+For a new path selectable via `DS4_*`, use the process runner before promoting
+it into the defaults:
 
 ```sh
 scripts/metal_ab.sh model.gguf prompt.txt DS4_NUOVO_KNOB 0 1 8
 ```
 
-Il runner usa due processi separati con prompt identico, greedy decode e
-persistenza usage disabilitata. Confronta gli id generati e un numero limitato
-di vettori logits completi: i vettori vengono trattenuti copy-on-write durante
-la misura, scritti soltanto dopo i timer e analizzati via `mmap`. Il report
-distingue `PASS_EXACT`, `PASS_NUMERIC` e `FAIL` e include tok/s di prefill,
-profilo decode e regime. Impostare `DS4_AB_ATOL=0 DS4_AB_RTOL=0` per percorsi
-che promettono parità bit-per-bit; tolleranze maggiori devono essere motivate
-per fusioni con diverso ordine di riduzione o percorsi dichiaratamente lossy.
+The runner uses two separate processes with an identical prompt, greedy decode
+and usage persistence disabled. It compares the generated ids and a limited
+number of full logits vectors: the vectors are held copy-on-write during the
+measurement, written only after the timers and analyzed via `mmap`. The report
+distinguishes `PASS_EXACT`, `PASS_NUMERIC` and `FAIL` and includes prefill
+tok/s, decode profile and regime. Set `DS4_AB_ATOL=0 DS4_AB_RTOL=0` for paths
+that promise bit-for-bit parity; larger tolerances must be justified for
+fusions with a different reduction order or explicitly lossy paths.
 
-Page cache, temperatura e pressione di memoria possono favorire uno dei due
-processi: ripetere con `DS4_AB_ORDER=candidate-first` e non promuovere variazioni
-sotto il rumore della macchina. `python3 scripts/metal_ab_compare.py --self-test`
-valida l'analizzatore senza richiedere Metal o un GGUF.
+Page cache, temperature and memory pressure can favor one of the two
+processes: repeat with `DS4_AB_ORDER=candidate-first` and do not promote
+variations below the machine's noise floor. `python3
+scripts/metal_ab_compare.py --self-test` validates the analyzer without
+requiring Metal or a GGUF.
 
-Per cercare una configurazione composta su più knob usare
-`scripts/metal_autotune.py`: esegue sweep monodimensionali/coordinate ascent,
-conferma i candidati in ordine ABBA, confronta anche ogni finalista con la root
-iniziale e respinge run contaminati da pressione RAM o swap. Il formato trace è
-validato fail-closed e top-3, hash e conteggio dei valori finiti vengono
-ricalcolati dai `.f32`, non accettati sulla fiducia dal JSON. Procedura e
-comandi completi sono in [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md).
+To search for a compound configuration across multiple knobs, use
+`scripts/metal_autotune.py`: it runs one-dimensional sweeps/coordinate ascent,
+confirms candidates in ABBA order, also compares each finalist against the
+initial root, and rejects runs contaminated by RAM pressure or swap. The trace
+format is validated fail-closed, and top-3, hash and finite-value counts are
+recomputed from the `.f32` files, not taken on trust from the JSON. The full
+procedure and commands are in [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md).
 
-## Benchmark di correttezza next-token
+## Next-token correctness benchmark
 
-Il benchmark di correttezza misura la **top-1/top-2/top-3 accuracy in teacher
-forcing** su un testo fisso. Per ogni posizione il modello riceve il prefisso
-reale, ordina i token per logit e verifica se il token successivo del corpus è
-il primo candidato, compare nei primi due o compare nei primi tre; nel passo
-seguente viene comunque inserito il token reale. Temperatura e sampling della
-generazione non partecipano alla metrica. Il seed del benchmark sceglie soltanto
-i segmenti del corpus e le loro lunghezze di contesto: a parità di input rende
-il piano riproducibile, ma non altera logits o graduatoria dei candidati. I tre
-candidati sono token del vocabolario, non esperti MoE.
+The correctness benchmark measures **top-1/top-2/top-3 accuracy under teacher
+forcing** on a fixed text. For each position the model receives the real
+prefix, ranks tokens by logit and checks whether the corpus's next token is
+the first candidate, appears in the top two, or appears in the top three; in
+the following step the real token is inserted regardless. The generation's
+temperature and sampling do not participate in the metric. The benchmark seed
+only chooses the corpus segments and their context lengths: given the same
+input it makes the plan reproducible, but does not alter logits or the
+candidate ranking. The three candidates are vocabulary tokens, not MoE
+experts.
 
-La prova multi-segmento richiede numero di segmenti, contesto minimo/massimo,
-token massimi per segmento e seed. Ogni primo target deve essere distinto; i
-segmenti possono però sovrapporsi. Il contesto viene estratto uniformemente
-entro l'intervallo effettivo e non può superare l'indice del target: perciò il
-massimo del singolo segmento è `min(massimoEffettivo, targetStart)`. Il punto di
-inizio del contesto deve restare non negativo. Il planner preferisce target che
-permettono il numero massimo richiesto di valutazioni e ricorre alla coda corta
-solo se sono necessari altri segmenti; ogni segmento valuta comunque fra uno e
-il limite richiesto di token.
+The multi-segment run requires the number of segments, minimum/maximum
+context, maximum tokens per segment and a seed. Every first target must be
+distinct; segments may nevertheless overlap. The context is drawn uniformly
+within the effective interval and cannot exceed the target's index: the
+per-segment maximum is therefore `min(massimoEffettivo, targetStart)`. The
+context's starting point must remain non-negative. The planner prefers targets
+that allow the requested maximum number of evaluations and falls back to the
+short tail only when more segments are needed; each segment still evaluates
+between one and the requested limit of tokens.
 
-Se il testo produce `N` token e si usa il prefisso minimo di un token, le
-predizioni verificabili sono `N - 1`: il primo token costituisce il contesto
-iniziale e non è un target. Con un prefisso non valutato di `C` token, i target
-disponibili diventano `N - C`, prima degli eventuali limiti di contesto o di
-durata scelti dalla UI. Questi confini devono restare coperti da test espliciti,
-perché valutare il prefisso o saltare l'ultimo target introduce un errore
-off-by-one nella percentuale. Questa è anche la semantica dell'overload storico
-a segmento singolo, che usa un contesto fisso.
+If the text produces `N` tokens and the minimum one-token prefix is used, the
+verifiable predictions are `N - 1`: the first token forms the initial context
+and is not a target. With an unevaluated prefix of `C` tokens, the available
+targets become `N - C`, before any context or duration limits chosen by the
+UI. These boundaries must remain covered by explicit tests, because evaluating
+the prefix or skipping the last target introduces an off-by-one error in the
+percentage. This is also the semantics of the historical single-segment
+overload, which uses a fixed context.
 
-Registrare almeno:
+Record at least:
 
-- testo/corpus o hash stabile del contenuto e lingua;
-- GGUF, tokenizer, build e configurazione completa del motore;
-- numero di token tokenizzati e numero di predizioni realmente valutate;
-- seed, segmenti richiesti/effettivi, intervallo di contesto e massimo per
-  segmento;
-- token corretti e accuracy complessiva per top-1, top-2 e top-3;
-- punto di partenza, contesto e token valutati per ciascun segmento;
-- eventuale troncamento imposto dal contesto o dal limite scelto.
+- text/corpus or a stable content hash, and language;
+- GGUF, tokenizer, build and full engine configuration;
+- number of tokenized tokens and number of predictions actually evaluated;
+- seed, requested/effective segments, context interval and per-segment
+  maximum;
+- correct tokens and overall accuracy for top-1, top-2 and top-3;
+- starting point, context and evaluated tokens for each segment;
+- any truncation imposed by the context or the chosen limit.
 
-Le tre metriche devono essere annidate in ogni osservazione, bucket e risultato:
-`top-1 <= top-2 <= top-3`. Le curve cumulative mostrano le percentuali
-dall'inizio della prova; le serie locali misurano soltanto il bucket corrente.
-L'ultimo bucket può contenere meno elementi e deve usare il proprio conteggio
-reale come denominatore per tutti e tre i ranghi. Anche una top-3 accuracy bassa
-non equivale automaticamente a una risposta semanticamente scorretta: testi
-naturali ammettono spesso più continuazioni plausibili. La metrica è soprattutto
-utile per confrontare build, quantizzazioni e ottimizzazioni sullo stesso corpus.
+The three metrics must be nested in every observation, bucket and result:
+`top-1 <= top-2 <= top-3`. Cumulative curves show the percentages from the
+start of the run; local series measure only the current bucket. The last
+bucket may contain fewer elements and must use its own real count as the
+denominator for all three ranks. Even a low top-3 accuracy does not
+automatically mean a semantically incorrect answer: natural texts often admit
+multiple plausible continuations. The metric is mainly useful for comparing
+builds, quantizations and optimizations on the same corpus.
 
-L'accuratezza globale deve essere calcolata come somma dei token corretti divisa
-per somma dei token valutati. Non fare la media semplice delle percentuali dei
-segmenti: darebbe troppo peso ai campioni corti. Il grafico per-segmento serve a
-mostrare la variabilità lungo il corpus, mentre i KPI globali restano ponderati.
+Global accuracy must be computed as the sum of correct tokens divided by the
+sum of evaluated tokens. Do not take a simple average of the segment
+percentages: it would over-weight short samples. The per-segment chart serves
+to show variability across the corpus, while the global KPIs stay weighted.
 
-## Baseline della ristrutturazione
+## Restructuring baseline
 
-Verifica eseguita il 13 luglio 2026:
+Verification performed on July 13, 2026:
 
-- build SwiftPM Debug riuscita;
-- build Release di `DS4Demo` riuscita;
-- build Xcode dell'app riuscita;
-- 246 test scoperti/eseguiti dalla suite, 96 skip legati soprattutto
-  all'ambiente Metal;
-- due asserzioni note in `ProjectCacheTests.testSymlinksAreRefused`, già
-  presenti nella baseline precedente alla ristrutturazione.
+- SwiftPM Debug build succeeded;
+- Release build of `DS4Demo` succeeded;
+- Xcode build of the app succeeded;
+- 246 tests discovered/executed by the suite, 96 skips mostly tied to the
+  Metal environment;
+- two known assertions in `ProjectCacheTests.testSymlinksAreRefused`, already
+  present in the baseline preceding the restructuring.
 
-Questa fotografia non è una deroga permanente: quando cambia l'ambiente o il
-test dei symlink viene corretto, aggiornare il documento.
+This snapshot is not a permanent waiver: when the environment changes or the
+symlink test is fixed, update this document.
 
-## Checklist per una modifica
+## Checklist for a change
 
-- [ ] Il codice compila in SwiftPM Debug.
-- [ ] I test puri interessati passano.
-- [ ] I test Metal sono stati realmente eseguiti su un Mac quando necessario.
-- [ ] La demo Release compila.
-- [ ] Il progetto Xcode è stato rigenerato se sono cambiati file o cartelle.
-- [ ] Le opzioni lossless/lossy sono dichiarate.
-- [ ] README locale e documento tematico sono aggiornati.
-- [ ] Nessun file generato è stato modificato a mano.
+- [ ] The code builds in SwiftPM Debug.
+- [ ] The affected pure tests pass.
+- [ ] The Metal tests were actually run on a Mac when necessary.
+- [ ] The Release demo builds.
+- [ ] The Xcode project was regenerated if files or folders changed.
+- [ ] Lossless/lossy options are declared.
+- [ ] The local README and the topic document are up to date.
+- [ ] No generated file was edited by hand.
 
-Vedere anche [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) e
+See also [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) and
 [BACKEND-METAL.md](BACKEND-METAL.md).

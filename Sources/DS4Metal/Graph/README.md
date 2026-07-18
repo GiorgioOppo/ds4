@@ -1,23 +1,24 @@
 # Graph
 
-Livello di composizione tra decoder e wrapper dei kernel Metal. Traduce le fasi
-matematiche del modello in dispatch su tensori e command buffer.
+Composition layer between the decoder and the Metal kernel wrappers. It
+translates the model's mathematical phases into dispatches over tensors and
+command buffers.
 
-## Struttura
+## Structure
 
-- [`Core/`](Core/README.md): contesto condiviso, pipeline e configurazione.
-- [`Operations/`](Operations/README.md): operazioni attention, compressor, MoE,
-  router, output e trasformazioni element-wise.
+- [`Core/`](Core/README.md): shared context, pipelines, and configuration.
+- [`Operations/`](Operations/README.md): attention, compressor, MoE, router,
+  output, and element-wise transform operations.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il [`decode DeepSeek-V4`](../Backends/DeepSeekV4/Decode/README.md) crea o riusa un `GraphContext`; le estensioni in
-`Operations` scelgono il wrapper di [`Kernels`](../Kernels/README.md), impostano
-buffer/offset e codificano il dispatch. I tensor sono forniti da
-[`Runtime`](../Runtime/README.md) e i pesi dal backend selezionato.
+The [`DeepSeek-V4 decode`](../Backends/DeepSeekV4/Decode/README.md) creates or reuses a `GraphContext`; the
+extensions in `Operations` choose the [`Kernels`](../Kernels/README.md)
+wrapper, set buffers/offsets, and encode the dispatch. Tensors are provided by
+[`Runtime`](../Runtime/README.md) and weights by the selected backend.
 
-## Regole di modifica
+## Modification rules
 
-Il grafo orchestra ma non deve duplicare il codice Metal. Ogni operazione deve
-esplicitare forma, quantizzazione, ownership del command buffer e requisiti di
-sincronizzazione. Mantenere le estensioni suddivise per fase matematica.
+The graph orchestrates but must not duplicate the Metal code. Every operation
+must make explicit its shape, quantization, command buffer ownership, and
+synchronization requirements. Keep the extensions split by mathematical phase.

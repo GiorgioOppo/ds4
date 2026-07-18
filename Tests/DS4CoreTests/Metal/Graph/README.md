@@ -1,11 +1,11 @@
 # Metal Graph Tests
 
-Questa cartella conserva le operazioni di grafo realmente comuni: gestione del
-`GraphContext` e blocco FFN denso. Le composizioni MLA, HyperConnections, NSA,
-router e decode layer sono testate nel
-[`backend DeepSeek-V4`](../Backends/DeepSeekV4/Graph/README.md).
+This folder keeps the genuinely shared graph operations: `GraphContext`
+management and the dense FFN block. The MLA, HyperConnections, NSA, router and
+decode layer compositions are tested in the
+[`DeepSeek-V4 backend`](../Backends/DeepSeekV4/Graph/README.md).
 
-I test di grafo stanno sopra i singoli kernel. Devono rilevare errori di wiring,
-shape, durata dei buffer e ordine dei comandi usando componenti CPU/reference
-per calcolare i risultati attesi. I casi limite dei singoli kernel restano in
+Graph tests sit above the individual kernels. They must catch wiring, shape,
+buffer lifetime and command ordering errors, using CPU/reference components to
+compute the expected results. Edge cases of individual kernels stay in
 `Kernels/`.

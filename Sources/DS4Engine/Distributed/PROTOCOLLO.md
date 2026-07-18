@@ -1,12 +1,13 @@
-# Protocollo distribuito v11
+# Distributed protocol v11
 
 ## Frame
 
-Ogni frame contiene `DistFrameHeader` seguito da un payload: magic `DS4D`, tipo
-di messaggio e lunghezza, tutti little-endian. Il decoder rifiuta magic errato,
-tipi sconosciuti nel percorso attivo, payload troncati e conteggi oltre i limiti.
+Every frame contains a `DistFrameHeader` followed by a payload: magic `DS4D`,
+message type and length, all little-endian. The decoder rejects a wrong magic,
+types unknown to the active path, truncated payloads and counts beyond the
+limits.
 
-## Connessione e assegnazione
+## Connection and assignment
 
 ```text
 coordinator                 worker
@@ -20,46 +21,46 @@ coordinator                 worker
      | <------- READY ---------- |
 ```
 
-`HELLO` identifica versione e assegnazione corrente. `FILE_NEED` include offset
-di ripresa validati tramite una catena SHA-256 a blocchi; il file completo viene
-promosso solo dopo verifica dell'hash finale. `ASSIGN` definisce modello,
-contesto, slice, cache, sidecar e knob prestazionali consentiti.
+`HELLO` identifies the version and current assignment. `FILE_NEED` includes
+resume offsets validated through a per-block SHA-256 chain; the complete file
+is promoted only after the final hash is verified. `ASSIGN` defines model,
+context, slice, cache, sidecars and the allowed performance knobs.
 
-## Pipeline orizzontale
+## Horizontal pipeline
 
-Il coordinator crea una sessione per turno, produce lo stato hidden e invia un
-`DistWork`. Il messaggio contiene posizione assoluta, token del chunk, slice,
-route e bit delle attivazioni. Ogni worker applica i propri layer e inoltra lo
-stato; il nodo terminale restituisce hidden state o logits al return listener.
-Un risultato con sessione obsoleta viene scartato.
+The coordinator creates one session per turn, produces the hidden state and
+sends a `DistWork`. The message carries the absolute position, the chunk's
+tokens, slice, route and activation bits. Each worker applies its own layers
+and forwards the state; the terminal node returns the hidden state or logits
+to the return listener. A result with a stale session is discarded.
 
-## Parallelismo verticale
+## Vertical parallelism
 
-`EXPERT_ASSIGN` distribuisce maschere disgiunte di esperti. Il payload codifica
-prima la lunghezza `UInt32` e poi i byte della maschera: 32 byte per i 256
-esperti Flash, 48 byte per i 384 esperti Pro. Lunghezza, bit di padding e
-copertura vengono validati rispetto alla geometria del GGUF. Per ciascun layer
-MoE il coordinator invia `EXPERT_WORK` con ID, pesi e attivazione; ogni shard
-risponde con `EXPERT_SUM`. Le somme parziali validate vengono aggregate nel
-backbone locale.
+`EXPERT_ASSIGN` distributes disjoint expert masks. The payload encodes
+first the `UInt32` length and then the mask bytes: 32 bytes for the 256
+Flash experts, 48 bytes for the 384 Pro experts. Length, padding bits and
+coverage are validated against the GGUF geometry. For each MoE layer
+the coordinator sends `EXPERT_WORK` with IDs, weights and activation; each
+shard replies with `EXPERT_SUM`. The validated partial sums are aggregated
+into the local backbone.
 
-Le assegnazioni orizzontali sono validate contro il numero di layer realmente
-ispezionato: 43 per Flash o 61 per Pro. Un worker inattivo annuncia zero layer
-fino al completamento di `ASSIGN`; `READY` deve poi riportare la geometria
-caricata.
+Horizontal assignments are validated against the layer count actually
+inspected: 43 for Flash or 61 for Pro. An idle worker announces zero layers
+until `ASSIGN` completes; `READY` must then report the loaded geometry.
 
-## Continuità KV
+## KV continuity
 
-`KV_QUERY`/`KV_LENGTHS` cercano lunghezze comuni a tutti gli shard;
-`KV_RESTORE` ripristina esattamente il prefisso concordato;
-`KV_SAVE`/`KV_ACK` salvano il turno pulito. Se anche un solo worker non può
-ripristinare la lunghezza scelta, il coordinator torna al prefill freddo.
+`KV_QUERY`/`KV_LENGTHS` look for lengths common to all shards;
+`KV_RESTORE` restores exactly the agreed prefix;
+`KV_SAVE`/`KV_ACK` save the clean turn. If even a single worker cannot
+restore the chosen length, the coordinator falls back to a cold prefill.
 
-## Compatibilità
+## Compatibility
 
-Il protocollo non negozia feature fra versioni diverse: un mismatch interrompe
-il setup. Ogni nuovo campo deve avere limiti espliciti, codifica deterministica,
-decode che fallisce in modo atomico e test round-trip più casi troncati.
+The protocol does not negotiate features across different versions: a
+mismatch aborts the setup. Every new field must have explicit limits, a
+deterministic encoding, decode that fails atomically and round-trip tests
+plus truncated cases.
 
-Vedi [`Protocol`](Protocol/README.md), [`Coordinator`](Coordinator/README.md) e
-[`Worker`](Worker/README.md).
+See [`Protocol`](Protocol/README.md), [`Coordinator`](Coordinator/README.md)
+and [`Worker`](Worker/README.md).

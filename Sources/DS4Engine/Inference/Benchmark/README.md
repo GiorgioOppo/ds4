@@ -1,79 +1,82 @@
 # Inference/Benchmark
 
-Misura il backend già caricato senza dipendere dalla GUI.
+Measures the already-loaded backend without depending on the GUI.
 
-## Componente
+## Component
 
-`InferenceService+Benchmark.swift` espone due misure distinte:
+`InferenceService+Benchmark.swift` exposes two distinct measurements:
 
-- `benchmark` usa un prompt sintetico e misura throughput di prefill e decode;
-- `accuracyBenchmark` tokenizza un corpus di testo semplice e misura la
-  **top-1/top-2/top-3 next-token accuracy** con teacher forcing.
+- `benchmark` uses a synthetic prompt and measures prefill and decode
+  throughput;
+- `accuracyBenchmark` tokenizes a plain-text corpus and measures the
+  **top-1/top-2/top-3 next-token accuracy** with teacher forcing.
 
-Il primo registra sia throughput medio sia velocità per-token; `warmup`
-inizializza kernel e cache degli esperti una sola volta. Il secondo restituisce
-osservazioni progressive e bucket pronti per i grafici, con accuratezza locale
-e cumulativa top-1, top-2 e top-3 espresse come frazioni `0...1`.
+The first records both average throughput and per-token speed; `warmup`
+initializes kernels and the expert cache once. The second returns progressive
+observations and buckets ready for charting, with local and cumulative top-1,
+top-2 and top-3 accuracy expressed as `0...1` fractions.
 
-## Correttezza next-token
+## Next-token correctness
 
-Il corpus deve contenere almeno due token. Il benchmark costruisce più segmenti
-del corpus usando un seed riproducibile. Ogni segmento ha un punto di partenza
-distinto per il primo target; i relativi intervalli possono comunque
-sovrapporsi. La lunghezza del contesto viene estratta uniformemente fra minimo
-e massimo effettivi, senza oltrepassare né il target scelto né la capacità KV.
-Il planner preferisce punti che permettono di valutare tutti i token richiesti
-per segmento e usa la coda corta del corpus soltanto quando servono altri punti.
-La selezione usa un Fisher-Yates parziale e sparso: tempo e memoria dipendono
-dal numero di segmenti effettivamente richiesti, non dal numero di possibili
-partenze nel corpus. A parità di seed, aumentare il numero di segmenti conserva
-il prefisso già selezionato e le relative lunghezze di contesto.
+The corpus must contain at least two tokens. The benchmark builds multiple
+corpus segments using a reproducible seed. Each segment has a distinct
+starting point for its first target; their intervals may still overlap. The
+context length is drawn uniformly between the effective minimum and maximum,
+without exceeding either the chosen target or the KV capacity. The planner
+prefers points that allow evaluating all requested tokens per segment and uses
+the corpus's short tail only when more points are needed. Selection uses a
+partial, sparse Fisher-Yates: time and memory depend on the number of segments
+actually requested, not on the number of possible starting points in the
+corpus. For the same seed, increasing the number of segments preserves the
+already-selected prefix and its context lengths.
 
-Il contesto del segmento non viene valutato; per ogni posizione successiva il
-modello estrae i tre token coi logits maggiori e verifica se il token vero è il
-primo candidato, compare nei primi due o compare nei primi tre. Questi insiemi
-sono annidati, quindi per costruzione `top-1 <= top-2 <= top-3`. Il benchmark
-reinserisce poi sempre il token vero: un errore non sposta né contamina le
-osservazioni seguenti. Il passaggio BOS → primo token non viene conteggiato.
+The segment's context is not evaluated; for each subsequent position the model
+extracts the three tokens with the highest logits and checks whether the true
+token is the first candidate, appears in the top two, or appears in the top
+three. These sets are nested, so by construction `top-1 <= top-2 <= top-3`.
+The benchmark then always reinserts the true token: a miss neither shifts nor
+contaminates the following observations. The BOS → first token step is not
+counted.
 
-I tre elementi sono **candidati token del vocabolario**, non esperti MoE. La
-selezione degli esperti avviene internamente ai layer e non viene misurata da
-questo benchmark.
+The three elements are **vocabulary token candidates**, not MoE experts.
+Expert selection happens inside the layers and is not measured by this
+benchmark.
 
-`StreamingDecoder.prefillTopK` riusa il prefill layer-major: gli hidden finali
-del chunk esistono già, l'output head viene applicato soltanto alle posizioni da
-valutare e i tre massimi vengono letti dal buffer Metal condiviso. Non vengono
-conservati `token × vocab` logits e non si degrada al costoso `forward`
-token-per-token.
+`StreamingDecoder.prefillTopK` reuses the layer-major prefill: the chunk's
+final hiddens already exist, the output head is applied only to the positions
+being evaluated, and the three maxima are read from the shared Metal buffer.
+No `token × vocab` logits are retained and there is no degradation to the
+costly token-by-token `forward`.
 
-Contesto minimo/massimo, token massimi per segmento e numero di segmenti vengono
-limitati al corpus e alla finestra KV; ogni segmento valuta sempre almeno un
-token. Un numero di segmenti nullo o negativo viene normalizzato a uno e il piano
-segnala il clamp tramite `truncated`. Il piano espone valori effettivi e
-troncamento, così il chiamante non deve dedurli dal risultato. Le metriche
-globali sommano corretti e valutati di tutti
-i segmenti prima di dividere: sono quindi ponderate per i token realmente
-valutati, non una media semplice delle percentuali dei segmenti. Il risultato
-mantiene anche i valori per segmento, usati dal grafico comparativo.
+Minimum/maximum context, maximum tokens per segment and the number of segments
+are clamped to the corpus and the KV window; each segment always evaluates at
+least one token. A zero or negative segment count is normalized to one and the
+plan reports the clamp via `truncated`. The plan exposes effective values and
+truncation, so the caller does not have to infer them from the result. The
+global metrics sum the correct and evaluated counts across all segments before
+dividing: they are therefore weighted by the tokens actually evaluated, not a
+simple average of the segment percentages. The result also keeps the
+per-segment values, used by the comparison chart.
 
-L'overload storico `accuracyBenchmark` con un singolo `contextTokens` e un
-singolo `maxTokens` resta disponibile e costruisce un piano a un solo segmento
-con contesto fisso. Le percentuali mostrate dalla UI sono ciascuna
-`topKAccuracy × 100`: il motore conserva sempre la rappresentazione `0...1`.
+The historical `accuracyBenchmark` overload with a single `contextTokens` and
+a single `maxTokens` remains available and builds a single-segment plan with a
+fixed context. The percentages shown by the UI are each
+`topKAccuracy × 100`: the engine always keeps the `0...1` representation.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-L'estensione opera sull'actor di [`Service`](../Service/README.md) e usa sampler
-e decoder di `DS4Core`/`DS4Metal`. Entrambe le misure alterano la KV e la marcano
-sporca. Il benchmark di correttezza non modifica `committedIds`, system prompt o
-stato logico della conversazione: il turno reale successivo ricostruisce la KV.
-Inoltre salva e ripristina l'usage-imatrix, così il corpus di prova non cambia il
-profilo esperti dell'agente. Cancellazione ed errori seguono lo stesso cleanup.
+The extension operates on the [`Service`](../Service/README.md) actor and uses
+samplers and decoders from `DS4Core`/`DS4Metal`. Both measurements alter the
+KV and mark it dirty. The correctness benchmark does not modify
+`committedIds`, the system prompt or the conversation's logical state: the
+next real turn rebuilds the KV. It also saves and restores the usage-imatrix,
+so the test corpus does not change the agent's expert profile. Cancellation
+and errors follow the same cleanup.
 
-## Estensione
+## Extension
 
-Una nuova metrica deve separare chiaramente tempo di preparazione, prefill,
-sampling CPU e decode GPU. Non cambiare parametri di qualità dell'utente durante
-un benchmark e mantenere cancellabili i loop lunghi. Le accuracy top-k misurano
-accordo esatto con quel corpus, non correttezza semantica: per confronti fra
-build, GGUF o knob usare sempre lo stesso testo, prefisso e intervallo valutato.
+A new metric must clearly separate preparation time, prefill, CPU sampling and
+GPU decode. Do not change the user's quality parameters during a benchmark,
+and keep long loops cancellable. The top-k accuracies measure exact agreement
+with that corpus, not semantic correctness: for comparisons across builds,
+GGUFs or knobs, always use the same text, prefix and evaluated interval.

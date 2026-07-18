@@ -1,51 +1,53 @@
 # DS4Engine
 
-`DS4Engine` è lo strato applicativo fra i dati portabili di `DS4Core`, il
-backend GPU di `DS4Metal` e i client come la GUI. Il target non contiene viste:
-coordina inferenza, strumenti, agenti, persistenza, modelli e nodi distribuiti.
+`DS4Engine` is the application layer between the portable data of `DS4Core`,
+the GPU backend of `DS4Metal` and clients such as the GUI. The target contains
+no views: it coordinates inference, tools, agents, persistence, models and
+distributed nodes.
 
-## Dipendenze
+## Dependencies
 
 ```text
 DS4Core ──┐
-          ├── DS4Engine ──> GUI / servizi applicativi
+          ├── DS4Engine ──> GUI / application services
 DS4Metal ─┘
 ```
 
-- `DS4Core`: GGUF, tokenizer, conversazione, sampling e formati condivisi.
-- `DS4Metal`: runtime Metal, decoder, cache ed esecuzione dei layer.
-- Foundation, Network, CryptoKit e Security sono usati solo nelle aree che ne
-  hanno bisogno.
+- `DS4Core`: GGUF, tokenizer, conversation, sampling and shared formats.
+- `DS4Metal`: Metal runtime, decoder, caches and layer execution.
+- Foundation, Network, CryptoKit and Security are used only in the areas that
+  need them.
 
-## Cartelle
+## Folders
 
-- [`Runtime`](Runtime/README.md): ispezione GGUF, selezione del backend e
-  capability effettivamente esposte a servizi e GUI.
-- [`Inference`](Inference/README.md): API e actor che possiede il decoder.
-- [`Distributed`](Distributed/README.md): protocollo, trasporto, coordinator e worker.
-- [`Tools`](Tools/README.md): function calling, strumenti integrati e MCP.
-- [`Persistence`](Persistence/README.md): checkpoint e cache persistenti.
-- [`ModelManagement`](ModelManagement/README.md): download e sidecar del modello.
-- [`Projects`](Projects/README.md): indice sicuro dei progetti importati.
-- [`Agents`](Agents/README.md): profili e registro degli agenti.
+- [`Runtime`](Runtime/README.md): GGUF inspection, backend selection and the
+  capabilities actually exposed to services and the GUI.
+- [`Inference`](Inference/README.md): API and the actor that owns the decoder.
+- [`Distributed`](Distributed/README.md): protocol, transport, coordinator and worker.
+- [`Tools`](Tools/README.md): function calling, built-in tools and MCP.
+- [`Persistence`](Persistence/README.md): checkpoints and persistent caches.
+- [`ModelManagement`](ModelManagement/README.md): model download and sidecar.
+- [`Projects`](Projects/README.md): secure index of imported projects.
+- [`Agents`](Agents/README.md): agent profiles and registry.
 
-## Regole architetturali
+## Architectural rules
 
-1. I tipi pubblici dell'inferenza vanno in `Inference/API`, non nella GUI.
-2. Lo stato mutabile del decoder resta isolato da `InferenceService`.
-3. I dati trasmessi in rete vivono in `Distributed/Protocol`; coordinator e
-   worker ne consumano i tipi ma non ne definiscono il formato.
-4. Un tool dichiara contratto ed esecuzione tramite `ToolRegistry`; le
-   integrazioni riutilizzabili non vanno duplicate nei singoli built-in.
-5. La persistenza non deve trattenere snapshot completi in RAM quando può
-   elaborarli in streaming.
-6. Le estensioni di un tipo principale seguono `Tipo+Responsabilita.swift`.
-7. Ogni GGUF passa da `RuntimeBackendFactory` prima di tokenizer, configurazione
-   o decoder specifici; riconoscere una famiglia non significa implementarla.
+1. Public inference types go in `Inference/API`, not in the GUI.
+2. The decoder's mutable state stays isolated from `InferenceService`.
+3. Data transmitted over the network lives in `Distributed/Protocol`;
+   coordinator and worker consume its types but do not define the format.
+4. A tool declares its contract and execution via `ToolRegistry`; reusable
+   integrations must not be duplicated in individual built-ins.
+5. Persistence must not hold complete snapshots in RAM when it can process
+   them in streaming.
+6. Extensions of a main type follow `Tipo+Responsabilita.swift`.
+7. Every GGUF goes through `RuntimeBackendFactory` before any specific
+   tokenizer, configuration or decoder; recognizing a family does not mean
+   implementing it.
 
-## Verifica delle modifiche
+## Verifying changes
 
-Dopo una modifica al target eseguire almeno `swift build --disable-sandbox` e i
-test in `Tests/DS4CoreTests/Engine`. Le modifiche al protocollo richiedono anche
-test di codifica/decodifica e un incremento di `Dist.protocolVersion` se non
-sono compatibili con i nodi esistenti.
+After a change to the target, run at least `swift build --disable-sandbox` and
+the tests in `Tests/DS4CoreTests/Engine`. Protocol changes also require
+encode/decode tests and a bump of `Dist.protocolVersion` if they are not
+compatible with existing nodes.

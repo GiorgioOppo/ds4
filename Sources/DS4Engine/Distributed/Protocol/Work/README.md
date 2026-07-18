@@ -1,21 +1,22 @@
 # Protocol/Work
 
-Definisce i dati della pipeline orizzontale.
+Defines the data of the horizontal pipeline.
 
-## Tipi
+## Types
 
-- `DistWork`: sessione, posizione, token, slice, flag, route, return endpoint e
-  stati hidden quantizzati.
-- `DistResult`: sessione, tipo del risultato, precisione e valori restituiti.
+- `DistWork`: session, position, tokens, slice, flags, route, return endpoint
+  and quantized hidden states.
+- `DistResult`: session, result type, precision and returned values.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il coordinator crea un lavoro per chunk; i worker lo decodificano, verificano
-che shape e slice coincidano con l'assegnazione, eseguono la propria parte e lo
-inoltrano. `ActivationCodec` in [`Codec`](../Codec/README.md) compatta i buffer.
+The coordinator creates one work item per chunk; workers decode it, verify
+that shape and slice match their assignment, execute their own part and
+forward it. `ActivationCodec` in [`Codec`](../Codec/README.md) compacts the
+buffers.
 
-## Estensione
+## Extension
 
-Conservare l'ID sessione in ogni risposta, validare `nTokens × hcStateCount`
-prima di allocare o copiare e limitare la route. Un nuovo flag non deve cambiare
-silenziosamente il significato dei bit esistenti.
+Preserve the session ID in every response, validate `nTokens × hcStateCount`
+before allocating or copying, and bound the route. A new flag must not
+silently change the meaning of existing bits.

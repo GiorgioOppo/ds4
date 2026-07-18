@@ -1,31 +1,32 @@
 # Tools/Core
 
-`ToolRegistry.swift` definisce il contratto comune e il catalogo dei built-in.
+`ToolRegistry.swift` defines the shared contract and the catalog of built-ins.
 
-## Tipi e responsabilità
+## Types and responsibilities
 
-- `BuiltinTool`: specifica `DS4Core.ToolSpec` più closure di esecuzione.
-- `ToolOutput`: testo e metadati restituiti al ciclo del modello.
-- `ToolExecutionPolicy`: allow-list esplicita e deny-by-default per ogni ciclo.
-- `constrainSubAgentTools`: interseca le scelte del modello con lo scope di
-  delega fidato del profilo padre; `subagent_run` non amplia i permessi.
-- `ToolRegistry`: liste `builtins`, `projectScoped`, `subAgentGrantable`, lookup,
-  composizione spec, dispatch e helper per argomenti.
-- `ArithmeticEvaluator`: parser condiviso dal calcolatore.
+- `BuiltinTool`: a `DS4Core.ToolSpec` plus an execution closure.
+- `ToolOutput`: text and metadata returned to the model loop.
+- `ToolExecutionPolicy`: explicit allow-list and deny-by-default for each loop.
+- `constrainSubAgentTools`: intersects the model's choices with the trusted
+  delegation scope of the parent profile; `subagent_run` does not widen
+  permissions.
+- `ToolRegistry`: the `builtins`, `projectScoped`, and `subAgentGrantable`
+  lists, lookup, spec composition, dispatch, and argument helpers.
+- `ArithmeticEvaluator`: parser shared with the calculator.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Dipende da Foundation e `DS4Core`. Le definizioni concrete sono estensioni del
-registro in [`Builtins`](../Builtins/README.md); gli strumenti MCP sono aggiunti
-da [`MCPManager`](../MCP/README.md).
+Depends on Foundation and `DS4Core`. The concrete definitions are registry
+extensions in [`Builtins`](../Builtins/README.md); MCP tools are added by
+[`MCPManager`](../MCP/README.md).
 
-## Estensione
+## Extension
 
-Registrare ogni tool una sola volta e mantenere stabili i nomi pubblici. Se
-richiede un progetto, inserirlo in `projectScoped`; se non è sicuro per un
-sub-agent, escluderlo esplicitamente. Gli helper qui devono essere generici.
+Register each tool exactly once and keep public names stable. If it requires a
+project, put it in `projectScoped`; if it is not safe for a sub-agent, exclude
+it explicitly. Helpers here must stay generic.
 
-Ogni esecuzione deve passare la stessa allow-list dichiarata al modello:
-`execute(_:policy:)` per i built-in o `executeAuto(_:policy:)` per built-in e
-MCP. Una chiamata negata restituisce `tool_not_allowed`; soltanto una chiamata
-consentita ma sconosciuta restituisce `nil` e può quindi usare il flusso manuale.
+Every execution must pass the same allow-list declared to the model:
+`execute(_:policy:)` for built-ins or `executeAuto(_:policy:)` for built-ins
+and MCP. A denied call returns `tool_not_allowed`; only a call that is allowed
+but unknown returns `nil` and may therefore use the manual flow.

@@ -1,9 +1,8 @@
 # Model/Backends/Qwen
 
-Punto di estensione riservato alla futura configurazione Qwen.
+Extension point reserved for the future Qwen configuration.
 
-In questa fase non contiene tipi di forma, validatori o factory: il detector
-comune riconosce gli identificatori `qwen*`, ma li segnala come
-`recognizedButNotImplemented`. Il supporto potrà essere dichiarato soltanto
-dopo validazione di metadata, varianti e backend Metal effettivamente presenti.
-
+At this stage it contains no shape types, validators or factories: the common
+detector recognizes `qwen*` identifiers but reports them as
+`recognizedButNotImplemented`. Support can be declared only after validating
+metadata, variants and an actually present Metal backend.

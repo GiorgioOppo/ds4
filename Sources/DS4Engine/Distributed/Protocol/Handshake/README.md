@@ -1,21 +1,21 @@
 # Protocol/Handshake
 
-Definisce i messaggi che trasformano un worker inattivo in un nodo assegnato.
+Defines the messages that turn an idle worker into an assigned node.
 
-## Tipi
+## Types
 
-- `DistHello`: versione, stato corrente, modello e slice già caricata.
-- `DistAssign`: modello, contesto, slice, output head, budget KV, cache esperti,
-  sidecar/Q4, usage profile e knob prestazionali whitelisted.
+- `DistHello`: version, current state, model and slice already loaded.
+- `DistAssign`: model, context, slice, output head, KV budget, expert cache,
+  sidecar/Q4, usage profile and whitelisted performance knobs.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il worker invia `HELLO`; il coordinator verifica compatibilità e, dopo i file,
-invia `ASSIGN`. La risposta `READY` riusa il payload `DistHello`. I file sono
-negoziati dai tipi in [`Files`](../Files/README.md).
+The worker sends `HELLO`; the coordinator checks compatibility and, after the
+files, sends `ASSIGN`. The `READY` response reuses the `DistHello` payload.
+Files are negotiated by the types in [`Files`](../Files/README.md).
 
-## Estensione
+## Extension
 
-Ogni campo deve avere default o incompatibilità esplicita. Le variabili ambiente
-ricevute devono essere filtrate anche dal worker usando la whitelist in
-[`Core`](../Core/README.md); non trasportare segreti o impostazioni arbitrarie.
+Every field must have a default or an explicit incompatibility. Received
+environment variables must also be filtered by the worker using the whitelist
+in [`Core`](../Core/README.md); do not carry secrets or arbitrary settings.

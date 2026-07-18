@@ -1,5 +1,4 @@
 # DeepSeek V4 DSML Tests
 
-Verifica rendering, escaping, parsing strict/recovery, round-trip delle chiamate
-tool e rifiuto atomico di markup incompleto o malformato.
-
+Verifies rendering, escaping, strict/recovery parsing, tool-call round-trips
+and atomic rejection of incomplete or malformed markup.

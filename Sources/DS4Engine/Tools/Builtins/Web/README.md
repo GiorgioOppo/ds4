@@ -1,22 +1,23 @@
 # Builtins/Web
 
-Espone al modello accesso web limitato.
+Exposes limited web access to the model.
 
-## Tool
+## Tools
 
-- `web_search`: interroga l'endpoint configurato (DuckDuckGo di default) e
-  restituisce titolo, URL e snippet.
-- `web_fetch`: scarica HTTP(S), converte HTML in testo e supporta finestre tramite
-  `offset` per pagine lunghe.
+- `web_search`: queries the configured endpoint (DuckDuckGo by default) and
+  returns title, URL and snippet.
+- `web_fetch`: downloads HTTP(S), converts HTML to text and supports windowing
+  via `offset` for long pages.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Entrambi delegano a [`WebClient`](../../Integrations/README.md), che applica
-protezione SSRF, validazione dei redirect, timeout e limite del body. L'endpoint
-di ricerca può essere impostato con `DS4_SEARCH_URL` e deve contenere `%@`.
+Both delegate to [`WebClient`](../../Integrations/README.md), which applies
+SSRF protection, redirect validation, timeouts and a body limit. The search
+endpoint can be set with `DS4_SEARCH_URL` and must contain `%@`.
 
-## Estensione
+## Extension
 
-Non usare `URLSession` direttamente nel built-in. Preservare i limiti di output
-e non seguire URL estratti da contenuto remoto senza la stessa validazione.
-macOS ATS può rifiutare pagine HTTP non sicure: HTTPS è il percorso previsto.
+Do not use `URLSession` directly in the built-in. Preserve the output limits
+and do not follow URLs extracted from remote content without the same
+validation. macOS ATS may reject insecure HTTP pages: HTTPS is the intended
+path.

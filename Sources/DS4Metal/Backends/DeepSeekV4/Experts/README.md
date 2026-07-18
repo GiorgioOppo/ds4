@@ -1,29 +1,30 @@
 # DeepSeekV4/Experts
 
-Formato sidecar e percorsi I/O ottimizzati per gli expert routed, i pesi più
-costosi da recuperare durante la generazione.
+Sidecar format and optimized I/O paths for the routed experts, the most
+expensive weights to fetch during generation.
 
-## File principali
+## Main files
 
-- [`ExpertBundle.swift`](ExpertBundle.swift): stato e header del sidecar `.expbundle`.
-- `ExpertBundle+Builder.swift` e `ExpertBundle+Layout.swift`: scelta percorso,
-  validazione layout e costruzione atomica del bundle.
-- `ExpertBundle+Read.swift`: letture CPU/pread delle slab contigue.
-- `ExpertBundle+MetalIO.swift`: caricamenti diretti tramite MetalIO quando disponibili.
-- `ExpertBundle+Usage.swift`: informazioni d'uso e diagnostica del bundle.
-- [`MetalIOCircuitBreaker.swift`](MetalIOCircuitBreaker.swift): disabilita MetalIO
-  quando prestazioni/errori indicano un percorso non affidabile.
+- [`ExpertBundle.swift`](ExpertBundle.swift): state and header of the `.expbundle` sidecar.
+- `ExpertBundle+Builder.swift` and `ExpertBundle+Layout.swift`: path selection,
+  layout validation and atomic construction of the bundle.
+- `ExpertBundle+Read.swift`: CPU/pread reads of the contiguous slabs.
+- `ExpertBundle+MetalIO.swift`: direct loads through MetalIO when available.
+- `ExpertBundle+Usage.swift`: usage information and bundle diagnostics.
+- [`MetalIOCircuitBreaker.swift`](MetalIOCircuitBreaker.swift): disables MetalIO
+  when performance/errors indicate an unreliable path.
 
-## Flusso
+## Flow
 
-Il builder riordina gate/up/down di ciascun expert in regioni contigue. A runtime
-la cache richiede una lista di expert e il bundle riempie slot disgiunti con una
-lettura batch; in assenza di sidecar valido o MetalIO, il factory ricade sul
-gather dal GGUF senza cambiare il layout consegnato ai kernel.
+The builder reorders each expert's gate/up/down into contiguous regions. At
+runtime the cache requests a list of experts and the bundle fills disjoint
+slots with one batch read; without a valid sidecar or MetalIO, the factory
+falls back to the gather from the GGUF without changing the layout delivered
+to the kernels.
 
-## Regole di modifica
+## Modification rules
 
-Verificare identità del GGUF, dimensioni, offset e completezza prima di usare il
-sidecar. La costruzione deve pubblicare solo file completi. MetalIO deve avere
-fallback CPU corretto e non può cambiare i byte; aggiornare versione/layout se
-cambia l'ordine delle slab.
+Verify GGUF identity, sizes, offsets and completeness before using the
+sidecar. Construction must publish only complete files. MetalIO must have a
+correct CPU fallback and cannot change the bytes; bump the version/layout if
+the slab order changes.

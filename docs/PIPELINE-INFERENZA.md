@@ -1,187 +1,189 @@
-# Pipeline di inferenza
+# Inference pipeline
 
-Questo documento segue una richiesta dalla GUI o dall'API fino al token
-mostrato all'utente. Per i dettagli matematici dei singoli layer vedere
-[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); per la collocazione dei file
-vedere [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md).
+This document follows a request from the GUI or the API all the way to the
+token shown to the user. For the mathematical details of the individual layers
+see [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); for file locations see
+[STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md).
 
-## Vista d'insieme
+## Overview
 
 ```text
 Chat / HTTP / benchmark
         |
         v
-InferenceService (stato, prefill/decode ed emissione eventi)
+InferenceService (state, prefill/decode and event emission)
         |
         +--> ChatRenderer + Tokenizer
         |
-        +--> riuso o ripristino del prefisso KV
+        +--> KV prefix reuse or restore
         |
-        +--> prefill del solo suffisso nuovo
+        +--> prefill of the new suffix only
         |
-        +--> ciclo decode: forward -> logits -> sampler -> token
+        +--> decode loop: forward -> logits -> sampler -> token
         |
-        +--> eventi testo / reasoning / tool call / metriche
+        +--> text / reasoning / tool call / metrics events
                          |
                          v
         ChatStore+ToolLoop / DistributedController
-        esecuzione tool -> risultati -> ripresa inferenza
+        tool execution -> results -> inference resumption
 ```
 
-La GUI, il server e il benchmark locale condividono una sola istanza di
-`InferenceService`. Questo evita di caricare due copie dei buffer residenti,
-della cache Q4 e dello scratch GPU, requisito essenziale sui Mac con 16 GB.
+The GUI, the server and the local benchmark share a single
+`InferenceService` instance. This avoids loading two copies of the resident
+buffers, the Q4 cache and the GPU scratch, an essential requirement on Macs
+with 16 GB.
 
-## 1. Caricamento del modello
+## 1. Model loading
 
-1. `GGUFModel` apre il GGUF e valida header, metadata e descrittori tensoriali.
-2. `ModelConfig` e `DSV4Shape` riconoscono il profilo supportato e rifiutano
-   forme incompatibili prima di avviare il decode.
-3. `Tokenizer` legge vocabolario, merge e token di controllo dal GGUF.
-4. `GGUFWeights` prepara le viste mappate dei pesi e i provider dei layer.
-5. `StreamingDecoder` sceglie il percorso di memoria richiesto: pesi densi
-   residenti o in streaming, cache esperti, bundle, `pread` o MetalIO.
-6. `InferenceService` pubblica avanzamento e log e rende il motore disponibile
-   a chat, server e benchmark.
+1. `GGUFModel` opens the GGUF and validates header, metadata and tensor
+   descriptors.
+2. `ModelConfig` and `DSV4Shape` recognize the supported profile and reject
+   incompatible shapes before decode starts.
+3. `Tokenizer` reads vocabulary, merges and control tokens from the GGUF.
+4. `GGUFWeights` prepares the mapped weight views and the layer providers.
+5. `StreamingDecoder` picks the requested memory path: resident or streamed
+   dense weights, expert cache, bundle, `pread` or MetalIO.
+6. `InferenceService` publishes progress and logs and makes the engine
+   available to chat, server and benchmark.
 
-I toggle che cambiano layout o residenza dei pesi vengono letti al caricamento:
-dopo una modifica occorre ricaricare il modello. Le eccezioni aggiornabili tra
-due prefill sono documentate nella
+Toggles that change weight layout or residency are read at load time: after a
+change the model must be reloaded. The exceptions that can be updated between
+two prefills are documented in the
 [Configuration Reference](../README.md#configuration-reference).
 
-## 2. Preparazione della conversazione
+## 2. Conversation preparation
 
-`ChatRenderer` trasforma sistema, turni, specifiche dei tool e risultati in
-DSML tramite un'implementazione Swift costruita sul template DeepSeek-V4 di
-riferimento. Il runtime non interpreta il Jinja incorporato nel GGUF: quel
-metadato è disponibile per diagnostica, mentre la modalità tool compatta
-predefinita abbrevia intenzionalmente la dichiarazione per ridurre il prefill.
-`Tokenizer` converte il testo renderizzato in token id. I tipi condivisi
-(`ChatTurn`, `ToolSpec` e `ToolCall`) vivono in `DS4Core`, quindi il servizio non
-introduce un secondo formato di conversazione.
+`ChatRenderer` turns system, turns, tool specs and results into DSML through a
+Swift implementation built on the reference DeepSeek-V4 template. The runtime
+does not interpret the Jinja embedded in the GGUF: that metadata is available
+for diagnostics, while the default compact tool mode intentionally shortens
+the declaration to reduce the prefill. `Tokenizer` converts the rendered text
+into token ids. The shared types (`ChatTurn`, `ToolSpec` and `ToolCall`) live
+in `DS4Core`, so the service does not introduce a second conversation format.
 
-Prima del prefill il servizio confronta gli id renderizzati con quelli già
-committati:
+Before the prefill the service compares the rendered ids with the ones already
+committed:
 
-- se il nuovo prompt estende esattamente il prefisso corrente, elabora solo il
-  suffisso;
-- se esiste un checkpoint compatibile, `DiskKVStore` lo ripristina e prosegue
-  dal prefisso salvato;
-- dopo uno stop o una divergenza ricostruisce lo stato dal prefisso sicuro.
+- if the new prompt exactly extends the current prefix, it processes only the
+  suffix;
+- if a compatible checkpoint exists, `DiskKVStore` restores it and continues
+  from the saved prefix;
+- after a stop or a divergence it rebuilds the state from the safe prefix.
 
-La ricorrenza del compressore NSA non può essere semplicemente riavvolta. Per
-questo lo stato visibile della conversazione e lo stato KV committato vengono
-tenuti distinti fino alla conclusione pulita del turno.
+The recurrence of the NSA compressor cannot simply be rewound. This is why the
+visible conversation state and the committed KV state are kept separate until
+the turn concludes cleanly.
 
 ## 3. Prefill
 
-Il prefill elabora molti token già noti. Il percorso è organizzato per layer e
-per chunk:
+The prefill processes many already-known tokens. The path is organized by
+layer and by chunk:
 
-1. lo stage di route/attention prepara un gruppo di token;
-2. i pesi densi del layer sono caricati una volta per il chunk;
-3. gli esperti richiesti dai token vengono uniti in gruppi limitati da
+1. the route/attention stage prepares a group of tokens;
+2. the layer's dense weights are loaded once per chunk;
+3. the experts requested by the tokens are merged into groups bounded by
    `DS4_PREFILL_UNION`;
-4. la FFN applica gli esperti ai token interessati;
-5. KV raw, cache compressa e stato ricorrente avanzano in ordine.
+4. the FFN applies the experts to the tokens involved;
+5. raw KV, compressed cache and recurrent state advance in order.
 
-`DS4_PREFILL_CHUNK`, `DS4_PREFILL_UNION` e `DS4_PREFILL_ROUTE_BATCH`
-controllano rispettivamente ammortamento dei pesi densi, memoria transitoria e
-numero di sincronizzazioni. Il prefill non è un decode ripetuto in un ciclo:
-usa strutture dedicate sotto
+`DS4_PREFILL_CHUNK`, `DS4_PREFILL_UNION` and `DS4_PREFILL_ROUTE_BATCH`
+respectively control dense-weight amortization, transient memory and the
+number of synchronizations. The prefill is not a decode repeated in a loop: it
+uses dedicated structures under
 `DS4Metal/Backends/DeepSeekV4/Decode/Prefill`.
 
-## 4. Decode di un token
+## 4. Decoding one token
 
-Per ogni token il decoder esegue tutti i layer in ordine:
+For each token the decoder runs all layers in order:
 
-1. embedding e stato HC iniziale;
-2. normalizzazione e proiezioni Q/KV;
-3. compressore e attenzione NSA;
-4. router MoE o tabella hash dei primi layer;
-5. gather dei sei esperti routed selezionati;
-6. FFN routed e shared, riduzione HC e passaggio al layer successivo;
-7. norm finale e output head;
-8. sampling e detokenizzazione.
+1. embedding and initial HC state;
+2. normalization and Q/KV projections;
+3. NSA compressor and attention;
+4. MoE router or hash table of the first layers;
+5. gather of the six selected routed experts;
+6. routed and shared FFN, HC reduction and hand-off to the next layer;
+7. final norm and output head;
+8. sampling and detokenization.
 
-`StreamingDecoder+LayerExecution.swift` orchestra il layer, mentre `Graph/*`
-compone operazioni GPU più piccole. I wrapper sotto `Kernels/*` devono restare
-privi di politica applicativa.
+`StreamingDecoder+LayerExecution.swift` orchestrates the layer, while
+`Graph/*` composes smaller GPU operations. The wrappers under `Kernels/*`
+must remain free of application policy.
 
-## 5. Streaming degli esperti
+## 5. Expert streaming
 
-Il modello MoE completo non deve risiedere in RAM. Per ogni layer vengono letti
-solo gli esperti scelti. Le strategie possono essere combinate:
+The full MoE model does not have to reside in RAM. For each layer only the
+selected experts are read. The strategies can be combined:
 
-- slot-cache LRU pre-riscaldata dalla usage imatrix;
-- letture dirette `pread` con `F_NOCACHE`;
-- bundle sidecar con gate/up/down contigui per esperto;
-- MetalIO con circuit breaker e fallback a `pread`;
-- prefetch esatto o guidato dallo storico;
-- pesi densi in streaming con ring di staging indipendente.
+- LRU slot cache pre-warmed from the usage imatrix;
+- direct `pread` reads with `F_NOCACHE`;
+- sidecar bundle with contiguous gate/up/down per expert;
+- MetalIO with circuit breaker and fallback to `pread`;
+- exact or history-guided prefetch;
+- streamed dense weights with an independent staging ring.
 
-La cache accelera il gather ma non cambia router, id o pesi degli esperti. I
-percorsi lossy sono dichiarati esplicitamente nella configurazione (`DENSE_Q4`,
-`QKV_Q4`, `SHARED_Q4`, `COMP_Q8`, riduzione degli esperti attivi).
+The cache speeds up the gather but does not change router, ids or expert
+weights. The lossy paths are declared explicitly in the configuration
+(`DENSE_Q4`, `QKV_Q4`, `SHARED_Q4`, `COMP_Q8`, reduction of the active
+experts).
 
-## 6. Sampling, reasoning e tool
+## 6. Sampling, reasoning and tools
 
-`Sampler` applica temperature, top-k, top-p, min-p e repetition penalty. Il
-token ottenuto viene convertito in byte senza assumere che ogni token sia una
-stringa UTF-8 completa.
+`Sampler` applies temperature, top-k, top-p, min-p and repetition penalty. The
+resulting token is converted into bytes without assuming that every token is a
+complete UTF-8 string.
 
-Gli eventi del servizio distinguono:
+The service events distinguish:
 
-- testo visibile;
-- contenuto di reasoning;
-- stream e completamento di una chiamata tool;
-- avanzamento e metriche;
-- completamento, stop ed errore.
+- visible text;
+- reasoning content;
+- streaming and completion of a tool call;
+- progress and metrics;
+- completion, stop and error.
 
-Quando il parser DSML riconosce una chiamata, `InferenceService` la emette come
-evento `.toolCall`: non esegue il tool. Nel percorso locale il loop è
-orchestrato da `ChatStore+ToolLoop.swift`; nel percorso distribuito da
-`DistributedController`. Questi consumer invocano `ToolRegistry.executeAuto`,
-raccolgono i risultati e avviano la continuazione. Il percorso locale li passa
-a `InferenceService.provideToolResults`; quello distribuito aggiunge i turni
-`toolResult` e richiama la generazione sul coordinator.
+When the DSML parser recognizes a call, `InferenceService` emits it as a
+`.toolCall` event: it does not execute the tool. On the local path the loop is
+orchestrated by `ChatStore+ToolLoop.swift`; on the distributed path by
+`DistributedController`. These consumers invoke `ToolRegistry.executeAuto`,
+collect the results and start the continuation. The local path passes them to
+`InferenceService.provideToolResults`; the distributed one appends the
+`toolResult` turns and re-invokes generation on the coordinator.
 
-## 7. Proprietà dello stato
+## 7. State ownership
 
-| Stato | Proprietario |
+| State | Owner |
 |---|---|
-| Conversazioni, selezione agente e impostazioni UI | `ChatStore` |
-| Loop tool locale/distribuito | `ChatStore+ToolLoop` / `DistributedController` |
-| Decoder condiviso, token committati e generazione attiva | `InferenceService` |
-| KV, scratch, cache esperti e profilazione GPU | `StreamingDecoder` |
-| Checkpoint persistenti | `DiskKVStore` |
-| Rendering DSML e tipi di conversazione | `DS4Core/Conversation` |
+| Conversations, agent selection and UI settings | `ChatStore` |
+| Local/distributed tool loop | `ChatStore+ToolLoop` / `DistributedController` |
+| Shared decoder, committed tokens and active generation | `InferenceService` |
+| KV, scratch, expert cache and GPU profiling | `StreamingDecoder` |
+| Persistent checkpoints | `DiskKVStore` |
+| DSML rendering and conversation types | `DS4Core/Conversation` |
 | Sampling | `DS4Core/Generation` |
 
-Regola pratica: la GUI non deve mutare direttamente buffer o KV; il backend
-Metal non deve conoscere sessioni, viste o protocollo HTTP.
+Rule of thumb: the GUI must not mutate buffers or KV directly; the Metal
+backend must not know about sessions, views or the HTTP protocol.
 
-## 8. Mappa del codice
+## 8. Code map
 
-- `Sources/DS4Core/Conversation` — modelli, rendering e parsing DSML.
-- `Sources/DS4Core/Tokenization` — BPE e detokenizzazione byte-level.
+- `Sources/DS4Core/Conversation` — models, DSML rendering and parsing.
+- `Sources/DS4Core/Tokenization` — BPE and byte-level detokenization.
 - `Sources/DS4Core/Generation` — sampler.
-- `Sources/DS4Metal/Backends/DeepSeekV4/Decode` — prefill, decode, KV e cache
-  del backend attualmente operativo.
-- `Sources/DS4Metal/Backends/DeepSeekV4` — forma Metal, pesi, esperti e
-  streaming DeepSeek; runtime e kernel condivisi restano fuori dal backend.
-- `Sources/DS4Engine/Inference` — API ed actor applicativo.
-- `Sources/DS4Engine/Persistence/KV` — checkpoint su disco.
-- `Sources/DwarfStar/Features/Chat` — stato e presentazione della chat.
+- `Sources/DS4Metal/Backends/DeepSeekV4/Decode` — prefill, decode, KV and
+  caches of the currently operational backend.
+- `Sources/DS4Metal/Backends/DeepSeekV4` — DeepSeek Metal shape, weights,
+  experts and streaming; shared runtime and kernels stay outside the backend.
+- `Sources/DS4Engine/Inference` — API and application actor.
+- `Sources/DS4Engine/Persistence/KV` — on-disk checkpoints.
+- `Sources/DwarfStar/Features/Chat` — chat state and presentation.
 
-## 9. Verifica delle modifiche
+## 9. Verifying changes
 
-Una modifica alla pipeline richiede, in proporzione al livello toccato:
+A change to the pipeline requires, in proportion to the level touched:
 
-1. test puri per tokenizer, renderer, sampler o protocollo;
-2. test di parità per wrapper e grafo Metal;
-3. build della demo Release;
-4. confronto di prompt, seed e configurazione identici;
-5. misura separata di prefill e decode, dopo il warm-up.
+1. pure tests for tokenizer, renderer, sampler or protocol;
+2. parity tests for wrappers and the Metal graph;
+3. a Release demo build;
+4. comparison with identical prompt, seed and configuration;
+5. separate measurement of prefill and decode, after warm-up.
 
-La procedura completa è in [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md).
+The full procedure is in [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md).

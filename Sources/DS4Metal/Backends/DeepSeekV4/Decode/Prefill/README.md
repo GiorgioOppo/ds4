@@ -1,26 +1,27 @@
 # DeepSeekV4/Decode/Prefill
 
-Ingestione efficiente del prompt con elaborazione layer-major e batching.
+Efficient prompt ingestion with layer-major processing and batching.
 
-## File principali
+## Main files
 
-- [`StreamingDecoder+Prefill.swift`](StreamingDecoder+Prefill.swift): suddivide i
-  token in chunk, orchestra le fasi e sceglie i percorsi FFN/matrix-matrix.
-- [`PrefillStage.swift`](PrefillStage.swift): staging buffer per un gruppo di token.
-- [`PrefillGather.swift`](PrefillGather.swift): gather expert in background con
-  consegna sincronizzata al chiamante.
+- [`StreamingDecoder+Prefill.swift`](StreamingDecoder+Prefill.swift): splits the
+  tokens into chunks, orchestrates the phases and chooses the FFN/matrix-matrix
+  paths.
+- [`PrefillStage.swift`](PrefillStage.swift): staging buffer for a group of tokens.
+- [`PrefillGather.swift`](PrefillGather.swift): background expert gather with
+  synchronized delivery to the caller.
 
-## Flusso
+## Flow
 
-Ogni chunk viene trasformato in uno staging contiguo; per ciascun layer si
-calcolano route e unione degli expert, sovrapponendo I/O del gruppo successivo e
-FFN GPU corrente. `DS4_PREFILL_CHUNK`, `DS4_PREFILL_ROUTE_BATCH`,
-`DS4_PREFILL_FFN_BATCH` e `DS4_PREFILL_MM` controllano le varianti documentate
-nella configurazione principale.
+Each chunk is transformed into a contiguous staging area; for each layer the
+routes and the expert union are computed, overlapping the next group's I/O
+with the current GPU FFN. `DS4_PREFILL_CHUNK`, `DS4_PREFILL_ROUTE_BATCH`,
+`DS4_PREFILL_FFN_BATCH` and `DS4_PREFILL_MM` control the variants documented
+in the main configuration.
 
-## Regole di modifica
+## Modification rules
 
-Il risultato deve essere equivalente a una sequenza di forward singoli. Un
-worker iniziato deve essere sempre atteso anche nei percorsi di errore. Limitare
-la memoria temporanea al chunk e misurare separatamente token/s, picco RAM e
-pressione SSD.
+The result must be equivalent to a sequence of single forwards. A started
+worker must always be awaited, including on error paths. Limit temporary
+memory to the chunk and measure token/s, peak RAM and SSD pressure
+separately.

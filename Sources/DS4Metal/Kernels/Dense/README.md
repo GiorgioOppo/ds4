@@ -1,23 +1,24 @@
 # Kernels/Dense
 
-Wrapper delle moltiplicazioni dense usate da proiezioni, output head e prefill.
+Wrappers for the dense multiplications used by projections, output head and
+prefill.
 
-## File principali
+## Main files
 
-- [`MetalDense.swift`](MetalDense.swift): matvec F16/Q8_0 e varianti Q4_K
-  specializzate tramite function constants e numero di simdgroup.
-- [`MetalMatmulMM.swift`](MetalMatmulMM.swift): matrix-matrix e percorsi batched,
-  inclusi gli ingressi organizzati per id.
+- [`MetalDense.swift`](MetalDense.swift): F16/Q8_0 matvec and specialized Q4_K
+  variants via function constants and simdgroup count.
+- [`MetalMatmulMM.swift`](MetalMatmulMM.swift): matrix-matrix and batched paths,
+  including inputs organized by id.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il decode usa soprattutto matvec a batch uno; il prefill può aggregare token e
-usare matmul per riutilizzare i pesi. `GraphContext` seleziona pipeline e
-configurazione in base a quantizzazione e forma del tensore.
+Decode mostly uses batch-one matvec; prefill can aggregate tokens and
+use matmul to reuse the weights. `GraphContext` selects pipeline and
+configuration based on quantization and tensor shape.
 
-## Regole di modifica
+## Modification rules
 
-Validare divisibilità dei blocchi quantizzati, dimensioni K/N e numero massimo
-di thread/simdgroup. Non scegliere una variante solo dal byte count: il tipo
-GGUF e il layout logico devono essere espliciti. Confrontare matvec e matmul sugli
-stessi input.
+Validate quantized block divisibility, K/N dimensions and the maximum number
+of threads/simdgroups. Do not pick a variant from the byte count alone: the
+GGUF type and the logical layout must be explicit. Compare matvec and matmul on
+the same inputs.

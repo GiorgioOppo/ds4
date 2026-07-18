@@ -1,31 +1,31 @@
 # DeepSeekV4/Architecture
 
-Geometria e dimensioni derivate dei profili DeepSeek-V4 serviti dai kernel
-Metal. Il profilo Flash statico resta disponibile come compatibilità sorgente,
-ma la costruzione model-aware usa la geometria instance-based.
+Geometry and derived dimensions of the DeepSeek-V4 profiles served by the
+Metal kernels. The static Flash profile remains available for source
+compatibility, but model-aware construction uses the instance-based geometry.
 
-## File principali
+## Main files
 
-- [`DSV4Shape.swift`](DSV4Shape.swift): layer, head, expert, rapporti di
-  compressione e costanti Flash legacy.
-- [`DSV4RuntimeGeometry.swift`](DSV4RuntimeGeometry.swift): geometria runtime
-  instance-based derivata dal profilo Flash/Pro o dalla configurazione GGUF.
-- [`DSV4Dims.swift`](DSV4Dims.swift): dimensioni runtime derivate e flag delle
-  fusioni/kernel configurabili.
-- [`RopeParams.swift`](RopeParams.swift): parametri per RoPE e scaling del contesto.
+- [`DSV4Shape.swift`](DSV4Shape.swift): layers, heads, experts, compression
+  ratios and legacy Flash constants.
+- [`DSV4RuntimeGeometry.swift`](DSV4RuntimeGeometry.swift): instance-based
+  runtime geometry derived from the Flash/Pro profile or the GGUF
+  configuration.
+- [`DSV4Dims.swift`](DSV4Dims.swift): derived runtime dimensions and flags for
+  configurable fusions/kernels.
+- [`RopeParams.swift`](RopeParams.swift): parameters for RoPE and context scaling.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il loader valida i metadati GGUF in `DeepSeekV4Configuration`; da questa viene
-costruita una `DSV4RuntimeGeometry`. Decoder, scratch, grafo e wrapper kernel
-possono così condividere dimensioni, compressione e RoPE del profilo selezionato.
-`DSV4Shape` conserva l'API Flash precedente per test e chiamanti legacy; non
-deve essere usato per dimensionare un GGUF Pro. Il profilo Pro Q2 locale usa
-61 layer, 384 esperti e i propri rapporti di compressione attraverso la stessa
-geometria runtime.
+The loader validates the GGUF metadata in `DeepSeekV4Configuration`; from this
+a `DSV4RuntimeGeometry` is built. Decoder, scratch, graph and kernel wrappers
+can thus share the selected profile's dimensions, compression and RoPE.
+`DSV4Shape` keeps the previous Flash API for tests and legacy callers; it must
+not be used to size a Pro GGUF. The local Pro Q2 profile uses 61 layers, 384
+experts and its own compression ratios through the same runtime geometry.
 
-## Regole di modifica
+## Change rules
 
-Non correggere una forma incompatibile con fallback silenziosi. Distinguere
-costanti del modello da tuning hardware. Ogni nuovo campo deve indicare unità,
-origine e consumatori; aggiornare validazione e test di allocazione insieme.
+Do not fix an incompatible shape with silent fallbacks. Distinguish model
+constants from hardware tuning. Every new field must state its unit, origin
+and consumers; update validation and allocation tests together.

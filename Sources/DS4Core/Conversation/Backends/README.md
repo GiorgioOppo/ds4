@@ -1,6 +1,5 @@
 # Conversation/Backends
 
-Template di chat e protocolli tool specifici delle famiglie di modello. I tipi
-valore comuni (`ChatTurn`, `ToolSpec`, `ToolCall`) restano in
+Chat templates and tool protocols specific to model families. The common
+value types (`ChatTurn`, `ToolSpec`, `ToolCall`) stay in
 [`../Models`](../Models/README.md).
-

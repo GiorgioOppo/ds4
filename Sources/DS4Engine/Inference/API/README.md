@@ -1,26 +1,27 @@
 # Inference/API
 
-Contiene i tipi pubblici e `Sendable` usati dai client del motore.
+Contains the public `Sendable` types used by clients of the engine.
 
-## Tipi principali
+## Main types
 
-- `ChatRole`: ruolo logico di un turno.
-- `DS4ThinkMode`: modalità di reasoning esposta dall'applicazione.
-- `SamplingParams`: temperatura, top-k/top-p/min-p, seed e penalità ripetizione.
-- `ModelInfo`: descrizione sintetica del modello caricato; conserva
-  `routedQuantBits` per compatibilità e aggiunge architettura, nome visualizzato,
-  riepilogo quantizzazione e capability runtime.
-- `GenEvent`: stream di reasoning, testo, tool call e avanzamento.
-- `InferenceError`: errori applicativi presentabili al chiamante.
+- `ChatRole`: logical role of a turn.
+- `DS4ThinkMode`: reasoning mode exposed by the application.
+- `SamplingParams`: temperature, top-k/top-p/min-p, seed and repetition
+  penalty.
+- `ModelInfo`: concise description of the loaded model; keeps
+  `routedQuantBits` for compatibility and adds architecture, display name,
+  quantization summary and runtime capabilities.
+- `GenEvent`: stream of reasoning, text, tool calls and progress.
+- `InferenceError`: application errors presentable to the caller.
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-I tipi dipendono da Foundation e, dove necessario, dai modelli portabili di
-`DS4Core`. Sono prodotti da [`Service`](../Service/README.md) e consumati da
-GUI, server e benchmark senza esporre oggetti Metal.
+The types depend on Foundation and, where needed, on the portable models of
+`DS4Core`. They are produced by [`Service`](../Service/README.md) and consumed
+by GUI, server and benchmarks without exposing Metal objects.
 
-## Estensione
+## Extension
 
-Mantenere i tipi indipendenti da SwiftUI e da `Metal`. Un nuovo evento deve
-avere semantica chiara nello stream e tutti i consumer devono gestirlo in modo
-esplicito; evitare di usare stringhe di stato quando serve un caso enum.
+Keep the types independent of SwiftUI and `Metal`. A new event must
+have clear semantics in the stream and every consumer must handle it
+explicitly; avoid state strings where an enum case is needed.

@@ -1,16 +1,16 @@
 # Persistence
 
-Contiene persistenza applicativa indipendente dalla GUI. Attualmente ospita la
-cache dei checkpoint KV in [`KV`](KV/README.md).
+Contains application persistence independent of the GUI. It currently hosts
+the KV checkpoint cache in [`KV`](KV/README.md).
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-`InferenceService` e i worker distribuiti richiedono lookup, restore e store;
-la cartella `Persistence` definisce il ciclo di vita su disco, mentre snapshot
-e import layer sono forniti da `DS4Metal`.
+`InferenceService` and the distributed workers request lookup, restore and
+store; the `Persistence` folder defines the on-disk lifecycle, while snapshots
+and layer imports are provided by `DS4Metal`.
 
-## Estensione
+## Extension
 
-Ogni nuovo archivio deve dichiarare chiave, formato/versione, budget, strategia
-di eviction, atomicità e comportamento su file corrotti. Evitare dipendenze da
-SwiftUI e mantenere RAM limitata durante I/O di grandi dati.
+Every new store must declare key, format/version, budget, eviction strategy,
+atomicity and behavior on corrupted files. Avoid dependencies on SwiftUI and
+keep RAM bounded during large-data I/O.

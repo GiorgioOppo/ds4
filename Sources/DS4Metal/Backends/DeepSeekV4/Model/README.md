@@ -1,30 +1,30 @@
 # DeepSeekV4/Model
 
-Caricamento dei pesi DeepSeek V4 dal GGUF verso GPUTensor: primitive per-tensore
-e assemblaggio per layer/output usati sia dal percorso all-resident sia dallo
+Loading of DeepSeek V4 weights from GGUF into GPUTensor: per-tensor primitives
+and per-layer/output assembly used by both the all-resident path and
 streaming.
 
-## File principali
+## Main files
 
-- [`GGUFWeights.swift`](GGUFWeights.swift): loader per-tensore (copia, vista
-  mmap no-copy), assemblaggio `LayerWeights` (`layer`, `layerMappedExperts`,
-  `layerMappedDense`, `layerSmallSkeleton`), output head, rilevamento e
-  validazione delle quantizzazioni routed (`detectMoEQuant`,
-  `validateRuntimeLayout`), gather/copia degli expert selezionati e primitive
-  `pread`/`madvise` condivise dagli streamer.
+- [`GGUFWeights.swift`](GGUFWeights.swift): per-tensor loader (copy, no-copy
+  mmap view), `LayerWeights` assembly (`layer`, `layerMappedExperts`,
+  `layerMappedDense`, `layerSmallSkeleton`), output head, detection and
+  validation of routed quantizations (`detectMoEQuant`,
+  `validateRuntimeLayout`), gather/copy of the selected experts, and
+  `pread`/`madvise` primitives shared by the streamers.
 
-## Flusso
+## Flow
 
-`validateRuntimeLayout` chiude il contratto al bind: tipi quant ammessi, gate/up
-coerenti, forme conformi alla geometria e tabella hash presente dove richiesta.
-Solo dopo si assemblano i `LayerWeights`; gli expert routed possono restare
-dummy (gather on-demand), viste mmap dell'intero tensore o slot della cache a
-seconda del factory chiamante.
+`validateRuntimeLayout` closes the contract at bind time: allowed quant types,
+consistent gate/up, shapes conforming to the geometry, and a hash table
+present where required. Only then are the `LayerWeights` assembled; routed
+experts may remain dummies (on-demand gather), mmap views of the whole tensor,
+or cache slots depending on the calling factory.
 
-## Regole di modifica
+## Change rules
 
-Le letture non devono mai superare i limiti dichiarati dal descrittore GGUF.
-Ogni builder di `LayerWeights` deve passare da `setExpertQuant` (quant per-layer
-mixed-precision). Le primitive `pread` restano thread-safe su fd condiviso
-(offset espliciti); gli hint `madvise` sono advisory e non possono cambiare la
-numerica.
+Reads must never exceed the limits declared by the GGUF descriptor. Every
+`LayerWeights` builder must go through `setExpertQuant` (per-layer
+mixed-precision quant). The `pread` primitives remain thread-safe on a shared
+fd (explicit offsets); `madvise` hints are advisory and cannot change the
+numerics.

@@ -1,23 +1,23 @@
 # Formats
 
-Formati binari e conversioni numeriche condivisi dal caricamento e dalla
-persistenza del modello.
+Binary formats and numeric conversions shared by model loading and
+persistence.
 
-## Struttura
+## Structure
 
-- [`GGUF/`](GGUF/README.md): parser mmap del file modello e dei metadati.
-- [`KVCheckpoint/`](KVCheckpoint/README.md): formato persistente della KV cache.
-- [`Quantization/`](Quantization/README.md): f16/f32 e Q8_0 -> Q4_K su CPU.
+- [`GGUF/`](GGUF/README.md): mmap parser for the model file and its metadata.
+- [`KVCheckpoint/`](KVCheckpoint/README.md): persistent KV cache format.
+- [`Quantization/`](Quantization/README.md): f16/f32 and Q8_0 -> Q4_K on CPU.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-`GGUFModel` valida e mappa il modello; `DS4Metal` usa i descrittori risultanti per
-creare viste sui pesi. `KVCFile` serializza lo stato ricorrente fuori dal percorso
-GGUF. Le conversioni CPU sono impiegate nella preparazione delle cache
-quantizzate. Tutta la cartella rimane indipendente da Metal.
+`GGUFModel` validates and maps the model; `DS4Metal` uses the resulting
+descriptors to create views over the weights. `KVCFile` serializes the
+recurrent state outside the GGUF path. The CPU conversions are used when
+preparing the quantized caches. The whole folder stays independent of Metal.
 
-## Regole di modifica
+## Modification rules
 
-Validare sempre limiti, overflow, allineamenti ed endianess prima di leggere.
-Non cambiare layout persistenti senza versione o migrazione. Evitare copie dei
-payload di grandi dimensioni nel percorso GGUF.
+Always validate bounds, overflow, alignment and endianness before reading. Do
+not change persistent layouts without a version or migration. Avoid copies of
+large payloads in the GGUF path.

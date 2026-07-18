@@ -1,17 +1,17 @@
 # Protocol/Core
 
-`Dist.swift` è la fonte autorevole del contratto globale: magic, versione wire,
-dimensioni massime, tipi di frame, flag di lavoro e whitelist dei knob.
+`Dist.swift` is the authoritative source of the global contract: magic, wire
+version, maximum sizes, frame types, work flags and the knob whitelist.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Tutti gli altri codec dipendono da `Dist`; coordinator, worker e trasporto ne
-usano i valori senza ridefinirli. Dipende da Foundation e dalle utility di
-`DS4Core`.
+All other codecs depend on `Dist`; coordinator, worker and transport use its
+values without redefining them. It depends on Foundation and the `DS4Core`
+utilities.
 
-## Estensione
+## Extension
 
-Assegnare valori numerici stabili ai nuovi `MsgType`, documentare la semantica
-in [`../../PROTOCOLLO.md`](../../PROTOCOLLO.md) e incrementare
-`protocolVersion` se un nodo precedente non può interpretare correttamente il
-nuovo flusso. I limiti per collezioni provenienti dalla rete sono obbligatori.
+Assign stable numeric values to new `MsgType`s, document the semantics in
+[`../../PROTOCOLLO.md`](../../PROTOCOLLO.md) and bump `protocolVersion` if an
+older node cannot correctly interpret the new flow. Limits on collections
+coming from the network are mandatory.

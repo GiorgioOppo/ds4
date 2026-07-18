@@ -1,138 +1,144 @@
-# Expert parallelism — scissione verticale del modello
+# Expert parallelism — vertical split of the model
 
-Stato al 16 luglio 2026: **fasi A-C implementate nel protocollo v11**. Sono
-attivi payload, worker expert shard, backbone del coordinatore, chat verticale e
-benchmark GUI. Restano da ampliare la validazione multi-Mac e le ottimizzazioni
-di fase D. Flash usa 256 esperti; il GGUF Pro Q2 completo usa 384 esperti. Il
-package Pro Q4 in due file non è ancora eseguibile.
+Status as of July 16, 2026: **phases A-C implemented in protocol v11**.
+Payloads, expert shard workers, coordinator backbone, vertical chat and GUI
+benchmark are active. Multi-Mac validation and phase D optimizations remain to
+be expanded. Flash uses 256 experts; the full Pro Q2 GGUF uses 384 experts. The
+two-file Pro Q4 package is not yet runnable.
 
-Prerequisito operativo: RTT inferiore a circa 1 ms fra i nodi, tramite bridge
-Thunderbolt o Ethernet diretta. Con circa 41 layer routed, un RTT di 7 ms
-aggiunge quasi 300 ms per token prima del lavoro utile; su Wi-Fi questa
-topologia è normalmente perdente.
+Operational prerequisite: RTT below roughly 1 ms between nodes, via a
+Thunderbolt bridge or direct Ethernet. With about 41 routed layers, a 7 ms RTT
+adds nearly 300 ms per token before any useful work; on Wi-Fi this topology is
+normally a losing proposition.
 
-## Perché una scissione verticale
+## Why a vertical split
 
-La pipeline orizzontale assegna intervalli di layer ai worker. Gli SSD lavorano
-in sequenza lungo il percorso del token: il tempo dominante tende alla somma
-dei gather delle slice.
+The horizontal pipeline assigns layer ranges to workers. The SSDs work
+sequentially along the token's path: the dominant time tends toward the sum
+of the slice gathers.
 
-Nella scissione verticale gli esperti di ogni layer — 256 per Flash o 384 per
-Pro — sono distribuiti fra i worker. Quando il router sceglie sei esperti, ogni
-SSD legge in parallelo la
-propria quota e restituisce una somma parziale. Sul costo dominante il tempo può
-avvicinarsi al massimo dei worker anziché alla somma, ma si paga un round-trip
-di rete per layer routed.
+In the vertical split, each layer's experts — 256 for Flash or 384 for
+Pro — are distributed across the workers. When the router picks six experts,
+each SSD reads its
+own share in parallel and returns a partial sum. On the dominant cost the time
+can approach the maximum across workers rather than the sum, but you pay one
+network round-trip per routed layer.
 
-## Architettura implementata
+## Implemented architecture
 
-- **Coordinatore/backbone locale**: embedding, route/attention di tutti i
-  layer, KV, compressori NSA, FFN shared, riduzioni HC e output head.
-- **Worker expert shard**: sottoinsieme degli esperti valido per tutti i layer;
-  nessun KV o stato di conversazione; gather, gate/up/down e somma pesata.
-- **Protocollo v11**: `expertAssign`, `expertWork`, `expertSum`, con geometria
-  e lunghezza della maschera validate dal GGUF.
-- **GUI**: toggle Vertical split, connessione, chat e benchmark dedicato.
+- **Coordinator/local backbone**: embedding, route/attention for all
+  layers, KV, NSA compressors, shared FFN, HC reductions and output head.
+- **Expert shard worker**: a subset of the experts valid for all layers;
+  no KV or conversation state; gather, gate/up/down and weighted sum.
+- **Protocol v11**: `expertAssign`, `expertWork`, `expertSum`, with geometry
+  and mask length validated against the GGUF.
+- **GUI**: Vertical split toggle, connection, chat and dedicated benchmark.
 
-`StreamingDecoder` espone una callback `remoteExperts` usata al posto del ramo
-FFN routed locale. Il coordinatore carica il backbone con cache esperti locale
-disattivata; gli expert shard usano bundle, slot-cache e knob assegnati.
+`StreamingDecoder` exposes a `remoteExperts` callback used in place of the
+local routed FFN branch. The coordinator loads the backbone with the local
+expert cache disabled; the expert shards use bundles, slot-cache and the
+assigned knobs.
 
-## Flusso per token e layer routed
+## Per-token flow and routed layers
 
-1. Il backbone calcola route/attention e produce id e pesi dei sei esperti.
-2. Il coordinator raggruppa gli id per mask proprietaria.
-3. Invia in parallelo `expertWork` con layer, sequenza, id, pesi e attivazione.
-4. Ogni worker valida che gli id siano posseduti, esegue la FFN e invia
+1. The backbone computes route/attention and produces the ids and weights of
+   the six experts.
+2. The coordinator groups the ids by owning mask.
+3. It sends `expertWork` in parallel with layer, sequence, ids, weights and
+   activation.
+4. Each worker validates that the ids are owned, runs the FFN and sends
    `expertSum`.
-5. Il coordinator somma le parziali e prosegue con shared FFN/riduzione del
-   layer.
+5. The coordinator sums the partials and continues with the layer's shared
+   FFN/reduction.
 
-Le attivazioni e le somme verticali sono trasportate a 32 o 16 bit. Il valore 8
-bit disponibile per la pipeline orizzontale non viene usato dal percorso
-verticale corrente.
+Vertical activations and sums are transported at 32 or 16 bits. The 8-bit
+option available for the horizontal pipeline is not used by the current
+vertical path.
 
-## Assegnazione degli esperti
+## Expert assignment
 
-`DistExpertAssign.expertMask` è preceduta sul wire dalla propria lunghezza e
-contiene un bit per esperto: 32 byte per Flash, 48 per Pro. Il bit `e` indica il
-possesso dell'esperto `e`. La partizione corrente è **round-robin**
-(`e % workerCount`), con copertura esatta e senza sovrapposizioni. Lunghezza,
-bit di padding, copertura e unicità sono rifiutati se non coincidono con la
-geometria caricata.
+`DistExpertAssign.expertMask` is preceded on the wire by its own length and
+contains one bit per expert: 32 bytes for Flash, 48 for Pro. Bit `e` indicates
+ownership of expert `e`. The current partition is **round-robin**
+(`e % workerCount`), with exact coverage and no overlaps. Length, padding
+bits, coverage and uniqueness are rejected if they do not match the loaded
+geometry.
 
-Il bilanciamento greedy basato sulla usage imatrix non è ancora attivo. È una
-possibile fase D: dovrebbe distribuire il carico osservato, non soltanto il
-numero di esperti, mantenendo copertura esatta e configurazione riproducibile.
+Greedy balancing based on the usage imatrix is not active yet. It is a
+possible phase D: it should distribute the observed load, not just the
+number of experts, while keeping exact coverage and a reproducible
+configuration.
 
-## Costi di comunicazione
+## Communication costs
 
-Ogni layer coinvolto invia un'attivazione e riceve una somma della larghezza
-del modello. Il traffico complessivo per worker coinvolto è circa:
+Each involved layer sends one activation and receives one sum of the model's
+width. Total traffic per involved worker is roughly:
 
-- Flash (4096 elementi): 32 KiB a F32 o 16 KiB a F16;
-- Pro (7168 elementi): 56 KiB a F32 o 28 KiB a F16;
-- in entrambi i casi si aggiungono header, id e pesi.
+- Flash (4096 elements): 32 KiB at F32 or 16 KiB at F16;
+- Pro (7168 elements): 56 KiB at F32 or 28 KiB at F16;
+- in both cases headers, ids and weights are added on top.
 
-La latenza, più della banda, è il vincolo: il round-trip si ripete lungo la
-sequenza dei layer routed e cresce quindi con la geometria del profilo.
+Latency, more than bandwidth, is the constraint: the round-trip repeats along
+the sequence of routed layers and therefore grows with the profile's geometry.
 
-Queste sono stime di ordine di grandezza. Il benchmark deve misurare traffico e
-latenza reali con lo stesso GGUF e la stessa cache della baseline locale.
+These are order-of-magnitude estimates. The benchmark must measure real
+traffic and latency with the same GGUF and the same cache as the local
+baseline.
 
-## Trasferimento dei file
+## File transfer
 
-Il setup riusa il trasferimento resumable del protocollo v8: GGUF e sidecar
-sono offerti con SHA-256 e checkpoint concatenati. Al momento il worker può
-ricevere il bundle completo e aprire soltanto i record necessari alla propria
+Setup reuses the resumable transfer from protocol v8: GGUF and sidecars are
+offered with SHA-256 and concatenated checkpoints. At the moment the worker
+can receive the full bundle and open only the records needed by its own
 mask.
 
-Un trasferimento futuro di un bundle fisicamente shardato ridurrebbe spazio e
-tempo di setup, ma richiede un nuovo tipo di manifest e una strategia di
-validazione dedicata.
+A future transfer of a physically sharded bundle would reduce setup space and
+time, but requires a new manifest type and a dedicated validation
+strategy.
 
-## Stato delle fasi
+## Phase status
 
-- **A — completata**: design, frame v11, encode/decode bound-checked e test
-  round-trip.
-- **B — completata**: `ExpertShard`, assegnazione worker, mask, bundle/cache e
-  serving `expertWork` -> `expertSum`.
-- **C — completata**: backbone locale, scatter/gather remoto, chat verticale,
-  toggle e benchmark.
-- **D — aperta**: bilanciamento dalla usage imatrix, overlap aggiuntivo,
-  eventuali file shard e campagna A/B multi-Mac.
+- **A — complete**: design, v11 frames, bound-checked encode/decode and
+  round-trip tests.
+- **B — complete**: `ExpertShard`, worker assignment, masks, bundle/cache and
+  `expertWork` -> `expertSum` serving.
+- **C — complete**: local backbone, remote scatter/gather, vertical chat,
+  toggle and benchmark.
+- **D — open**: balancing from the usage imatrix, additional overlap,
+  possible shard files and a multi-Mac A/B campaign.
 
-## Criteri di validazione
+## Validation criteria
 
-1. Misurare RTT prima di connettere la route verticale.
-2. Verificare copertura e unicità delle mask.
-3. Confrontare F32 verticale con il percorso locale a sei esperti.
-4. Misurare separatamente F16 per qualità e rete.
-5. Registrare prefill, decode a regime, byte/token, banda e cache hit-rate.
-6. Confrontare verticale, pipeline e locale con modello, prompt e warm-up
-   identici.
-7. Prima di certificare Pro, eseguire parità numerica e benchmark multi-Mac sul
-   GGUF Q2 completo; i test di protocollo da soli non misurano logits o qualità.
+1. Measure RTT before connecting the vertical route.
+2. Verify mask coverage and uniqueness.
+3. Compare vertical F32 with the local six-expert path.
+4. Measure F16 separately for quality and network.
+5. Record prefill, steady-state decode, bytes/token, bandwidth and cache
+   hit-rate.
+6. Compare vertical, pipeline and local with identical model, prompt and
+   warm-up.
+7. Before certifying Pro, run numeric parity and multi-Mac benchmarks on the
+   full Q2 GGUF; protocol tests alone do not measure logits or quality.
 
-L'obiettivo progettuale resta almeno 1,5x rispetto al locale a parità di
-qualità. Se la latenza di rete o lo sbilanciamento annullano il gather parallelo,
-la modalità deve restare opzionale.
+The design goal remains at least 1.5x over local at equal quality. If network
+latency or imbalance cancels out the parallel gather, the mode must remain
+optional.
 
-## Limiti e sicurezza
+## Limits and security
 
-- il backbone completo deve stare sul coordinator secondo il profilo locale;
-- ogni worker riceve attivazioni del modello in chiaro;
-- la perdita di un peer invalida gli esperti che possiede;
-- chat e benchmark non possono condividere simultaneamente la route;
-- i due GGUF Pro Q4 parziali non possono essere usati come worker slice: manca
-  ancora il loader multi-shard;
-- il protocollo non offre autenticazione o TLS.
+- the full backbone must fit on the coordinator according to the local profile;
+- each worker receives model activations in the clear;
+- losing a peer invalidates the experts it owns;
+- chat and benchmark cannot share the route simultaneously;
+- the two partial Pro Q4 GGUFs cannot be used as worker slices: the
+  multi-shard loader is still missing;
+- the protocol offers no authentication or TLS.
 
-Usare soltanto una rete fidata. Per il quadro completo vedere
-[INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) e
+Use only a trusted network. For the full picture see
+[INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) and
 [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 
-## Mappa del codice
+## Code map
 
 - `Sources/DS4Engine/Distributed/Protocol/Experts`
 - `Sources/DS4Engine/Distributed/Coordinator/DistCoordinator+ExpertParallelism.swift`

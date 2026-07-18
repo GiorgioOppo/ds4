@@ -1,19 +1,21 @@
 # Conversation/Models
 
-Tipi valore condivisi tra interfaccia, motore e renderer della chat.
+Value types shared between the interface, the engine and the chat renderer.
 
-## File principali
+## Main files
 
-- [`ConversationModels.swift`](ConversationModels.swift): definisce `ToolSpec`,
-  schema di una funzione disponibile; `ToolCall`, invocazione con argomenti JSON;
-  `ChatTurn`, sequenza tipizzata di messaggi system, user, assistant e tool result.
+- [`ConversationModels.swift`](ConversationModels.swift): defines `ToolSpec`,
+  the schema of an available function; `ToolCall`, an invocation with JSON
+  arguments; `ChatTurn`, a typed sequence of system, user, assistant and tool
+  result messages.
 
-I tipi sono `Sendable` ed `Equatable`; `ToolSpec` e `ToolCall` sono anche
-`Identifiable`, così possono attraversare in sicurezza UI e servizi concorrenti.
+The types are `Sendable` and `Equatable`; `ToolSpec` and `ToolCall` are also
+`Identifiable`, so they can safely cross UI and concurrent services.
 
-## Flusso e regole
+## Flow and rules
 
-Questi modelli non eseguono strumenti e non conoscono il backend. Sono consumati
-da [`DSML`](../DSML/README.md) e dai livelli superiori. Aggiungere nuovi casi a
-`ChatTurn` solo aggiornando renderer, parser, persistenza e test di exhaustiveness;
-non inserire qui stato runtime o dipendenze applicative.
+These models do not execute tools and know nothing about the backend. They are
+consumed by [`DSML`](../DSML/README.md) and by the layers above. Add new cases
+to `ChatTurn` only while updating renderer, parser, persistence and
+exhaustiveness tests; do not put runtime state or application dependencies
+here.

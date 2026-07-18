@@ -1,21 +1,22 @@
 # Worker/Serving
 
-È il dispatcher principale dei frame ricevuti da una connessione coordinator.
+The main dispatcher for frames received from a coordinator connection.
 
-## Flusso
+## Flow
 
-`DistWorker+Serving.swift` invia `HELLO`, quindi gestisce offerta/ricezione file,
-assegnazioni, comandi KV, richieste expert e `WORK`. Per la pipeline orizzontale
-esegue la slice sotto `DistGate`, inoltra lo stato al worker seguente oppure
-restituisce il risultato al return listener.
+`DistWorker+Serving.swift` sends `HELLO`, then handles file offer/receipt,
+assignments, KV commands, expert requests and `WORK`. For the horizontal
+pipeline it runs the slice under `DistGate`, forwards the state to the next
+worker or returns the result to the return listener.
 
-## Dipendenze
+## Dependencies
 
-Compone tutte le aree del worker e usa [`Transport`](../../Transport/README.md)
-e [`Protocol`](../../Protocol/README.md). Non implementa codec wire propri.
+Composes all the worker areas and uses [`Transport`](../../Transport/README.md)
+and [`Protocol`](../../Protocol/README.md). It does not implement its own wire
+codecs.
 
-## Estensione
+## Extension
 
-Ogni nuovo `MsgType` deve avere uno stato del lifecycle in cui è ammesso e una
-risposta di errore deterministica. Validare sessione, assegnazione, slice,
-posizione, contesto e shape prima di toccare il motore.
+Every new `MsgType` must have a lifecycle state in which it is allowed and a
+deterministic error response. Validate session, assignment, slice,
+position, context and shape before touching the engine.

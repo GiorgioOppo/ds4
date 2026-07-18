@@ -1,28 +1,28 @@
-# Analisi della comprimibilita dei GGUF
+# GGUF compressibility analysis
 
-Questa guida descrive i due strumenti esplorativi usati per misurare la
-ridondanza dei pesi prima di investire in nuovi kernel, rappresentazioni
-fattorizzate o fine-tuning. Entrambi leggono il GGUF senza modificarlo e non
-producono un modello immediatamente eseguibile da DwarfStar.
+This guide describes the two exploratory tools used to measure weight
+redundancy before investing in new kernels, factorized representations, or
+fine-tuning. Both read the GGUF without modifying it and do not produce a
+model that DwarfStar can run directly.
 
-Tornare all'[indice degli script](README.md).
+Back to the [scripts index](README.md).
 
-## Requisiti
+## Requirements
 
 ```sh
 python3 -m pip install -U gguf numpy
 ```
 
-Il pacchetto `gguf` fornisce la dequantizzazione dei formati supportati da
-`gguf.quants`. I comandi seguenti presuppongono di essere eseguiti dalla radice
-del repository.
+The `gguf` package provides dequantization for the formats supported by
+`gguf.quants`. The commands below assume they are run from the repository
+root.
 
-## `gguf_spectrum.py`: spettro e ridondanza
+## `gguf_spectrum.py`: spectrum and redundancy
 
-Per i tensori selezionati lo script calcola lo spettro dei valori singolari e
-riporta il rango effettivo al 90%, 95% e 99% dell'energia. Per gli esperti
-routed stima inoltre, tramite proiezione e PCA, quante basi condivise servono a
-spiegare la variabilita fra esperti.
+For the selected tensors the script computes the singular value spectrum and
+reports the effective rank at 90%, 95%, and 99% of the energy. For routed
+experts it additionally estimates, via projection and PCA, how many shared
+bases are needed to explain the variability across experts.
 
 ```sh
 python3 scripts/gguf_spectrum.py /percorso/modello.gguf
@@ -31,21 +31,21 @@ python3 scripts/gguf_spectrum.py /percorso/modello.gguf --full
 python3 scripts/gguf_spectrum.py /percorso/modello.gguf --layers 2 --json risultati.json
 ```
 
-`--full` include anche embedding e testa di output e puo richiedere molto piu
-tempo e memoria. Le stime sugli esperti dipendono da `--proj`: sono uno
-strumento decisionale, non una prova di equivalenza del modello.
+`--full` also includes the embeddings and the output head and can take much
+more time and memory. The expert estimates depend on `--proj`: they are a
+decision-making tool, not a proof of model equivalence.
 
-## `gguf_to_graph.py`: fattorizzazione su grafo
+## `gguf_to_graph.py`: graph factorization
 
-Ogni matrice `W[out x in]` selezionata viene approssimata con una SVD troncata:
+Each selected matrix `W[out x in]` is approximated with a truncated SVD:
 
 ```text
 input -- B[r x in] --> bottleneck r -- A[out x r] --> output
 ```
 
-I parametri risiedono sugli archi `A` e `B`; i nodi descrivono soltanto gli
-spazi di attivazione. Lo script puo produrre JSON, Graphviz DOT e, su richiesta,
-un archivio NumPy con i fattori.
+The parameters live on the edges `A` and `B`; the nodes describe only the
+activation spaces. The script can produce JSON, Graphviz DOT, and, on request,
+a NumPy archive with the factors.
 
 ```sh
 python3 scripts/gguf_to_graph.py /percorso/modello.gguf \
@@ -57,25 +57,25 @@ python3 scripts/gguf_to_graph.py /percorso/modello.gguf \
   --layers 0,2 --experts --rank 64 --npz fattori.npz
 ```
 
-La trasformazione e **lossy**. Il riepilogo riporta frazione di parametri
-conservata ed errore relativo di ricostruzione; recuperare la qualita richiede
-normalmente addestramento o fine-tuning e una successiva validazione end-to-end.
+The transformation is **lossy**. The summary reports the fraction of
+parameters retained and the relative reconstruction error; recovering quality
+normally requires training or fine-tuning followed by end-to-end validation.
 
-## Scelta del GGUF
+## Choosing the GGUF
 
-Il motore gestisce tensori esperti in `Q4_K`, `Q2_K` e `IQ2_XXS`, tensori densi
-in `Q8_0` e valori `F16`/`F32` dove necessari. Per un'analisi dettagliata degli
-esperti conviene partire da un GGUF meno aggressivamente quantizzato: le
-conclusioni tratte da un modello a 2 bit non si trasferiscono automaticamente
-ad altre varianti.
+The engine handles expert tensors in `Q4_K`, `Q2_K`, and `IQ2_XXS`, dense
+tensors in `Q8_0`, and `F16`/`F32` values where needed. For a detailed expert
+analysis it is best to start from a less aggressively quantized GGUF:
+conclusions drawn from a 2-bit model do not automatically transfer to other
+variants.
 
-## Interpretazione corretta
+## Correct interpretation
 
-- Un rango numericamente basso non garantisce che la qualita linguistica resti
-  invariata.
-- I risultati dipendono dal layer, dal tensore, dalla quantizzazione e dai
-  parametri di campionamento dell'analisi.
-- Prima di implementare un nuovo formato, confrontare memoria, banda, errore
-  sui logit e qualita su un insieme di prompt riproducibile.
-- Questi script sono strumenti offline: non fanno parte del percorso di
-  caricamento o inferenza della GUI e della demo.
+- A numerically low rank does not guarantee that linguistic quality remains
+  unchanged.
+- Results depend on the layer, the tensor, the quantization, and the
+  analysis's sampling parameters.
+- Before implementing a new format, compare memory, bandwidth, logit error,
+  and quality on a reproducible set of prompts.
+- These scripts are offline tools: they are not part of the load or inference
+  path of the GUI or the demo.

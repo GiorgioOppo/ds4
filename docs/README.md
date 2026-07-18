@@ -1,116 +1,116 @@
-# Documentazione di DwarfStar
+# DwarfStar Documentation
 
-Indice della documentazione tecnica e operativa. Ogni cartella del codice e dei
-test ha inoltre un `README.md` locale con responsabilità, dipendenze, file
-principali e regole di modifica.
+Index of the technical and operational documentation. Every code and test
+folder also has a local `README.md` with responsibilities, dependencies, main
+files and modification rules.
 
-## Per iniziare
+## Getting started
 
-- [README del progetto](../README.md) — panoramica, avvio rapido e riferimento
-  completo della configurazione.
-- [DOCUMENTAZIONE.md](DOCUMENTAZIONE.md) — guida ampia all'app, workflow,
-  pannelli e troubleshooting.
-- [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md) — moduli, dipendenze e mappa
-  delle cartelle.
-- [ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md) — matrice dei
-  backend, rilevamento GGUF, capacità e regole per introdurre Qwen e GLM 5.2.
-- [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) — workflow per modificare codice,
-  documentazione, kernel e progetto Xcode.
+- [Project README](../README.md) — overview, quick start and complete
+  configuration reference.
+- [DOCUMENTAZIONE.md](DOCUMENTAZIONE.md) — broad guide to the app, workflows,
+  panels and troubleshooting.
+- [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md) — modules, dependencies and
+  folder map.
+- [ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md) — backend matrix,
+  GGUF detection, capabilities and rules for introducing Qwen and GLM 5.2.
+- [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) — workflow for modifying code,
+  documentation, kernels and the Xcode project.
 
-## Motore e inferenza
+## Engine and inference
 
-- [`architectures/`](architectures/README.md) — documentazione separata per
-  DeepSeek V4, Qwen e il port progressivo GLM 5.2.
-- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md) — ciclo completo da prompt a
-  token, ownership dello stato, prefill, decode e tool loop.
-- [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md) — dettagli del modello,
-  GGUF, tokenizer, NSA, MoE, quantizzazione e grafo.
-- [BACKEND-METAL.md](BACKEND-METAL.md) — runtime, tensori, command buffer,
-  wrapper, kernel generati e validazione numerica.
-- [DS4CORE-INFERENCE.md](DS4CORE-INFERENCE.md) — riferimento compatto ai
-  componenti inference-facing privi di dipendenza GPU.
+- [`architectures/`](architectures/README.md) — separate documentation for
+  DeepSeek V4, Qwen and the progressive GLM 5.2 port.
+- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md) — full cycle from prompt to
+  token, state ownership, prefill, decode and tool loop.
+- [ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md) — model details,
+  GGUF, tokenizer, NSA, MoE, quantization and graph.
+- [BACKEND-METAL.md](BACKEND-METAL.md) — runtime, tensors, command buffers,
+  wrappers, generated kernels and numeric validation.
+- [DS4CORE-INFERENCE.md](DS4CORE-INFERENCE.md) — compact reference to the
+  inference-facing components free of GPU dependencies.
 - [`DS4Engine/Inference/FLUSSO-INFERENZA.md`](../Sources/DS4Engine/Inference/FLUSSO-INFERENZA.md)
-  — dettaglio del servizio applicativo e delle sue estensioni.
+  — details of the application service and its extensions.
 
-## Configurazione e prestazioni
+## Configuration and performance
 
-- [Configuration Reference](../README.md#configuration-reference) — tabella
-  autorevole di impostazioni GUI, `DS4_*`, server, distribuzione e MCP.
-- [CONFIGURAZIONE-E-PROFILI.md](CONFIGURAZIONE-E-PROFILI.md) — precedenza,
-  momento di lettura, profili qualità/prestazioni e regole per nuovi knob.
-- [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.md) — misure storiche della
-  demo, colli di bottiglia e runbook A/B.
-- [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md) — ricerca multi-parametro con
-  coordinate ascent, confronto ABBA, gate logits e checkpoint riprendibile.
-- [METAL-AB-M1-PRO-2026-07-16.md](METAL-AB-M1-PRO-2026-07-16.md) — risultati
-  bit-exact e prestazionali dei nuovi staging KV, copy packed e RoPE specializzati.
-- [SELF-SPECULATIVE.md](SELF-SPECULATIVE.md) — design e misure datate del
-  decode self-speculative, attualmente opt-in sperimentale.
+- [Configuration Reference](../README.md#configuration-reference) — the
+  authoritative table of GUI settings, `DS4_*`, server, distribution and MCP.
+- [CONFIGURAZIONE-E-PROFILI.md](CONFIGURAZIONE-E-PROFILI.md) — precedence,
+  read timing, quality/performance profiles and rules for new knobs.
+- [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.md) — historical demo
+  measurements, bottlenecks and A/B runbook.
+- [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md) — multi-parameter search with
+  coordinate ascent, ABBA comparison, logits gate and resumable checkpoint.
+- [METAL-AB-M1-PRO-2026-07-16.md](METAL-AB-M1-PRO-2026-07-16.md) — bit-exact
+  and performance results of the new specialized KV staging, packed copy and RoPE.
+- [SELF-SPECULATIVE.md](SELF-SPECULATIVE.md) — design and dated measurements
+  of self-speculative decode, currently an experimental opt-in.
 
-I file con misure riportano data e macchina: sono fotografie sperimentali, non
-default universali.
+Files with measurements state date and machine: they are experimental
+snapshots, not universal defaults.
 
-## Distribuzione
+## Distribution
 
-- [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) — topologia
-  orizzontale e verticale, setup, file, KV, sicurezza e protocollo v11.
-- [EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.md) — stato implementativo,
-  costi e validazione della scissione verticale.
+- [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) — horizontal and
+  vertical topology, setup, files, KV, security and protocol v11.
+- [EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.md) — implementation status,
+  costs and validation of the vertical split.
 - [`Distributed/PROTOCOLLO.md`](../Sources/DS4Engine/Distributed/PROTOCOLLO.md)
-  — messaggi e invarianti vicino al codice.
+  — messages and invariants close to the code.
 
-## GUI, server, strumenti e dati
+## GUI, server, tools and data
 
-- [GUI-SERVER-E-API.md](GUI-SERVER-E-API.md) — feature SwiftUI, motore
-  condiviso, HTTP/SSE e regole per nuovi endpoint.
-- [STRUMENTI-AGENTI-MCP.md](STRUMENTI-AGENTI-MCP.md) — registro tool, agenti,
-  sub-agent, trasporti MCP e sicurezza.
-- [`Chat/FLOW.md`](../Sources/DwarfStar/Features/Chat/FLOW.md) — flusso della
-  chat vicino alla feature.
+- [GUI-SERVER-E-API.md](GUI-SERVER-E-API.md) — SwiftUI features, shared
+  engine, HTTP/SSE and rules for new endpoints.
+- [STRUMENTI-AGENTI-MCP.md](STRUMENTI-AGENTI-MCP.md) — tool registry, agents,
+  sub-agents, MCP transports and security.
+- [`Chat/FLOW.md`](../Sources/DwarfStar/Features/Chat/FLOW.md) — chat flow
+  close to the feature.
 - [`Server/HTTP-API.md`](../Sources/DwarfStar/Features/Server/HTTP-API.md) —
-  contratti HTTP locali e mapping degli endpoint.
+  local HTTP contracts and endpoint mapping.
 - [`GESTIONE-MODELLI.md`](../Sources/DS4Engine/ModelManagement/GESTIONE-MODELLI.md)
-  — download, token, sidecar e lifecycle dei modelli.
+  — download, tokens, sidecars and model lifecycle.
 - [`FORMATO-CHECKPOINT.md`](../Sources/DS4Engine/Persistence/KV/FORMATO-CHECKPOINT.md)
-  — checkpoint KV e compatibilità persistente.
+  — KV checkpoints and persistent compatibility.
 - [`SICUREZZA-PERCORSI.md`](../Sources/DS4Engine/Projects/SICUREZZA-PERCORSI.md)
-  e [`Tools/SICUREZZA.md`](../Sources/DS4Engine/Tools/SICUREZZA.md) — confini
-  filesystem e sicurezza dei tool.
+  and [`Tools/SICUREZZA.md`](../Sources/DS4Engine/Tools/SICUREZZA.md) —
+  filesystem boundaries and tool security.
 
-## Test, rilascio e conformità
+## Testing, release and compliance
 
-- [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md) — strategia, comandi,
-  skip GPU, parità e checklist.
-- [`Tests/METAL-TESTS.md`](../Tests/METAL-TESTS.md) — requisiti e convenzioni
-  specifiche per i test Metal.
-- [CRITTOGRAFIA.md](CRITTOGRAFIA.md) — inventario crittografico, trasporti in
-  chiaro e note di export compliance con fonti ufficiali.
-- [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) — fotografia datata del confronto con
-  il progetto C upstream e procedura per aggiornarla.
-- [`packaging/README.md`](../packaging/README.md) — bundle, firma ed
+- [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md) — strategy, commands,
+  GPU skips, parity and checklists.
+- [`Tests/METAL-TESTS.md`](../Tests/METAL-TESTS.md) — requirements and
+  conventions specific to the Metal tests.
+- [CRITTOGRAFIA.md](CRITTOGRAFIA.md) — cryptographic inventory, cleartext
+  transports and export compliance notes with official sources.
+- [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md) — dated snapshot of the comparison
+  with the upstream C project and the procedure for refreshing it.
+- [`packaging/README.md`](../packaging/README.md) — bundle, signing and
   entitlements.
 
-## Sorgenti autorevoli
+## Authoritative sources
 
-- I kernel si modificano in [`metal/`](../metal/README.md), non nel file Swift
-  generato.
-- Il template tool-calling di riferimento è in
+- Kernels are modified in [`metal/`](../metal/README.md), not in the
+  generated Swift file.
+- The reference tool-calling template is in
   [`templates/`](../templates/README.md).
-- Gli script di build e analisi sono descritti in
+- The build and analysis scripts are described in
   [`scripts/`](../scripts/README.md).
-- La mappa completa dei sorgenti parte da [`Sources/README.md`](../Sources/README.md).
-- La mappa dei test parte da [`Tests/README.md`](../Tests/README.md).
+- The complete source map starts from [`Sources/README.md`](../Sources/README.md).
+- The test map starts from [`Tests/README.md`](../Tests/README.md).
 
-## Regole di manutenzione
+## Maintenance rules
 
-Quando cambia un comportamento:
+When a behavior changes:
 
-1. aggiornare il README della cartella proprietaria;
-2. aggiornare il documento tematico corrispondente;
-3. mantenere esempi e default coerenti con il codice;
-4. dichiarare data e hardware per misure prestazionali;
-5. distinguere funzioni operative, sperimentali e soltanto progettate;
-6. verificare collegamenti relativi e percorsi dopo ogni spostamento.
+1. update the README of the owning folder;
+2. update the corresponding thematic document;
+3. keep examples and defaults consistent with the code;
+4. state date and hardware for performance measurements;
+5. distinguish operational, experimental and design-only features;
+6. verify relative links and paths after every move.
 
-I Markdown collocati dentro i target sono esclusi automaticamente da SwiftPM e
-da XcodeGen: possono restare accanto al codice senza entrare nel binario.
+Markdown files placed inside targets are automatically excluded by SwiftPM and
+by XcodeGen: they can stay next to the code without entering the binary.

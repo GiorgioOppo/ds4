@@ -1,24 +1,24 @@
 # Formats/Quantization
 
-Primitive CPU portabili per conversione e requantizzazione dei pesi.
+Portable CPU primitives for weight conversion and requantization.
 
-## File principali
+## Key files
 
-- [`Half.swift`](Half.swift): conversioni f32/f16, inclusa la via software
-  indipendente dall'architettura.
-- [`Quantize.swift`](Quantize.swift): dequantizzazione Q8_0 e quantizzazione
-  f32 -> Q4_K coerenti con i quantizzatori di riferimento ggml; dequant di
-  riferimento Q2_K/Q5_K/Q6_K (esperti routed GLM 5.2) senza quantizzatore
-  locale — i byte GGUF sono la fixture.
+- [`Half.swift`](Half.swift): f32/f16 conversions, including the
+  architecture-independent software path.
+- [`Quantize.swift`](Quantize.swift): Q8_0 dequantization and f32 -> Q4_K
+  quantization consistent with the ggml reference quantizers; reference
+  Q2_K/Q5_K/Q6_K dequant (GLM 5.2 routed experts) with no local quantizer —
+  the GGUF bytes are the fixture.
 
-## Flusso
+## Flow
 
-Il loader legge blocchi GGUF Q8_0, li converte in float e produce cache Q4_K
-residenti per i percorsi configurati. I layout risultanti sono poi consumati dai
-kernel di `DS4Metal`; questa cartella non effettua dispatch GPU.
+The loader reads GGUF Q8_0 blocks, converts them to float, and produces
+resident Q4_K caches for the configured paths. The resulting layouts are then
+consumed by the `DS4Metal` kernels; this folder performs no GPU dispatch.
 
-## Regole di modifica
+## Modification rules
 
-Layout, arrotondamento, scale e dimensioni di blocco sono parte del contratto con
-i kernel. Ogni ottimizzazione deve mantenere test di parità numerica e casi per
-valori limite; evitare API dipendenti da Metal o Accelerate.
+Layout, rounding, scales, and block sizes are part of the contract with the
+kernels. Every optimization must keep numerical-parity tests and edge-value
+cases; avoid APIs that depend on Metal or Accelerate.

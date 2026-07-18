@@ -1,23 +1,23 @@
 # Backends
 
-Implementazioni Metal specifiche per famiglia di modello. Runtime, tensori e
-primitive GPU condivise restano nelle cartelle di primo livello di `DS4Metal`;
-architettura, schema GGUF, pesi, stato KV, prefill e decode appartengono invece
-al rispettivo backend.
+Metal implementations specific to each model family. Runtime, tensors and
+shared GPU primitives stay in the top-level folders of `DS4Metal`;
+architecture, GGUF schema, weights, KV state, prefill and decode belong to
+the respective backend instead.
 
-## Backend
+## Backends
 
-- [`Common/`](Common/README.md): regole del confine condiviso e future API di
-  selezione a livello token/chunk.
-- [`DeepSeekV4/`](DeepSeekV4/README.md): backend attualmente operativo.
-- [`GLM52/`](GLM52/README.md): schema, riferimenti DSA e primitive Metal in
-  costruzione; non contiene ancora un decoder eseguibile.
-- [`Qwen/`](Qwen/README.md): spazio riservato; Qwen non è ancora supportato.
+- [`Common/`](Common/README.md): rules of the shared boundary and future
+  token/chunk-level selection APIs.
+- [`DeepSeekV4/`](DeepSeekV4/README.md): the currently operational backend.
+- [`GLM52/`](GLM52/README.md): schema, DSA references and Metal primitives
+  under construction; it does not yet contain a runnable decoder.
+- [`Qwen/`](Qwen/README.md): reserved space; Qwen is not supported yet.
 
-## Regole di modifica
+## Modification rules
 
-La famiglia viene scelta al caricamento del modello, mai dentro il ciclo
-per-layer o per-kernel. Non costruire contenitori universali pieni di campi
-opzionali: ogni backend conserva pesi, scratch e snapshot con tipi concreti.
-Promuovere una funzione nel livello comune solo quando semantica, layout e
-vincoli di sincronizzazione coincidono realmente tra più backend.
+The family is chosen at model load time, never inside the per-layer or
+per-kernel loop. Do not build universal containers full of optional fields:
+each backend keeps weights, scratch and snapshots with concrete types.
+Promote a function into the common layer only when semantics, layout and
+synchronization constraints genuinely coincide across multiple backends.

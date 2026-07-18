@@ -1,131 +1,128 @@
-# Strumenti, agenti e MCP
+# Tools, agents, and MCP
 
-Il sistema di tool permette al modello di richiedere operazioni strutturate
-senza incorporare logica applicativa nel renderer o nel backend Metal. I tool
-integrati e quelli MCP condividono il registro e il formato DSML esposto al
-modello.
+The tool system lets the model request structured operations without embedding
+application logic in the renderer or the Metal backend. Built-in tools and MCP
+tools share the registry and the DSML format exposed to the model.
 
-## Flusso di una chiamata
+## Flow of a call
 
 ```text
-ToolSpec -> ChatRenderer -> prompt DSML -> token generati
-   -> ToolCallParser -> evento toolCall
+ToolSpec -> ChatRenderer -> DSML prompt -> generated tokens
+   -> ToolCallParser -> toolCall event
    -> ChatStore+ToolLoop / DistributedController
-   -> ToolRegistry -> esecuzione
-   -> risultato strutturato -> nuovo turno tool_result -> inferenza
+   -> ToolRegistry -> execution
+   -> structured result -> new tool_result turn -> inference
 ```
 
-`DS4Core` conosce soltanto specifiche, rendering e parsing. `InferenceService`
-emette la chiamata completa; `ChatStore+ToolLoop` e `DistributedController`
-orchestrano i round. `DS4Engine` fornisce registro ed esecuzione. La GUI mostra
-stato e risultati senza reinterpretare il protocollo DSML.
+`DS4Core` knows only specs, rendering, and parsing. `InferenceService` emits
+the complete call; `ChatStore+ToolLoop` and `DistributedController` orchestrate
+the rounds. `DS4Engine` provides the registry and execution. The GUI shows
+status and results without reinterpreting the DSML protocol.
 
-## Registro
+## Registry
 
-`ToolRegistry` associa nome, descrizione, schema parametri ed handler. Ogni
-agente usa una allow-list per filtrare le `ToolSpec` dichiarate nel prompt: un
-tool escluso non viene presentato al modello nel turno corrente.
+`ToolRegistry` associates name, description, parameter schema, and handler.
+Each agent uses an allow-list to filter the `ToolSpec`s declared in the prompt:
+an excluded tool is not presented to the model in the current turn.
 
-Questa allow-list è un filtro di esposizione, **non** un confine di sicurezza
-né un controllo applicato automaticamente all'esecuzione. L'API
-`ToolRegistry.executeAuto(_:)` risolve direttamente qualunque built-in
-registrato o tool MCP con quel nome e non riceve l'insieme consentito. Un
-chiamante che accetta `ToolCall` da una fonte non fidata e richiede enforcement
-deve quindi verificare esplicitamente il nome contro la propria policy prima di
-invocare `executeAuto`; registrazione e allow-list, da sole, non autorizzano la
-chiamata.
+This allow-list is an exposure filter, **not** a security boundary and not a
+check automatically applied at execution time. The
+`ToolRegistry.executeAuto(_:)` API directly resolves any registered built-in or
+MCP tool with that name and does not receive the allowed set. A caller that
+accepts `ToolCall`s from an untrusted source and requires enforcement must
+therefore explicitly check the name against its own policy before invoking
+`executeAuto`; registration and allow-listing, on their own, do not authorize
+the call.
 
-Categorie integrate:
+Built-in categories:
 
-- aritmetica e orologio;
-- file limitati al progetto;
-- indice e modifica del progetto;
-- Git e import GitHub;
-- fetch e ricerca Web;
-- elenco e avvio di sub-agent.
+- arithmetic and clock;
+- project-restricted files;
+- project indexing and editing;
+- Git and GitHub import;
+- Web fetch and search;
+- listing and launching sub-agents.
 
-I tool sono raggruppati sotto `Sources/DS4Engine/Tools/Builtins`, uno per file o
-responsabilità coesa.
+The tools are grouped under `Sources/DS4Engine/Tools/Builtins`, one per file or
+cohesive responsibility.
 
-## Sicurezza dei tool locali
+## Local tool security
 
-I tool di progetto devono risolvere e normalizzare il percorso rispetto alla
-root autorizzata. Symlink, `..` e percorsi assoluti non devono consentire fuga
-dalla root. Le operazioni Git usano una whitelist; l'import GitHub non deve
-ereditare credenziali arbitrarie.
+Project tools must resolve and normalize paths against the authorized root.
+Symlinks, `..`, and absolute paths must not allow escaping the root. Git
+operations use a whitelist; the GitHub import must not inherit arbitrary
+credentials.
 
-Un nuovo tool che modifica file deve dichiarare chiaramente il proprio ambito
-e restituire errori strutturati. Non usare output del modello come comando shell
-generico.
+A new tool that modifies files must clearly declare its scope and return
+structured errors. Do not use model output as a generic shell command.
 
-## Agenti
+## Agents
 
-Un profilo agente contiene:
+An agent profile contains:
 
-- id e nome;
+- id and name;
 - system prompt;
-- icona/metadati di presentazione;
-- allow-list dei tool;
-- profilo di uso degli esperti.
+- icon/presentation metadata;
+- tool allow-list;
+- expert-usage profile.
 
-Cambiare agente modifica il contesto applicativo e il profilo di routing, non
-crea un secondo decoder. I profili sono gestiti sotto `DS4Engine/Agents` e
-presentati dalle feature Chat/Tuning.
+Switching agents changes the application context and the routing profile; it
+does not create a second decoder. Profiles are managed under `DS4Engine/Agents`
+and presented by the Chat/Tuning features.
 
-## Sub-agent
+## Sub-agents
 
-I sub-agent ricevono domanda e contesto esplicitamente delegati. Eseguono una
-conversazione isolata e restituiscono soltanto la risposta finale al chiamante.
-La cache KV è content-keyed per riutilizzare prefissi compatibili senza
-contaminare il contesto principale.
+Sub-agents receive an explicitly delegated question and context. They run an
+isolated conversation and return only the final answer to the caller. The KV
+cache is content-keyed so compatible prefixes can be reused without
+contaminating the main context.
 
-L'orchestratore deve limitare profondità, strumenti e quantità di contenuto
-passato al sub-agent. Uno stop della chat principale deve propagare ai task
-figli.
+The orchestrator must limit depth, tools, and the amount of content passed to
+the sub-agent. Stopping the main chat must propagate to child tasks.
 
 ## MCP
 
-`Sources/DS4Engine/Tools/MCP` implementa:
+`Sources/DS4Engine/Tools/MCP` implements:
 
-- configurazione persistibile;
-- protocollo JSON-RPC;
-- transport stdio;
+- persistable configuration;
+- the JSON-RPC protocol;
+- stdio transport;
 - Streamable HTTP;
-- discovery e chiamata dei tool;
-- mapping dei nomi nel registro locale.
+- tool discovery and invocation;
+- name mapping into the local registry.
 
-I tool remoti vengono esposti come `mcp_<server>_<tool>` per evitare collisioni.
-Le configurazioni possono provenire da JSON compatibile con `mcpServers`.
+Remote tools are exposed as `mcp_<server>_<tool>` to avoid collisions.
+Configurations can come from JSON compatible with `mcpServers`.
 
-## Transport stdio
+## stdio transport
 
-Il manager avvia un processo figlio, invia messaggi JSON-RPC su stdin e legge
-stdout. Log o testo non protocollare non devono essere interpretati come una
-risposta valida. Ambiente e argomenti arrivano dalla configurazione esplicita.
+The manager launches a child process, sends JSON-RPC messages on stdin, and
+reads stdout. Logs or non-protocol text must not be interpreted as a valid
+response. Environment and arguments come from the explicit configuration.
 
 ## Streamable HTTP
 
-Il transport invia JSON-RPC all'endpoint configurato, conserva eventuali
-header e gestisce risposte/stream secondo il protocollo supportato. Token e
-header sono dati sensibili e non devono comparire nei log diagnostici.
+The transport sends JSON-RPC to the configured endpoint, preserves any headers,
+and handles responses/streams according to the supported protocol. Tokens and
+headers are sensitive data and must not appear in diagnostic logs.
 
-## Aggiungere un tool integrato
+## Adding a built-in tool
 
-1. Creare l'implementazione nella categoria corretta.
-2. Definire schema JSON stretto e descrizione breve.
-3. Validare ogni parametro prima dell'effetto.
-4. Registrare il tool nel punto centrale.
-5. Decidere quali agenti possono usarlo.
-6. Aggiungere test di successo, input errato e confine di sicurezza.
-7. Aggiornare il README della categoria.
+1. Create the implementation in the correct category.
+2. Define a strict JSON schema and a short description.
+3. Validate every parameter before any effect.
+4. Register the tool at the central point.
+5. Decide which agents may use it.
+6. Add tests for success, invalid input, and the security boundary.
+7. Update the category README.
 
-## Aggiungere funzionalità MCP
+## Adding MCP functionality
 
-Separare configurazione, transport e mapping nel registro. Non introdurre
-dipendenze MCP in `DS4Core` o `DS4Metal`. Coprire handshake, elenco tool,
-chiamata, errore remoto, timeout e cancellazione.
+Keep configuration, transport, and registry mapping separate. Do not introduce
+MCP dependencies into `DS4Core` or `DS4Metal`. Cover handshake, tool listing,
+invocation, remote errors, timeouts, and cancellation.
 
-## Documenti correlati
+## Related documents
 
 - [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md)
 - [GUI-SERVER-E-API.md](GUI-SERVER-E-API.md)

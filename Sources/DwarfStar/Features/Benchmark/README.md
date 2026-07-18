@@ -1,113 +1,118 @@
 # DwarfStar/Features/Benchmark
 
-Benchmark nativi del motore condiviso. Il pannello offre due misure distinte:
+Native benchmarks for the shared engine. The panel offers two distinct
+measurements:
 
-- **Speed** misura throughput di prefill e generazione a contesti crescenti ed
-  è disponibile sia in locale sia attraverso il coordinator distribuito;
-- **Correctness** misura quante volte il token successivo di un testo fornito
-  dall'utente compare fra i primi uno, due o tre candidati del modello. Usa
-  teacher forcing ed è al momento disponibile soltanto sul motore locale.
+- **Speed** measures prefill and generation throughput at increasing context
+  lengths and is available both locally and through the distributed
+  coordinator;
+- **Correctness** measures how often the next token of a user-provided text
+  appears among the model's top one, two or three candidates. It uses teacher
+  forcing and is currently available only on the local engine.
 
-## Componenti
+## Components
 
 - [`Controllers/BenchController.swift`](Controllers/BenchController.swift)
-  costruisce i punti delle due misure, coordina esecuzione e cancellazione e
-  impedisce l'esecuzione locale mentre la chat usa lo stesso motore.
-- [`Views/BenchView.swift`](Views/BenchView.swift) presenta selezione del motore,
-  corpus e limiti, stato di avanzamento, KPI e grafici Swift Charts.
+  builds the data points for both measurements, coordinates execution and
+  cancellation, and prevents local runs while the chat is using the same
+  engine.
+- [`Views/BenchView.swift`](Views/BenchView.swift) presents engine selection,
+  corpus and limits, progress state, KPIs and Swift Charts graphs.
 
-Il benchmark locale riusa l'unico `InferenceService` già caricato: non crea una
-seconda copia del modello. Quello distribuito riusa la connessione attiva del
-coordinator. Entrambi modificano lo stato KV e non devono sovrapporsi a una
-generazione chat.
+The local benchmark reuses the single `InferenceService` already loaded: it
+does not create a second copy of the model. The distributed one reuses the
+coordinator's active connection. Both modify KV state and must not overlap
+with a chat generation.
 
-## Correctness: significato della metrica
+## Correctness: meaning of the metric
 
-Il testo viene tokenizzato dal tokenizer del GGUF. Il motore seleziona più
-segmenti riproducibili tramite seed: il primo target di ciascun segmento è
-distinto, anche se contesto e target dei segmenti possono sovrapporsi. Per ogni
-segmento estrae uniformemente la lunghezza del contesto fra i limiti scelti e
-valuta fino al massimo configurato di token. Preferisce segmenti completi e usa
-la coda corta del corpus solo quando il numero richiesto lo rende necessario.
+The text is tokenized by the GGUF's tokenizer. The engine selects multiple
+segments reproducibly via seed: the first target of each segment is distinct,
+even though segment contexts and targets may overlap. For each segment it
+draws the context length uniformly between the chosen limits and evaluates up
+to the configured maximum number of tokens. It prefers complete segments and
+uses the short tail of the corpus only when the requested count makes it
+necessary.
 
-Il contesto non viene valutato; per ogni token successivo il motore riceve
-sempre il token reale precedente e confronta il token reale seguente con i tre
-candidati dal logit più alto. Questo teacher forcing evita che un singolo errore
-faccia divergere il resto del test. I candidati sono token del vocabolario, non
-i tre esperti MoE selezionati internamente dal router.
+The context itself is not evaluated; for each next token the engine always
+receives the real previous token and compares the real following token against
+the three candidates with the highest logits. This teacher forcing prevents a
+single error from derailing the rest of the test. The candidates are
+vocabulary tokens, not the three MoE experts selected internally by the
+router.
 
-La top-1 conta i casi in cui il primo candidato è esatto, la top-2 quelli in cui
-il token atteso compare nei primi due e la top-3 quelli in cui compare nei primi
-tre. Per costruzione vale sempre `top-1 <= top-2 <= top-3`.
-Non misura correttezza fattuale, capacità di ragionamento o qualità generale di
-una risposta. I confronti tra modelli o configurazioni sono significativi solo
-usando lo stesso testo, tokenizer, seed, numero di segmenti, intervallo di
-contesto e limite per segmento. La UI mostra:
+Top-1 counts the cases where the first candidate is exact, top-2 those where
+the expected token appears in the first two, and top-3 those where it appears
+in the first three. By construction, `top-1 <= top-2 <= top-3` always holds.
+It does not measure factual correctness, reasoning ability or the overall
+quality of a response. Comparisons between models or configurations are
+meaningful only when using the same text, tokenizer, seed, number of segments,
+context range and per-segment limit. The UI shows:
 
-- corretti/totale e accuratezza top-1, top-2 e top-3, durata e token valutati al
-  secondo;
-- un grafico cumulativo dell'aggregazione progressiva dei token valutati;
-- un grafico comparativo top-1, top-2 e top-3 per ciascun segmento;
-- l'aggregato globale, calcolato sui conteggi complessivi e quindi ponderato per
-  il numero di token realmente valutato in ogni segmento.
+- correct/total and top-1, top-2 and top-3 accuracy, duration and tokens
+  evaluated per second;
+- a cumulative chart of the progressive aggregation of evaluated tokens;
+- a comparative top-1, top-2 and top-3 chart for each segment;
+- the global aggregate, computed on the overall counts and therefore weighted
+  by the number of tokens actually evaluated in each segment.
 
-Per mantenere reattiva l'interfaccia anche con milioni di token richiesti, il
-controller conserva al massimo circa 4.096 punti per il grafico live e aumenta
-automaticamente la dimensione minima dei blocchi del grafico finale. I contatori
-Top-1/2/3 e il risultato finale continuano a includere ogni token valutato: viene
-ridotta solo la densità visiva dei punti.
+To keep the interface responsive even with millions of requested tokens, the
+controller keeps at most about 4,096 points for the live chart and
+automatically increases the minimum block size of the final chart. The
+Top-1/2/3 counters and the final result still include every evaluated token:
+only the visual density of the points is reduced.
 
-Per riprodurre una prova vanno mantenuti uguali corpus, seed, numero di
-segmenti, intervallo del contesto e token massimi per segmento. Segmenti più
-corti non devono avere lo stesso peso di quelli completi nella metrica globale.
+To reproduce a run, the corpus, seed, number of segments, context range and
+maximum tokens per segment must be kept identical. Shorter segments must not
+carry the same weight as complete ones in the global metric.
 
-La modalità distribuita viene rifiutata esplicitamente per Correctness: il
-protocollo corrente restituisce soltanto i logits dell'ultimo token di un chunk
-e non esiste un fallback silenzioso al motore locale.
+Distributed mode is explicitly rejected for Correctness: the current protocol
+returns only the logits of the last token of a chunk, and there is no silent
+fallback to the local engine.
 
-## Interpretazione
+## Interpretation
 
-- Il prefill layer-major tende ad ammortizzare i costi fissi all'aumentare dei
-  token, ma chunk, union, cache e pressione memoria possono cambiare il trend.
-- Il decode è una sequenza token-per-token; sul profilo Flash in streaming può
-  essere dominato dal gather SSD, mentre a contesti lunghi cresce il peso
-  dell'attenzione e del KV.
-- Il primo punto e i primi token possono includere warm-up, wiring e cache
-  fredde. Confrontare sempre la stessa metrica di regime.
-- I risultati locali e distribuiti non sono confrontabili se cambiano GGUF,
-  contesto, activation bits, route, cache o knob del motore.
+- Layer-major prefill tends to amortize fixed costs as tokens increase, but
+  chunking, union, caches and memory pressure can change the trend.
+- Decode is a token-by-token sequence; on the streaming Flash profile it can
+  be dominated by the SSD gather, while at long contexts the weight of
+  attention and KV grows.
+- The first point and the first tokens may include warm-up, wiring and cold
+  caches. Always compare the same steady-state metric.
+- Local and distributed results are not comparable if the GGUF, context,
+  activation bits, route, caches or engine knobs change.
 
-I vecchi numeri puntuali sono stati rimossi da questo README perché non avevano
-data, build, hash del GGUF e linea completa dei knob. Le misure storiche per cui
-è disponibile un contesto esplicito restano in
+The old point-in-time numbers were removed from this README because they
+lacked date, build, GGUF hash and the complete knob line. Historical
+measurements for which an explicit context is available remain in
 [`docs/VALUTAZIONE-DEMO-PERF.md`](../../../../docs/VALUTAZIONE-DEMO-PERF.md).
 
-## Provenienza obbligatoria per nuove misure
+## Required provenance for new measurements
 
-Quando si aggiorna la documentazione con risultati reali, registrare insieme:
+When updating the documentation with real results, record together:
 
-1. data, commit/build e modalità Local o Distributed;
-2. modello del Mac, RAM, versione macOS e pressione memoria/swap;
-3. nome, dimensione e SHA-256 del GGUF;
-4. contesto, prompt o corpus, token generati e warm-up;
-5. linea completa `DS4 engine:` e impostazioni non comprese in quella linea;
-6. stato caldo/freddo di `.usage.json`, `.q4dense`, `.expbundle` e disk KV;
-7. per la distribuzione, peer, topologia, activation bits e caratteristiche
-   della rete;
-8. media/percentile usato, numero di ripetizioni e variabilità osservata.
+1. date, commit/build and Local or Distributed mode;
+2. Mac model, RAM, macOS version and memory/swap pressure;
+3. name, size and SHA-256 of the GGUF;
+4. context, prompt or corpus, generated tokens and warm-up;
+5. the complete `DS4 engine:` line and any settings not covered by that line;
+6. warm/cold state of `.usage.json`, `.q4dense`, `.expbundle` and disk KV;
+7. for distribution: peers, topology, activation bits and network
+   characteristics;
+8. mean/percentile used, number of repetitions and observed variability.
 
-Conservare il report grezzo o un riferimento stabile ad esso. Una singola cifra
-senza questi dati va descritta come osservazione non riproducibile, non come
-default o regressione.
+Keep the raw report or a stable reference to it. A single figure without this
+data must be described as a non-reproducible observation, not as a default or
+a regression.
 
-## Regole di modifica
+## Modification rules
 
-Il controller possiede esecuzione e risultati; la view soltanto controlli e
-rendering. Mantenere l'esclusione reciproca con Chat, non introdurre un secondo
-engine e aggiornare i test quando cambia la definizione delle metriche. Gli
-aggiornamenti prodotti dal lavoro detached devono attraversare stream Sendable:
-mai mutare direttamente stato osservabile MainActor dal motore.
+The controller owns execution and results; the view only controls and
+rendering. Maintain mutual exclusion with Chat, do not introduce a second
+engine, and update the tests when the definition of the metrics changes.
+Updates produced by detached work must go through Sendable streams: never
+mutate MainActor observable state directly from the engine.
 
-Vedere anche il [README dei controller](Controllers/README.md), il
-[README delle view](Views/README.md) e la
-[guida di testing](../../../../docs/TESTING-E-VALIDAZIONE.md).
+See also the [controllers README](Controllers/README.md), the
+[views README](Views/README.md) and the
+[testing guide](../../../../docs/TESTING-E-VALIDAZIONE.md).

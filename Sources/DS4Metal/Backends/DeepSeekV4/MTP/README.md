@@ -1,17 +1,17 @@
 # DeepSeekV4/MTP (Multi-Token Prediction)
 
-Componenti per lo speculative decode con la testa MTP di DeepSeek. Il sidecar
-ha l'accessory id interno `mtp`, ma è escluso dal catalogo GUI dei modelli
-principali. Piano e stato in `docs/SELF-SPECULATIVE.md`, sezione "Fase M".
+Components for speculative decode with the DeepSeek MTP head. The sidecar
+has the internal accessory id `mtp`, but is excluded from the GUI catalog of
+main models. Plan and status in `docs/SELF-SPECULATIVE.md`, section "Fase M".
 
-- `MTPSidecar.swift` — Fase M1: apertura del GGUF sidecar, classificazione dei
-  tensori nei ruoli d'interfaccia (eh_proj, embed_tokens, enorm, hnorm,
-  shared_head.*) e report di validazione contro le dimensioni del modello
-  principale. Solo metadati: nessun buffer GPU, nessun effetto sul decode.
-  Esposto nella demo via `DS4_MTP_GGUF` (percorso esplicito, oppure `=1` per
-  cercare `*MTP*.gguf` accanto al modello).
+- `MTPSidecar.swift` — Phase M1: opening the sidecar GGUF, classifying the
+  tensors into interface roles (eh_proj, embed_tokens, enorm, hnorm,
+  shared_head.*) and a validation report against the main model's
+  dimensions. Metadata only: no GPU buffers, no effect on decode.
+  Exposed in the demo via `DS4_MTP_GGUF` (explicit path, or `=1` to
+  look for `*MTP*.gguf` next to the model).
 
-La Fase M2 (caricamento residente + forward del draft) va cablata SOLO dopo
-aver letto il report M1 sul sidecar reale: nomi, forme e quant dei tensori del
-blocco transformer MTP determinano il wiring, e indovinarli produce garbage
-silenzioso.
+Phase M2 (resident loading + draft forward) must be wired up ONLY after
+reading the M1 report on the real sidecar: names, shapes and quants of the
+MTP transformer block's tensors determine the wiring, and guessing them
+produces silent garbage.

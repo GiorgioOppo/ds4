@@ -1,30 +1,30 @@
 # DeepSeekV4/Streaming
 
-Streaming dei pesi densi per-layer da SSD tramite ring di staging, con cache
-residenti opzionali per ridurre la banda per token.
+Streaming of per-layer dense weights from SSD through a staging ring, with
+optional resident caches to reduce per-token bandwidth.
 
-## File principali
+## Main files
 
-- [`DenseStreamer.swift`](DenseStreamer.swift): stato, piano per layer, file
-  descriptor e inizializzazione del ring.
-- `DenseStreamer+Types.swift`: entry, campi e tipi interni del piano.
-- `DenseStreamer+Pipeline.swift`: read-ahead e consegna ordinata degli slot.
-- `DenseStreamer+Q4Cache.swift`: requant Q8_0 -> Q4_K e cache persistente.
-- `DenseStreamer+CompressorQ8.swift`: conversione opzionale dei compressor F16.
+- [`DenseStreamer.swift`](DenseStreamer.swift): state, per-layer plan, file
+  descriptors and ring initialization.
+- `DenseStreamer+Types.swift`: entries, fields and internal types of the plan.
+- `DenseStreamer+Pipeline.swift`: read-ahead and ordered delivery of slots.
+- `DenseStreamer+Q4Cache.swift`: Q8_0 -> Q4_K requant and persistent cache.
+- `DenseStreamer+CompressorQ8.swift`: optional conversion of the F16 compressors.
 
-## Flusso
+## Flow
 
-All'avvio viene costruito un piano di regioni allineate. Durante il decode,
-mentre la GPU elabora il layer corrente, il ring legge i layer futuri con
-`pread/F_NOCACHE`; i pesi residenti Q4 o compressor vengono esclusi dallo stream.
-Con `DS4_LAZY_IDX`, anche le proiezioni di scoring dell'indexer restano fuori
-dal piano: vengono lette una sola volta in buffer residenti quando il contesto
-effettivamente usato raggiunge la soglia sparse. Al consumo, le subview dello
-slot e gli eventuali buffer residenti popolano un `LayerWeights` temporaneo.
+At startup an aligned-region plan is built. During decode, while the GPU
+processes the current layer, the ring reads future layers with
+`pread/F_NOCACHE`; resident Q4 or compressor weights are excluded from the
+stream. With `DS4_LAZY_IDX`, the indexer's scoring projections also stay out
+of the plan: they are read once into resident buffers when the context
+actually in use reaches the sparse threshold. On consumption, the slot's
+subviews and any resident buffers populate a temporary `LayerWeights`.
 
-## Regole di modifica
+## Modification rules
 
-Uno slot non può essere sovrascritto finché la GPU lo usa. Mantenere limitato il
-numero di richieste in-flight e gestire tutti i worker nei percorsi di errore.
-Separare ottimizzazioni senza perdita da quantizzazioni con perdita e invalidare la cache
-quando cambiano modello, formato o parametri di conversione.
+A slot must not be overwritten while the GPU is using it. Keep the number of
+in-flight requests bounded and handle all workers in the error paths.
+Keep lossless optimizations separate from lossy quantizations and invalidate
+the cache whenever the model, format or conversion parameters change.

@@ -1,11 +1,10 @@
-# Struttura del progetto
+# Project structure
 
-Questa guida descrive dove collocare nuovo codice e quali dipendenze sono
-ammesse. La struttura separa i dati puri, l'esecuzione GPU, l'orchestrazione,
-le funzionalità dell'app e la CLI, in modo che ogni modifica abbia un
-proprietario chiaro.
+This guide describes where to place new code and which dependencies are
+allowed. The structure separates pure data, GPU execution, orchestration,
+app features and the CLI, so that every change has a clear owner.
 
-## Moduli e dipendenze
+## Modules and dependencies
 
 ```text
 DS4Metal  = DS4Core
@@ -14,220 +13,221 @@ DwarfStar = DS4Core + DS4Engine
 DS4Demo   = DS4Core + DS4Metal
 ```
 
-In particolare:
+In particular:
 
-| Target | Dipendenze | Contenuto |
+| Target | Dependencies | Contents |
 |---|---|---|
-| `DS4Core` | nessuna interna | Formati e contratti portabili, rilevamento architettura, sampling e componenti Core dei backend. |
-| `DS4Metal` | `DS4Core` | Runtime e kernel Metal comuni; decoder, pesi e stato GPU separati per backend. |
-| `DS4Engine` | `DS4Core`, `DS4Metal` | Selezione del backend, servizio di inferenza, strumenti, persistenza, download e distribuzione. |
-| `DwarfStar` | `DS4Engine`, `DS4Core` | Interfaccia SwiftUI, stato delle feature e server HTTP esposto dall'app. |
-| `DS4Demo` | `DS4Core`, `DS4Metal` | CLI diagnostica che usa direttamente il motore, senza lo strato applicativo. |
+| `DS4Core` | no internal ones | Portable formats and contracts, architecture detection, sampling and the Core components of the backends. |
+| `DS4Metal` | `DS4Core` | Shared Metal runtime and kernels; decoder, weights and GPU state kept separate per backend. |
+| `DS4Engine` | `DS4Core`, `DS4Metal` | Backend selection, inference service, tools, persistence, downloads and distribution. |
+| `DwarfStar` | `DS4Engine`, `DS4Core` | SwiftUI interface, feature state and the HTTP server exposed by the app. |
+| `DS4Demo` | `DS4Core`, `DS4Metal` | Diagnostic CLI that uses the engine directly, without the application layer. |
 
-Le sottocartelle non sono moduli Swift. Servono a rendere visibile la
-responsabilità del codice; i confini reali sono i target dichiarati in
+Subfolders are not Swift modules. They exist to make code ownership
+visible; the real boundaries are the targets declared in
 `Package.swift`.
 
-## Mappa delle responsabilità
+## Responsibility map
 
-### DS4Core: contratti portabili e frontend dei backend
+### DS4Core: portable contracts and backend frontends
 
-- `Model/Common`: identificatore `general.architecture`, famiglia, descrittore,
-  capacità e rilevamento senza dipendenze Metal.
-- `Model/Backends/DeepSeekV4`: forma, profili Flash/Pro, default e validazione
-  dei metadati `deepseek4.*`.
-- `Model/Backends/Qwen`: punto di estensione documentato; nessuna forma Qwen è
-  ancora implementata.
-- `Conversation/Models`: turni, specifiche e chiamate tool condivise.
-- `Conversation/Backends/DeepSeekV4`: renderer, markup DSML e parsing delle
-  chiamate specifici del template DeepSeek.
-- `Tokenization/Common`: primitive byte-level riutilizzabili.
-- `Tokenization/Backends/DeepSeekV4`: tokenizer, token speciali e modalità
-  thinking DeepSeek; il percorso Qwen resta separato e non operativo.
-- `Formats/GGUF`: tipi GGUF, cursore binario e modello mappato in memoria.
-- `Formats/KVCheckpoint`: involucro persistente comune; i payload restano dei
-  singoli backend.
-- `Formats/Quantization`: conversioni numeriche e quantizzazione CPU.
-- `Generation`: sampling e politiche di scelta del token.
-- `Storage` e `Diagnostics`: pianificazione cache/SSD e avanzamento del load.
+- `Model/Common`: `general.architecture` identifier, family, descriptor,
+  capabilities and detection with no Metal dependencies.
+- `Model/Backends/DeepSeekV4`: shape, Flash/Pro profiles, defaults and
+  validation of `deepseek4.*` metadata.
+- `Model/Backends/Qwen`: documented extension point; no Qwen shape is
+  implemented yet.
+- `Conversation/Models`: shared turns, specs and tool calls.
+- `Conversation/Backends/DeepSeekV4`: renderer, DSML markup and call parsing
+  specific to the DeepSeek template.
+- `Tokenization/Common`: reusable byte-level primitives.
+- `Tokenization/Backends/DeepSeekV4`: DeepSeek tokenizer, special tokens and
+  thinking mode; the Qwen path stays separate and non-operational.
+- `Formats/GGUF`: GGUF types, binary cursor and memory-mapped model.
+- `Formats/KVCheckpoint`: shared persistent wrapper; payloads belong to the
+  individual backends.
+- `Formats/Quantization`: numeric conversions and CPU quantization.
+- `Generation`: sampling and token-choice policies.
+- `Storage` and `Diagnostics`: cache/SSD planning and load progress.
 
-Qui devono vivere strutture riutilizzabili senza Metal, rete o UI. Un tipo non
-diventa comune solo perché due modelli hanno un concetto con lo stesso nome:
-layout, token speciali e semantica devono essere realmente compatibili.
+Reusable structures with no Metal, network or UI dependencies must live here.
+A type does not become common just because two models share a concept with the
+same name: layout, special tokens and semantics must be genuinely compatible.
 
-### DS4Metal: runtime comune e backend GPU concreti
+### DS4Metal: shared runtime and concrete GPU backends
 
-- `Runtime/Core`: device, command queue, pipeline e `GPUTensor`.
-- `Runtime/Generated`: sorgenti Metal incorporati e generati.
-- `Kernels/<Area>`: wrapper Swift di operazioni riutilizzabili, raggruppati per
-  attenzione, compressione, dense, MoE e tensori.
-- `Graph/Core` e `Graph/Operations`: infrastruttura del grafo oggi condivisa
-  con il backend DeepSeek; non ospita la selezione dell'architettura.
-- `Model/Quantization`: descrittori di quantizzazione GPU comuni.
-- `Backends/Common`: confine di esecuzione ad alto livello e regole che
-  impediscono dispatch dinamico nel ciclo per layer.
-- `Backends/DeepSeekV4/Architecture`: dimensioni Flash e parametri RoPE.
-- `Backends/DeepSeekV4/Weights`, `Streaming`, `Experts`, `MTP`: mapping GGUF,
-  pesi densi ed esperti, sidecar e streaming specifici DeepSeek.
-- `Backends/DeepSeekV4/Decode`: esecuzione, generazione, attenzione, cache,
-  KV, prefill, diagnostica, riferimento e stato del decoder concreto.
-- `Backends/GLM52`: schema tensoriale, riferimenti DSA/IndexShare e primitive
-  Metal progressive; il decoder non è ancora eseguibile.
-- `Backends/Qwen`: placeholder documentato; nessun kernel o decoder fittizio.
+- `Runtime/Core`: device, command queue, pipelines and `GPUTensor`.
+- `Runtime/Generated`: embedded and generated Metal sources.
+- `Kernels/<Area>`: Swift wrappers for reusable operations, grouped by
+  attention, compression, dense, MoE and tensors.
+- `Graph/Core` and `Graph/Operations`: graph infrastructure currently shared
+  with the DeepSeek backend; it does not host architecture selection.
+- `Model/Quantization`: shared GPU quantization descriptors.
+- `Backends/Common`: high-level execution boundary and rules that
+  prevent dynamic dispatch inside the per-layer loop.
+- `Backends/DeepSeekV4/Architecture`: Flash dimensions and RoPE parameters.
+- `Backends/DeepSeekV4/Weights`, `Streaming`, `Experts`, `MTP`: GGUF mapping,
+  dense and expert weights, sidecars and DeepSeek-specific streaming.
+- `Backends/DeepSeekV4/Decode`: execution, generation, attention, cache,
+  KV, prefill, diagnostics, reference and state of the concrete decoder.
+- `Backends/GLM52`: tensor schema, DSA/IndexShare references and progressive
+  Metal primitives; the decoder is not yet runnable.
+- `Backends/Qwen`: documented placeholder; no fake kernels or decoder.
 
-Una struttura dati che contiene buffer o risorse Metal appartiene a questo
-target. La scelta dell'architettura avviene prima di entrare nel percorso caldo:
-non aggiungere `if qwen` a `StreamingDecoder` o ai suoi layer. Una scelta
-applicativa su come usare il modello appartiene invece a `DS4Engine`.
+A data structure holding Metal buffers or resources belongs in this
+target. Architecture choice happens before entering the hot path:
+do not add `if qwen` to `StreamingDecoder` or its layers. An application-level
+choice about how to use the model belongs in `DS4Engine` instead.
 
-### DS4Engine: API e funzionalità applicative
+### DS4Engine: API and application features
 
-- `Runtime/Common`: ispezione del modello, selezione del backend, descrittore e
-  capacità consumate dai client.
-- `Runtime/Backends/DeepSeekV4`: costruzione e impostazioni del backend
-  operativo senza cambiare il percorso caldo del decoder.
-- `Runtime/Backends/Qwen`: errore esplicito e punto di estensione, non una
-  implementazione simulata.
-- `Inference/API`: DTO pubblici di richieste, eventi, risultati e benchmark.
-- `Inference/Service`: actor principale e sue estensioni per conversazione,
-  generazione e agenti.
-- `Inference/Benchmark`, `Diagnostics`, `Subagents`, `Tuning`: funzionalità
-  separate che compongono il servizio.
-- `Distributed/Protocol`: dati del protocollo di rete divisi per framing,
-  handshake, file, KV, work, esperti, codec e serializzazione.
-- `Distributed/Coordinator`: stato centrale ed estensioni separate per
-  connessioni, file, KV, chat, expert parallelism e benchmark.
-- `Distributed/Worker`: stato del nodo ed estensioni raggruppate in
-  `Assignments`, `Files`, `KV`, `Lifecycle`, `Serving` e `Concurrency`.
-- `Distributed/Transport`, `Execution`, `Files`: rete, motore per nodo e
-  distribuzione dei modelli, tenuti separati dai messaggi wire.
-- `Tools/Core`: registro e contratti comuni; `Tools/Builtins`: un tool per file;
-  `Tools/Integrations` e `Tools/MCP`: client e protocolli esterni.
-- `Agents`, `ModelManagement`, `Persistence`, `Projects`: servizi applicativi
-  con responsabilità autonome.
+- `Runtime/Common`: model inspection, backend selection, descriptor and
+  capabilities consumed by clients.
+- `Runtime/Backends/DeepSeekV4`: construction and settings of the operational
+  backend without touching the decoder's hot path.
+- `Runtime/Backends/Qwen`: explicit error and extension point, not a
+  simulated implementation.
+- `Inference/API`: public DTOs for requests, events, results and benchmarks.
+- `Inference/Service`: main actor and its extensions for conversation,
+  generation and agents.
+- `Inference/Benchmark`, `Diagnostics`, `Subagents`, `Tuning`: separate
+  features that compose the service.
+- `Distributed/Protocol`: network protocol data split by framing,
+  handshake, files, KV, work, experts, codecs and serialization.
+- `Distributed/Coordinator`: central state and separate extensions for
+  connections, files, KV, chat, expert parallelism and benchmarks.
+- `Distributed/Worker`: node state and extensions grouped into
+  `Assignments`, `Files`, `KV`, `Lifecycle`, `Serving` and `Concurrency`.
+- `Distributed/Transport`, `Execution`, `Files`: networking, per-node engine
+  and model distribution, kept separate from the wire messages.
+- `Tools/Core`: registry and shared contracts; `Tools/Builtins`: one tool per
+  file; `Tools/Integrations` and `Tools/MCP`: external clients and protocols.
+- `Agents`, `ModelManagement`, `Persistence`, `Projects`: application services
+  with autonomous responsibilities.
 
-I tipi trasmessi su rete non devono dipendere dal coordinator o dal worker.
-Il trasporto non deve definire la semantica dei messaggi. Le estensioni del
-servizio seguono il nome `InferenceService+Responsabilita.swift`.
-`InferenceService` resta la façade pubblica: ispeziona e seleziona una volta il
-backend, poi conserva il decoder concreto. Demo, GUI e diagnostica non devono
-duplicare euristiche basate sul nome del file.
+Types transmitted over the network must not depend on the coordinator or the
+worker. The transport must not define message semantics. Service extensions
+follow the `InferenceService+Responsibility.swift` naming.
+`InferenceService` remains the public façade: it inspects and selects the
+backend once, then holds the concrete decoder. Demo, GUI and diagnostics must
+not duplicate heuristics based on the file name.
 
-### DwarfStar: feature dell'interfaccia
+### DwarfStar: interface features
 
-Ogni area visibile vive in `Features/<Feature>`:
+Every visible area lives in `Features/<Feature>`:
 
 - `Chat`: `Models`, `Persistence`, `ViewModels`, `Views`;
 - `Server`: `API`, `Networking`, `Concurrency`, `Services`, `Controllers`,
   `Views`;
-- `Benchmark`, `Diagnostics`, `Distributed`: controller e viste separati;
-- `ModelManagement`: modelli, servizi e viste;
-- `Project`, `Settings`, `Tuning`: contenuto specifico della feature.
+- `Benchmark`, `Diagnostics`, `Distributed`: separate controllers and views;
+- `ModelManagement`: models, services and views;
+- `Project`, `Settings`, `Tuning`: feature-specific content.
 
-`App` contiene solo bootstrap, ambiente, impostazioni globali e navigazione
-radice. `Shared/Support` è riservato a helper realmente condivisi tra più
-feature; non deve diventare una cartella generica.
+`App` contains only bootstrap, environment, global settings and root
+navigation. `Shared/Support` is reserved for helpers genuinely shared across
+multiple features; it must not become a catch-all folder.
 
-### DS4Demo: CLI e diagnostica
+### DS4Demo: CLI and diagnostics
 
-`Command/main.swift` gestisce argomenti e ciclo di esecuzione. Logging, audit
-del modello e benchmark del disco stanno in `Diagnostics`, così la CLI non
-duplica logica del motore.
+`Command/main.swift` handles arguments and the execution loop. Logging, model
+audit and disk benchmarks live in `Diagnostics`, so the CLI does not
+duplicate engine logic.
 
-### Test: struttura speculare ai domini
+### Tests: structure mirroring the domains
 
-Il target SwiftPM resta unico (`DS4CoreTests`), ma i file sono raggruppati per
-modulo e responsabilità:
+The SwiftPM target stays single (`DS4CoreTests`), but files are grouped by
+module and responsibility:
 
 ```text
 Tests/DS4CoreTests/
-  Core/                 contratti comuni e regressioni dei backend Core
-  Metal/                runtime/kernel comuni e regressioni dei backend GPU
-  Engine/               selezione backend, inferenza e servizi applicativi
+  Core/                 shared contracts and Core backend regressions
+  Metal/                shared runtime/kernels and GPU backend regressions
+  Engine/               backend selection, inference and application services
 ```
 
-Le sottocartelle sono scoperte ricorsivamente sia da SwiftPM sia da XcodeGen.
-Un nuovo test va collocato accanto al dominio del codice verificato; il nome del
-target non implica che debba riguardare soltanto `DS4Core`.
+Subfolders are discovered recursively by both SwiftPM and XcodeGen.
+A new test goes next to the domain of the code under test; the target name
+does not imply it must concern only `DS4Core`.
 
-## Regole per nuovi file
+## Rules for new files
 
-1. Collocare una struttura dati accanto al dominio che la possiede, non accanto
-   al primo chiamante. I DTO pubblici vanno in `Inference/API`; i messaggi wire
-   in `Distributed/Protocol`; i modelli solo UI nella feature corrispondente.
-2. Separare definizione dei dati, serializzazione, I/O ed esecuzione quando
-   cambiano per motivi diversi.
-3. Preferire un tipo principale o un'estensione coesa per file. Per estendere
-   un tipo usare `Tipo+Funzionalita.swift`.
-4. Tenere le dipendenze orientate verso il basso: Core non conosce Metal,
-   Engine o UI; Metal non conosce Engine o UI; Engine non conosce SwiftUI.
-5. Ispezione e descrizione dell'architettura stanno nel livello comune; forma,
-   tokenizer, template, tensori, decoder e payload KV stanno nel backend.
-6. Un wrapper Metal riutilizzabile va in `Kernels/<Area>`; il sorgente eseguito
-   dalla GPU va in `metal/*.metal`. Un grafo specifico va in
-   `Backends/<Architettura>` e non nel runtime comune.
-7. Una feature GUI nuova riceve una cartella propria, con sottocartelle create
-   solo quando esistono responsabilità distinte (modelli, servizi, controller,
-   viste o persistenza).
-8. Non modificare a mano file generati. Documentare sempre il comando che li
-   rigenera.
-9. Ogni nuova cartella sorgente, test o operativa deve contenere un
-   `README.md` con scopo, dipendenze, file principali e regole di verifica. I
-   dettagli trasversali vanno in un documento tematico sotto `docs/`.
+1. Place a data structure next to the domain that owns it, not next to
+   its first caller. Public DTOs go in `Inference/API`; wire messages
+   in `Distributed/Protocol`; UI-only models in the corresponding feature.
+2. Separate data definition, serialization, I/O and execution when
+   they change for different reasons.
+3. Prefer one main type or one cohesive extension per file. To extend
+   a type use `Type+Feature.swift`.
+4. Keep dependencies pointing downward: Core knows nothing about Metal,
+   Engine or UI; Metal knows nothing about Engine or UI; Engine knows
+   nothing about SwiftUI.
+5. Architecture inspection and description live in the common layer; shape,
+   tokenizer, templates, tensors, decoder and KV payloads live in the backend.
+6. A reusable Metal wrapper goes in `Kernels/<Area>`; the source executed
+   by the GPU goes in `metal/*.metal`. An architecture-specific graph goes in
+   `Backends/<Architecture>`, not in the shared runtime.
+7. A new GUI feature gets its own folder, with subfolders created
+   only when distinct responsibilities exist (models, services, controllers,
+   views or persistence).
+8. Never edit generated files by hand. Always document the command that
+   regenerates them.
+9. Every new source, test or operational folder must contain a
+   `README.md` with purpose, dependencies, main files and verification rules.
+   Cross-cutting details go in a thematic document under `docs/`.
 
-I Markdown collocati dentro un target sono esclusi automaticamente dal helper
-`markdownFiles` in `Package.swift`; XcodeGen usa l'esclusione ricorsiva
-`**/*.md`. Non mantenere liste manuali di README nel manifesto.
+Markdown files placed inside a target are excluded automatically by the
+`markdownFiles` helper in `Package.swift`; XcodeGen uses the recursive
+exclusion `**/*.md`. Do not maintain manual README lists in the manifest.
 
-## Kernel generati
+## Generated kernels
 
-I file `metal/*.metal` sono la fonte autorevole. Il comando:
+The `metal/*.metal` files are the source of truth. The command:
 
 ```sh
 make embed-kernels
 ```
 
-genera
-`Sources/DS4Metal/Runtime/Generated/KernelSources.swift`, incorporato nei
-binari SwiftPM e nell'app. Ogni modifica a un kernel deve quindi seguire questo
-flusso:
+generates
+`Sources/DS4Metal/Runtime/Generated/KernelSources.swift`, embedded in the
+SwiftPM binaries and in the app. Every kernel change must therefore follow
+this flow:
 
-1. modificare il file `.metal`;
-2. aggiornare il wrapper in `Sources/DS4Metal/Kernels/<Area>` se cambia la
-   firma;
-3. eseguire `make embed-kernels`;
-4. compilare e lanciare i test.
+1. edit the `.metal` file;
+2. update the wrapper in `Sources/DS4Metal/Kernels/<Area>` if the
+   signature changes;
+3. run `make embed-kernels`;
+4. build and run the tests.
 
-## Build, test e progetto Xcode
+## Build, tests and Xcode project
 
-Dalla radice del repository:
+From the repository root:
 
 ```sh
-# Build di debug di tutti i target
+# Debug build of all targets
 swift build --disable-sandbox
 
-# Suite di test
+# Test suite
 swift test --disable-sandbox
 
-# Build release della demo
+# Release build of the demo
 swift build -c release --product DS4Demo --disable-sandbox
 
-# Rigenera il progetto dopo aggiunte, rimozioni o spostamenti di file
+# Regenerate the project after adding, removing or moving files
 xcodegen generate
 
-# Avvia la CLI o la GUI tramite SwiftPM
+# Launch the CLI or the GUI through SwiftPM
 swift run DS4Demo
 swift run DwarfStar
 ```
 
-Su macOS, se la toolchain attiva non punta all'installazione completa di
-Xcode, anteporre:
+On macOS, if the active toolchain does not point to the full Xcode
+installation, prefix with:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --disable-sandbox
 ```
 
-Dopo una riorganizzazione verificare sia SwiftPM sia il progetto rigenerato:
+After a reorganization verify both SwiftPM and the regenerated project:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -239,5 +239,5 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-`xcodegen generate` usa `project.yml` come fonte autorevole: non aggiungere i
-file manualmente al `.pbxproj`.
+`xcodegen generate` uses `project.yml` as the source of truth: do not add
+files manually to the `.pbxproj`.

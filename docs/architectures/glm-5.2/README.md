@@ -1,123 +1,121 @@
 # GLM 5.2
 
-Questa cartella descrive il port nativo di GLM 5.2 (`glm-dsa`) in DwarfStar.
-Lo stato corrente non è più soltanto “download”: detector, contratto GGUF,
-tokenizer e protocollo chat sono implementati e verificati. Il decoder resta
-però intenzionalmente non eseguibile; GUI, demo, server e benchmark non possono
-ancora selezionare GLM.
+This folder describes the native port of GLM 5.2 (`glm-dsa`) in DwarfStar.
+The current state is no longer just "download": detector, GGUF contract,
+tokenizer and chat protocol are implemented and verified. The decoder however
+remains intentionally non-runnable; GUI, demo, server and benchmark cannot yet
+select GLM.
 
-## Stato corrente
+## Current state
 
-| Capacità | Stato |
+| Capability | State |
 |---|---|
-| Catalogo e download GUI | sì, tre GGUF monolitici con revisione/size/SHA fissati |
-| Riconoscimento `general.architecture = glm-dsa` | sì |
-| Selezione frontend/tokenizer | sì |
-| Configurazione e schema GGUF | sì, geometria stretta e 1.809 tensori |
-| Mappa pesi e piano letture top-8 | sì, payload-free e quant-block-aware |
-| Lettura payload dal GGUF | sì, `pread` bounded su descrittori e piani top-8 (record gate\|up\|down) |
-| Tokenizer GPT-2 + pretokenizer `glm4` | sì |
-| Template chat, reasoning e tool XML nativi | sì |
-| Oracle CPU di router, DSA/IndexShare e cache compatta | sì |
-| Kernel Metal GLM | tutte le fasi come primitive validate; composizione GPU del layer first-token e del decode step contro gli oracle |
-| Prefill, decode e output logits end-to-end | no |
-| Selezione GUI o `DS4Demo` | no |
-| Server, benchmark, KV checkpoint e distribuzione | no |
+| Catalog and GUI download | yes, three monolithic GGUFs with pinned revision/size/SHA |
+| Recognition of `general.architecture = glm-dsa` | yes |
+| Frontend/tokenizer selection | yes |
+| Configuration and GGUF schema | yes, strict geometry and 1,809 tensors |
+| Weight map and top-8 read plan | yes, payload-free and quant-block-aware |
+| Payload reads from the GGUF | yes, bounded `pread` over descriptors and top-8 plans (gate\|up\|down records) |
+| GPT-2 tokenizer + `glm4` pretokenizer | yes |
+| Native chat template, reasoning and XML tools | yes |
+| CPU oracle for router, DSA/IndexShare and compact cache | yes |
+| GLM Metal kernels | all phases as validated primitives; GPU composition of the first-token layer and of the decode step against the oracles |
+| End-to-end prefill, decode and logits output | no |
+| GUI or `DS4Demo` selection | no |
+| Server, benchmark, KV checkpoints and distribution | no |
 
-Le entry del catalogo restano `downloadOnly`. Un file completato può essere
-ispezionato e tokenizzato, ma `BackendSelector` lo rifiuta con un errore
-“backend non ancora implementato”; non esiste alcun fallback al decoder
-DeepSeek V4.
+The catalog entries remain `downloadOnly`. A completed file can be inspected
+and tokenized, but `BackendSelector` rejects it with a "backend not yet
+implemented" error; there is no fallback to the DeepSeek V4 decoder.
 
-## Contratto verificato sul GGUF reale
+## Contract verified against the real GGUF
 
-Il 17 luglio 2026 è stato letto l'header reale della variante IQ2_XXS dello
-snapshot Antirez `2638b3b878f5c6cc3ae7334b8dbea1275025f52e`:
+On July 17, 2026 the real header of the IQ2_XXS variant of the Antirez
+snapshot `2638b3b878f5c6cc3ae7334b8dbea1275025f52e` was read:
 
-- 66 metadata KV e 1.809 descrittori tensoriali;
-- architettura `glm-dsa`, 79 blocchi memorizzati e 78 blocchi autoregressivi;
-- hidden 6.144, vocabolario 154.880, 64 teste, KV-LoRA 512 e RoPE tail 64;
-- 256 esperti routed, top-8, un esperto condiviso e tre layer densi;
-- indexer 32×128, top-k 2.048 e full-indexer su 21 layer;
-- contesto dichiarato 1.048.576 token;
+- 66 metadata KVs and 1,809 tensor descriptors;
+- `glm-dsa` architecture, 79 stored blocks and 78 autoregressive blocks;
+- hidden 6,144, vocabulary 154,880, 64 heads, KV-LoRA 512 and RoPE tail 64;
+- 256 routed experts, top-8, one shared expert and three dense layers;
+- indexer 32×128, top-k 2,048 and full indexer on 21 layers;
+- declared context of 1,048,576 tokens;
 - `tokenizer.ggml.model = gpt2`, `tokenizer.ggml.pre = glm4`;
 - BOS `154822 = [gMASK]`, `<sop> = 154824`, EOS
   `154820 = <|endoftext|>`.
 
-Il test opzionale `GLM52RealHeaderIntegrationTests` usa una copia sparse della
-dimensione originale: valida configurazione, vocabolario e tutti i descrittori
-senza leggere il payload dei pesi. I test ordinari usano fixture sintetiche e
-non richiedono il GGUF.
+The optional test `GLM52RealHeaderIntegrationTests` uses a sparse copy of the
+original size: it validates configuration, vocabulary and all descriptors
+without reading the weight payload. The ordinary tests use synthetic fixtures
+and do not require the GGUF.
 
-## Cache DSA e memoria
+## DSA cache and memory
 
-Il layout compatto F16 conserva per token:
+The compact F16 layout keeps per token:
 
-- 78 × 512 valori KV-LoRA;
-- 78 × 64 valori RoPE;
-- 21 × 128 chiavi indexer.
+- 78 × 512 KV-LoRA values;
+- 78 × 64 RoPE values;
+- 21 × 128 indexer keys.
 
-Il totale è 95.232 byte/token, circa 372 MiB a 4.096 token e 8,87 GiB a
-100.000 token. Il planner DwarfStar cresce a slab append-only e può imporre un
-budget residente: una finestra logica grande non provoca quindi, da sola,
-l'allocazione immediata dell'intera cache. Il runtime dovrà comunque decidere
-come gestire contesti che superano RAM e budget SSD prima di dichiarare il
-milione di token supportato.
+The total is 95,232 bytes/token, roughly 372 MiB at 4,096 tokens and 8.87 GiB
+at 100,000 tokens. The DwarfStar planner grows in append-only slabs and can
+enforce a resident budget: a large logical window therefore does not, by
+itself, trigger the immediate allocation of the entire cache. The runtime will
+still have to decide how to handle contexts that exceed RAM and SSD budget
+before declaring the one-million-token context supported.
 
-## Manifest download
+## Download manifest
 
-| Variante | Filename | Dimensione esatta | SHA-256 |
+| Variant | Filename | Exact size | SHA-256 |
 |---|---|---:|---|
-| IQ2_XXS RoutedIQ | `GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf` | 211.075.856.448 byte | `a49de64c5020432bdae23de36a423a9660a5621bc0db8d12b66bd8814b07fea0` |
-| Q2_K RoutedQ2K | `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` | 262.036.650.048 byte | `b9fa49d010dad35b96418c45831c212a746715b0646c1121ccfc414455bd6fe5` |
-| Q4_K RoutedQ4K | `GLM-5.2-UD-Q4_K_RoutedQ4K.gguf` | 434.170.886.208 byte | `7160879c87756236eea16ec6bfeb19288d16fa94dcfcef3a5ed5f38b1383d3a5` |
+| IQ2_XXS RoutedIQ | `GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf` | 211,075,856,448 bytes | `a49de64c5020432bdae23de36a423a9660a5621bc0db8d12b66bd8814b07fea0` |
+| Q2_K RoutedQ2K | `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` | 262,036,650,048 bytes | `b9fa49d010dad35b96418c45831c212a746715b0646c1121ccfc414455bd6fe5` |
+| Q4_K RoutedQ4K | `GLM-5.2-UD-Q4_K_RoutedQ4K.gguf` | 434,170,886,208 bytes | `7160879c87756236eea16ec6bfeb19288d16fa94dcfcef3a5ed5f38b1383d3a5` |
 
-Sono alternative monolitiche, non shard. Il downloader scrive su `.part`, usa
-buffer limitati, supporta resume e verifica SHA a blocchi senza caricare il
-GGUF in RAM.
+These are monolithic alternatives, not shards. The downloader writes to
+`.part`, uses bounded buffers, supports resume and verifies the SHA in blocks
+without loading the GGUF into RAM.
 
-## Avanzamento del runtime
+## Runtime progress
 
-La sequenza di abilitazione è vincolante:
+The enablement sequence is binding:
 
-1. collegare la mappa pesi validata alle letture SSD/MetalIO top-8 e alle cache
-   — avviato: `GLM52PayloadReader` esegue descrittori e piani top-8 con `pread`
-   bounded (doppia prova dei limiti, rifiuto dei GGUF troncati all'apertura) e
-   `GLM52ExpertSlotCache` fornisce la cache LRU per-esperto con hit
-   byte-identici e pinning del batch; restano MetalIO e residency;
-2. completare Q/KV-LoRA, RoPE, indexer, attenzione DSA e IndexShare
-   — fatto a livello di validazione: il decode step è composto su GPU
-   (`glm52DecodeLayer`) con il cablaggio esatto upstream — store delle cache
-   PRIMA di selezione/attenzione (prefisso KV-LoRA normato + coda K-RoPE
-   grezza), chiave indexer con LayerNorm centrata e RoPE sul prefisso,
-   `visible = pos+1` con fill-range o score+top-k, IndexShare verbatim, e
-   rotazione della coda K per-riga al momento dell'attenzione — giudicato
-   dall'oracle `GLM52DecodeCPUReference`. Il grafo persistente è composto:
-   pesi quantizzati residenti caricati una volta (attenzione, FFN
-   densi/shared, output head), cache compatta e chiavi indexer residenti
-   aggiornate in place, attivazioni incatenate su buffer (un solo command
-   buffer nel percorso fill-range), accumulo esperti su GPU con streaming
-   per-token dei record selezionati, e il forward multi-layer
-   `glm52ResidentDecodeForward` con la policy IndexShare reale sugli indici
-   assoluti. Il motore reale `GLM52ResidentModel` carica la mappa pesi
-   validata dal GGUF nei buffer residenti (embedding row per token, esperti
-   routed via slot cache), esegue prefill token-per-token e greedy decode;
-   il kernel IQ2_XXS (formato routed del file pubblicato) è validato
-   contro il dequant di riferimento, quindi l'intero stack di 78 layer è
-   caricabile dal GGUF reale. Il gate di parità è pronto in forma opt-in:
-   `GLM52LogitsParityIntegrationTests` confronta motore e oracle CPU sui
-   pesi reali dequantizzati (stack troncato 4 layer: densi + primo sparse
-   con IndexShare ed esperti IQ2_XXS), selezioni e router esatti e tutti i
-   154.880 logits entro |delta| <= 0,05 + 1% con argmax identico; resta
-   l'estensione allo stack completo di 78 layer;
-3. completare layer densi, MoE routed/shared, RMS residuale e output head;
-4. confrontare embedding, ogni layer e logits con un oracle indipendente;
-5. verificare prefill e decode su prompt reali, incluse chat e tool call;
-6. misurare RAM, pressure, SSD e cancellazione della sessione;
-7. solo allora cambiare il catalogo da `downloadOnly` e abilitare GUI/demo;
-8. server, benchmark, checkpoint KV e distribuzione vengono dopo il runtime
-   locale.
+1. wire the validated weight map to the top-8 SSD/MetalIO reads and to the
+   caches — started: `GLM52PayloadReader` executes descriptors and top-8 plans
+   with bounded `pread` (double bounds check, rejection of truncated GGUFs at
+   open) and `GLM52ExpertSlotCache` provides the per-expert LRU cache with
+   byte-identical hits and batch pinning; MetalIO and residency remain;
+2. complete Q/KV-LoRA, RoPE, indexer, DSA attention and IndexShare
+   — done at the validation level: the decode step is composed on GPU
+   (`glm52DecodeLayer`) with the exact upstream wiring — cache stores BEFORE
+   selection/attention (normed KV-LoRA prefix + raw K-RoPE tail), indexer key
+   with centered LayerNorm and RoPE on the prefix, `visible = pos+1` with
+   fill-range or score+top-k, verbatim IndexShare, and per-row rotation of the
+   K tail at attention time — judged by the `GLM52DecodeCPUReference` oracle.
+   The persistent graph is composed: resident quantized weights loaded once
+   (attention, dense/shared FFN, output head), compact cache and resident
+   indexer keys updated in place, activations chained on buffers (a single
+   command buffer on the fill-range path), expert accumulation on GPU with
+   per-token streaming of the selected records, and the multi-layer forward
+   `glm52ResidentDecodeForward` with the real IndexShare policy on absolute
+   indices. The real engine `GLM52ResidentModel` loads the validated weight
+   map from the GGUF into resident buffers (embedding row per token, routed
+   experts via slot cache), runs token-by-token prefill and greedy decode;
+   the IQ2_XXS kernel (routed format of the published file) is validated
+   against the reference dequant, so the entire 78-layer stack is loadable
+   from the real GGUF. The parity gate is ready in opt-in form:
+   `GLM52LogitsParityIntegrationTests` compares engine and CPU oracle on the
+   real dequantized weights (truncated 4-layer stack: dense + first sparse
+   with IndexShare and IQ2_XXS experts), exact selections and router and all
+   154,880 logits within |delta| <= 0.05 + 1% with identical argmax; the
+   extension to the full 78-layer stack remains;
+3. complete dense layers, routed/shared MoE, residual RMS and output head;
+4. compare embedding, every layer and logits against an independent oracle;
+5. verify prefill and decode on real prompts, including chat and tool calls;
+6. measure RAM, pressure, SSD and session deletion;
+7. only then flip the catalog from `downloadOnly` and enable GUI/demo;
+8. server, benchmark, KV checkpoints and distribution come after the local
+   runtime.
 
-La mappa dettagliata rispetto al branch upstream è in
-[`PORTING-ANTIREZ.md`](PORTING-ANTIREZ.md); nomi, forme e tipi GGUF sono in
-[`CONTRATTO-GGUF.md`](CONTRATTO-GGUF.md).
+The detailed map against the upstream branch is in
+[`PORTING-ANTIREZ.md`](PORTING-ANTIREZ.md); GGUF names, shapes and types are
+in [`CONTRATTO-GGUF.md`](CONTRATTO-GGUF.md).

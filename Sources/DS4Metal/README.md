@@ -1,34 +1,35 @@
 # DS4Metal
 
-Runtime Metal multi-backend. Le primitive comuni gestiscono device, tensori,
-pipeline e operazioni GPU; ogni famiglia di modello possiede architettura,
-pesi, stato ricorrente, streaming e orchestrazione del decode. Il target dipende
-da `DS4Core` e da `Metal.framework`.
+Multi-backend Metal runtime. The common primitives manage device, tensors,
+pipelines and GPU operations; each model family owns its architecture,
+weights, recurrent state, streaming and decode orchestration. The target
+depends on `DS4Core` and `Metal.framework`.
 
-## Struttura
+## Structure
 
-- [`Runtime/`](Runtime/README.md): device, command queue, pipeline e tensori GPU.
-- [`Backends/`](Backends/README.md): implementazioni specifiche per famiglia di modello.
-- [`Model/`](Model/README.md): tipi di modello realmente condivisi tra backend.
-- [`Kernels/`](Kernels/README.md): wrapper Swift dei kernel `.metal`.
-- [`Graph/`](Graph/README.md): operazioni che compongono il grafo di inferenza.
+- [`Runtime/`](Runtime/README.md): device, command queue, pipelines and GPU tensors.
+- [`Backends/`](Backends/README.md): family-specific model implementations.
+- [`Model/`](Model/README.md): model types genuinely shared across backends.
+- [`Kernels/`](Kernels/README.md): Swift wrappers for the `.metal` kernels.
+- [`Graph/`](Graph/README.md): operations that compose the inference graph.
 
-## Flusso
+## Flow
 
-`MetalRuntime` compila le sorgenti incorporate. Il backend selezionato converte
-i tensor descriptor di `DS4Core.GGUFModel` in `GPUTensor`, dimensiona scratch e
-KV cache e orchestra prefill/forward tramite `GraphContext`. Il backend
-DeepSeek-V4 è operativo; la cartella Qwen documenta il confine preparato ma non
-fornisce ancora un decoder.
+`MetalRuntime` compiles the embedded sources. The selected backend converts
+the tensor descriptors of `DS4Core.GGUFModel` into `GPUTensor`, sizes scratch
+and KV cache, and orchestrates prefill/forward via `GraphContext`. The
+DeepSeek-V4 backend is operational; the Qwen folder documents the prepared
+boundary but does not yet provide a decoder.
 
-## Regole di modifica
+## Change rules
 
-- Correttezza numerica e parità con il percorso di riferimento precedono le
-  ottimizzazioni.
-- Dichiarare esplicitamente layout, tipo quantizzato, offset e sincronizzazione.
-- Non aggiungere campi di famiglie diverse a un unico contenitore di pesi o scratch.
-- La selezione del backend avviene fuori dal ciclo per-layer: il percorso caldo
-  resta concreto e privo di dispatch dinamico per operazione.
-- Non modificare direttamente codice generato; rigenerarlo dalla sorgente.
-- Documentare nuovi knob `DS4_*` nella configurazione principale e nel dominio.
-- Aggiungere test CPU o Metal mirati per ogni nuovo percorso di dispatch.
+- Numerical correctness and parity with the reference path come before
+  optimizations.
+- Declare layout, quantized type, offsets and synchronization explicitly.
+- Do not add fields from different families to a single weights or scratch
+  container.
+- Backend selection happens outside the per-layer loop: the hot path stays
+  concrete, with no per-operation dynamic dispatch.
+- Do not edit generated code directly; regenerate it from the source.
+- Document new `DS4_*` knobs in the main configuration and in the domain.
+- Add targeted CPU or Metal tests for every new dispatch path.

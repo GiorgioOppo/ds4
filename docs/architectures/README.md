@@ -1,27 +1,26 @@
-# Backend di architettura
+# Architecture backends
 
-Questa cartella contiene la documentazione che cambia in funzione della
-famiglia di modello. Le regole comuni e la matrice dello stato sono in
+This folder contains the documentation that varies by model family. The
+common rules and the status matrix are in
 [`../ARCHITETTURE-SUPPORTATE.md`](../ARCHITETTURE-SUPPORTATE.md).
 
-Ogni sottocartella deve dichiarare:
+Each subfolder must declare:
 
-- identificatori GGUF riconosciuti;
-- profili realmente eseguibili;
-- tokenizer e formato conversazionale;
-- decoder, KV e capacità Metal;
-- impostazioni applicabili e limiti della distribuzione;
-- test necessari per considerare il backend supportato.
+- recognized GGUF identifiers;
+- profiles that are actually runnable;
+- tokenizer and conversation format;
+- decoder, KV and Metal capabilities;
+- applicable settings and distribution limits;
+- tests required to consider the backend supported.
 
-Un backend documentato come pianificato non deve comparire nella GUI come
-operativo e non deve riutilizzare silenziosamente un decoder di un'altra
-famiglia.
+A backend documented as planned must not appear in the GUI as operational and
+must not silently reuse another family's decoder.
 
-## Famiglie documentate
+## Documented families
 
-- [`deepseek-v4/`](deepseek-v4/README.md): backend locale operativo per Flash
-  e Pro Q2 singolo; Pro Q4 split resta download-only.
-- [`qwen/`](qwen/README.md): architettura riconosciuta, backend ancora in
-  preparazione.
-- [`glm-5.2/`](glm-5.2/README.md): manifest, contratto GGUF e port progressivo;
-  detector/frontend disponibili, decoder ancora non eseguibile.
+- [`deepseek-v4/`](deepseek-v4/README.md): operational local backend for Flash
+  and single-file Pro Q2; Pro Q4 split remains download-only.
+- [`qwen/`](qwen/README.md): recognized architecture, backend still in
+  preparation.
+- [`glm-5.2/`](glm-5.2/README.md): manifest, GGUF contract and progressive
+  port; detector/frontend available, decoder not yet runnable.

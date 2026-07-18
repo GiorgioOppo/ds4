@@ -1,77 +1,77 @@
-# Ciclo di vita dei modelli
+# Model lifecycle
 
 ## Download
 
-La GUI legge `ModelCatalogRegistry`, sceglie un `ModelCatalogEntry` e scarica
-i suoi `ModelTarget` con `ModelDownloader.acquire`. Il file viene scritto come
-`.part`; una richiesta successiva usa HTTP Range per riprendere i byte già
-presenti. Il risultato distingue esplicitamente un nuovo download da un file
-finale regolare e non vuoto già presente.
-Se il target dichiara `expectedSizeBytes`, il finale viene riusato soltanto
-quando coincide anche la dimensione; non viene riletto integralmente a ogni
-avvio.
+The GUI reads `ModelCatalogRegistry`, picks a `ModelCatalogEntry` and downloads
+its `ModelTarget`s with `ModelDownloader.acquire`. The file is written as a
+`.part`; a subsequent request uses HTTP Range to resume the bytes already
+present. The result explicitly distinguishes a fresh download from a regular,
+non-empty final file that is already present.
+If the target declares `expectedSizeBytes`, the final file is reused only when
+the size matches as well; it is not fully re-read on every startup.
 
-La GUI usa come destinazione scrivibile
-`~/Library/Application Support/DwarfStar/models/`. Prima di aprire la rete
-cerca inoltre il filename esatto nelle directory modello di sviluppo e nella
-directory del GGUF attivo: se trova un finale regolare e non vuoto lo riusa in
-posizione, applicando l'eventuale controllo di dimensione esatta. Un finale
-vuoto non è considerato valido.
+The GUI uses `~/Library/Application Support/DwarfStar/models/` as the writable
+destination. Before opening the network it also looks for the exact filename in
+the development model directories and in the directory of the active GGUF: if
+it finds a regular, non-empty final file it reuses it in place, applying the
+exact-size check when applicable. An empty final file is not considered valid.
 
-La ripresa accetta `206` solo con `Content-Range` coerente. Se il server ignora
-Range e risponde `200`, il `.part` viene troncato e riscritto; `416` vale come
-completamento solo quando la dimensione remota coincide con quella locale.
-Cancellazione ed errori di trasporto conservano il `.part`; preflight dello
-spazio, validator remoto e gate per path evitano rispettivamente saturazione,
-append su oggetti cambiati e doppio writer.
+Resume accepts `206` only with a consistent `Content-Range`. If the server
+ignores Range and responds `200`, the `.part` is truncated and rewritten; `416`
+counts as completion only when the remote size matches the local one.
+Cancellation and transport errors preserve the `.part`; the disk-space
+preflight, the remote validator and the per-path gate respectively prevent
+saturation, appending to changed objects and a double writer.
 
-Prima della rinomina atomica i nuovi download vengono verificati con il digest
-SHA-256 fissato nel catalogo. I tre Flash e PRO Q2 singolo sono eseguibili e
-selezionabili; il package PRO Q4 e i tre GLM 5.2 restano `downloadOnly`. MTP è
-un accessorio distinto e non è una voce del catalogo principale.
+Before the atomic rename, new downloads are verified against the SHA-256
+digest pinned in the catalog. The three Flash files and the single PRO Q2 are
+runnable and selectable; the PRO Q4 package and the three GLM 5.2 files remain
+`downloadOnly`. MTP is a distinct accessory and is not an entry in the main
+catalog.
 
-| Voce | Artefatti | Download | Selezione/esecuzione |
+| Entry | Artifacts | Download | Selection/execution |
 |---|---:|---:|---:|
-| Flash Q2 imatrix | 1 | sì | sì |
-| Flash mixed Q2/Q4 imatrix | 1 | sì | sì |
-| Flash Q4 imatrix | 1 | sì | sì |
-| Pro Q2 imatrix | 1 | sì | sì |
-| Pro Q4 split | 2 shard | sì | no |
-| GLM 5.2 IQ2_XXS | 1 | sì | no |
-| GLM 5.2 Q2_K | 1 | sì | no |
-| GLM 5.2 Q4_K | 1 | sì | no |
+| Flash Q2 imatrix | 1 | yes | yes |
+| Flash mixed Q2/Q4 imatrix | 1 | yes | yes |
+| Flash Q4 imatrix | 1 | yes | yes |
+| Pro Q2 imatrix | 1 | yes | yes |
+| Pro Q4 split | 2 shards | yes | no |
+| GLM 5.2 IQ2_XXS | 1 | yes | no |
+| GLM 5.2 Q2_K | 1 | yes | no |
+| GLM 5.2 Q4_K | 1 | yes | no |
 
-La scansione automatica propone i tre filename Flash e il Pro Q2 selezionabili.
-I GGUF GLM completati restano esclusi finché il backend non diventa `runnable`.
-**Browse** resta disponibile per file esterni, ma `InferenceService.inspectModel`
-e `BackendSelector` ne validano architettura e profilo prima di cambiare il
-modello attivo.
+The automatic scan offers the three Flash filenames and the selectable Pro Q2.
+Completed GLM GGUFs stay excluded until the backend becomes `runnable`.
+**Browse** remains available for external files, but
+`InferenceService.inspectModel` and `BackendSelector` validate their
+architecture and profile before changing the active model.
 
-## Credenziali
+## Credentials
 
-La precedenza del token Hugging Face è: valore esplicito, `HF_TOKEN`, file
-standard della cache Hugging Face. Nell'app il valore esplicito proviene dal
-Keychain tramite `HFTokenStore`; non deve essere mostrato integralmente o
-incluso nei messaggi di errore.
+The Hugging Face token precedence is: explicit value, `HF_TOKEN`, standard
+Hugging Face cache file. In the app, the explicit value comes from the
+Keychain via `HFTokenStore`; it must not be shown in full or included in error
+messages.
 
-## Artefatti derivati
+## Derived artifacts
 
-`ExpertBundleTool.ensure` apre il GGUF in mmap, deriva geometria e
-quantizzazione degli esperti e chiama `ExpertBundle.openOrBuild`. Il sidecar e
-la cache dense-Q4 sono ricostruibili: il GGUF resta sempre la fonte primaria.
+`ExpertBundleTool.ensure` opens the GGUF via mmap, derives the experts'
+geometry and quantization and calls `ExpertBundle.openOrBuild`. The sidecar and
+the dense-Q4 cache are rebuildable: the GGUF always remains the primary
+source.
 
-## Uso locale e distribuito
+## Local and distributed use
 
-Il servizio locale risolve i sidecar dalla directory configurata. In modalità
-distribuita il coordinator include gli artefatti attivi nel manifest e il
-worker scarica soltanto quelli non già verificati. La configurazione di
-assegnazione decide se il worker deve usarli.
+The local service resolves the sidecars from the configured directory. In
+distributed mode the coordinator includes the active artifacts in the manifest
+and the worker downloads only those not already verified. The assignment
+configuration decides whether the worker must use them.
 
-Il downloader è più generale del loader locale: il package PRO Q4 può essere
-acquisito senza essere proposto come modello attivo, come i tre GLM 5.2
-provenienti da un repository Hugging Face distinto. Nessun percorso corrente
-carica il componente MTP separato; il self-speculative `DS4_SPEC_K` della demo
-non usa quei pesi.
+The downloader is more general than the local loader: the PRO Q4 package can
+be acquired without being offered as the active model, as can the three GLM
+5.2 files coming from a separate Hugging Face repository. No current path
+loads the separate MTP component; the demo's self-speculative `DS4_SPEC_K`
+does not use those weights.
 
-Vedi [`Download`](Download/README.md) e
+See [`Download`](Download/README.md) and
 [`Distributed/Files`](../Distributed/Files/README.md).

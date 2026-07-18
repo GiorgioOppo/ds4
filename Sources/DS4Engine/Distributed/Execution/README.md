@@ -1,44 +1,44 @@
 # Distributed/Execution
 
-## Confine architetturale
+## Architectural boundary
 
-`DistEngine` ed `ExpertShard` restano fisicamente in questa cartella per non
-rompere le API pubbliche e il protocollo distribuito v11, ma l'implementazione è
-DeepSeek-V4-specifica. La geometria non è fissa: Flash usa 43 layer e 256
-esperti, Pro 61 layer e 384 esperti. Entrambi passano ora da
-`RuntimeBackendFactory` prima di costruire tokenizer o decoder: una famiglia
-Qwen riconosciuta viene rifiutata come backend non ancora implementato.
+`DistEngine` and `ExpertShard` physically stay in this folder to avoid
+breaking the public APIs and the distributed protocol v11, but the
+implementation is DeepSeek-V4-specific. The geometry is not fixed: Flash uses
+43 layers and 256 experts, Pro 61 layers and 384 experts. Both now go through
+`RuntimeBackendFactory` before building tokenizer or decoder: a recognized
+Qwen family is rejected as a backend not yet implemented.
 
-Non spostare semplicemente questi tipi sotto un backend Qwen: prima occorre una
-nuova capability distribuita e un handshake che includa architettura, fingerprint
-del modello e geometria delle attivazioni. Ogni modifica wire incompatibile
-richiede un nuovo protocollo; non viene negoziata fra build diverse.
+Do not simply move these types under a Qwen backend: first you need a new
+distributed capability and a handshake that includes architecture, model
+fingerprint and activation geometry. Every wire-incompatible change
+requires a new protocol; it is not negotiated between different builds.
 
-Il GGUF Pro Q2 a file singolo usa questi percorsi. Il package Pro Q4 a due file
-resta download-only: i nomi `Layers00-30` e `Layers31-output` non sostituiscono
-un loader capace di assemblare e validare più shard.
+The single-file Pro Q2 GGUF uses these paths. The two-file Pro Q4 package
+remains download-only: the names `Layers00-30` and `Layers31-output` are no
+substitute for a loader capable of assembling and validating multiple shards.
 
-Adatta `DS4Metal` alle unità di lavoro distribuite senza includere networking.
+Adapts `DS4Metal` to distributed work units without including networking.
 
-## Componenti
+## Components
 
-- `DistEngine.swift`: embedding, forward di slice singole o batch, output head,
-  tokenizer, sampling, KV shard e percorso verticale.
-- `ExpertShard.swift`: `ExpertShardEngine`, che carica una maschera di esperti e
-  restituisce la somma parziale richiesta da `DistExpertWork`.
+- `DistEngine.swift`: embedding, forward of single or batched slices, output
+  head, tokenizer, sampling, KV shard and vertical path.
+- `ExpertShard.swift`: `ExpertShardEngine`, which loads an expert mask and
+  returns the partial sum requested by `DistExpertWork`.
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-Dipende da `DS4Core`, `DS4Metal` e dai tipi in [`Protocol`](../Protocol/README.md).
-Coordinator e worker trasformano i frame in chiamate a questi motori; nessun
-tipo di questa cartella apre socket.
+Depends on `DS4Core`, `DS4Metal` and the types in [`Protocol`](../Protocol/README.md).
+Coordinator and workers turn frames into calls to these engines; no type in
+this folder opens sockets.
 
-`DistEngine.chatPromptIds` applica la stessa neutralizzazione dei token di
-controllo usata dall'inferenza locale a turni, storico e schemi tool, poi lascia
-al renderer l'aggiunta esclusiva dei delimitatori strutturali fidati.
+`DistEngine.chatPromptIds` applies the same control-token neutralization used
+by local inference to turns, history and tool schemas, then leaves the
+renderer as the sole party adding the trusted structural delimiters.
 
-## Estensione
+## Extension
 
-Conservare qui la semantica numerica dell'esecuzione distribuita. Validare shape,
-layer, quantizzazione e maschere prima del dispatch GPU. Nuove strategie di
-trasporto appartengono a [`Transport`](../Transport/README.md).
+Keep the numeric semantics of distributed execution here. Validate shapes,
+layers, quantization and masks before GPU dispatch. New transport strategies
+belong in [`Transport`](../Transport/README.md).

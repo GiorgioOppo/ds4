@@ -1,15 +1,14 @@
 # Model/Backends/DeepSeekV4
 
-Forma e validazione metadata di DeepSeek V4 Flash/Pro.
+Shape and metadata validation for DeepSeek V4 Flash/Pro.
 
-- `DeepSeekV4Configuration.swift` contiene `DeepSeekV4Shape`,
-  `DeepSeekV4Configuration`, default ed errori specifici.
-- Gli alias pubblici storici (`ModelShape`, `ModelConfig`, `ModelDefaults`,
-  `ModelVariant`, `ModelConfigError`) restano disponibili senza cambiare il
-  comportamento dei consumer esistenti.
+- `DeepSeekV4Configuration.swift` contains `DeepSeekV4Shape`,
+  `DeepSeekV4Configuration`, defaults and family-specific errors.
+- The historical public aliases (`ModelShape`, `ModelConfig`, `ModelDefaults`,
+  `ModelVariant`, `ModelConfigError`) remain available without changing the
+  behavior of existing consumers.
 
-La configurazione verifica prima `general.architecture`; un GGUF Qwen viene
-riconosciuto come famiglia ma rifiutato perché il relativo backend non è ancora
-implementato. I vecchi GGUF DeepSeek senza la chiave generale continuano a
-essere riconosciuti tramite i metadata `deepseek4.*`.
-
+The configuration checks `general.architecture` first; a Qwen GGUF is
+recognized as a family but rejected because its backend is not yet
+implemented. Old DeepSeek GGUFs without the general key continue to be
+recognized through the `deepseek4.*` metadata.

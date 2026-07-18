@@ -1,27 +1,26 @@
 # Inference/Subagents
 
-Esegue attività delegate in un contesto isolato, preservando la conversazione
-principale.
+Runs delegated tasks in an isolated context, preserving the main conversation.
 
-## Componente e flusso
+## Component and flow
 
-`InferenceService+Subagents.swift` risolve ruolo, target e tool concessi;
-prepara un prefisso dedicato; salva la KV principale; esegue round limitati di
-inferenza/tool; infine ripristina il contesto originale. I prefissi di file o
-progetto possono essere riusati tramite una cache KV content-addressed.
-Contenuto di progetto, domanda, prompt di ruolo, schemi e risultati tool vengono
-neutralizzati prima di aggiungere il framing fidato della chat isolata.
+`InferenceService+Subagents.swift` resolves the role, target, and granted
+tools; prepares a dedicated prefix; saves the main KV; runs a bounded number
+of inference/tool rounds; and finally restores the original context. File or
+project prefixes can be reused through a content-addressed KV cache. Project
+content, the question, the role prompt, tool schemas, and tool results are
+neutralized before adding the trusted framing of the isolated chat.
 
-## Dipendenze
+## Dependencies
 
-Usa [`Agents`](../../Agents/README.md), [`Projects`](../../Projects/README.md),
-[`Tools`](../../Tools/README.md) e [`Persistence/KV`](../../Persistence/KV/README.md).
+Uses [`Agents`](../../Agents/README.md), [`Projects`](../../Projects/README.md),
+[`Tools`](../../Tools/README.md), and [`Persistence/KV`](../../Persistence/KV/README.md).
 
-## Estensione
+## Extension
 
-- Intersecare sempre i tool richiesti sia con `subAgentGrantable` sia con
-  `allowedTools`, lo scope fidato catturato dal profilo padre. Il ruolo e gli
-  argomenti scelti dal modello possono restringere lo scope, mai ampliarlo.
-- Imporre limiti a round, token e testo riportato nel trace.
-- Ripristinare la KV principale anche in caso di errore o cancellazione.
-- Non condividere implicitamente contenuti o autorizzazioni fra agenti.
+- Always intersect the requested tools with both `subAgentGrantable` and
+  `allowedTools`, the trusted scope captured from the parent profile. The role
+  and arguments chosen by the model may narrow the scope, never widen it.
+- Enforce limits on rounds, tokens, and the text reported in the trace.
+- Restore the main KV even on error or cancellation.
+- Do not implicitly share content or authorizations between agents.

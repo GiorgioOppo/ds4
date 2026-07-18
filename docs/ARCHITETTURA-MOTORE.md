@@ -1,4 +1,4 @@
-# Backend DeepSeek V4 — architettura del motore
+# DeepSeek V4 backend — engine architecture
 
 This document describes the operational **DeepSeek V4 backend** behind
 DwarfStar: how its GGUF is opened, how text becomes DeepSeek tokens, how tokens

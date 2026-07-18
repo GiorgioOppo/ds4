@@ -1,24 +1,24 @@
 # Builtins/Projects
 
-Permette al modello di esplorare e modificare l'indice del progetto senza
-inserire l'intero repository nel prompt.
+Lets the model explore and modify the project index without
+putting the entire repository into the prompt.
 
-## Tool
+## Tools
 
-- `project_tree`, `project_list`, `project_find`: orientamento e percorsi.
-- `project_read`, `project_search`: letture limitate e ricerca opzionalmente
-  ristretta a una sottocartella.
-- `project_write`, `project_edit`: scrittura e sostituzione esatta.
-- `project_reload`: ricostruzione dell'indice dopo cambiamenti esterni.
+- `project_tree`, `project_list`, `project_find`: orientation and paths.
+- `project_read`, `project_search`: bounded reads and search optionally
+  restricted to a subfolder.
+- `project_write`, `project_edit`: writing and exact replacement.
+- `project_reload`: index rebuild after external changes.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Tutti i tool usano [`ProjectCache`](../../../Projects/README.md) e sono
-`projectScoped`. Git reindicizza automaticamente dopo le operazioni che mutano
-il working tree; editor e script esterni richiedono `project_reload`.
+All tools use [`ProjectCache`](../../../Projects/README.md) and are
+`projectScoped`. Git re-indexes automatically after operations that mutate
+the working tree; external editors and scripts require `project_reload`.
 
-## Estensione
+## Extension
 
-Preferire risposte aggregate e bounded per ridurre il costo di prefill. Separare
-ricerca dei nomi da ricerca del contenuto e non caricare file freddi nella cache
-quando una scansione streaming è sufficiente.
+Prefer aggregated, bounded responses to reduce prefill cost. Separate
+name search from content search and do not load cold files into the cache
+when a streaming scan is sufficient.

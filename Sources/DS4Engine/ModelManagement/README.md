@@ -1,38 +1,39 @@
 # ModelManagement
 
-Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
+Gathers model operations that are not part of the inference cycle.
 
-## Componenti
+## Components
 
-- [`Catalog`](Catalog/README.md): registro cross-family, cataloghi DeepSeek V4
-  e GLM 5.2, artefatti e disponibilità nel runtime corrente.
-- [`Download`](Download/README.md): credenziali, download GGUF riprendibile e
-  stato consumato dalla GUI.
-- `ExpertBundleTool.swift`: verifica o costruisce il sidecar degli esperti senza
-  caricare il decoder completo.
-- `ModelFileDiagnostics.swift`: pre-flight del percorso modello — spiega la
-  causa reale di un open fallito (file assente, `.part` orfano da riprendere,
-  file nella Application Support legacy invisibile alla sandbox) con il rimedio
-  nel messaggio; usato da `InferenceService` prima di aprire il GGUF.
+- [`Catalog`](Catalog/README.md): cross-family registry, DeepSeek V4 and
+  GLM 5.2 catalogs, artifacts and availability in the current runtime.
+- [`Download`](Download/README.md): credentials, resumable GGUF download and
+  state consumed by the GUI.
+- `ExpertBundleTool.swift`: verifies or builds the expert sidecar without
+  loading the full decoder.
+- `ModelFileDiagnostics.swift`: pre-flight of the model path — explains the
+  real cause of a failed open (missing file, orphaned `.part` to resume, file
+  in the legacy Application Support invisible to the sandbox) with the remedy
+  in the message; used by `InferenceService` before opening the GGUF.
 
-La procedura operativa è descritta in
+The operating procedure is described in
 [`GESTIONE-MODELLI.md`](GESTIONE-MODELLI.md).
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-Il catalogo è la fonte unica e non dipende dalla GUI. Il downloader usa
-Foundation/CryptoKit; il token store usa Security. La costruzione del bundle
-usa metadati `DS4Core` e logica `DS4Metal`. Il risultato è poi consumato da [`Inference`](../Inference/README.md) o
+The catalog is the single source and does not depend on the GUI. The
+downloader uses Foundation/CryptoKit; the token store uses Security. Bundle
+construction uses `DS4Core` metadata and `DS4Metal` logic. The result is then
+consumed by [`Inference`](../Inference/README.md) or
 [`Distributed`](../Distributed/README.md).
 
-## Estensione
+## Extension
 
-Una nuova trasformazione deve produrre un artefatto deterministico, verificabile
-e separato dal GGUF originale. Non memorizzare segreti in UserDefaults o log e
-non sostituire un file finale prima che download/verifica siano completi.
+A new transformation must produce a deterministic, verifiable artifact kept
+separate from the original GGUF. Do not store secrets in UserDefaults or logs
+and do not replace a final file before download/verification are complete.
 
-Essere presenti nel catalogo significa essere acquisibili, non necessariamente
-eseguibili. Le tre voci DeepSeek V4 Flash e il Pro Q2 in un singolo GGUF sono
-`runnable`; il Pro Q4 resta `downloadOnly` perché è un package multi-shard. I
-tre GGUF monolitici GLM 5.2 sono anch'essi `downloadOnly` finché non esiste un
-backend `glm-dsa` verificato.
+Being in the catalog means being acquirable, not necessarily runnable. The
+three DeepSeek V4 Flash entries and the single-GGUF Pro Q2 are `runnable`;
+the Pro Q4 remains `downloadOnly` because it is a multi-shard package. The
+three monolithic GLM 5.2 GGUFs are also `downloadOnly` until a verified
+`glm-dsa` backend exists.

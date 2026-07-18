@@ -1,25 +1,25 @@
 # Tokenization/API
 
-Contratto minimo condiviso dai tokenizer dei diversi backend.
+The minimal contract shared by the tokenizers of the different backends.
 
-`TokenizerProtocol` espone tokenizzazione del testo, tokenizzazione di prompt già
-resi e decodifica di un token. Non impone id per ruoli, reasoning o tool: quei
-delimitatori appartengono al backend conversazionale e possono non essere token
-atomici in tutte le famiglie.
+`TokenizerProtocol` exposes text tokenization, tokenization of already
+rendered prompts and decoding of a token. It does not impose IDs for roles,
+reasoning or tools: those delimiters belong to the conversation backend and
+may not be atomic tokens in every family.
 
-`TokenizerFactory` seleziona esclusivamente dall'architettura rilevata:
+`TokenizerFactory` selects exclusively from the detected architecture:
 
 - `deepseek4` → `DeepSeekV4Tokenizer`;
 - `glm-dsa` → `GLM52Tokenizer`;
-- Qwen riconosciuto → errore esplicito `tokenizerNotImplemented`;
-- architetture sconosciute o assenti → errore esplicito.
+- recognized Qwen → explicit `tokenizerNotImplemented` error;
+- unknown or missing architectures → explicit error.
 
-Il fallback DeepSeek storico si applica soltanto quando
-`general.architecture` manca e sono presenti metadati `deepseek4.*`. Non viene
-mai applicato a un'architettura esplicita diversa.
+The historical DeepSeek fallback applies only when
+`general.architecture` is missing and `deepseek4.*` metadata is present. It is
+never applied to a different explicit architecture.
 
-La disponibilità del tokenizer è separata dalla disponibilità del runtime:
-GLM 5.2 può essere ispezionato e tokenizzato anche mentre il suo backend Metal
-rimane `recognizedButNotImplemented`. `ConversationBackendPolicy` applica la
-stessa separazione scegliendo `deepSeekDSML` o `glm52Native`, senza costruire un
-motore di inferenza.
+Tokenizer availability is separate from runtime availability:
+GLM 5.2 can be inspected and tokenized even while its Metal backend
+remains `recognizedButNotImplemented`. `ConversationBackendPolicy` applies the
+same separation by choosing `deepSeekDSML` or `glm52Native`, without building
+an inference engine.

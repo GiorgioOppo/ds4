@@ -1,4 +1,4 @@
 # Tokenization Backend Tests
 
-Test di parità e sicurezza specifici dei tokenizer delle singole famiglie.
-
+Parity and safety tests specific to the tokenizers of the individual
+families.

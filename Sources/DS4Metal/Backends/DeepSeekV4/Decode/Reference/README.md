@@ -1,20 +1,20 @@
 # DeepSeekV4/Decode/Reference
 
-Decoder leggibile e conservativo usato come oracolo di correttezza.
+Readable, conservative decoder used as a correctness oracle.
 
-## File principali
+## Main files
 
-- [`DSV4Decoder.swift`](DSV4Decoder.swift): decoder di riferimento con attention
-  densa e `OutputHeadWeights` espliciti.
+- [`DSV4Decoder.swift`](DSV4Decoder.swift): reference decoder with dense
+  attention and explicit `OutputHeadWeights`.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Carica le stesse forme e gli stessi pesi del backend ottimizzato, ma privilegia
-passaggi diretti e verificabili. I test confrontano output intermedi o logits
-per distinguere errori matematici da problemi di streaming/scheduling.
+It loads the same shapes and the same weights as the optimized backend, but
+favors direct, verifiable passes. Tests compare intermediate outputs or logits
+to tell mathematical errors apart from streaming/scheduling problems.
 
-## Regole di modifica
+## Modification rules
 
-Non introdurre qui ottimizzazioni che rendano il riferimento dipendente dal
-percorso in verifica. Le modifiche matematiche devono derivare dalla specifica
-del modello e avere test con tolleranze motivate.
+Do not introduce optimizations here that would make the reference depend on the
+path under verification. Mathematical changes must derive from the model
+specification and come with tests whose tolerances are justified.
