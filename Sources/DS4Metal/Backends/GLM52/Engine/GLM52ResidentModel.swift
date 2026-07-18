@@ -206,7 +206,9 @@ public final class GLM52ResidentModel {
                 index, shape: shape)
             let provider = try GLM52StreamedExpertProvider(
                 reader: reader, weightMap: map, layer: index,
-                slotCount: options.expertSlotCount)
+                slotCount: options.expertSlotCount,
+                bundleDirectory: ProcessInfo.processInfo
+                    .environment["DS4_GLM_BUNDLE_DIR"])
             providers[index] = provider
             streamed.append(StreamedLayer(
                 tensors: try GLM52StreamedLayerTensors(

@@ -37,19 +37,30 @@ public final class GLM52StreamedExpertProvider {
 
     public var stats: GLM52ExpertSlotCacheStats { cache.stats }
 
+    /// When `bundleDirectory` holds a valid per-layer bundle, experts are
+    /// served from it in ONE contiguous read; a bundle that exists but does
+    /// not match this GGUF throws instead of being silently ignored.
     public convenience init(reader: GLM52PayloadReader,
                             weightMap: GLM52WeightMap,
                             layer: Int,
-                            slotCount: Int = 16) throws {
-        try self.init(reader: reader, layer: layer,
-                      weights: try weightMap.routedExperts(layer: layer),
-                      slotCount: slotCount)
+                            slotCount: Int = 16,
+                            bundleDirectory: String? = nil) throws {
+        let weights = try weightMap.routedExperts(layer: layer)
+        let bundle = try bundleDirectory.flatMap {
+            try GLM52ExpertBundle.open(
+                directory: $0, layer: layer, weights: weights,
+                expertCount: Int(weightMap.configuration.shape.nExpert),
+                sourceFileSize: reader.fileSize)
+        }
+        try self.init(reader: reader, layer: layer, weights: weights,
+                      slotCount: slotCount, bundle: bundle)
     }
 
     public init(reader: GLM52PayloadReader,
                 layer: Int,
                 weights: GLM52RoutedExpertWeights,
-                slotCount: Int = 16) throws {
+                slotCount: Int = 16,
+                bundle: GLM52ExpertBundle? = nil) throws {
         guard Self.supportedTypes.contains(weights.gate.type),
               Self.supportedTypes.contains(weights.down.type),
               weights.gate.type == weights.up.type else {
@@ -61,6 +72,7 @@ public final class GLM52StreamedExpertProvider {
         self.layer = layer
         gateUpType = weights.gate.type
         downType = weights.down.type
+        self.bundle = bundle
         planner = try GLM52ExpertStreamPlanner(layer: layer, weights: weights)
         let probe = try planner.plan(selectedExperts: [0])
         let layout = try reader.packedLayout(of: probe)
@@ -68,6 +80,10 @@ public final class GLM52StreamedExpertProvider {
             reader: reader, slotCount: slotCount,
             slotBytes: layout.recordBytes)
     }
+
+    /// Per-layer contiguous bundle; nil serves from the GGUF's three
+    /// scattered tensors through the LRU slot cache.
+    private let bundle: GLM52ExpertBundle?
 
     private let lock = NSLock()
 
@@ -86,6 +102,10 @@ public final class GLM52StreamedExpertProvider {
     /// Serialized: the LRU cache is not concurrency-safe and the prefetch
     /// path races the decode thread by design.
     public func expert(_ id: UInt32) throws -> GLM52QuantizedExpert {
+        // Bundle path: one contiguous bounded read, thread-safe by
+        // construction (stateless pread) — no lock and no LRU needed; the
+        // page cache does the reuse.
+        if let bundle { return try bundle.expert(id) }
         lock.lock()
         defer { lock.unlock() }
         let plan = try planner.plan(selectedExperts: [id])

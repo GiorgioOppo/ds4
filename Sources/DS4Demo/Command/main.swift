@@ -152,6 +152,34 @@ do {
             } else {
                 log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
             }
+            // Prepass bundle: DS4_GLM_BUILD_BUNDLES=1 + DS4_GLM_BUNDLE_DIR
+            // riimpacchetta i record esperti di ogni layer sparse in file
+            // contigui (una lettura per esperto invece di tre; duplica su
+            // disco il payload routed). Resumabile: i bundle validi vengono
+            // saltati.
+            if environment["DS4_GLM_BUILD_BUNDLES"] == "1",
+               let bundleDir = environment["DS4_GLM_BUNDLE_DIR"] {
+                let map = try GLM52WeightMap(model: model)
+                let reader = try GLM52PayloadReader(path: ggufPath,
+                                                    weightMap: map)
+                let shape = map.configuration.shape
+                let start = Date()
+                for layer in Int(shape.nLeadingDense)..<Int(shape.inferenceLayerCount) {
+                    let built = try GLM52ExpertBundle.build(
+                        directory: bundleDir, layer: layer,
+                        weightMap: map, reader: reader) { done, total in
+                        if done % 64 == 0 {
+                            log("DS4Demo: bundle blk\(layer): \(done)/\(total)")
+                        }
+                    }
+                    log("DS4Demo: bundle blk\(layer) "
+                        + (built ? "creato" : "già valido"))
+                }
+                log(String(format: "DS4Demo: bundle completati in %.0f s in %@",
+                           Date().timeIntervalSince(start), bundleDir))
+                exit(0)
+            }
+
             let loadStart = Date()
             let glm = try GLM52ResidentModel(
                 runtime: runtime, path: ggufPath, options: glmOptions)
