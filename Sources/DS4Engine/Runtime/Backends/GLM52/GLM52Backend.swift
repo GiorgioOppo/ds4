@@ -1,4 +1,5 @@
 import DS4Core
+import DS4Metal
 
 /// Registration record for the GLM 5.2 (`glm-dsa`) family.
 ///
@@ -16,4 +17,9 @@ public enum GLM52BackendDefinition {
     ]
 
     public static let runtimeCapabilities: BackendCapabilities = []
+
+    /// The enablement switch, forwarded from the target-visible gate in
+    /// DS4Metal (`GLM52RuntimeGate.enabled`): selector routing, catalog
+    /// availability and demo dispatch all key off that single constant.
+    public static var runtimeEnabled: Bool { GLM52RuntimeGate.enabled }
 }

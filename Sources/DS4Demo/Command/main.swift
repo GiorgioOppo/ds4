@@ -122,7 +122,38 @@ do {
     do {
         try ModelArchitectureDetector.requireImplemented(detectedArchitecture)
     } catch {
-        if detectedArchitecture.family == .qwen {
+        if detectedArchitecture.family == .glm, GLM52RuntimeGate.enabled {
+            // GLM 5.2 greedy demo on the resident engine (validation-grade
+            // speed). Prompt from DS4_PROMPT; token budget from DS4_MAX_NEW.
+            let prompt = ProcessInfo.processInfo.environment["DS4_PROMPT"]
+                ?? "Ciao! Presentati in una frase."
+            let maxNew = Int(ProcessInfo.processInfo
+                .environment["DS4_MAX_NEW"] ?? "") ?? 128
+            log("DS4Demo: GLM 5.2 greedy — prompt: \(prompt)")
+            let tokenizer = try GLM52Tokenizer(model: model)
+            let runtime = try MetalRuntime()
+            log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
+            let glm = try GLM52ResidentModel(
+                runtime: runtime, path: ggufPath,
+                options: GLM52ResidentModelOptions())
+            let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
+            var logits = try glm.prefill(tokens)
+            var produced = 0
+            while produced < maxNew {
+                guard let token = GLM52GreedyDecoding.argmax(logits) else {
+                    break
+                }
+                produced += 1
+                if tokenizer.isStopToken(token, reasoning: .none) { break }
+                FileHandle.standardOutput.write(Data(tokenizer.tokenText(token)))
+                if produced == maxNew { break }
+                logits = try glm.forwardNext(token)
+            }
+            print("")
+            exit(0)
+        }
+        if detectedArchitecture.family == .qwen
+            || detectedArchitecture.family == .glm {
             log("DS4Demo: backend \(detectedArchitecture.id.rawValue) non ancora implementato")
         } else {
             log("DS4Demo: \(error)")

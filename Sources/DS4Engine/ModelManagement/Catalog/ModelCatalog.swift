@@ -1,5 +1,6 @@
 import Foundation
 import DS4Core
+import DS4Metal
 
 /// Stable identifiers exposed to the GUI and persisted by callers.
 public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashable {
@@ -310,9 +311,14 @@ public enum DeepSeekV4ModelCatalog {
 /// GLM tokenizer, tensor schema, DSA/MoE decoder or Metal backend, so making a
 /// monolithic file selectable would misrepresent runtime support.
 public enum GLM52ModelCatalog {
-    private static let unavailable = ModelRuntimeAvailability.downloadOnly(
-        reason: "Download disponibile; il runtime GLM 5.2 non è ancora implementato."
-    )
+    // Keyed off the single enablement switch: selectable the moment the
+    // real-GGUF logits parity gate flips GLM52RuntimeGate.enabled.
+    private static let unavailable: ModelRuntimeAvailability =
+        GLM52RuntimeGate.enabled
+            ? .runnable
+            : .downloadOnly(
+                reason: "Download disponibile; il runtime GLM 5.2 non è ancora abilitato (gate di parità logits)."
+            )
 
     public static let entries: [ModelCatalogEntry] = [
         .init(

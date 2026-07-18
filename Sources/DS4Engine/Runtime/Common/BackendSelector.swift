@@ -5,6 +5,7 @@ import DS4Core
 /// enum on purpose: hot token loops keep their concrete decoder type.
 public enum RuntimeBackendKind: String, Sendable, Equatable {
     case deepSeekV4
+    case glm52
 }
 
 public enum BackendSelectionError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -37,6 +38,13 @@ public enum BackendSelector {
                 )
             }
             return .deepSeekV4
+        }
+        if descriptor.architecture == GLM52BackendDefinition.supportedArchitecture,
+           GLM52BackendDefinition.runtimeEnabled {
+            // The switch: flipped only after the real-GGUF logits parity gate
+            // passed on hardware. Before that, GLM files fall through to the
+            // explicit not-implemented refusal below.
+            return .glm52
         }
         if descriptor.family == .glm || descriptor.family == .qwen {
             throw BackendSelectionError.backendNotImplemented(descriptor.architecture)
