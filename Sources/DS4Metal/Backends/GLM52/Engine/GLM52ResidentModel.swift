@@ -237,12 +237,27 @@ public final class GLM52ResidentModel {
                     down: try reader.bytes(of: map.layer(index, .denseDown)))
             } else {
                 // Resident layers stream their EXPERTS too (the routed bank
-                // never fits) — and deserve the bundle exactly like the
-                // streamed tail.
-                let provider = try GLM52StreamedExpertProvider(
-                    reader: reader, weightMap: map, layer: index,
-                    slotCount: options.expertSlotCount,
-                    bundleDirectory: bundleDirectory)
+                // never fits): the unified sidecar's embedded records win,
+                // then the legacy bundle, then the plain GGUF.
+                let routed = try map.routedExperts(layer: index)
+                let sidecar = try GLM52LayerQuantSidecar.open(
+                    directory: layerQ4Directory, layer: index,
+                    source: try GLM52StreamedLayerTensors(
+                        index: index, map: map, fullIndexer: isFull),
+                    routed: routed,
+                    expertCount: Int(shape.nExpert),
+                    sourceFileSize: reader.fileSize)
+                let provider: GLM52StreamedExpertProvider
+                if let view = sidecar?.expertView {
+                    provider = try GLM52StreamedExpertProvider(
+                        reader: reader, layer: index, weights: routed,
+                        slotCount: options.expertSlotCount, bundle: view)
+                } else {
+                    provider = try GLM52StreamedExpertProvider(
+                        reader: reader, weightMap: map, layer: index,
+                        slotCount: options.expertSlotCount,
+                        bundleDirectory: bundleDirectory)
+                }
                 providers[index] = provider
                 quantizedFFN = .sparse(
                     routerRows: try f32(map.layer(index, .router)),
@@ -280,19 +295,31 @@ public final class GLM52ResidentModel {
             .environment["DS4_GLM_LAYERQ4_DIR"] ?? (path + ".glm-layers-q4")
         var sidecarReaders: [Int: GLM52PayloadReader] = [:]
         var streamed: [StreamedLayer] = []
+        var unifiedExpertLayers = 0
         for index in residentCount..<count {
             let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(
                 index, shape: shape)
-            let provider = try GLM52StreamedExpertProvider(
-                reader: reader, weightMap: map, layer: index,
-                slotCount: options.expertSlotCount,
-                bundleDirectory: bundleDirectory)
-            providers[index] = provider
             let ggufTensors = try GLM52StreamedLayerTensors(
                 index: index, map: map, fullIndexer: isFull)
+            let routed = try map.routedExperts(layer: index)
             let sidecar = try GLM52LayerQuantSidecar.open(
                 directory: layerQ4Directory, layer: index,
-                source: ggufTensors, sourceFileSize: reader.fileSize)
+                source: ggufTensors, routed: routed,
+                expertCount: Int(shape.nExpert),
+                sourceFileSize: reader.fileSize)
+            let provider: GLM52StreamedExpertProvider
+            if let view = sidecar?.expertView {
+                unifiedExpertLayers += 1
+                provider = try GLM52StreamedExpertProvider(
+                    reader: reader, layer: index, weights: routed,
+                    slotCount: options.expertSlotCount, bundle: view)
+            } else {
+                provider = try GLM52StreamedExpertProvider(
+                    reader: reader, weightMap: map, layer: index,
+                    slotCount: options.expertSlotCount,
+                    bundleDirectory: bundleDirectory)
+            }
+            providers[index] = provider
             if let sidecar { sidecarReaders[index] = sidecar.reader }
             let tensors = sidecar?.tensors ?? ggufTensors
             streamed.append(StreamedLayer(
@@ -325,7 +352,8 @@ public final class GLM52ResidentModel {
         if !sidecarReaders.isEmpty {
             FileHandle.standardError.write(Data(
                 ("DS4 glm: sidecar Q4 layer attivo su \(sidecarReaders.count)"
-                 + "/\(streamed.count) layer streamati\n").utf8))
+                 + "/\(streamed.count) layer streamati "
+                 + "(\(unifiedExpertLayers) con esperti unificati)\n").utf8))
         }
         // The template always sizes the indexer slots (every layer stores
         // indexer tensors in the schema, so the descriptors exist even for

@@ -130,6 +130,27 @@ public final class GLM52ExpertBundle {
                 absOffset: UInt64(headerBytes), bytes: payloadBytes))
     }
 
+    /// View over an expert payload EMBEDDED in a unified layer sidecar:
+    /// the caller has already validated the identity header; this binds the
+    /// shared reader to the section's offset. Reads behave exactly like a
+    /// standalone bundle (one bounded pread per record).
+    static func view(layer: Int, expertCount: Int, gateBytes: Int,
+                     upBytes: Int, downBytes: Int, gateUpType: UInt32,
+                     downType: UInt32, reader: GLM52PayloadReader,
+                     payloadOffset: UInt64) -> GLM52ExpertBundle {
+        let recordBytes = gateBytes + upBytes + downBytes
+        return GLM52ExpertBundle(
+            layer: layer, expertCount: expertCount,
+            gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes,
+            gateUpType: gateUpType, downType: downType,
+            reader: reader,
+            payload: GLM52WeightDescriptor(
+                name: "pack.blk\(layer).experts",
+                type: gateUpType, dims: [],
+                absOffset: payloadOffset,
+                bytes: UInt64(recordBytes * expertCount)))
+    }
+
     private init(layer: Int, expertCount: Int, gateBytes: Int, upBytes: Int,
                  downBytes: Int, gateUpType: UInt32, downType: UInt32,
                  reader: GLM52PayloadReader,

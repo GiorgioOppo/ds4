@@ -194,28 +194,32 @@ do {
                     bundleDir))
                 exit(0)
             }
-            // Prepass sidecar Q4 layer: DS4_GLM_BUILD_LAYERQ4=1 riquantizza
-            // Q8_0→Q4_K i tensori grossi streamati di ogni layer sparse
-            // (~metà dei byte SSD per token; perdita di qualità contenuta e
-            // dichiarata). DS4_GLM_LAYERQ4_LAYERS è il tetto sui sidecar
-            // TOTALI (come i bundle); parziale-friendly: i layer senza
-            // sidecar streammano Q8 dal GGUF.
+            // Prepass sidecar UNIFICATO: DS4_GLM_BUILD_LAYERQ4=1 costruisce
+            // per ogni layer sparse UN file con i tensori grossi
+            // riquantizzati Q4_K e i record esperti contigui. Migra da solo
+            // i file legacy (tensori dal sidecar v1, esperti dal bundle
+            // .experts, che viene eliminato a pack validato — il disco
+            // resta ~invariato). DS4_GLM_LAYERQ4_LAYERS è il tetto sui
+            // sidecar TOTALI; parziale-friendly come sempre.
             if environment["DS4_GLM_BUILD_LAYERQ4"] == "1" {
                 let sidecarDir = environment["DS4_GLM_LAYERQ4_DIR"]
                     ?? (ggufPath + ".glm-layers-q4")
+                let legacyBundles = environment["DS4_GLM_BUNDLE_DIR"]
+                    ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: ggufPath,
                                                     weightMap: map)
                 let start = Date()
                 let summary = try GLM52LayerQuantSidecar.buildAvailable(
                     directory: sidecarDir, weightMap: map, reader: reader,
+                    legacyBundleDirectory: legacyBundles,
                     maxSidecars: environment["DS4_GLM_LAYERQ4_LAYERS"]
                         .flatMap(Int.init)) { layer, built in
-                    log("DS4Demo: layerq4 blk\(layer) "
+                    log("DS4Demo: pack blk\(layer) "
                         + (built ? "creato" : "già valido"))
                 }
                 log(String(
-                    format: "DS4Demo: layerq4 in %.0f s — %d creati, "
+                    format: "DS4Demo: pack unificati in %.0f s — %d creati, "
                         + "%d già validi, %d mancanti%@ (dir %@)",
                     Date().timeIntervalSince(start), summary.created,
                     summary.alreadyValid, summary.remaining,

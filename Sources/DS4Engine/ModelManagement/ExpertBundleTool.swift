@@ -17,24 +17,28 @@ public enum ExpertBundleTool {
             let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
             let selection = try RuntimeBackendFactory.prepare(model: model)
             if selection.backend == .glm52 {
-                // Sidecar GLM: un bundle contiguo per ogni layer sparse,
-                // accanto al GGUF (o in DS4_GLM_BUNDLE_DIR). Resumabile: i
-                // bundle già validi vengono saltati, quindi il bottone può
-                // essere premuto di nuovo dopo un'interruzione.
+                // Sidecar GLM UNIFICATO: un file per layer sparse con i
+                // tensori grossi riquantizzati Q4_K E i record esperti
+                // contigui, accanto al GGUF (DS4_GLM_LAYERQ4_DIR per
+                // spostarlo). Migra da solo i file legacy (bundle .experts
+                // e sidecar v1) e resumabile: ripremere riprende dal primo
+                // layer mancante.
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: modelPath,
                                                     weightMap: map)
-                let directory = ProcessInfo.processInfo
-                    .environment["DS4_GLM_BUNDLE_DIR"]
+                let environment = ProcessInfo.processInfo.environment
+                let directory = environment["DS4_GLM_LAYERQ4_DIR"]
+                    ?? (modelPath + ".glm-layers-q4")
+                let legacyBundles = environment["DS4_GLM_BUNDLE_DIR"]
                     ?? (modelPath + ".glm-experts")
-                let summary = try GLM52ExpertBundle.buildAvailable(
-                    directory: directory, weightMap: map,
-                    reader: reader) { layer, built in
+                let summary = try GLM52LayerQuantSidecar.buildAvailable(
+                    directory: directory, weightMap: map, reader: reader,
+                    legacyBundleDirectory: legacyBundles) { layer, built in
                     FileHandle.standardError.write(Data(
-                        ("DS4 expbundle: GLM blk\(layer) "
+                        ("DS4 expbundle: GLM pack blk\(layer) "
                          + (built ? "creato" : "già valido") + "\n").utf8))
                 }
-                var outcome = "Bundle GLM in \(directory): "
+                var outcome = "Sidecar GLM unificati in \(directory): "
                     + "\(summary.created) creati, "
                     + "\(summary.alreadyValid) già validi"
                 if summary.remaining > 0 {
