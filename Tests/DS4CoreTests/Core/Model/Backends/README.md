@@ -1,5 +1,4 @@
 # Model Backend Tests
 
-Test di configurazione specifici delle architetture. Ogni backend mantiene qui
-fixture, invarianti di forma e verifiche di compatibilità dei propri alias.
-
+Architecture-specific configuration tests. Each backend keeps its fixtures,
+shape invariants and alias compatibility checks here.

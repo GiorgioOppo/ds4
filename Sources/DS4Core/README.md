@@ -1,30 +1,30 @@
 # DS4Core
 
-Fondazione portabile del progetto, scritta in Swift e priva di dipendenze da
-Metal. Espone formati, modelli conversazionali, tokenizzazione, campionamento e
-tipi condivisi usati da `DS4Metal` e `DS4Engine`.
+Portable foundation of the project, written in Swift and free of Metal
+dependencies. It exposes formats, conversation models, tokenization, sampling
+and shared types used by `DS4Metal` and `DS4Engine`.
 
-## Struttura
+## Structure
 
-- [`Conversation/`](Conversation/README.md): tipi comuni e formati chat per backend.
-- [`Diagnostics/`](Diagnostics/README.md): avanzamento thread-safe del caricamento.
-- [`Formats/`](Formats/README.md): GGUF, checkpoint KV e primitive di quantizzazione.
-- [`Generation/`](Generation/README.md): selezione del token successivo.
-- [`Model/`](Model/README.md): rilevamento architettura e configurazioni per backend.
-- [`Storage/`](Storage/README.md): pianificazione della cache SSD e simulazione RAM.
-- [`Tokenization/`](Tokenization/README.md): API comune e tokenizer per backend.
+- [`Conversation/`](Conversation/README.md): common types and per-backend chat formats.
+- [`Diagnostics/`](Diagnostics/README.md): thread-safe load progress.
+- [`Formats/`](Formats/README.md): GGUF, KV checkpoints and quantization primitives.
+- [`Generation/`](Generation/README.md): next-token selection.
+- [`Model/`](Model/README.md): architecture detection and per-backend configurations.
+- [`Storage/`](Storage/README.md): SSD cache planning and RAM simulation.
+- [`Tokenization/`](Tokenization/README.md): common API and per-backend tokenizers.
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-`DS4Core` dipende unicamente dalla libreria standard e da Foundation. Il flusso
-tipico è: apertura del GGUF -> costruzione del tokenizer -> rendering della
-conversazione -> tokenizzazione -> campionamento dei logits prodotti dal backend.
-Le operazioni GPU e l'esecuzione del decoder appartengono a `DS4Metal`.
+`DS4Core` depends only on the standard library and Foundation. The typical
+flow is: open the GGUF -> build the tokenizer -> render the conversation ->
+tokenize -> sample the logits produced by the backend. GPU operations and
+decoder execution belong to `DS4Metal`.
 
-## Regole di modifica
+## Modification rules
 
-- Non introdurre import o tipi Metal in questo target.
-- Mantenere deterministici parser, rendering e sampler, con test di parità.
-- Conservare la compatibilità binaria dei formati persistenti.
-- Collocare ogni nuova responsabilità nella sottocartella di dominio e aggiornare
-  il relativo README.
+- Do not introduce Metal imports or types into this target.
+- Keep parsers, rendering and sampler deterministic, with parity tests.
+- Preserve binary compatibility of persisted formats.
+- Place every new responsibility in its domain subfolder and update the
+  corresponding README.

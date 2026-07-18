@@ -1,23 +1,23 @@
 # Worker/Assignments
 
-Carica e pubblica le responsabilità assegnate al worker.
+Loads and publishes the responsibilities assigned to the worker.
 
-## File
+## Files
 
-- `DistWorker+Assignment.swift`: slice di layer, output head, cache KV e knob.
-- `DistWorker+ExpertAssignment.swift`: maschera verticale di esperti e relativo
+- `DistWorker+Assignment.swift`: layer slice, output head, KV cache and knobs.
+- `DistWorker+ExpertAssignment.swift`: vertical expert mask and its
   `ExpertShardEngine`.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-L'handler valida il payload, risolve i file trasferiti, applica solo knob
-whitelisted e costruisce il motore fuori dal lock. Lo stato precedente resta
-utilizzabile fino al commit atomico del nuovo motore; al termine viene inviato
-`READY`. Dipende da [`Execution`](../../Execution/README.md) e
+The handler validates the payload, resolves the transferred files, applies
+only whitelisted knobs and builds the engine outside the lock. The previous
+state stays usable until the atomic commit of the new engine; `READY` is sent
+at the end. Depends on [`Execution`](../../Execution/README.md) and
 [`Protocol/Handshake`](../../Protocol/Handshake/README.md).
 
-## Estensione
+## Extension
 
-Separare fase di claim, caricamento e commit. Non pubblicare assegnazioni
-parziali e non riusare un motore se modello, slice, contesto o opzioni numeriche
-non coincidono.
+Keep the claim, load and commit phases separate. Do not publish partial
+assignments and do not reuse an engine if model, slice, context or numeric
+options do not match.

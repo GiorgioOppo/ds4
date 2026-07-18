@@ -1,24 +1,23 @@
 # Builtins/Files
 
-Espone accesso raw e modifiche puntuali ai file sotto la root importata.
+Exposes raw access and targeted edits to files under the imported root.
 
-## Tool
+## Tools
 
-- `file_read` e `file_lines`: contenuto o intervalli di righe.
-- `file_write` e `file_add`: creazione/scrittura controllata.
-- `file_modify`: sostituzione mirata.
-- `file_delete`: eliminazione di un singolo file, mai directory.
+- `file_read` and `file_lines`: content or line ranges.
+- `file_write` and `file_add`: controlled creation/writing.
+- `file_modify`: targeted replacement.
+- `file_delete`: deletion of a single file, never directories.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Le specifiche delegano a [`ProjectCache`](../../../Projects/README.md), che
-standardizza e ricontrolla i percorsi. Sono tutti `projectScoped` e gli output
-di lettura sono limitati.
+The specs delegate to [`ProjectCache`](../../../Projects/README.md), which
+normalizes and re-checks paths. They are all `projectScoped` and read outputs
+are bounded.
 
-## Estensione
+## Extension
 
-Applicare le invarianti in
+Apply the invariants in
 [`Projects/SICUREZZA-PERCORSI.md`](../../../Projects/SICUREZZA-PERCORSI.md),
-evitare glob distruttivi e richiedere testo di ricerca univoco per modifiche.
-Una nuova operazione di directory necessita una revisione esplicita del modello
-di autorizzazione.
+avoid destructive globs and require unambiguous search text for edits. A new
+directory operation needs an explicit review of the authorization model.

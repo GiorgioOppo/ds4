@@ -1,35 +1,34 @@
-# Backend Qwen — predisposizione
+# Qwen backend — groundwork
 
-Qwen è al momento una famiglia **riconosciuta ma non eseguibile**. Questa
-cartella documenta il confine preparato per aggiungere il backend senza
-inserire condizioni Qwen nel decoder DeepSeek.
+Qwen is currently a **recognized but not runnable** family. This folder
+documents the boundary prepared for adding the backend without introducing
+Qwen conditionals into the DeepSeek decoder.
 
-## Già predisposto
+## Already in place
 
-- identificazione della famiglia da `general.architecture`;
-- errore dedicato quando il backend non è ancora implementato;
-- cartelle separate nei livelli Core, Metal ed Engine;
-- descrizione e capacità del modello consumabili da demo e GUI;
-- separazione dei componenti DeepSeek prima dell'aggiunta di nuovi kernel.
+- family identification from `general.architecture`;
+- dedicated error when the backend is not yet implemented;
+- separate folders in the Core, Metal and Engine layers;
+- model description and capabilities consumable by demo and GUI;
+- separation of the DeepSeek components ahead of adding new kernels.
 
-## Non ancora implementato
+## Not yet implemented
 
-- scelta della variante Qwen GGUF di riferimento;
-- tokenizer, token speciali e template chat;
-- mapping dei tensori e validazione della forma;
-- prefill, decoder Metal e KV cache;
-- reasoning e formato delle chiamate tool;
-- preset UI e diagnostica numerica;
-- checkpoint, inferenza distribuita e benchmark certificati.
+- choice of the reference Qwen GGUF variant;
+- tokenizer, special tokens and chat template;
+- tensor mapping and shape validation;
+- prefill, Metal decoder and KV cache;
+- reasoning and tool-call format;
+- UI presets and numerical diagnostics;
+- checkpoints, distributed inference and certified benchmarks.
 
-Finché questi elementi non sono completati, caricare un GGUF Qwen deve
-terminare prima della costruzione del decoder con un messaggio che indica che
-il modello è stato riconosciuto ma il backend non è ancora disponibile.
+Until these elements are complete, loading a Qwen GGUF must stop before
+decoder construction with a message stating that the model was recognized but
+the backend is not yet available.
 
-## Primo passo implementativo
+## First implementation step
 
-Prima di scrivere kernel occorre scegliere un singolo file GGUF piccolo e
-rappresentativo, registrare il valore esatto di `general.architecture`, i
-metadati del tokenizer e l'elenco dei tensori, quindi fissare golden test CPU.
-Solo da quel contratto si ricavano forma, loader e grafi Metal.
-
+Before writing kernels, pick a single small, representative GGUF file, record
+the exact value of `general.architecture`, the tokenizer metadata and the
+tensor list, then pin CPU golden tests. Only from that contract are shape,
+loader and Metal graphs derived.

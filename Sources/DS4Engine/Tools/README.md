@@ -1,30 +1,30 @@
 # Tools
 
-Implementa il function calling del modello: contratti, strumenti incorporati,
-integrazioni condivise e server MCP esterni.
+Implements the model's function calling: contracts, built-in tools, shared
+integrations and external MCP servers.
 
-## Struttura
+## Structure
 
-- [`Core`](Core/README.md): `BuiltinTool`, `ToolOutput` e `ToolRegistry`.
-- [`Builtins`](Builtins/README.md): un tool per file, raggruppato per dominio.
-- [`Integrations`](Integrations/README.md): client web, git e GitHub riutilizzabili.
-- [`MCP`](MCP/README.md): configurazione, protocollo, trasporti e manager MCP.
+- [`Core`](Core/README.md): `BuiltinTool`, `ToolOutput` and `ToolRegistry`.
+- [`Builtins`](Builtins/README.md): one tool per file, grouped by domain.
+- [`Integrations`](Integrations/README.md): reusable web, git and GitHub clients.
+- [`MCP`](MCP/README.md): MCP configuration, protocol, transports and manager.
 
-Le proprietà di sicurezza e le superfici autorizzate sono riassunte in
+The security properties and authorized surfaces are summarized in
 [`SICUREZZA.md`](SICUREZZA.md).
 
-## Flusso
+## Flow
 
-1. Il client chiede a `ToolRegistry` le `ToolSpec` abilitate.
-2. Il modello emette nome e JSON degli argomenti.
-3. `executeAuto` risolve prima i built-in e poi l'indice MCP.
-4. `ToolOutput` torna al ciclo di inferenza come risultato del tool.
+1. The client asks `ToolRegistry` for the enabled `ToolSpec`s.
+2. The model emits the tool name and the argument JSON.
+3. `executeAuto` resolves built-ins first, then the MCP index.
+4. `ToolOutput` returns to the inference loop as the tool result.
 
-I tool di progetto usano [`ProjectCache`](../Projects/README.md); i profili in
-[`Agents`](../Agents/README.md) decidono quali nomi sono dichiarati.
+Project tools use [`ProjectCache`](../Projects/README.md); the profiles in
+[`Agents`](../Agents/README.md) decide which names are declared.
 
-## Estensione
+## Extension
 
-Un nuovo tool deve avere schema ristretto, output limitato, errori leggibili e
-una politica chiara per progetto/sub-agent. La logica condivisa o con side
-effect esterni va in `Integrations`, non duplicata nella closure del built-in.
+A new tool must have a narrow schema, bounded output, readable errors and a
+clear per-project/sub-agent policy. Shared logic, or logic with external side
+effects, belongs in `Integrations`, not duplicated in the built-in's closure.
