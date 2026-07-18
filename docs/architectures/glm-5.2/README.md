@@ -102,10 +102,9 @@ La sequenza di abilitazione è vincolante:
    assoluti. Il motore reale `GLM52ResidentModel` carica la mappa pesi
    validata dal GGUF nei buffer residenti (embedding row per token, esperti
    routed via slot cache), esegue prefill token-per-token e greedy decode;
-   gli esperti IQ2_XXS del file pubblicato sono RIFIUTATI al caricamento
-   finché non arriva il loro kernel validato — i tre layer densi Q8_0
-   girano già sul file reale (smoke test opt-in); restano il kernel
-   IQ2_XXS e la parità logits full-model;
+   il kernel IQ2_XXS (formato routed del file pubblicato) è validato
+   contro il dequant di riferimento, quindi l'intero stack di 78 layer è
+   caricabile dal GGUF reale; resta la parità logits full-model;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;
 5. verificare prefill e decode su prompt reali, incluse chat e tool call;

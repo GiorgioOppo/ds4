@@ -20,14 +20,13 @@ public enum GLM52StreamedExpertProviderError: Error, Sendable, Equatable,
 }
 
 public final class GLM52StreamedExpertProvider {
-    /// Types the validated MoE kernels dispatch today. IQ2_XXS — the routed
-    /// type of the published GGUF — is deliberately NOT here yet: its
-    /// dequant/dot kernel is a later tranche and silently wrong output is
-    /// worse than a refusal at load time.
+    /// Types the validated MoE kernels dispatch today — including IQ2_XXS,
+    /// the routed type of the published GGUF. Anything else is refused at
+    /// load: silently wrong output is worse than an error.
     public static let supportedTypes: Set<UInt32> = [
         GLM52TensorSchema.q8_0, GLM52TensorSchema.q2_K,
         GLM52TensorSchema.q4_K, GLM52TensorSchema.q5_K,
-        GLM52TensorSchema.q6_K,
+        GLM52TensorSchema.q6_K, GLM52TensorSchema.iq2_XXS,
     ]
 
     public let layer: Int

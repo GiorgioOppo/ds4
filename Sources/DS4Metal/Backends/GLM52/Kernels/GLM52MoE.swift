@@ -38,7 +38,8 @@ extension MetalRuntime {
               width.isMultiple(of: Int(info.blockElems)),
               [GLM52TensorSchema.q8_0, GLM52TensorSchema.q2_K,
                GLM52TensorSchema.q4_K, GLM52TensorSchema.q5_K,
-               GLM52TensorSchema.q6_K].contains(type)
+               GLM52TensorSchema.q6_K,
+               GLM52TensorSchema.iq2_XXS].contains(type)
         else { return nil }
         return (width / Int(info.blockElems)) * Int(info.blockBytes)
     }

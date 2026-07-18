@@ -9,10 +9,10 @@ import Metal
 // compact caches. This is roadmap wiring, not enablement: BackendSelector
 // still refuses `glm-dsa` until the real-GGUF logits parity gate passes.
 //
-// Loading is scoped on purpose: `layerCount` may truncate the stack (the
-// leading dense layers are Q8_0 and run today; sparse layers additionally
-// require a routed-expert type with a validated kernel — the published
-// IQ2_XXS GGUF is refused at load until that kernel tranche lands).
+// Loading is scoped on purpose: `layerCount` may truncate the stack for
+// smoke tests and partial validation. Routed experts require a type with a
+// validated kernel (Q8_0, the K-quants and IQ2_XXS — the published GGUF's
+// routed format); anything else is refused at load.
 
 public struct GLM52ResidentModelOptions: Sendable {
     /// Layers to load from the front of the stack; nil loads every

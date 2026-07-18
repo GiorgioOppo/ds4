@@ -13,11 +13,11 @@ Deliberate scope limits:
 
 - `layerCount` may truncate the stack from the front. The three leading
   dense layers are Q8_0 end to end and run against the published file today;
-  sparse layers additionally need a routed-expert type with a validated
-  kernel — the published IQ2_XXS routed experts are REFUSED at load
-  (`GLM52StreamedExpertProviderError.unsupportedExpertType`) until that
-  kernel tranche lands, because silently wrong output is worse than an
-  error.
+  routed experts need a type with a validated kernel — Q8_0, the four
+  K-quants and IQ2_XXS (the published routed format) are supported; any
+  other type is refused at load
+  (`GLM52StreamedExpertProviderError.unsupportedExpertType`), because
+  silently wrong output is worse than an error.
 - This is roadmap wiring, not enablement: `BackendSelector` still refuses
   `glm-dsa`, and the catalog stays `downloadOnly`, until the full-model
   real-GGUF logits parity gate passes.

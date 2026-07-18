@@ -798,6 +798,42 @@ static inline float glm52_dot_q8_0_row(device const uchar *row,
     return acc;
 }
 
+// IQ2_XXS: 66-byte superblocks of 256 — f16 scale + 32 uint16 words. Each
+// 32-value group decodes four 8-value cells through the shared grid/sign
+// tables the DeepSeek prelude already embeds (same concatenated library),
+// with db = d * (0.5 + top-nibble) * 0.25. Same emission order as
+// Quantize.dequantIQ2_XXS, the CPU reference.
+static inline float glm52_dot_iq2_xxs_row(device const uchar *row,
+                                          device const float *x,
+                                          uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 66u;
+        const float d = glm52_half_at(base);
+        device const ushort *qs = (device const ushort *)(base + 2u);
+        for (uint ib = 0u; ib < 8u; ib++) {
+            const uint aux0 = (uint)qs[4u * ib]
+                | ((uint)qs[4u * ib + 1u] << 16u);
+            const uint aux1 = (uint)qs[4u * ib + 2u]
+                | ((uint)qs[4u * ib + 3u] << 16u);
+            const float db = d * (0.5f + (float)(aux1 >> 28u)) * 0.25f;
+            for (uint l = 0u; l < 4u; l++) {
+                constant uchar *grid = (constant uchar *)
+                    (ds4_metal_iq2xxs_grid + ((aux0 >> (8u * l)) & 255u));
+                const uchar signs =
+                    ds4_metal_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
+                const uint out0 = sb * 256u + ib * 32u + l * 8u;
+                for (uint j = 0u; j < 8u; j++) {
+                    const float w = db * (float)grid[j]
+                        * (((signs >> j) & 1u) != 0u ? -1.0f : 1.0f);
+                    acc += w * x[out0 + j];
+                }
+            }
+        }
+    }
+    return acc;
+}
+
 static inline uint glm52_kquant_row_bytes(uint type, uint width) {
     switch (type) {
         case 8u:  return (width / 32u) * 34u;
@@ -805,6 +841,7 @@ static inline uint glm52_kquant_row_bytes(uint type, uint width) {
         case 12u: return (width / 256u) * 144u;
         case 13u: return (width / 256u) * 176u;
         case 14u: return (width / 256u) * 210u;
+        case 16u: return (width / 256u) * 66u;
         default:  return 0u;
     }
 }
@@ -819,6 +856,7 @@ static inline float glm52_dot_kquant_row(uint type,
         case 12u: return glm52_dot_q4_K_row(row, x, width);
         case 13u: return glm52_dot_q5_K_row(row, x, width);
         case 14u: return glm52_dot_q6_K_row(row, x, width);
+        case 16u: return glm52_dot_iq2_xxs_row(row, x, width);
         default:  return 0.0f;
     }
 }

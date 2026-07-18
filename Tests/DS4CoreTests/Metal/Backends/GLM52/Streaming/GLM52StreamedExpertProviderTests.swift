@@ -85,14 +85,16 @@ final class GLM52StreamedExpertProviderTests: XCTestCase {
 
     func testUnsupportedRoutedTypeIsRefusedAtLoad() throws {
         let reader = try makeReader()
+        // F32 stands in for any type without a validated routed kernel
+        // (IQ2_XXS graduated into the supported set with its kernel).
         XCTAssertThrowsError(try GLM52StreamedExpertProvider(
             reader: reader, layer: 5,
-            weights: routedWeights(gateUpType: GLM52TensorSchema.iq2_XXS),
+            weights: routedWeights(downType: GLM52TensorSchema.f32),
             slotCount: 8)) {
             XCTAssertEqual(
                 $0 as? GLM52StreamedExpertProviderError,
                 .unsupportedExpertType(layer: 5,
-                                       type: GLM52TensorSchema.iq2_XXS))
+                                       type: GLM52TensorSchema.f32))
         }
     }
 
