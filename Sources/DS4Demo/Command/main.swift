@@ -157,8 +157,10 @@ do {
             // contigui (una lettura per esperto invece di tre; duplica su
             // disco il payload routed). Resumabile: i bundle validi vengono
             // saltati.
-            if environment["DS4_GLM_BUILD_BUNDLES"] == "1",
-               let bundleDir = environment["DS4_GLM_BUNDLE_DIR"] {
+            if environment["DS4_GLM_BUILD_BUNDLES"] == "1" {
+                // Convenzione sidecar: accanto al GGUF, salvo override.
+                let bundleDir = environment["DS4_GLM_BUNDLE_DIR"]
+                    ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: ggufPath,
                                                     weightMap: map)

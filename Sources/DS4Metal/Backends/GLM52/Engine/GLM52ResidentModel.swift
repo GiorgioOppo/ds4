@@ -127,6 +127,12 @@ public final class GLM52ResidentModel {
         }
 
         LoadProgress.shared.set(0.02, "GLM: mappa pesi e schema")
+        // Sidecar convention (like the DeepSeek .expbundle): the expert
+        // bundles live beside the GGUF unless DS4_GLM_BUNDLE_DIR overrides.
+        // Auto-discovered and identity-validated per layer; absence is
+        // simply the plain GGUF path.
+        let bundleDirectory = ProcessInfo.processInfo
+            .environment["DS4_GLM_BUNDLE_DIR"] ?? (path + ".glm-experts")
         let geometry = GLM52DecodeGeometry.v5_2
         var layers: [GLM52ResidentStackLayer] = []
         var providers: [Int: GLM52StreamedExpertProvider] = [:]
@@ -207,8 +213,7 @@ public final class GLM52ResidentModel {
             let provider = try GLM52StreamedExpertProvider(
                 reader: reader, weightMap: map, layer: index,
                 slotCount: options.expertSlotCount,
-                bundleDirectory: ProcessInfo.processInfo
-                    .environment["DS4_GLM_BUNDLE_DIR"])
+                bundleDirectory: bundleDirectory)
             providers[index] = provider
             streamed.append(StreamedLayer(
                 tensors: try GLM52StreamedLayerTensors(
