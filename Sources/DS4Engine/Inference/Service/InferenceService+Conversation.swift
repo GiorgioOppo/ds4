@@ -25,7 +25,19 @@ public func resetDecodeProfile() { decoder.resetProfile() }
     public func setDiskKV(directory: URL?, budgetTokens: Int) {
         guard let directory else { diskKV = nil; return }
         let bits: UInt8 = dims.gateQuant == .iq2_xxs ? 2 : 4
-        diskKV = try? DiskKVStore(directory: directory, budgetMB: 0, quantBits: bits,
+        // I checkpoint sono legati al MODELLO: la directory condivisa faceva
+        // tentare a una sessione il restore di KV scritti da un altro GGUF
+        // (o dopo un cambio backend), con errore in faccia all'utente. La
+        // sottodirectory chiave per nome file + dimensione: un modello
+        // diverso vede una cartella diversa e i checkpoint estranei
+        // semplicemente non esistono per lui.
+        let file = (model.path as NSString).lastPathComponent
+        let attributes = try? FileManager.default
+            .attributesOfItem(atPath: model.path)
+        let size = (attributes?[.size] as? UInt64) ?? 0
+        let scoped = directory.appendingPathComponent(
+            "\(file)-\(size)", isDirectory: true)
+        diskKV = try? DiskKVStore(directory: scoped, budgetMB: 0, quantBits: bits,
                                   contextSize: contextSize, budgetTokens: max(1, budgetTokens))
     }
 
