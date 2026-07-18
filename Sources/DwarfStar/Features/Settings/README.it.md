@@ -72,7 +72,7 @@ lo snapshot completo delle preferenze iniziali dopo un crash o un commit
 interrotto. Il pannello possiede l'avanzamento e lo Stop, ed espone nel Finder
 il report Markdown/JSON generato.
 
-**Sfoglia** è il percorso avanzato per un GGUF esterno. Convalida il
+**Browse** è il percorso avanzato per un GGUF esterno. Convalida il
 descrittore di runtime prima di aggiornare `DS4ModelPath` e rende persistente
 un bookmark security-scoped solo per i file esterni. Un modello del catalogo
 sotto Application Support viene salvato come percorso gestito dall'app e
