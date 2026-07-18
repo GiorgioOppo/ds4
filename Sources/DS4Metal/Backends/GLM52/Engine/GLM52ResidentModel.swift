@@ -126,11 +126,15 @@ public final class GLM52ResidentModel {
             return raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
         }
 
+        LoadProgress.shared.set(0.02, "GLM: mappa pesi e schema")
         let geometry = GLM52DecodeGeometry.v5_2
         var layers: [GLM52ResidentStackLayer] = []
         var providers: [Int: GLM52StreamedExpertProvider] = [:]
         layers.reserveCapacity(residentCount)
         for index in 0..<residentCount {
+            LoadProgress.shared.set(
+                0.05 + 0.75 * Double(index) / Double(max(residentCount, 1)),
+                "GLM: layer residente \(index + 1)/\(residentCount)")
             let attention = GLM52QuantizedDecodeAttention(
                 attnNorm: try f32(map.layer(index, .attentionNorm)),
                 qA: try reader.bytes(of: map.layer(index, .attentionQueryA)),
@@ -195,6 +199,7 @@ public final class GLM52ResidentModel {
         // Streamed tail: sparse layers whose big tensors arrive per token
         // through the double-buffered staging slots. Small per-layer state
         // (norms, router, proj, caches) stays resident.
+        LoadProgress.shared.set(0.82, "GLM: stato streaming per layer")
         var streamed: [StreamedLayer] = []
         for index in residentCount..<count {
             let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(
@@ -241,6 +246,7 @@ public final class GLM52ResidentModel {
         scratch = try GLM52DecodeScratch(
             runtime: runtime, geometry: geometry,
             scoreCapacity: options.cacheCapacity)
+        LoadProgress.shared.set(0.9, "GLM: output head")
         head = try GLM52ResidentOutputHead(
             runtime: runtime, geometry: geometry,
             outputNorm: try f32(map.global(.outputNorm)),

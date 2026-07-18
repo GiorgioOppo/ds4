@@ -5,16 +5,22 @@ import Foundation
 /// GLM 5.2 chat service for the GUI: mirrors the chat subset of the DeepSeek
 /// `InferenceService` API (send / sendWithHistory / modelInfo / warmup /
 /// quiesceForTeardown) over the GLM resident engine, so `ChatStore` can host
-/// either backend. Deliberate v1 limits, stated where the GUI can see them:
-/// greedy decoding (SamplingParams accepted, ignored), no tool calls, no
-/// reasoning stream, and every generation re-prefills the rendered
-/// conversation after a context reset (batched layer-major prefill — the
-/// incremental KV suffix reuse of the DeepSeek path comes later).
+/// either backend.
+///
+/// Feature parity with the DeepSeek service so far: sampled decoding
+/// (temperature, top-K, repetition penalty via `GLM52Sampler`), stoppable
+/// generation (the stream's termination cancels the producer), incremental
+/// KV between turns (only the rendered conversation's NEW suffix is
+/// prefilled when it extends what the engine already holds — otherwise a
+/// context reset and a full layer-major batched prefill). Still deliberate
+/// v1 limits: no tool calls and no reasoning stream.
 public actor GLM52ChatService {
     public let service: GLM52InferenceService
     private let contextSize: Int
     private var systemPrompt: String?
     private var transcript: [ChatTurn] = []
+    /// Tokens the engine's caches currently hold, in order.
+    private var primedTokens: [Int32] = []
 
     public init(modelPath: String,
                 contextSize: Int,
@@ -51,7 +57,7 @@ public actor GLM52ChatService {
             kvCacheBytes: UInt64(95_232) * UInt64(contextSize),
             architecture: GLM52BackendDefinition.supportedArchitecture,
             displayName: "GLM 5.2 (glm-dsa)",
-            quantizationSummary: "routed IQ2_XXS · greedy",
+            quantizationSummary: "routed IQ2_XXS",
             capabilities: GLM52BackendDefinition.runtimeCapabilities)
     }
 
@@ -70,11 +76,14 @@ public actor GLM52ChatService {
                      sampling: SamplingParams,
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         transcript.append(.user(userText))
-        return generate(turns: renderableTurns(), maxTokens: maxTokens)
+        return generate(turns: renderableTurns(), sampling: sampling,
+                        maxTokens: maxTokens)
     }
 
     /// Restore a persisted conversation and generate: the provided history
-    /// replaces the running transcript.
+    /// replaces the running transcript. The incremental-KV prefix match
+    /// still applies, so a reopened chat whose rendering extends the live
+    /// caches does not pay a full re-prefill.
     public func sendWithHistory(_ history: [ChatTurn], userText: String,
                                 systemPrompt: String?,
                                 thinkMode: DS4ThinkMode,
@@ -83,7 +92,8 @@ public actor GLM52ChatService {
         -> AsyncThrowingStream<GenEvent, Error> {
         if let systemPrompt { self.systemPrompt = systemPrompt }
         transcript = history + [.user(userText)]
-        return generate(turns: renderableTurns(), maxTokens: maxTokens)
+        return generate(turns: renderableTurns(), sampling: sampling,
+                        maxTokens: maxTokens)
     }
 
     // MARK: - Generation
@@ -92,20 +102,23 @@ public actor GLM52ChatService {
         (systemPrompt.map { [ChatTurn.system($0)] } ?? []) + transcript
     }
 
-    private func appendAssistant(_ text: String) {
-        transcript.append(.assistant(text: text, toolCalls: []))
+    private func noteGeneration(fedTokens: [Int32], assistant: String) {
+        primedTokens = fedTokens
+        transcript.append(.assistant(text: assistant, toolCalls: []))
     }
 
     private func generate(turns: [ChatTurn],
+                          sampling: SamplingParams,
                           maxTokens: Int)
         -> AsyncThrowingStream<GenEvent, Error> {
         let service = self.service
         let contextSize = self.contextSize
+        let primed = self.primedTokens
         return AsyncThrowingStream { continuation in
             // Detached: the engine blocks on GPU/SSD waits and must not
             // occupy the cooperative pool (same discipline as the DeepSeek
             // actor's serial GCD executor).
-            Task.detached(priority: .userInitiated) {
+            let producer = Task.detached(priority: .userInitiated) {
                 do {
                     let rendered = try GLM52ChatRenderer.render(turns: turns)
                     let tokens = service.tokenizer
@@ -115,17 +128,41 @@ public actor GLM52ChatService {
                             "conversazione (\(tokens.count) token) oltre il "
                             + "contesto GLM configurato (\(contextSize))")
                     }
-                    continuation.yield(.progress(
-                        "prefill \(tokens.count) token (layer-major)"))
-                    service.engine.resetContext()
-                    var logits = try service.engine.prefill(tokens)
+
+                    // Incremental KV: prefill only the suffix when the
+                    // rendered conversation extends what the caches hold.
+                    let common = zip(primed, tokens)
+                        .prefix { $0 == $1 }.count
+                    let incremental = common == primed.count
+                        && common == service.engine.position
+                        && common < tokens.count
+                    let suffix: [Int32]
+                    if incremental {
+                        suffix = Array(tokens[common...])
+                        continuation.yield(.progress(
+                            "prefill incrementale \(suffix.count) token "
+                            + "(+\(common) in cache)"))
+                    } else {
+                        service.engine.resetContext()
+                        suffix = tokens
+                        continuation.yield(.progress(
+                            "prefill \(tokens.count) token (layer-major)"))
+                    }
+                    var logits = try service.engine.prefill(suffix)
+
+                    var fed = tokens
                     var produced = 0
                     var reply: [UInt8] = []
                     let budget = min(maxTokens,
                                      contextSize - tokens.count - 1)
-                    while produced < budget {
-                        guard let token = GLM52GreedyDecoding.argmax(logits)
-                        else { break }
+                    while produced < budget, !Task.isCancelled {
+                        guard let token = GLM52Sampler.sample(
+                            logits: logits,
+                            temperature: sampling.temperature,
+                            topK: sampling.topK,
+                            repetitionPenalty: sampling.repetitionPenalty,
+                            recentTokens: fed.suffix(
+                                GLM52Sampler.penaltyWindow)) else { break }
                         produced += 1
                         if service.tokenizer.isStopToken(token,
                                                          reasoning: .none) {
@@ -141,16 +178,19 @@ public actor GLM52ChatService {
                             continuation.yield(.progress(
                                 "\(produced) token generati"))
                         }
-                        if produced == budget { break }
+                        if produced == budget || Task.isCancelled { break }
                         logits = try service.engine.forwardNext(token)
+                        fed.append(token)
                     }
                     let text = String(decoding: reply, as: UTF8.self)
-                    await self.appendAssistant(text)
+                    await self.noteGeneration(fedTokens: fed,
+                                              assistant: text)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in producer.cancel() }
         }
     }
 }
