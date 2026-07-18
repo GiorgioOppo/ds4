@@ -1,21 +1,22 @@
 # Generation
 
-Selezione CPU del token successivo a partire dai logits.
+CPU-side selection of the next token from the logits.
 
-## File principali
+## Main files
 
-- [`Sampler.swift`](Sampler.swift): argmax, RNG xorshift64*, temperature,
-  top-k, top-p, min-p e penalità di ripetizione.
+- [`Sampler.swift`](Sampler.swift): argmax, xorshift64* RNG, temperature,
+  top-k, top-p, min-p and repetition penalties.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il backend produce i logits; il servizio passa parametri, token recenti e stato
-RNG a `Sampler.sample`; l'id scelto torna al tokenizer e al ciclo di generazione.
-L'implementazione usa soltanto Swift/libm ed è indipendente dalla GPU.
+The backend produces the logits; the service passes parameters, recent tokens
+and RNG state to `Sampler.sample`; the chosen id returns to the tokenizer and
+the generation loop. The implementation uses only Swift/libm and is
+GPU-independent.
 
-## Regole di modifica
+## Modification rules
 
-La riproducibilità con lo stesso seed e la parità con il riferimento C sono
-requisiti funzionali. Conservare l'ordine dei candidati e il comportamento dei
-fallback per logits non finiti; accompagnare nuove strategie con test statistici
-e deterministici separati.
+Reproducibility with the same seed and parity with the C reference are
+functional requirements. Preserve candidate order and the fallback behavior
+for non-finite logits; accompany new strategies with separate statistical and
+deterministic tests.

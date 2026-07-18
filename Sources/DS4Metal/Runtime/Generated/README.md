@@ -1,22 +1,22 @@
 # Runtime/Generated
 
-Artefatti generati necessari per distribuire l'app senza sorgenti Metal esterne.
+Generated artifacts required to ship the app without external Metal sources.
 
-## File principali
+## Main files
 
-- [`KernelSources.swift`](KernelSources.swift): dizionario delle sorgenti
-  `metal/*.metal`, concatenate da `MetalRuntime` nell'ordine canonico.
+- [`KernelSources.swift`](KernelSources.swift): dictionary of the
+  `metal/*.metal` sources, concatenated by `MetalRuntime` in canonical order.
 
-## Generazione
+## Generation
 
-La sorgente autorevole è nella cartella `metal/` del repository. Dopo una
-modifica eseguire `make embed-kernels`, che invoca `scripts/embed_kernels.sh` e
-rigenera questo file; quindi compilare almeno il target `DS4Metal` e i test dei
-kernel incorporati.
+The authoritative source lives in the repository's `metal/` folder. After a
+change, run `make embed-kernels`, which invokes `scripts/embed_kernels.sh` and
+regenerates this file; then build at least the `DS4Metal` target and the
+embedded-kernel tests.
 
-## Regole di modifica
+## Modification rules
 
-Non modificare `KernelSources.swift` a mano e non aggiungere logica applicativa
-in questa cartella. Le differenze devono essere riproducibili eseguendo il
-generatore su un checkout pulito; aggiornare insieme ordine/nome dei kernel in
-`MetalRuntime` quando cambia il set sorgente.
+Do not edit `KernelSources.swift` by hand and do not add application logic to
+this folder. Diffs must be reproducible by running the generator on a clean
+checkout; update kernel order/names in `MetalRuntime` together with any change
+to the source set.
