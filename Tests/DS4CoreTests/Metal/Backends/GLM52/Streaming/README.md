@@ -10,6 +10,10 @@ destination sizes, descriptors or planned ranges beyond the real end of file
 (truncated download), hand-built plans that mix per-expert byte sizes, empty
 plans and unopenable paths.
 
+The slot-cache suite proves hits byte-identical to fresh reads, LRU
+eviction with partial-overlap survival, batch pinning, and the creation-time
+budget floor (one token's selection must fit).
+
 All fixtures are small block-legal geometries (Q4_K/Q6_K, 16 experts, ~2 MiB)
 written to temp files — no Metal device and no real model download involved.
 The end-to-end open+plan+read pass over a real sparse GGUF lives in

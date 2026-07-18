@@ -19,8 +19,12 @@ reads of one plan fill disjoint destinations concurrently
 `GGUFWeights.gatherExperts` pattern); the serial path is byte-identical.
 
 The gate|up|down record mirrors the interleaved slot layout of the DeepSeek
-expert pool, so a future GLM slot cache can consume these buffers without
-repacking.
+expert pool. `GLM52ExpertSlotCache` builds on it: an LRU slot cache keyed by
+(layer, expert) whose hits serve byte-identical records to a fresh read —
+the upstream logits-invariance lesson holds by construction. The batch being
+served is pinned against itself, and budgets below one token's top-8 working
+set are refused at creation. MetalIO fills come later beside it, with this
+pread path as the permanent correctness fallback.
 
 The reader never interprets the quantized bytes it moves and owns no GPU
 resource: it stays testable against synthetic files without a Metal device.

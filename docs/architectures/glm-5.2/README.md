@@ -82,8 +82,9 @@ La sequenza di abilitazione è vincolante:
 
 1. collegare la mappa pesi validata alle letture SSD/MetalIO top-8 e alle cache
    — avviato: `GLM52PayloadReader` esegue descrittori e piani top-8 con `pread`
-   bounded (doppia prova dei limiti, rifiuto dei GGUF troncati all'apertura);
-   restano MetalIO, slot-cache e residency;
+   bounded (doppia prova dei limiti, rifiuto dei GGUF troncati all'apertura) e
+   `GLM52ExpertSlotCache` fornisce la cache LRU per-esperto con hit
+   byte-identici e pinning del batch; restano MetalIO e residency;
 2. completare Q/KV-LoRA, RoPE, indexer, attenzione DSA e IndexShare;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;
