@@ -131,6 +131,119 @@ public final class GLM52ResidentDecodeCaches {
     }
 }
 
+/// One layer's FFN resident on the GPU: the norm plus dense or shared
+/// weights uploaded once. Routed experts stay a per-token stream (the
+/// provider yields the selected experts' bytes); the F32 router rows stay
+/// host-side beside the CPU router matvec.
+public final class GLM52ResidentFFN {
+    enum Kind {
+        case dense(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
+        case sparse(routerRows: [Float], routerBias: [Float],
+                    sharedGate: MTLBuffer, sharedUp: MTLBuffer,
+                    sharedDown: MTLBuffer,
+                    expertProvider: (UInt32) throws -> GLM52QuantizedExpert)
+    }
+    let ffnNorm: MTLBuffer
+    let kind: Kind
+
+    public init(runtime: MetalRuntime,
+                geometry: GLM52DecodeGeometry,
+                ffnNorm: [Float],
+                ffn: GLM52QuantizedLayerFFN) throws {
+        let layer = geometry.layer
+        let embedBytes = MetalRuntime.glm52Q8RowBytes(layer.embeddingWidth)
+        func require(_ got: Int, _ expected: Int,
+                     _ component: String) throws {
+            guard got == expected else {
+                throw MetalError.unsupported(
+                    "GLM 5.2 resident FFN \(component) has \(got) elements, "
+                    + "expected \(expected)")
+            }
+        }
+        try require(ffnNorm.count, layer.embeddingWidth, "ffnNorm")
+        self.ffnNorm = try runtime.glm52GraphBuffer(ffnNorm)
+        switch ffn {
+        case .dense(let gate, let up, let down):
+            let hiddenBytes = MetalRuntime.glm52Q8RowBytes(
+                layer.denseHiddenWidth)
+            try require(gate.count, layer.denseHiddenWidth * embedBytes,
+                        "dense gate")
+            try require(up.count, layer.denseHiddenWidth * embedBytes,
+                        "dense up")
+            try require(down.count, layer.embeddingWidth * hiddenBytes,
+                        "dense down")
+            kind = .dense(gate: try runtime.glm52GraphBuffer(gate),
+                          up: try runtime.glm52GraphBuffer(up),
+                          down: try runtime.glm52GraphBuffer(down))
+        case .sparse(let routerRows, let routerBias, let sharedGate,
+                     let sharedUp, let sharedDown, let expertProvider):
+            let hiddenBytes = MetalRuntime.glm52Q8RowBytes(
+                layer.expertHiddenWidth)
+            try require(routerRows.count,
+                        GLM52RouterReference.expertCount
+                            * layer.embeddingWidth, "router rows")
+            try require(routerBias.count,
+                        GLM52RouterReference.expertCount, "router bias")
+            try require(sharedGate.count,
+                        layer.expertHiddenWidth * embedBytes, "shared gate")
+            try require(sharedUp.count,
+                        layer.expertHiddenWidth * embedBytes, "shared up")
+            try require(sharedDown.count,
+                        layer.embeddingWidth * hiddenBytes, "shared down")
+            kind = .sparse(routerRows: routerRows, routerBias: routerBias,
+                           sharedGate: try runtime.glm52GraphBuffer(sharedGate),
+                           sharedUp: try runtime.glm52GraphBuffer(sharedUp),
+                           sharedDown: try runtime.glm52GraphBuffer(sharedDown),
+                           expertProvider: expertProvider)
+        }
+    }
+}
+
+/// The output head resident on the GPU: final RMSNorm weight and the Q8_0
+/// vocabulary matvec rows, uploaded once.
+public final class GLM52ResidentOutputHead {
+    let norm: MTLBuffer
+    let head: MTLBuffer
+    public let vocabularySize: Int
+    let embeddingWidth: Int
+
+    public init(runtime: MetalRuntime,
+                geometry: GLM52DecodeGeometry,
+                outputNorm: [Float],
+                outputHead: [UInt8],
+                vocabularySize: Int) throws {
+        let embed = geometry.layer.embeddingWidth
+        guard outputNorm.count == embed, vocabularySize > 0,
+              outputHead.count == vocabularySize
+                  * MetalRuntime.glm52Q8RowBytes(embed) else {
+            throw MetalError.unsupported(
+                "GLM 5.2 resident output head expects [vocab] Q8_0 rows of "
+                + "\(embed) and a matching norm")
+        }
+        norm = try runtime.glm52GraphBuffer(outputNorm)
+        head = try runtime.glm52GraphBuffer(outputHead)
+        self.vocabularySize = vocabularySize
+        embeddingWidth = embed
+    }
+}
+
+/// One resident decode layer of the stack: the ABSOLUTE layer index drives
+/// the IndexShare role through `GLM52IndexSharePolicy`.
+public struct GLM52ResidentStackLayer {
+    public let index: Int
+    public let weights: GLM52ResidentDecodeWeights
+    public let ffn: GLM52ResidentFFN
+    public let caches: GLM52ResidentDecodeCaches
+
+    public init(index: Int, weights: GLM52ResidentDecodeWeights,
+                ffn: GLM52ResidentFFN, caches: GLM52ResidentDecodeCaches) {
+        self.index = index
+        self.weights = weights
+        self.ffn = ffn
+        self.caches = caches
+    }
+}
+
 extension MetalRuntime {
     // MARK: - Buffer helpers
 
@@ -220,17 +333,48 @@ extension MetalRuntime {
             threadgroupMemoryLength: 256 * MemoryLayout<Float>.stride)
     }
 
-    private func glm52EncodeMatvecQ8(into commandBuffer: MTLCommandBuffer,
-                                     input: MTLBuffer, weights: MTLBuffer,
-                                     output: MTLBuffer, rowCount: Int,
-                                     inputWidth: Int) throws {
+    private func glm52EncodeMatvecQ8(
+        into commandBuffer: MTLCommandBuffer,
+        input: MTLBuffer, weights: MTLBuffer,
+        output: MTLBuffer, rowCount: Int, inputWidth: Int,
+        weightType: UInt32 = GLM52TensorSchema.q8_0) throws {
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer, pipelineName: "kernel_glm52_moe_down",
-            arguments: [GLM52TensorSchema.q8_0, UInt32(rowCount),
+            arguments: [weightType, UInt32(rowCount),
                         UInt32(inputWidth), Float(1).bitPattern],
             buffers: [input, weights, output],
             threadgroups: MTLSize(width: (rowCount + width - 1) / width,
+                                  height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+    }
+
+    private func glm52EncodePairSwiGLU(
+        into commandBuffer: MTLCommandBuffer,
+        input: MTLBuffer, gate: MTLBuffer, up: MTLBuffer, mid: MTLBuffer,
+        hiddenWidth: Int, inputWidth: Int, routeWeight: Float,
+        weightType: UInt32 = GLM52TensorSchema.q8_0) throws {
+        let width = 256
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_pair_swiglu",
+            arguments: [weightType, UInt32(hiddenWidth),
+                        UInt32(inputWidth), routeWeight.bitPattern],
+            buffers: [input, gate, up, mid],
+            threadgroups: MTLSize(width: (hiddenWidth + width - 1) / width,
+                                  height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+    }
+
+    private func glm52EncodeAdd(into commandBuffer: MTLCommandBuffer,
+                                a: MTLBuffer, b: MTLBuffer,
+                                output: MTLBuffer, count: Int) throws {
+        let width = 256
+        try glm52GraphEncode(
+            into: commandBuffer, pipelineName: "kernel_glm52_add_f32",
+            arguments: [UInt32(count), 0, 0, 0],
+            buffers: [a, b, output],
+            threadgroups: MTLSize(width: (count + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
     }
@@ -499,27 +643,193 @@ extension MetalRuntime {
                 selection)
     }
 
-    /// One full decode layer on resident attention state: attention
-    /// residual, then the shared residual FFN stage (host glue — FFN
-    /// residency arrives with the expert-streaming integration).
+    /// One full decode layer on resident state: attention residual, then the
+    /// resident FFN stage. Dense layers and the shared expert run entirely
+    /// on resident buffers; sparse layers tap `ffnIn` back to the host once
+    /// for the F32 router and stream the selected experts' bytes per token
+    /// (uploads that are inherent to streaming, not residency gaps).
     public func glm52ResidentDecodeLayer(
         weights: GLM52ResidentDecodeWeights,
+        ffn: GLM52ResidentFFN,
         caches: GLM52ResidentDecodeCaches,
         input: [Float],
         reusedSelection: [UInt32]?,
-        ffnNorm: [Float],
-        ffn: GLM52QuantizedLayerFFN,
         position: Int) throws
         -> (output: [Float], routing: GLM52RouterOutput?,
             selection: [UInt32]) {
+        let geometry = weights.geometry
+        let embed = geometry.layer.embeddingWidth
         let attn = try glm52ResidentDecodeAttention(
             weights: weights, caches: caches, input: input,
             reusedSelection: reusedSelection, position: position)
-        let afterAttn = (0..<input.count).map { input[$0] + attn.output[$0] }
-        let ffnResult = try glm52LayerFFNStage(
-            geometry: weights.geometry.layer, afterAttention: afterAttn,
-            ffnNorm: ffnNorm, ffn: ffn)
-        return (ffnResult.output, ffnResult.routing, attn.selection)
+        let afterAttn = (0..<embed).map { input[$0] + attn.output[$0] }
+
+        let afterAttnBuffer = try glm52GraphBuffer(afterAttn)
+        let ffnIn = try glm52GraphOutputBuffer(floats: embed)
+        let output = try glm52GraphOutputBuffer(floats: embed)
+
+        switch ffn.kind {
+        case .dense(let gate, let up, let down):
+            let mid = try glm52GraphOutputBuffer(
+                floats: geometry.layer.denseHiddenWidth)
+            let ffnOut = try glm52GraphOutputBuffer(floats: embed)
+            guard let commandBuffer = queue.makeCommandBuffer() else {
+                throw MetalError.bufferAlloc
+            }
+            try glm52EncodeRMSNorm(into: commandBuffer, input: afterAttnBuffer,
+                                   weight: ffn.ffnNorm, output: ffnIn,
+                                   width: embed)
+            try glm52EncodePairSwiGLU(
+                into: commandBuffer, input: ffnIn, gate: gate, up: up,
+                mid: mid, hiddenWidth: geometry.layer.denseHiddenWidth,
+                inputWidth: embed, routeWeight: 1)
+            try glm52EncodeMatvecQ8(
+                into: commandBuffer, input: mid, weights: down,
+                output: ffnOut, rowCount: embed,
+                inputWidth: geometry.layer.denseHiddenWidth)
+            try glm52EncodeAdd(into: commandBuffer, a: afterAttnBuffer,
+                               b: ffnOut, output: output, count: embed)
+            try glm52GraphCommit(commandBuffer)
+            return (glm52GraphReadback(output, count: embed), nil,
+                    attn.selection)
+
+        case .sparse(let routerRows, let routerBias, let sharedGate,
+                     let sharedUp, let sharedDown, let expertProvider):
+            // Stage 1: the FFN norm, read back once for the F32 router.
+            guard let normBuffer = queue.makeCommandBuffer() else {
+                throw MetalError.bufferAlloc
+            }
+            try glm52EncodeRMSNorm(into: normBuffer, input: afterAttnBuffer,
+                                   weight: ffn.ffnNorm, output: ffnIn,
+                                   width: embed)
+            try glm52GraphCommit(normBuffer)
+            let ffnInHost = glm52GraphReadback(ffnIn, count: embed)
+            let logits = try GLM52FFNCPUReference.matvec(
+                rows: routerRows, input: ffnInHost,
+                rowCount: GLM52RouterReference.expertCount)
+            let routed = try glm52Route(logits: logits, bias: routerBias)
+
+            // Stage 2: shared expert plus the streamed routed experts, all
+            // accumulated on GPU (out = afterAttn + shared + sum experts).
+            let hidden = geometry.layer.expertHiddenWidth
+            let mid = try glm52GraphOutputBuffer(floats: hidden)
+            let contribution = try glm52GraphOutputBuffer(floats: embed)
+            guard let ffnBuffer = queue.makeCommandBuffer() else {
+                throw MetalError.bufferAlloc
+            }
+            try glm52EncodePairSwiGLU(
+                into: ffnBuffer, input: ffnIn, gate: sharedGate,
+                up: sharedUp, mid: mid, hiddenWidth: hidden,
+                inputWidth: embed, routeWeight: 1)
+            try glm52EncodeMatvecQ8(
+                into: ffnBuffer, input: mid, weights: sharedDown,
+                output: contribution, rowCount: embed, inputWidth: hidden)
+            try glm52EncodeAdd(into: ffnBuffer, a: afterAttnBuffer,
+                               b: contribution, output: output, count: embed)
+            for (rank, expert) in routed.selected.enumerated() {
+                let record = try expertProvider(UInt32(bitPattern: expert))
+                let gate = try glm52GraphBuffer(record.gate)
+                let up = try glm52GraphBuffer(record.up)
+                let down = try glm52GraphBuffer(record.down)
+                try glm52EncodePairSwiGLU(
+                    into: ffnBuffer, input: ffnIn, gate: gate, up: up,
+                    mid: mid, hiddenWidth: hidden, inputWidth: embed,
+                    routeWeight: routed.weights[rank],
+                    weightType: record.gateUpType)
+                try glm52EncodeMatvecQ8(
+                    into: ffnBuffer, input: mid, weights: down,
+                    output: contribution, rowCount: embed,
+                    inputWidth: hidden, weightType: record.downType)
+                try glm52EncodeAdd(into: ffnBuffer, a: output,
+                                   b: contribution, output: output,
+                                   count: embed)
+            }
+            try glm52GraphCommit(ffnBuffer)
+            return (glm52GraphReadback(output, count: embed), routed,
+                    attn.selection)
+        }
+    }
+
+    /// One decode token through a stack of resident layers in order, with
+    /// the REAL IndexShare threading: full-indexer layers (per
+    /// `GLM52IndexSharePolicy` on the absolute layer index) compute and
+    /// publish the selection; the layers in between must present the
+    /// expected source layer and reuse it verbatim. Returns the logits from
+    /// the resident output head plus per-layer selections and routings.
+    public func glm52ResidentDecodeForward(
+        layers: [GLM52ResidentStackLayer],
+        outputHead: GLM52ResidentOutputHead,
+        embeddedToken: [Float],
+        position: Int) throws
+        -> (logits: [Float], selections: [Int: [UInt32]],
+            routings: [Int: GLM52RouterOutput]) {
+        guard !layers.isEmpty else {
+            throw MetalError.unsupported(
+                "GLM 5.2 resident forward requires at least one layer")
+        }
+        var hidden = embeddedToken
+        var lastSelection: (source: Int, rows: [UInt32])?
+        var selections: [Int: [UInt32]] = [:]
+        var routings: [Int: GLM52RouterOutput] = [:]
+
+        for layer in layers {
+            let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(layer.index)
+            guard isFull == layer.weights.isFullIndexer else {
+                throw MetalError.unsupported(
+                    "GLM 5.2 layer \(layer.index) role mismatch: policy says "
+                    + (isFull ? "full-indexer" : "IndexShare"))
+            }
+            let reused: [UInt32]?
+            if isFull {
+                reused = nil
+            } else {
+                guard let source = GLM52IndexSharePolicy
+                          .selectionSourceLayer(for: layer.index),
+                      let last = lastSelection, last.source == source else {
+                    throw MetalError.unsupported(
+                        "GLM 5.2 IndexShare layer \(layer.index) has no "
+                        + "selection from its source layer")
+                }
+                reused = last.rows
+            }
+            let result = try glm52ResidentDecodeLayer(
+                weights: layer.weights, ffn: layer.ffn,
+                caches: layer.caches, input: hidden,
+                reusedSelection: reused, position: position)
+            hidden = result.output
+            selections[layer.index] = result.selection
+            if let routing = result.routing {
+                routings[layer.index] = routing
+            }
+            if isFull {
+                lastSelection = (layer.index, result.selection)
+            }
+        }
+
+        // Resident output head: final RMSNorm and the vocabulary matvec.
+        guard hidden.count == outputHead.embeddingWidth else {
+            throw MetalError.unsupported(
+                "GLM 5.2 resident head expects a "
+                + "\(outputHead.embeddingWidth)-wide hidden state")
+        }
+        let hiddenBuffer = try glm52GraphBuffer(hidden)
+        let normalized = try glm52GraphOutputBuffer(floats: hidden.count)
+        let logits = try glm52GraphOutputBuffer(
+            floats: outputHead.vocabularySize)
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalError.bufferAlloc
+        }
+        try glm52EncodeRMSNorm(into: commandBuffer, input: hiddenBuffer,
+                               weight: outputHead.norm, output: normalized,
+                               width: hidden.count)
+        try glm52EncodeMatvecQ8(into: commandBuffer, input: normalized,
+                                weights: outputHead.head, output: logits,
+                                rowCount: outputHead.vocabularySize,
+                                inputWidth: hidden.count)
+        try glm52GraphCommit(commandBuffer)
+        return (glm52GraphReadback(logits,
+                                   count: outputHead.vocabularySize),
+                selections, routings)
     }
 
     /// Validation wrapper for the generic-width RMSNorm kernel.

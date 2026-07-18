@@ -56,4 +56,17 @@ the residual adds, the router and the 32-row F32 `indexer.proj` matvec.
 Correctness anchor: parity with `glm52DecodeAttention`, itself judged by
 `GLM52DecodeCPUReference`; the one intentional arithmetic difference is the
 float-reduction GPU RMSNorm replacing the Double-accumulation CPU glue.
-FFN/expert residency and prefill arrive in later tranches.
+
+The stack level completes the resident story: `GLM52ResidentFFN` uploads
+each layer's FFN norm plus dense/shared weights once (routed experts remain
+a per-token byte stream through the provider — inherent to streaming, not a
+residency gap), `glm52ResidentDecodeLayer` runs the residual FFN half on
+resident buffers with GPU accumulation (`kernel_glm52_add_f32`), tapping
+`ffnIn` back to the host once per sparse layer for the F32 router, and
+`glm52ResidentDecodeForward` chains a stack of `GLM52ResidentStackLayer`
+values under the REAL IndexShare policy (absolute layer indices; full
+layers publish the selection, intermediate layers must match their policy
+source and reuse it verbatim), finishing in the resident output head
+(`GLM52ResidentOutputHead`: final RMSNorm + vocabulary matvec). Judged
+against the per-dispatch composition. Prefill on real prompts and the
+real-GGUF logits parity are the remaining gates.

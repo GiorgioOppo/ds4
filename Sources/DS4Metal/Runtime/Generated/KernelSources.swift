@@ -12066,6 +12066,25 @@ kernel void kernel_glm52_rms_norm_f32(
     }
 }
 
+struct ds4_metal_args_glm52_add {
+    uint32_t count;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+// Elementwise residual add for the resident graph. Aliasing out with a is
+// safe: each thread reads and writes only its own index.
+kernel void kernel_glm52_add_f32(
+        constant ds4_metal_args_glm52_add &args,
+        device const float *a,
+        device const float *b,
+        device float       *out,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.count) return;
+    out[tid] = a[tid] + b[tid];
+}
+
 // Interleaved compact-cache row store: cache-ready 576-wide F32 rows
 // (normalized KV-LoRA prefix + RAW K-RoPE tail) converted to F16 at their
 // absolute positions — the exact layout kernel_glm52_attention_indexed_f16
