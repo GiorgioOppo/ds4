@@ -69,8 +69,19 @@ final class GLM52AttentionReferenceTests: XCTestCase {
         let ranked = [8, 2, 6, 0]
         let shuffled = [0, 6, 2, 8]
 
-        for oracle in [GLM52AttentionCPUReference.expanded,
-                       GLM52AttentionCPUReference.absorbed] {
+        // Explicit closures: unapplied function references would not carry
+        // the defaulted rotateTailByRowPosition parameter.
+        typealias Oracle = (GLM52AttentionGeometry, [Float], [Float],
+                            [Float], [Float], [Int]) throws -> [Float]
+        let oracles: [Oracle] = [
+            { try GLM52AttentionCPUReference.expanded(
+                geometry: $0, query: $1, keyB: $2, valueB: $3,
+                cache: $4, selection: $5) },
+            { try GLM52AttentionCPUReference.absorbed(
+                geometry: $0, query: $1, keyB: $2, valueB: $3,
+                cache: $4, selection: $5) },
+        ]
+        for oracle in oracles {
             let a = try oracle(geometry, f.query, f.keyB, f.valueB, f.cache, ranked)
             let b = try oracle(geometry, f.query, f.keyB, f.valueB, f.cache, shuffled)
             for i in 0..<a.count {
