@@ -1,28 +1,28 @@
 # DeepSeekV4/Decode/State
 
-Buffer temporanei riutilizzati lungo il forward per evitare allocazioni per token.
+Temporary buffers reused along the forward pass to avoid per-token
+allocations.
 
-## File principali
+## Main files
 
-- [`DecodeScratch.swift`](DecodeScratch.swift): tensor scratch per proiezioni,
-  attention, router, MoE, output e indici; include viste speciali per i percorsi
-  densi quantizzati.
-- [`LayerWeights.swift`](LayerWeights.swift): pesi residenti di un layer come
-  GPUTensor, con i flag per-layer di quantizzazione (routed, denso Q4, compressori
-  Q8) letti dai dispatch di `DecodeLayer` e degli streamer.
+- [`DecodeScratch.swift`](DecodeScratch.swift): scratch tensors for
+  projections, attention, router, MoE, output and indices; includes special
+  views for the quantized dense paths.
+- [`LayerWeights.swift`](LayerWeights.swift): resident weights of one layer as
+  GPUTensor, with the per-layer quantization flags (routed, dense Q4, Q8
+  compressors) read by the dispatches of `DecodeLayer` and the streamers.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Lo scratch parte dalla capacità richiesta dal contesto effettivamente usato e
-cresce geometricamente quando viene superato un nuovo high-water mark. La
-capacità massima configurata resta soltanto un limite: non viene impegnata alla
-prima domanda. La sostituzione avviene dopo il drain dei command buffer e lo
-scratch continua a essere condiviso in sequenza dalle operazioni del grafo.
-Non rappresenta lo stato persistente della conversazione: quello appartiene
-alla KV cache.
+The scratch starts from the capacity required by the actually used context and
+grows geometrically when a new high-water mark is exceeded. The configured
+maximum capacity remains just a limit: it is not committed on first demand.
+Replacement happens after the command buffers drain, and the scratch keeps
+being shared sequentially by the graph's operations. It does not represent the
+persistent conversation state: that belongs to the KV cache.
 
-## Regole di modifica
+## Modification rules
 
-Documentare per ogni buffer forma logica, byte effettivi, dtype e durata. Le
-alias/view sono ammesse solo se gli intervalli di vita non si sovrappongono; una
-nuova allocazione nel percorso per-token richiede una motivazione misurata.
+Document for every buffer its logical shape, effective bytes, dtype and
+lifetime. Aliases/views are allowed only if the lifetimes do not overlap; a
+new allocation in the per-token path requires a measured justification.

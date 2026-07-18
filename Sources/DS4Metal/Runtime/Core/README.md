@@ -1,24 +1,26 @@
 # Runtime/Core
 
-Astrazioni minime sopra Metal e memoria unificata Apple Silicon.
+Minimal abstractions over Metal and Apple Silicon unified memory.
 
-## File principali
+## Main files
 
-- [`MetalRuntime.swift`](MetalRuntime.swift): seleziona il device, crea queue e
-  libreria, concatena i kernel incorporati e memorizza le compute pipeline.
-- [`GPUTensor.swift`](GPUTensor.swift): buffer con lunghezza logica, byte offset,
-  viste zero-copy, allocazioni residenti/mmap e lock best-effort delle pagine.
+- [`MetalRuntime.swift`](MetalRuntime.swift): selects the device, creates
+  queue and library, concatenates the embedded kernels and caches the compute
+  pipelines.
+- [`GPUTensor.swift`](GPUTensor.swift): buffer with logical length, byte
+  offset, zero-copy views, resident/mmap allocations and best-effort page
+  locking.
 
-## Flusso
+## Flow
 
-Il runtime viene creato una volta per decoder. Loader e scratch costruiscono
-`GPUTensor`; i wrapper kernel associano `buffer` e `byteOffset` agli encoder. Le
-viste mmap condividono il page cache, mentre subview e staging condividono un
-buffer Metal già allocato.
+The runtime is created once per decoder. Loaders and scratch build
+`GPUTensor`s; the kernel wrappers bind `buffer` and `byteOffset` to the
+encoders. The mmap views share the page cache, while subviews and staging
+share an already allocated Metal buffer.
 
-## Regole di modifica
+## Modification rules
 
-Ogni binding deve rispettare `byteOffset`, non solo il buffer base. Usare buffer
-non inizializzati solo quando la scrittura copre l'intero intervallo prima della
-lettura. Non trattenere puntatori CPU oltre la vita del buffer/mmap e non creare
-una pipeline nel percorso per-token se può essere memorizzata.
+Every binding must honor `byteOffset`, not just the base buffer. Use
+uninitialized buffers only when the write covers the whole range before the
+read. Do not hold CPU pointers beyond the buffer/mmap lifetime and do not
+create a pipeline in the per-token path if it can be cached.
