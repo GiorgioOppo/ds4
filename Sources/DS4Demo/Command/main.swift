@@ -132,10 +132,28 @@ do {
             log("DS4Demo: GLM 5.2 greedy — prompt: \(prompt)")
             let tokenizer = try GLM52Tokenizer(model: model)
             let runtime = try MetalRuntime()
-            log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
+            // Knob GLM: DS4_GLM_RESIDENT_LAYERS (quanti layer restano
+            // residenti; gli altri streammano da SSD), DS4_GLM_ACTIVE_EXPERTS
+            // (meno esperti = meno I/O, qualità ridotta),
+            // DS4_GLM_EXPERT_SLOTS (slot cache esperti per layer sparse).
+            let environment = ProcessInfo.processInfo.environment
+            var glmOptions = GLM52ResidentModelOptions()
+            glmOptions.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
+                .flatMap(Int.init)
+            glmOptions.activeExperts = environment["DS4_GLM_ACTIVE_EXPERTS"]
+                .flatMap(Int.init)
+            if let slots = environment["DS4_GLM_EXPERT_SLOTS"]
+                .flatMap(Int.init) {
+                glmOptions.expertSlotCount = slots
+            }
+            if let resident = glmOptions.residentLayerCount {
+                log("DS4Demo: GLM streaming — \(resident) layer residenti, "
+                    + "il resto da SSD per token")
+            } else {
+                log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
+            }
             let glm = try GLM52ResidentModel(
-                runtime: runtime, path: ggufPath,
-                options: GLM52ResidentModelOptions())
+                runtime: runtime, path: ggufPath, options: glmOptions)
             let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
             var logits = try glm.prefill(tokens)
             var produced = 0

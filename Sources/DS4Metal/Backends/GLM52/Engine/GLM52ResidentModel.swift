@@ -22,13 +22,25 @@ public struct GLM52ResidentModelOptions: Sendable {
     public var cacheCapacity: Int
     /// Expert slots per sparse layer's streaming cache.
     public var expertSlotCount: Int
+    /// Layers kept fully resident from the front; the remaining SPARSE
+    /// layers stream their big tensors from SSD per token (double-buffered
+    /// prefetch). nil keeps every loaded layer resident. Must cover at
+    /// least the three leading dense layers.
+    public var residentLayerCount: Int?
+    /// Cap on routed experts executed per token (rank order, weights
+    /// untouched): less expert I/O, lower quality. nil runs the full top-8.
+    public var activeExperts: Int?
 
     public init(layerCount: Int? = nil,
                 cacheCapacity: Int = 4_096,
-                expertSlotCount: Int = 16) {
+                expertSlotCount: Int = 16,
+                residentLayerCount: Int? = nil,
+                activeExperts: Int? = nil) {
         self.layerCount = layerCount
         self.cacheCapacity = cacheCapacity
         self.expertSlotCount = expertSlotCount
+        self.residentLayerCount = residentLayerCount
+        self.activeExperts = activeExperts
     }
 }
 
@@ -37,13 +49,32 @@ public final class GLM52ResidentModel {
     public let loadedLayerCount: Int
     public private(set) var position = 0
 
+    private struct StreamedLayer {
+        let tensors: GLM52StreamedLayerTensors
+        let attnNorm: MTLBuffer
+        let qANorm: MTLBuffer
+        let kvANorm: MTLBuffer
+        let ffnNorm: MTLBuffer
+        let indexerKeyNorm: MTLBuffer?
+        let indexerKeyNormBias: MTLBuffer?
+        let proj: [Float]?
+        let routerRows: [Float]
+        let routerBias: [Float]
+        let provider: GLM52StreamedExpertProvider
+        let caches: GLM52ResidentDecodeCaches
+    }
+
     private let runtime: MetalRuntime
     private let reader: GLM52PayloadReader
     private let embedding: GLM52WeightDescriptor
     private let embeddingRowBytes: Int
     private let stack: [GLM52ResidentStackLayer]
+    private let streamedLayers: [StreamedLayer]
+    private let streamer: GLM52LayerStreamer?
     private let head: GLM52ResidentOutputHead
-    private let providers: [GLM52StreamedExpertProvider]
+    private let providers: [Int: GLM52StreamedExpertProvider]
+    private let activeExperts: Int?
+    private let geometry = GLM52DecodeGeometry.v5_2
     private let vocabulary: Int
     private let embeddingWidth: Int
 
@@ -77,6 +108,13 @@ public final class GLM52ResidentModel {
         }
         embeddingRowBytes = MetalRuntime.glm52Q8RowBytes(embeddingWidth)
         loadedLayerCount = count
+        activeExperts = options.activeExperts
+        let residentCount = min(count, options.residentLayerCount ?? count)
+        guard residentCount >= min(count, Int(shape.nLeadingDense)) else {
+            throw MetalError.unsupported(
+                "GLM 5.2 streaming requires the \(shape.nLeadingDense) "
+                + "leading dense layers to stay resident")
+        }
 
         func f32(_ descriptor: GLM52WeightDescriptor) throws -> [Float] {
             guard descriptor.type == GLM52TensorSchema.f32 else {
@@ -89,9 +127,9 @@ public final class GLM52ResidentModel {
 
         let geometry = GLM52DecodeGeometry.v5_2
         var layers: [GLM52ResidentStackLayer] = []
-        var providers: [GLM52StreamedExpertProvider] = []
-        layers.reserveCapacity(count)
-        for index in 0..<count {
+        var providers: [Int: GLM52StreamedExpertProvider] = [:]
+        layers.reserveCapacity(residentCount)
+        for index in 0..<residentCount {
             let attention = GLM52QuantizedDecodeAttention(
                 attnNorm: try f32(map.layer(index, .attentionNorm)),
                 qA: try reader.bytes(of: map.layer(index, .attentionQueryA)),
@@ -127,7 +165,7 @@ public final class GLM52ResidentModel {
                 let provider = try GLM52StreamedExpertProvider(
                     reader: reader, weightMap: map, layer: index,
                     slotCount: options.expertSlotCount)
-                providers.append(provider)
+                providers[index] = provider
                 quantizedFFN = .sparse(
                     routerRows: try f32(map.layer(index, .router)),
                     routerBias: try f32(map.layer(index, .routerBias)),
@@ -152,6 +190,52 @@ public final class GLM52ResidentModel {
                     capacity: options.cacheCapacity, fullIndexer: isFull)))
         }
         stack = layers
+
+        // Streamed tail: sparse layers whose big tensors arrive per token
+        // through the double-buffered staging slots. Small per-layer state
+        // (norms, router, proj, caches) stays resident.
+        var streamed: [StreamedLayer] = []
+        for index in residentCount..<count {
+            let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(
+                index, shape: shape)
+            let provider = try GLM52StreamedExpertProvider(
+                reader: reader, weightMap: map, layer: index,
+                slotCount: options.expertSlotCount)
+            providers[index] = provider
+            streamed.append(StreamedLayer(
+                tensors: try GLM52StreamedLayerTensors(
+                    index: index, map: map, fullIndexer: isFull),
+                attnNorm: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .attentionNorm))),
+                qANorm: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .attentionQueryANorm))),
+                kvANorm: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .attentionKVANorm))),
+                ffnNorm: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .feedForwardNorm))),
+                indexerKeyNorm: isFull ? try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .indexerKeyNorm))) : nil,
+                indexerKeyNormBias: isFull ? try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .indexerKeyNormBias))) : nil,
+                proj: isFull
+                    ? try f32(map.layer(index, .indexerProjection)) : nil,
+                routerRows: try f32(map.layer(index, .router)),
+                routerBias: try f32(map.layer(index, .routerBias)),
+                provider: provider,
+                caches: try GLM52ResidentDecodeCaches(
+                    runtime: runtime, geometry: geometry,
+                    capacity: options.cacheCapacity, fullIndexer: isFull)))
+        }
+        streamedLayers = streamed
+        // The template always sizes the indexer slots (every layer stores
+        // indexer tensors in the schema, so the descriptors exist even for
+        // IndexShare layers).
+        streamer = streamed.isEmpty ? nil : try GLM52LayerStreamer(
+            runtime: runtime, reader: reader,
+            template: try GLM52StreamedLayerTensors(
+                index: streamed[0].tensors.index, map: map,
+                fullIndexer: true))
+
         self.providers = providers
         head = try GLM52ResidentOutputHead(
             runtime: runtime, geometry: geometry,
@@ -178,14 +262,93 @@ public final class GLM52ResidentModel {
         return row
     }
 
-    /// Advance the model by one token; returns the full logits row.
+    /// Advance the model by one token; returns the full logits row. The
+    /// resident prefix computes first; the streamed tail overlaps each
+    /// layer's compute with the SSD prefetch of the next one, and after the
+    /// step the expert lookahead warms the slot caches with this token's
+    /// selections (consecutive tokens reselect often).
     public func forwardNext(_ token: Int32) throws -> [Float] {
         let embedded = try embeddingRow(token)
-        let result = try runtime.glm52ResidentDecodeForward(
-            layers: stack, outputHead: head, embeddedToken: embedded,
-            position: position)
+        var hidden = embedded
+        var lastSelection: (source: Int, rows: [UInt32])?
+        var routings: [Int: [Int32]] = [:]
+
+        if let streamer, let first = streamedLayers.first {
+            streamer.prefetch(first.tensors)
+        }
+        func reuse(for index: Int, isFull: Bool) throws -> [UInt32]? {
+            if isFull { return nil }
+            guard let source = GLM52IndexSharePolicy.selectionSourceLayer(
+                      for: index),
+                  let last = lastSelection, last.source == source else {
+                throw MetalError.unsupported(
+                    "GLM 5.2 IndexShare layer \(index) has no selection "
+                    + "from its source layer")
+            }
+            return last.rows
+        }
+
+        for layer in stack {
+            let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(layer.index)
+            let result = try runtime.glm52ResidentDecodeLayer(
+                weights: layer.weights, ffn: layer.ffn, caches: layer.caches,
+                input: hidden,
+                reusedSelection: try reuse(for: layer.index, isFull: isFull),
+                position: position, activeExperts: activeExperts)
+            hidden = result.output
+            if isFull { lastSelection = (layer.index, result.selection) }
+            if let routing = result.routing {
+                routings[layer.index] = routing.selected
+            }
+        }
+        for (rank, streamedLayer) in streamedLayers.enumerated() {
+            let index = streamedLayer.tensors.index
+            let buffers = try streamer!.wait(for: index)
+            if rank + 1 < streamedLayers.count {
+                streamer!.prefetch(streamedLayers[rank + 1].tensors)
+            }
+            let isFull = streamedLayer.proj != nil
+            let weights = GLM52ResidentDecodeWeights(
+                geometry: geometry,
+                attnNorm: streamedLayer.attnNorm, qA: buffers.qA,
+                qANorm: streamedLayer.qANorm, qB: buffers.qB,
+                kvA: buffers.kvA, kvANorm: streamedLayer.kvANorm,
+                keyB: buffers.keyB, valueB: buffers.valueB,
+                attnOutput: buffers.attnOutput,
+                indexer: isFull ? GLM52ResidentDecodeWeights.ResidentIndexer(
+                    key: buffers.indexerKey,
+                    keyNorm: streamedLayer.indexerKeyNorm!,
+                    keyNormBias: streamedLayer.indexerKeyNormBias!,
+                    queryB: buffers.indexerQueryB,
+                    proj: streamedLayer.proj!) : nil)
+            let ffn = GLM52ResidentFFN(
+                ffnNorm: streamedLayer.ffnNorm,
+                kind: .sparse(
+                    routerRows: streamedLayer.routerRows,
+                    routerBias: streamedLayer.routerBias,
+                    sharedGate: buffers.sharedGate,
+                    sharedUp: buffers.sharedUp,
+                    sharedDown: buffers.sharedDown,
+                    expertProvider: { [provider = streamedLayer.provider] in
+                        try provider.expert($0)
+                    }))
+            let result = try runtime.glm52ResidentDecodeLayer(
+                weights: weights, ffn: ffn, caches: streamedLayer.caches,
+                input: hidden,
+                reusedSelection: try reuse(for: index, isFull: isFull),
+                position: position, activeExperts: activeExperts)
+            hidden = result.output
+            if isFull { lastSelection = (index, result.selection) }
+            if let routing = result.routing {
+                routings[index] = routing.selected
+            }
+        }
         position += 1
-        return result.logits
+        for (index, selected) in routings {
+            providers[index]?.prefetch(selected.map { UInt32(bitPattern: $0) })
+        }
+        return try runtime.glm52ResidentLogits(outputHead: head,
+                                               hidden: hidden)
     }
 
     /// Feed a whole prompt token by token; returns the logits after the

@@ -69,8 +69,25 @@ public final class GLM52StreamedExpertProvider {
             slotBytes: layout.recordBytes)
     }
 
+    private let lock = NSLock()
+
+    /// Speculative warm-up of the slot cache off-thread — the DeepSeek
+    /// expert-lookahead analog: consecutive tokens reselect experts often,
+    /// so the previous token's selection is a cheap bet. Errors are
+    /// swallowed on purpose (a failed prefetch just means a cold read later).
+    public func prefetch(_ ids: [UInt32]) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            for id in ids { _ = try? self.expert(id) }
+        }
+    }
+
     /// One expert's quantized record, from the slot cache or freshly read.
+    /// Serialized: the LRU cache is not concurrency-safe and the prefetch
+    /// path races the decode thread by design.
     public func expert(_ id: UInt32) throws -> GLM52QuantizedExpert {
+        lock.lock()
+        defer { lock.unlock() }
         let plan = try planner.plan(selectedExperts: [id])
         return try cache.withRecords(plan: plan) { records, layout in
             let record = records[0]

@@ -39,6 +39,28 @@ public final class GLM52ResidentDecodeWeights {
     let indexer: ResidentIndexer?
     public var isFullIndexer: Bool { indexer != nil }
 
+    /// Compose a weights view over EXISTING buffers — the streaming path
+    /// builds one per layer step from per-layer norm buffers plus reused
+    /// staging slots. No validation and no copies: the caller (the layer
+    /// streamer) owns both.
+    init(geometry: GLM52DecodeGeometry,
+         attnNorm: MTLBuffer, qA: MTLBuffer, qANorm: MTLBuffer,
+         qB: MTLBuffer, kvA: MTLBuffer, kvANorm: MTLBuffer,
+         keyB: MTLBuffer, valueB: MTLBuffer, attnOutput: MTLBuffer,
+         indexer: ResidentIndexer?) {
+        self.geometry = geometry
+        self.attnNorm = attnNorm
+        self.qA = qA
+        self.qANorm = qANorm
+        self.qB = qB
+        self.kvA = kvA
+        self.kvANorm = kvANorm
+        self.keyB = keyB
+        self.valueB = valueB
+        self.attnOutput = attnOutput
+        self.indexer = indexer
+    }
+
     public init(runtime: MetalRuntime,
                 geometry: GLM52DecodeGeometry,
                 attention: GLM52QuantizedDecodeAttention,
@@ -145,6 +167,13 @@ public final class GLM52ResidentFFN {
     }
     let ffnNorm: MTLBuffer
     let kind: Kind
+
+    /// Compose an FFN view over EXISTING buffers (streaming path — see the
+    /// weights counterpart). No validation and no copies.
+    init(ffnNorm: MTLBuffer, kind: Kind) {
+        self.ffnNorm = ffnNorm
+        self.kind = kind
+    }
 
     public init(runtime: MetalRuntime,
                 geometry: GLM52DecodeGeometry,
@@ -648,13 +677,17 @@ extension MetalRuntime {
     /// on resident buffers; sparse layers tap `ffnIn` back to the host once
     /// for the F32 router and stream the selected experts' bytes per token
     /// (uploads that are inherent to streaming, not residency gaps).
+    /// `activeExperts` caps the routed experts actually executed (rank
+    /// order, weights untouched): less expert I/O, lower quality — the GLM
+    /// analog of the DeepSeek DS4_ACTIVE_EXPERTS knob.
     public func glm52ResidentDecodeLayer(
         weights: GLM52ResidentDecodeWeights,
         ffn: GLM52ResidentFFN,
         caches: GLM52ResidentDecodeCaches,
         input: [Float],
         reusedSelection: [UInt32]?,
-        position: Int) throws
+        position: Int,
+        activeExperts: Int? = nil) throws
         -> (output: [Float], routing: GLM52RouterOutput?,
             selection: [UInt32]) {
         let geometry = weights.geometry
@@ -726,7 +759,10 @@ extension MetalRuntime {
                 output: contribution, rowCount: embed, inputWidth: hidden)
             try glm52EncodeAdd(into: ffnBuffer, a: afterAttnBuffer,
                                b: contribution, output: output, count: embed)
-            for (rank, expert) in routed.selected.enumerated() {
+            let usedExperts = min(routed.selected.count,
+                                  max(1, activeExperts ?? routed.selected.count))
+            for rank in 0..<usedExperts {
+                let expert = routed.selected[rank]
                 let record = try expertProvider(UInt32(bitPattern: expert))
                 let gate = try glm52GraphBuffer(record.gate)
                 let up = try glm52GraphBuffer(record.up)
@@ -806,7 +842,16 @@ extension MetalRuntime {
             }
         }
 
-        // Resident output head: final RMSNorm and the vocabulary matvec.
+        return (try glm52ResidentLogits(outputHead: outputHead,
+                                        hidden: hidden),
+                selections, routings)
+    }
+
+    /// Resident output head on its own: final RMSNorm plus the vocabulary
+    /// matvec over the resident Q8_0 rows. Shared by the stack forward and
+    /// the streaming engine's manual layer loop.
+    public func glm52ResidentLogits(outputHead: GLM52ResidentOutputHead,
+                                    hidden: [Float]) throws -> [Float] {
         guard hidden.count == outputHead.embeddingWidth else {
             throw MetalError.unsupported(
                 "GLM 5.2 resident head expects a "
@@ -827,9 +872,7 @@ extension MetalRuntime {
                                 rowCount: outputHead.vocabularySize,
                                 inputWidth: hidden.count)
         try glm52GraphCommit(commandBuffer)
-        return (glm52GraphReadback(logits,
-                                   count: outputHead.vocabularySize),
-                selections, routings)
+        return glm52GraphReadback(logits, count: outputHead.vocabularySize)
     }
 
     /// Validation wrapper for the generic-width RMSNorm kernel.

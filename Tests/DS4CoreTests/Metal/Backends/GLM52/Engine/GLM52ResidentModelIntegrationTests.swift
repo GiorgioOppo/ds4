@@ -46,4 +46,38 @@ final class GLM52ResidentModelIntegrationTests: XCTestCase {
         XCTAssertThrowsError(try model.embeddingRow(-1))
         XCTAssertThrowsError(try model.embeddingRow(154_880))
     }
+
+    /// Streamed-vs-resident equivalence on REAL weights: the same 4-layer
+    /// stack once fully resident and once with the sparse layer streamed
+    /// from SSD through the double-buffered slots must produce the same
+    /// logits — streaming is a memory strategy, never a numeric one.
+    func testStreamedTailMatchesResidentOnRealLayout() throws {
+        guard let path = ProcessInfo.processInfo
+                  .environment["DS4_GLM52_SPARSE_GGUF"], !path.isEmpty else {
+            throw XCTSkip("set DS4_GLM52_SPARSE_GGUF to a real or exact-size "
+                          + "sparse GLM 5.2 GGUF")
+        }
+        let runtime: MetalRuntime
+        do { runtime = try MetalRuntime() }
+        catch MetalError.noDevice { throw XCTSkip("Metal device unavailable") }
+
+        let resident = try GLM52ResidentModel(
+            runtime: runtime, path: path,
+            options: GLM52ResidentModelOptions(
+                layerCount: 4, cacheCapacity: 8))
+        let streamed = try GLM52ResidentModel(
+            runtime: runtime, path: path,
+            options: GLM52ResidentModelOptions(
+                layerCount: 4, cacheCapacity: 8, residentLayerCount: 3))
+
+        for token in [Int32(154_822), 9_333, 21] {
+            let a = try resident.forwardNext(token)
+            let b = try streamed.forwardNext(token)
+            XCTAssertEqual(a.count, b.count)
+            for i in 0..<a.count {
+                XCTAssertEqual(a[i], b[i], accuracy: 1e-4 + abs(a[i]) * 1e-4,
+                               "streamed logits diverge at \(i)")
+            }
+        }
+    }
 }

@@ -24,3 +24,23 @@ Deliberate scope limits:
 
 `GLM52GreedyDecoding` keeps argmax (lowest-index ties) and the generation
 loop free of Metal so both are unit-tested without a device.
+
+# SSD streaming
+
+`GLM52LayerStreamer` is the GLM analog of the DeepSeek StreamingDecoder:
+sparse layers past `residentLayerCount` keep only their small state resident
+(norms, router rows, indexer proj, decode caches — ~12 MiB/layer) while the
+big Q8_0 tensors are pread DIRECTLY into two reusable staging buffer sets,
+with the next layer's fill overlapping the current layer's GPU compute.
+Streaming is a memory strategy, never a numeric one: the streamed path runs
+the exact same resident-graph functions on the staged buffers.
+
+Knobs (demo: DS4_GLM_RESIDENT_LAYERS / DS4_GLM_ACTIVE_EXPERTS /
+DS4_GLM_EXPERT_SLOTS): resident-layer budget, routed-expert cap (rank-order
+truncation — less I/O, lower quality), expert slot-cache size. After every
+token the engine warms each sparse layer's slot cache with that token's
+selected experts (`GLM52StreamedExpertProvider.prefetch`, serialized against
+the decode thread). Honest arithmetic: a fully streamed 78-layer pass reads
+~36 GiB/token — the resident budget, the expert-record coalescing already
+done by `read(plan:)`, and the future MTLIO/bundle paths are what make the
+16-32 GiB machines viable.
