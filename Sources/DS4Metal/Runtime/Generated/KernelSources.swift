@@ -11744,6 +11744,211 @@ kernel void kernel_glm52_value_project_q8_0(
         attn_out[(uint64_t)head * N_VALUE + d] = partial;
     }
 }
+
+// MARK: - Routed expert FFN (K-quant weights)
+
+// Validation kernels for the routed expert stages: one thread owns one output
+// row and dequantizes its K-quant row serially with the exact reference
+// pairing (same element order as the CPU dequant references), so the GPU path
+// is comparable to the FFN oracle on dequantized weights. Correctness only —
+// the tuned per-quant families come later, beside these fixtures.
+
+struct ds4_metal_args_glm52_moe {
+    uint32_t weight_type;    // GGUF id: 10=q2_K, 12=q4_K, 13=q5_K, 14=q6_K
+    uint32_t row_count;
+    uint32_t input_width;    // dot width, multiple of 256
+    float    route_weight;   // pair kernel: multiplies the SwiGLU mid
+};
+
+static inline float glm52_half_at(device const uchar *p) {
+    return (float)(*(device const half *)p);
+}
+
+static inline uchar2 glm52_scale_min_k4(uint j, device const uchar *q) {
+    if (j < 4u) {
+        return uchar2(q[j] & 63u, q[j + 4u] & 63u);
+    }
+    return uchar2((q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u),
+                  (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u));
+}
+
+static inline float glm52_dot_q2_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 84u;
+        device const uchar *qs = base + 16u;
+        const float d = glm52_half_at(base + 80u);
+        const float dmin = glm52_half_at(base + 82u);
+        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
+            for (uint plane = 0u; plane < 4u; plane++) {
+                for (uint l = 0u; l < 32u; l++) {
+                    const uchar sc = base[half128 / 16u + plane * 2u + l / 16u];
+                    const uint q = (qs[half128 / 4u + l] >> (plane * 2u)) & 3u;
+                    const float w = d * (float)(sc & 0x0Fu) * (float)q -
+                        dmin * (float)(sc >> 4u);
+                    acc += w * x[sb * 256u + half128 + plane * 32u + l];
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q4_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 144u;
+        const float d = glm52_half_at(base);
+        const float dmin = glm52_half_at(base + 2u);
+        device const uchar *scales = base + 4u;
+        device const uchar *qs = base + 16u;
+        for (uint j = 0u; j < 8u; j++) {
+            const uchar2 sm = glm52_scale_min_k4(j, scales);
+            const float dj = d * (float)sm.x;
+            const float mj = dmin * (float)sm.y;
+            const uint chunk = (j / 2u) * 32u;
+            const uint shift = (j & 1u) * 4u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint q = (qs[chunk + l] >> shift) & 0x0Fu;
+                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q5_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 176u;
+        const float d = glm52_half_at(base);
+        const float dmin = glm52_half_at(base + 2u);
+        device const uchar *scales = base + 4u;
+        device const uchar *qh = base + 16u;
+        device const uchar *qs = base + 48u;
+        for (uint j = 0u; j < 8u; j++) {
+            const uchar2 sm = glm52_scale_min_k4(j, scales);
+            const float dj = d * (float)sm.x;
+            const float mj = dmin * (float)sm.y;
+            const uint chunk = (j / 2u) * 32u;
+            const uint shift = (j & 1u) * 4u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint q = ((qs[chunk + l] >> shift) & 0x0Fu) +
+                    ((qh[l] >> j) & 1u) * 16u;
+                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q6_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 210u;
+        device const uchar *ql = base;
+        device const uchar *qh = base + 128u;
+        device const char *scales = (device const char *)(base + 192u);
+        const float d = glm52_half_at(base + 208u);
+        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
+            const uint qlHalf = half128 / 2u;
+            const uint qhHalf = half128 / 4u;
+            const uint scHalf = half128 / 16u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint sub = l / 16u;
+                const uchar high = qh[qhHalf + l];
+                const int q1 = (int)((ql[qlHalf + l] & 0x0Fu) | ((high << 4u) & 0x30u)) - 32;
+                const int q2 = (int)((ql[qlHalf + l + 32u] & 0x0Fu) | ((high << 2u) & 0x30u)) - 32;
+                const int q3 = (int)((ql[qlHalf + l] >> 4u) | (high & 0x30u)) - 32;
+                const int q4 = (int)((ql[qlHalf + l + 32u] >> 4u) | ((high >> 2u) & 0x30u)) - 32;
+                const uint out0 = sb * 256u + half128 + l;
+                acc += d * (float)scales[scHalf + sub] * (float)q1 * x[out0];
+                acc += d * (float)scales[scHalf + sub + 2u] * (float)q2 * x[out0 + 32u];
+                acc += d * (float)scales[scHalf + sub + 4u] * (float)q3 * x[out0 + 64u];
+                acc += d * (float)scales[scHalf + sub + 6u] * (float)q4 * x[out0 + 96u];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline uint glm52_kquant_row_bytes(uint type, uint width) {
+    const uint blocks = width / 256u;
+    switch (type) {
+        case 10u: return blocks * 84u;
+        case 12u: return blocks * 144u;
+        case 13u: return blocks * 176u;
+        case 14u: return blocks * 210u;
+        default:  return 0u;
+    }
+}
+
+static inline float glm52_dot_kquant_row(uint type,
+                                         device const uchar *row,
+                                         device const float *x,
+                                         uint width) {
+    switch (type) {
+        case 10u: return glm52_dot_q2_K_row(row, x, width);
+        case 12u: return glm52_dot_q4_K_row(row, x, width);
+        case 13u: return glm52_dot_q5_K_row(row, x, width);
+        case 14u: return glm52_dot_q6_K_row(row, x, width);
+        default:  return 0.0f;
+    }
+}
+
+static inline float glm52_silu(float value) {
+    // Stable sigmoid, matching upstream sigmoid_stable.
+    const float s = value >= 0.0f
+        ? 1.0f / (1.0f + exp(-value))
+        : exp(value) / (1.0f + exp(value));
+    return value * s;
+}
+
+// mid[r] = silu(gate_r · x) * (up_r · x) * route_weight — GLM SwiGLU has no
+// clamp and the route weight multiplies the mid BEFORE the down projection.
+kernel void kernel_glm52_moe_pair_swiglu(
+        constant ds4_metal_args_glm52_moe &args,
+        device const float *x,
+        device const uchar *gate_rows,
+        device const uchar *up_rows,
+        device float       *mid,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.row_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    const uint64_t offset = (uint64_t)tid * row_bytes;
+    const float g = glm52_dot_kquant_row(args.weight_type, gate_rows + offset,
+                                         x, args.input_width);
+    const float u = glm52_dot_kquant_row(args.weight_type, up_rows + offset,
+                                         x, args.input_width);
+    mid[tid] = glm52_silu(g) * u * args.route_weight;
+}
+
+// out[r] = down_r · mid for ONE expert; the chained validation wrapper sums
+// expert contributions host-side.
+kernel void kernel_glm52_moe_down(
+        constant ds4_metal_args_glm52_moe &args,
+        device const float *mid,
+        device const uchar *down_rows,
+        device float       *out,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.row_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    out[tid] = glm52_dot_kquant_row(args.weight_type,
+                                    down_rows + (uint64_t)tid * row_bytes,
+                                    mid, args.input_width);
+}
 """###,
         "argsort": ###"""
 struct ds4_metal_args_argsort {

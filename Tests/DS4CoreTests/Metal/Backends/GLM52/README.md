@@ -43,3 +43,8 @@ The Q8_0 suite quantizes the projection weights with the shared test
 quantizer, dequantizes the same bytes, and requires the Q8 kernels to match
 the F32 baselines on those dequantized values — quantization error belongs to
 the fixture, never to the kernel.
+
+The MoE suite applies the same discipline to the routed expert kernels:
+Q4_K fixtures from the real quantizer, synthesized Q2_K/Q5_K/Q6_K blocks
+decoded by the `Quantize` references, stage and chained comparisons against
+`GLM52FFNCPUReference`, and contract rejections (types, sizes, widths).

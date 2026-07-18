@@ -36,7 +36,7 @@ utilizzabili come promessa prestazionale per questa app.
 | Router | oracle CPU e kernel Metal dedicato |
 | DSA/IndexShare | layout, policy, scorer/top-k CPU, primitive Metal e top-k GPU multi-blocco (argsort+merge) |
 | Attenzione compatta | oracle CPU doppio (espanso vs assorbito) e kernel Metal staged qk_lowrank/indexed/value_project (F32 e Q8_0) confrontati con l'oracle |
-| FFN/MoE/output head | oracle CPU F32-ref (denso, routed+shared con peso pre-down, output head) e dequant di riferimento Q2_K/Q5_K/Q6_K; kernel Metal mancanti |
+| FFN/MoE/output head | oracle CPU F32-ref, dequant K-quant di riferimento e kernel Metal di validazione per gli esperti routed (pair-SwiGLU e down su Q2_K/Q4_K/Q5_K/Q6_K); famiglie ottimizzate e denso/output head GPU mancanti |
 | Cache | planner F16 lazy; KV-LoRA norm/store e indexer-K norm/RoPE/store isolati |
 | Decoder | non ancora presente |
 

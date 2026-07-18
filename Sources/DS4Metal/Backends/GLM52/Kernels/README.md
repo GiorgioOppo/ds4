@@ -36,7 +36,13 @@ The currently validated atomic boundaries are:
   (the `ds4_gpu_indexer_topk_tensor` dispatch: per-block bitonic argsort, then
   iterative binary-search merges), reusing the vendored DeepSeek argsort
   kernels. Causal future rows arrive as `-INFINITY` scores and sink to the
-  end; ties follow the bitonic network, not the oracle's lowest-index rule.
+  end; ties follow the bitonic network, not the oracle's lowest-index rule;
+- `GLM52MoE`: validation kernels for the routed expert stages — fused
+  gate/up SwiGLU (route weight on the mid, before down) and the down
+  projection — reading Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored in the
+  GGUF with one thread per output row and the reference element pairing.
+  Baseline: `GLM52FFNCPUReference` on the dequantized weights. The tuned
+  per-quant families (slots/addr/masked batches) come later beside these.
 
 The compact-store input is intentionally *cache-ready*: its first 512 values
 have already passed through `GLM52KVLoRANorm` and its final 64 values are the
