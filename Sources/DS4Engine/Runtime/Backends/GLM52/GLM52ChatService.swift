@@ -28,10 +28,11 @@ public actor GLM52ChatService {
         let environment = ProcessInfo.processInfo.environment
         var options = GLM52ResidentModelOptions()
         options.cacheCapacity = max(256, contextSize)
-        // Streaming defaults sized for consumer RAM: three resident dense
-        // layers unless the user overrides.
+        // RAM-adaptive residency (the biggest tok/s lever on streaming);
+        // DS4_GLM_RESIDENT_LAYERS overrides.
         options.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
-            .flatMap(Int.init) ?? 3
+            .flatMap(Int.init)
+            ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
         options.activeExperts = environment["DS4_GLM_ACTIVE_EXPERTS"]
             .flatMap(Int.init)
         if let slots = environment["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {

@@ -88,7 +88,10 @@ public final class GLM52LayerStreamer {
 
     private static func makeMetalIO(runtime: MetalRuntime, path: String)
         -> (queue: MTLIOCommandQueue, handle: MTLIOFileHandle)? {
-        guard ProcessInfo.processInfo.environment["DS4_GLM_MTLIO"] == "1"
+        // Default ON (DS4_GLM_MTLIO=0 opts out): the fallback to pread on
+        // any anomaly is automatic and permanent, so the fast path is safe
+        // to prefer.
+        guard ProcessInfo.processInfo.environment["DS4_GLM_MTLIO"] != "0"
         else { return nil }
         do {
             let descriptor = MTLIOCommandQueueDescriptor()

@@ -31,6 +31,20 @@ public struct GLM52ResidentModelOptions: Sendable {
     /// untouched): less expert I/O, lower quality. nil runs the full top-8.
     public var activeExperts: Int?
 
+    /// RAM-adaptive resident budget: half the physical memory minus a 6 GiB
+    /// reserve (output head, dense layers, caches, staging, OS), at ~230 MiB
+    /// per resident sparse layer. Floor: the three dense layers. Every
+    /// resident layer removes ~230 MiB of SSD reads from EVERY decoded
+    /// token, so this is the single biggest tok/s lever on streaming.
+    public static func adaptiveResidentLayerCount(
+        totalLayers: Int = 78) -> Int {
+        let physical = Double(ProcessInfo.processInfo.physicalMemory)
+        let budget = physical * 0.5 - 6.0 * 1_073_741_824
+        let perLayer = 230.0 * 1_048_576
+        let extra = budget > 0 ? Int(budget / perLayer) : 0
+        return max(3, min(totalLayers, 3 + extra))
+    }
+
     public init(layerCount: Int? = nil,
                 cacheCapacity: Int = 4_096,
                 expertSlotCount: Int = 16,

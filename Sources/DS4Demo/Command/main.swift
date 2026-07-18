@@ -140,6 +140,7 @@ do {
             var glmOptions = GLM52ResidentModelOptions()
             glmOptions.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
                 .flatMap(Int.init)
+                ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
             glmOptions.activeExperts = environment["DS4_GLM_ACTIVE_EXPERTS"]
                 .flatMap(Int.init)
             if let slots = environment["DS4_GLM_EXPERT_SLOTS"]
