@@ -1,17 +1,19 @@
-# Runtime multi-backend
+# Multi-backend runtime
 
-Questo livello separa l'ispezione portabile di un GGUF dalla costruzione del
-decoder specifico. `RuntimeBackendFactory` legge prima `general.architecture`,
-produce un `RuntimeModelDescriptor` e soltanto dopo abilita un backend concreto.
+This layer separates the portable inspection of a GGUF from the construction
+of the specific decoder. `RuntimeBackendFactory` first reads
+`general.architecture`, produces a `RuntimeModelDescriptor` and only then
+enables a concrete backend.
 
-Il percorso numerico corrente resta DeepSeek V4 e continua a usare direttamente
-`StreamingDecoder`: il layer Runtime non introduce dispatch dinamico nel loop di
-generazione. Flash e Pro Q2 singolo vengono selezionati localmente e costruiscono
-una geometria immutabile distinta; il package Pro Q4 split resta download-only.
-La distribuzione Pro è in verifica e non è parte del supporto locale dichiarato.
-Qwen è riconosciuto per consentire messaggi chiari e UI capability-driven. GLM
-5.2 dispone già di detector e frontend nativi, ma la costruzione viene comunque
-rifiutata finché il decoder Metal non supera i gate numerici end-to-end.
+The current numerical path remains DeepSeek V4 and keeps using
+`StreamingDecoder` directly: the Runtime layer introduces no dynamic dispatch
+in the generation loop. Flash and single-file Pro Q2 are selected locally and
+build a distinct immutable geometry; the Pro Q4 split package remains
+download-only. Distributed Pro is under verification and is not part of the
+declared local support. Qwen is recognized to allow clear messages and a
+capability-driven UI. GLM 5.2 already has a native detector and frontend, but
+construction is still rejected until the Metal decoder passes the end-to-end
+numerical gates.
 
-Le API pubbliche storiche di `InferenceService` e le variabili `DS4_*` restano
-compatibili.
+The historical public APIs of `InferenceService` and the `DS4_*` variables
+remain compatible.
