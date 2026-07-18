@@ -22,19 +22,23 @@ public actor GLM52ChatService {
     /// Tokens the engine's caches currently hold, in order.
     private var primedTokens: [Int32] = []
 
+    /// `residentLayers`/`activeExperts` are the GUI settings (nil = env,
+    /// then RAM-adaptive / full top-8).
     public init(modelPath: String,
                 contextSize: Int,
-                systemPrompt: String?) throws {
+                systemPrompt: String?,
+                residentLayers: Int? = nil,
+                activeExperts: Int? = nil) throws {
         let environment = ProcessInfo.processInfo.environment
         var options = GLM52ResidentModelOptions()
         options.cacheCapacity = max(256, contextSize)
         // RAM-adaptive residency (the biggest tok/s lever on streaming);
-        // DS4_GLM_RESIDENT_LAYERS overrides.
-        options.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
-            .flatMap(Int.init)
+        // GUI setting first, DS4_GLM_RESIDENT_LAYERS next.
+        options.residentLayerCount = residentLayers
+            ?? environment["DS4_GLM_RESIDENT_LAYERS"].flatMap(Int.init)
             ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
-        options.activeExperts = environment["DS4_GLM_ACTIVE_EXPERTS"]
-            .flatMap(Int.init)
+        options.activeExperts = activeExperts
+            ?? environment["DS4_GLM_ACTIVE_EXPERTS"].flatMap(Int.init)
         if let slots = environment["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {
             options.expertSlotCount = slots
         }

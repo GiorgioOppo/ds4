@@ -154,6 +154,8 @@ extension ChatStore {
         }
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
+        let glmResident = glmResidentLayers
+        let glmExperts = glmActiveExperts
         let loadEngineSignature = machineAutoTuneEngineSignature()
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudgetTokens = diskKVBudgetKTok * 1000
@@ -194,7 +196,11 @@ extension ChatStore {
                             do {
                                 cont.resume(returning: try GLM52ChatService(
                                     modelPath: path, contextSize: ctx,
-                                    systemPrompt: nil))
+                                    systemPrompt: nil,
+                                    residentLayers: glmResident > 0
+                                        ? glmResident : nil,
+                                    activeExperts: glmExperts > 0
+                                        ? glmExperts : nil))
                             } catch {
                                 cont.resume(throwing: error)
                             }

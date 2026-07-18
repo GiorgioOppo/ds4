@@ -224,6 +224,17 @@ final class ChatStore {
     var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 22 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
+    /// GLM 5.2: layer residenti (0 = adattivo alla RAM fisica). Ogni layer
+    /// residente in più toglie ~230 MiB di SSD da ogni token generato.
+    /// Si applica al prossimo caricamento del modello.
+    var glmResidentLayers: Int = (UserDefaults.standard.object(forKey: "GLMResidentLayers") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmResidentLayers, forKey: "GLMResidentLayers") }
+    }
+    /// GLM 5.2: esperti eseguiti per token (0 = tutti gli 8 del router).
+    /// Meno esperti = meno I/O, qualità ridotta.
+    var glmActiveExperts: Int = (UserDefaults.standard.object(forKey: "GLMActiveExperts") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmActiveExperts, forKey: "GLMActiveExperts") }
+    }
     /// Layer-aware expert-cache layout for mixed-quant GGUFs. Each routed layer
     /// gets a pool with its real IQ2/Q4 record size, while the allocator keeps
     /// the total byte budget at or below the legacy 22-slot plan. Exact: it only

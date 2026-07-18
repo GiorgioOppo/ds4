@@ -239,6 +239,16 @@ struct SettingsView: View {
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.caption).foregroundStyle(.orange)
                 }
+                Stepper("GLM 5.2 · layer residenti: "
+                        + (store.glmResidentLayers == 0
+                           ? "auto (RAM)" : "\(store.glmResidentLayers)"),
+                        value: $store.glmResidentLayers, in: 0...78, step: 1)
+                Stepper("GLM 5.2 · esperti attivi: "
+                        + (store.glmActiveExperts == 0
+                           ? "8 (tutti)" : "\(store.glmActiveExperts)"),
+                        value: $store.glmActiveExperts, in: 0...8, step: 1)
+                Text("Parametri del backend GLM 5.2, applicati al prossimo caricamento. Layer residenti 0 = adattivo alla RAM fisica; ogni layer residente in più toglie ~230 MiB di SSD da ogni token. Esperti attivi sotto 8 riduce l'I/O per token al costo di qualità.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Mixed-quant expert cache (recommended)", isOn: $store.multiQuantCacheEnabled)
                 Text("Caches every routed IQ2/Q4 layer with its real record size under the same total byte budget as the legacy cache. The M1 Pro A/B improved decode by 28.9% and cut expert reads by 31.1%, with all 64 tokens and 2,068,480 logits bit-identical. Turn OFF to restore the legacy off-class bypass. Applies on the next model load.")
                     .font(.caption).foregroundStyle(.secondary)
