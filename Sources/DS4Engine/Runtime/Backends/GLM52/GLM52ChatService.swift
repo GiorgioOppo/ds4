@@ -471,8 +471,20 @@ public actor GLM52ChatService {
                         }
                         let bytes = service.tokenizer.tokenText(token)
                         reply.append(contentsOf: bytes)
-                        if let piece = String(bytes: bytes,
-                                              encoding: .utf8) {
+                        let specials = service.tokenizer.special
+                        if token == specials.thinkOpen
+                            || token == specials.thinkClose {
+                            // I marcatori think sono TOKEN SPECIALI
+                            // dedicati: la transizione scatta sull'ID —
+                            // robusta anche se la resa testuale cambiasse —
+                            // svuotando prima il testo trattenuto nel modo
+                            // corrente.
+                            for event in splitter.flush() {
+                                continuation.yield(event)
+                            }
+                            splitter.inThink = token == specials.thinkOpen
+                        } else if let piece = String(bytes: bytes,
+                                                     encoding: .utf8) {
                             for event in splitter.feed(piece) {
                                 continuation.yield(event)
                             }
