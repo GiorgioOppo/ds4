@@ -1,11 +1,11 @@
 # Conversation/Backends/DeepSeekV4
 
-Formato conversazionale addestrato di DeepSeek V4.
+DeepSeek V4's trained conversational format.
 
-- [`DSML/`](DSML/README.md) contiene rendering del template, delimitatori e
-  parsing strict/recovery delle chiamate tool.
+- [`DSML/`](DSML/README.md) contains template rendering, delimiters and
+  strict/recovery parsing of tool calls.
 
-I nomi pubblici storici sono invariati; cambia soltanto la collocazione fisica,
-così un futuro backend Qwen può fornire il proprio template senza condividere
-accidentalmente i tag DeepSeek.
+The historical public names are unchanged; only the physical location
+changes, so a future Qwen backend can provide its own template without
+accidentally sharing the DeepSeek tags.
 

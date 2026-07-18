@@ -1,23 +1,25 @@
 # Distributed/Files
 
-Gestisce identità e conservazione locale dei grandi artefatti distribuiti.
+Manages the identity and local retention of large distributed artifacts.
 
-## Componenti
+## Components
 
-- `DistFileHash`: SHA-256 completo, catena di checkpoint e cache persistente
-  validata con dimensione e data di modifica.
-- `DistFileStore`: directory gestita, sanitizzazione nomi, manifest e verifica
-  rapida dei file già ricevuti.
+- `DistFileHash`: full SHA-256, checkpoint chain and persistent cache
+  validated with size and modification date.
+- `DistFileStore`: managed directory, name sanitization, manifest and fast
+  verification of files already received.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il coordinator calcola una volta hash e catena; il worker usa il manifest per
-evitare trasferimenti già verificati. I messaggi corrispondenti sono in
-[`Protocol/Files`](../Protocol/Files/README.md), la ricezione in
-[`Worker/Files`](../Worker/Files/README.md). Dipende da Foundation e CryptoKit.
+The coordinator computes the hash and chain once; the worker uses the manifest
+to avoid transfers already verified. The corresponding messages are in
+[`Protocol/Files`](../Protocol/Files/README.md), reception in
+[`Worker/Files`](../Worker/Files/README.md). Depends on Foundation and
+CryptoKit.
 
-## Estensione
+## Extension
 
-Non fidarsi di nomi inviati in rete, non promuovere `.part` senza hash finale e
-invalidare la cache quando cambiano dimensione o mtime. Un nuovo sidecar richiede
-un nuovo `Kind` nel protocollo e una politica esplicita di risoluzione.
+Do not trust names sent over the network, do not promote `.part` files
+without a final hash and invalidate the cache when size or mtime change. A new
+sidecar requires a new `Kind` in the protocol and an explicit resolution
+policy.

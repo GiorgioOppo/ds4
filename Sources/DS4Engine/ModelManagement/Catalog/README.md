@@ -1,43 +1,43 @@
 # ModelManagement/Catalog
 
-Contiene il catalogo tipizzato cross-family usato dalla GUI. Le tre varianti
-complete DeepSeek V4 Flash e il Pro Q2 in un singolo GGUF sono scaricabili e
-selezionabili. Il package PRO Q4 e i tre GGUF monolitici GLM 5.2 sono visibili e
-scaricabili, ma non avviabili dal runtime corrente.
+Contains the typed cross-family catalog used by the GUI. The three complete
+DeepSeek V4 Flash variants and the single-GGUF Pro Q2 are downloadable and
+selectable. The PRO Q4 package and the three monolithic GLM 5.2 GGUFs are
+visible and downloadable, but not startable by the current runtime.
 
-Ogni `ModelCatalogEntry` raggruppa uno o più `ModelTarget`: un modello completo
-ha un solo artefatto principale, mentre PRO Q4 è un package di due shard. MTP è
-un accessorio separato e non compare nel catalogo dei modelli principali.
+Each `ModelCatalogEntry` groups one or more `ModelTarget`s: a complete model
+has a single main artifact, while PRO Q4 is a package of two shards. MTP is a
+separate accessory and does not appear in the main model catalog.
 
-Il nome remoto, sorgente/revisione Hugging Face, identificatore, dimensione
-esatta disponibile e digest SHA-256 sono centralizzati qui: la GUI non deve
-duplicare nomi file o dedurre il supporto dal filename.
+The remote name, Hugging Face source/revision, identifier, exact available
+size and SHA-256 digest are centralized here: the GUI must not duplicate file
+names or infer support from the filename.
 
-## Matrice corrente
+## Current matrix
 
-| ID | Edizione | Forma | Disponibilità |
+| ID | Edition | Shape | Availability |
 |---|---|---|---|
-| `q2-imatrix` | Flash | un GGUF Q2/IQ2XXS | `runnable` |
-| `q2-q4-imatrix` | Flash | un GGUF mixed Q2/Q4 | `runnable` |
-| `q4-imatrix` | Flash | un GGUF Q4 | `runnable` |
-| `pro-q2-imatrix` | Pro | un GGUF Q2 | `runnable` |
-| `pro-q4-split` | Pro | due shard Q4 | `downloadOnly` |
-| `glm-5.2-iq2-xxs` | GLM 5.2 | un GGUF IQ2_XXS | `downloadOnly` |
-| `glm-5.2-q2-k` | GLM 5.2 | un GGUF Q2_K | `downloadOnly` |
-| `glm-5.2-q4-k` | GLM 5.2 | un GGUF Q4_K | `downloadOnly` |
+| `q2-imatrix` | Flash | one Q2/IQ2XXS GGUF | `runnable` |
+| `q2-q4-imatrix` | Flash | one mixed Q2/Q4 GGUF | `runnable` |
+| `q4-imatrix` | Flash | one Q4 GGUF | `runnable` |
+| `pro-q2-imatrix` | Pro | one Q2 GGUF | `runnable` |
+| `pro-q4-split` | Pro | two Q4 shards | `downloadOnly` |
+| `glm-5.2-iq2-xxs` | GLM 5.2 | one IQ2_XXS GGUF | `downloadOnly` |
+| `glm-5.2-q2-k` | GLM 5.2 | one Q2_K GGUF | `downloadOnly` |
+| `glm-5.2-q4-k` | GLM 5.2 | one Q4_K GGUF | `downloadOnly` |
 
-`ModelCatalogEntry.isSelectable` richiede runtime `runnable`, un solo artefatto
-e ruolo `mainModel`. Questa regola impedisce a un package split o a un
-accessorio di diventare un modello locale. `DeepSeekV4AccessoryCatalog.mtp`
-resta separato e non viene iterato da `ModelCatalogRegistry.entries`.
+`ModelCatalogEntry.isSelectable` requires a `runnable` runtime, a single
+artifact and the `mainModel` role. This rule prevents a split package or an
+accessory from becoming a local model. `DeepSeekV4AccessoryCatalog.mtp`
+remains separate and is not iterated by `ModelCatalogRegistry.entries`.
 
-La disponibilità dei profili singolo-file deriva da
-`DeepSeekV4BackendDefinition.locallyRunnableVariants`; il catalogo non mantiene
-un secondo flag Pro. Quando si estende il catalogo, fissare filename e SHA-256
-dalla fonte remota, conservare gli ID già persistiti e abilitare un profilo solo
-dopo una validazione end-to-end di loader, tokenizer, decoder e forma.
+The availability of the single-file profiles derives from
+`DeepSeekV4BackendDefinition.locallyRunnableVariants`; the catalog does not
+keep a second Pro flag. When extending the catalog, pin filename and SHA-256
+from the remote source, keep the already-persisted IDs, and enable a profile
+only after an end-to-end validation of loader, tokenizer, decoder and shape.
 
-`GLM52ModelCatalog` usa il repository `antirez/glm-5.2-gguf` bloccato alla
-revisione `2638b3b878f5c6cc3ae7334b8dbea1275025f52e`. Il registro ombrello
-`ModelCatalogRegistry` concatena i cataloghi famiglia-specifici; ID e filename
-devono essere globalmente unici.
+`GLM52ModelCatalog` uses the `antirez/glm-5.2-gguf` repository pinned at
+revision `2638b3b878f5c6cc3ae7334b8dbea1275025f52e`. The umbrella registry
+`ModelCatalogRegistry` concatenates the family-specific catalogs; IDs and
+filenames must be globally unique.

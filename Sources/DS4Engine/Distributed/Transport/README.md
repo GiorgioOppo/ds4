@@ -1,23 +1,23 @@
 # Distributed/Transport
 
-Incapsula il trasporto TCP asincrono basato su Network.framework.
+Encapsulates the asynchronous TCP transport based on Network.framework.
 
-## Componenti
+## Components
 
-- `DistError`: errori di frame, rete, versione e trasferimento.
-- `DistConnection`: connessione framed con timeout e letture esatte.
-- `DistRouteEntry`: indirizzo e slice di un passaggio della route.
-- `DistReturnListener`: listener del coordinator per i risultati terminali.
+- `DistError`: frame, network, version and transfer errors.
+- `DistConnection`: framed connection with timeouts and exact reads.
+- `DistRouteEntry`: address and slice of one hop of the route.
+- `DistReturnListener`: coordinator listener for the terminal results.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-`DistConnection` aggiunge/rimuove soltanto l'header definito in
-[`Protocol/Framing`](../Protocol/Framing/README.md); la semantica del payload
-resta nei codec del protocollo. Coordinator e worker possiedono il ciclo di
-vita delle connessioni.
+`DistConnection` only adds/removes the header defined in
+[`Protocol/Framing`](../Protocol/Framing/README.md); the payload semantics
+stay in the protocol codecs. Coordinator and worker own the connection
+lifecycle.
 
-## Estensione
+## Extension
 
-Mantenere cancellabili connect, send e receive; imporre timeout e letture con
-lunghezza esatta. TLS, autenticazione o un trasporto alternativo devono
-preservare l'interfaccia a frame e avere una configurazione esplicita.
+Keep connect, send and receive cancellable; enforce timeouts and exact-length
+reads. TLS, authentication or an alternative transport must preserve the
+framed interface and have an explicit configuration.

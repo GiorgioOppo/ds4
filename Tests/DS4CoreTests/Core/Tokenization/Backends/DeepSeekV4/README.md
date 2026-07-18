@@ -1,5 +1,5 @@
 # DeepSeek V4 Tokenizer Tests
 
-Copre parità col riferimento C, round-trip byte-level, token di controllo,
-neutralizzazione degli input non fidati e compatibilità dell'alias `Tokenizer`.
+Covers parity with the C reference, byte-level round-trip, control tokens,
+neutralization of untrusted input and compatibility of the `Tokenizer` alias.
 

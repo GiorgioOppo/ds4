@@ -1,25 +1,26 @@
 # Conversation/Backends/DeepSeekV4/DSML
 
-Implementazione del protocollo DSML usato dal modello per dichiarare ed emettere
-chiamate a strumenti.
+Implementation of the DSML protocol used by the model to declare and emit
+tool calls.
 
-## File principali
+## Main files
 
-- [`ToolMarkup.swift`](ToolMarkup.swift): costruisce delimitatori e tag DSML.
-- [`ChatRenderer.swift`](ChatRenderer.swift): rende cronologia, schemi tool e
-  prompt di generazione, con modalità completa o compatta.
-- [`ToolCallParser.swift`](ToolCallParser.swift): estrae invocazioni e parametri
-  dall'output del modello.
+- [`ToolMarkup.swift`](ToolMarkup.swift): builds DSML delimiters and tags.
+- [`ChatRenderer.swift`](ChatRenderer.swift): renders history, tool schemas
+  and the generation prompt, with full or compact mode.
+- [`ToolCallParser.swift`](ToolCallParser.swift): extracts invocations and
+  parameters from the model output.
 
-## Flusso
+## Flow
 
-I tipi in [`Models`](../../../Models/README.md) entrano nel renderer; il testo prodotto
-viene tokenizzato. Dopo la generazione, il parser ricostruisce `[ToolCall]`; il
-risultato dello strumento torna nella cronologia come `ChatTurn.toolResult`.
+The types in [`Models`](../../../Models/README.md) go into the renderer; the
+produced text is tokenized. After generation, the parser reconstructs
+`[ToolCall]`; the tool result goes back into the history as
+`ChatTurn.toolResult`.
 
-## Regole di modifica
+## Modification rules
 
-- Preservare delimitatori, escaping di `</tool_result>` e ordinamento stabile JSON.
-- Trattare input del modello e risultati tool come dati non fidati.
-- Misurare la modalità compatta sia per riduzione del prefill sia per affidabilità.
-- Aggiungere test round-trip quando cambiano rendering o parsing.
+- Preserve delimiters, `</tool_result>` escaping and stable JSON ordering.
+- Treat model input and tool results as untrusted data.
+- Measure compact mode both for prefill reduction and for reliability.
+- Add round-trip tests when rendering or parsing changes.
