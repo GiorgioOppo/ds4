@@ -194,7 +194,7 @@ public final class GLM52PayloadReader: @unchecked Sendable {
             // (record e proiezione propri); il primo errore e' protetto dal
             // lock — stesso pattern di GGUFWeights.gatherExperts.
             nonisolated(unsafe) let destinationBase = base
-            nonisolated(unsafe) let jobList = jobs
+            let jobList = jobs
             nonisolated(unsafe) var failure: GLM52PayloadReaderError?
             let lock = NSLock()
             let fd = self.fd
