@@ -92,12 +92,14 @@ La sequenza di abilitazione è vincolante:
    grezza), chiave indexer con LayerNorm centrata e RoPE sul prefisso,
    `visible = pos+1` con fill-range o score+top-k, IndexShare verbatim, e
    rotazione della coda K per-riga al momento dell'attenzione — giudicato
-   dall'oracle `GLM52DecodeCPUReference`. Il grafo persistente della fase
-   attenzione è avviato: pesi quantizzati residenti caricati una volta
-   (`GLM52ResidentDecodeWeights`), cache compatta e chiavi indexer residenti
-   aggiornate in place (`GLM52ResidentDecodeCaches`), attivazioni incatenate
-   su buffer con un solo command buffer nel percorso fill-range; restano la
-   residenza dell'FFN (con lo streaming esperti) e il prefill;
+   dall'oracle `GLM52DecodeCPUReference`. Il grafo persistente è composto:
+   pesi quantizzati residenti caricati una volta (attenzione, FFN
+   densi/shared, output head), cache compatta e chiavi indexer residenti
+   aggiornate in place, attivazioni incatenate su buffer (un solo command
+   buffer nel percorso fill-range), accumulo esperti su GPU con streaming
+   per-token dei record selezionati, e il forward multi-layer
+   `glm52ResidentDecodeForward` con la policy IndexShare reale sugli indici
+   assoluti; restano il prefill su prompt reali e la parità logits;
 3. completare layer densi, MoE routed/shared, RMS residuale e output head;
 4. confrontare embedding, ogni layer e logits con un oracle indipendente;
 5. verificare prefill e decode su prompt reali, incluse chat e tool call;
