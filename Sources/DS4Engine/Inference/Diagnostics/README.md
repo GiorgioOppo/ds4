@@ -1,22 +1,22 @@
 # Inference/Diagnostics
 
-Fornisce diagnostica read-only sul GGUF senza avviare il decoder Metal.
+Provides read-only diagnostics on the GGUF without starting the Metal decoder.
 
-## Componente
+## Component
 
-`Diagnostics.swift` apre metadati e tokenizer per:
+`Diagnostics.swift` opens metadata and tokenizer to:
 
-- mostrare ID e testo dei token;
-- ispezionare `tokenizer.chat_template`;
-- verificare token speciali e markup DSML;
-- confrontare dichiarazioni tool complete e compatte.
+- show token IDs and text;
+- inspect `tokenizer.chat_template`;
+- verify special tokens and DSML markup;
+- compare full and compact tool declarations.
 
-## Dipendenze e flusso
+## Dependencies and flow
 
-Dipende da `DS4Core` e Foundation. Gli output sono stringhe destinate a GUI,
-log o test; nessuno stato del servizio viene modificato.
+Depends on `DS4Core` and Foundation. Outputs are strings intended for GUI,
+logs or tests; no service state is modified.
 
-## Estensione
+## Extension
 
-Preferire controlli deterministici e senza side effect. Una diagnosi che misura
-la GPU appartiene a [`Benchmark`](../Benchmark/README.md), non qui.
+Prefer deterministic, side-effect-free checks. A diagnostic that measures
+the GPU belongs in [`Benchmark`](../Benchmark/README.md), not here.

@@ -1,9 +1,9 @@
 # Backend Metal Tests
 
-Test organizzati per famiglia di modello. Le suite comuni di runtime e kernel
-restano nelle cartelle di primo livello; qui vivono shape, schema GGUF, stato KV
-e composizioni di grafo che hanno semantica specifica del backend.
+Tests organized by model family. The common runtime and kernel suites stay in
+the top-level folders; here live shapes, GGUF schema, KV state and graph
+compositions with backend-specific semantics.
 
-- [`DeepSeekV4/`](DeepSeekV4/README.md): backend attualmente implementato.
-- [`GLM52/`](GLM52/README.md): schema/DSA, oracoli e primitive Metal progressive;
-  nessun test dichiara ancora disponibile il decoder.
+- [`DeepSeekV4/`](DeepSeekV4/README.md): currently implemented backend.
+- [`GLM52/`](GLM52/README.md): schema/DSA, oracles and progressive Metal
+  primitives; no test declares the decoder available yet.
