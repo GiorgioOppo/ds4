@@ -15,7 +15,34 @@ public enum ExpertBundleTool {
         guard !modelPath.isEmpty else { return "Nessun modello selezionato." }
         do {
             let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
-            _ = try RuntimeBackendFactory.prepare(model: model)
+            let selection = try RuntimeBackendFactory.prepare(model: model)
+            if selection.backend == .glm52 {
+                // Sidecar GLM: un bundle contiguo per ogni layer sparse,
+                // accanto al GGUF (o in DS4_GLM_BUNDLE_DIR). Resumabile: i
+                // bundle già validi vengono saltati, quindi il bottone può
+                // essere premuto di nuovo dopo un'interruzione.
+                let map = try GLM52WeightMap(model: model)
+                let reader = try GLM52PayloadReader(path: modelPath,
+                                                    weightMap: map)
+                let directory = ProcessInfo.processInfo
+                    .environment["DS4_GLM_BUNDLE_DIR"]
+                    ?? (modelPath + ".glm-experts")
+                let shape = map.configuration.shape
+                let sparse = Int(shape.nLeadingDense)..<Int(shape.inferenceLayerCount)
+                var created = 0
+                var skipped = 0
+                for layer in sparse {
+                    let built = try GLM52ExpertBundle.build(
+                        directory: directory, layer: layer,
+                        weightMap: map, reader: reader)
+                    if built { created += 1 } else { skipped += 1 }
+                    FileHandle.standardError.write(Data(
+                        "DS4 expbundle: GLM blk\(layer) "
+                        + "(\(created + skipped)/\(sparse.count))\n".utf8))
+                }
+                return "Bundle GLM pronti in \(directory): "
+                    + "\(created) creati, \(skipped) già validi."
+            }
             let geometry = DSV4RuntimeGeometry(configuration: try ModelConfig(model: model))
             var dims = geometry.dims
             let mq = GGUFWeights.detectMoEQuant(model)
