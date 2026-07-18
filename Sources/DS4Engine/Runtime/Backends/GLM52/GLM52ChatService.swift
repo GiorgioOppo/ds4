@@ -297,6 +297,15 @@ public actor GLM52ChatService {
     private struct StreamSplitter {
         var inThink = false
         var pending = ""
+
+        /// Col think ATTIVO il prompt renderizzato termina con `<think>`:
+        /// la generazione comincia già DENTRO il blocco e contiene solo il
+        /// `</think>` di chiusura — lo splitter deve partire in modalità
+        /// reasoning, o l'intera catena passa come testo e la chiusura
+        /// finisce letterale nella UI.
+        init(startsInThink: Bool) {
+            inThink = startsInThink
+        }
         mutating func feed(_ piece: String) -> [GenEvent] {
             pending += piece
             var events: [GenEvent] = []
@@ -442,7 +451,8 @@ public actor GLM52ChatService {
                     var fed = tokens
                     var produced = 0
                     var reply: [UInt8] = []
-                    var splitter = StreamSplitter()
+                    var splitter = StreamSplitter(
+                        startsInThink: thinkMode.core == .high)
                     let decodeStart = Date()
                     let budget = min(maxTokens,
                                      contextSize - tokens.count - 1)
@@ -479,10 +489,17 @@ public actor GLM52ChatService {
                     for event in splitter.flush() {
                         continuation.yield(event)
                     }
-                    // Native GLM XML tool calls: parsed from the full reply;
-                    // the GUI receives them as one .toolCall event (the
-                    // automatic tool loop stays DeepSeek-only in this v1).
-                    let raw = String(decoding: reply, as: UTF8.self)
+                    // Native GLM XML tool calls: parsed from the full reply.
+                    // Col think attivo il grezzo inizia col ragionamento
+                    // (senza marcatore di apertura — sta nel prompt): via
+                    // il prefisso fino al `</think>`, così transcript e
+                    // parser vedono solo la risposta visibile.
+                    var raw = String(decoding: reply, as: UTF8.self)
+                    if thinkMode.core == .high,
+                       let close = raw.range(
+                           of: GLM52ConversationProtocol.thinkClose) {
+                        raw = String(raw[close.upperBound...])
+                    }
                     let parsed = GLM52ToolCodec.parse(raw,
                                                       tools: declaredTools)
                     if !parsed.calls.isEmpty {
