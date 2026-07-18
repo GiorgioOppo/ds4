@@ -105,7 +105,9 @@ extension MetalRuntime {
             encoder.setBuffer(buffer, offset: 0, index: index + 1)
         }
         if let length = threadgroupMemoryLength {
-            encoder.setThreadgroupMemoryLength(length, index: 0)
+            // 16-byte multiple: Metal API validation (Xcode runs) aborts on
+            // unaligned threadgroup memory lengths.
+            encoder.setThreadgroupMemoryLength((length + 15) & ~15, index: 0)
         }
         encoder.dispatchThreadgroups(threadgroups,
                                      threadsPerThreadgroup: threadsPerThreadgroup)

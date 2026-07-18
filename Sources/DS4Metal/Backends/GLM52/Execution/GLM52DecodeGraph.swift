@@ -338,7 +338,10 @@ extension MetalRuntime {
             encoder.setBuffer(buffer, offset: 0, index: index + 1)
         }
         if let length = threadgroupMemoryLength {
-            encoder.setThreadgroupMemoryLength(length, index: 0)
+            // Metal API validation aborts on lengths that are not multiples
+            // of 16 bytes (Xcode-run builds have it on; CLI runs do not —
+            // which is why the test suite never tripped this).
+            encoder.setThreadgroupMemoryLength((length + 15) & ~15, index: 0)
         }
         encoder.dispatchThreadgroups(
             threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
