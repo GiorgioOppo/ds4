@@ -12025,6 +12025,74 @@ kernel void kernel_glm52_rope_tail_f32(
     tail[1] = x0 * s + x1 * c;
 }
 
+// MARK: - Resident decode graph primitives
+
+struct ds4_metal_args_glm52_rms_norm {
+    uint32_t width;
+    float    epsilon;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+// Generic-width RMSNorm with weight: one 256-thread threadgroup per row,
+// float parallel reduction. Serves the resident decode graph's attn_norm and
+// q_a_norm stages so activations never leave the GPU; the 512-wide KV-LoRA
+// prefix keeps its dedicated cache-ready kernel.
+kernel void kernel_glm52_rms_norm_f32(
+        constant ds4_metal_args_glm52_rms_norm &args,
+        device const float *input,
+        device const float *weight,
+        device float       *output,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 threads [[threads_per_threadgroup]]) {
+    const uint nth = threads.x;
+    if (nth != 256u) return;
+    float sum_squares = 0.0f;
+    for (uint i = tid; i < args.width; i += nth) {
+        const float value = input[i];
+        sum_squares += value * value;
+    }
+    scratch[tid] = sum_squares;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = nth >> 1u; step > 0u; step >>= 1u) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_rms =
+        rsqrt(scratch[0] / (float)args.width + args.epsilon);
+    for (uint i = tid; i < args.width; i += nth) {
+        output[i] = (input[i] * inverse_rms) * weight[i];
+    }
+}
+
+// Interleaved compact-cache row store: cache-ready 576-wide F32 rows
+// (normalized KV-LoRA prefix + RAW K-RoPE tail) converted to F16 at their
+// absolute positions — the exact layout kernel_glm52_attention_indexed_f16
+// reads. The two-plane store kernel remains for the upstream-shaped caches.
+kernel void kernel_glm52_store_compact_row_f16(
+        constant ds4_metal_args_glm52_store_compact_kv &args,
+        device const float *rows,
+        device half        *compact_cache,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 threads [[threads_per_threadgroup]]) {
+    constexpr uint ROW_WIDTH = 576u;
+    const uint token = group.x;
+    const uint nth = threads.x;
+    if (token >= args.n_tokens ||
+        args.pos0 >= args.cache_cap ||
+        token >= args.cache_cap - args.pos0) {
+        return;
+    }
+    device const float *src = rows + (uint64_t)token * ROW_WIDTH;
+    device half *dst = compact_cache +
+        (uint64_t)(args.pos0 + token) * ROW_WIDTH;
+    for (uint i = tid; i < ROW_WIDTH; i += nth) {
+        dst[i] = (half)src[i];
+    }
+}
+
 // Rotate the n_rot-wide PREFIX of every head in place — the indexer-side
 // convention: upstream forces rot_offset = 0 for the 128-wide indexer
 // queries and keys, while the MLA query rotates its tail. Same adjacent-pair

@@ -38,3 +38,22 @@ shared `glm52LayerFFNStage`. Host arrays move through shared buffers per
 dispatch — the persistent-GPUTensor decode graph that keeps activations and
 caches resident comes next, with this composition as its correctness
 baseline. Still not a runnable decode loop; no catalog capability changes.
+
+# GLM 5.2 resident decode graph
+
+`GLM52ResidentDecodeWeights` uploads a layer's quantized weights ONCE into
+MTLBuffers; `GLM52ResidentDecodeCaches` keeps the compact cache (interleaved
+`[capacity][576]` F16 rows) and the indexer key plane resident on the GPU,
+appended in place. `glm52ResidentDecodeAttention` encodes the whole attention
+step on chained buffers: in the fill-range path a SINGLE command buffer
+covers the norms (new `kernel_glm52_rms_norm_f32`), the LoRA projections,
+the compact-row store (new `kernel_glm52_store_compact_row_f16`), both RoPE
+kernels, the indexer key store, qk_lowrank, the rotated indexed attention
+and the output projection; the top-k path splits only around the score
+readback that feeds the host-orchestrated multi-block top-k. The CPU keeps
+the residual adds, the router and the 32-row F32 `indexer.proj` matvec.
+
+Correctness anchor: parity with `glm52DecodeAttention`, itself judged by
+`GLM52DecodeCPUReference`; the one intentional arithmetic difference is the
+float-reduction GPU RMSNorm replacing the Double-accumulation CPU glue.
+FFN/expert residency and prefill arrive in later tranches.

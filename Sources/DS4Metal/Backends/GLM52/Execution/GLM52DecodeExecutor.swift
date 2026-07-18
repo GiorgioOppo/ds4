@@ -220,10 +220,51 @@ extension MetalRuntime {
         reusedSelection: [UInt32]?,
         caches: GLM52DecodeCaches,
         position: Int) throws {
+        try glm52ValidateDecodeWeights(
+            geometry: geometry, attention: attention, indexer: indexer)
+        let g = geometry
+        let layer = g.layer
+        guard position >= 0 else {
+            throw MetalError.unsupported(
+                "GLM 5.2 decode position must be non-negative")
+        }
+        try glm52RequireCount(input.count, layer.embeddingWidth, "input")
+
+        let cacheRowWidth = layer.kvLoraRank + layer.ropeDimension
+        try glm52RequireCount(caches.compactBits.count,
+                              position * cacheRowWidth, "compactBits")
+        if indexer != nil {
+            guard reusedSelection == nil else {
+                throw MetalError.unsupported(
+                    "full-indexer decode layer must not receive a reused "
+                    + "selection")
+            }
+            try glm52RequireCount(caches.indexerKeyBits.count,
+                                  position * g.indexerHeadDimension,
+                                  "indexerKeyBits")
+        } else {
+            guard reusedSelection != nil else {
+                throw MetalError.unsupported(
+                    "IndexShare decode layer requires the preceding "
+                    + "full-indexer selection")
+            }
+            guard caches.indexerKeyBits.isEmpty else {
+                throw MetalError.unsupported(
+                    "IndexShare decode layer must not own indexer keys")
+            }
+        }
+    }
+
+    /// Geometry and weight-count contract shared by the per-dispatch decode
+    /// executor and the resident decode graph.
+    func glm52ValidateDecodeWeights(
+        geometry: GLM52DecodeGeometry,
+        attention: GLM52QuantizedDecodeAttention,
+        indexer: GLM52QuantizedDecodeIndexer?) throws {
         let g = geometry
         let layer = g.layer
         let fixed = GLM52AttentionGeometry.v5_2
-        guard g.isValid, position >= 0,
+        guard g.isValid,
               layer.headCount == fixed.headCount,
               g.nopeDimension == fixed.nopeDimension,
               layer.ropeDimension == fixed.ropeDimension,
@@ -246,7 +287,6 @@ extension MetalRuntime {
         let embedBytes = Self.glm52Q8RowBytes(layer.embeddingWidth)
         let qLoraBytes = Self.glm52Q8RowBytes(g.qLoraRank)
         let headsWidth = layer.headCount * layer.valueDimension
-        try glm52RequireCount(input.count, layer.embeddingWidth, "input")
         try glm52RequireCount(attention.attnNorm.count, layer.embeddingWidth,
                               "attnNorm")
         try glm52RequireCount(attention.qA.count, g.qLoraRank * embedBytes,
@@ -270,16 +310,7 @@ extension MetalRuntime {
                               layer.embeddingWidth
                                   * Self.glm52Q8RowBytes(headsWidth),
                               "attnOutput")
-
-        let cacheRowWidth = layer.kvLoraRank + layer.ropeDimension
-        try glm52RequireCount(caches.compactBits.count,
-                              position * cacheRowWidth, "compactBits")
         if let indexer {
-            guard reusedSelection == nil else {
-                throw MetalError.unsupported(
-                    "full-indexer decode layer must not receive a reused "
-                    + "selection")
-            }
             try glm52RequireCount(indexer.key.count,
                                   g.indexerHeadDimension * embedBytes,
                                   "indexer.key")
@@ -294,19 +325,6 @@ extension MetalRuntime {
             try glm52RequireCount(indexer.proj.count,
                                   g.indexerHeadCount * layer.embeddingWidth,
                                   "indexer.proj")
-            try glm52RequireCount(caches.indexerKeyBits.count,
-                                  position * g.indexerHeadDimension,
-                                  "indexerKeyBits")
-        } else {
-            guard reusedSelection != nil else {
-                throw MetalError.unsupported(
-                    "IndexShare decode layer requires the preceding "
-                    + "full-indexer selection")
-            }
-            guard caches.indexerKeyBits.isEmpty else {
-                throw MetalError.unsupported(
-                    "IndexShare decode layer must not own indexer keys")
-            }
         }
     }
 

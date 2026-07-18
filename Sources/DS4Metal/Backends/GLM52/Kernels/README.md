@@ -48,6 +48,13 @@ The currently validated atomic boundaries are:
   queries — upstream forces `rot_offset = 0` there). Iterative-theta CPU
   oracle (`rotate`/`rotatePrefix`), closed-form-theta kernels, forward only
   on GPU;
+- resident-graph primitives (wrappers live beside the graph in
+  `Execution/GLM52DecodeGraph.swift`): `kernel_glm52_rms_norm_f32`, a
+  generic-width weighted RMSNorm (256-thread float reduction) for the
+  attn_norm/q_a_norm stages of the resident decode graph, and
+  `kernel_glm52_store_compact_row_f16`, the interleaved `[pos][576]` F16
+  compact-row store matching the layout the indexed attention kernel reads
+  (the two-plane store remains for the upstream-shaped caches);
 - `GLM52MoE`: validation kernels for the quantized FFN matvec stages —
   fused gate/up SwiGLU (route weight on the mid, before down) and the down
   projection — reading Q8_0 and Q2_K/Q4_K/Q5_K/Q6_K rows exactly as stored
