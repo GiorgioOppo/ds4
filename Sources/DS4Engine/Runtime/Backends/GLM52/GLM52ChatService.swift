@@ -48,11 +48,11 @@ public actor GLM52ChatService {
             nVocab: Int(shape.nVocab),
             contextSize: contextSize,
             routedQuantBits: 2,
-            kvCacheBytes: 95_232 * contextSize,
+            kvCacheBytes: UInt64(95_232) * UInt64(contextSize),
             architecture: GLM52BackendDefinition.supportedArchitecture,
             displayName: "GLM 5.2 (glm-dsa)",
             quantizationSummary: "routed IQ2_XXS · greedy",
-            capabilities: GLM52BackendDefinition.modelCapabilities)
+            capabilities: GLM52BackendDefinition.runtimeCapabilities)
     }
 
     public func warmup() -> Bool { true }
