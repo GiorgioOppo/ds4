@@ -100,7 +100,7 @@ final class GLM52PayloadReaderTests: XCTestCase {
         let reader = try GLM52PayloadReader(path: path)
 
         var short = [UInt8](repeating: 0, count: Int(weights.gate.bytes) - 1)
-        short.withUnsafeMutableBytes { buffer in
+        try short.withUnsafeMutableBytes { buffer in
             XCTAssertThrowsError(try reader.read(weights.gate, into: buffer)) {
                 XCTAssertEqual(
                     $0 as? GLM52PayloadReaderError,
@@ -181,7 +181,7 @@ final class GLM52PayloadReaderTests: XCTestCase {
 
         // The serial path must be byte-identical to the concurrent one.
         var serial = [UInt8](repeating: 0, count: layout.totalBytes)
-        try serial.withUnsafeMutableBytes {
+        _ = try serial.withUnsafeMutableBytes {
             try reader.read(plan: plan, into: $0, concurrent: false)
         }
         XCTAssertEqual(serial, packed)
@@ -196,7 +196,7 @@ final class GLM52PayloadReaderTests: XCTestCase {
         let layout = try reader.packedLayout(of: plan)
 
         var oversized = [UInt8](repeating: 0, count: layout.totalBytes + 1)
-        oversized.withUnsafeMutableBytes { buffer in
+        try oversized.withUnsafeMutableBytes { buffer in
             XCTAssertThrowsError(try reader.read(plan: plan, into: buffer)) {
                 XCTAssertEqual(
                     $0 as? GLM52PayloadReaderError,
@@ -216,7 +216,7 @@ final class GLM52PayloadReaderTests: XCTestCase {
         let layout = try reader.packedLayout(of: plan)
 
         var packed = [UInt8](repeating: 0, count: layout.totalBytes)
-        packed.withUnsafeMutableBytes { buffer in
+        try packed.withUnsafeMutableBytes { buffer in
             XCTAssertThrowsError(try reader.read(plan: plan, into: buffer)) {
                 guard case .rangeOutsideFile = $0 as? GLM52PayloadReaderError else {
                     return XCTFail("expected rangeOutsideFile, got \($0)")

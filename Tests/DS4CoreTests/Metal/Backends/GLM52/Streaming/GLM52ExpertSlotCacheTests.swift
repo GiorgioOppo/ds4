@@ -58,7 +58,7 @@ final class GLM52ExpertSlotCacheTests: XCTestCase {
         -> (packed: [UInt8], layout: GLM52ExpertPackedRecordLayout) {
         let layout = try reader.packedLayout(of: plan)
         var packed = [UInt8](repeating: 0, count: layout.totalBytes)
-        try packed.withUnsafeMutableBytes {
+        _ = try packed.withUnsafeMutableBytes {
             try reader.read(plan: plan, into: $0)
         }
         return (packed, layout)

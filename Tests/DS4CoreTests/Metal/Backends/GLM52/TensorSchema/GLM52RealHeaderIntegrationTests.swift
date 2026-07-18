@@ -61,7 +61,7 @@ final class GLM52RealHeaderIntegrationTests: XCTestCase {
         let layout = try reader.packedLayout(of: plan)
         XCTAssertEqual(UInt64(layout.totalBytes), plan.totalBytes)
         var packed = [UInt8](repeating: 1, count: layout.totalBytes)
-        try packed.withUnsafeMutableBytes {
+        _ = try packed.withUnsafeMutableBytes {
             try reader.read(plan: plan, into: $0)
         }
 
