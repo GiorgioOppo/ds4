@@ -257,6 +257,86 @@ do {
             let decodeStart = Date()
             var steadyStart = decodeStart
             var produced = 0
+            // DS4_GLM_SPEC_K=N (>=2): decode speculativo prompt-lookup —
+            // il draft è il transcript stesso (n-gramma 4→2) e la VERIFICA
+            // è un forward layer-major della finestra (pesi letti una volta
+            // per l'intera finestra: è l'unico modo di battere il tetto
+            // dell'I/O per token). Accettazione greedy; il rifiuto fa
+            // rollback delle cache e ricommitta solo il prefisso valido.
+            let specK = environment["DS4_GLM_SPEC_K"].flatMap(Int.init) ?? 0
+            if specK >= 2 {
+                log("DS4Demo: decode speculativo prompt-lookup GLM — "
+                    + "finestra \(specK), n-gramma 4→2")
+                var history = tokens.map { Int($0) }
+                var rounds = 0, drafted = 0, accepted = 0, misses = 0
+                specLoop: while produced < maxNew {
+                    guard let tP = GLM52GreedyDecoding.argmax(logits) else {
+                        break
+                    }
+                    produced += 1
+                    if tokenizer.isStopToken(tP, reasoning: .none) { break }
+                    stdout.write(Data(tokenizer.tokenText(tP)))
+                    history.append(Int(tP))
+                    if produced >= maxNew { break }
+                    let cands = PromptLookup.draft(history: history,
+                                                   count: specK - 1)
+                    let t0 = Date()
+                    if cands.isEmpty {
+                        misses += 1
+                        logits = try glm.forwardNext(tP)
+                        let dt = Date().timeIntervalSince(t0)
+                        log(String(format: "  [tok %d  %.1fs  %.2f tok/s]",
+                                   produced, dt, dt > 0 ? 1.0 / dt : 0))
+                        continue
+                    }
+                    let base = glm.position
+                    let window: [Int32] = [tP] + cands.map(Int32.init)
+                    var logitsAll = try glm.forwardBatch(window)
+                    var j = 0
+                    while j + 1 < window.count {
+                        guard let a = GLM52GreedyDecoding.argmax(
+                                  logitsAll[j]),
+                              a == window[j + 1] else { break }
+                        j += 1
+                    }
+                    rounds += 1
+                    drafted += window.count - 1
+                    accepted += j
+                    if j + 1 < window.count {
+                        try glm.rollback(to: base)
+                        logitsAll = try glm.forwardBatch(
+                            Array(window.prefix(j + 1)))
+                    }
+                    if j >= 1 {
+                        for candidate in window[1...j] {
+                            if tokenizer.isStopToken(candidate,
+                                                     reasoning: .none) {
+                                break specLoop
+                            }
+                            stdout.write(Data(
+                                tokenizer.tokenText(candidate)))
+                            history.append(Int(candidate))
+                            produced += 1
+                            if produced >= maxNew { break }
+                        }
+                    }
+                    logits = logitsAll[j]
+                    let dt = Date().timeIntervalSince(t0)
+                    log(String(format: "  [round %d  +%d tok  %.1fs  %.2f tok/s  accept %.2f  miss %d]",
+                               rounds, j + 1, dt,
+                               dt > 0 ? Double(j + 1) / dt : 0,
+                               drafted > 0
+                                   ? Double(accepted) / Double(drafted) : 0,
+                               misses))
+                }
+                if rounds > 0 || misses > 0 {
+                    log(String(format: "DS4Demo: prompt-lookup — %d round speculativi, %d forward diretti (miss), accettazione draft %.0f%%",
+                               rounds, misses,
+                               drafted > 0
+                                   ? 100 * Double(accepted) / Double(drafted)
+                                   : 0))
+                }
+            } else {
             while produced < maxNew {
                 guard let token = GLM52GreedyDecoding.argmax(logits) else {
                     break
@@ -277,6 +357,7 @@ do {
                     glm.resetStreamingStats()
                     steadyStart = Date()
                 }
+            }
             }
             stdout.write(Data("\n".utf8))
             let decodeSeconds = Date().timeIntervalSince(decodeStart)

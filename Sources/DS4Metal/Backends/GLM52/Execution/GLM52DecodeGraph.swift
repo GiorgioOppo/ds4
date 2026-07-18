@@ -187,6 +187,14 @@ public final class GLM52ResidentDecodeCaches {
     /// the live count are never read, so no clearing is needed.
     public func reset() { rows = 0 }
 
+    /// Speculative rejection: drop the rows beyond `rowCount` (rows past
+    /// the live count are never read, so no scrubbing is needed).
+    func rollback(to rowCount: Int) {
+        precondition(rowCount >= 0 && rowCount <= rows,
+                     "rollback oltre le righe vive")
+        rows = rowCount
+    }
+
     var compactRowBytes: Int {
         let rowWidth = geometry.layer.kvLoraRank + geometry.layer.ropeDimension
         return rowWidth * MemoryLayout<UInt16>.stride

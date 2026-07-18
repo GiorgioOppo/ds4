@@ -56,7 +56,9 @@ final class ServerController {
             log = "The chat engine is still generating, awaiting tool results, or warming up. Finish or stop that work before starting the server.\n"
             return
         }
-        guard let engine = store.sharedEngine else {
+        let engine = store.sharedEngine
+        let glmEngine = store.isReady ? store.glmService : nil
+        guard engine != nil || glmEngine != nil else {
             log = "No model loaded. Load the model in Settings first — the server exposes that single shared engine.\n"
             return
         }
@@ -96,9 +98,11 @@ final class ServerController {
             // esperti e i kernel freddi in mezzo al prefill del client.
             try Task.checkCancellation()
             onLog("riscaldamento motore (no-op se già caldo)…\n")
-            await engine.warmup()
+            await engine?.warmup()
+            _ = await glmEngine?.warmup()
             try Task.checkCancellation()
-            let srv = LocalServer(engine: engine, modelName: name, config: cfg, onLog: onLog)
+            let srv = LocalServer(engine: engine, glmEngine: glmEngine,
+                                  modelName: name, config: cfg, onLog: onLog)
             try srv.start()
             return srv
         }

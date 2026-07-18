@@ -187,6 +187,22 @@ public actor GLM52ChatService {
                         maxTokens: maxTokens, thinkMode: thinkMode)
     }
 
+    /// Stateless completion for the local HTTP server (OpenAI semantics:
+    /// each request carries the whole conversation). The request replaces
+    /// the running transcript; the incremental-KV prefix match still
+    /// applies, so consecutive requests of the same client conversation
+    /// prefill only the new suffix.
+    public func complete(turns: [ChatTurn], tools: [ToolSpec],
+                         thinkMode: DS4ThinkMode, sampling: SamplingParams,
+                         maxTokens: Int)
+        -> AsyncThrowingStream<GenEvent, Error> {
+        self.tools = tools
+        systemPrompt = nil
+        transcript = turns
+        return generate(turns: turns, sampling: sampling,
+                        maxTokens: maxTokens, thinkMode: thinkMode)
+    }
+
     /// Feed tool outputs back (native GLM observation turns) and stream the
     /// assistant continuation — the DeepSeek tool loop's GLM counterpart.
     /// v1 honesty: the re-render after a tool round rarely prefix-matches

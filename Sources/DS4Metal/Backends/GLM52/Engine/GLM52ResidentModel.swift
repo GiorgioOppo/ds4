@@ -772,7 +772,38 @@ public final class GLM52ResidentModel {
                 "GLM 5.2 prefill requires at least one token")
         }
         if tokens.count == 1 { return try forwardNext(tokens[0]) }
+        let hiddens = try runLayerMajor(tokens)
+        return try runtime.glm52ResidentLogits(
+            outputHead: head, hidden: hiddens[hiddens.count - 1])
+    }
 
+    /// Speculative VERIFY: layer-major forward of a window returning the
+    /// logits of EVERY position (weights read once for the whole window —
+    /// the same amortization that makes speculation pay on streaming).
+    public func forwardBatch(_ tokens: [Int32]) throws -> [[Float]] {
+        guard !tokens.isEmpty else {
+            throw MetalError.unsupported(
+                "GLM 5.2 forwardBatch requires at least one token")
+        }
+        if tokens.count == 1 { return [try forwardNext(tokens[0])] }
+        let hiddens = try runLayerMajor(tokens)
+        return try hiddens.map {
+            try runtime.glm52ResidentLogits(outputHead: head, hidden: $0)
+        }
+    }
+
+    /// Speculative REJECTION: drop the cache rows past `target` and rewind
+    /// the position — the next forward overwrites the abandoned rows.
+    public func rollback(to target: Int) throws {
+        guard target >= 0, target <= position else {
+            throw MetalError.unsupported(
+                "GLM 5.2 rollback a \(target) fuori da 0...\(position)")
+        }
+        for caches in allCaches { caches.rollback(to: target) }
+        position = target
+    }
+
+    private func runLayerMajor(_ tokens: [Int32]) throws -> [[Float]] {
         var hiddens: [[Float]] = try tokens.map { try embeddingRow($0) }
         let basePosition = position
         counters.tokens += tokens.count
@@ -962,8 +993,7 @@ public final class GLM52ResidentModel {
                       ffn: ffn, caches: streamedLayer.caches)
         }
         position = basePosition + tokens.count
-        return try runtime.glm52ResidentLogits(
-            outputHead: head, hidden: hiddens[tokens.count - 1])
+        return hiddens
     }
 
     /// Prefill plus greedy decode. Returns only the generated tokens (the
