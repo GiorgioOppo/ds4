@@ -1,22 +1,22 @@
 # Formats/KVCheckpoint
 
-Formato su disco per salvare e riutilizzare lo stato KV del decoder.
+On-disk format for saving and reusing the decoder's KV state.
 
-## File principali
+## Main files
 
-- [`KVCFile.swift`](KVCFile.swift): header, flag di estensione, naming SHA-1,
-  punteggio di eviction e codifica/decodifica del payload.
-- `DSV4PayloadHeader`: descrive la forma specifica dello snapshot DeepSeek-V4.
+- [`KVCFile.swift`](KVCFile.swift): header, extension flags, SHA-1 naming,
+  eviction score and payload encoding/decoding.
+- `DSV4PayloadHeader`: describes the DeepSeek-V4-specific snapshot shape.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il livello di persistenza converte un `KVSnapshot` Metal in payload e header,
-scrive il checkpoint e in seguito lo valida prima del ripristino. Qui è definito
-solo il contratto binario: policy della cache e I/O orchestrato appartengono a
+The persistence layer converts a Metal `KVSnapshot` into payload and header,
+writes the checkpoint and later validates it before restore. Only the binary
+contract is defined here: cache policy and orchestrated I/O belong to
 `DS4Engine`.
 
-## Regole di modifica
+## Modification rules
 
-Mantenere magic, versione, flag e ordine dei campi compatibili. Verificare forma
-e dimensione prima di allocare o decodificare. Un'estensione del payload deve
-usare un flag/versione riconoscibile dai lettori precedenti.
+Keep magic, version, flags and field order compatible. Verify shape and size
+before allocating or decoding. A payload extension must use a flag/version
+recognizable by older readers.

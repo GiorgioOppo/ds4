@@ -1,23 +1,24 @@
 # Protocol/Experts
 
-Definisce i frame del parallelismo verticale MoE, estesi dal protocollo v11 per
-la geometria Pro.
+Defines the frames of the vertical MoE parallelism, extended by protocol v11
+for the Pro geometry.
 
-## Tipi
+## Types
 
-- `DistExpertAssign`: modello, maschera esperti a lunghezza prefissata, cache,
-  usage e knob. La maschera è di 32 byte per Flash e 48 per Pro.
-- `DistExpertWork`: sequenza, layer, esperti selezionati, pesi e attivazione.
-- `DistExpertSum`: sequenza, layer e somma parziale dello shard.
+- `DistExpertAssign`: model, fixed-length expert mask, cache, usage and
+  knobs. The mask is 32 bytes for Flash and 48 for Pro.
+- `DistExpertWork`: sequence, layer, selected experts, weights and activation.
+- `DistExpertSum`: sequence, layer and the shard's partial sum.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il coordinator partiziona gli esperti, assegna le maschere e invia una richiesta
-per ogni layer instradato. [`ExpertShardEngine`](../../Execution/README.md)
-calcola il contributo locale; il coordinator valida sequenza/layer e aggrega.
+The coordinator partitions the experts, assigns the masks and sends one
+request per routed layer. [`ExpertShardEngine`](../../Execution/README.md)
+computes the local contribution; the coordinator validates sequence/layer and
+aggregates.
 
-## Estensione
+## Extension
 
-Le maschere devono essere disgiunte o avere una politica di aggregazione
-esplicita. Lunghezza esatta, bit di padding, conteggi di ID/pesi, precisione e
-dimensione dell'attivazione devono essere validati prima di eseguire il kernel.
+Masks must be disjoint or have an explicit aggregation policy. Exact length,
+padding bits, ID/weight counts, and activation precision and size must be
+validated before running the kernel.
