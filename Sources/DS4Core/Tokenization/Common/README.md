@@ -1,7 +1,7 @@
 # Tokenization/Common
 
-Primitive riutilizzabili che non selezionano un template o un'architettura.
+Reusable primitives that do not select a template or an architecture.
 
-- `ByteLevel.swift` implementa la mappa byte/codepoint GPT-2 e le utility UTF-8
-  usate dal BPE DeepSeek; un futuro tokenizer può riusarle quando compatibili.
-
+- `ByteLevel.swift` implements the GPT-2 byte/codepoint map and the UTF-8
+  utilities used by the DeepSeek BPE; a future tokenizer can reuse them when
+  compatible.

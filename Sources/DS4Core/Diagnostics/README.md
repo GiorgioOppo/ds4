@@ -1,21 +1,20 @@
 # Diagnostics
 
-Primitive portabili per comunicare lo stato delle operazioni lunghe.
+Portable primitives for reporting the state of long-running operations.
 
-## File principali
+## Main files
 
-- [`LoadProgress.swift`](LoadProgress.swift): singleton thread-safe che pubblica
-  frazione e descrizione dello stadio durante apertura GGUF, preparazione cache e
-  caricamento dei pesi.
+- [`LoadProgress.swift`](LoadProgress.swift): thread-safe singleton that
+  publishes stage fraction and description during GGUF opening, cache
+  preparation and weight loading.
 
-## Flusso e dipendenze
+## Flow and dependencies
 
-Il produttore chiama `reset`, `set`, `begin` e `advance`; UI o servizio leggono
-periodicamente `snapshot`. La sincronizzazione avviene con `NSLock`, senza
-dipendenze da SwiftUI o Metal.
+The producer calls `reset`, `set`, `begin` and `advance`; the UI or service
+periodically reads `snapshot`. Synchronization uses `NSLock`, with no SwiftUI
+or Metal dependencies.
 
-## Regole di modifica
+## Modification rules
 
-Le scritture possono arrivare da worker concorrenti: non esporre direttamente lo
-stato mutabile e mantenere `snapshot` economico. Nuove metriche strutturate
-devono restare indipendenti dalla UI.
+Writes can come from concurrent workers: do not expose mutable state directly
+and keep `snapshot` cheap. New structured metrics must remain UI-independent.

@@ -1,11 +1,12 @@
-# Contratto GGUF GLM 5.2
+# GLM 5.2 GGUF Contract
 
-Il backend accetta soltanto la geometria GLM 5.2 verificata. Non tenta di
-interpretare varianti future con costanti compatibili “per caso”.
+The backend accepts only the verified GLM 5.2 geometry. It does not try to
+interpret future variants whose constants happen to be compatible "by
+chance".
 
-## Metadata essenziali
+## Essential metadata
 
-| Campo | Valore |
+| Field | Value |
 |---|---:|
 | `general.architecture` | `glm-dsa` |
 | `glm-dsa.block_count` | 79 |
@@ -25,37 +26,39 @@ interpretare varianti future con costanti compatibili “per caso”.
 | `glm-dsa.attention.indexer.key_length` | 128 |
 | `glm-dsa.attention.indexer.top_k` | 2.048 |
 
-Anche epsilon RMS, frequenza RoPE, scala/norma del router, dimensioni FFN e
-campi MLA vengono confrontati con `GLM52Shape.v5_2`.
+RMS epsilon, RoPE frequency, router scale/norm, FFN dimensions and MLA
+fields are also checked against `GLM52Shape.v5_2`.
 
 ## Tensor directory
 
-I tre tensori globali sono embedding Q8_0, output norm F32 e output head Q8_0.
-Ogni blocco contiene RMS, Q-LoRA, KV-LoRA, proiezioni MLA, indexer e FFN. I
-blocchi 0–2 hanno FFN denso Q8_0; i blocchi 3–78 contengono router, 256 esperti
-routed e un esperto condiviso. Il blocco 78 conserva inoltre i tensori `nextn` e
-non viene eseguito nel normale percorso autoregressivo.
+The three global tensors are the Q8_0 embedding, F32 output norm and Q8_0
+output head. Every block contains RMS, Q-LoRA, KV-LoRA, MLA projections,
+indexer and FFN. Blocks 0–2 have a dense Q8_0 FFN; blocks 3–78 contain the
+router, 256 routed experts and one shared expert. Block 78 additionally holds
+the `nextn` tensors and is not executed in the normal autoregressive path.
 
-Quantizzazioni routed ammesse dal contratto del grafo di riferimento:
+Routed quantizations allowed by the reference graph contract:
 
-- gate/up: IQ2_XXS, Q2_K, Q4_K o Q5_K, con tipo identico nello stesso layer;
-- down: IQ2_XXS, Q2_K, Q4_K, Q5_K o Q6_K;
-- pesi di controllo/densi: Q8_0 o F32 secondo il singolo tensore.
+- gate/up: IQ2_XXS, Q2_K, Q4_K or Q5_K, with identical type within the same
+  layer;
+- down: IQ2_XXS, Q2_K, Q4_K, Q5_K or Q6_K;
+- control/dense weights: Q8_0 or F32 depending on the individual tensor.
 
-La validazione controlla nomi, rango, forme, tipi e coerenza gate/up prima di
-allocare risorse GPU. Il futuro loader di streaming deve inoltre verificare che
-ogni slice expert rispetti il blocco della quantizzazione e i limiti del file.
+Validation checks names, rank, shapes, types and gate/up consistency before
+allocating GPU resources. The future streaming loader must additionally
+verify that every expert slice respects the quantization block and the file
+bounds.
 
-## Tokenizer e wire format
+## Tokenizer and wire format
 
-- GPT-2 byte-level BPE con pretokenizer `glm4`;
-- sequenza iniziale `[gMASK]<sop>`;
-- ruoli `<|system|>`, `<|user|>`, `<|assistant|>`, `<|observation|>`;
+- GPT-2 byte-level BPE with `glm4` pretokenizer;
+- initial sequence `[gMASK]<sop>`;
+- roles `<|system|>`, `<|user|>`, `<|assistant|>`, `<|observation|>`;
 - thinking `<think>…</think>`;
-- tool call
-  `<tool_call>nome<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`;
-- tool result sotto
+- tool calls
+  `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`;
+- tool results under
   `<|observation|><tool_response>…</tool_response>`.
 
-`<|tool|>` non esiste nel vocabolario verificato e non deve essere introdotto
-come ruolo sintetico.
+`<|tool|>` does not exist in the verified vocabulary and must not be
+introduced as a synthetic role.

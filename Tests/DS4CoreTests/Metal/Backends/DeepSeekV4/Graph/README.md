@@ -1,9 +1,9 @@
 # DeepSeek-V4 Graph Tests
 
-Composizioni `GraphContext` specifiche di DeepSeek-V4: Q/KV latente, attention
-MLA, output low-rank, compressore NSA, router top-6, routed MoE,
-HyperConnections e decoder/layer completi.
+DeepSeek-V4-specific `GraphContext` compositions: latent Q/KV, MLA attention,
+low-rank output, NSA compressor, top-6 router, routed MoE, HyperConnections
+and complete decoder/layers.
 
-I test delle primitive riutilizzabili rimangono in
-[`Metal/Graph`](../../../Graph/README.md); gli edge case dei singoli kernel
-rimangono in `Metal/Kernels`.
+Tests for the reusable primitives remain in
+[`Metal/Graph`](../../../Graph/README.md); edge cases of individual kernels
+remain in `Metal/Kernels`.

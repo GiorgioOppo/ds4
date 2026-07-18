@@ -1,14 +1,14 @@
 # Backends/Common
 
-Confine previsto per contratti di alto livello realmente indipendenti dal
-modello, come identificazione della famiglia, capacità dichiarate e operazioni
-token/chunk. Al momento non contiene sorgenti Swift: le API pubbliche esistenti
-rimangono invariate durante il puro spostamento preparatorio.
+Intended boundary for high-level contracts that are genuinely
+model-independent, such as family identification, declared capabilities and
+token/chunk operations. It currently contains no Swift sources: the existing
+public APIs remain unchanged during the purely preparatory move.
 
-Runtime e operazioni condivise continuano a vivere in
+Runtime and shared operations continue to live in
 [`Runtime`](../../Runtime/README.md), [`Graph`](../../Graph/README.md),
-[`Kernels`](../../Kernels/README.md) e [`Model`](../../Model/README.md).
+[`Kernels`](../../Kernels/README.md) and [`Model`](../../Model/README.md).
 
-Un eventuale protocollo comune può essere invocato al confine della sessione,
-ma non deve introdurre type erasure, lookup per stringa o dispatch dinamico nel
-percorso caldo dei layer.
+A possible common protocol may be invoked at the session boundary, but it
+must not introduce type erasure, string lookups or dynamic dispatch into the
+hot path of the layers.
