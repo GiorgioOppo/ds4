@@ -1,6 +1,5 @@
 # Model/Common Tests
 
-Test puri per normalizzazione degli identificatori, rilevamento da metadata,
-fallback DeepSeek legacy, classificazione della famiglia Qwen e confine che
-rifiuta backend riconosciuti ma non ancora implementati.
-
+Pure tests for identifier normalization, detection from metadata, the legacy
+DeepSeek fallback, Qwen family classification, and the boundary that rejects
+recognized but not yet implemented backends.

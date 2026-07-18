@@ -1,108 +1,111 @@
-# Configurazione e profili di esecuzione
+# Configuration and execution profiles
 
-Questo documento spiega come leggere e applicare la configurazione. La tabella
-completa di ogni chiave, valore e default resta la
-[Configuration Reference](../README.md#configuration-reference), che è la
-fonte autorevole per i singoli parametri.
+This document explains how to read and apply the configuration. The complete
+table of every key, value and default remains the
+[Configuration Reference](../README.md#configuration-reference), which is the
+authoritative source for individual parameters.
 
-I knob storici `DS4_*` descritti qui appartengono al backend DeepSeek V4 salvo
-indicazione contraria. La GUI li espone soltanto quando il descrittore runtime
-dichiara la capability corrispondente; il futuro backend Qwen avrà un profilo
-proprio e non erediterà automaticamente cache esperti, NSA o geometrie Q4.
+The historical `DS4_*` knobs described here belong to the DeepSeek V4 backend
+unless stated otherwise. The GUI exposes them only when the runtime descriptor
+declares the corresponding capability; the future Qwen backend will have its
+own profile and will not automatically inherit expert cache, NSA or Q4
+geometries.
 
-## Livelli di configurazione
+## Configuration layers
 
-La configurazione arriva da tre livelli:
+Configuration comes from three layers:
 
-1. impostazioni GUI persistite in `UserDefaults`;
-2. variabili d'ambiente lette dal motore e dalla demo;
-3. parametri locali di server, distribuzione, MCP, agenti e download.
+1. GUI settings persisted in `UserDefaults`;
+2. environment variables read by the engine and the demo;
+3. local parameters of server, distribution, MCP, agents and downloads.
 
-Nell'app la GUI esporta i principali `DS4_*` all'avvio e quando cambiano. Per
-questi knob il valore persistito dall'app prevale sull'ambiente del processo.
-Nella demo, nei test e negli strumenti da terminale prevale invece l'ambiente.
+In the app the GUI exports the main `DS4_*` at startup and whenever they
+change. For these knobs the value persisted by the app takes precedence over
+the process environment. In the demo, in tests and in command-line tools the
+environment takes precedence instead.
 
-## Quando viene letto un valore
+## When a value is read
 
-La maggioranza delle opzioni di memoria, formato e pipeline viene fissata al
-caricamento del modello. Cambiarla richiede unload/reload. Le opzioni di prefill
-indicate come aggiornabili vengono rilette a ogni chiamata. Alcune impostazioni
-di sampling o UI si applicano al turno successivo senza ricaricare i pesi.
+Most memory, format and pipeline options are fixed at model load. Changing
+them requires an unload/reload. Prefill options marked as updatable are
+re-read on every call. Some sampling or UI settings apply on the next turn
+without reloading the weights.
 
-Prima di un benchmark annotare sempre:
+Before a benchmark, always record:
 
-- GGUF e hash/size;
-- RAM e modello del Mac;
-- contesto e prompt;
-- cache calda o fredda;
-- tutti i knob non predefiniti;
-- warm-up escluso dalla misura.
+- GGUF and hash/size;
+- RAM and Mac model;
+- context and prompt;
+- warm or cold cache;
+- all non-default knobs;
+- warm-up excluded from the measurement.
 
-## Categorie di knob
+## Knob categories
 
-| Categoria | Esempi | Rischio principale |
+| Category | Examples | Main risk |
 |---|---|---|
-| memoria/I/O | dense stream, pread, mlock, bundle, MetalIO | pressione RAM o contesa SSD |
-| cache | slot esperti, Q4 cache, KV su disco | spazio e invalidazione |
-| prefill | chunk, union, route batch, FFN batch | picco di memoria transitoria |
-| kernel | fusioni e numero di simdgroup | compatibilità GPU e parità |
-| diagnostica | profilo route, DIAG, warm-up | overhead che altera la misura |
-| qualità | Q4/Q8 derivati, active experts | divergenza numerica o qualitativa |
+| memory/I/O | dense stream, pread, mlock, bundle, MetalIO | RAM pressure or SSD contention |
+| cache | expert slots, Q4 cache, on-disk KV | space and invalidation |
+| prefill | chunk, union, route batch, FFN batch | transient memory peak |
+| kernels | fusions and simdgroup count | GPU compatibility and parity |
+| diagnostics | route profile, DIAG, warm-up | overhead that skews the measurement |
+| quality | derived Q4/Q8, active experts | numerical or qualitative divergence |
 
-## Lossless e lossy
+## Lossless and lossy
 
-Non tutti i toggle hanno lo stesso significato:
+Not all toggles mean the same thing:
 
-- streaming, layout, prefetch, cache e fusioni dichiarate bit-identiche non
-  riducono l'informazione del modello;
-- alcune fusioni o matmul cambiano l'ordine di accumulo e possono differire di
-  pochi ulp;
-- requantizzazione Q4/Q8 e riduzione degli esperti attivi sono lossy.
+- streaming, layout, prefetch, caches and fusions declared bit-identical do
+  not reduce the model's information;
+- some fusions or matmuls change the accumulation order and may differ by a
+  few ulp;
+- Q4/Q8 requantization and reducing the active experts are lossy.
 
-Ogni profilo condiviso deve indicare esplicitamente quali opzioni sono lossy.
-Disattivare contemporaneamente `DENSE_Q4`, `QKV_Q4` e `SHARED_Q4` non garantisce
-da solo qualità perfetta se restano altri knob lossy o se il GGUF di partenza è
-fortemente quantizzato.
+Every shared profile must state explicitly which options are lossy. Disabling
+`DENSE_Q4`, `QKV_Q4` and `SHARED_Q4` at the same time does not by itself
+guarantee perfect quality if other lossy knobs remain or if the source GGUF is
+heavily quantized.
 
-## Profilo misurato a bassa RAM
+## Measured low-RAM profile
 
-Il profilo usato come base sui Mac da 16 GB privilegia:
+The profile used as the baseline on 16 GB Macs favors:
 
-- streaming dei pesi densi;
-- letture esperti dirette o bundle;
-- pinning best-effort dei buffer caldi;
-- cache esperti dimensionata senza saturare la memoria;
-- Q4 delle grandi proiezioni, quando il compromesso qualitativo è accettato;
-- chunk prefill abbastanza grande da ammortizzare i pesi;
-- fusioni e pipeline asincrona già validate.
+- streaming of the dense weights;
+- direct or bundled expert reads;
+- best-effort pinning of hot buffers;
+- an expert cache sized without saturating memory;
+- Q4 for the large projections, when the quality trade-off is accepted;
+- a prefill chunk large enough to amortize the weights;
+- fusions and async pipeline already validated.
 
-Il valore migliore dipende dal margine di RAM reale. Applicazioni aperte in
-parallelo possono spingere macOS in compressione/swap e ridurre il decode fino a
-ordini di grandezza; prima di attribuire il rallentamento a MetalIO o a un
-kernel controllare pressione memoria e swap.
+The best value depends on the actual RAM headroom. Applications open in
+parallel can push macOS into compression/swap and cut decode by up to orders
+of magnitude; before blaming MetalIO or a kernel for the slowdown, check
+memory pressure and swap.
 
-## Profilo orientato alla qualità
+## Quality-oriented profile
 
-Per isolare la qualità:
+To isolate quality:
 
-1. usare il GGUF di qualità desiderata;
-2. tenere `DS4_ACTIVE_EXPERTS=6`;
-3. disattivare cache derivate lossy (`DENSE_Q4`, `QKV_Q4`, `SHARED_Q4`,
+1. use the GGUF of the desired quality;
+2. keep `DS4_ACTIVE_EXPERTS=6`;
+3. disable lossy derived caches (`DENSE_Q4`, `QKV_Q4`, `SHARED_Q4`,
    `COMP_Q8`);
-4. usare sampling deterministico o seed fissato;
-5. conservare streaming, bundle e cache lossless se aiutano le prestazioni;
-6. confrontare logit o testo contro lo stesso prompt e template.
+4. use deterministic sampling or a fixed seed;
+5. keep lossless streaming, bundles and caches if they help performance;
+6. compare logits or text against the same prompt and template.
 
-Le opzioni lossless non devono essere disattivate per principio: cambiare il
-percorso I/O non cambia i pesi letti.
+Lossless options should not be disabled on principle: changing the I/O path
+does not change the weights being read.
 
-## Profilo di diagnosi
+## Diagnostic profile
 
-`DS4_DIAG=1` abilita il report ampio della demo. `DS4_PROFILE_ROUTE=1` aggiunge
-sincronizzazioni per separare sottostadi e non va usato per il numero finale di
-tok/s. Usare un knob per volta e tenere invariati usage file, prompt e cache.
+`DS4_DIAG=1` enables the demo's extended report. `DS4_PROFILE_ROUTE=1` adds
+synchronizations to separate substages and must not be used for the final
+tok/s number. Use one knob at a time and keep usage file, prompt and cache
+unchanged.
 
-Esempio di forma del comando:
+Example command shape:
 
 ```sh
 DS4_DIAG=1 \
@@ -111,36 +114,35 @@ DS4_WARMUP=4 \
 swift run -c release DS4Demo /percorso/modello.gguf 32 "Prompt di controllo"
 ```
 
-I comandi operativi completi della demo sono in
+The demo's full operational commands are in
 [`Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.md).
 
-## Cache e file derivati
+## Caches and derived files
 
-- `.usage.json` contiene frequenze di routing, non pesi modificati;
-- `.q4dense` e cache compressori contengono rappresentazioni derivate;
-- `.expbundle` riordina gli stessi byte degli esperti per letture contigue;
-- i checkpoint KV dipendono da modello, token e configurazione compatibile;
-- i worker distribuiti conservano file verificati nel proprio store gestito.
+- `.usage.json` contains routing frequencies, not modified weights;
+- `.q4dense` and compressor caches contain derived representations;
+- `.expbundle` reorders the same expert bytes for contiguous reads;
+- KV checkpoints depend on model, tokens and a compatible configuration;
+- distributed workers keep verified files in their own managed store.
 
-Una cache deve essere validata per dimensione, versione e identità del modello.
-Se si sospetta corruzione, rimuovere soltanto il derivato interessato, non il
-GGUF originale.
+A cache must be validated by size, version and model identity. If corruption
+is suspected, remove only the affected derived file, not the original GGUF.
 
-## Precedenza nella distribuzione
+## Precedence in distribution
 
-Il coordinator invia ai worker una whitelist di knob prestazionali. Un worker
-non deve sostituirli con i propri default dopo l'assegnazione. Opzioni lossy e
-sidecar viaggiano in campi tipizzati per impedire configurazioni implicite.
+The coordinator sends the workers a whitelist of performance knobs. A worker
+must not replace them with its own defaults after assignment. Lossy options
+and sidecars travel in typed fields to prevent implicit configurations.
 
-Vedere [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
+See [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
 
-## Regola di documentazione
+## Documentation rule
 
-Quando viene introdotto un nuovo parametro:
+When a new parameter is introduced:
 
-1. documentare default, momento di lettura e dipendenze;
-2. indicare se è bit-identico, equivalente o lossy;
-3. aggiungerlo alla Configuration Reference;
-4. aggiornare il README della cartella proprietaria;
-5. se viene propagato ai worker, aggiornare e testare la whitelist;
-6. aggiungere un A/B riproducibile quando è un knob prestazionale.
+1. document its default, read time and dependencies;
+2. state whether it is bit-identical, equivalent or lossy;
+3. add it to the Configuration Reference;
+4. update the README of the owning folder;
+5. if it is propagated to workers, update and test the whitelist;
+6. add a reproducible A/B when it is a performance knob.

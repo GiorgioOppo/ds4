@@ -1,12 +1,12 @@
-# Backend Qwen
+# Qwen Backend
 
-Stato: famiglia GGUF riconosciuta, backend non ancora implementato.
+Status: GGUF family recognized, backend not yet implemented.
 
-L'ispezione restituisce nome, famiglia e capability del modello, ma le capability
-runtime restano vuote e `BackendSelector` termina con
-`backend <architettura> non ancora implementato`. Questo avviene prima che il
-codice tenti di leggere metadati, token speciali o tensori DeepSeek.
+Inspection returns the model's name, family and capabilities, but the runtime
+capabilities remain empty and `BackendSelector` terminates with
+`backend <architettura> non ancora implementato`. This happens before the
+code attempts to read DeepSeek metadata, special tokens or tensors.
 
-Per abilitare Qwen serviranno decoder Metal, schema pesi, KV, chat template/tool
-codec, test numerici e smoke test GGUF dedicati; non è sufficiente rimuovere il
-controllo dalla factory.
+Enabling Qwen will require a Metal decoder, weight schema, KV, chat
+template/tool codec, numeric tests and dedicated GGUF smoke tests; removing
+the check from the factory is not enough.

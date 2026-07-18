@@ -1,38 +1,41 @@
 # Inference/Service
 
-Implementa l'actor centrale che carica il modello e serializza ogni operazione
-sul decoder.
+Implements the central actor that loads the model and serializes every
+operation on the decoder.
 
-## File principali
+## Main files
 
-- `InferenceService.swift`: dipendenze, stato, executor e inizializzazione.
-- `InferenceService+Conversation.swift`: rendering, turni e continuità KV.
-- `InferenceService+Generation.swift`: prefill, sampling, stream e checkpoint.
-- `InferenceService+Agents.swift`: selezione del profilo agente.
+- `InferenceService.swift`: dependencies, state, executor and initialization.
+- `InferenceService+Conversation.swift`: rendering, turns and KV continuity.
+- `InferenceService+Generation.swift`: prefill, sampling, streaming and
+  checkpoints.
+- `InferenceService+Agents.swift`: agent profile selection.
 
-## Flusso
+## Flow
 
-Il chiamante configura conversazione e strumenti, quindi avvia `send`,
-`sendWithHistory` o `complete`. Il servizio rende i token, riusa o ricostruisce
-la KV, esegue prefill e decode, e restituisce un `AsyncThrowingStream<GenEvent>`.
-Il flusso dettagliato è in [`../FLUSSO-INFERENZA.md`](../FLUSSO-INFERENZA.md).
+The caller configures conversation and tools, then starts `send`,
+`sendWithHistory` or `complete`. The service renders the tokens, reuses or
+rebuilds the KV, runs prefill and decode, and returns an
+`AsyncThrowingStream<GenEvent>`. The detailed flow is in
+[`../FLUSSO-INFERENZA.md`](../FLUSSO-INFERENZA.md).
 
-Prima di tokenizer, configurazione DeepSeek e Metal, l'inizializzatore passa da
-[`RuntimeBackendFactory`](../../Runtime/README.md). Qwen viene riconosciuto ma
-rifiutato esplicitamente come backend non ancora implementato; il decode
-DeepSeek continua a usare il tipo concreto `StreamingDecoder`.
+Before tokenizer, DeepSeek configuration and Metal, the initializer goes
+through [`RuntimeBackendFactory`](../../Runtime/README.md). Qwen is recognized
+but explicitly rejected as a backend not yet implemented; DeepSeek decode
+keeps using the concrete `StreamingDecoder` type.
 
-Prima del rendering, ogni campo fornito da utenti, storico, tool o API viene
-neutralizzato rispetto ai token strutturali del GGUF. Solo il framing prodotto
-da `ChatRenderer` può quindi diventare BOS, ruolo o delimitatore DSML atomico.
+Before rendering, every field supplied by users, history, tools or API is
+neutralized with respect to the GGUF's structural tokens. Only the framing
+produced by `ChatRenderer` can therefore become BOS, a role or an atomic DSML
+delimiter.
 
-## Dipendenze
+## Dependencies
 
-Dipende da `DS4Core`, `DS4Metal`, [`Persistence/KV`](../../Persistence/KV/README.md),
-[`Agents`](../../Agents/README.md) e [`Tools`](../../Tools/README.md).
+Depends on `DS4Core`, `DS4Metal`, [`Persistence/KV`](../../Persistence/KV/README.md),
+[`Agents`](../../Agents/README.md) and [`Tools`](../../Tools/README.md).
 
-## Estensione
+## Extension
 
-Conservare qui soltanto le responsabilità del ciclo di inferenza. Benchmark,
-tuning e sub-agent hanno cartelle proprie. Ogni nuovo percorso deve gestire
-cancellazione, limite contesto e transizioni di `kvDirty`.
+Keep only the inference-loop responsibilities here. Benchmarks, tuning and
+sub-agents have their own folders. Every new path must handle cancellation,
+the context limit and `kvDirty` transitions.

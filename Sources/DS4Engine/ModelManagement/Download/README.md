@@ -1,78 +1,81 @@
 # ModelManagement/Download
 
-Implementa download nativi e riprendibili dei GGUF, senza `curl` o processi
-esterni.
+Implements native, resumable GGUF downloads, without `curl` or external
+processes.
 
-## Componenti
+## Components
 
-- `ModelDownloader.swift`: API `acquire`, controllo locale, percorso sicuro,
-  preflight dello spazio, finalizzazione atomica ed esito tipizzato.
-- `HTTPRangeFileTransfer.swift`: sessione HTTP senza cache, ricezione a blocchi,
-  resume validato e scrittura diretta del `.part`.
-- `ModelDownloadTypes.swift`: progresso, fasi ed esito
-  `alreadyPresent`/`downloaded` consumati dalla GUI.
-- `HFTokenStore.swift`: lettura/scrittura del token Hugging Face nel Keychain,
-  forma mascherata e descrizione della fonte attiva.
+- `ModelDownloader.swift`: `acquire` API, local check, safe path, disk space
+  preflight, atomic finalization and typed outcome.
+- `HTTPRangeFileTransfer.swift`: cache-free HTTP session, chunked reception,
+  validated resume and direct writing of the `.part` file.
+- `ModelDownloadTypes.swift`: progress, phases and the
+  `alreadyPresent`/`downloaded` outcome consumed by the GUI.
+- `HFTokenStore.swift`: reads/writes the Hugging Face token in the Keychain,
+  masked form and description of the active source.
 
-## Flusso
+## Flow
 
-Il downloader scrive in `<ggufDir>/<nome>.part`, riprende dall'offset presente e
-rinomina solo a stream concluso. `URLSessionDataDelegate` consegna blocchi
-`Data`: non esiste un'iterazione Swift per ciascun byte dei GGUF da centinaia di
-GB. La sessione ephemeral non usa cache HTTP, cookie o credential storage e la
-delegate queue è seriale: viene elaborato un solo blocco per volta. Le notifiche
-di avanzamento sono limitate per non sovraccaricare la GUI.
+The downloader writes to `<ggufDir>/<name>.part`, resumes from the existing
+offset and renames only once the stream has finished. `URLSessionDataDelegate`
+delivers `Data` chunks: there is no Swift iteration over every byte of GGUFs
+hundreds of GB in size. The ephemeral session uses no HTTP cache, cookies or
+credential storage, and the delegate queue is serial: only one chunk is
+processed at a time. Progress notifications are throttled so as not to
+overload the GUI.
 
-I descrittori usati per scrivere il `.part` e per la verifica SHA dopo un resume
-sono marcati `F_NOCACHE`: i byte sequenziali del download non devono riempire la
-unified file cache di macOS ed espellere pesi o pagine utili del modello. La
-verifica legge al massimo 8 MiB per volta e svuota l'autorelease pool a ogni
-blocco. Anche il sidecar JSON di resume è accettato solo entro 64 KiB. Il picco
-RAM del downloader resta quindi indipendente dalla dimensione totale del GGUF.
+The descriptors used to write the `.part` and for SHA verification after a
+resume are marked `F_NOCACHE`: the sequential bytes of the download must not
+fill macOS's unified file cache and evict useful model weights or pages. The
+verification reads at most 8 MiB at a time and drains the autorelease pool at
+every chunk. The resume JSON sidecar is likewise accepted only up to 64 KiB.
+The downloader's peak RAM therefore stays independent of the total GGUF size.
 
-Una risposta `206` è accettata solo se `Content-Range` parte dalla dimensione
-locale. Se il server risponde `200` a una richiesta Range, il `.part` viene
-realmente troncato prima del riavvio; `416` è considerato completo solo quando
-la dimensione remota coincide esattamente. ETag/Last-Modified sono conservati
-in un piccolo sidecar e inviati come `If-Range` alla ripresa.
+A `206` response is accepted only if `Content-Range` starts at the local size.
+If the server answers `200` to a Range request, the `.part` is actually
+truncated before restarting; `416` is considered complete only when the remote
+size matches exactly. ETag/Last-Modified are kept in a small sidecar and sent
+as `If-Range` on resume.
 
-I nuovi download del catalogo hanno SHA-256 fissati e sono verificati prima
-della rinomina. Un file finale regolare e non vuoto già presente produce subito
-`alreadyPresent`: non viene riscaricato né riletto integralmente a ogni apertura.
-Quando il target ha `expectedSizeBytes`, il byte count deve coincidere; questa
-guardia permette di riusare i GGUF GLM da centinaia di GB senza hash completo a
-ogni apertura e senza accettare un finale troncato. Un file finale vuoto non è
-mai considerato un GGUF valido.
+New catalog downloads have pinned SHA-256 hashes and are verified before the
+rename. A regular, non-empty final file already present immediately yields
+`alreadyPresent`: it is neither re-downloaded nor fully re-read on every open.
+When the target has `expectedSizeBytes`, the byte count must match; this guard
+makes it possible to reuse the hundreds-of-GB GLM GGUFs without a full hash on
+every open and without accepting a truncated final file. An empty final file
+is never considered a valid GGUF.
 
-Il downloader esegue un preflight dello spazio, include un margine per il
-filesystem e considera i byte del `.part` già presenti. Un gate actor impedisce
-acquisizioni concorrenti dello stesso path. La GUI sceglie
-`~/Library/Application Support/DwarfStar/models/` perché le Resources di una
-app installata non sono scrivibili.
+The downloader runs a disk space preflight, includes a filesystem margin and
+accounts for the `.part` bytes already present. An actor gate prevents
+concurrent acquisitions of the same path. The GUI chooses
+`~/Library/Application Support/DwarfStar/models/` because the Resources of an
+installed app are not writable.
 
-La risoluzione del token segue: esplicito → `HF_TOKEN` →
-`~/.cache/huggingface/token`. Il Keychain è consultato dalla GUI, non dal metodo
-generico `resolveToken`, così CLI e test non generano prompt inattesi.
+Token resolution follows: explicit → `HF_TOKEN` →
+`~/.cache/huggingface/token`. The Keychain is consulted by the GUI, not by the
+generic `resolveToken` method, so CLI and tests do not trigger unexpected
+prompts.
 
-## Dipendenze e sicurezza
+## Dependencies and security
 
-Foundation gestisce URLSession/file, CryptoKit l'integrità e Security il
-Keychain. La verifica del contenuto è indipendente dalla rotazione dei
-certificati CDN. Il bearer token è rimosso quando Hugging Face redirige verso un
-host CDN differente. Non inserire token in URL, log o stato non protetto.
+Foundation handles URLSession/files, CryptoKit handles integrity and Security
+the Keychain. Content verification is independent of CDN certificate rotation.
+The bearer token is removed when Hugging Face redirects to a different CDN
+host. Do not put tokens in URLs, logs or unprotected state.
 
-## Estensione
+## Extension
 
-Per aggiungere un target, usare ID e nome file stabili, sorgente Hugging Face
-con revisione preferibilmente bloccata, dimensione esatta quando disponibile e
-SHA-256 autorevole. `ModelDownloader` costruisce la URL dal `source` del target,
-quindi cataloghi diversi non condividono più un repository globale. Conservare cancellazione, resume e callback
-di avanzamento; evitare buffer proporzionali alla dimensione del modello.
+To add a target, use a stable ID and file name, a Hugging Face source with the
+revision preferably pinned, exact size when available and an authoritative
+SHA-256. `ModelDownloader` builds the URL from the target's `source`, so
+different catalogs no longer share a global repository. Preserve cancellation,
+resume and progress callbacks; avoid buffers proportional to the model size.
 
-Un target scaricabile non implica compatibilità con il decoder. Il catalogo
-principale dichiara il supporto runtime per entry: i tre Flash e PRO Q2
-singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
-restano `downloadOnly`. MTP è un accessorio separato e non compare tra i modelli GUI.
+A downloadable target does not imply decoder compatibility. The main catalog
+declares runtime support per entry: the three Flash and single-file PRO Q2
+models are selectable, while the PRO Q4 package and the three GLM 5.2 remain
+`downloadOnly`. MTP is a separate accessory and does not appear among the GUI
+models.
 
-Le impostazioni correlate sono nella
+Related settings are in the
 [Configuration Reference](../../../../README.md#configuration-reference).

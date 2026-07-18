@@ -1,47 +1,48 @@
-# Flusso dell'inferenza locale
+# Local inference flow
 
-## 1. Inizializzazione
+## 1. Initialization
 
-`InferenceService.init` apre il GGUF, costruisce tokenizer e runtime Metal,
-valida il profilo del modello e crea lo `StreamingDecoder`. Le variabili
-`DS4_*` vengono lette prima del caricamento; cambiare un knob dopo la creazione
-del servizio non riconfigura il decoder esistente.
+`InferenceService.init` opens the GGUF, builds the tokenizer and Metal
+runtime, validates the model profile and creates the `StreamingDecoder`.
+`DS4_*` variables are read before loading; changing a knob after the service
+has been created does not reconfigure the existing decoder.
 
-## 2. Preparazione della conversazione
+## 2. Conversation preparation
 
-`ChatRenderer` produce il suffisso per il nuovo turno. `committedIds` descrive
-esattamente i token già presenti nella KV: una conversazione append-only
-prefilla soltanto il nuovo suffisso. Se il prefisso non è più affidabile
-(`kvDirty`) il servizio ricostruisce prima la KV dai token confermati.
+`ChatRenderer` produces the suffix for the new turn. `committedIds` describes
+exactly the tokens already present in the KV: an append-only conversation
+prefills only the new suffix. If the prefix is no longer trustworthy
+(`kvDirty`), the service first rebuilds the KV from the confirmed tokens.
 
-## 3. Ripristino e prefill
+## 3. Restore and prefill
 
-Quando la cache su disco è attiva, `DiskKVStore` cerca il prefisso più lungo
-compatibile. Il ripristino avviene un layer alla volta. I token non coperti dal
-checkpoint sono inviati al decoder in chunk; gli eventi `.progress` rendono
-visibile l'avanzamento.
+When the on-disk cache is enabled, `DiskKVStore` looks for the longest
+compatible prefix. The restore happens one layer at a time. Tokens not covered
+by the checkpoint are sent to the decoder in chunks; `.progress` events make
+the progress visible.
 
-## 4. Generazione
+## 4. Generation
 
-Il decoder restituisce i logits, `Sampler` seleziona il token successivo e il
-tokenizer lo converte in byte. Il servizio separa testo, reasoning e markup dei
-tool emettendo `GenEvent`. Il contesto avanza solo con token realmente accettati.
+The decoder returns the logits, `Sampler` selects the next token and the
+tokenizer converts it to bytes. The service separates text, reasoning and tool
+markup by emitting `GenEvent`. The context advances only with actually
+accepted tokens.
 
-## 5. Tool e conclusione
+## 5. Tools and completion
 
-Una tool call completa sospende la risposta con `.toolCall`. Dopo l'esecuzione,
-`provideToolResults` aggiunge al contesto il risultato e riapre l'assistente.
-Una generazione pulita salva profilo esperti e, se configurato, checkpoint KV;
-cancellazioni o errori marcano invece la cache come sporca.
+A complete tool call suspends the response with `.toolCall`. After execution,
+`provideToolResults` appends the result to the context and reopens the
+assistant. A clean generation saves the expert profile and, if configured, a
+KV checkpoint; cancellations or errors instead mark the cache as dirty.
 
-## Invarianti
+## Invariants
 
-- `committedIds.count` deve coincidere con la frontiera KV valida.
-- Il decoder è usato esclusivamente dall'executor seriale dell'actor.
-- Reasoning e markup tool devono essere preservati nel contesto anche quando
-  non sono mostrati come testo normale.
-- Benchmark e sub-agent ripristinano o invalidano esplicitamente lo stato della
-  conversazione principale.
+- `committedIds.count` must match the valid KV frontier.
+- The decoder is used exclusively by the actor's serial executor.
+- Reasoning and tool markup must be preserved in the context even when they
+  are not shown as normal text.
+- Benchmarks and sub-agents explicitly restore or invalidate the state of the
+  main conversation.
 
-Vedi anche [`Service`](Service/README.md), [`Persistence/KV`](../Persistence/KV/README.md)
-e [`Tools`](../Tools/README.md).
+See also [`Service`](Service/README.md), [`Persistence/KV`](../Persistence/KV/README.md)
+and [`Tools`](../Tools/README.md).
