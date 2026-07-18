@@ -197,18 +197,29 @@ public final class GLM52ResidentDecodeCaches {
 /// provider yields the selected experts' bytes); the F32 router rows stay
 /// host-side beside the CPU router matvec.
 /// One routed selection staged for the GPU: every selected record resident
-/// in ONE shared buffer (rank-strided packed gate|up|down), ready to bind
-/// with offsets — no per-expert allocations, no copies.
+/// in ONE shared arena buffer at its own offset (packed gate|up|down),
+/// ready to bind — no per-expert allocations, no copies. Offsets are
+/// per-record because the arena keeps records wherever its LRU placed
+/// them (a hit reuses a slot filled tokens ago).
 public struct GLM52StagedExpertSelection {
     public let buffer: MTLBuffer
-    public let layout: GLM52ExpertPackedRecordLayout
+    /// Byte offset of each rank's record in `buffer` (rank order of the
+    /// staged ids).
+    public let recordOffsets: [Int]
+    public let gateBytes: Int
+    public let upBytes: Int
+    public let downBytes: Int
     public let gateUpType: UInt32
     public let downType: UInt32
 
-    public init(buffer: MTLBuffer, layout: GLM52ExpertPackedRecordLayout,
+    public init(buffer: MTLBuffer, recordOffsets: [Int], gateBytes: Int,
+                upBytes: Int, downBytes: Int,
                 gateUpType: UInt32, downType: UInt32) {
         self.buffer = buffer
-        self.layout = layout
+        self.recordOffsets = recordOffsets
+        self.gateBytes = gateBytes
+        self.upBytes = upBytes
+        self.downBytes = downBytes
         self.gateUpType = gateUpType
         self.downType = downType
     }

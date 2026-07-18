@@ -408,9 +408,8 @@ extension MetalRuntime {
                     UInt32(bitPattern: routed.selected[$0])
                 }
                 let staged = try stage(ids)
-                let recordLayout = staged.layout
                 for rank in 0..<usedExperts {
-                    let base = recordLayout.recordOffset(rank: rank)
+                    let base = staged.recordOffsets[rank]
                     try glm52EncodePairSwiGLU(
                         into: ffnBuffer, input: scratch.ffnIn,
                         gate: staged.buffer, up: staged.buffer,
@@ -418,8 +417,8 @@ extension MetalRuntime {
                         inputWidth: layer.embeddingWidth,
                         routeWeight: routed.weights[rank],
                         weightType: staged.gateUpType,
-                        gateOffset: base + recordLayout.gateOffset,
-                        upOffset: base + recordLayout.upOffset)
+                        gateOffset: base,
+                        upOffset: base + staged.gateBytes)
                     try glm52EncodeMatvecQ8(
                         into: ffnBuffer, input: scratch.mid,
                         weights: staged.buffer,
@@ -427,7 +426,8 @@ extension MetalRuntime {
                         rowCount: layer.embeddingWidth,
                         inputWidth: hidden,
                         weightType: staged.downType,
-                        weightsOffset: base + recordLayout.downOffset)
+                        weightsOffset: base + staged.gateBytes
+                            + staged.upBytes)
                     try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
                                        b: scratch.contribution,
                                        output: scratch.hidden,

@@ -83,12 +83,16 @@ public final class GLM52StreamedExpertProvider {
             slotBytes: layout.recordBytes)
     }
 
-    /// Packed gate|up|down record size — the unit the staging buffer is
+    /// Packed gate|up|down record size — the unit the staging arena is
     /// sized in.
     public var recordBytes: Int {
         Int(planner.gateLayout.expertBytes + planner.upLayout.expertBytes
             + planner.downLayout.expertBytes)
     }
+
+    public var gateRecordBytes: Int { Int(planner.gateLayout.expertBytes) }
+    public var upRecordBytes: Int { Int(planner.upLayout.expertBytes) }
+    public var downRecordBytes: Int { Int(planner.downLayout.expertBytes) }
 
     /// Whether the packed record can be bound with Metal buffer offsets:
     /// every offset in the record (and the record stride) must stay 4-byte
@@ -107,51 +111,26 @@ public final class GLM52StreamedExpertProvider {
 
     private let lock = NSLock()
 
-    /// The zero-copy hot path: the whole selection's packed records land in
-    /// `destination` (rank-strided gate|up|down — an MTLBuffer's contents on
-    /// the staged decode path), read CONCURRENTLY. With a bundle each record
-    /// is one contiguous pread; without, one multi-expert plan drives the
-    /// reader's concurrent scattered reads. No lock on either path — both
-    /// are stateless pread into disjoint ranges. `destination` must hold
-    /// exactly `ids.count * recordBytes`.
-    public func stageRecords(_ ids: [UInt32],
-                             into destination: UnsafeMutableRawBufferPointer)
-        throws -> GLM52ExpertPackedRecordLayout {
-        guard let bundle else {
-            let plan = try planner.plan(selectedExperts: ids)
-            return try reader.read(plan: plan, into: destination,
-                                   concurrent: true)
-        }
-        let layout = GLM52ExpertPackedRecordLayout(
-            expertCount: ids.count,
-            gateBytes: Int(planner.gateLayout.expertBytes),
-            upBytes: Int(planner.upLayout.expertBytes),
-            downBytes: Int(planner.downLayout.expertBytes))
-        guard destination.count == layout.totalBytes,
-              bundle.recordBytes == layout.recordBytes,
-              let base = destination.baseAddress else {
-            throw GLM52PayloadReaderError.destinationSizeMismatch(
-                expected: UInt64(layout.totalBytes),
-                got: destination.count)
-        }
-        nonisolated(unsafe) let destinationBase = base
-        nonisolated(unsafe) var failure: Error?
-        let lock = NSLock()
-        let recordBytes = layout.recordBytes
-        DispatchQueue.concurrentPerform(iterations: ids.count) { rank in
-            let slice = UnsafeMutableRawBufferPointer(
-                start: destinationBase + rank * recordBytes,
-                count: recordBytes)
-            do {
-                try bundle.read(ids[rank], into: slice)
-            } catch {
-                lock.lock()
-                if failure == nil { failure = error }
-                lock.unlock()
+    /// One expert's packed gate|up|down record straight into `destination`
+    /// — the arena's fill primitive, called CONCURRENTLY for the records of
+    /// a selection. Bundle: one contiguous pread; GGUF: one single-expert
+    /// plan with the reader's concurrent scattered reads. No lock on either
+    /// path — both are stateless pread into disjoint destinations.
+    /// `destination` must hold exactly `recordBytes`.
+    public func readRecord(_ id: UInt32,
+                           into destination: UnsafeMutableRawBufferPointer)
+        throws {
+        if let bundle {
+            guard bundle.recordBytes == recordBytes else {
+                throw GLM52PayloadReaderError.destinationSizeMismatch(
+                    expected: UInt64(recordBytes),
+                    got: bundle.recordBytes)
             }
+            try bundle.read(id, into: destination)
+            return
         }
-        if let failure { throw failure }
-        return layout
+        let plan = try planner.plan(selectedExperts: [id])
+        _ = try reader.read(plan: plan, into: destination, concurrent: true)
     }
 
     /// Speculative warm-up of the slot cache off-thread — the DeepSeek
