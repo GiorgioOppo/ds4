@@ -1,0 +1,49 @@
+import XCTest
+import DS4Core
+@testable import DS4Metal
+
+/// Opt-in engine smoke over a real (or exact-size sparse) GLM 5.2 GGUF: load
+/// the three leading DENSE layers — Q8_0 end to end, no routed experts — as
+/// a resident stack, run a real prefill token by token and a short greedy
+/// decode. This proves loader, resident upload, cache growth, embedding-row
+/// reads and the generation loop against the published tensor layout; it is
+/// NOT a quality gate (a truncated stack has no meaningful logits — the
+/// full-model logits parity is the roadmap's separate, binding gate).
+final class GLM52ResidentModelIntegrationTests: XCTestCase {
+    func testDenseLayerEngineSmokeOnRealLayout() throws {
+        guard let path = ProcessInfo.processInfo
+                  .environment["DS4_GLM52_SPARSE_GGUF"], !path.isEmpty else {
+            throw XCTSkip("set DS4_GLM52_SPARSE_GGUF to a real or exact-size "
+                          + "sparse GLM 5.2 GGUF")
+        }
+        let runtime: MetalRuntime
+        do { runtime = try MetalRuntime() }
+        catch MetalError.noDevice { throw XCTSkip("Metal device unavailable") }
+
+        let model = try GLM52ResidentModel(
+            runtime: runtime, path: path,
+            options: GLM52ResidentModelOptions(
+                layerCount: 3, cacheCapacity: 16, expertSlotCount: 16))
+        XCTAssertEqual(model.loadedLayerCount, 3)
+        XCTAssertEqual(model.configuration.shape, .v5_2)
+
+        let embedded = try model.embeddingRow(9_333)
+        XCTAssertEqual(embedded.count, 6_144)
+
+        let logits = try model.prefill([9_333, 21, 42])
+        XCTAssertEqual(logits.count, 154_880)
+        XCTAssertEqual(model.position, 3)
+        XCTAssertTrue(logits.allSatisfy(\.isFinite),
+                      "prefill produced non-finite logits")
+
+        // Prompt token (position 4) + one step for the second sample: the
+        // final sampled token is never fed back, so the position lands at 5.
+        let generated = try model.generateGreedy(
+            prompt: [7], maxNewTokens: 2, endTokens: [])
+        XCTAssertEqual(generated.count, 2)
+        XCTAssertEqual(model.position, 5)
+
+        XCTAssertThrowsError(try model.embeddingRow(-1))
+        XCTAssertThrowsError(try model.embeddingRow(154_880))
+    }
+}

@@ -143,6 +143,37 @@ public final class GLM52PayloadReader: @unchecked Sendable {
         return payload
     }
 
+    /// A byte sub-range of one validated descriptor (the embedding-row read:
+    /// one token's Q8_0 row out of a ~1 GiB tensor). The range is validated
+    /// against the descriptor FIRST and against the file second, so a stale
+    /// offset can never leave the tensor even on an oversized file.
+    public func bytes(of descriptor: GLM52WeightDescriptor,
+                      byteOffset: UInt64,
+                      byteCount: UInt64) throws -> [UInt8] {
+        guard byteCount > 0,
+              byteOffset <= descriptor.bytes,
+              byteCount <= descriptor.bytes - byteOffset else {
+            throw GLM52PayloadReaderError.rangeOutsideFile(
+                name: descriptor.name,
+                end: descriptor.absOffset + byteOffset + byteCount,
+                fileSize: fileSize)
+        }
+        let absolute = descriptor.absOffset + byteOffset
+        let bytes = try checkedRange(name: descriptor.name,
+                                     offset: absolute,
+                                     byteCount: byteCount)
+        var payload = [UInt8](repeating: 0, count: bytes)
+        let ok = payload.withUnsafeMutableBytes { buffer in
+            GGUFWeights.preadFull(fd, into: buffer.baseAddress!,
+                                  bytes: bytes, offset: Int(absolute))
+        }
+        guard ok else {
+            throw GLM52PayloadReaderError.readFailed(
+                name: descriptor.name, offset: absolute, bytes: byteCount)
+        }
+        return payload
+    }
+
     /// Execute one expert stream plan: the 24 planned ranges land as packed
     /// gate|up|down records in router rank order. The three preads of one
     /// expert stay adjacent in the destination even though they are scattered

@@ -38,7 +38,7 @@ utilizzabili come promessa prestazionale per questa app.
 | Attenzione compatta | oracle CPU doppio (espanso vs assorbito) e kernel Metal staged qk_lowrank/indexed/value_project (F32 e Q8_0) confrontati con l'oracle |
 | FFN/MoE/output head | oracle CPU F32-ref, dequant K-quant di riferimento e kernel Metal di validazione per tutte le fasi (routed K-quant, denso/shared/output head Q8_0); famiglie ottimizzate per-quant mancanti |
 | Cache | planner F16 lazy; KV-LoRA norm/store e indexer-K norm/RoPE/store isolati |
-| Decoder | oracle CPU first-token E decode step (cablaggio esatto di `glm_graph_forward_token`: store cache prima di selezione/attenzione, fill-range/top-k con `visible = pos+1`, IndexShare verbatim), composizioni GPU di entrambi sui kernel validati confrontate con gli oracle; grafo residente della fase attenzione (pesi caricati una volta, cache GPU in place, un command buffer nel percorso fill-range) in parità con l'executor; residenza FFN/esperti e prefill su prompt reali mancanti |
+| Decoder | oracle CPU first-token E decode step (cablaggio esatto di `glm_graph_forward_token`: store cache prima di selezione/attenzione, fill-range/top-k con `visible = pos+1`, IndexShare verbatim), composizioni GPU di entrambi sui kernel validati confrontate con gli oracle; grafo residente della fase attenzione (pesi caricati una volta, cache GPU in place, un command buffer nel percorso fill-range) in parità con l'executor; motore reale GLM52ResidentModel (caricamento pesi dal GGUF, embedding row, prefill token-per-token, greedy decode; esperti IQ2_XXS rifiutati finché manca il kernel) | 
 
 ## Scelte deliberate diverse da upstream
 
