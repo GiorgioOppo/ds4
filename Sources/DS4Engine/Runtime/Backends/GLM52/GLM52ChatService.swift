@@ -148,11 +148,19 @@ public actor GLM52ChatService {
                         continuation.yield(.progress(
                             "prefill \(tokens.count) token (layer-major)"))
                     }
+                    let prefillStart = Date()
                     var logits = try service.engine.prefill(suffix)
+                    let prefillSeconds = max(
+                        Date().timeIntervalSince(prefillStart), 0.001)
+                    continuation.yield(.progress(String(
+                        format: "prefill %d tok in %.1fs · %.2f tok/s",
+                        suffix.count, prefillSeconds,
+                        Double(suffix.count) / prefillSeconds)))
 
                     var fed = tokens
                     var produced = 0
                     var reply: [UInt8] = []
+                    let decodeStart = Date()
                     let budget = min(maxTokens,
                                      contextSize - tokens.count - 1)
                     while produced < budget, !Task.isCancelled {
@@ -174,10 +182,11 @@ public actor GLM52ChatService {
                                               encoding: .utf8) {
                             continuation.yield(.text(piece))
                         }
-                        if produced % 8 == 0 {
-                            continuation.yield(.progress(
-                                "\(produced) token generati"))
-                        }
+                        let elapsed = max(
+                            Date().timeIntervalSince(decodeStart), 0.001)
+                        continuation.yield(.progress(String(
+                            format: "%d tok · %.2f tok/s",
+                            produced, Double(produced) / elapsed)))
                         if produced == budget || Task.isCancelled { break }
                         logits = try service.engine.forwardNext(token)
                         fed.append(token)
