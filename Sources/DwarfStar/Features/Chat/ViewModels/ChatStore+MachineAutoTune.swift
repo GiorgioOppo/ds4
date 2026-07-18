@@ -306,6 +306,10 @@ extension ChatStore {
             return
         }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard glmService == nil else {
+            benchStatus = "Auto-tune non disponibile col backend GLM 5.2 (v1)."
+            return
+        }
         guard !isGenerating else { benchStatus = "Ferma la generazione prima dell'auto-tune."; return }
         guard !benchRunning else { return }
 

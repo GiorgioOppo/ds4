@@ -19,6 +19,10 @@ extension ChatStore {
     func runSettingsBenchmark(quick: Bool = false) {
         guard let service else { benchStatus = "Carica prima il modello."; return }
         guard phase == .ready else { benchStatus = "Attendi che il modello sia pronto."; return }
+        guard glmService == nil else {
+            benchStatus = "Benchmark non disponibile col backend GLM 5.2 (v1)."
+            return
+        }
         guard !isGenerating else { benchStatus = "Ferma la generazione prima del benchmark."; return }
         guard !benchRunning else { return }
         let activityGate = EngineActivityGate.shared
