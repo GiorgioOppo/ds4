@@ -106,7 +106,7 @@ extension ChatStore {
 
     /// Submit manually-entered results for the pending (non-built-in) tool calls.
     func submitManualResults(_ contents: [String: String]) {
-        guard let service, !pendingManualCalls.isEmpty,
+        guard service != nil || glmService != nil, !pendingManualCalls.isEmpty,
               let epoch = pendingManualEpoch,
               conversationEpoch == epoch,
               pendingManualCalls.count == pendingManualOutputIndices.count else { return }
@@ -127,7 +127,11 @@ extension ChatStore {
         pendingManualOutputIndices = []
         pendingManualEpoch = nil
         awaitingManualResults = false
-        continueWithToolOutputs(outputs, service: service, epoch: epoch)
+        if let service {
+            continueWithToolOutputs(outputs, service: service, epoch: epoch)
+        } else if let glm = glmService {
+            continueWithGLMToolOutputs(outputs, glm: glm, epoch: epoch)
+        }
     }
 
     /// Abandon the pending manual tool calls without answering them. The calls

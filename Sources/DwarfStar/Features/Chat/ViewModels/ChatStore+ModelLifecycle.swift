@@ -218,6 +218,9 @@ extension ChatStore {
                         }
                     }
                     let glmInfo = await glm.modelInfo()
+                    // Warmup reale (un token attraverso lo stack streamato):
+                    // il primo token utente non paga i costi una-tantum.
+                    _ = await glm.warmup()
                     await MainActor.run {
                         self.glmService = glm
                         self.service = nil

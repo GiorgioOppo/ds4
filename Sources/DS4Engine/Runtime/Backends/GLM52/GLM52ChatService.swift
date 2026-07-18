@@ -70,7 +70,27 @@ public actor GLM52ChatService {
             capabilities: GLM52BackendDefinition.runtimeCapabilities)
     }
 
-    public func warmup() -> Bool { true }
+    /// REAL warmup: one full 1-token pass through the streamed stack — file
+    /// handles, residual pipeline compilations, arena and staging slots all
+    /// get touched, so the first user token stops paying the one-time
+    /// costs. Context and telemetry are reset right after.
+    public func warmup() async -> Bool {
+        let service = self.service
+        primedTokens = []
+        return await Task.detached(priority: .userInitiated) {
+            let probe = service.tokenizer
+                .tokenizeRenderedChat("ciao").first ?? 1
+            do {
+                service.engine.resetContext()
+                _ = try service.engine.prefill([probe])
+                service.engine.resetContext()
+                service.engine.resetStreamingStats()
+                return true
+            } catch {
+                return false
+            }
+        }.value
+    }
 
     public func quiesceForTeardown() async {}
 
@@ -146,6 +166,24 @@ public actor GLM52ChatService {
                         maxTokens: maxTokens, thinkMode: thinkMode)
     }
 
+    /// Feed tool outputs back (native GLM observation turns) and stream the
+    /// assistant continuation — the DeepSeek tool loop's GLM counterpart.
+    /// v1 honesty: the re-render after a tool round rarely prefix-matches
+    /// the live caches (thinking is not re-rendered), so the continuation
+    /// usually pays a fresh layer-major prefill.
+    public func provideToolResults(_ outputs: [ToolOutput],
+                                   thinkMode: DS4ThinkMode,
+                                   sampling: SamplingParams,
+                                   maxTokens: Int)
+        -> AsyncThrowingStream<GenEvent, Error> {
+        transcript.append(contentsOf: outputs.map {
+            .toolResult(callId: $0.callId, name: $0.name,
+                        content: $0.content)
+        })
+        return generate(turns: renderableTurns(), sampling: sampling,
+                        maxTokens: maxTokens, thinkMode: thinkMode)
+    }
+
     /// Restore a persisted conversation and generate: the provided history
     /// replaces the running transcript. The incremental-KV prefix match
     /// still applies, so a reopened chat whose rendering extends the live
@@ -168,9 +206,12 @@ public actor GLM52ChatService {
         (systemPrompt.map { [ChatTurn.system($0)] } ?? []) + transcript
     }
 
-    private func noteGeneration(fedTokens: [Int32], assistant: String) {
+    private func noteGeneration(fedTokens: [Int32], assistant: String,
+                                calls: [ToolCall]) {
         primedTokens = fedTokens
-        transcript.append(.assistant(text: assistant, toolCalls: []))
+        // The tool calls stay ON the assistant turn: the tool-loop re-render
+        // needs them between the assistant text and the observations.
+        transcript.append(.assistant(text: assistant, toolCalls: calls))
     }
 
     /// Splits the raw token stream into reasoning/text events on the GLM
@@ -229,15 +270,43 @@ public actor GLM52ChatService {
             // actor's serial GCD executor).
             let producer = Task.detached(priority: .userInitiated) {
                 do {
-                    let rendered = try GLM52ChatRenderer.render(
-                        turns: turns, tools: declaredTools,
+                    // FINESTRA SCORREVOLE sull'overflow: quando la
+                    // conversazione supera il contesto, i turni più vecchi
+                    // (mai il system) vengono scartati dal RENDER — il
+                    // transcript completo resta persistito a monte — finché
+                    // resta almeno una riserva di generazione.
+                    var activeTurns = turns
+                    var rendered = try GLM52ChatRenderer.render(
+                        turns: activeTurns, tools: declaredTools,
                         reasoning: thinkMode.core)
-                    let tokens = service.tokenizer
+                    var tokens = service.tokenizer
                         .tokenizeRenderedChat(rendered)
-                    guard tokens.count + 1 < contextSize else {
-                        throw GGUFError.cannotOpen(
-                            "conversazione (\(tokens.count) token) oltre il "
-                            + "contesto GLM configurato (\(contextSize))")
+                    let reserve = min(256, max(32, maxTokens))
+                    var droppedTurns = 0
+                    while tokens.count + reserve >= contextSize {
+                        guard let dropIndex = activeTurns.firstIndex(
+                                  where: { turn in
+                                      if case .system = turn { return false }
+                                      return true
+                                  }),
+                              dropIndex < activeTurns.count - 1 else {
+                            throw GGUFError.cannotOpen(
+                                "conversazione (\(tokens.count) token) "
+                                + "oltre il contesto GLM (\(contextSize)) "
+                                + "anche dopo la finestra scorrevole")
+                        }
+                        activeTurns.remove(at: dropIndex)
+                        droppedTurns += 1
+                        rendered = try GLM52ChatRenderer.render(
+                            turns: activeTurns, tools: declaredTools,
+                            reasoning: thinkMode.core)
+                        tokens = service.tokenizer
+                            .tokenizeRenderedChat(rendered)
+                    }
+                    if droppedTurns > 0 {
+                        continuation.yield(.progress(
+                            "contesto pieno: finestra scorrevole, scartati "
+                            + "\(droppedTurns) turni più vecchi dal render"))
                     }
 
                     // Incremental KV: prefill only the suffix when the
@@ -318,7 +387,8 @@ public actor GLM52ChatService {
                         continuation.yield(.toolCall(parsed.calls))
                     }
                     await self.noteGeneration(fedTokens: fed,
-                                              assistant: parsed.visibleText)
+                                              assistant: parsed.visibleText,
+                                              calls: parsed.calls)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

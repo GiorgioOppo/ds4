@@ -157,7 +157,9 @@ extension ChatStore {
     /// continues (a continuation was spawned or we're awaiting manual input) — in
     /// which case the caller must NOT mark generation finished.
     func handleToolCalls(assistantIndex index: Int, epoch: UInt64) async -> Bool {
-        guard ownsConversationWork(epoch), let service, index < messages.count else { return false }
+        guard ownsConversationWork(epoch),
+              service != nil || glmService != nil,
+              index < messages.count else { return false }
         let calls = messages[index].toolCalls
         guard !calls.isEmpty else { return false }
 
@@ -234,6 +236,15 @@ extension ChatStore {
                 }
                 let run: InferenceService.SubAgentRun
                 do {
+                    // Delega sub-agent: il runner vive su InferenceService,
+                    // quindi resta DeepSeek-only; col backend GLM il tool
+                    // fallisce con un errore pulito nel transcript.
+                    guard let service else {
+                        throw NSError(
+                            domain: "DwarfStar", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "sub-agent non disponibile col backend GLM 5.2"])
+                    }
                     run = try await service.runSubAgent(
                         target: target, question: question, agent: agent, tools: tools,
                         allowedTools: activeConversationDelegatedToolNames.sorted(),
@@ -312,8 +323,38 @@ extension ChatStore {
                                       text: "✗ internal tool-result alignment error; continuation stopped"))
             return false
         }
-        return continueWithToolOutputs(outputSlots.compactMap { $0 }, service: service,
-                                       epoch: epoch)
+        if let service {
+            return continueWithToolOutputs(outputSlots.compactMap { $0 },
+                                           service: service, epoch: epoch)
+        }
+        guard let glm = glmService else { return false }
+        return continueWithGLMToolOutputs(outputSlots.compactMap { $0 },
+                                          glm: glm, epoch: epoch)
+    }
+
+    /// GLM counterpart of `continueWithToolOutputs`: same loop shape over
+    /// the GLM chat service's native observation turns.
+    @discardableResult
+    func continueWithGLMToolOutputs(_ outputs: [ToolOutput],
+                                    glm: GLM52ChatService,
+                                    epoch: UInt64) -> Bool {
+        guard ownsConversationWork(epoch) else { return false }
+        let index = appendAssistant()
+        isGenerating = true
+        let mode = thinkMode
+        let params = sampling
+        generation = Task(priority: .userInitiated) { [weak self] in
+            let stream = await glm.provideToolResults(outputs, thinkMode: mode,
+                                                      sampling: params,
+                                                      maxTokens: 4096)
+            guard let self, self.ownsConversationWork(epoch) else { return }
+            await self.consume(stream, into: index, epoch: epoch)
+            guard self.ownsConversationWork(epoch) else { return }
+            let continued = await self.handleToolCalls(assistantIndex: index,
+                                                       epoch: epoch)
+            if !continued { self.finishIfIdle(epoch: epoch) }
+        }
+        return true
     }
 
     /// Feed tool outputs back and stream the model's continuation (which may emit
