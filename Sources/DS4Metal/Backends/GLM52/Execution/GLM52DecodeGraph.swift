@@ -500,7 +500,8 @@ extension MetalRuntime {
         input: MTLBuffer, gate: MTLBuffer, up: MTLBuffer, mid: MTLBuffer,
         hiddenWidth: Int, inputWidth: Int, routeWeight: Float,
         weightType: UInt32 = GLM52TensorSchema.q8_0,
-        gateOffset: Int = 0, upOffset: Int = 0) throws {
+        gateOffset: Int = 0, upOffset: Int = 0,
+        inputOffset: Int = 0) throws {
         if GLM52MatvecDispatch.cooperative {
             let rows = GLM52MatvecDispatch.rowsPerThreadgroup
             try glm52GraphEncode(
@@ -509,7 +510,7 @@ extension MetalRuntime {
                 arguments: [weightType, UInt32(hiddenWidth),
                             UInt32(inputWidth), routeWeight.bitPattern],
                 buffers: [input, gate, up, mid],
-                offsets: [0, gateOffset, upOffset, 0],
+                offsets: [inputOffset, gateOffset, upOffset, 0],
                 threadgroups: MTLSize(
                     width: (hiddenWidth + rows - 1) / rows,
                     height: 1, depth: 1),
@@ -524,7 +525,7 @@ extension MetalRuntime {
             arguments: [weightType, UInt32(hiddenWidth),
                         UInt32(inputWidth), routeWeight.bitPattern],
             buffers: [input, gate, up, mid],
-            offsets: [0, gateOffset, upOffset, 0],
+            offsets: [inputOffset, gateOffset, upOffset, 0],
             threadgroups: MTLSize(width: (hiddenWidth + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
@@ -532,12 +533,15 @@ extension MetalRuntime {
 
     func glm52EncodeAdd(into commandBuffer: MTLCommandBuffer,
                                 a: MTLBuffer, b: MTLBuffer,
-                                output: MTLBuffer, count: Int) throws {
+                                output: MTLBuffer, count: Int,
+                                aOffset: Int = 0, bOffset: Int = 0,
+                                outputOffset: Int = 0) throws {
         let width = 256
         try glm52GraphEncode(
             into: commandBuffer, pipelineName: "kernel_glm52_add_f32",
             arguments: [UInt32(count), 0, 0, 0],
             buffers: [a, b, output],
+            offsets: [aOffset, bOffset, outputOffset],
             threadgroups: MTLSize(width: (count + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))

@@ -577,29 +577,124 @@ public final class GLM52ResidentModel {
         var lastSelections: [(source: Int, rows: [UInt32])?] =
             Array(repeating: nil, count: tokens.count)
 
+        // Per-token planes of the two-phase expert path, allocated on the
+        // first sparse layer that needs them (100 MB at the 4096-token cap,
+        // freed with the prefill).
+        let planeStride = embeddingWidth * MemoryLayout<Float>.stride
+        var planes: (hidden: MTLBuffer, ffnIn: MTLBuffer)?
+        func expertPlanes() throws -> (hidden: MTLBuffer, ffnIn: MTLBuffer) {
+            if let planes { return planes }
+            guard let hidden = runtime.device.makeBuffer(
+                      length: tokens.count * planeStride,
+                      options: .storageModeShared),
+                  let ffnIn = runtime.device.makeBuffer(
+                      length: tokens.count * planeStride,
+                      options: .storageModeShared) else {
+                throw MetalError.bufferAlloc
+            }
+            planes = (hidden, ffnIn)
+            return (hidden, ffnIn)
+        }
+
+        func reusedSelection(index: Int, isFull: Bool, token: Int) throws
+            -> [UInt32]? {
+            if isFull { return nil }
+            guard let source = GLM52IndexSharePolicy
+                      .selectionSourceLayer(for: index),
+                  let last = lastSelections[token],
+                  last.source == source else {
+                throw MetalError.unsupported(
+                    "GLM 5.2 IndexShare layer \(index) has no "
+                    + "selection from its source layer")
+            }
+            return last.rows
+        }
+
         func sweep(index: Int, isFull: Bool,
                    weights: GLM52ResidentDecodeWeights,
                    ffn: GLM52ResidentFFN,
                    caches: GLM52ResidentDecodeCaches) throws {
+            // TWO-PHASE expert path for sparse layers on the staged fetch:
+            // phase A runs attention+router+shared per token (routed FFN
+            // deferred) snapshotting hidden/ffnIn planes; phase B stages
+            // each UNIQUE routed expert once for the whole prompt and
+            // applies it to every token that selected it. Expert I/O drops
+            // from selections×record to unique×record — the difference is
+            // the whole game on long prompts.
+            if case .sparse = ffn.kind, let stage = stagedFetch[index] {
+                let planes = try expertPlanes()
+                var users: [UInt32: [(token: Int, weight: Float)]] = [:]
+                var order: [UInt32] = []
+                for t in 0..<tokens.count {
+                    scratch.loadHidden(hiddens[t])
+                    let result = try runtime.glm52ChainedDecodeLayer(
+                        weights: weights, ffn: ffn, caches: caches,
+                        scratch: scratch,
+                        reusedSelection: try reusedSelection(
+                            index: index, isFull: isFull, token: t),
+                        position: basePosition + t,
+                        activeExperts: activeExperts,
+                        deferSparseFFN: true)
+                    if isFull {
+                        lastSelections[t] = (index, result.selection)
+                    }
+                    noteRouting(index, result.routing)
+                    if let routing = result.routing {
+                        let used = min(routing.selected.count,
+                                       max(1, activeExperts
+                                               ?? routing.selected.count))
+                        for rank in 0..<used {
+                            let id = UInt32(
+                                bitPattern: routing.selected[rank])
+                            if users[id] == nil {
+                                users[id] = []
+                                order.append(id)
+                            }
+                            users[id]?.append((t, routing.weights[rank]))
+                        }
+                    }
+                    memcpy(planes.hidden.contents() + t * planeStride,
+                           scratch.hidden.contents(), planeStride)
+                    memcpy(planes.ffnIn.contents() + t * planeStride,
+                           scratch.ffnIn.contents(), planeStride)
+                }
+                var start = 0
+                while start < order.count {
+                    let batch = Array(
+                        order[start..<min(start + 8, order.count)])
+                    let staged = try stage(batch)
+                    var applications:
+                        [(slot: Int, token: Int, weight: Float)] = []
+                    for (slot, id) in batch.enumerated() {
+                        for use in users[id] ?? [] {
+                            applications.append(
+                                (slot, use.token, use.weight))
+                        }
+                    }
+                    try runtime.glm52ApplyRoutedExperts(
+                        staged: staged, applications: applications,
+                        hiddenAll: planes.hidden, ffnInAll: planes.ffnIn,
+                        scratch: scratch, embeddingWidth: embeddingWidth,
+                        expertHiddenWidth:
+                            geometry.layer.expertHiddenWidth)
+                    start += 8
+                }
+                for t in 0..<tokens.count {
+                    let pointer = (planes.hidden.contents()
+                        + t * planeStride).bindMemory(
+                            to: Float.self, capacity: embeddingWidth)
+                    hiddens[t] = Array(UnsafeBufferPointer(
+                        start: pointer, count: embeddingWidth))
+                }
+                return
+            }
             for t in 0..<tokens.count {
                 scratch.loadHidden(hiddens[t])
-                let reused: [UInt32]?
-                if isFull {
-                    reused = nil
-                } else {
-                    guard let source = GLM52IndexSharePolicy
-                              .selectionSourceLayer(for: index),
-                          let last = lastSelections[t],
-                          last.source == source else {
-                        throw MetalError.unsupported(
-                            "GLM 5.2 IndexShare layer \(index) has no "
-                            + "selection from its source layer")
-                    }
-                    reused = last.rows
-                }
                 let result = try runtime.glm52ChainedDecodeLayer(
                     weights: weights, ffn: ffn, caches: caches,
-                    scratch: scratch, reusedSelection: reused,
+                    scratch: scratch,
+                    reusedSelection: try reusedSelection(
+                        index: index, isFull: isFull, token: t),
                     position: basePosition + t,
                     activeExperts: activeExperts)
                 if isFull {

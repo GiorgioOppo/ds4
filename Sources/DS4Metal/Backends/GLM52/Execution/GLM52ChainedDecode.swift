@@ -137,7 +137,8 @@ extension MetalRuntime {
         scratch: GLM52DecodeScratch,
         reusedSelection: [UInt32]?,
         position: Int,
-        activeExperts: Int? = nil) throws
+        activeExperts: Int? = nil,
+        deferSparseFFN: Bool = false) throws
         -> (routing: GLM52RouterOutput?, selection: [UInt32]) {
         let g = weights.geometry
         let layer = g.layer
@@ -395,6 +396,16 @@ extension MetalRuntime {
                                b: scratch.contribution,
                                output: scratch.hidden,
                                count: layer.embeddingWidth)
+            if deferSparseFFN {
+                // Two-phase prefill, phase A: the shared expert is already
+                // encoded above; the ROUTED experts are applied later by
+                // the caller EXPERT-MAJOR (union staging reads each unique
+                // record once for the whole prompt). scratch.ffnIn and
+                // scratch.hidden are the per-token planes it snapshots.
+                try glm52GraphCommit(ffnBuffer)
+                caches.appendedRow()
+                return (routing, selection)
+            }
             let usedExperts = min(routed.selected.count,
                                   max(1, activeExperts
                                           ?? routed.selected.count))
@@ -464,5 +475,52 @@ extension MetalRuntime {
 
         caches.appendedRow()
         return (routing, selection)
+    }
+
+    /// Two-phase prefill, phase B: apply ONE staged batch of routed experts
+    /// to every (token, weight) that selected them, expert-major, in one
+    /// command buffer. `hiddenAll`/`ffnInAll` are `[token][embeddingWidth]`
+    /// F32 planes snapshotted by phase A; each token's hidden accumulates
+    /// its contributions in place. Note the float-order caveat: per-token
+    /// contributions land in union order instead of router rank order, so
+    /// prefill and token-by-token decode agree within accumulation
+    /// tolerance, no longer bit-exactly.
+    public func glm52ApplyRoutedExperts(
+        staged: GLM52StagedExpertSelection,
+        applications: [(slot: Int, token: Int, weight: Float)],
+        hiddenAll: MTLBuffer, ffnInAll: MTLBuffer,
+        scratch: GLM52DecodeScratch,
+        embeddingWidth: Int, expertHiddenWidth: Int) throws {
+        guard !applications.isEmpty else { return }
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalError.bufferAlloc
+        }
+        let planeStride = embeddingWidth * MemoryLayout<Float>.stride
+        for application in applications {
+            let base = staged.recordOffsets[application.slot]
+            let tokenOffset = application.token * planeStride
+            try glm52EncodePairSwiGLU(
+                into: commandBuffer, input: ffnInAll,
+                gate: staged.buffer, up: staged.buffer,
+                mid: scratch.mid, hiddenWidth: expertHiddenWidth,
+                inputWidth: embeddingWidth,
+                routeWeight: application.weight,
+                weightType: staged.gateUpType,
+                gateOffset: base,
+                upOffset: base + staged.gateBytes,
+                inputOffset: tokenOffset)
+            try glm52EncodeMatvecQ8(
+                into: commandBuffer, input: scratch.mid,
+                weights: staged.buffer, output: scratch.contribution,
+                rowCount: embeddingWidth, inputWidth: expertHiddenWidth,
+                weightType: staged.downType,
+                weightsOffset: base + staged.gateBytes + staged.upBytes)
+            try glm52EncodeAdd(
+                into: commandBuffer, a: hiddenAll,
+                b: scratch.contribution, output: hiddenAll,
+                count: embeddingWidth,
+                aOffset: tokenOffset, outputOffset: tokenOffset)
+        }
+        try glm52GraphCommit(commandBuffer)
     }
 }
