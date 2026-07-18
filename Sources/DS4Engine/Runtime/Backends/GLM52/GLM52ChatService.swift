@@ -74,6 +74,13 @@ public actor GLM52ChatService {
         self.systemPrompt = systemPrompt
     }
 
+    /// Tools declared to the model (rendered into the native GLM XML tool
+    /// prompt). The compact form is a DeepSeek-only optimization: accepted
+    /// and ignored here.
+    public func setTools(_ tools: [ToolSpec]) { self.tools = tools }
+    public func setCompactTools(_ on: Bool) {}
+    private var tools: [ToolSpec] = []
+
     public func committedTokens() -> Int { service.engine.position }
 
     /// Append a user message to the running transcript and generate.
@@ -82,7 +89,7 @@ public actor GLM52ChatService {
                      maxTokens: Int) -> AsyncThrowingStream<GenEvent, Error> {
         transcript.append(.user(userText))
         return generate(turns: renderableTurns(), sampling: sampling,
-                        maxTokens: maxTokens)
+                        maxTokens: maxTokens, thinkMode: thinkMode)
     }
 
     /// Restore a persisted conversation and generate: the provided history
@@ -98,7 +105,7 @@ public actor GLM52ChatService {
         if let systemPrompt { self.systemPrompt = systemPrompt }
         transcript = history + [.user(userText)]
         return generate(turns: renderableTurns(), sampling: sampling,
-                        maxTokens: maxTokens)
+                        maxTokens: maxTokens, thinkMode: thinkMode)
     }
 
     // MARK: - Generation
@@ -112,20 +119,65 @@ public actor GLM52ChatService {
         transcript.append(.assistant(text: assistant, toolCalls: []))
     }
 
+    /// Splits the raw token stream into reasoning/text events on the GLM
+    /// `<think>` markers, holding back a short tail so a marker split across
+    /// token boundaries is never emitted as text.
+    private struct StreamSplitter {
+        var inThink = false
+        var pending = ""
+        mutating func feed(_ piece: String) -> [GenEvent] {
+            pending += piece
+            var events: [GenEvent] = []
+            while true {
+                let marker = inThink
+                    ? GLM52ConversationProtocol.thinkClose
+                    : GLM52ConversationProtocol.thinkOpen
+                guard let range = pending.range(of: marker) else { break }
+                let chunk = String(pending[..<range.lowerBound])
+                if !chunk.isEmpty {
+                    events.append(inThink ? .reasoning(chunk) : .text(chunk))
+                }
+                pending = String(pending[range.upperBound...])
+                inThink.toggle()
+            }
+            let hold = 12
+            if pending.count > hold {
+                let cut = pending.index(pending.endIndex, offsetBy: -hold)
+                let emit = String(pending[..<cut])
+                pending = String(pending[cut...])
+                if !emit.isEmpty {
+                    events.append(inThink ? .reasoning(emit) : .text(emit))
+                }
+            }
+            return events
+        }
+        mutating func flush() -> [GenEvent] {
+            guard !pending.isEmpty else { return [] }
+            let event: GenEvent = inThink
+                ? .reasoning(pending) : .text(pending)
+            pending = ""
+            return [event]
+        }
+    }
+
     private func generate(turns: [ChatTurn],
                           sampling: SamplingParams,
-                          maxTokens: Int)
+                          maxTokens: Int,
+                          thinkMode: DS4ThinkMode)
         -> AsyncThrowingStream<GenEvent, Error> {
         let service = self.service
         let contextSize = self.contextSize
         let primed = self.primedTokens
+        let declaredTools = self.tools
         return AsyncThrowingStream { continuation in
             // Detached: the engine blocks on GPU/SSD waits and must not
             // occupy the cooperative pool (same discipline as the DeepSeek
             // actor's serial GCD executor).
             let producer = Task.detached(priority: .userInitiated) {
                 do {
-                    let rendered = try GLM52ChatRenderer.render(turns: turns)
+                    let rendered = try GLM52ChatRenderer.render(
+                        turns: turns, tools: declaredTools,
+                        reasoning: thinkMode.core)
                     let tokens = service.tokenizer
                         .tokenizeRenderedChat(rendered)
                     guard tokens.count + 1 < contextSize else {
@@ -165,6 +217,7 @@ public actor GLM52ChatService {
                     var fed = tokens
                     var produced = 0
                     var reply: [UInt8] = []
+                    var splitter = StreamSplitter()
                     let decodeStart = Date()
                     let budget = min(maxTokens,
                                      contextSize - tokens.count - 1)
@@ -177,15 +230,17 @@ public actor GLM52ChatService {
                             recentTokens: fed.suffix(
                                 GLM52Sampler.penaltyWindow)) else { break }
                         produced += 1
-                        if service.tokenizer.isStopToken(token,
-                                                         reasoning: .none) {
+                        if service.tokenizer.isStopToken(
+                            token, reasoning: thinkMode.core) {
                             break
                         }
                         let bytes = service.tokenizer.tokenText(token)
                         reply.append(contentsOf: bytes)
                         if let piece = String(bytes: bytes,
                                               encoding: .utf8) {
-                            continuation.yield(.text(piece))
+                            for event in splitter.feed(piece) {
+                                continuation.yield(event)
+                            }
                         }
                         let elapsed = max(
                             Date().timeIntervalSince(decodeStart), 0.001)
@@ -196,9 +251,20 @@ public actor GLM52ChatService {
                         logits = try service.engine.forwardNext(token)
                         fed.append(token)
                     }
-                    let text = String(decoding: reply, as: UTF8.self)
+                    for event in splitter.flush() {
+                        continuation.yield(event)
+                    }
+                    // Native GLM XML tool calls: parsed from the full reply;
+                    // the GUI receives them as one .toolCall event (the
+                    // automatic tool loop stays DeepSeek-only in this v1).
+                    let raw = String(decoding: reply, as: UTF8.self)
+                    let parsed = GLM52ToolCodec.parse(raw,
+                                                      tools: declaredTools)
+                    if !parsed.calls.isEmpty {
+                        continuation.yield(.toolCall(parsed.calls))
+                    }
                     await self.noteGeneration(fedTokens: fed,
-                                              assistant: text)
+                                              assistant: parsed.visibleText)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
