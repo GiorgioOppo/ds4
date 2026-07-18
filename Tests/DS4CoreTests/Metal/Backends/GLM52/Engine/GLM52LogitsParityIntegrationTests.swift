@@ -12,7 +12,15 @@ import DS4Core
 /// form of the roadmap's parity gate; the CPU oracle is slow (~minutes) by
 /// design — it is the judge, not a runtime path.
 final class GLM52LogitsParityIntegrationTests: XCTestCase {
-    private let layerCount = 4
+    /// Layers under parity: default 4 (dense prefix + first sparse). Set
+    /// DS4_GLM52_PARITY_LAYERS up to 78 for the full stack — the oracle
+    /// keeps ~0.7 GiB of dequantized F32 weights PER LAYER resident (~55 GiB
+    /// at 78) and its CPU forward takes minutes per position; run the full
+    /// gate only on a machine with the RAM to hold it.
+    private let layerCount = min(
+        78, max(1, Int(ProcessInfo.processInfo
+                          .environment["DS4_GLM52_PARITY_LAYERS"] ?? "4")
+                    ?? 4))
     private let prompt: [Int32] = [154_822, 9_333, 21]
 
     private func dequant(_ bytes: [UInt8], type: UInt32,
