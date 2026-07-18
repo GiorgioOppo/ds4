@@ -149,6 +149,19 @@ final class GLM52DecodeGraphTests: XCTestCase {
             values: [1, 2], weight: [1]))
     }
 
+    func testF32MatvecKernelMatchesOracle() throws {
+        let runtime = try makeRuntime()
+        let rows = Self.floats(32 * 256, seed: 61, scale: 0.4)
+        let input = Self.floats(256, seed: 62, scale: 0.4)
+        let gpu = try runtime.glm52MatvecF32(rows: rows, input: input,
+                                             rowCount: 32)
+        let oracle = try GLM52FFNCPUReference.matvec(
+            rows: rows, input: input, rowCount: 32)
+        assertClose(gpu, oracle, label: "f32 matvec", tolerance: 1e-4)
+        XCTAssertThrowsError(try runtime.glm52MatvecF32(
+            rows: [1, 2], input: [1], rowCount: 3))
+    }
+
     func testResidentFillRangeMatchesPerDispatchExecutor() throws {
         let runtime = try makeRuntime()
         let geometry = Self.geometry(topK: 2_048)

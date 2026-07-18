@@ -295,7 +295,7 @@ extension MetalRuntime {
         return buffer
     }
 
-    private func glm52GraphOutputBuffer(floats count: Int) throws -> MTLBuffer {
+    func glm52GraphOutputBuffer(floats count: Int) throws -> MTLBuffer {
         guard let buffer = device.makeBuffer(
             length: count * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
@@ -304,7 +304,7 @@ extension MetalRuntime {
         return buffer
     }
 
-    private func glm52GraphReadback(_ buffer: MTLBuffer,
+    func glm52GraphReadback(_ buffer: MTLBuffer,
                                     count: Int) -> [Float] {
         let pointer = buffer.contents().bindMemory(
             to: Float.self, capacity: count)
@@ -314,7 +314,7 @@ extension MetalRuntime {
     /// Encode one kernel dispatch into an open command buffer. Sequential
     /// encoders in one command buffer execute in order with automatic hazard
     /// tracking on the shared buffers.
-    private func glm52GraphEncode(
+    func glm52GraphEncode(
         into commandBuffer: MTLCommandBuffer,
         pipelineName: String,
         arguments: [UInt32],
@@ -341,7 +341,7 @@ extension MetalRuntime {
         encoder.endEncoding()
     }
 
-    private func glm52GraphCommit(_ commandBuffer: MTLCommandBuffer) throws {
+    func glm52GraphCommit(_ commandBuffer: MTLCommandBuffer) throws {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
@@ -349,7 +349,7 @@ extension MetalRuntime {
 
     // MARK: - Encoded stages
 
-    private func glm52EncodeRMSNorm(into commandBuffer: MTLCommandBuffer,
+    func glm52EncodeRMSNorm(into commandBuffer: MTLCommandBuffer,
                                     input: MTLBuffer, weight: MTLBuffer,
                                     output: MTLBuffer, width: Int,
                                     epsilon: Float = 1e-5) throws {
@@ -362,7 +362,7 @@ extension MetalRuntime {
             threadgroupMemoryLength: 256 * MemoryLayout<Float>.stride)
     }
 
-    private func glm52EncodeMatvecQ8(
+    func glm52EncodeMatvecQ8(
         into commandBuffer: MTLCommandBuffer,
         input: MTLBuffer, weights: MTLBuffer,
         output: MTLBuffer, rowCount: Int, inputWidth: Int,
@@ -378,7 +378,7 @@ extension MetalRuntime {
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
     }
 
-    private func glm52EncodePairSwiGLU(
+    func glm52EncodePairSwiGLU(
         into commandBuffer: MTLCommandBuffer,
         input: MTLBuffer, gate: MTLBuffer, up: MTLBuffer, mid: MTLBuffer,
         hiddenWidth: Int, inputWidth: Int, routeWeight: Float,
@@ -395,7 +395,7 @@ extension MetalRuntime {
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
     }
 
-    private func glm52EncodeAdd(into commandBuffer: MTLCommandBuffer,
+    func glm52EncodeAdd(into commandBuffer: MTLCommandBuffer,
                                 a: MTLBuffer, b: MTLBuffer,
                                 output: MTLBuffer, count: Int) throws {
         let width = 256
@@ -408,7 +408,7 @@ extension MetalRuntime {
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
     }
 
-    private func glm52EncodeRope(into commandBuffer: MTLCommandBuffer,
+    func glm52EncodeRope(into commandBuffer: MTLCommandBuffer,
                                  pipelineName: String, values: MTLBuffer,
                                  headCount: Int, headDimension: Int,
                                  rotationDimension: Int,

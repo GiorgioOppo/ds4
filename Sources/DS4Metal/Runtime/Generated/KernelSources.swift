@@ -12104,6 +12104,31 @@ kernel void kernel_glm52_rms_norm_f32(
     }
 }
 
+struct ds4_metal_args_glm52_matvec_f32 {
+    uint32_t row_count;
+    uint32_t input_width;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+// Plain F32 matvec (one thread per output row) for the small F32 tensors the
+// chained graph keeps on GPU — the 32-row indexer.proj. Validation-grade on
+// purpose, like the quantized row kernels beside it.
+kernel void kernel_glm52_matvec_f32(
+        constant ds4_metal_args_glm52_matvec_f32 &args,
+        device const float *rows,
+        device const float *x,
+        device float       *out,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.row_count) return;
+    device const float *row = rows + (uint64_t)tid * args.input_width;
+    float acc = 0.0f;
+    for (uint i = 0u; i < args.input_width; i++) {
+        acc += row[i] * x[i];
+    }
+    out[tid] = acc;
+}
+
 struct ds4_metal_args_glm52_add {
     uint32_t count;
     uint32_t pad0;

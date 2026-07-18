@@ -74,6 +74,7 @@ public final class GLM52ResidentModel {
     private let head: GLM52ResidentOutputHead
     private let providers: [Int: GLM52StreamedExpertProvider]
     private let activeExperts: Int?
+    private let scratch: GLM52DecodeScratch
     private let geometry = GLM52DecodeGeometry.v5_2
     private let vocabulary: Int
     private let embeddingWidth: Int
@@ -237,6 +238,9 @@ public final class GLM52ResidentModel {
                 fullIndexer: true))
 
         self.providers = providers
+        scratch = try GLM52DecodeScratch(
+            runtime: runtime, geometry: geometry,
+            scoreCapacity: options.cacheCapacity)
         head = try GLM52ResidentOutputHead(
             runtime: runtime, geometry: geometry,
             outputNorm: try f32(map.global(.outputNorm)),
@@ -269,7 +273,7 @@ public final class GLM52ResidentModel {
     /// selections (consecutive tokens reselect often).
     public func forwardNext(_ token: Int32) throws -> [Float] {
         let embedded = try embeddingRow(token)
-        var hidden = embedded
+        scratch.loadHidden(embedded)
         var lastSelection: (source: Int, rows: [UInt32])?
         var routings: [Int: [Int32]] = [:]
 
@@ -290,12 +294,11 @@ public final class GLM52ResidentModel {
 
         for layer in stack {
             let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(layer.index)
-            let result = try runtime.glm52ResidentDecodeLayer(
+            let result = try runtime.glm52ChainedDecodeLayer(
                 weights: layer.weights, ffn: layer.ffn, caches: layer.caches,
-                input: hidden,
+                scratch: scratch,
                 reusedSelection: try reuse(for: layer.index, isFull: isFull),
                 position: position, activeExperts: activeExperts)
-            hidden = result.output
             if isFull { lastSelection = (layer.index, result.selection) }
             if let routing = result.routing {
                 routings[layer.index] = routing.selected
@@ -332,12 +335,11 @@ public final class GLM52ResidentModel {
                     expertProvider: { [provider = streamedLayer.provider] in
                         try provider.expert($0)
                     }))
-            let result = try runtime.glm52ResidentDecodeLayer(
+            let result = try runtime.glm52ChainedDecodeLayer(
                 weights: weights, ffn: ffn, caches: streamedLayer.caches,
-                input: hidden,
+                scratch: scratch,
                 reusedSelection: try reuse(for: index, isFull: isFull),
                 position: position, activeExperts: activeExperts)
-            hidden = result.output
             if isFull { lastSelection = (index, result.selection) }
             if let routing = result.routing {
                 routings[index] = routing.selected
@@ -347,8 +349,9 @@ public final class GLM52ResidentModel {
         for (index, selected) in routings {
             providers[index]?.prefetch(selected.map { UInt32(bitPattern: $0) })
         }
-        return try runtime.glm52ResidentLogits(outputHead: head,
-                                               hidden: hidden)
+        return try runtime.glm52ResidentLogits(
+            outputHead: head,
+            hidden: scratch.readHidden(count: embeddingWidth))
     }
 
     /// Feed a whole prompt token by token; returns the logits after the
