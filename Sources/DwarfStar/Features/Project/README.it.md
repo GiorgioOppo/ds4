@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Project
 
 - **`Views/ProjectView.swift`** gestisce la libreria dei progetti. Importa

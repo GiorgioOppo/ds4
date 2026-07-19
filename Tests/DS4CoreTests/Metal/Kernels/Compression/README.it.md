@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel di compressione
 
 Test per le proiezioni del compressore e le primitive split/reduce delle

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di persistenza del motore
 
 `DiskKVStoreTests.swift` valida lookup KV, serializzazione, indicizzazione,

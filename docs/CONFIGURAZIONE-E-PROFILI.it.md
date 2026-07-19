@@ -1,8 +1,10 @@
+[English](CONFIGURAZIONE-E-PROFILI.md) | **Italiano**
+
 # Configurazione e profili di esecuzione
 
 Questo documento spiega come leggere e applicare la configurazione. La tabella
 completa di ogni chiave, valore e default resta la
-[Configuration Reference](../README.md#configuration-reference), che è la
+[Configuration Reference](../README.it.md#riferimento-di-configurazione), che è la
 fonte autorevole per i singoli parametri.
 
 I knob storici `DS4_*` descritti qui appartengono al backend DeepSeek V4 salvo
@@ -112,7 +114,7 @@ swift run -c release DS4Demo /percorso/modello.gguf 32 "Prompt di controllo"
 ```
 
 I comandi operativi completi della demo sono in
-[`Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.md).
+[`Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.it.md).
 
 ## Cache e file derivati
 
@@ -132,7 +134,7 @@ Il coordinator invia ai worker una whitelist di knob prestazionali. Un worker
 non deve sostituirli con i propri default dopo l'assegnazione. Opzioni lossy e
 sidecar viaggiano in campi tipizzati per impedire configurazioni implicite.
 
-Vedere [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
+Vedere [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.it.md).
 
 ## Regola di documentazione
 

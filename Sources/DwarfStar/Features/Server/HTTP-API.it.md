@@ -1,3 +1,5 @@
+[English](HTTP-API.md) | **Italiano**
+
 # API HTTP locale
 
 Il server in-process espone il modello già caricato dall'app; non crea mai un

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 configuration tests
 
 These metadata-only GGUF fixtures verify the exact GLM 5.2 shape without

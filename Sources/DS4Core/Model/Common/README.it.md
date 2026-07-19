@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model/Common
 
 Contratti portabili per identificare un'architettura senza selezionare per

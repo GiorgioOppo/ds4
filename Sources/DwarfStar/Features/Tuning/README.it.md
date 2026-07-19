@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Tuning
 
 - **`Views/TuningView.swift`** mostra gli slot della cache degli esperti
@@ -5,7 +7,7 @@
   IQ2/Q4 consapevole del layer (`DS4MultiQuantCache`, attiva di default),
   l'hit-rate e la concentrazione del routing per layer tramite la imatrix di
   utilizzo. Vedi il
-  [Riferimento di configurazione](../../../../README.md#configuration-reference)
+  [Riferimento di configurazione](../../../../README.it.md#riferimento-di-configurazione)
   nella radice.
 - **`Views/AgentsView.swift`** modifica i ruoli degli agenti: prompt, icona,
   tool per agente e import/export JSON. Si tratta di gestione degli agenti più

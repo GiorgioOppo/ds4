@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar Shared
 
 Cross-feature application support lives here. Code in `Shared/` must be usable

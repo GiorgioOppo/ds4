@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Inference/Diagnostics
 
 Provides read-only diagnostics on the GGUF without starting the Metal decoder.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # ModelManagement/Download
 
 Implementa download nativi e riprendibili dei GGUF, senza `curl` o processi
@@ -75,4 +77,4 @@ singolo-file sono selezionabili, mentre il package PRO Q4 e i tre GLM 5.2
 restano `downloadOnly`. MTP è un accessorio separato e non compare tra i modelli GUI.
 
 Le impostazioni correlate sono nella
-[Configuration Reference](../../../../README.md#configuration-reference).
+[Configuration Reference](../../../../README.it.md#riferimento-di-configurazione).

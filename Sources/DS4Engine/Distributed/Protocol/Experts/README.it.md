@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Experts
 
 Definisce i frame del parallelismo MoE verticale, esteso dal protocollo v11
@@ -14,7 +16,7 @@ per la geometria Pro.
 
 Il coordinator partiziona gli esperti, assegna le maschere e invia una
 richiesta per ogni layer routed.
-[`ExpertShardEngine`](../../Execution/README.md) calcola il contributo
+[`ExpertShardEngine`](../../Execution/README.it.md) calcola il contributo
 locale; il coordinator valida sequenza/layer e aggrega.
 
 ## Estensione

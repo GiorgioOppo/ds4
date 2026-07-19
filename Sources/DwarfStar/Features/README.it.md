@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Feature di DwarfStar
 
 Ogni directory figlia implementa un'area rivolta all'utente dell'applicazione

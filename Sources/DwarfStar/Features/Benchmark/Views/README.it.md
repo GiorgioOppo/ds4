@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # View dei benchmark
 
 `BenchView.swift` renderizza il picker Speed/Correctness, la configurazione,

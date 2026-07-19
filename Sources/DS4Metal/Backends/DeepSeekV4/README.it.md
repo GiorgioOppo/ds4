@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend DeepSeek-V4
 
 Implementazione Metal per DeepSeek V4 Flash e Pro. Il GGUF validato produce una
@@ -8,12 +10,12 @@ distribuzione Pro non sono ancora dichiarati operativi.
 
 ## Struttura
 
-- [`Architecture/`](Architecture/README.md): shape, dimensioni e RoPE.
-- [`Model/`](Model/README.md): schema tensor e caricamento GGUF.
-- [`Streaming/`](Streaming/README.md): staging dei pesi densi da SSD.
-- [`Experts/`](Experts/README.md): expert bundle, cache e MetalIO.
-- [`MTP/`](MTP/README.md): sidecar Multi-Token Prediction.
-- [`Decode/`](Decode/README.md): stato KV/NSA, prefill e generazione.
+- [`Architecture/`](Architecture/README.it.md): shape, dimensioni e RoPE.
+- [`Model/`](Model/README.it.md): schema tensor e caricamento GGUF.
+- [`Streaming/`](Streaming/README.it.md): staging dei pesi densi da SSD.
+- [`Experts/`](Experts/README.it.md): expert bundle, cache e MetalIO.
+- [`MTP/`](MTP/README.it.md): sidecar Multi-Token Prediction.
+- [`Decode/`](Decode/README.it.md): stato KV/NSA, prefill e generazione.
 
 ## Confine architetturale
 

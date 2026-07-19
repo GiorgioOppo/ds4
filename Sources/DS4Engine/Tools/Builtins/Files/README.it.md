@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Builtins/Files
 
 Espone accesso raw e modifiche puntuali ai file sotto la root importata.
@@ -11,14 +13,14 @@ Espone accesso raw e modifiche puntuali ai file sotto la root importata.
 
 ## Flusso e dipendenze
 
-Le specifiche delegano a [`ProjectCache`](../../../Projects/README.md), che
+Le specifiche delegano a [`ProjectCache`](../../../Projects/README.it.md), che
 standardizza e ricontrolla i percorsi. Sono tutti `projectScoped` e gli output
 di lettura sono limitati.
 
 ## Estensione
 
 Applicare le invarianti in
-[`Projects/SICUREZZA-PERCORSI.md`](../../../Projects/SICUREZZA-PERCORSI.md),
+[`Projects/SICUREZZA-PERCORSI.md`](../../../Projects/SICUREZZA-PERCORSI.it.md),
 evitare glob distruttivi e richiedere testo di ricerca univoco per modifiche.
 Una nuova operazione di directory necessita una revisione esplicita del modello
 di autorizzazione.

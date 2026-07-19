@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 conversation protocol
 
 This directory owns GLM 5.2 chat framing and native tool syntax. The wire

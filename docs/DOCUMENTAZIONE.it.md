@@ -1,3 +1,5 @@
+[English](DOCUMENTAZIONE.md) | **Italiano**
+
 # Documentazione DwarfStar
 
 Questa è la guida per utenti e sviluppatori di DwarfStar: cosa fa l'app, come è
@@ -17,13 +19,13 @@ catalogato per il download ripristinabile con verifica di integrità e ora ha un
 detector registrato, un contratto GGUF rigoroso e un frontend nativo per
 tokenizer/chat. Il suo decoder Metal è incompleto, quindi i file `glm-dsa`
 restano non selezionabili. Vedi la
-[matrice di supporto](ARCHITETTURE-SUPPORTATE.md) per la distinzione precisa
+[matrice di supporto](ARCHITETTURE-SUPPORTATE.it.md) per la distinzione precisa
 tra modelli riconosciuti e supportati.
 
 Per i dettagli di più basso livello del motore, vedi
-[`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.md). Per la conformità di
-esportazione per l'App Store, vedi [`CRITTOGRAFIA.md`](CRITTOGRAFIA.md).
-L'indice della documentazione in [`README.md`](README.md) collega le guide
+[`ARCHITETTURA-MOTORE.md`](ARCHITETTURA-MOTORE.it.md). Per la conformità di
+esportazione per l'App Store, vedi [`CRITTOGRAFIA.md`](CRITTOGRAFIA.it.md).
+L'indice della documentazione in [`README.md`](README.it.md) collega le guide
 tematiche su inferenza, Metal, esecuzione distribuita, GUI/server,
 configurazione e test.
 
@@ -212,7 +214,7 @@ maggiore di zero.
 14. Salva l'imatrix di utilizzo e stampa il profilo di decode.
 
 Vedi `Sources/DS4Demo/README.md` per esempi diagnostici e il
-[Riferimento di configurazione](../README.md#configuration-reference) nel
+[Riferimento di configurazione](../README.it.md#riferimento-di-configurazione) nel
 README di radice per l'elenco completo delle variabili d'ambiente `DS4_*`.
 
 ## 5. App SwiftUI: `DwarfStar`
@@ -318,7 +320,7 @@ Impostazioni facoltative di memoria e I/O:
   hash, che sono sempre prefetchati esattamente).
 
 Ogni manopola dietro questi interruttori, più quelle solo-CLI, è documentata
-nel [Riferimento di configurazione](../README.md#configuration-reference) del
+nel [Riferimento di configurazione](../README.it.md#riferimento-di-configurazione) del
 README di radice, che è il riferimento completo dei parametri.
 
 ### Passo 2 — Caricare
@@ -601,7 +603,7 @@ caricamento del modello. L'app esegue migrazioni una tantum dai default
 sperimentali più vecchi a questo profilo misurato (vedi la Sezione 7); le
 modifiche future dell'utente sono preservate. L'elenco completo delle manopole
 d'ambiente del motore, incluse quelle solo-CLI, vive nel
-[Riferimento di configurazione](../README.md#configuration-reference) del
+[Riferimento di configurazione](../README.it.md#riferimento-di-configurazione) del
 README di radice.
 
 ### Page cache vs buffer wired
@@ -884,8 +886,8 @@ o 61 layer Pro. Questa topologia richiede un RTT cablato sotto circa 1 ms
 perché introduce circa un round-trip per layer instradato. Il GGUF Pro Q2
 completo è accettato; il Pro Q4 diviso resta solo scaricabile finché non esiste
 un loader multi-shard. Vedi
-[`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md) e
-[`EXPERT_PARALLELISM.md`](EXPERT_PARALLELISM.md).
+[`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.it.md) e
+[`EXPERT_PARALLELISM.md`](EXPERT_PARALLELISM.it.md).
 
 Il setup dei worker gira IN PARALLELO: il trasferimento dei file e il
 caricamento del motore di ogni peer procedono insieme, così la route si attiva

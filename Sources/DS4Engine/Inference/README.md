@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Inference
 
 This area exposes the application API and coordinates the complete inference

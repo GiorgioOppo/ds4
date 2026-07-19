@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test Metal
 
 Validazione per `DS4Metal`, suddivisa per livello di astrazione:
@@ -10,4 +12,4 @@ Validazione per `DS4Metal`, suddivisa per livello di astrazione:
 
 I casi dipendenti dalla GPU devono saltare esplicitamente quando Metal non è
 disponibile. Un test saltato non è un pass; vedi
-[`METAL-TESTS.md`](../../METAL-TESTS.md) per le convenzioni.
+[`METAL-TESTS.md`](../../METAL-TESTS.it.md) per le convenzioni.

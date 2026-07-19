@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Persistence/KV
 
 `DiskKVStore` conserva checkpoint del decoder indicizzati dal prefisso esatto
@@ -13,7 +15,7 @@ prefill completo.
 - `+Streaming`: import/export un layer alla volta.
 - `+Serialization`: primitive del corpo binario.
 
-Il layout è documentato in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.md).
+Il layout è documentato in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.it.md).
 
 ## Flusso e dipendenze
 

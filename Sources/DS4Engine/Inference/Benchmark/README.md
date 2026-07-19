@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Inference/Benchmark
 
 Measures the already-loaded backend without depending on the GUI.

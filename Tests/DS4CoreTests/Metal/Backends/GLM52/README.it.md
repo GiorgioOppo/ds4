@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test Metal GLM 5.2
 
 Questi test confrontano i kernel Metal GLM di proprietà dell'architettura con

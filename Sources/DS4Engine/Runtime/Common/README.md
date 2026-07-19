@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Runtime/Common
 
 - `ModelInspector` converts GGUF metadata into DS4Core's neutral descriptors

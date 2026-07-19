@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Files
 
 Defines the resumable transfer of GGUFs and sidecars.

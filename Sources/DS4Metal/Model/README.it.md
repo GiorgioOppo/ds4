@@ -1,19 +1,21 @@
+[English](README.md) | **Italiano**
+
 # Model
 
 Tipi di modello condivisi tra i backend Metal. Le descrizioni architetturali,
 gli schemi tensor GGUF, lo streaming e le cache specifiche vivono sotto
-[`Backends/`](../Backends/README.md).
+[`Backends/`](../Backends/README.it.md).
 
 ## Struttura
 
-- [`Quantization/`](Quantization/README.md): metadati dei layout MoE quantizzati.
+- [`Quantization/`](Quantization/README.it.md): metadati dei layout MoE quantizzati.
 
 ## Flusso
 
 Il codice in questa cartella non deve assumere nomi tensor, forma della KV cache,
 numero di head o strategia di routing di una singola famiglia. Il backend
 DeepSeek-V4 mantiene il proprio modello in
-[`Backends/DeepSeekV4`](../Backends/DeepSeekV4/README.md).
+[`Backends/DeepSeekV4`](../Backends/DeepSeekV4/README.it.md).
 
 ## Regole di modifica
 

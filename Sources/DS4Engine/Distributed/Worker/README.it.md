@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Worker
 
 `DistWorker` è un nodo inizialmente inattivo che ascolta una porta, riceve file
@@ -6,12 +8,12 @@ e carica il lavoro assegnato dal coordinator.
 ## Struttura
 
 - `DistWorker.swift`: configurazione e stato condiviso protetto da lock.
-- [`Lifecycle`](Lifecycle/README.md): listener, start/stop e `HELLO`.
-- [`Assignments`](Assignments/README.md): caricamento slice o shard esperti.
-- [`Files`](Files/README.md): ricezione resumable e verifica.
-- [`KV`](KV/README.md): comandi di checkpoint.
-- [`Serving`](Serving/README.md): dispatch dei frame e pipeline.
-- [`Concurrency`](Concurrency/README.md): serializzazione del lavoro Metal.
+- [`Lifecycle`](Lifecycle/README.it.md): listener, start/stop e `HELLO`.
+- [`Assignments`](Assignments/README.it.md): caricamento slice o shard esperti.
+- [`Files`](Files/README.it.md): ricezione resumable e verifica.
+- [`KV`](KV/README.it.md): comandi di checkpoint.
+- [`Serving`](Serving/README.it.md): dispatch dei frame e pipeline.
+- [`Concurrency`](Concurrency/README.it.md): serializzazione del lavoro Metal.
 
 ## Flusso
 

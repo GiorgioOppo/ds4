@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Work
 
 Defines the data of the horizontal pipeline.

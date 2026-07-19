@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Generation Tests
 
 `SamplerTests.swift` validates greedy and stochastic sampling controls,

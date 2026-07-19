@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dell'Engine distribuito
 
 `DistProtocolTests.swift` copre codifica/decodifica dei messaggi, framing,

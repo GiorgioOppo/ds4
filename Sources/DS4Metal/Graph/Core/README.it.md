@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Graph/Core
 
 Stato condiviso e primitive di dispatch del grafo Metal.
@@ -11,7 +13,7 @@ Stato condiviso e primitive di dispatch del grafo Metal.
 ## Flusso e dipendenze
 
 Il decoder costruisce il contesto; le estensioni in
-[`Operations`](../Operations/README.md) lo usano per codificare fasi consecutive.
+[`Operations`](../Operations/README.it.md) lo usano per codificare fasi consecutive.
 La configurazione delle threadgroup viene validata contro device, forma e
 quantizzazione prima del dispatch.
 

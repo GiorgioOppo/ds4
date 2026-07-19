@@ -1,3 +1,5 @@
+[English](FORMATO-CHECKPOINT.md) | **Italiano**
+
 # Formato dei checkpoint KV
 
 Il file combina header portabili di `DS4Core` e un corpo Swift esplicito:

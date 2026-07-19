@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model/Backends/DeepSeekV4
 
 Forma e validazione metadata di DeepSeek V4 Flash/Pro.

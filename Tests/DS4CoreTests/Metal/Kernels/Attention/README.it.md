@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel di attention
 
 Test per RoPE, compressione KV, scoring/pooling dell'indexer, selezione

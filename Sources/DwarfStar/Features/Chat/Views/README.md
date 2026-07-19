@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Chat Views
 
 SwiftUI presentation for conversations:

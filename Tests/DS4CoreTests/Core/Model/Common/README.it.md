@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model/Common Tests
 
 Test puri per normalizzazione degli identificatori, rilevamento da metadata,

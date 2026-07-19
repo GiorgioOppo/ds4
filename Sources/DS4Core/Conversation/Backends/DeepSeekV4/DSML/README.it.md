@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Conversation/Backends/DeepSeekV4/DSML
 
 Implementazione del protocollo DSML usato dal modello per dichiarare ed emettere
@@ -13,7 +15,7 @@ chiamate a strumenti.
 
 ## Flusso
 
-I tipi in [`Models`](../../../Models/README.md) entrano nel renderer; il testo prodotto
+I tipi in [`Models`](../../../Models/README.it.md) entrano nel renderer; il testo prodotto
 viene tokenizzato. Dopo la generazione, il parser ricostruisce `[ToolCall]`; il
 risultato dello strumento torna nella cronologia come `ChatTurn.toolResult`.
 

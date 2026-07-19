@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Controller del server
 
 `ServerController.swift` possiede lo stato rivolto all'utente di host, porta,

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Benchmark
 
 Benchmark nativi del motore condiviso. Il pannello offre due misure distinte:
@@ -80,7 +82,7 @@ e non esiste un fallback silenzioso al motore locale.
 I vecchi numeri puntuali sono stati rimossi da questo README perché non avevano
 data, build, hash del GGUF e linea completa dei knob. Le misure storiche per cui
 è disponibile un contesto esplicito restano in
-[`docs/VALUTAZIONE-DEMO-PERF.md`](../../../../docs/VALUTAZIONE-DEMO-PERF.md).
+[`docs/VALUTAZIONE-DEMO-PERF.md`](../../../../docs/VALUTAZIONE-DEMO-PERF.it.md).
 
 ## Provenienza obbligatoria per nuove misure
 
@@ -108,6 +110,6 @@ engine e aggiornare i test quando cambia la definizione delle metriche. Gli
 aggiornamenti prodotti dal lavoro detached devono attraversare stream Sendable:
 mai mutare direttamente stato osservabile MainActor dal motore.
 
-Vedere anche il [README dei controller](Controllers/README.md), il
-[README delle view](Views/README.md) e la
-[guida di testing](../../../../docs/TESTING-E-VALIDAZIONE.md).
+Vedere anche il [README dei controller](Controllers/README.it.md), il
+[README delle view](Views/README.it.md) e la
+[guida di testing](../../../../docs/TESTING-E-VALIDAZIONE.it.md).

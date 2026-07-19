@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 Metal tests
 
 These tests compare architecture-owned GLM Metal kernels with independent

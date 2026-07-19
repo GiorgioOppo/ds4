@@ -1,3 +1,5 @@
+**English** | [Italiano](DOCUMENTAZIONE.it.md)
+
 # DwarfStar Documentation
 
 This is the user-facing and developer-facing guide for DwarfStar: what the app

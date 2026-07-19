@@ -1,3 +1,5 @@
+**English** | [Italiano](ARCHITETTURA-MOTORE.it.md)
+
 # DeepSeek V4 backend — engine architecture
 
 This document describes the operational **DeepSeek V4 backend** behind

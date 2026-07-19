@@ -1,3 +1,5 @@
+[English](README-analisi.md) | **Italiano**
+
 # Analisi della comprimibilita dei GGUF
 
 Questa guida descrive i due strumenti esplorativi usati per misurare la
@@ -5,7 +7,7 @@ ridondanza dei pesi prima di investire in nuovi kernel, rappresentazioni
 fattorizzate o fine-tuning. Entrambi leggono il GGUF senza modificarlo e non
 producono un modello immediatamente eseguibile da DwarfStar.
 
-Tornare all'[indice degli script](README.md).
+Tornare all'[indice degli script](README.it.md).
 
 ## Requisiti
 

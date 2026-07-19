@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Nucleo di auto-tuning della macchina
 
 Questa directory contiene il livello decisionale puro e neutrale rispetto

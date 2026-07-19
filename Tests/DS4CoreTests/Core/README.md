@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Core Tests
 
 Deterministic tests for the platform-independent `DS4Core` module. The child

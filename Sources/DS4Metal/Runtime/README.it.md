@@ -1,11 +1,13 @@
+[English](README.md) | **Italiano**
+
 # Runtime
 
 Fondazione Metal sulla quale poggiano loader, grafo e decoder.
 
 ## Struttura
 
-- [`Core/`](Core/README.md): device, libreria, pipeline e `GPUTensor`.
-- [`Generated/`](Generated/README.md): sorgenti kernel incorporate e generate.
+- [`Core/`](Core/README.it.md): device, libreria, pipeline e `GPUTensor`.
+- [`Generated/`](Generated/README.it.md): sorgenti kernel incorporate e generate.
 
 ## Flusso e dipendenze
 

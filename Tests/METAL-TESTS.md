@@ -1,3 +1,5 @@
+**English** | [Italiano](METAL-TESTS.it.md)
+
 # Running Metal Tests
 
 Metal tests compare GPU results with compact CPU-faithful references. They are

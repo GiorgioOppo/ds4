@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model/Quantization
 
 Descrizione dei formati quantizzati accettati dai kernel MoE.
@@ -13,7 +15,7 @@ Descrizione dei formati quantizzati accettati dai kernel MoE.
 Il loader traduce il tipo GGUF in `MoEQuant`; gather, cache e kernel usano lo
 stesso valore per calcolare intervalli gate/up/down e scegliere la pipeline.
 Le conversioni CPU risiedono in
-[`DS4Core/Formats/Quantization`](../../../DS4Core/Formats/Quantization/README.md).
+[`DS4Core/Formats/Quantization`](../../../DS4Core/Formats/Quantization/README.it.md).
 
 ## Regole di modifica
 

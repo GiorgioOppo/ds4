@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 layer reference tests
 
 Device-free suites for the layer/forward oracles: the first-token attention

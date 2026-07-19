@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocollo di conversazione GLM 5.2
 
 Questa directory possiede il framing della chat GLM 5.2 e la sintassi nativa

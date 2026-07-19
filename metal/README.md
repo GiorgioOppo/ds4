@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Metal Kernels
 
 Metal kernel sources (`.metal`) are the **source of truth** for GPU execution.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Runtime/Core
 
 Astrazioni minime sopra Metal e memoria unificata Apple Silicon.

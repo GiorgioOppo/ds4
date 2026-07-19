@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tools
 
 Implements the model's function calling: contracts, built-in tools, shared

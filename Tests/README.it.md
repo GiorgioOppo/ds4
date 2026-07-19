@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test
 
 Test unitari per gli strati del motore in puro Swift. **La correttezza è la
@@ -38,6 +40,6 @@ sviluppatore o il percorso di un GGUF di produzione; questi saltano quando la
 fixture è assente e andrebbero migrati a kernel incorporati o a fixture
 compatte. Uno skip non è un pass e va riportato separatamente.
 
-Vedi [`METAL-TESTS.md`](METAL-TESTS.md) per le convenzioni complete su skip,
+Vedi [`METAL-TESTS.md`](METAL-TESTS.it.md) per le convenzioni complete su skip,
 parità e confronto numerico. Ogni sottodirectory di test ha un README locale
 che ne descrive l'ambito e le regole per le fixture.

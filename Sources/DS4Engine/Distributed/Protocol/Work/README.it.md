@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Work
 
 Definisce i dati della pipeline orizzontale.
@@ -12,7 +14,7 @@ Definisce i dati della pipeline orizzontale.
 
 Il coordinator crea un lavoro per chunk; i worker lo decodificano, verificano
 che shape e slice coincidano con l'assegnazione, eseguono la propria parte e lo
-inoltrano. `ActivationCodec` in [`Codec`](../Codec/README.md) compatta i buffer.
+inoltrano. `ActivationCodec` in [`Codec`](../Codec/README.it.md) compatta i buffer.
 
 ## Estensione
 

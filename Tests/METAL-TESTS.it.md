@@ -1,3 +1,5 @@
+[English](METAL-TESTS.md) | **Italiano**
+
 # Esecuzione dei test Metal
 
 I test Metal confrontano i risultati della GPU con riferimenti compatti fedeli

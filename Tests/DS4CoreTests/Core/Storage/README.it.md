@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dello Storage di Core
 
 `SSDCachePlanTests.swift` verifica la pianificazione deterministica di

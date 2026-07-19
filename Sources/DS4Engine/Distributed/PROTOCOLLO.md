@@ -1,3 +1,5 @@
+**English** | [Italiano](PROTOCOLLO.it.md)
+
 # Distributed protocol v11
 
 ## Frame

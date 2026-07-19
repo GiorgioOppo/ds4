@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Diagnostics Controllers
 
 `DiagnosticsController.swift` converts model path and input text into tokenizer

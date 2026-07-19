@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel MoE
 
 Copertura per il routing e per l'esecuzione degli esperti fusa/non fusa su

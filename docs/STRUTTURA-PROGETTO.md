@@ -1,3 +1,5 @@
+**English** | [Italiano](STRUTTURA-PROGETTO.it.md)
+
 # Project structure
 
 This guide describes where to place new code and which dependencies are

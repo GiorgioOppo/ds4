@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model Backend Tests
 
 Test di configurazione specifici delle architetture. Ogni backend mantiene qui

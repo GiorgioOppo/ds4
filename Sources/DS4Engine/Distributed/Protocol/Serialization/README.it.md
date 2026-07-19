@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Serialization
 
 `Data+LittleEndian.swift` contiene le primitive interne per aggiungere e leggere

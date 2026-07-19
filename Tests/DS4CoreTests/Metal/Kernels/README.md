@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Metal Kernel Tests
 
 Focused parity tests for the kernels embedded by `DS4Metal`. Each test should

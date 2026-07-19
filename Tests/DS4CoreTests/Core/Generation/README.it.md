@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di generazione
 
 `SamplerTests.swift` convalida i controlli di sampling greedy e stocastico,

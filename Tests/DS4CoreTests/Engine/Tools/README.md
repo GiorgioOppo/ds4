@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tool Engine Tests
 
 - `ToolRegistryTests.swift` validates registration, grants, schemas, and

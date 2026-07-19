@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Settings Views
 
 `SettingsView.swift` edits shared model, context, execution, memory, I/O, and

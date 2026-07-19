@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Experts
 
 Defines the frames of the vertical MoE parallelism, extended by protocol v11

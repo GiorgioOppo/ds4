@@ -1,3 +1,5 @@
+[English](ARCHITETTURA-MOTORE.md) | **Italiano**
+
 # Backend DeepSeek V4 — architettura del motore
 
 Questo documento descrive il **backend DeepSeek V4** operativo alla base di
@@ -6,7 +8,7 @@ come i token attraversano il suo grafo di decode Metal, come gli esperti routed
 vengono letti in streaming dall'SSD e come il livello di servizio ritrasforma i
 logits in uno stream di chat. Il rilevamento dell'architettura e le regole
 condivise con i backend futuri sono documentati separatamente in
-[`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.md).
+[`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.it.md).
 
 L'obiettivo del port è la fedeltà comportamentale agli upstream `ds4.c` /
 `ds4_metal.m`, integrandosi al tempo stesso in modo pulito con Swift, SwiftUI,
@@ -14,21 +16,21 @@ gli actor, `Network.framework` e la sandbox di macOS.
 
 Collegamenti incrociati:
 
-- [`DOCUMENTAZIONE.md`](DOCUMENTAZIONE.md) — uso dell'app, pannelli, flussi di
+- [`DOCUMENTAZIONE.md`](DOCUMENTAZIONE.it.md) — uso dell'app, pannelli, flussi di
   lavoro.
-- [`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.md) — rilevamento
+- [`ARCHITETTURE-SUPPORTATE.md`](ARCHITETTURE-SUPPORTATE.it.md) — rilevamento
   della famiglia di modelli, confini dei backend e matrice di supporto corrente.
-- [`PIPELINE-INFERENZA.md`](PIPELINE-INFERENZA.md) — ciclo di vita della
+- [`PIPELINE-INFERENZA.md`](PIPELINE-INFERENZA.it.md) — ciclo di vita della
   richiesta, proprietà dello stato, prefill e decode.
-- [`BACKEND-METAL.md`](BACKEND-METAL.md) — runtime, wrapper, kernel generati e
+- [`BACKEND-METAL.md`](BACKEND-METAL.it.md) — runtime, wrapper, kernel generati e
   regole di validazione numerica.
-- [`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md) — topologie
+- [`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.it.md) — topologie
   orizzontali e verticali e protocollo v11.
-- [`../README.md`](../README.md) — panoramica del repository e comandi di build.
-- [`../README.md#configuration-reference`](../README.md#configuration-reference)
+- [`../README.md`](../README.it.md) — panoramica del repository e comandi di build.
+- [`../README.md#configuration-reference`](../README.it.md#riferimento-di-configurazione)
   — l'elenco autorevole di ogni knob `DS4_*` citato più avanti, con default e
   indicazioni di tuning.
-- [`../Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.md) — demo CLI e
+- [`../Sources/DS4Demo/README.md`](../Sources/DS4Demo/README.it.md) — demo CLI e
   knob di runtime.
 
 ## Indice
@@ -650,7 +652,7 @@ successivo fa anche da punto di join, così solo il round-trip del route resta
 sincrono.
 
 Tutti i knob `DS4_*` di questa sezione sono documentati con i default nella
-[Configuration Reference](../README.md#configuration-reference) alla radice.
+[Configuration Reference](../README.it.md#riferimento-di-configurazione) alla radice.
 
 ### Costruttori
 
@@ -954,7 +956,7 @@ route e azzerano la KV dei worker.
 
 Il flusso operativo completo, il comportamento di ripresa dei file e il
 confronto tra le topologie sono in
-[`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.md).
+[`INFERENZA-DISTRIBUITA.md`](INFERENZA-DISTRIBUITA.it.md).
 
 ## 16. Riferimento incrociato da C a Swift
 

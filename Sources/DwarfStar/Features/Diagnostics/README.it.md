@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Diagnostics
 
 - **`Controllers/DiagnosticsController.swift` / `Views/DiagnosticsView.swift`**

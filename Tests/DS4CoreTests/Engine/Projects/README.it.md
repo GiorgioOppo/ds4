@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dell'engine dei progetti
 
 `ProjectCacheTests.swift` copre l'indicizzazione, le query, le modifiche, i

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Kernels/MoE
 
 Wrapper per il router e per i feed-forward routed/shared del

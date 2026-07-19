@@ -1,3 +1,5 @@
+**English** | [Italiano](FLUSSO-INFERENZA.it.md)
+
 # Local inference flow
 
 ## 1. Initialization

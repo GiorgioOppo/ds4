@@ -1,3 +1,5 @@
+**English** | [Italiano](CONFIGURAZIONE-E-PROFILI.it.md)
+
 # Configuration and execution profiles
 
 This document explains how to read and apply the configuration. The complete

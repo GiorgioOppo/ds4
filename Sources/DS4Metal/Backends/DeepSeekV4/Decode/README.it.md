@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode
 
 Orchestrazione dell'inferenza ricorrente: inizializzazione, prefill, forward di
@@ -5,15 +7,15 @@ un token, gestione KV, output head e diagnostica.
 
 ## Struttura
 
-- [`Execution/`](Execution/README.md): stato del decoder e percorso per-layer.
-- [`Prefill/`](Prefill/README.md): ingestione layer-major di più token.
-- [`Generation/`](Generation/README.md): embedding/output head e generazione.
-- [`State/`](State/README.md): buffer scratch riutilizzabili.
-- [`KV/`](KV/README.md): snapshot e ripristino dello stato ricorrente.
-- [`Attention/`](Attention/README.md): selezione top-k CPU dell'indexer.
-- [`Cache/`](Cache/README.md): cache LRU e statistiche degli expert.
-- [`Diagnostics/`](Diagnostics/README.md): profilo temporale e I/O.
-- [`Reference/`](Reference/README.md): implementazione di riferimento per parità.
+- [`Execution/`](Execution/README.it.md): stato del decoder e percorso per-layer.
+- [`Prefill/`](Prefill/README.it.md): ingestione layer-major di più token.
+- [`Generation/`](Generation/README.it.md): embedding/output head e generazione.
+- [`State/`](State/README.it.md): buffer scratch riutilizzabili.
+- [`KV/`](KV/README.it.md): snapshot e ripristino dello stato ricorrente.
+- [`Attention/`](Attention/README.it.md): selezione top-k CPU dell'indexer.
+- [`Cache/`](Cache/README.it.md): cache LRU e statistiche degli expert.
+- [`Diagnostics/`](Diagnostics/README.it.md): profilo temporale e I/O.
+- [`Reference/`](Reference/README.it.md): implementazione di riferimento per parità.
 
 ## Flusso
 
@@ -24,7 +26,7 @@ FFN -> output head. Gli snapshot permettono di sospendere e riprendere il flusso
 
 Il raw KV è una finestra circolare/lineare limitata a `nSWA`; il contesto più
 vecchio sopravvive nelle righe compresse NSA. Le opzioni runtime sono nella
-[Configuration Reference](../../../../../README.md#configuration-reference).
+[Configuration Reference](../../../../../README.it.md#riferimento-di-configurazione).
 
 ## Regole di modifica
 

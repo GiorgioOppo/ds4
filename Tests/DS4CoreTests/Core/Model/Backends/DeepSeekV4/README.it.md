@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeek V4 Model Tests
 
 Verifica profili Flash/Pro, formule dei compressori, configurazione di un GGUF

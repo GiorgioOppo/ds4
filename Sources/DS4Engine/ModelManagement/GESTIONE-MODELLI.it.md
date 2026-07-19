@@ -1,3 +1,5 @@
+[English](GESTIONE-MODELLI.md) | **Italiano**
+
 # Ciclo di vita dei modelli
 
 ## Download
@@ -73,5 +75,5 @@ provenienti da un repository Hugging Face distinto. Nessun percorso corrente
 carica il componente MTP separato; il self-speculative `DS4_SPEC_K` della demo
 non usa quei pesi.
 
-Vedi [`Download`](Download/README.md) e
-[`Distributed/Files`](../Distributed/Files/README.md).
+Vedi [`Download`](Download/README.it.md) e
+[`Distributed/Files`](../Distributed/Files/README.it.md).

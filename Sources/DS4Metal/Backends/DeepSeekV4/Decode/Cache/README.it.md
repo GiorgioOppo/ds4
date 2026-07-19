@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Cache
 
 Cache residente degli expert MoE e storico della frequenza di routing.

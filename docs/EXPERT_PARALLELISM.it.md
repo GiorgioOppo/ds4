@@ -1,3 +1,5 @@
+[English](EXPERT_PARALLELISM.md) | **Italiano**
+
 # Expert parallelism — scissione verticale del modello
 
 Stato al 16 luglio 2026: **fasi A-C implementate nel protocollo v11**. Sono
@@ -129,8 +131,8 @@ la modalità deve restare opzionale.
 - il protocollo non offre autenticazione o TLS.
 
 Usare soltanto una rete fidata. Per il quadro completo vedere
-[INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md) e
-[CRITTOGRAFIA.md](CRITTOGRAFIA.md).
+[INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.it.md) e
+[CRITTOGRAFIA.md](CRITTOGRAFIA.it.md).
 
 ## Mappa del codice
 

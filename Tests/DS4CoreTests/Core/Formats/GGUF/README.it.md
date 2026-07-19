@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del formato GGUF
 
 `GGUFTests.swift` esercita header GGUF, metadati, array, descrittori di

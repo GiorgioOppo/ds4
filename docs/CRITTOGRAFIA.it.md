@@ -1,3 +1,5 @@
+[English](CRITTOGRAFIA.md) | **Italiano**
+
 # Crittografia e conformità all'esportazione (export compliance) — DwarfStar
 
 Questo documento registra come DwarfStar usa la crittografia, sia ai fini

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Conversation
 
 Tipi portabili per la conversazione e formati di rendering specifici dei
@@ -5,12 +7,12 @@ backend.
 
 ## Contenuto
 
-- [`Models/`](Models/README.md): `ToolSpec`, `ToolCall` e `ChatTurn`.
-- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): template e protocollo
+- [`Models/`](Models/README.it.md): `ToolSpec`, `ToolCall` e `ChatTurn`.
+- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.it.md): template e protocollo
   tool DSML di DeepSeek V4.
-- [`Backends/GLM52/`](Backends/GLM52/README.md): ruoli GLM, reasoning,
+- [`Backends/GLM52/`](Backends/GLM52/README.it.md): ruoli GLM, reasoning,
   tool-call XML piatto e parser incrementale contenuto.
-- [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione documentato,
+- [`Backends/Qwen/`](Backends/Qwen/README.it.md): punto di estensione documentato,
   senza renderer o parser fittizi.
 
 ## Flusso e dipendenze

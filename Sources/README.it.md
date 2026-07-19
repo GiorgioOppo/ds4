@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Sources
 
 L'albero dei sorgenti è organizzato prima per **target Swift**, poi per feature
@@ -169,9 +171,9 @@ DS4Demo/
   estensioni `Type+Responsibility.swift` e tieni i DTO separati da I/O o
   esecuzione.
 
-Vedi [`../docs/STRUTTURA-PROGETTO.md`](../docs/STRUTTURA-PROGETTO.md) per le
+Vedi [`../docs/STRUTTURA-PROGETTO.md`](../docs/STRUTTURA-PROGETTO.it.md) per le
 regole di dipendenza, il flusso di contribuzione e i comandi di build.
-Vedi [`../docs/ARCHITETTURE-SUPPORTATE.md`](../docs/ARCHITETTURE-SUPPORTATE.md)
+Vedi [`../docs/ARCHITETTURE-SUPPORTATE.md`](../docs/ARCHITETTURE-SUPPORTATE.it.md)
 per la matrice di supporto e le checklist per GLM 5.2 e Qwen.
 
 ## Regola della documentazione locale
@@ -180,7 +182,7 @@ Ogni directory in `Sources` ha un `README.md`. Leggi prima il README del
 target, poi il README locale più vicino prima di modificare un tipo. I file
 locali documentano proprietà, dipendenze, file principali e regole di
 estensione/test; il comportamento trasversale appartiene a
-[`../docs/`](../docs/README.md).
+[`../docs/`](../docs/README.it.md).
 
 Tutti i file Markdown collocati accanto ai sorgenti dei target vengono
 individuati ed esclusi dall'helper in `Package.swift`; `project.yml` applica

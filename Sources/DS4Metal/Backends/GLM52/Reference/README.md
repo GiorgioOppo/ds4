@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 layer reference
 
 CPU oracle of one full GLM layer and of the first-token forward chain, the

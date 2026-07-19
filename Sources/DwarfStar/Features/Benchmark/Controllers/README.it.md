@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Controller dei benchmark
 
 `BenchController.swift` possiede il tipo di benchmark, gli input, il ciclo di

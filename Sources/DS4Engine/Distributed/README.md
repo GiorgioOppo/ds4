@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Distributed
 
 Implements inference across multiple Macs with two strategies:

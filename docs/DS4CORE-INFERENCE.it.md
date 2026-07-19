@@ -1,3 +1,5 @@
+[English](DS4CORE-INFERENCE.md) | **Italiano**
+
 # Componenti di DS4Core rivolti all'inferenza
 
 Componenti puramente rivolti all'inferenza che non toccano la GPU. I contratti
@@ -34,9 +36,9 @@ portabili sono tenuti separati dal frontend di ciascun backend di modello.
 
 I parametri di sampling esposti all'utente (temperatura, penalità di
 ripetizione, il top-k fisso) sono documentati nel
-[Riferimento di configurazione](../README.md#configuration-reference) alla
+[Riferimento di configurazione](../README.it.md#riferimento-di-configurazione) alla
 radice del repository.
 
 Per il ciclo di vita end-to-end vedere
-[PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md); per l'ownership delle cartelle
-leggere [`Sources/DS4Core/README.md`](../Sources/DS4Core/README.md).
+[PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.it.md); per l'ownership delle cartelle
+leggere [`Sources/DS4Core/README.md`](../Sources/DS4Core/README.it.md).

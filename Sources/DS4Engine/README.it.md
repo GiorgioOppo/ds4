@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DS4Engine
 
 `DS4Engine` è lo strato applicativo fra i dati portabili di `DS4Core`, il
@@ -19,15 +21,15 @@ DS4Metal ─┘
 
 ## Cartelle
 
-- [`Runtime`](Runtime/README.md): ispezione GGUF, selezione del backend e
+- [`Runtime`](Runtime/README.it.md): ispezione GGUF, selezione del backend e
   capability effettivamente esposte a servizi e GUI.
-- [`Inference`](Inference/README.md): API e actor che possiede il decoder.
-- [`Distributed`](Distributed/README.md): protocollo, trasporto, coordinator e worker.
-- [`Tools`](Tools/README.md): function calling, strumenti integrati e MCP.
-- [`Persistence`](Persistence/README.md): checkpoint e cache persistenti.
-- [`ModelManagement`](ModelManagement/README.md): download e sidecar del modello.
-- [`Projects`](Projects/README.md): indice sicuro dei progetti importati.
-- [`Agents`](Agents/README.md): profili e registro degli agenti.
+- [`Inference`](Inference/README.it.md): API e actor che possiede il decoder.
+- [`Distributed`](Distributed/README.it.md): protocollo, trasporto, coordinator e worker.
+- [`Tools`](Tools/README.it.md): function calling, strumenti integrati e MCP.
+- [`Persistence`](Persistence/README.it.md): checkpoint e cache persistenti.
+- [`ModelManagement`](ModelManagement/README.it.md): download e sidecar del modello.
+- [`Projects`](Projects/README.it.md): indice sicuro dei progetti importati.
+- [`Agents`](Agents/README.it.md): profili e registro degli agenti.
 
 ## Regole architetturali
 

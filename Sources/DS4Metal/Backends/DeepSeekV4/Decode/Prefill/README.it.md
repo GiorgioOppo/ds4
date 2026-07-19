@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Prefill
 
 Ingestione efficiente del prompt con elaborazione layer-major e batching.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend Qwen
 
 Stato: famiglia GGUF riconosciuta, backend non ancora implementato.

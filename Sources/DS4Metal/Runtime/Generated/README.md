@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Runtime/Generated
 
 Generated artifacts required to ship the app without external Metal sources.

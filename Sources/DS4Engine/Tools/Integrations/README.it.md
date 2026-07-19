@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tools/Integrations
 
 Contiene implementazioni con side effect riusate dai built-in.
@@ -12,7 +14,7 @@ Contiene implementazioni con side effect riusate dai built-in.
 
 ## Flusso e dipendenze
 
-I built-in in [`Web`](../Builtins/Web/README.md) e `Git.swift` traducono JSON in
+I built-in in [`Web`](../Builtins/Web/README.it.md) e `Git.swift` traducono JSON in
 chiamate a queste integrazioni. Le integrazioni restituiscono dati o errori e non
 formattano il prompt del modello.
 

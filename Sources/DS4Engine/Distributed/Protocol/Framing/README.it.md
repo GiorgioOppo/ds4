@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Framing
 
 `DistFrameHeader.swift` definisce l'involucro di ogni messaggio: magic, tipo e
@@ -5,9 +7,9 @@ numero di byte del payload.
 
 ## Flusso e dipendenze
 
-[`Transport`](../../Transport/README.md) legge prima l'header, valida magic e
+[`Transport`](../../Transport/README.it.md) legge prima l'header, valida magic e
 tipo e poi richiede esattamente la lunghezza dichiarata. La serializzazione usa
-le primitive di [`Serialization`](../Serialization/README.md).
+le primitive di [`Serialization`](../Serialization/README.it.md).
 
 ## Estensione
 

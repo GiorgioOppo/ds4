@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Worker/Serving
 
 È il dispatcher principale dei frame ricevuti da una connessione coordinator.
@@ -11,8 +13,8 @@ restituisce il risultato al return listener.
 
 ## Dipendenze
 
-Compone tutte le aree del worker e usa [`Transport`](../../Transport/README.md)
-e [`Protocol`](../../Protocol/README.md). Non implementa codec wire propri.
+Compone tutte le aree del worker e usa [`Transport`](../../Transport/README.it.md)
+e [`Protocol`](../../Protocol/README.it.md). Non implementa codec wire propri.
 
 ## Estensione
 

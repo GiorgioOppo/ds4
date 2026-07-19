@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/State
 
 Buffer temporanei riutilizzati lungo il forward per evitare allocazioni per token.

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Compression Kernel Tests
 
 Tests for compressor projections and Hyper-Connection split/reduce primitives:

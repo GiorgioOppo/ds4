@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di esecuzione dei layer GLM 5.2
 
 Suite GPU-contro-oracolo per la composizione dei layer: layer densi e sparsi

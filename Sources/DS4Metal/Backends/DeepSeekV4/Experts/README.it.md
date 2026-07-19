@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Experts
 
 Formato sidecar e percorsi I/O ottimizzati per gli expert routed, i pesi più

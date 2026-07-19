@@ -1,11 +1,13 @@
+[English](README.md) | **Italiano**
+
 # Script
 
 Script di build e di analisi.
 
 La metodologia delle prestazioni e la precedenza della configurazione sono
 documentate in
-[`docs/VALUTAZIONE-DEMO-PERF.md`](../docs/VALUTAZIONE-DEMO-PERF.md) e
-[`docs/CONFIGURAZIONE-E-PROFILI.md`](../docs/CONFIGURAZIONE-E-PROFILI.md).
+[`docs/VALUTAZIONE-DEMO-PERF.md`](../docs/VALUTAZIONE-DEMO-PERF.it.md) e
+[`docs/CONFIGURAZIONE-E-PROFILI.md`](../docs/CONFIGURAZIONE-E-PROFILI.it.md).
 
 - **`embed_kernels.sh`** rigenera
   `Sources/DS4Metal/Runtime/Generated/KernelSources.swift` da `metal/*.metal`,
@@ -49,9 +51,9 @@ documentate in
   `final-env.sh`. Il profilo standard regola i knob sicuri di decode/I/O; i
   knob di prefill richiedono un prompt separato di almeno 1024–2048 token.
   Esclude deliberatamente la quantizzazione e le modifiche a esperti ridotti.
-  Vedi [`docs/AUTOTUNING-METAL.md`](../docs/AUTOTUNING-METAL.md). Esegui i test
+  Vedi [`docs/AUTOTUNING-METAL.md`](../docs/AUTOTUNING-METAL.it.md). Esegui i test
   senza modello con `python3 scripts/metal_autotune.py --self-test`.
 - **`gguf_spectrum.py`** e **`gguf_to_graph.py`** sono strumenti di analisi
   della compressione GGUF (ispezione dello spettro dei valori singolari ed
   esportazione del grafo fattorizzato). Vedi
-  [`README-analisi.md`](README-analisi.md).
+  [`README-analisi.md`](README-analisi.it.md).

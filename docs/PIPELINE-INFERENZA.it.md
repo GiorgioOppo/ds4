@@ -1,9 +1,11 @@
+[English](PIPELINE-INFERENZA.md) | **Italiano**
+
 # Pipeline di inferenza
 
 Questo documento segue una richiesta dalla GUI o dall'API fino al token
 mostrato all'utente. Per i dettagli matematici dei singoli layer vedere
-[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); per la collocazione dei file
-vedere [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md).
+[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.it.md); per la collocazione dei file
+vedere [STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.it.md).
 
 ## Vista d'insieme
 
@@ -47,7 +49,7 @@ della cache Q4 e dello scratch GPU, requisito essenziale sui Mac con 16 GB.
 I toggle che cambiano layout o residenza dei pesi vengono letti al caricamento:
 dopo una modifica occorre ricaricare il modello. Le eccezioni aggiornabili tra
 due prefill sono documentate nella
-[Configuration Reference](../README.md#configuration-reference).
+[Configuration Reference](../README.it.md#riferimento-di-configurazione).
 
 ## 2. Preparazione della conversazione
 
@@ -184,4 +186,4 @@ Una modifica alla pipeline richiede, in proporzione al livello toccato:
 4. confronto di prompt, seed e configurazione identici;
 5. misura separata di prefill e decode, dopo il warm-up.
 
-La procedura completa è in [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md).
+La procedura completa è in [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.it.md).

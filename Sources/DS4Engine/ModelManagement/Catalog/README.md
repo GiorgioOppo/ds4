@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # ModelManagement/Catalog
 
 Contains the typed cross-family catalog used by the GUI. The three complete

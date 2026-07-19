@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Concorrenza del Server
 
 `RequestGate.swift` è un mutex FIFO consapevole della cancellazione che

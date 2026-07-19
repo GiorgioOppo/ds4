@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Qwen backend
 
 Placeholder for future Qwen support. The family is recognized in the project

@@ -1,3 +1,5 @@
+**English** | [Italiano](ARCHITETTURE-SUPPORTATE.it.md)
+
 # Supported model architectures
 
 This document defines the boundary between the shared parts of DwarfStar and

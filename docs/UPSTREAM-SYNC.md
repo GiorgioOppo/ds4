@@ -1,3 +1,5 @@
+**English** | [Italiano](UPSTREAM-SYNC.it.md)
+
 # Upstream Sync (`antirez/ds4`)
 
 DwarfStar's engine is a **pure-Swift rewrite** of the upstream C project

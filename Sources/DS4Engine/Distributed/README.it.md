@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed
 
 Implementa inferenza su più Mac con due strategie:
@@ -16,15 +18,15 @@ solo scaricabili finché non esisterà un loader multi-shard.
 
 ## Struttura
 
-- [`Protocol`](Protocol/README.md): framing e messaggi serializzabili.
-- [`Transport`](Transport/README.md): connessioni TCP basate su Network.framework.
-- [`Coordinator`](Coordinator/README.md): topologia, chat, KV e distribuzione file.
-- [`Worker`](Worker/README.md): listener, assegnazioni ed esecuzione richieste.
-- [`Execution`](Execution/README.md): adattatori del decoder per slice e shard.
-- [`Files`](Files/README.md): hash, manifest e archivio locale dei modelli.
+- [`Protocol`](Protocol/README.it.md): framing e messaggi serializzabili.
+- [`Transport`](Transport/README.it.md): connessioni TCP basate su Network.framework.
+- [`Coordinator`](Coordinator/README.it.md): topologia, chat, KV e distribuzione file.
+- [`Worker`](Worker/README.it.md): listener, assegnazioni ed esecuzione richieste.
+- [`Execution`](Execution/README.it.md): adattatori del decoder per slice e shard.
+- [`Files`](Files/README.it.md): hash, manifest e archivio locale dei modelli.
 
 Il formato e le sequenze wire sono descritti in
-[`PROTOCOLLO.md`](PROTOCOLLO.md).
+[`PROTOCOLLO.md`](PROTOCOLLO.it.md).
 
 ## Flusso sintetico
 

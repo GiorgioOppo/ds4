@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Worker/Assignments
 
 Loads and publishes the responsibilities assigned to the worker.

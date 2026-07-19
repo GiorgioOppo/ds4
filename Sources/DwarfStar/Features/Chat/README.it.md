@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Chat
 
 View model e UI della chat.
@@ -18,7 +20,7 @@ View model e UI della chat.
   manopole di sampling e prefill (`DS4Temperature`, `DS4RepPenalty`,
   `DS4PrefillUnion`, `DS4PrefillChunk`); tutte le chiavi e i valori
   predefiniti sono elencati nel
-  [Riferimento di Configurazione](../../../../README.md#configuration-reference)
+  [Riferimento di Configurazione](../../../../README.it.md#riferimento-di-configurazione)
   alla radice.
 - **`Persistence/ChatSession.swift`** definisce il modello di chat `Codable`,
   inclusi i metadati e le voci di trascrizione come `StoredMessage`.
@@ -79,6 +81,6 @@ di sessione in `Persistence`, lo stato UI mutabile in `ViewModels` e tutto il
 rendering in `Views`. I tipi condivisi dell'engine restano in `DS4Engine` o
 `DS4Core` invece di spostarsi nella feature GUI.
 
-Vedi [`FLOW.md`](FLOW.md) per il ciclo di vita end-to-end di messaggi, tool,
+Vedi [`FLOW.md`](FLOW.it.md) per il ciclo di vita end-to-end di messaggi, tool,
 sessioni ed engine condiviso. Ogni directory figlia ha le proprie regole di
 proprietà e modifica in un README locale.

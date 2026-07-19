@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/MTP (Multi-Token Prediction)
 
 Componenti per lo speculative decode con la testa MTP di DeepSeek. Il sidecar

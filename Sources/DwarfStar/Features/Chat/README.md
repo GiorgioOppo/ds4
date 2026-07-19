@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar/Features/Chat
 
 Chat view model and UI.

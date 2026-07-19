@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # ModelManagement/Download
 
 Implements native, resumable GGUF downloads, without `curl` or external

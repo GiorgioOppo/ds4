@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Comando DS4Demo
 
 `main.swift` è il punto di ingresso della CLI. Analizza gli argomenti

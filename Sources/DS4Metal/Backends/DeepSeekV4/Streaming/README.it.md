@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Streaming
 
 Streaming dei pesi densi per-layer da SSD tramite ring di staging, con cache

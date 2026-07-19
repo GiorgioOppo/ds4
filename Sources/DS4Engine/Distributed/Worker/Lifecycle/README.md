@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Worker/Lifecycle
 
 Owns the listener's lifecycle and the worker's session state.

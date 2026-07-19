@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Networking del server
 
 Questa directory implementa i dettagli di trasporto HTTP indipendenti dal

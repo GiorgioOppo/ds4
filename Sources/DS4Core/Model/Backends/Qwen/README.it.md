@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model/Backends/Qwen
 
 Punto di estensione riservato alla futura configurazione Qwen.

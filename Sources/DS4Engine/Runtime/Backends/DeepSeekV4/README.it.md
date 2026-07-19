@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend DeepSeek V4
 
 Registra il backend già operativo: generazione locale, reasoning e DSML tools,

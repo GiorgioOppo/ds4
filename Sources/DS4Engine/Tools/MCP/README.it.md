@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tools/MCP
 
 Collega server Model Context Protocol e presenta i loro strumenti accanto ai
@@ -21,7 +23,7 @@ instrada la call al client corretto e converte il risultato in testo.
 
 ## Dipendenze e ciclo di vita
 
-Dipende da Foundation e `DS4Core`; è consumato da [`Core`](../Core/README.md).
+Dipende da Foundation e `DS4Core`; è consumato da [`Core`](../Core/README.it.md).
 Timeout e cancellazione devono risolvere immediatamente la richiesta pendente.
 I change handler notificano i consumer quando cambia la lista dichiarabile.
 

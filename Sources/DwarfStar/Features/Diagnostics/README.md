@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar/Features/Diagnostics
 
 - **`Controllers/DiagnosticsController.swift` / `Views/DiagnosticsView.swift`** dump tokens and

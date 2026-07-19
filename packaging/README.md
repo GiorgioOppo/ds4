@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Packaging
 
 Files and scripts for assembling and signing the macOS `.app` bundle.

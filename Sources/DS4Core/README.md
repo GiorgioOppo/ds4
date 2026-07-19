@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DS4Core
 
 Portable foundation of the project, written in Swift and free of Metal

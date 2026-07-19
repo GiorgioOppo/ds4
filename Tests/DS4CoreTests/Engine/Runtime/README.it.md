@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test Runtime multi-backend
 
 Questi test esercitano il confine di selezione senza caricare un modello reale:

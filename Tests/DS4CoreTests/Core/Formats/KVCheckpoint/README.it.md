@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei checkpoint KV
 
 `KVCFileTests.swift` copre gli header dei checkpoint, i metadati, i payload

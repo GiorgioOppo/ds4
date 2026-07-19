@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar Shared
 
 Qui risiede il supporto applicativo trasversale alle feature. Il codice in

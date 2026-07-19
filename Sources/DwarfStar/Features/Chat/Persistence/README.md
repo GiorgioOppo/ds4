@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Chat Persistence
 
 This directory owns the on-disk representation of app conversations.

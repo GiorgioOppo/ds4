@@ -1,3 +1,5 @@
+**English** | [Italiano](CRITTOGRAFIA.it.md)
+
 # Encryption and Export Compliance — DwarfStar
 
 This document records how DwarfStar uses cryptography, both for Apple export

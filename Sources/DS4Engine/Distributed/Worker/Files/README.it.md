@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Worker/Files
 
 Riceve file grandi in modo incrementale e riprendibile.
@@ -11,8 +13,8 @@ Una disconnessione sospende il file senza cancellare il prefisso valido.
 
 ## Dipendenze
 
-Usa CryptoKit, [`Distributed/Files`](../../Files/README.md) e i messaggi in
-[`Protocol/Files`](../../Protocol/Files/README.md).
+Usa CryptoKit, [`Distributed/Files`](../../Files/README.it.md) e i messaggi in
+[`Protocol/Files`](../../Protocol/Files/README.it.md).
 
 ## Estensione
 

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Kernels/Dense
 
 Wrapper delle moltiplicazioni dense usate da proiezioni, output head e prefill.

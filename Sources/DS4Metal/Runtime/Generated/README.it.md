@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Runtime/Generated
 
 Artefatti generati necessari per distribuire l'app senza sorgenti Metal esterne.

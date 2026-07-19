@@ -1,3 +1,5 @@
+**English** | [Italiano](VALUTAZIONE-DEMO-PERF.it.md)
+
 # Demo performance evaluation (DS4Demo)
 
 > **Historical benchmark log, not a reference for defaults.** The measurements

@@ -1,3 +1,5 @@
+[English](FLUSSO-INFERENZA.md) | **Italiano**
+
 # Flusso dell'inferenza locale
 
 ## 1. Inizializzazione
@@ -43,5 +45,5 @@ cancellazioni o errori marcano invece la cache come sporca.
 - Benchmark e sub-agent ripristinano o invalidano esplicitamente lo stato della
   conversazione principale.
 
-Vedi anche [`Service`](Service/README.md), [`Persistence/KV`](../Persistence/KV/README.md)
-e [`Tools`](../Tools/README.md).
+Vedi anche [`Service`](Service/README.it.md), [`Persistence/KV`](../Persistence/KV/README.it.md)
+e [`Tools`](../Tools/README.it.md).

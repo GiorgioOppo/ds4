@@ -1,9 +1,11 @@
+[English](README.md) | **Italiano**
+
 # Kernel Metal
 
 Le sorgenti dei kernel Metal (`.metal`) sono la **fonte di verità** per
 l'esecuzione su GPU. Il flusso di lavoro completo runtime/wrapper e la politica
 di validazione numerica sono in
-[`docs/BACKEND-METAL.md`](../docs/BACKEND-METAL.md).
+[`docs/BACKEND-METAL.md`](../docs/BACKEND-METAL.it.md).
 Vengono incorporate nel binario tramite:
 
 ```sh
@@ -51,7 +53,7 @@ File principali per peso a runtime:
    la firma del kernel cambia.
 4. Mantieni l'ordine dei file sincronizzato con `MetalRuntime.kernelFiles`.
 5. Esegui i test dei kernel e dei grafi descritti in
-   [`Tests/METAL-TESTS.md`](../Tests/METAL-TESTS.md).
+   [`Tests/METAL-TESTS.md`](../Tests/METAL-TESTS.it.md).
 
 ## Stato dell'audit dei kernel (revisionato il 2026-07-13)
 

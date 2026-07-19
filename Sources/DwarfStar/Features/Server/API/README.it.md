@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Adapter API del Server
 
 Adapter specifici per endpoint traducono il JSON HTTP in richieste per

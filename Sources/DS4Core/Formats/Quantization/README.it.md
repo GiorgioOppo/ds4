@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Formats/Quantization
 
 Primitive CPU portabili per conversione e requantizzazione dei pesi.

@@ -1,3 +1,5 @@
+**English** | [Italiano](INFERENZA-DISTRIBUITA.it.md)
+
 # Distributed inference
 
 DwarfStar supports two distinct topologies over the same native TCP protocol:

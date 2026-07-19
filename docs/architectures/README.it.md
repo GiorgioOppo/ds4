@@ -1,8 +1,10 @@
+[English](README.md) | **Italiano**
+
 # Backend di architettura
 
 Questa cartella contiene la documentazione che cambia in funzione della
 famiglia di modello. Le regole comuni e la matrice dello stato sono in
-[`../ARCHITETTURE-SUPPORTATE.md`](../ARCHITETTURE-SUPPORTATE.md).
+[`../ARCHITETTURE-SUPPORTATE.md`](../ARCHITETTURE-SUPPORTATE.it.md).
 
 Ogni sottocartella deve dichiarare:
 
@@ -19,9 +21,9 @@ famiglia.
 
 ## Famiglie documentate
 
-- [`deepseek-v4/`](deepseek-v4/README.md): backend locale operativo per Flash
+- [`deepseek-v4/`](deepseek-v4/README.it.md): backend locale operativo per Flash
   e Pro Q2 singolo; Pro Q4 split resta download-only.
-- [`qwen/`](qwen/README.md): architettura riconosciuta, backend ancora in
+- [`qwen/`](qwen/README.it.md): architettura riconosciuta, backend ancora in
   preparazione.
-- [`glm-5.2/`](glm-5.2/README.md): manifest, contratto GGUF e port progressivo;
+- [`glm-5.2/`](glm-5.2/README.it.md): manifest, contratto GGUF e port progressivo;
   detector/frontend disponibili, decoder ancora non eseguibile.

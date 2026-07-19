@@ -1,3 +1,5 @@
+**English** | [Italiano](STRUMENTI-AGENTI-MCP.it.md)
+
 # Tools, agents, and MCP
 
 The tool system lets the model request structured operations without embedding

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Core
 
 `Dist.swift` è la fonte autorevole del contratto globale: magic, versione wire,
@@ -12,6 +14,6 @@ usano i valori senza ridefinirli. Dipende da Foundation e dalle utility di
 ## Estensione
 
 Assegnare valori numerici stabili ai nuovi `MsgType`, documentare la semantica
-in [`../../PROTOCOLLO.md`](../../PROTOCOLLO.md) e incrementare
+in [`../../PROTOCOLLO.md`](../../PROTOCOLLO.it.md) e incrementare
 `protocolVersion` se un nodo precedente non può interpretare correttamente il
 nuovo flusso. I limiti per collezioni provenienti dalla rete sono obbligatori.

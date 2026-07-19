@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/Benchmark
 
 Misura il backend già caricato senza dipendere dalla GUI.
@@ -63,7 +65,7 @@ con contesto fisso. Le percentuali mostrate dalla UI sono ciascuna
 
 ## Flusso e dipendenze
 
-L'estensione opera sull'actor di [`Service`](../Service/README.md) e usa sampler
+L'estensione opera sull'actor di [`Service`](../Service/README.it.md) e usa sampler
 e decoder di `DS4Core`/`DS4Metal`. Entrambe le misure alterano la KV e la marcano
 sporca. Il benchmark di correttezza non modifica `committedIds`, system prompt o
 stato logico della conversazione: il turno reale successivo ricostruisce la KV.

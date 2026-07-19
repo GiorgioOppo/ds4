@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di Core
 
 Test deterministici per il modulo indipendente dalla piattaforma `DS4Core`. Le

@@ -1,3 +1,5 @@
+**English** | [Italiano](GUI-SERVER-E-API.it.md)
+
 # GUI, local server, and API
 
 The SwiftUI GUI and the HTTP server are two entry points into the same engine.

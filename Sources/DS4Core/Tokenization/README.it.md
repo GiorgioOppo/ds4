@@ -1,22 +1,24 @@
+[English](README.md) | **Italiano**
+
 # Tokenization
 
 Contratto comune e implementazioni di tokenizzazione specifiche dei backend.
 
 ## Struttura
 
-- [`API/`](API/README.md): superficie minima `TokenizerProtocol`.
-- [`Common/`](Common/README.md): primitive byte-level riutilizzabili.
-- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md): BPE JoyAI/DeepSeek,
+- [`API/`](API/README.it.md): superficie minima `TokenizerProtocol`.
+- [`Common/`](Common/README.it.md): primitive byte-level riutilizzabili.
+- [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.it.md): BPE JoyAI/DeepSeek,
   token speciali e reasoning; conserva l'alias storico `Tokenizer`.
-- [`Backends/GLM52/`](Backends/GLM52/README.md): GPT-2 byte-level BPE,
+- [`Backends/GLM52/`](Backends/GLM52/README.it.md): GPT-2 byte-level BPE,
   pretokenizer `glm4`, controlli GLM e stop policy.
-- [`Backends/Qwen/`](Backends/Qwen/README.md): punto di estensione, senza
+- [`Backends/Qwen/`](Backends/Qwen/README.it.md): punto di estensione, senza
   implementazione fittizia.
 
 ## Flusso
 
 I tokenizer concreti leggono le tabelle tramite
-[`GGUFModel`](../Formats/GGUF/README.md).
+[`GGUFModel`](../Formats/GGUF/README.it.md).
 Il testo semplice attraversa pre-tokenizzazione e merge BPE; una chat già resa
 riconosce prima i token speciali indicizzati per byte iniziale. Gli id generati
 alimentano prefill e decode; gli id in uscita vengono ricomposti in byte/testo.

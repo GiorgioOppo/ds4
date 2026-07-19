@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dell'Engine di gestione modelli
 
 - `HFTokenStoreTests.swift` verifica il comportamento di memorizzazione dei

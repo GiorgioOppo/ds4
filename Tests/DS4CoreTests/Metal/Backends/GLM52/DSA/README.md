@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM compact DSA tests
 
 Pure CPU tests cover compact-cache bytes, lazy slab growth, the 21-layer

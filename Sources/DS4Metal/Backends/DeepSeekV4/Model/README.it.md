@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Model
 
 Caricamento dei pesi DeepSeek V4 dal GGUF verso GPUTensor: primitive per-tensore

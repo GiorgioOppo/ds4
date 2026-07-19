@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Formats
 
 Formati binari e conversioni numeriche condivisi dal caricamento e dalla
@@ -5,9 +7,9 @@ persistenza del modello.
 
 ## Struttura
 
-- [`GGUF/`](GGUF/README.md): parser mmap del file modello e dei metadati.
-- [`KVCheckpoint/`](KVCheckpoint/README.md): formato persistente della KV cache.
-- [`Quantization/`](Quantization/README.md): f16/f32 e Q8_0 -> Q4_K su CPU.
+- [`GGUF/`](GGUF/README.it.md): parser mmap del file modello e dei metadati.
+- [`KVCheckpoint/`](KVCheckpoint/README.it.md): formato persistente della KV cache.
+- [`Quantization/`](Quantization/README.it.md): f16/f32 e Q8_0 -> Q4_K su CPU.
 
 ## Flusso e dipendenze
 

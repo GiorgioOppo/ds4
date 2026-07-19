@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Graph/Operations
 
 Operazioni del grafo raggruppate per fase matematica del modello.
@@ -17,7 +19,7 @@ Operazioni del grafo raggruppate per fase matematica del modello.
 Le operazioni sono estensioni di `GraphContext`: ricevono tensori già dimensionati,
 selezionano pipeline e quantizzazione, codificano i kernel e restituiscono il
 tensor/stato per la fase seguente. Il percorso esatto è orchestrato da
-[`Backends/DeepSeekV4/Decode/Execution`](../../Backends/DeepSeekV4/Decode/Execution/README.md).
+[`Backends/DeepSeekV4/Decode/Execution`](../../Backends/DeepSeekV4/Decode/Execution/README.it.md).
 
 ## Attention decode: raw ring e split-K
 

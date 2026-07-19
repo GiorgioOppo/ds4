@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Kernels/Tensor
 
 Wrapper delle operazioni tensor generiche riutilizzate dal grafo.

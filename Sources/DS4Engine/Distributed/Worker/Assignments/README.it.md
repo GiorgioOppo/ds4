@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Worker/Assignments
 
 Carica e pubblica le responsabilità assegnate al worker.
@@ -13,8 +15,8 @@ Carica e pubblica le responsabilità assegnate al worker.
 L'handler valida il payload, risolve i file trasferiti, applica solo knob
 whitelisted e costruisce il motore fuori dal lock. Lo stato precedente resta
 utilizzabile fino al commit atomico del nuovo motore; al termine viene inviato
-`READY`. Dipende da [`Execution`](../../Execution/README.md) e
-[`Protocol/Handshake`](../../Protocol/Handshake/README.md).
+`READY`. Dipende da [`Execution`](../../Execution/README.it.md) e
+[`Protocol/Handshake`](../../Protocol/Handshake/README.it.md).
 
 ## Estensione
 

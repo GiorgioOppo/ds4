@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Model Management Engine Tests
 
 - `HFTokenStoreTests.swift` checks token storage behavior without exposing a

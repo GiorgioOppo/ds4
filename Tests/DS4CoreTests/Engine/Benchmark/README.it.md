@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del benchmark di accuratezza
 
 Questi test validano il contratto di aggregazione puro usato dal benchmark di

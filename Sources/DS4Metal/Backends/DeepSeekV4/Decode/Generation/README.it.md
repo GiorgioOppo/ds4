@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Generation
 
 Operazioni che trasformano token in input del decoder e stato finale in logits.
@@ -12,7 +14,7 @@ Operazioni che trasformano token in input del decoder e stato finale in logits.
 
 L'id del token seleziona la riga di embedding; il risultato entra nel forward.
 All'ultimo layer, output norm e matrice di output producono logits leggibili dal
-[`Sampler`](../../../../../DS4Core/Generation/README.md). Il ciclo e le policy di stop
+[`Sampler`](../../../../../DS4Core/Generation/README.it.md). Il ciclo e le policy di stop
 sono orchestrati da `DS4Engine`.
 
 ## Regole di modifica

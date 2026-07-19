@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 model contract
 
 This directory owns the portable GLM 5.2 model geometry and GGUF metadata

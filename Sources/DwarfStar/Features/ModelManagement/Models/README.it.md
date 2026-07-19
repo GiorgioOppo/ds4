@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model Management Models
 
 `ModelCatalog.swift` definisce il record leggero `DiscoveredModel` e lo scanner

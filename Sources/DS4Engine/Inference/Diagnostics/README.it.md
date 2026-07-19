@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/Diagnostics
 
 Fornisce diagnostica read-only sul GGUF senza avviare il decoder Metal.
@@ -19,4 +21,4 @@ log o test; nessuno stato del servizio viene modificato.
 ## Estensione
 
 Preferire controlli deterministici e senza side effect. Una diagnosi che misura
-la GPU appartiene a [`Benchmark`](../Benchmark/README.md), non qui.
+la GPU appartiene a [`Benchmark`](../Benchmark/README.it.md), non qui.

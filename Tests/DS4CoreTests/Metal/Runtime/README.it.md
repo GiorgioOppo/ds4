@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del runtime Metal
 
 `MetalRuntimeTests.swift` verifica la scoperta del device, la compilazione

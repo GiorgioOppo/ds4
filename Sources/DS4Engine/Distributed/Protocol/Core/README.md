@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Core
 
 `Dist.swift` is the authoritative source of the global contract: magic, wire

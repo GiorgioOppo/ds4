@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Projects
 
 `ProjectCache` indicizza un progetto importato separatamente dalla memoria della
@@ -14,14 +16,14 @@ e `file_*`.
 - `+Files`: accesso raw, range di linee e operazioni confinate.
 
 Le invarianti di sicurezza sono in
-[`SICUREZZA-PERCORSI.md`](SICUREZZA-PERCORSI.md).
+[`SICUREZZA-PERCORSI.md`](SICUREZZA-PERCORSI.it.md).
 
 ## Flusso e dipendenze
 
 L'import registra percorsi relativi testuali entro limiti di quantità e
 dimensione. I contenuti sono caricati pigramente sotto un budget LRU-like; una
 ricerca su file freddi non deve espellere inutilmente la cache. I built-in in
-[`Tools/Builtins/Projects`](../Tools/Builtins/Projects/README.md) sono il
+[`Tools/Builtins/Projects`](../Tools/Builtins/Projects/README.it.md) sono il
 principale consumer.
 
 ## Estensione

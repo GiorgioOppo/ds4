@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test della diagnostica dell'engine
 
 `DiagnosticsTests.swift` valida i report diagnostici e la trasformazione dei

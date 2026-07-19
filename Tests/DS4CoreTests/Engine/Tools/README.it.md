@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del motore dei tool
 
 - `ToolRegistryTests.swift` valida registrazione, concessioni, schemi e

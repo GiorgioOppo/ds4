@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dello schema dei tensori GLM 5.2
 
 Record sintetici della directory dei tensori esercitano tutti i confini dei

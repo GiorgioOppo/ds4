@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 layer execution tests
 
 GPU-vs-oracle suites for the layer composition: dense and sparse first-token

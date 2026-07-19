@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Viste delle Impostazioni
 
 `SettingsView.swift` modifica la configurazione condivisa di modello,

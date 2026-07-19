@@ -1,3 +1,5 @@
+**English** | [Italiano](SICUREZZA.it.md)
+
 # Tool security
 
 Tool arguments are produced by the model and may derive from untrusted

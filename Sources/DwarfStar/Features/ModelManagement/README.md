@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar/Features/ModelManagement
 
 Selection and native download of the GGUFs supported by the GUI.

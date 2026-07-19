@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Formats/KVCheckpoint
 
 Formato su disco per salvare e riutilizzare lo stato KV del decoder.

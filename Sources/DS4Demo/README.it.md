@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DS4Demo
 
 `DS4Demo` è un eseguibile CLI di demo e diagnostica per l'engine in puro Swift
@@ -99,7 +101,7 @@ storage/scheduling, può alterare l'ordine di accumulazione oppure è
 deliberatamente lossy. Non dedurre l'equivalenza numerica dal solo fatto che
 una manopola è orientata alle prestazioni. Le stesse manopole sono documentate
 dal punto di vista dell'app nella sezione
-[Configuration Reference](../../README.md#configuration-reference) del README
+[Configuration Reference](../../README.it.md#riferimento-di-configurazione) del README
 principale.
 
 | Variabile | Valori | Default | Effetto |
@@ -150,7 +152,7 @@ principale.
 | `DS4_DENSE_Q4` | `=1` (richiede `DS4_DENSE_STREAM=1`) | off | **LOSSY.** Riquantizza le tre proiezioni giganti dell'attention (`q_b`, `output_a`, `output_b` — Q8_0, 107 di ~145 MB/layer) in Q4_K al caricamento e le mantiene RESIDENTI (~1.4 GB, bloccati con `DS4_MLOCK`): metà dei loro byte, letture a velocità RAM, ~4.6 GB/token rimossi dallo stream SSD — la maggiore riduzione di byte disponibile una volta che il decode è disk-bound. Usa i kernel matvec Q4_K già validati (matvec denso = kernel MoE a id con k=1; l'`output_a` raggruppato = k=8 con righe di attivazione per gruppo). Qualità: deriva dei logit ~0.02%, gli output greedy occasionalmente divergono ma restano coerenti. Il PRIMO caricamento paga un passaggio di requant parallelo e scrive una cache accanto al modello (`<gguf>.q4dense`, ~1.4 GB per questo trio base); le opzioni QKV/shared aggiungono record e ne aumentano la dimensione. I caricamenti successivi riusano la cache validata, con tempo di caricamento dipendente da SSD e pressione sulla memoria. Eliminare il file per forzare un nuovo requant. |
 | `DS4_SHARED_Q4` | `=1` (richiede `DS4_DENSE_Q4=1`) | off | **LOSSY.** Riquantizza in Q4_K anche le proiezioni FFN dell'esperto condiviso (gate/up/down, Q8_0) e le mantiene residenti: i loro slab escono del tutto dallo stream denso per token, liberando banda disco per il gather degli esperti. Stessa cache `.q4dense` (il toggle ri-riquantizza una volta). Fare A/B sulla qualità prima di adottarla. |
 | `DS4_QKV_Q4` | `=1` (richiede `DS4_DENSE_Q4=1`) | off | **LOSSY.** Riquantizza in Q4_K anche le restanti proiezioni di attention di media taglia (`q_a`, `kv` — Q8_0, ~16 MB/layer) e le mantiene residenti: ~0.7 GB/token in meno dallo stream per ~0.35 GB di RAM, e il matvec Q4 legge metà dei byte di quello Q8. Stessa cache `.q4dense` — una cache costruita senza questa manopola resta valida e solo i nuovi tensori vengono riquantizzati (i record corrispondono per chiave). Fare A/B sulla qualità prima di adottarla. |
-| `DS4_SPEC_K` | `2`..`8` | off | **Decode greedy AUTO-SPECULATIVO** ([progetto e misurazioni](../../docs/SELF-SPECULATIVE.md)): per round, N-1 candidati generati con un draft economico e verificati in un solo passaggio batch a configurazione piena. Si attiva solo con temperatura `0` e penalità di ripetizione `<=1`; altrimenti la demo lo disabilita. Il percorso resta opt-in perché le misurazioni attuali non mostrano vantaggi prestazionali. |
+| `DS4_SPEC_K` | `2`..`8` | off | **Decode greedy AUTO-SPECULATIVO** ([progetto e misurazioni](../../docs/SELF-SPECULATIVE.it.md)): per round, N-1 candidati generati con un draft economico e verificati in un solo passaggio batch a configurazione piena. Si attiva solo con temperatura `0` e penalità di ripetizione `<=1`; altrimenti la demo lo disabilita. Il percorso resta opt-in perché le misurazioni attuali non mostrano vantaggi prestazionali. |
 | `DS4_SPEC_DRAFT_EXPERTS` | `1`..`k-1` | `2` | Esperti attivi del DRAFT speculativo (pesi di route rinormalizzati, stesso meccanismo di `DS4_ACTIVE_EXPERTS`): meno esperti = draft più economico ma minore accettazione. Fare A/B per modello. |
 | `DS4_Q4_CACHE_DIR` | percorso di directory | non impostata (cache accanto al GGUF) | Dove la cache di requant `.q4dense` viene SCRITTA quando impostata (`<dir>/<gguf-name>.q4dense`). La lettura prova entrambi i posti: una cache prodotta dalla demo accanto al GGUF viene rilevata e PROMOSSA nella posizione primaria, così demo e app condividono una sola conversione. L'app sandboxed la imposta al proprio Application Support (non può scrivere accanto a un modello scelto dal picker). |
 | `DS4_FUSED_MOE` | `=0` disabilita | on | Usa i kernel MoE fusi per default. `=0` seleziona il percorso non fuso per A/B numerici e debugging; può cambiare arrotondamento e output. |
@@ -288,9 +290,9 @@ Il file riceve solo la risposta generata; i log restano a schermo.
 
 ## Struttura dei sorgenti
 
-- [`Command/README.md`](Command/README.md) documenta l'entry point della CLI e
+- [`Command/README.md`](Command/README.it.md) documenta l'entry point della CLI e
   il suo confine di dipendenze.
-- [`Diagnostics/README.md`](Diagnostics/README.md) documenta il logging,
+- [`Diagnostics/README.md`](Diagnostics/README.it.md) documenta il logging,
   l'ispezione dei GGUF e gli helper di misurazione del disco.
 
 Mantenere questo README come riferimento autoritativo per comandi e variabili

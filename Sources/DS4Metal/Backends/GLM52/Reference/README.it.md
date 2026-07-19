@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Riferimento del layer GLM 5.2
 
 Oracolo CPU di un layer GLM completo e della catena forward del primo token,

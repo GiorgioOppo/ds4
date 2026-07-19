@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tokenization API tests
 
 The factory tests verify architecture-only policy and construction from tiny

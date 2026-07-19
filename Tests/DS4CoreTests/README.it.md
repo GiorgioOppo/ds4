@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tests/DS4CoreTests
 
 Test di parità e unitari per `DS4Core`, `DS4Metal` e `DS4Engine` con XCTest.
@@ -17,13 +19,13 @@ l'uguaglianza.
 
 ## Mappa delle directory
 
-- [`Core/`](Core/README.md): test unitari deterministici solo CPU.
-- [`Metal/`](Metal/README.md): kernel, grafi, decoder, loader e runtime.
-- [`Engine/`](Engine/README.md): servizi, persistenza, protocolli, progetti e
+- [`Core/`](Core/README.it.md): test unitari deterministici solo CPU.
+- [`Metal/`](Metal/README.it.md): kernel, grafi, decoder, loader e runtime.
+- [`Engine/`](Engine/README.it.md): servizi, persistenza, protocolli, progetti e
   tool.
 
 I test seguono l'ownership di produzione: aggiungi un nuovo caso accanto
 all'area del componente, non alla radice di questa directory. Usa file
 temporanei e dipendenze iniettate; non fare mai affidamento su credenziali,
 repository, modello scaricato o accesso di rete dell'utente. Le convenzioni di
-skip su GPU sono documentate in [`../METAL-TESTS.md`](../METAL-TESTS.md).
+skip su GPU sono documentate in [`../METAL-TESTS.md`](../METAL-TESTS.it.md).

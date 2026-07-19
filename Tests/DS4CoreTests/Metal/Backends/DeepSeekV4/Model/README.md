@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek-V4 Model Tests
 
 - `GGUFLoaderTests.swift`: model metadata and loader validation.

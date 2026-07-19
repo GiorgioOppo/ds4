@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Kernel GLM 5.2
 
 Qui risiedono i wrapper Swift e gli oracoli scalari di correttezza per i kernel

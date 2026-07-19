@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenization/Backends
 
 Implementazioni di tokenizzazione specifiche delle famiglie di modello. Ogni

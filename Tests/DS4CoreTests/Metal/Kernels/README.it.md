@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel Metal
 
 Test di parità mirati per i kernel incorporati da `DS4Metal`. Ogni test

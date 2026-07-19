@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Viste di Distributed
 
 `DistributedView.swift` contiene il pannello di configurazione del worker,

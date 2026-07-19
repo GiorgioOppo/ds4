@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar
 
 The SwiftUI macOS app for Apple Silicon. It is driven by `DS4Engine`; a sidebar

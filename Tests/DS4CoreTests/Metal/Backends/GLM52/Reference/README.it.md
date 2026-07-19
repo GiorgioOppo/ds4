@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del riferimento del layer GLM 5.2
 
 Suite senza device per gli oracoli layer/forward: la scorciatoia di attenzione

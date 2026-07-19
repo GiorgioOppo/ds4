@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenization/Backends/Qwen
 
 Punto di estensione riservato al futuro tokenizer Qwen.

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Conversation/Models
 
 Value types shared between the interface, the engine and the chat renderer.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Viste di Tuning
 
 - `TuningView.swift` presenta il dimensionamento della cache degli esperti,

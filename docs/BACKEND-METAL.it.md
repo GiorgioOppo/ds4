@@ -1,11 +1,13 @@
+[English](BACKEND-METAL.md) | **Italiano**
+
 # Backend Metal
 
 Questa guida descrive i confini del runtime GPU condiviso e il percorso
 corretto per modificare un backend, un wrapper o un kernel. Le formule del
 backend DeepSeek sono approfondite in
-[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.md); la separazione multi-modello
+[ARCHITETTURA-MOTORE.md](ARCHITETTURA-MOTORE.it.md); la separazione multi-modello
 è definita in
-[ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.md).
+[ARCHITETTURE-SUPPORTATE.md](ARCHITETTURE-SUPPORTATE.it.md).
 
 ## Livelli del backend
 
@@ -151,7 +153,7 @@ Un aumento di throughput non basta per accettare un kernel. Servono almeno:
 - misura dopo warm-up senza profilazione invasiva.
 
 I rischi dormienti già individuati sono elencati in
-[metal/README.md](../metal/README.md); non abilitare un percorso indicato come
+[metal/README.md](../metal/README.it.md); non abilitare un percorso indicato come
 non raggiunto senza risolverne o validarne le precondizioni.
 
 ## Aggiungere una nuova operazione
@@ -177,6 +179,6 @@ con la profilazione disattivata.
 
 Vedere anche:
 
-- [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.md)
-- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md)
-- [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md)
+- [VALUTAZIONE-DEMO-PERF.md](VALUTAZIONE-DEMO-PERF.it.md)
+- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.it.md)
+- [TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.it.md)

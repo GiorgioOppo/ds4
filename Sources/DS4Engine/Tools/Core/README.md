@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tools/Core
 
 `ToolRegistry.swift` defines the shared contract and the catalog of built-ins.

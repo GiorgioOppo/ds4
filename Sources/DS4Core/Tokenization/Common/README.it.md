@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenization/Common
 
 Primitive riutilizzabili che non selezionano un template o un'architettura.

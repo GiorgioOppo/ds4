@@ -1,3 +1,5 @@
+[English](UPSTREAM-SYNC.md) | **Italiano**
+
 # Sincronizzazione con l'upstream (`antirez/ds4`)
 
 L'engine di DwarfStar è una **riscrittura in puro Swift** del progetto C
@@ -34,7 +36,7 @@ Fuori dall'ambito di questo port: i backend CUDA/ROCm (`ds4_cuda.cu`,
 `ds4_rocm.cu`, `rocm/`), il percorso speculativo upstream basato su MTP,
 l'agente da terminale (`ds4_agent.c`, comportamento raw-mode/TTY), `ds4-eval` e
 `ds4_cli.c`. L'esperimento CLI self-speculative di DwarfStar, separato e privo
-di MTP, è documentato in [`SELF-SPECULATIVE.md`](SELF-SPECULATIVE.md) e non è
+di MTP, è documentato in [`SELF-SPECULATIVE.md`](SELF-SPECULATIVE.it.md) e non è
 una prova che la superficie MTP upstream sia stata portata.
 
 ## Revisione dei commit recenti (fino a `80ebbc3`)

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/Tuning
 
 Raccoglie e persiste il profilo di instradamento degli esperti usato per
@@ -12,7 +14,7 @@ della KV in base alla configurazione attiva.
 ## Flusso e dipendenze
 
 Il profilo viene caricato durante l'inizializzazione del
-[`Service`](../Service/README.md), aggiornato dalla generazione e salvato a fine
+[`Service`](../Service/README.it.md), aggiornato dalla generazione e salvato a fine
 turno. I contatori provengono da `DS4Metal`; i file sono dati applicativi in
 Application Support.
 

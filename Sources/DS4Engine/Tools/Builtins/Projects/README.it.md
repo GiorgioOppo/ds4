@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Builtins/Projects
 
 Permette al modello di esplorare e modificare l'indice del progetto senza
@@ -13,7 +15,7 @@ inserire l'intero repository nel prompt.
 
 ## Flusso e dipendenze
 
-Tutti i tool usano [`ProjectCache`](../../../Projects/README.md) e sono
+Tutti i tool usano [`ProjectCache`](../../../Projects/README.it.md) e sono
 `projectScoped`. Git reindicizza automaticamente dopo le operazioni che mutano
 il working tree; editor e script esterni richiedono `project_reload`.
 

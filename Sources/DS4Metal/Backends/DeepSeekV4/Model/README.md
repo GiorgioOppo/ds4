@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Model
 
 Loading of DeepSeek V4 weights from GGUF into GPUTensor: per-tensor primitives

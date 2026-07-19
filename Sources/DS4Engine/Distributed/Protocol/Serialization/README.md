@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Serialization
 
 `Data+LittleEndian.swift` contains the internal primitives for appending and

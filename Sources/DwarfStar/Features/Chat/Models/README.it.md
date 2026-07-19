@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Modelli della Chat
 
 `ChatModels.swift` definisce i modelli di presentazione come `UIMessage` e

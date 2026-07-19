@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Architecture
 
 Geometry and derived dimensions of the DeepSeek-V4 profiles served by the

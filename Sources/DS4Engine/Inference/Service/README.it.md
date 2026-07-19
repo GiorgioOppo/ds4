@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/Service
 
 Implementa l'actor centrale che carica il modello e serializza ogni operazione
@@ -15,10 +17,10 @@ sul decoder.
 Il chiamante configura conversazione e strumenti, quindi avvia `send`,
 `sendWithHistory` o `complete`. Il servizio rende i token, riusa o ricostruisce
 la KV, esegue prefill e decode, e restituisce un `AsyncThrowingStream<GenEvent>`.
-Il flusso dettagliato è in [`../FLUSSO-INFERENZA.md`](../FLUSSO-INFERENZA.md).
+Il flusso dettagliato è in [`../FLUSSO-INFERENZA.md`](../FLUSSO-INFERENZA.it.md).
 
 Prima di tokenizer, configurazione DeepSeek e Metal, l'inizializzatore passa da
-[`RuntimeBackendFactory`](../../Runtime/README.md). Qwen viene riconosciuto ma
+[`RuntimeBackendFactory`](../../Runtime/README.it.md). Qwen viene riconosciuto ma
 rifiutato esplicitamente come backend non ancora implementato; il decode
 DeepSeek continua a usare il tipo concreto `StreamingDecoder`.
 
@@ -28,8 +30,8 @@ da `ChatRenderer` può quindi diventare BOS, ruolo o delimitatore DSML atomico.
 
 ## Dipendenze
 
-Dipende da `DS4Core`, `DS4Metal`, [`Persistence/KV`](../../Persistence/KV/README.md),
-[`Agents`](../../Agents/README.md) e [`Tools`](../../Tools/README.md).
+Dipende da `DS4Core`, `DS4Metal`, [`Persistence/KV`](../../Persistence/KV/README.it.md),
+[`Agents`](../../Agents/README.it.md) e [`Tools`](../../Tools/README.it.md).
 
 ## Estensione
 

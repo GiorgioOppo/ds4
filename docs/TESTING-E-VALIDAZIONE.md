@@ -1,3 +1,5 @@
+**English** | [Italiano](TESTING-E-VALIDAZIONE.it.md)
+
 # Testing and validation
 
 The tests cover different levels: pure logic, formats, protocol, Metal

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Kernels/Compression
 
 Wrapper per riduzione/espansione delle HyperConnections e compressione ricorrente
@@ -15,7 +17,7 @@ del contesto NSA.
 Prima dell'attention lo stato residuo viene ridotto; compressor e gate aggregano
 token raw in righe NSA persistenti. Dopo attention/FFN, l'uscita viene espansa
 nei flussi HyperConnection. Le operazioni sono composte da
-[`Graph/Operations`](../../Graph/Operations/README.md).
+[`Graph/Operations`](../../Graph/Operations/README.it.md).
 
 ## Regole di modifica
 

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Diagnostica di DS4Demo
 
 Helper mirati usati dall'eseguibile a riga di comando:

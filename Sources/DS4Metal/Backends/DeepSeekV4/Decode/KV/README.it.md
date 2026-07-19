@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/KV
 
 Esportazione e ripristino dello stato ricorrente del decoder.
@@ -12,7 +14,7 @@ Esportazione e ripristino dello stato ricorrente del decoder.
 
 Il decoder copia in uno snapshot CPU finestra raw KV, righe compresse e stato
 dell'indexer. `DS4Engine` può conservarlo in memoria o codificarlo con
-[`KVCFile`](../../../../../DS4Core/Formats/KVCheckpoint/README.md), quindi ripristinarlo
+[`KVCFile`](../../../../../DS4Core/Formats/KVCheckpoint/README.it.md), quindi ripristinarlo
 in un decoder con la stessa architettura.
 
 ## Regole di modifica

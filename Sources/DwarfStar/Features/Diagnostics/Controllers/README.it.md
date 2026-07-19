@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Controller della diagnostica
 
 `DiagnosticsController.swift` converte il percorso del modello e il testo di

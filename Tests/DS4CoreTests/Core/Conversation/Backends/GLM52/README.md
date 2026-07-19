@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 conversation tests
 
 These model-free tests cover `[gMASK]<sop>` chat framing, High/Max reasoning,

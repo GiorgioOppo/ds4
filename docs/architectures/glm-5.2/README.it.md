@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # GLM 5.2
 
 Questa cartella descrive il port nativo di GLM 5.2 (`glm-dsa`) in DwarfStar.
@@ -119,5 +121,5 @@ La sequenza di abilitazione è vincolante:
    locale.
 
 La mappa dettagliata rispetto al branch upstream è in
-[`PORTING-ANTIREZ.md`](PORTING-ANTIREZ.md); nomi, forme e tipi GGUF sono in
-[`CONTRATTO-GGUF.md`](CONTRATTO-GGUF.md).
+[`PORTING-ANTIREZ.md`](PORTING-ANTIREZ.it.md); nomi, forme e tipi GGUF sono in
+[`CONTRATTO-GGUF.md`](CONTRATTO-GGUF.it.md).

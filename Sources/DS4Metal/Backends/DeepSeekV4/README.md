@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek-V4 backend
 
 Metal implementation for DeepSeek V4 Flash and Pro. The validated GGUF

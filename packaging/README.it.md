@@ -1,9 +1,11 @@
+[English](README.md) | **Italiano**
+
 # Packaging
 
 File e script per assemblare e firmare il bundle macOS `.app`.
 
-Vedi [`docs/GUIDA-SVILUPPO.md`](../docs/GUIDA-SVILUPPO.md) per il flusso di
-release completo e [`docs/CRITTOGRAFIA.md`](../docs/CRITTOGRAFIA.md) per
+Vedi [`docs/GUIDA-SVILUPPO.md`](../docs/GUIDA-SVILUPPO.it.md) per il flusso di
+release completo e [`docs/CRITTOGRAFIA.md`](../docs/CRITTOGRAFIA.it.md) per
 l'inventario tecnico di crittografia/conformità all'esportazione.
 
 - **`make_app.sh`** costruisce `build/DwarfStar.app` dal binario release di

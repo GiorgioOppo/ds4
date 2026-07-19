@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Generation
 
 Selezione CPU del token successivo a partire dai logits.

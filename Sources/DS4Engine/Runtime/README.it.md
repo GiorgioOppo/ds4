@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Runtime multi-backend
 
 Questo livello separa l'ispezione portabile di un GGUF dalla costruzione del

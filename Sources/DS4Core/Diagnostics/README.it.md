@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Diagnostics
 
 Primitive portabili per comunicare lo stato delle operazioni lunghe.

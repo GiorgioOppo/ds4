@@ -1,3 +1,5 @@
+**English** | [Italiano](BACKEND-METAL.it.md)
+
 # Metal Backend
 
 This guide describes the boundaries of the shared GPU runtime and the correct

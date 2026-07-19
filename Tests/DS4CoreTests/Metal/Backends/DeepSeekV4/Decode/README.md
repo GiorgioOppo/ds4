@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek-V4 Decode Tests
 
 Tests for `StreamingDecoder`, indexer selection, expert-cache allocation, layer

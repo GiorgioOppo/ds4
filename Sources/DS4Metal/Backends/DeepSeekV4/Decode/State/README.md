@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Decode/State
 
 Temporary buffers reused along the forward pass to avoid per-token

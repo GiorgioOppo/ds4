@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Server
 
 Server HTTP nativo in-process costruito su `Network.framework`, compatibile
@@ -43,10 +45,10 @@ processi locali, non dall'intercettazione sulla rete.
 
 Default del pannello: host `127.0.0.1`, porta `8000`, max token `1024`, CORS
 disattivato, nessuna API key. Vedi il
-[Riferimento di configurazione](../../../../README.md#configuration-reference)
+[Riferimento di configurazione](../../../../README.it.md#riferimento-di-configurazione)
 nella radice.
 
-Vedi [`HTTP-API.md`](HTTP-API.md) per la matrice degli endpoint e il ciclo di
+Vedi [`HTTP-API.md`](HTTP-API.it.md) per la matrice degli endpoint e il ciclo di
 vita delle richieste. I README locali sotto `API/`, `Networking/`,
 `Concurrency/`, `Services/`, `Controllers/` e `Views/` definiscono i confini
 di proprietà. I nuovi endpoint dovrebbero riutilizzare gli helper di parsing,

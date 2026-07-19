@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/API
 
 Contiene i tipi pubblici e `Sendable` usati dai client del motore.
@@ -16,7 +18,7 @@ Contiene i tipi pubblici e `Sendable` usati dai client del motore.
 ## Dipendenze e flusso
 
 I tipi dipendono da Foundation e, dove necessario, dai modelli portabili di
-`DS4Core`. Sono prodotti da [`Service`](../Service/README.md) e consumati da
+`DS4Core`. Sono prodotti da [`Service`](../Service/README.it.md) e consumati da
 GUI, server e benchmark senza esporre oggetti Metal.
 
 ## Estensione

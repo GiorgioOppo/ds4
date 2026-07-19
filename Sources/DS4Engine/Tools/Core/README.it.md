@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tools/Core
 
 `ToolRegistry.swift` definisce il contratto comune e il catalogo dei built-in.
@@ -16,8 +18,8 @@
 ## Flusso e dipendenze
 
 Dipende da Foundation e `DS4Core`. Le definizioni concrete sono estensioni del
-registro in [`Builtins`](../Builtins/README.md); gli strumenti MCP sono aggiunti
-da [`MCPManager`](../MCP/README.md).
+registro in [`Builtins`](../Builtins/README.it.md); gli strumenti MCP sono aggiunti
+da [`MCPManager`](../MCP/README.it.md).
 
 ## Estensione
 

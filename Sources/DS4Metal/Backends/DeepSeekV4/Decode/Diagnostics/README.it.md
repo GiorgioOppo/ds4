@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Diagnostics
 
 Misurazioni aggregate del percorso caldo di inferenza.

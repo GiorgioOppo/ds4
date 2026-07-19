@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Kernels/Dense
 
 Wrappers for the dense multiplications used by projections, output head and

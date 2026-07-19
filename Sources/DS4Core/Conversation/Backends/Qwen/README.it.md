@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Conversation/Backends/Qwen
 
 Punto di estensione riservato al futuro template conversazionale Qwen.

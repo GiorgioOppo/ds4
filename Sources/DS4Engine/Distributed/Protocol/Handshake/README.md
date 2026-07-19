@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Handshake
 
 Defines the messages that turn an idle worker into an assigned node.

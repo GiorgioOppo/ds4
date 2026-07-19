@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Builtins/Arithmetic
 
 Strumenti locali, deterministici e senza side effect esterni.
@@ -12,7 +14,7 @@ Strumenti locali, deterministici e senza side effect esterni.
 ## Dipendenze e flusso
 
 Le closure ricevono JSON, usano gli helper di
-[`Tools/Core`](../../Core/README.md) e restituiscono `ToolOutput`. Non accedono a
+[`Tools/Core`](../../Core/README.it.md) e restituiscono `ToolOutput`. Non accedono a
 progetto, rete o decoder.
 
 ## Estensione

@@ -1,12 +1,14 @@
+[English](README.md) | **Italiano**
+
 # ModelManagement
 
 Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
 
 ## Componenti
 
-- [`Catalog`](Catalog/README.md): registro cross-family, cataloghi DeepSeek V4
+- [`Catalog`](Catalog/README.it.md): registro cross-family, cataloghi DeepSeek V4
   e GLM 5.2, artefatti e disponibilità nel runtime corrente.
-- [`Download`](Download/README.md): credenziali, download GGUF riprendibile e
+- [`Download`](Download/README.it.md): credenziali, download GGUF riprendibile e
   stato consumato dalla GUI.
 - `ExpertBundleTool.swift`: verifica o costruisce il sidecar degli esperti senza
   caricare il decoder completo.
@@ -16,14 +18,14 @@ Raccoglie operazioni sul modello che non fanno parte del ciclo di inferenza.
   nel messaggio; usato da `InferenceService` prima di aprire il GGUF.
 
 La procedura operativa è descritta in
-[`GESTIONE-MODELLI.md`](GESTIONE-MODELLI.md).
+[`GESTIONE-MODELLI.md`](GESTIONE-MODELLI.it.md).
 
 ## Dipendenze e flusso
 
 Il catalogo è la fonte unica e non dipende dalla GUI. Il downloader usa
 Foundation/CryptoKit; il token store usa Security. La costruzione del bundle
-usa metadati `DS4Core` e logica `DS4Metal`. Il risultato è poi consumato da [`Inference`](../Inference/README.md) o
-[`Distributed`](../Distributed/README.md).
+usa metadati `DS4Core` e logica `DS4Metal`. Il risultato è poi consumato da [`Inference`](../Inference/README.it.md) o
+[`Distributed`](../Distributed/README.it.md).
 
 ## Estensione
 

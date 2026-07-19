@@ -1,3 +1,5 @@
+[English](PROTOCOLLO.md) | **Italiano**
+
 # Protocollo distribuito v11
 
 ## Frame
@@ -61,5 +63,5 @@ Il protocollo non negozia feature fra versioni diverse: un mismatch interrompe
 il setup. Ogni nuovo campo deve avere limiti espliciti, codifica deterministica,
 decode che fallisce in modo atomico e test round-trip più casi troncati.
 
-Vedi [`Protocol`](Protocol/README.md), [`Coordinator`](Coordinator/README.md) e
-[`Worker`](Worker/README.md).
+Vedi [`Protocol`](Protocol/README.it.md), [`Coordinator`](Coordinator/README.it.md) e
+[`Worker`](Worker/README.it.md).

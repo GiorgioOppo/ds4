@@ -1,7 +1,9 @@
+[English](README.md) | **Italiano**
+
 # Persistence
 
 Contiene persistenza applicativa indipendente dalla GUI. Attualmente ospita la
-cache dei checkpoint KV in [`KV`](KV/README.md).
+cache dei checkpoint KV in [`KV`](KV/README.it.md).
 
 ## Flusso e dipendenze
 

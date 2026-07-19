@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Generation
 
 CPU-side selection of the next token from the logits.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Agent tests
 
 Questa cartella verifica i profili predefiniti di `DS4Engine/Agents` senza

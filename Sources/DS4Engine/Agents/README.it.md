@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Agents
 
 Questa cartella definisce i profili degli agenti disponibili all'orchestratore.
@@ -12,9 +14,9 @@ Non esegue inferenza e non contiene logica UI.
 ## Flusso e dipendenze
 
 La GUI o `InferenceService` seleziona un profilo dal registro; il prompt e la
-lista dei nomi tool vengono poi risolti tramite [`Tools`](../Tools/README.md).
+lista dei nomi tool vengono poi risolti tramite [`Tools`](../Tools/README.it.md).
 L'area dipende soltanto da Foundation, mentre l'esecuzione resta in
-[`Inference`](../Inference/README.md).
+[`Inference`](../Inference/README.it.md).
 
 ## Contratto dei profili
 

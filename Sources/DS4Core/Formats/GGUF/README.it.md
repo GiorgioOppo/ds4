@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Formats/GGUF
 
 Lettura validata e a copia zero dei modelli GGUF.

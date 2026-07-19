@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Chat Template (Tool Calling)
 
 [`chat_template.jinja`](chat_template.jinja) è il `chat_template` Jinja di
@@ -100,6 +102,6 @@ print(prompt)
 - Implementazione Swift equivalente:
   [`ChatRenderer`](../Sources/DS4Core/Conversation/Backends/DeepSeekV4/DSML/ChatRenderer.swift).
 - Dettagli sul motore:
-  [`docs/ARCHITETTURA-MOTORE.md`](../docs/ARCHITETTURA-MOTORE.md), sezione 14.
+  [`docs/ARCHITETTURA-MOTORE.md`](../docs/ARCHITETTURA-MOTORE.it.md), sezione 14.
 - Ciclo di vita e ownership dei tool:
-  [`docs/STRUMENTI-AGENTI-MCP.md`](../docs/STRUMENTI-AGENTI-MCP.md).
+  [`docs/STRUMENTI-AGENTI-MCP.md`](../docs/STRUMENTI-AGENTI-MCP.it.md).

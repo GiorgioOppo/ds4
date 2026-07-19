@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Motore GLM 5.2
 
 `GLM52ResidentModel` è il motore reale sul GGUF reale: valida lo schema,

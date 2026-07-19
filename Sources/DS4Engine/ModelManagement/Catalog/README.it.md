@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # ModelManagement/Catalog
 
 Contiene il catalogo tipizzato cross-family usato dalla GUI. Le tre varianti

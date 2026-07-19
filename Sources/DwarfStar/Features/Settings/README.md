@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar/Features/Settings
 
 - **`Views/SettingsView.swift`** renders global Settings. Model path and context length

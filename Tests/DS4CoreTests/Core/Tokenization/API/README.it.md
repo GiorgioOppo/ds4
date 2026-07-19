@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dell'API di tokenizzazione
 
 I test della factory verificano la politica basata sulla sola architettura e

@@ -1,3 +1,5 @@
+[English](TESTING-E-VALIDAZIONE.md) | **Italiano**
+
 # Testing e validazione
 
 I test verificano livelli diversi: logica pura, formati, protocollo, wrapper
@@ -136,7 +138,7 @@ conferma i candidati in ordine ABBA, confronta anche ogni finalista con la root
 iniziale e respinge run contaminati da pressione RAM o swap. Il formato trace è
 validato fail-closed e top-3, hash e conteggio dei valori finiti vengono
 ricalcolati dai `.f32`, non accettati sulla fiducia dal JSON. Procedura e
-comandi completi sono in [AUTOTUNING-METAL.md](AUTOTUNING-METAL.md).
+comandi completi sono in [AUTOTUNING-METAL.md](AUTOTUNING-METAL.it.md).
 
 ## Benchmark di correttezza next-token
 
@@ -220,5 +222,5 @@ test dei symlink viene corretto, aggiornare il documento.
 - [ ] README locale e documento tematico sono aggiornati.
 - [ ] Nessun file generato è stato modificato a mano.
 
-Vedere anche [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.md) e
-[BACKEND-METAL.md](BACKEND-METAL.md).
+Vedere anche [GUIDA-SVILUPPO.md](GUIDA-SVILUPPO.it.md) e
+[BACKEND-METAL.md](BACKEND-METAL.it.md).

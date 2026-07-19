@@ -1,3 +1,5 @@
+[English](SICUREZZA.md) | **Italiano**
+
 # Sicurezza degli strumenti
 
 Gli argomenti dei tool sono prodotti dal modello e possono derivare da contenuto
@@ -7,7 +9,7 @@ non fidato. Vanno quindi trattati come input ostile.
 
 Tutti i percorsi sono confinati alla root importata, risolti nuovamente prima
 dell'I/O e sottoposti alle regole in
-[`../Projects/SICUREZZA-PERCORSI.md`](../Projects/SICUREZZA-PERCORSI.md).
+[`../Projects/SICUREZZA-PERCORSI.md`](../Projects/SICUREZZA-PERCORSI.it.md).
 Output di lettura, lista e ricerca hanno limiti di righe, risultati e byte.
 
 ## Rete

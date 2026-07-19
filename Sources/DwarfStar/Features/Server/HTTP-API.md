@@ -1,3 +1,5 @@
+**English** | [Italiano](HTTP-API.it.md)
+
 # Local HTTP API
 
 The in-process server exposes the model already loaded by the app; it never

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Project Views
 
 `ProjectView.swift` contains the project-library UI and the app-facing

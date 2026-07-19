@@ -1,3 +1,5 @@
+[English](SICUREZZA-PERCORSI.md) | **Italiano**
+
 # Sicurezza dei percorsi progetto
 
 ## Confine

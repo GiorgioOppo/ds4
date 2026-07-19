@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Decode/Attention
 
 CPU support logic for NSA sparse attention selection.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backends
 
 Implementazioni Metal specifiche per famiglia di modello. Runtime, tensori e
@@ -7,12 +9,12 @@ al rispettivo backend.
 
 ## Backend
 
-- [`Common/`](Common/README.md): regole del confine condiviso e future API di
+- [`Common/`](Common/README.it.md): regole del confine condiviso e future API di
   selezione a livello token/chunk.
-- [`DeepSeekV4/`](DeepSeekV4/README.md): backend attualmente operativo.
-- [`GLM52/`](GLM52/README.md): schema, riferimenti DSA e primitive Metal in
+- [`DeepSeekV4/`](DeepSeekV4/README.it.md): backend attualmente operativo.
+- [`GLM52/`](GLM52/README.it.md): schema, riferimenti DSA e primitive Metal in
   costruzione; non contiene ancora un decoder eseguibile.
-- [`Qwen/`](Qwen/README.md): spazio riservato; Qwen non è ancora supportato.
+- [`Qwen/`](Qwen/README.it.md): spazio riservato; Qwen non è ancora supportato.
 
 ## Regole di modifica
 

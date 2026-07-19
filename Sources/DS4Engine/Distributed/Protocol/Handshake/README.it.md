@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Handshake
 
 Definisce i messaggi che trasformano un worker inattivo in un nodo assegnato.
@@ -12,10 +14,10 @@ Definisce i messaggi che trasformano un worker inattivo in un nodo assegnato.
 
 Il worker invia `HELLO`; il coordinator verifica compatibilità e, dopo i file,
 invia `ASSIGN`. La risposta `READY` riusa il payload `DistHello`. I file sono
-negoziati dai tipi in [`Files`](../Files/README.md).
+negoziati dai tipi in [`Files`](../Files/README.it.md).
 
 ## Estensione
 
 Ogni campo deve avere default o incompatibilità esplicita. Le variabili ambiente
 ricevute devono essere filtrate anche dal worker usando la whitelist in
-[`Core`](../Core/README.md); non trasportare segreti o impostazioni arbitrarie.
+[`Core`](../Core/README.it.md); non trasportare segreti o impostazioni arbitrarie.

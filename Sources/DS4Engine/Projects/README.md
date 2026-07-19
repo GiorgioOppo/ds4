@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Projects
 
 `ProjectCache` indexes an imported project separately from the chat memory.

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Controller distribuiti
 
 `DistributedController.swift` possiede il ciclo di vita di coordinator e

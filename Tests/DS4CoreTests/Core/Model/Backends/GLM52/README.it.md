@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di configurazione GLM 5.2
 
 Queste fixture GGUF di soli metadati verificano l'esatta forma di GLM 5.2

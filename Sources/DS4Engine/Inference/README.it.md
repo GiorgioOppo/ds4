@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference
 
 Questa area espone l'API applicativa e coordina il ciclo completo di inferenza.
@@ -6,20 +8,20 @@ decoder, della conversazione e della continuità KV.
 
 ## Struttura
 
-- [`API`](API/README.md): DTO pubblici, parametri di sampling ed eventi.
-- [`Service`](Service/README.md): caricamento, conversazione, prefill e decode.
-- [`Benchmark`](Benchmark/README.md): misurazione e warm-up.
-- [`Diagnostics`](Diagnostics/README.md): ispezione di tokenizer e template.
-- [`Subagents`](Subagents/README.md): contesti isolati per lavori delegati.
-- [`Tuning`](Tuning/README.md): profilo d'uso degli esperti e metriche cache.
+- [`API`](API/README.it.md): DTO pubblici, parametri di sampling ed eventi.
+- [`Service`](Service/README.it.md): caricamento, conversazione, prefill e decode.
+- [`Benchmark`](Benchmark/README.it.md): misurazione e warm-up.
+- [`Diagnostics`](Diagnostics/README.it.md): ispezione di tokenizer e template.
+- [`Subagents`](Subagents/README.it.md): contesti isolati per lavori delegati.
+- [`Tuning`](Tuning/README.it.md): profilo d'uso degli esperti e metriche cache.
 
-La descrizione passo per passo è in [FLUSSO-INFERENZA.md](FLUSSO-INFERENZA.md).
+La descrizione passo per passo è in [FLUSSO-INFERENZA.md](FLUSSO-INFERENZA.it.md).
 
 ## Dipendenze
 
 `DS4Core` fornisce tokenizer, rendering, tool call e sampling; `DS4Metal`
 fornisce runtime e `StreamingDecoder`. La persistenza KV è incapsulata in
-[`Persistence/KV`](../Persistence/KV/README.md).
+[`Persistence/KV`](../Persistence/KV/README.it.md).
 
 ## Regole di estensione
 

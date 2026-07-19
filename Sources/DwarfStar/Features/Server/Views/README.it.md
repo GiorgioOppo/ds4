@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Viste del server
 
 `ServerView.swift` disegna la configurazione del listener, le opzioni di

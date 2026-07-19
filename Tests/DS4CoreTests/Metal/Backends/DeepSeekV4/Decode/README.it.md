@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di decode DeepSeek-V4
 
 Test per `StreamingDecoder`, selezione dell'indexer, allocazione della cache

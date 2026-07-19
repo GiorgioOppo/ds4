@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 engine
 
 `GLM52ResidentModel` is the real engine over the real GGUF: it validates the

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Servizi del Server
 
 `LocalServer.swift` possiede il listener `Network.framework`, il riferimento

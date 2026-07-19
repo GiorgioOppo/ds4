@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel densi
 
 `MetalDenseTests.swift` e `MetalMatmulMMTests.swift` validano i percorsi

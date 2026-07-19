@@ -1,3 +1,5 @@
+[English](STRUTTURA-PROGETTO.md) | **Italiano**
+
 # Struttura del progetto
 
 Questa guida descrive dove collocare nuovo codice e quali dipendenze sono

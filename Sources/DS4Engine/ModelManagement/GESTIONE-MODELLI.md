@@ -1,3 +1,5 @@
+**English** | [Italiano](GESTIONE-MODELLI.it.md)
+
 # Model lifecycle
 
 ## Download

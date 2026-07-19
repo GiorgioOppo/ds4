@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Distributed
 
 UI per l'inferenza distribuita. L'engine e il protocollo risiedono sotto
@@ -15,7 +17,7 @@ UI per l'inferenza distribuita. L'engine e il protocollo risiedono sotto
 
 Valori predefiniti: porta worker 9100, lista peer `127.0.0.1:9100`, bit di
 attivazione 32, chunk di prefill 32, max token 512, porta di ritorno 9099.
-Consulta la [Guida di riferimento alla configurazione](../../../../README.md#configuration-reference)
+Consulta la [Guida di riferimento alla configurazione](../../../../README.it.md#riferimento-di-configurazione)
 alla radice.
 
 Mantieni il ciclo di vita dei ruoli e lo stato della UI nel controller, la

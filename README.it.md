@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar — inferenza LLM nativa su macOS
 
 DwarfStar è un'applicazione nativa Swift / SwiftUI per eseguire modelli
@@ -22,15 +24,15 @@ GGUF Flash a 2 bit gira su un MacBook da 16 GB facendo streaming dei pesi
 degli esperti instradati da SSD; quell'affermazione sulla memoria non descrive
 l'artefatto Pro, molto più grande.
 
-> La documentazione parte da [`docs/README.md`](docs/README.md). Il
+> La documentazione parte da [`docs/README.md`](docs/README.it.md). Il
 > [Riferimento di configurazione](#riferimento-di-configurazione) qui sotto è
 > la tabella autorevole dei parametri; le guide dedicate coprono le
-> [architetture supportate](docs/ARCHITETTURE-SUPPORTATE.md),
-> la [pipeline di inferenza](docs/PIPELINE-INFERENZA.md),
-> il [backend Metal](docs/BACKEND-METAL.md),
-> l'[inferenza distribuita](docs/INFERENZA-DISTRIBUITA.md),
-> [GUI/server](docs/GUI-SERVER-E-API.md) e
-> il [testing](docs/TESTING-E-VALIDAZIONE.md).
+> [architetture supportate](docs/ARCHITETTURE-SUPPORTATE.it.md),
+> la [pipeline di inferenza](docs/PIPELINE-INFERENZA.it.md),
+> il [backend Metal](docs/BACKEND-METAL.it.md),
+> l'[inferenza distribuita](docs/INFERENZA-DISTRIBUITA.it.md),
+> [GUI/server](docs/GUI-SERVER-E-API.it.md) e
+> il [testing](docs/TESTING-E-VALIDAZIONE.it.md).
 
 ## Architettura
 
@@ -251,7 +253,7 @@ byte per Flash, 384/48 byte per Pro). Le raccolte da SSD dei worker possono
 così girare in parallelo, al costo di circa un round-trip di rete per layer
 instradato. Questa modalità richiede un collegamento cablato con RTT sotto
 circa 1 ms; è intenzionalmente inadatta al Wi-Fi.
-Vedi [`docs/INFERENZA-DISTRIBUITA.md`](docs/INFERENZA-DISTRIBUITA.md).
+Vedi [`docs/INFERENZA-DISTRIBUITA.md`](docs/INFERENZA-DISTRIBUITA.it.md).
 
 ## Struttura del repository
 
@@ -279,9 +281,9 @@ spiega proprietà, dipendenze, regole di estensione e come si collega al resto
 del sistema.
 
 La mappa completa dei sorgenti e le regole di collocazione sono in
-[`docs/STRUTTURA-PROGETTO.md`](docs/STRUTTURA-PROGETTO.md).
+[`docs/STRUTTURA-PROGETTO.md`](docs/STRUTTURA-PROGETTO.it.md).
 La matrice di supporto e le regole per aggiungere un backend sono in
-[`docs/ARCHITETTURE-SUPPORTATE.md`](docs/ARCHITETTURE-SUPPORTATE.md).
+[`docs/ARCHITETTURE-SUPPORTATE.md`](docs/ARCHITETTURE-SUPPORTATE.it.md).
 
 ## Demo CLI
 
@@ -306,7 +308,7 @@ swift run DS4Demo [gguf-path] [maxNew] [prompt]
 La demo onora ogni variabile d'ambiente del motore elencata nel
 [Riferimento di configurazione](#riferimento-di-configurazione) qui sotto; il
 flusso di lavoro di profiling e la prosa sulle singole regolazioni vivono in
-[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.md).
+[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.it.md).
 ## Riferimento di configurazione
 
 Tutto ciò che è configurabile nel progetto, in un unico posto. La
@@ -465,7 +467,7 @@ defaults write org.ds4.dwarfstar DS4DenseAhead -int 3     # bundle di `make app`
 Per l'equivalente ricerca isolata per processo su più regolazioni
 interagenti, usare
 [`scripts/metal_autotune.py`](scripts/metal_autotune.py) e il
-[`runbook di autotuning multi-parametro`](docs/AUTOTUNING-METAL.md). Confronta
+[`runbook di autotuning multi-parametro`](docs/AUTOTUNING-METAL.it.md). Confronta
 i logit sull'intero vocabolario, conferma le prestazioni in ordine ABBA, fa
 checkpoint di ogni decisione ed emette un `final-env.sh` sourceable. La GUI
 segue gli stessi principi di promozione con ricaricamenti in-process
@@ -495,7 +497,7 @@ o MM possono cambiare l'ordine di accumulazione in virgola mobile, e la
 riquantizzazione o un numero ridotto di esperti attivi sono deliberatamente
 lossy. Assumere l'identità bit a bit solo dove è dichiarata. Le indicazioni di
 flusso di lavoro ("quale regolazione provare per prima") sono in
-[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.md).
+[`Sources/DS4Demo/README.md`](Sources/DS4Demo/README.it.md).
 
 #### Percorsi e integrazione
 

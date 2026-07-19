@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek V4 Tokenizer Tests
 
 Covers parity with the C reference, byte-level round-trip, control tokens,

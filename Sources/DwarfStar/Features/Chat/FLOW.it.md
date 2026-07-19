@@ -1,3 +1,5 @@
+[English](FLOW.md) | **Italiano**
+
 # Flusso di esecuzione della chat
 
 Questo documento descrive i confini di ownership della funzionalità dell'app

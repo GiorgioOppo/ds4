@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenization/Backends/DeepSeekV4
 
 Tokenizer byte-level BPE con pre-tokenizer JoyAI/DeepSeek, token speciali di

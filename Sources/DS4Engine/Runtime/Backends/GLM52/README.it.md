@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Registrazione runtime GLM 5.2
 
 Questa directory possiede la registrazione lato motore per i modelli GGUF che

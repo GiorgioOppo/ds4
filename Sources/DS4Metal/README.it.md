@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DS4Metal
 
 Runtime Metal multi-backend. Le primitive comuni gestiscono device, tensori,
@@ -7,11 +9,11 @@ da `DS4Core` e da `Metal.framework`.
 
 ## Struttura
 
-- [`Runtime/`](Runtime/README.md): device, command queue, pipeline e tensori GPU.
-- [`Backends/`](Backends/README.md): implementazioni specifiche per famiglia di modello.
-- [`Model/`](Model/README.md): tipi di modello realmente condivisi tra backend.
-- [`Kernels/`](Kernels/README.md): wrapper Swift dei kernel `.metal`.
-- [`Graph/`](Graph/README.md): operazioni che compongono il grafo di inferenza.
+- [`Runtime/`](Runtime/README.it.md): device, command queue, pipeline e tensori GPU.
+- [`Backends/`](Backends/README.it.md): implementazioni specifiche per famiglia di modello.
+- [`Model/`](Model/README.it.md): tipi di modello realmente condivisi tra backend.
+- [`Kernels/`](Kernels/README.it.md): wrapper Swift dei kernel `.metal`.
+- [`Graph/`](Graph/README.it.md): operazioni che compongono il grafo di inferenza.
 
 ## Flusso
 

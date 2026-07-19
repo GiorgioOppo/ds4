@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 runtime registration
 
 This directory owns the engine-facing registration for GGUF models declaring

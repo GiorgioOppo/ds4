@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 tokenizer
 
 `GLM52Tokenizer` implements GPT-2 byte-level BPE with the ChatGLM4 `glm4`

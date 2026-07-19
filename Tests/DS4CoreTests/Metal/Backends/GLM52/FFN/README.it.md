@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di riferimento dell'FFN GLM 5.2
 
 Suite senza device per gli oracoli dell'FFN. Il matvec è reimplementato in modo

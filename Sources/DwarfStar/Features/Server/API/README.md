@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Server API Adapters
 
 Endpoint-specific adapters translate HTTP JSON into engine requests and stream

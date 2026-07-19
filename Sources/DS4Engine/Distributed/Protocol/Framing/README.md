@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Framing
 
 `DistFrameHeader.swift` defines the envelope of every message: magic, type

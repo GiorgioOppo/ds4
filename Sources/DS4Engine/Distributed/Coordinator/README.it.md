@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Coordinator
 
 `DistCoordinator` possiede la configurazione del cluster, il motore locale e le
@@ -15,8 +17,8 @@ connessioni ai worker. Le responsabilità sono separate in estensioni.
 
 ## Dipendenze e flusso
 
-Usa [`Protocol`](../Protocol/README.md), [`Transport`](../Transport/README.md),
-[`Execution`](../Execution/README.md) e [`Files`](../Files/README.md). `connect`
+Usa [`Protocol`](../Protocol/README.it.md), [`Transport`](../Transport/README.it.md),
+[`Execution`](../Execution/README.it.md) e [`Files`](../Files/README.it.md). `connect`
 prepara la route orizzontale; `connectVertical` prepara gli shard esperti. Solo
 dopo tutti i `READY` una chat o un benchmark può iniziare.
 

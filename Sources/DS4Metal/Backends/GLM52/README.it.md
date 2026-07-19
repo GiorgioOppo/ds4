@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend Metal GLM 5.2
 
 Questo albero possiede il codice numerico per l'architettura `glm-dsa`. Il

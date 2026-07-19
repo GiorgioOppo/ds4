@@ -1,3 +1,5 @@
+[English](AUTOTUNING-METAL.md) | **Italiano**
+
 # Autotuning multi-parametro Metal
 
 `scripts/metal_autotune.py` cerca una configurazione con maggiore throughput

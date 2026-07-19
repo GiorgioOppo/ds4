@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di conversazione GLM 5.2
 
 Questi test senza modello coprono il framing di chat `[gMASK]<sop>`, il

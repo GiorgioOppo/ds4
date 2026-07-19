@@ -1,3 +1,5 @@
+[English](METAL-AB-M1-PRO-2026-07-16.md) | **Italiano**
+
 # A/B dei kernel Metal su M1 Pro — 16 luglio 2026
 
 Questa è una fotografia sperimentale, non una promessa valida per ogni Apple

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DS4Core
 
 Fondazione portabile del progetto, scritta in Swift e priva di dipendenze da
@@ -6,13 +8,13 @@ tipi condivisi usati da `DS4Metal` e `DS4Engine`.
 
 ## Struttura
 
-- [`Conversation/`](Conversation/README.md): tipi comuni e formati chat per backend.
-- [`Diagnostics/`](Diagnostics/README.md): avanzamento thread-safe del caricamento.
-- [`Formats/`](Formats/README.md): GGUF, checkpoint KV e primitive di quantizzazione.
-- [`Generation/`](Generation/README.md): selezione del token successivo.
-- [`Model/`](Model/README.md): rilevamento architettura e configurazioni per backend.
-- [`Storage/`](Storage/README.md): pianificazione della cache SSD e simulazione RAM.
-- [`Tokenization/`](Tokenization/README.md): API comune e tokenizer per backend.
+- [`Conversation/`](Conversation/README.it.md): tipi comuni e formati chat per backend.
+- [`Diagnostics/`](Diagnostics/README.it.md): avanzamento thread-safe del caricamento.
+- [`Formats/`](Formats/README.it.md): GGUF, checkpoint KV e primitive di quantizzazione.
+- [`Generation/`](Generation/README.it.md): selezione del token successivo.
+- [`Model/`](Model/README.it.md): rilevamento architettura e configurazioni per backend.
+- [`Storage/`](Storage/README.it.md): pianificazione della cache SSD e simulazione RAM.
+- [`Tokenization/`](Tokenization/README.it.md): API comune e tokenizer per backend.
 
 ## Dipendenze e flusso
 

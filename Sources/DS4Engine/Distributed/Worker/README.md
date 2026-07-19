@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Distributed/Worker
 
 `DistWorker` is an initially idle node that listens on a port, receives files

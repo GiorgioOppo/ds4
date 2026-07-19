@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 streaming
 
 First tranche of GLM roadmap step 1: from the validated read plan to real GGUF

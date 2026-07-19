@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Conversation/Models
 
 Tipi valore condivisi tra interfaccia, motore e renderer della chat.
@@ -14,6 +16,6 @@ I tipi sono `Sendable` ed `Equatable`; `ToolSpec` e `ToolCall` sono anche
 ## Flusso e regole
 
 Questi modelli non eseguono strumenti e non conoscono il backend. Sono consumati
-da [`DSML`](../Backends/DeepSeekV4/DSML/README.md) e dai livelli superiori. Aggiungere nuovi casi a
+da [`DSML`](../Backends/DeepSeekV4/DSML/README.it.md) e dai livelli superiori. Aggiungere nuovi casi a
 `ChatTurn` solo aggiornando renderer, parser, persistenza e test di exhaustiveness;
 non inserire qui stato runtime o dipendenze applicative.

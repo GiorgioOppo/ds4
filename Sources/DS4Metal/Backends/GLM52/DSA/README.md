@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 compact DSA reference
 
 This directory contains non-runnable policies and CPU correctness oracles for

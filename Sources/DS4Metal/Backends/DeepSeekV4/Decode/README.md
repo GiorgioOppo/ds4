@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Decode
 
 Orchestration of recurrent inference: initialization, prefill, single-token

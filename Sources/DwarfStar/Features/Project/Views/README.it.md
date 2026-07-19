@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # View dei progetti
 
 `ProjectView.swift` contiene la UI della libreria dei progetti e l'adapter di

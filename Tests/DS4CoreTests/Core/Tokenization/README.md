@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tokenization Tests
 
 [`Backends/DeepSeekV4/`](Backends/DeepSeekV4/README.md) covers vocabulary

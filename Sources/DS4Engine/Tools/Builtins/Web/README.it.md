@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Builtins/Web
 
 Espone al modello accesso web limitato.
@@ -11,7 +13,7 @@ Espone al modello accesso web limitato.
 
 ## Flusso e dipendenze
 
-Entrambi delegano a [`WebClient`](../../Integrations/README.md), che applica
+Entrambi delegano a [`WebClient`](../../Integrations/README.it.md), che applica
 protezione SSRF, validazione dei redirect, timeout e limite del body. L'endpoint
 di ricerca può essere impostato con `DS4_SEARCH_URL` e deve contenere `%@`.
 

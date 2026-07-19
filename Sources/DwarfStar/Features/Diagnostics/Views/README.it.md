@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Viste di diagnostica
 
 `DiagnosticsView.swift` presenta l'ispezione di token/template e include

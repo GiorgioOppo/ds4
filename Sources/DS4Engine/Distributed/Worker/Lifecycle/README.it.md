@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Worker/Lifecycle
 
 Possiede il ciclo di vita del listener e lo stato di sessione del worker.
@@ -11,7 +13,7 @@ modello locale o trasferito.
 ## Flusso e dipendenze
 
 `start` apre il listener; ogni connessione passa a
-[`Serving`](../Serving/README.md). `admit` impedisce che turni concorrenti
+[`Serving`](../Serving/README.it.md). `admit` impedisce che turni concorrenti
 resettino la KV attiva. `stop` chiude listener, task e risorse persistenti.
 
 ## Estensione

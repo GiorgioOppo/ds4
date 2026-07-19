@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tensor Kernel Tests
 
 Elemental GPU operations: copy, unary/binary transforms, normalization,

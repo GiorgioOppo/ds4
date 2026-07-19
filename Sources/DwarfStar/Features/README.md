@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar Features
 
 Each child directory implements one user-facing area of the macOS application.

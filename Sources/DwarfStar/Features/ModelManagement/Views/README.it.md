@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Model Management Views
 
 - `ModelPicker.swift` usa `NSOpenPanel` e bookmark security-scoped per GGUF

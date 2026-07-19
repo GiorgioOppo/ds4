@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Features/Settings
 
 - **`Views/SettingsView.swift`** effettua il rendering delle Impostazioni
@@ -39,7 +41,7 @@ memoria al mantenere residente ogni peso denso. Il preset veloce abilita
 `DS4MultiQuantCache` per impostazione predefinita dopo l'A/B esatto del
 2026-07-16; il suo interruttore può ripristinare il bypass off-class legacy.
 La chiave UserDefaults e il valore predefinito di ogni impostazione sono
-documentati nella [Guida di riferimento alla configurazione](../../../../README.md#configuration-reference)
+documentati nella [Guida di riferimento alla configurazione](../../../../README.it.md#riferimento-di-configurazione)
 alla radice.
 
 L'ispezione del modello viene eseguita senza caricare Metal. I controlli

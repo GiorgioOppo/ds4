@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Architecture
 
 Geometria e dimensioni derivate dei profili DeepSeek-V4 serviti dai kernel

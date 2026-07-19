@@ -1,3 +1,5 @@
+**English** | [Italiano](DS4CORE-INFERENCE.it.md)
+
 # DS4Core inference-facing components
 
 Pure inference-facing pieces that do not touch the GPU. Portable contracts are

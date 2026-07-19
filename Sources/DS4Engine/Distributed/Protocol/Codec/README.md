@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/Codec
 
 `ActivationCodec.swift` converts `Float` vectors into 32-, 16- or 8-bit

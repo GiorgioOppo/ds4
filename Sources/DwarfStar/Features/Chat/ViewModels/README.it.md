@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # View model della Chat
 
 `ChatStore` è il proprietario dello stato sul main actor per la feature Chat.

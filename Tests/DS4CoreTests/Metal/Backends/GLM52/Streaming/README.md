@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 streaming tests
 
 Byte-faithfulness of `GLM52PayloadReader` against synthetic pattern files: a

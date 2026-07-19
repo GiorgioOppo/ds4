@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Contratto del modello GLM 5.2
 
 Questa directory possiede la geometria portabile del modello GLM 5.2 e la

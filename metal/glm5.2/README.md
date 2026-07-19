@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 kernels
 
 Metal kernel sources for the GLM 5.2 (`glm-dsa`) backend: sigmoid top-8 router,

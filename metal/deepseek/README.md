@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek V4 kernels
 
 Metal kernel sources for the DeepSeek V4 graph plus the shared generic ops

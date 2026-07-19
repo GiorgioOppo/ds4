@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenization/API
 
 Contratto minimo condiviso dai tokenizer dei diversi backend.

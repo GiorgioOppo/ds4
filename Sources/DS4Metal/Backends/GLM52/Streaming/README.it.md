@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Streaming GLM 5.2
 
 Prima tranche del passo 1 della roadmap GLM: dal piano di lettura validato ai

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Inference/Subagents
 
 Esegue attività delegate in un contesto isolato, preservando la conversazione
@@ -14,8 +16,8 @@ neutralizzati prima di aggiungere il framing fidato della chat isolata.
 
 ## Dipendenze
 
-Usa [`Agents`](../../Agents/README.md), [`Projects`](../../Projects/README.md),
-[`Tools`](../../Tools/README.md) e [`Persistence/KV`](../../Persistence/KV/README.md).
+Usa [`Agents`](../../Agents/README.it.md), [`Projects`](../../Projects/README.it.md),
+[`Tools`](../../Tools/README.it.md) e [`Persistence/KV`](../../Persistence/KV/README.it.md).
 
 ## Estensione
 

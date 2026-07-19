@@ -1,3 +1,5 @@
+[English](SELF-SPECULATIVE.md) | **Italiano**
+
 # Decode self-speculative CLI sperimentale
 
 > **Stato al 13 luglio 2026:** le fasi A-C sono implementate nella demo CLI e

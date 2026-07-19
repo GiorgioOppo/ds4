@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Core Storage Tests
 
 `SSDCachePlanTests.swift` checks deterministic storage/cache planning, budgets,

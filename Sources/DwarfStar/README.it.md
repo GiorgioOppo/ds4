@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar
 
 L'app macOS SwiftUI per Apple Silicon. È guidata da `DS4Engine`; una sidebar
@@ -6,7 +8,7 @@ contesto si configurano una sola volta in **Settings** tramite `AppSettings`,
 e vengono poi ereditati da ogni controller. Ogni impostazione persistita
 (chiave UserDefaults, valore predefinito, variabile d'ambiente dell'engine) è
 documentata nel
-[Riferimento di Configurazione](../../README.md#configuration-reference) alla
+[Riferimento di Configurazione](../../README.it.md#riferimento-di-configurazione) alla
 radice.
 
 L'app è organizzata per **feature**, con una cartella per tab o area sotto
@@ -59,15 +61,15 @@ valori SHA-256 o decisioni di supporto runtime.
 
 ## Mappa della documentazione
 
-- [`App/README.md`](App/README.md): avvio e impostazioni condivise.
-- [`Features/README.md`](Features/README.md): indice delle feature e confini.
-- [`Features/Chat/FLOW.md`](Features/Chat/FLOW.md): flusso di messaggi, tool,
+- [`App/README.md`](App/README.it.md): avvio e impostazioni condivise.
+- [`Features/README.md`](Features/README.it.md): indice delle feature e confini.
+- [`Features/Chat/FLOW.md`](Features/Chat/FLOW.it.md): flusso di messaggi, tool,
   persistenza ed engine condiviso.
-- [`Features/ModelManagement/README.md`](Features/ModelManagement/README.md):
+- [`Features/ModelManagement/README.md`](Features/ModelManagement/README.it.md):
   catalogo GUI, riuso, ripresa, selezione e confine di runtime.
-- [`Features/Server/HTTP-API.md`](Features/Server/HTTP-API.md): endpoint e
+- [`Features/Server/HTTP-API.md`](Features/Server/HTTP-API.it.md): endpoint e
   ciclo di vita delle richieste.
-- [`Shared/README.md`](Shared/README.md): regole di supporto trasversali alle
+- [`Shared/README.md`](Shared/README.it.md): regole di supporto trasversali alle
   feature.
 
 Ogni directory sorgente ha un README locale. Aggiorna il README più vicino

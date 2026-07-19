@@ -1,3 +1,5 @@
+**English** | [Italiano](METAL-AB-M1-PRO-2026-07-16.it.md)
+
 # Metal kernel A/B on M1 Pro — July 16, 2026
 
 This is an experimental snapshot, not a promise valid for every Apple GPU. The

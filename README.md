@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DwarfStar — native LLM inference on macOS
 
 DwarfStar is a native Swift / SwiftUI application for running local language

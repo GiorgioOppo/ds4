@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend DeepSeek V4
 
 DeepSeek V4 è il backend operativo di riferimento. Flash e Pro condividono lo

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 layer execution
 
 First GPU composition of a GLM layer: the first-token forward with every

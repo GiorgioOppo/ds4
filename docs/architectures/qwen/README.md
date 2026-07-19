@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Qwen backend — groundwork
 
 Qwen is currently a **recognized but not runnable** family. This folder

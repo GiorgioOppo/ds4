@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test di quantizzazione
 
 - `HalfTests.swift` verifica la conversione in mezza precisione e i casi

@@ -1,3 +1,5 @@
+[English](GUI-SERVER-E-API.md) | **Italiano**
+
 # GUI, server locale e API
 
 La GUI SwiftUI e il server HTTP sono due ingressi allo stesso motore. Entrambi
@@ -174,7 +176,7 @@ un identificatore di compatibilità: il server usa sempre il singolo GGUF già
 caricato.
 
 La tabella completa dei campi accettati è nella
-[Configuration Reference](../README.md#http-server-server-tab).
+[Configuration Reference](../README.it.md#server-http-scheda-server).
 
 ## Sicurezza
 
@@ -184,7 +186,7 @@ tunnel. L'API key applicativa evita richieste accidentali ma, senza TLS, non
 protegge il token da intercettazione.
 
 Il body è limitato e il parser rifiuta richieste malformate. CORS è disattivato
-di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
+di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.it.md).
 
 ## Aggiungere una feature GUI
 
@@ -220,4 +222,4 @@ di default. Vedere [CRITTOGRAFIA.md](CRITTOGRAFIA.md).
 - `Sources/DwarfStar/Features/Server/Concurrency/RequestGate.swift`
 - `Sources/DS4Engine/Inference/Service/InferenceService.swift`
 
-Per il flusso interno vedere [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md).
+Per il flusso interno vedere [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.it.md).

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test della DSA compatta GLM
 
 Test in pura CPU coprono i byte della cache compatta, la crescita lazy degli

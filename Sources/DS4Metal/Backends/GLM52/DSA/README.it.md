@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Riferimento DSA compatto GLM 5.2
 
 Questa directory contiene politiche non eseguibili e oracoli di correttezza su

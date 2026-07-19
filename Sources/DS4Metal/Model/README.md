@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Model
 
 Model types shared across the Metal backends. Architectural descriptions,

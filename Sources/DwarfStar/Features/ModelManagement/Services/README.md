@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Model Management Services
 
 `DownloadRunner.swift` is the main-actor adapter around

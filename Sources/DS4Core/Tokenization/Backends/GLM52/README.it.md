@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Tokenizer GLM 5.2
 
 `GLM52Tokenizer` implementa il BPE byte-level in stile GPT-2 con il

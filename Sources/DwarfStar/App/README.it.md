@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/App
 
 Shell dell'applicazione e stato condiviso.
@@ -15,7 +17,7 @@ Shell dell'applicazione e stato condiviso.
   (`DS4ContextSize`) e la modalità di esecuzione locale/distribuita
   (`DS4EngineMode`). Le Impostazioni possiedono questi valori; gli altri
   controller li leggono attraverso lo stato condiviso dell'app. Consulta la
-  [Guida di riferimento alla configurazione](../../../README.md#configuration-reference)
+  [Guida di riferimento alla configurazione](../../../README.it.md#riferimento-di-configurazione)
   alla radice per tutte le chiavi e i valori predefiniti.
 - **`AppEnvironment.swift`** risolve i percorsi per le esecuzioni in sviluppo
   rispetto all'app impacchettata, calcola i preset hardware basati sulla RAM

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 tokenizer tests
 
 These model-free tests pin the `glm4` split boundaries, Unicode number and

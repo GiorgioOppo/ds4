@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Persistenza della Chat
 
 Questa directory possiede la rappresentazione su disco delle conversazioni

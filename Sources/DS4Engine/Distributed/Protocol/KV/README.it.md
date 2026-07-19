@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/KV
 
 `DistKV.swift` serializza i messaggi di continuità KV per ogni slice.
@@ -13,7 +15,7 @@
 
 Il coordinator interseca le lunghezze restituite da tutti i worker e sceglie un
 prefisso comune; ogni worker inoltra l'operazione al proprio `DistEngine` e
-[`DiskKVStore`](../../../Persistence/KV/README.md).
+[`DiskKVStore`](../../../Persistence/KV/README.it.md).
 
 ## Estensione
 

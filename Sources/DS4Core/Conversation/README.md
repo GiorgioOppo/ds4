@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Conversation
 
 Portable conversation types and backend-specific rendering formats.

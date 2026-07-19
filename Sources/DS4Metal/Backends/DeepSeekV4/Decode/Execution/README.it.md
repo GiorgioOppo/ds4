@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Execution
 
 Implementazione principale del decoder streaming e del forward per layer.
@@ -22,7 +24,7 @@ Implementazione principale del decoder streaming e del forward per layer.
 ## Flusso
 
 Il factory costruisce le strategie di peso e cache. `forward` prepara input e
-attraversa i layer; `DecodeLayer` usa le operazioni di [`Graph`](../../../../Graph/README.md),
+attraversa i layer; `DecodeLayer` usa le operazioni di [`Graph`](../../../../Graph/README.it.md),
 scrive KV e produce lo stato successivo. Il percorso asincrono sovrappone gather
 e FFN rispettando le dipendenze tra command buffer.
 

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test del tokenizer GLM 5.2
 
 Questi test senza modello fissano i confini di split di `glm4`, la gestione

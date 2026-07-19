@@ -1,3 +1,5 @@
+[English](INFERENZA-DISTRIBUITA.md) | **Italiano**
+
 # Inferenza distribuita
 
 DwarfStar supporta due topologie distinte sullo stesso protocollo TCP nativo:
@@ -63,7 +65,7 @@ Stato attuale:
   un miglioramento possibile.
 
 I dettagli prestazionali sono in
-[EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.md).
+[EXPERT_PARALLELISM.md](EXPERT_PARALLELISM.it.md).
 
 ## Ciclo di connessione
 
@@ -167,7 +169,7 @@ dense, viaggiano in campi tipizzati e con il relativo sidecar.
 Il protocollo non offre TLS né autenticazione. Prompt, token e attivazioni
 viaggiano in chiaro. Usare soltanto una LAN fidata o un tunnel protetto e non
 esporre la porta worker su Internet. Vedere
-[CRITTOGRAFIA.md](CRITTOGRAFIA.md).
+[CRITTOGRAFIA.md](CRITTOGRAFIA.it.md).
 
 ## Mappa del codice
 

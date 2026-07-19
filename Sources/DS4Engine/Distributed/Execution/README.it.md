@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Execution
 
 ## Confine architetturale
@@ -29,7 +31,7 @@ Adatta `DS4Metal` alle unità di lavoro distribuite senza includere networking.
 
 ## Dipendenze e flusso
 
-Dipende da `DS4Core`, `DS4Metal` e dai tipi in [`Protocol`](../Protocol/README.md).
+Dipende da `DS4Core`, `DS4Metal` e dai tipi in [`Protocol`](../Protocol/README.it.md).
 Coordinator e worker trasformano i frame in chiamate a questi motori; nessun
 tipo di questa cartella apre socket.
 
@@ -41,4 +43,4 @@ al renderer l'aggiunta esclusiva dei delimitatori strutturali fidati.
 
 Conservare qui la semantica numerica dell'esecuzione distribuita. Validare shape,
 layer, quantizzazione e maschere prima del dispatch GPU. Nuove strategie di
-trasporto appartengono a [`Transport`](../Transport/README.md).
+trasporto appartengono a [`Transport`](../Transport/README.it.md).

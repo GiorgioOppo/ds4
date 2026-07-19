@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Schema dei tensori GLM 5.2
 
 `GLM52TensorSchema` è il validatore fail-fast della directory per l'esatto

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Decode/Generation
 
 Operations that turn tokens into decoder input and final state into logits.

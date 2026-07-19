@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Persistence
 
 Contains application persistence independent of the GUI. It currently hosts

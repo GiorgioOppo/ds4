@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Qwen Backend
 
 Status: GGUF family recognized, backend not yet implemented.

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Inference/Subagents
 
 Runs delegated tasks in an isolated context, preserving the main conversation.

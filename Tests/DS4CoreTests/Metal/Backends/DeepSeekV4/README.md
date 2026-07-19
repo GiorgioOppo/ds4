@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek-V4 Metal Tests
 
 - [`Decode/`](Decode/README.md): streaming decoder, indexer, and expert cache.

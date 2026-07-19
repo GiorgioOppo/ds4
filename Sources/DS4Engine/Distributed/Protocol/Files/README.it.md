@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Protocol/Files
 
 Definisce il trasferimento resumable di GGUF e sidecar.
@@ -13,9 +15,9 @@ Definisce il trasferimento resumable di GGUF e sidecar.
 
 ## Flusso e dipendenze
 
-I metadati sono costruiti in [`../../Files`](../../Files/README.md), inviati dal
-[`Coordinator`](../../Coordinator/README.md) e verificati in
-[`Worker/Files`](../../Worker/Files/README.md).
+I metadati sono costruiti in [`../../Files`](../../Files/README.it.md), inviati dal
+[`Coordinator`](../../Coordinator/README.it.md) e verificati in
+[`Worker/Files`](../../Worker/Files/README.it.md).
 
 ## Estensione
 

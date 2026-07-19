@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend Qwen
 
 Placeholder per il futuro supporto Qwen. La famiglia è riconosciuta nella

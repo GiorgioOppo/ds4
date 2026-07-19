@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Diagnostics
 
 Portable primitives for reporting the state of long-running operations.

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Tools/MCP
 
 Connects Model Context Protocol servers and presents their tools alongside

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Riferimento FFN GLM 5.2
 
 Oracoli di correttezza su CPU per gli stadi feed-forward di GLM, port del

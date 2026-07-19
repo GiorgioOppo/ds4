@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dello streaming GLM 5.2
 
 Fedeltà al byte di `GLM52PayloadReader` contro file sintetici a pattern: una

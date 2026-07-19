@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei kernel Tensor
 
 Operazioni GPU elementari: copy, trasformazioni unarie/binarie,

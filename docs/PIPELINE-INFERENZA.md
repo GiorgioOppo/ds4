@@ -1,3 +1,5 @@
+**English** | [Italiano](PIPELINE-INFERENZA.it.md)
+
 # Inference pipeline
 
 This document follows a request from the GUI or the API all the way to the

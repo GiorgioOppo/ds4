@@ -1,3 +1,5 @@
+[English](CONTRATTO-GGUF.md) | **Italiano**
+
 # Contratto GGUF GLM 5.2
 
 Il backend accetta soltanto la geometria GLM 5.2 verificata. Non tenta di

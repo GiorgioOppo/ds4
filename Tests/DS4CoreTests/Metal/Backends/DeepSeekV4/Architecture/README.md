@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeekV4/Architecture tests
 
 Verifies the runtime geometry of the Flash and Pro profiles, the parity of the

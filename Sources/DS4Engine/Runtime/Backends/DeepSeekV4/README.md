@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # DeepSeek V4 backend
 
 Registers the already operational backend: local generation, reasoning and

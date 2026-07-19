@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Files
 
 Gestisce identità e conservazione locale dei grandi artefatti distribuiti.
@@ -13,8 +15,8 @@ Gestisce identità e conservazione locale dei grandi artefatti distribuiti.
 
 Il coordinator calcola una volta hash e catena; il worker usa il manifest per
 evitare trasferimenti già verificati. I messaggi corrispondenti sono in
-[`Protocol/Files`](../Protocol/Files/README.md), la ricezione in
-[`Worker/Files`](../Worker/Files/README.md). Dipende da Foundation e CryptoKit.
+[`Protocol/Files`](../Protocol/Files/README.it.md), la ricezione in
+[`Worker/Files`](../Worker/Files/README.it.md). Dipende da Foundation e CryptoKit.
 
 ## Estensione
 

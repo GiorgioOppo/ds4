@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Test dei formati
 
 Test per i formati persistenti e dei file modello di proprietà di `DS4Core`:

@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Backend Qwen — predisposizione
 
 Qwen è al momento una famiglia **riconosciuta ma non eseguibile**. Questa

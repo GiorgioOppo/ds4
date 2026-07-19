@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DeepSeekV4/Decode/Reference
 
 Decoder leggibile e conservativo usato come oracolo di correttezza.

@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Model Management Views
 
 - `ModelPicker.swift` uses `NSOpenPanel` and security-scoped bookmarks for

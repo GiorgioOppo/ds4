@@ -1,3 +1,5 @@
+**English** | [Italiano](EXPERT_PARALLELISM.it.md)
+
 # Expert parallelism — vertical split of the model
 
 Status as of July 16, 2026: **phases A-C implemented in protocol v11**.

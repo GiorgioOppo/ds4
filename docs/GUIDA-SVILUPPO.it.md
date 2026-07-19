@@ -1,8 +1,10 @@
+[English](GUIDA-SVILUPPO.md) | **Italiano**
+
 # Guida allo sviluppo
 
 Questa è la checklist pratica per modificare il repository senza rompere i
 confini fra moduli o i flussi di generazione. La mappa completa è in
-[STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.md).
+[STRUTTURA-PROGETTO.md](STRUTTURA-PROGETTO.it.md).
 
 ## Prima di modificare
 
@@ -79,7 +81,7 @@ se `xcrun` non usa l'installazione completa di Xcode.
 
 ## Modifiche ai kernel
 
-Seguire [BACKEND-METAL.md](BACKEND-METAL.md): kernel `.metal`, wrapper Swift,
+Seguire [BACKEND-METAL.md](BACKEND-METAL.it.md): kernel `.metal`, wrapper Swift,
 composizione del grafo, test CPU/GPU, embedding e build Release sono un'unica
 unità di modifica.
 
@@ -93,7 +95,7 @@ Tenere separati:
 - I/O dei pesi;
 - sampling e presentazione.
 
-Consultare [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md). Una nuova modalità
+Consultare [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.it.md). Una nuova modalità
 non deve creare un secondo motore dentro la GUI.
 
 ## Modifiche al protocollo distribuito
@@ -103,7 +105,7 @@ non deve creare un secondo motore dentro la GUI.
 3. Aggiungere test round-trip e payload malformati.
 4. Aggiornare coordinator e worker separatamente.
 5. Incrementare `Dist.protocolVersion` per cambi incompatibili.
-6. Aggiornare [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.md).
+6. Aggiornare [INFERENZA-DISTRIBUITA.md](INFERENZA-DISTRIBUITA.it.md).
 
 Non consentire al wire di impostare ambiente arbitrario.
 
@@ -111,7 +113,7 @@ Non consentire al wire di impostare ambiente arbitrario.
 
 Tenere parsing/protocollo, servizi, controller e viste in file distinti. Le
 azioni lunghe devono rispettare cancellazione e actor isolation. Consultare
-[GUI-SERVER-E-API.md](GUI-SERVER-E-API.md).
+[GUI-SERVER-E-API.md](GUI-SERVER-E-API.it.md).
 
 ## Documentazione
 
@@ -138,4 +140,4 @@ e condizioni del benchmark.
 - [ ] `git diff --check` pulito.
 
 La strategia di test completa è in
-[TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.md).
+[TESTING-E-VALIDAZIONE.md](TESTING-E-VALIDAZIONE.it.md).

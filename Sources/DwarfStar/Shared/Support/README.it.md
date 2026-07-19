@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # DwarfStar/Shared/Support
 
 Utility GUI trasversali.

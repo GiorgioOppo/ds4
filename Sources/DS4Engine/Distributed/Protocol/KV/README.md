@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Protocol/KV
 
 `DistKV.swift` serializes the KV continuity messages for each slice.

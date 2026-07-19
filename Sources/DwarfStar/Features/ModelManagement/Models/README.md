@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Model Management Models
 
 `ModelCatalog.swift` defines the lightweight `DiscoveredModel` record and the

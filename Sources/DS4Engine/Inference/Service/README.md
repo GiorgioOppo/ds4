@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # Inference/Service
 
 Implements the central actor that loads the model and serializes every

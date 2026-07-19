@@ -1,3 +1,5 @@
+**English** | [Italiano](SICUREZZA-PERCORSI.it.md)
+
 # Project path security
 
 ## Boundary

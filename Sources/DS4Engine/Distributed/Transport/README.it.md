@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Transport
 
 Incapsula il trasporto TCP asincrono basato su Network.framework.
@@ -12,7 +14,7 @@ Incapsula il trasporto TCP asincrono basato su Network.framework.
 ## Flusso e dipendenze
 
 `DistConnection` aggiunge/rimuove soltanto l'header definito in
-[`Protocol/Framing`](../Protocol/Framing/README.md); la semantica del payload
+[`Protocol/Framing`](../Protocol/Framing/README.it.md); la semantica del payload
 resta nei codec del protocollo. Coordinator e worker possiedono il ciclo di
 vita delle connessioni.
 

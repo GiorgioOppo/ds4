@@ -1,3 +1,5 @@
+[English](ARCHITETTURE-SUPPORTATE.md) | **Italiano**
+
 # Architetture modello supportate
 
 Questo documento definisce il confine tra le parti comuni di DwarfStar e i
@@ -136,14 +138,14 @@ voce `runnable` restano il grafo completo MLA/DSA, MoE routed/shared, loader e
 streaming pesi, KV runtime, output logits e confronti numerici di
 prefill/decode. MTP non fa parte del primo percorso autoregressivo. I knob
 DeepSeek non devono essere riutilizzati implicitamente. La checklist è nel
-[README GLM 5.2](architectures/glm-5.2/README.md).
+[README GLM 5.2](architectures/glm-5.2/README.it.md).
 
 ## Documenti per famiglia
 
-- [`architectures/deepseek-v4/README.md`](architectures/deepseek-v4/README.md)
+- [`architectures/deepseek-v4/README.md`](architectures/deepseek-v4/README.it.md)
   descrive il backend operativo e i suoi vincoli.
-- [`architectures/qwen/README.md`](architectures/qwen/README.md) descrive la
+- [`architectures/qwen/README.md`](architectures/qwen/README.it.md) descrive la
   predisposizione e ciò che resta da implementare.
-- [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.md) descrive
+- [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.it.md) descrive
   contratto verificato, tranche implementate e gate del backend GLM.
-- [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.md) indica dove collocare i file.
+- [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.it.md) indica dove collocare i file.

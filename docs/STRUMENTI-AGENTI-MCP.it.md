@@ -1,3 +1,5 @@
+[English](STRUMENTI-AGENTI-MCP.md) | **Italiano**
+
 # Strumenti, agenti e MCP
 
 Il sistema di tool permette al modello di richiedere operazioni strutturate
@@ -127,7 +129,7 @@ chiamata, errore remoto, timeout e cancellazione.
 
 ## Documenti correlati
 
-- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.md)
-- [GUI-SERVER-E-API.md](GUI-SERVER-E-API.md)
-- [`templates/README.md`](../templates/README.md)
-- [`Sources/DS4Engine/Tools/README.md`](../Sources/DS4Engine/Tools/README.md)
+- [PIPELINE-INFERENZA.md](PIPELINE-INFERENZA.it.md)
+- [GUI-SERVER-E-API.md](GUI-SERVER-E-API.it.md)
+- [`templates/README.md`](../templates/README.it.md)
+- [`Sources/DS4Engine/Tools/README.md`](../Sources/DS4Engine/Tools/README.it.md)

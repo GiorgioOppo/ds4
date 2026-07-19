@@ -1,3 +1,5 @@
+**English** | [Italiano](README-analisi.it.md)
+
 # GGUF compressibility analysis
 
 This guide describes the two exploratory tools used to measure weight

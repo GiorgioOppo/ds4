@@ -1,3 +1,5 @@
+[English](VALUTAZIONE-DEMO-PERF.md) | **Italiano**
+
 # Valutazione delle prestazioni della demo (DS4Demo)
 
 > **Log storico di benchmark, non riferimento dei default.** Le misure di questo
@@ -7,7 +9,7 @@
 > esteso, bundle e MetalIO sono sempre indicati nel contesto della prova. I
 > valori non descrivono il preset GUI corrente e non sono risultati universali.
 > Per i parametri operativi correnti usare la
-> [Configuration Reference](../README.md#configuration-reference); per una nuova
+> [Configuration Reference](../README.it.md#riferimento-di-configurazione); per una nuova
 > misura registrare anche hash del GGUF, versione della build, pressione memoria
 > e stato caldo/freddo delle cache.
 

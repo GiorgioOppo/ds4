@@ -1,3 +1,5 @@
+**English** | [Italiano](README.it.md)
+
 # GLM 5.2 tensor-schema tests
 
 Synthetic tensor-directory records exercise all layer boundaries and supported

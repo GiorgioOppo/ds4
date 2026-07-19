@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Storage
 
 Pianificazione portabile del working set quando il modello è più grande della
@@ -15,7 +17,7 @@ RAM disponibile.
 Il piano viene costruito prima del decoder e guida la dimensione delle cache
 concrete di `DS4Metal`. La simulazione è uno strumento diagnostico: non contiene
 policy del decoder e non legge pesi. Le opzioni runtime sono raccolte nella
-[Configuration Reference](../../../README.md#configuration-reference).
+[Configuration Reference](../../../README.it.md#riferimento-di-configurazione).
 
 ## Regole di modifica
 

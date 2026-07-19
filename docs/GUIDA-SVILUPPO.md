@@ -1,3 +1,5 @@
+**English** | [Italiano](GUIDA-SVILUPPO.it.md)
+
 # Development guide
 
 This is the practical checklist for changing the repository without breaking

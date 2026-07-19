@@ -1,3 +1,5 @@
+[English](README.md) | **Italiano**
+
 # Distributed/Protocol
 
 Raccoglie tutti i tipi serializzati sul wire. Le strutture non aprono socket e
@@ -5,17 +7,17 @@ non conoscono lo stato di coordinator o worker.
 
 ## Aree
 
-- [`Core`](Core/README.md): versione, tipi messaggio, flag e limiti.
-- [`Framing`](Framing/README.md): header comune dei frame.
-- [`Serialization`](Serialization/README.md): primitive little-endian.
-- [`Handshake`](Handshake/README.md): identità e assegnazione.
-- [`Files`](Files/README.md): offerta e trasferimento artefatti.
-- [`KV`](KV/README.md): controllo dei checkpoint shard.
-- [`Work`](Work/README.md): stati hidden, route e risultati.
-- [`Experts`](Experts/README.md): parallelismo verticale MoE.
-- [`Codec`](Codec/README.md): compressione delle attivazioni.
+- [`Core`](Core/README.it.md): versione, tipi messaggio, flag e limiti.
+- [`Framing`](Framing/README.it.md): header comune dei frame.
+- [`Serialization`](Serialization/README.it.md): primitive little-endian.
+- [`Handshake`](Handshake/README.it.md): identità e assegnazione.
+- [`Files`](Files/README.it.md): offerta e trasferimento artefatti.
+- [`KV`](KV/README.it.md): controllo dei checkpoint shard.
+- [`Work`](Work/README.it.md): stati hidden, route e risultati.
+- [`Experts`](Experts/README.it.md): parallelismo verticale MoE.
+- [`Codec`](Codec/README.it.md): compressione delle attivazioni.
 
-La sequenza completa è in [`../PROTOCOLLO.md`](../PROTOCOLLO.md).
+La sequenza completa è in [`../PROTOCOLLO.md`](../PROTOCOLLO.it.md).
 
 ## Regole
 
