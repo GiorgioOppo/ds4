@@ -879,7 +879,7 @@ embedding, campionamento, rendering del prompt e orchestrazione finale.
 ### Protocollo e topologia
 
 Il protocollo di rete (`Sources/DS4Engine/Distributed/Protocol/`) è un framing
-nativo DwarfStar, attualmente alla versione 10. Il coordinatore valida la
+nativo DwarfStar, attualmente alla versione 11. Il coordinatore valida la
 versione PER PRIMA COSA, così un cluster misto fallisce con un errore chiaro
 invece che con frame corrotti. La cronologia delle versioni fa anche da elenco
 delle funzionalità:

@@ -70,7 +70,7 @@ User text
 
 At the application level, `InferenceService` owns the decoder and exposes async
 streams. The service tracks the exact committed token ids in the conversation.
-When a user sends a new turn, only the suffix not already in KV is prefixed.
+When a user sends a new turn, only the suffix not already in KV is prefilled.
 When tools are called, their results are appended as tool-result turns and the
 decode continues from the same append-only state.
 
@@ -823,7 +823,7 @@ prompt rendering, and final orchestration.
 
 The wire protocol (`Sources/DS4Engine/Distributed/Protocol/`) is
 DwarfStar-native framing, currently
-at version 10. The coordinator validates the version FIRST, so a mixed cluster
+at version 11. The coordinator validates the version FIRST, so a mixed cluster
 fails with a clear error instead of garbled frames. The version history doubles
 as the feature list:
 
