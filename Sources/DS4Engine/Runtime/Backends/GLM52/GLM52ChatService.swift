@@ -12,8 +12,11 @@ import Foundation
 /// generation (the stream's termination cancels the producer), incremental
 /// KV between turns (only the rendered conversation's NEW suffix is
 /// prefilled when it extends what the engine already holds — otherwise a
-/// context reset and a full layer-major batched prefill). Still deliberate
-/// v1 limits: no tool calls and no reasoning stream.
+/// context reset and a full layer-major batched prefill), the reasoning
+/// stream (`<think>` split on special-token IDs) and native XML tool calls
+/// with observation turns. Not mirrored (by design): decode profiles,
+/// DeepSeek disk-KV budget, sub-agents, distributed execution; top-P/min-P
+/// and the seeded RNG are DeepSeek-sampler-only for now.
 public actor GLM52ChatService {
     public let service: GLM52InferenceService
     private let contextSize: Int

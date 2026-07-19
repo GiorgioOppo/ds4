@@ -223,12 +223,18 @@ extension ChatStore {
         bundleBuildRunning = true
         bundleBuildStatus = "Verifica/creazione in corso… (dettagli nel Log motore)"
         let path = modelPath
-        let serviceBarrier = service
+        // Il barrier è il backend generico: con GLM caricato il motore vivo è
+        // glmService, e la build del sidecar GLM contende lo stesso SSD.
+        let serviceBarrier = chatBackend
         let task = Task(priority: .userInitiated) { [weak self] in
             // A completed chat may still be streaming a large DiskKV snapshot.
             // Join it before giving the same SSD to a tens-of-gigabytes bundle
             // build; the activity lease prevents a new generation meanwhile.
             await serviceBarrier?.quiesceForTeardown()
+            // Per un GGUF GLM la tool legge DS4_GLM_LAYERQ4_DIR/BUNDLE_DIR:
+            // allineale alla stessa politica del load (sibling se possibile,
+            // altrimenti Application Support). No-op per DeepSeek.
+            ChatStore.prepareGLMSidecarEnvironment(modelPath: path)
             // Su thread GCD, non sul pool cooperativo: la build del bundle fa
             // fan-out con concurrentPerform (copyExpert) — vedi ChatStore.load.
             let outcome = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in

@@ -201,6 +201,10 @@ extension ChatStore {
                 if inspected.architecture
                        == GLM52BackendDefinition.supportedArchitecture,
                    GLM52BackendDefinition.runtimeEnabled {
+                    // Sidecar GLM: riusa quello accanto al GGUF quando c'è,
+                    // altrimenti redirigi la build in Application Support
+                    // (in sandbox la cartella del modello non è scrivibile).
+                    Self.prepareGLMSidecarEnvironment(modelPath: path)
                     let glm = try await withCheckedThrowingContinuation {
                         (cont: CheckedContinuation<GLM52ChatService, Error>) in
                         DispatchQueue.global(qos: .userInitiated).async {

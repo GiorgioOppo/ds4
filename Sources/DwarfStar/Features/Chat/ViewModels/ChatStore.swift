@@ -656,12 +656,6 @@ final class ChatStore {
     var modelCapabilities: BackendCapabilities {
         info?.capabilities ?? inspectedModelDescriptor?.capabilities ?? []
     }
-    var supportsDeepSeekPerformanceTuning: Bool {
-        modelCapabilities.contains(.deepSeekPerformanceTuning)
-    }
-    var supportsExpertTuning: Bool {
-        modelCapabilities.contains(.expertRouting)
-    }
     var supportsReasoning: Bool {
         modelCapabilities.contains(.reasoning)
     }

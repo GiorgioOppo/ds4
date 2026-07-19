@@ -14,8 +14,11 @@
   `Features/ModelManagement`: le tre varianti Flash del catalogo e la Pro Q2 a
   file singolo possono essere selezionate dopo il download, mentre la Pro Q4
   split resta visibilmente solo scaricabile. Le tre quantizzazioni GLM 5.2 sono
-  scaricabili dalla revisione bloccata del loro repository ma restano solo
-  scaricabili finché il loro runtime non sarà implementato.
+  scaricabili dalla revisione bloccata del loro repository e diventano
+  selezionabili quando `GLM52RuntimeGate.enabled` è attivo.
+  Le sezioni benchmark e memoria arrivano da [`BackendUI/`](BackendUI/README.it.md):
+  una classe base astratta più un'implementazione DeepSeek e una GLM, scelte
+  dal modello selezionato, così ogni backend vede sempre i propri controlli.
 - **`Views/MCPServersView.swift`** effettua il rendering del pannello MCP:
   `MCPStore` rende persistenti i server MCP configurati (UserDefaults,
   import/export JSON in formato `mcpServers`) e li invia a `MCPManager.shared`

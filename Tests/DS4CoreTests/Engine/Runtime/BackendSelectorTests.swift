@@ -40,7 +40,11 @@ final class BackendSelectorTests: XCTestCase {
         }
     }
 
-    func testGLM52IsInspectedButRejectedUntilItsMetalBackendIsReady() throws {
+    /// GLM segue il gate runtime: con `GLM52RuntimeGate.enabled` l'inspector
+    /// riporta `implemented` + capability runtime GLM e il selettore ritorna
+    /// `.glm52`; a gate spento restano il rifiuto esplicito e la
+    /// disponibilità statica riconosciuta-ma-non-implementata di DS4Core.
+    func testGLM52SelectionFollowsTheRuntimeGate() throws {
         let descriptor = try ModelInspector.inspect(
             generalArchitecture: "glm-dsa",
             displayName: "GLM 5.2",
@@ -49,18 +53,27 @@ final class BackendSelectorTests: XCTestCase {
 
         XCTAssertEqual(descriptor.architecture, .glmDSA)
         XCTAssertEqual(descriptor.family, .glm)
-        XCTAssertEqual(descriptor.backendAvailability, .recognizedButNotImplemented)
         XCTAssertTrue(descriptor.model.capabilities.contains(.chat))
         XCTAssertTrue(descriptor.model.capabilities.contains(.tools))
         XCTAssertTrue(descriptor.model.capabilities.contains(.reasoning))
         XCTAssertTrue(descriptor.model.capabilities.contains(.mixtureOfExperts))
-        XCTAssertTrue(descriptor.capabilities.isEmpty)
 
-        XCTAssertThrowsError(try BackendSelector.select(descriptor)) { error in
-            guard case BackendSelectionError.backendNotImplemented(let id) = error else {
-                return XCTFail("errore inatteso: \(error)")
+        if GLM52BackendDefinition.runtimeEnabled {
+            XCTAssertEqual(descriptor.backendAvailability, .implemented)
+            XCTAssertEqual(descriptor.capabilities,
+                           GLM52BackendDefinition.runtimeCapabilities)
+            XCTAssertEqual(try BackendSelector.select(descriptor), .glm52)
+        } else {
+            XCTAssertEqual(descriptor.backendAvailability,
+                           .recognizedButNotImplemented)
+            XCTAssertEqual(descriptor.capabilities,
+                           GLM52BackendDefinition.runtimeCapabilities)
+            XCTAssertThrowsError(try BackendSelector.select(descriptor)) { error in
+                guard case BackendSelectionError.backendNotImplemented(let id) = error else {
+                    return XCTFail("errore inatteso: \(error)")
+                }
+                XCTAssertEqual(id, .glmDSA)
             }
-            XCTAssertEqual(id, .glmDSA)
         }
     }
 

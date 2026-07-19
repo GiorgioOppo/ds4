@@ -6,7 +6,8 @@ import DS4Core
 /// backend has been selected.
 public enum ModelInspector {
     public static func inspect(_ model: GGUFModel) throws -> RuntimeModelDescriptor {
-        let detected = try ModelArchitectureDetector.detect(in: model)
+        let detected = gateAwareAvailability(
+            try ModelArchitectureDetector.detect(in: model))
         let prefix = detected.id.ggufMetadataNamespace
         let name = model.string("general.name").flatMap { $0.isEmpty ? nil : $0 }
             ?? fallbackName(for: detected)
@@ -30,10 +31,10 @@ public enum ModelInspector {
                                hasDeepSeekV4Metadata: Bool = false,
                                layerCount: Int? = nil) throws
         -> RuntimeModelDescriptor {
-        let detected = try ModelArchitectureDetector.detect(
+        let detected = gateAwareAvailability(try ModelArchitectureDetector.detect(
             generalArchitecture: generalArchitecture,
             hasDeepSeekV4Metadata: hasDeepSeekV4Metadata
-        )
+        ))
         let descriptor = ModelDescriptor(
             architecture: detected,
             name: displayName.flatMap { $0.isEmpty ? nil : $0 } ?? fallbackName(for: detected),
@@ -65,11 +66,29 @@ public enum ModelInspector {
         switch detected.backendAvailability {
         case .implemented where detected.id == .deepSeekV4:
             return DeepSeekV4BackendDefinition.runtimeCapabilities
-        case .recognizedButNotImplemented where detected.family == .glm:
+        case .implemented where detected.family == .glm,
+             .recognizedButNotImplemented where detected.family == .glm:
             return GLM52BackendDefinition.runtimeCapabilities
         case .implemented, .recognizedButNotImplemented, .unknown:
             return QwenBackendDefinition.runtimeCapabilities
         }
+    }
+
+    /// DS4Core marks GLM statically as recognized-but-not-implemented because
+    /// it cannot see the runtime gate (it lives above DS4Core). Overlay the
+    /// gate here so descriptors reflect what THIS build actually runs: with
+    /// `GLM52RuntimeGate.enabled` a `glm-dsa` file loads and generates, and
+    /// the UI must not caption it as "backend not implemented".
+    private static func gateAwareAvailability(
+        _ detected: DetectedModelArchitecture) -> DetectedModelArchitecture {
+        guard detected.family == .glm,
+              detected.id == GLM52BackendDefinition.supportedArchitecture,
+              detected.backendAvailability == .recognizedButNotImplemented,
+              GLM52BackendDefinition.runtimeEnabled else { return detected }
+        return DetectedModelArchitecture(
+            id: detected.id,
+            family: detected.family,
+            backendAvailability: .implemented)
     }
 
     private static func fallbackName(for detected: DetectedModelArchitecture) -> String {

@@ -70,7 +70,13 @@ final class ModelInspectorGLM52Tests: XCTestCase {
         XCTAssertEqual(descriptor.layerCount, 79)
         XCTAssertEqual(descriptor.embeddingLength, 6_144)
         XCTAssertEqual(descriptor.vocabularySize, 154_880)
-        XCTAssertEqual(descriptor.backendAvailability, .recognizedButNotImplemented)
-        XCTAssertTrue(descriptor.capabilities.isEmpty)
+        // La disponibilità segue il gate runtime GLM (overlay dell'inspector
+        // sulla detection statica di DS4Core); le capability runtime sono
+        // quelle dichiarate dal backend in entrambi gli stati del gate.
+        XCTAssertEqual(descriptor.backendAvailability,
+                       GLM52BackendDefinition.runtimeEnabled
+                           ? .implemented : .recognizedButNotImplemented)
+        XCTAssertEqual(descriptor.capabilities,
+                       GLM52BackendDefinition.runtimeCapabilities)
     }
 }

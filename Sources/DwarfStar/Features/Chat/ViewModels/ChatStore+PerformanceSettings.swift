@@ -108,4 +108,45 @@ extension ChatStore {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("DwarfStar/expert-bundle", isDirectory: true)
     }
+
+    /// Sidecar GLM (layer Q4 unificati + bundle legacy da migrare): l'engine
+    /// li cerca in DS4_GLM_LAYERQ4_DIR / DS4_GLM_BUNDLE_DIR con default
+    /// ACCANTO al GGUF. In sandbox la cartella del modello può non essere
+    /// scrivibile — stessa ragione per cui DS4_Q4_CACHE_DIR DeepSeek punta
+    /// ad Application Support. Politica per load: sidecar già presente
+    /// accanto al modello → riusalo (es. costruito dalla demo); cartella
+    /// scrivibile → costruisci lì, condiviso con la demo; altrimenti
+    /// Application Support in una directory per-modello (nome-dimensione,
+    /// stessa scopatura del checkpoint disk-KV GLM). Deterministico a ogni
+    /// chiamata, come le directory DeepSeek fissate in init.
+    nonisolated static func prepareGLMSidecarEnvironment(modelPath: String) {
+        guard !modelPath.isEmpty else { return }
+        let fm = FileManager.default
+        let parent = (modelPath as NSString).deletingLastPathComponent
+        let siblingQ4 = modelPath + ".glm-layers-q4"
+        let siblingLegacy = modelPath + ".glm-experts"
+        let managed = glmSidecarDirectory(modelPath: modelPath)
+        let q4Dir: String
+        if fm.fileExists(atPath: siblingQ4) || fm.isWritableFile(atPath: parent) {
+            q4Dir = siblingQ4
+        } else {
+            q4Dir = managed.appendingPathComponent("layers-q4", isDirectory: true).path
+        }
+        let legacyDir = fm.fileExists(atPath: siblingLegacy)
+            ? siblingLegacy
+            : managed.appendingPathComponent("experts", isDirectory: true).path
+        _ = setenv("DS4_GLM_LAYERQ4_DIR", q4Dir, 1)
+        _ = setenv("DS4_GLM_BUNDLE_DIR", legacyDir, 1)
+    }
+
+    /// Application Support/DwarfStar/glm-sidecar/<file>-<size>: la casa dei
+    /// sidecar GLM quando la cartella del modello non è scrivibile.
+    nonisolated static func glmSidecarDirectory(modelPath: String) -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let file = (modelPath as NSString).lastPathComponent
+        let attributes = try? FileManager.default.attributesOfItem(atPath: modelPath)
+        let size = (attributes?[.size] as? UInt64) ?? 0
+        return base.appendingPathComponent("DwarfStar/glm-sidecar/\(file)-\(size)",
+                                           isDirectory: true)
+    }
 }

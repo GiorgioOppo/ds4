@@ -2,8 +2,11 @@
 
 # Tuning Views
 
-- `TuningView.swift` presents expert-cache sizing, mixed-quant pool policy, hit
-  rate, and routing concentration supplied by the active engine.
+- `TuningView.swift` renders the panel provided by the per-backend UI class
+  (`Settings/BackendUI`): DeepSeek shows expert-cache sizing, mixed-quant pool
+  policy, hit rate, and routing concentration; GLM re-exposes its
+  residency/streaming steppers with a pointer to the measurement benchmark;
+  other backends fall back to an unavailable view.
 - `AgentsView.swift` edits agent prompts, icons, tool grants, and JSON
   import/export.
 
