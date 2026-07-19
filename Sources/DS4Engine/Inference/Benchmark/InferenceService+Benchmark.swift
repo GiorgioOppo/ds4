@@ -1060,16 +1060,16 @@ public struct BenchPoint: Sendable {
             // A cancelled auto-tune restoration must be allowed to retry this
             // work instead of publishing a cold engine as already warmed.
             warmedUp = true
-            FileHandle.standardError.write(Data(String(
-                format: "DS4 engine: warmup completato in %.1fs (pool esperti + kernel caldi)\n",
-                Date().timeIntervalSince(t0)).utf8))
+            log(String(
+                format: "warmup completato in %.1fs (pool esperti + kernel caldi)",
+                Date().timeIntervalSince(t0)))
             resetConversation(systemPrompt: saved)
             return true
         } catch {
             // Best-effort: un warmup fallito non deve bloccare nulla — il primo
             // messaggio reale pagherà la partenza fredda come prima.
             warmedUp = false
-            FileHandle.standardError.write(Data("DS4 engine: warmup fallito: \(error)\n".utf8))
+            log("warmup fallito: \(error)")
             resetConversation(systemPrompt: saved)
             return false
         }

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import DS4Engine
+import DS4Core
 
 @main
 struct DwarfStarApp: App {
@@ -16,7 +17,7 @@ struct DwarfStarApp: App {
         // never expose a half-winner/half-baseline configuration to this launch.
         let recovery = MachineAutoTuneTransactionStore.recoverAtLaunch()
         if let message = recovery.logMessage {
-            FileHandle.standardError.write(Data(("DS4: \(message)\n").utf8))
+            DS4Log.info("autotune", message)
         }
         let settings = AppSettings()
         _settings = State(initialValue: settings)

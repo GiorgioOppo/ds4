@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0076A5A836338F6A24D66F0D /* GLM52AttentionRotationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5F75D1D42714803AF224730 /* GLM52AttentionRotationTests.swift */; };
+		01288A22B7874591EFDE356D /* DeepSeekSettingsUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCC583DC184C832D16DD5CC /* DeepSeekSettingsUI.swift */; };
 		0154029C5ACF17871D9BE83F /* MetalDense.swift in Sources */ = {isa = PBXBuildFile; fileRef = C33B22E66841DF4F6949AB31 /* MetalDense.swift */; };
 		01D62BCEDBE239A489B32940 /* ProjectCache+Files.swift in Sources */ = {isa = PBXBuildFile; fileRef = D270D230B2F2F9EDF446E897 /* ProjectCache+Files.swift */; };
 		0253E572CD85106621427DC6 /* LocalServer+Responses.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4DCB53A949477E48E4B50F7 /* LocalServer+Responses.swift */; };
@@ -24,6 +25,7 @@
 		097829B73B8C4B7CD8F0A2EA /* StreamingDecoder+LayerExecution.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE66760C0FA2E09DDD88F221 /* StreamingDecoder+LayerExecution.swift */; };
 		0B7E38B695BFFED89C55166D /* BenchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68C47011BF70F79E49E26DEE /* BenchView.swift */; };
 		0C644EF919516B54E684E893 /* StreamingDecoder+Forward.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DAABC68A0D5E3DCD9467A92 /* StreamingDecoder+Forward.swift */; };
+		0C6AEB94AEFD2EB7D079DBBD /* GLM52SettingsUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF5BC0D60E37C789963108AA /* GLM52SettingsUI.swift */; };
 		0D3B629F360B02974C5E4299 /* DistFileMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CCDC6C175CE654B368B5AA2 /* DistFileMessages.swift */; };
 		0D4B90EF598537A755259E2E /* DiskKVStore+Serialization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8745A6A73847D523C964B071 /* DiskKVStore+Serialization.swift */; };
 		0E3778C39F3BED3BC97BBF89 /* ProjectCache+Editing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55BAA80EEC70CF4DF6FDFFA1 /* ProjectCache+Editing.swift */; };
@@ -50,6 +52,7 @@
 		19FCD84BAFE7BF1890EE96C0 /* DistWorker+Files.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E047A07E29B889651EC6FCB /* DistWorker+Files.swift */; };
 		1B79A26C63091E0C312DE33E /* MachineAutoTuneTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6E108C268C3775BF0EFC867 /* MachineAutoTuneTests.swift */; };
 		1BBD1D4F579A65784FB4E50F /* ModelArchitecture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55991DBB6DD2D56F93371CBD /* ModelArchitecture.swift */; };
+		1CBE16CE753AAE3C9D1F23F6 /* BackendSettingsUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5EC4F3DBD492903DFC11895 /* BackendSettingsUI.swift */; };
 		1D6921C5FC45E0F9E9C0B31E /* GLM52DecodeGraph.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07BFC548FFE5CA86034C66C8 /* GLM52DecodeGraph.swift */; };
 		1DAEA3B8CADFE4B75518424D /* GLM52StreamedExpertProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = F13886A6ADD49E7B334698B1 /* GLM52StreamedExpertProvider.swift */; };
 		1E526A309CACC12F101FD42A /* LocalServer+LegacyCompletions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72A38C97FF037082F516CB7D /* LocalServer+LegacyCompletions.swift */; };
@@ -596,6 +599,7 @@
 		1D6E25A233DEDA5E7E84E835 /* libDS4Core.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libDS4Core.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		1EAFF91002D3FD8DC2C5B41B /* GLM52IndexerTopKTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52IndexerTopKTests.swift; sourceTree = "<group>"; };
 		1FDF45E12C5958C152843BD3 /* MetalIndexerScore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerScore.swift; sourceTree = "<group>"; };
+		2036D61AFC009EA69BBBB24A /* README.it.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.it.md; sourceTree = "<group>"; };
 		211AB4B369422542ACE9F898 /* Subtract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Subtract.swift; sourceTree = "<group>"; };
 		216CA155A6B64AFB447015A1 /* LocalServer+OpenAIChat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalServer+OpenAIChat.swift"; sourceTree = "<group>"; };
 		21DEAFF4D6781CDDCF59DFF3 /* GLM52RealHeaderIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52RealHeaderIntegrationTests.swift; sourceTree = "<group>"; };
@@ -750,6 +754,7 @@
 		6F9B434F53D557A84EAD908F /* MetalGetRowsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGetRowsTests.swift; sourceTree = "<group>"; };
 		704A7924F7BE37060EB20E81 /* GraphFFNTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphFFNTests.swift; sourceTree = "<group>"; };
 		70C492C8BC58723E64C32946 /* GraphCompressor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphCompressor.swift; sourceTree = "<group>"; };
+		715BFFD67813AEF5FC03CD8A /* README.it.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.it.md; sourceTree = "<group>"; };
 		71BBA008B9F22097EB94652A /* MetalIndexerPool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPool.swift; sourceTree = "<group>"; };
 		72A38C97FF037082F516CB7D /* LocalServer+LegacyCompletions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalServer+LegacyCompletions.swift"; sourceTree = "<group>"; };
 		72CDEB8BA56E51030CFB5AC5 /* WebFetch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebFetch.swift; sourceTree = "<group>"; };
@@ -848,6 +853,7 @@
 		A570B14832FFFA612C8AC86E /* AttachmentViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentViews.swift; sourceTree = "<group>"; };
 		A5A43BA5DE36783B471282CD /* DistFrameHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistFrameHeader.swift; sourceTree = "<group>"; };
 		A5E43CA0AD3734BB75314681 /* GitHubToolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubToolTests.swift; sourceTree = "<group>"; };
+		A5EC4F3DBD492903DFC11895 /* BackendSettingsUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendSettingsUI.swift; sourceTree = "<group>"; };
 		A5F75D1D42714803AF224730 /* GLM52AttentionRotationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52AttentionRotationTests.swift; sourceTree = "<group>"; };
 		A6902CF862026571CFAD6477 /* StreamingDecoder+Generation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StreamingDecoder+Generation.swift"; sourceTree = "<group>"; };
 		A7ED640CB2CBE554263A44C7 /* ProjectRead.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectRead.swift; sourceTree = "<group>"; };
@@ -920,6 +926,7 @@
 		CA42134584A9542349688BE4 /* MetalSoftmaxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSoftmaxTests.swift; sourceTree = "<group>"; };
 		CA889187DFFE1AC80235A31D /* DiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsTests.swift; sourceTree = "<group>"; };
 		CB4552AD0A3259AAB04D8394 /* DistCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistCoordinator.swift; sourceTree = "<group>"; };
+		CB5CDEC7315F2618694F3606 /* README.it.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.it.md; sourceTree = "<group>"; };
 		CB76082DB7E5E259900F63DA /* TokenizerFactoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TokenizerFactoryTests.swift; sourceTree = "<group>"; };
 		CBF1799470CA92F86FB87DF1 /* ServerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerController.swift; sourceTree = "<group>"; };
 		CC31562F8ED73DC6DE443D48 /* DSV4Dims.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DSV4Dims.swift; sourceTree = "<group>"; };
@@ -931,6 +938,7 @@
 		CEFC43A3AC734248222CACA8 /* ProjectCache+Queries.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ProjectCache+Queries.swift"; sourceTree = "<group>"; };
 		CF06520B4940A14D0A9A4302 /* dsv4_rope.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = dsv4_rope.metal; sourceTree = "<group>"; };
 		CF0FB9856870589119AD4A7A /* EngineLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineLog.swift; sourceTree = "<group>"; };
+		CF5BC0D60E37C789963108AA /* GLM52SettingsUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52SettingsUI.swift; sourceTree = "<group>"; };
 		CFB5BAD85C9703E09F6FDB61 /* GraphUnary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphUnary.swift; sourceTree = "<group>"; };
 		CFCF20B95E895C6C0C9095DF /* GLM52PayloadReaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52PayloadReaderTests.swift; sourceTree = "<group>"; };
 		D1448CB098230A1E0E377DE9 /* ChatStore+Agents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+Agents.swift"; sourceTree = "<group>"; };
@@ -974,6 +982,7 @@
 		EC912984A3376FCB4C0F832E /* GLM52ResidentModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ResidentModel.swift; sourceTree = "<group>"; };
 		ECB707A1393DBCA7AA6B0F4A /* MetalGLU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGLU.swift; sourceTree = "<group>"; };
 		ECCBCAB1AC76BB0D76219B01 /* ExpertBundle+MetalIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ExpertBundle+MetalIO.swift"; sourceTree = "<group>"; };
+		ECCC583DC184C832D16DD5CC /* DeepSeekSettingsUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepSeekSettingsUI.swift; sourceTree = "<group>"; };
 		ED8F11DB099681E8A45AE1A1 /* GraphAttnSplitKTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttnSplitKTests.swift; sourceTree = "<group>"; };
 		EDAE596E4D815E2BEF672D4D /* GLM52TokenizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52TokenizerTests.swift; sourceTree = "<group>"; };
 		EDE6492D25BA4C8DC74C83D8 /* IndexerSelectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IndexerSelectTests.swift; sourceTree = "<group>"; };
@@ -1210,6 +1219,7 @@
 		129BC2D2173D2B84E704E349 /* Settings */ = {
 			isa = PBXGroup;
 			children = (
+				A860378423B5E4A8A0175848 /* BackendUI */,
 				9AF683CADFB3282452927696 /* Views */,
 			);
 			path = Settings;
@@ -1342,6 +1352,7 @@
 				3F2DC26015A5F26D1BB44C79 /* glu.metal */,
 				E6F5317E7EE861DDF2A8EEE7 /* moe.metal */,
 				2EE9F816A835465F5555048E /* norm.metal */,
+				CB5CDEC7315F2618694F3606 /* README.it.md */,
 				7762331C4F4169AEB9A61831 /* README.md */,
 				DE1F8280AEF989CB323E8D87 /* repeat.metal */,
 				B0EA8C6E1912F5A56A949435 /* set_rows.metal */,
@@ -2223,6 +2234,7 @@
 		87B232AE201803421F88E676 /* metal */ = {
 			isa = PBXGroup;
 			children = (
+				715BFFD67813AEF5FC03CD8A /* README.it.md */,
 				42AEFDFA3BECD0733B996737 /* README.md */,
 				50B5999173768A1A4BC9070C /* common */,
 				2903CA3D42324B8A6C82A7EB /* deepseek */,
@@ -2449,6 +2461,16 @@
 			path = Core;
 			sourceTree = "<group>";
 		};
+		A860378423B5E4A8A0175848 /* BackendUI */ = {
+			isa = PBXGroup;
+			children = (
+				A5EC4F3DBD492903DFC11895 /* BackendSettingsUI.swift */,
+				ECCC583DC184C832D16DD5CC /* DeepSeekSettingsUI.swift */,
+				CF5BC0D60E37C789963108AA /* GLM52SettingsUI.swift */,
+			);
+			path = BackendUI;
+			sourceTree = "<group>";
+		};
 		A911816A2DA2BEE278F4A06F /* Inference */ = {
 			isa = PBXGroup;
 			children = (
@@ -2481,6 +2503,7 @@
 			isa = PBXGroup;
 			children = (
 				3A7F447742092B3A83F01631 /* glm52.metal */,
+				2036D61AFC009EA69BBBB24A /* README.it.md */,
 				E0545600A0014A2F1F1E129F /* README.md */,
 			);
 			path = glm5.2;
@@ -3575,6 +3598,7 @@
 				3910E408B91A91870A85B053 /* AppEnvironment.swift in Sources */,
 				02F54E13AE782A9953F00CC6 /* AppSettings.swift in Sources */,
 				B42ABA8B653CD2C7627A414B /* AttachmentViews.swift in Sources */,
+				1CBE16CE753AAE3C9D1F23F6 /* BackendSettingsUI.swift in Sources */,
 				FAABA8DE1DAC03EE890F5018 /* BenchController.swift in Sources */,
 				0B7E38B695BFFED89C55166D /* BenchView.swift in Sources */,
 				F2DBB515162AF69C3194EC59 /* ChatListView.swift in Sources */,
@@ -3596,6 +3620,7 @@
 				3AA5EFADE904170CE6E588F6 /* ChatTabView.swift in Sources */,
 				8E5D3AF34F7B6A6A6FE6C7A7 /* ChatView.swift in Sources */,
 				EF6B24941A1AC8C5F354DC7B /* ContentView.swift in Sources */,
+				01288A22B7874591EFDE356D /* DeepSeekSettingsUI.swift in Sources */,
 				95C304D24A5BBC46ECA2C2D6 /* DiagnosticsController.swift in Sources */,
 				1349A19AB693BD1A6069BDB5 /* DiagnosticsView.swift in Sources */,
 				2029FB5CFF3FD821B7C40CCF /* DistributedController.swift in Sources */,
@@ -3605,6 +3630,7 @@
 				44EA43EBD5EA9FC300E03717 /* DwarfStarApp.swift in Sources */,
 				E908F42F91F2713ED7B51EFF /* EngineActivityGate.swift in Sources */,
 				19AD32520137A46781A53BF9 /* EngineLog.swift in Sources */,
+				0C6AEB94AEFD2EB7D079DBBD /* GLM52SettingsUI.swift in Sources */,
 				1394885E24778BF511F8EE1B /* HTTPRequest.swift in Sources */,
 				C1056B1242EC7922CF758ACA /* LocalServer+Anthropic.swift in Sources */,
 				657F2F85E60570F56AFC8D01 /* LocalServer+HTTPResponses.swift in Sources */,
@@ -4126,7 +4152,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -4156,7 +4182,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 10;
+				CURRENT_PROJECT_VERSION = 11;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;

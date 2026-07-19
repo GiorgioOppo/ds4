@@ -51,6 +51,7 @@ public final class GLM52StreamedExpertProvider {
             try GLM52ExpertBundle.open(
                 directory: $0, layer: layer, weights: weights,
                 expertCount: Int(weightMap.configuration.shape.nExpert),
+                sourcePath: reader.path,
                 sourceFileSize: reader.fileSize)
         }
         try self.init(reader: reader, layer: layer, weights: weights,

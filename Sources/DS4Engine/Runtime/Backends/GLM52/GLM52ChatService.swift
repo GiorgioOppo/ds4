@@ -177,7 +177,9 @@ public actor GLM52ChatService {
             var logits = try service.engine.prefill(tokens)
             let prefillSeconds = max(
                 Date().timeIntervalSince(prefillStart), 0.001)
-            let prefillReport = service.engine.streamingReport()
+            let prefillReport = service.engine.profileReport(
+                title: "Profilo prefill")
+                + "\n" + service.engine.streamingReport()
             service.engine.resetStreamingStats()
             let decodeStart = Date()
             var produced = 0
@@ -190,7 +192,9 @@ public actor GLM52ChatService {
             }
             let decodeSeconds = max(
                 Date().timeIntervalSince(decodeStart), 0.001)
-            let decodeReport = service.engine.streamingReport()
+            let decodeReport = service.engine.profileReport(
+                title: "Profilo decode")
+                + "\n" + service.engine.streamingReport()
             service.engine.resetContext()
             return BenchmarkNumbers(
                 prefillTps: Double(tokens.count) / prefillSeconds,
@@ -220,6 +224,39 @@ public actor GLM52ChatService {
     private var tools: [ToolSpec] = []
 
     public func committedTokens() -> Int { service.engine.position }
+
+    /// Hit/miss dell'arena esperti per la riga di tuning della GUI (snapshot
+    /// lock-protetto sul motore, sicuro anche a generazione in corso).
+    public func expertArenaCounters() -> (hits: Int, misses: Int)? {
+        service.engine.expertArenaCounters()
+    }
+
+    /// Esito dell'auto-tune dei knob di caricamento (report + vincitori
+    /// come nome-env → valore; "" = default del motore).
+    public struct AutoTuneOutcome: Sendable {
+        public let report: String
+        public let winners: [String: String]
+    }
+
+    /// Auto-tune SENZA servizio vivo: il chiamante scarica il modello prima
+    /// (un solo motore alla volta — ogni misura costruisce e getta il suo)
+    /// e lo ricarica coi vincitori dopo. Wrapper GUI-friendly di
+    /// GLM52ResidentModel.autoTune: knob ESATTI di caricamento, un gradino
+    /// alla volta, ~1 min a configurazione.
+    public static func autoTune(modelPath: String, genTokens: Int = 12)
+        throws -> AutoTuneOutcome {
+        let runtime = try MetalRuntime()
+        let model = try GGUFModel(path: modelPath, metalMapping: false,
+                                  prefetchCPU: false)
+        let tokenizer = try GLM52Tokenizer(model: model)
+        let tokens = try tokenizer.encodeChatPrompt(
+            prompt: "Auto-tune: misura sintetica dei knob di caricamento.")
+        let outcome = try GLM52ResidentModel.autoTune(
+            runtime: runtime, path: modelPath, prompt: tokens,
+            genTokens: genTokens)
+        return AutoTuneOutcome(report: outcome.report,
+                               winners: outcome.winners)
+    }
 
     /// Append a user message to the running transcript and generate.
     public func send(userText: String, thinkMode: DS4ThinkMode,

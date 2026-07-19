@@ -18,7 +18,9 @@ import DS4Core
 /// dove `hidden` è l'hidden finale pre-head del modello principale alla
 /// posizione corrente e il blocco è un layer transformer proprio del modulo
 /// MTP (con la SUA attention e quindi un suo KV incrementale).
-public struct MTPSidecar {
+public struct MTPSidecar: DS4Logging {
+    public static let logTag = "mtp"
+
     /// Ruoli d'interfaccia riconosciuti. Le conversioni llama.cpp chiamano i
     /// tensori blk.N.nextn.* (eh_proj, embed_tokens, enorm, hnorm,
     /// shared_head.*); altri converter usano nomi mtp.* o i nomi del modello
@@ -79,8 +81,8 @@ public struct MTPSidecar {
             guard let t else { return "    \(label): MANCANTE" }
             return "    \(label): \(t.name)  \(t.typeName)  [\(shape(t))]  (\(t.bytes >> 20) MB)"
         }
-        var s = "DS4 mtp: sidecar \((model.path as NSString).lastPathComponent) — "
-            + "\(model.tensors.count) tensori, \(model.size >> 20) MB"
+        var s = DS4Log.line(Self.logTag, "sidecar \((model.path as NSString).lastPathComponent) — "
+            + "\(model.tensors.count) tensori, \(model.size >> 20) MB")
         s += "\n" + line("eh_proj      ", inventory.ehProj)
         s += "\n" + line("embed_tokens ", inventory.embedTokens)
         s += "\n" + line("enorm        ", inventory.enorm)

@@ -8,7 +8,10 @@ import Foundation
 // bound to their source GGUF by an identity header (file size plus the three
 // tensor offsets and types); a stale or foreign bundle is refused, never
 // silently served. Build is one-time, per layer, resumable (existing valid
-// bundles are skipped) and atomic (.part then rename).
+// bundles are skipped) and atomic. I record vivono nel PACK UNICO
+// glm52-experts.glmsidecar (stesso contenitore a sezioni del sidecar Q4);
+// i file per-layer legacy restano leggibili e vengono migrati nel pack
+// alla prima build successiva.
 //
 // Disk cost is honest and deliberate: the routed payload is duplicated
 // (~most of the GGUF). This is the same trade the DeepSeek bundle makes —
@@ -49,6 +52,9 @@ public final class GLM52ExpertBundle {
 
     private let reader: GLM52PayloadReader
     private let payload: GLM52WeightDescriptor
+    /// True quando il record vive nel pack unico; false = file per-layer
+    /// legacy (candidato alla migrazione) o vista embedded nel sidecar.
+    public let fromPack: Bool
 
     public static func fileName(layer: Int) -> String {
         "glm52-blk\(layer).experts"
@@ -86,18 +92,50 @@ public final class GLM52ExpertBundle {
         return bytes
     }
 
-    /// Open and validate a layer bundle against the live weight map; nil if
-    /// the file does not exist, throws if it exists but does not match.
+    /// Open and validate a layer bundle against the live weight map; nil
+    /// quando assente, throws se esiste ma non corrisponde. Ordine di
+    /// ricerca: prima la sezione nel PACK UNICO, poi il file per-layer
+    /// legacy (leggibile finché non migrato nel pack alla prossima build).
     public static func open(directory: String, layer: Int,
                             weights: GLM52RoutedExpertWeights,
                             expertCount: Int,
+                            sourcePath: String,
                             sourceFileSize: UInt64) throws
         -> GLM52ExpertBundle? {
+        if let index = try GLM52SidecarPack.scan(
+               directory: directory,
+               fileName: GLM52SidecarPack.expertsFileName(
+                   sourcePath: sourcePath),
+               legacyFileName: GLM52SidecarPack.legacyExpertsFileName,
+               sourceFileSize: sourceFileSize),
+           let section = index.sections[layer] {
+            let pack = try GLM52PayloadReader(path: index.path)
+            return try open(
+                reader: try pack.windowed(offset: section.offset,
+                                          length: section.length),
+                at: index.path + "#blk\(layer)", fromPack: true,
+                layer: layer, weights: weights, expertCount: expertCount,
+                sourceFileSize: sourceFileSize)
+        }
         let bundlePath = path(directory: directory, layer: layer)
         guard FileManager.default.fileExists(atPath: bundlePath) else {
             return nil
         }
         let reader = try GLM52PayloadReader(path: bundlePath)
+        return try open(reader: reader, at: bundlePath, fromPack: false,
+                        layer: layer, weights: weights,
+                        expertCount: expertCount,
+                        sourceFileSize: sourceFileSize)
+    }
+
+    /// Validazione comune: file per-layer o vista finestrata sulla sezione
+    /// del pack — stessi offset interni per costruzione.
+    private static func open(reader: GLM52PayloadReader, at bundlePath: String,
+                             fromPack: Bool, layer: Int,
+                             weights: GLM52RoutedExpertWeights,
+                             expertCount: Int,
+                             sourceFileSize: UInt64) throws
+        -> GLM52ExpertBundle? {
         guard reader.fileSize >= UInt64(headerBytes) else {
             throw GLM52ExpertBundleError.invalidHeader(path: bundlePath)
         }
@@ -123,7 +161,7 @@ public final class GLM52ExpertBundle {
             layer: layer, expertCount: expertCount,
             gateBytes: perGate, upBytes: perUp, downBytes: perDown,
             gateUpType: weights.gate.type, downType: weights.down.type,
-            reader: reader,
+            reader: reader, fromPack: fromPack,
             payload: GLM52WeightDescriptor(
                 name: "bundle.blk\(layer).payload",
                 type: weights.gate.type, dims: [],
@@ -143,7 +181,7 @@ public final class GLM52ExpertBundle {
             layer: layer, expertCount: expertCount,
             gateBytes: gateBytes, upBytes: upBytes, downBytes: downBytes,
             gateUpType: gateUpType, downType: downType,
-            reader: reader,
+            reader: reader, fromPack: false,
             payload: GLM52WeightDescriptor(
                 name: "pack.blk\(layer).experts",
                 type: gateUpType, dims: [],
@@ -153,7 +191,7 @@ public final class GLM52ExpertBundle {
 
     private init(layer: Int, expertCount: Int, gateBytes: Int, upBytes: Int,
                  downBytes: Int, gateUpType: UInt32, downType: UInt32,
-                 reader: GLM52PayloadReader,
+                 reader: GLM52PayloadReader, fromPack: Bool,
                  payload: GLM52WeightDescriptor) {
         self.layer = layer
         self.expertCount = expertCount
@@ -163,6 +201,7 @@ public final class GLM52ExpertBundle {
         self.gateUpType = gateUpType
         self.downType = downType
         self.reader = reader
+        self.fromPack = fromPack
         self.payload = payload
     }
 
@@ -249,6 +288,7 @@ public final class GLM52ExpertBundle {
             let existing = (try? open(
                 directory: directory, layer: layer, weights: weights,
                 expertCount: Int(shape.nExpert),
+                sourcePath: reader.path,
                 sourceFileSize: reader.fileSize)) ?? nil
             if existing == nil, free < perLayer + minFreeBytes {
                 stopped = "spazio disco insufficiente (liberi "
@@ -287,11 +327,27 @@ public final class GLM52ExpertBundle {
                              reader: GLM52PayloadReader,
                              progress: ((Int, Int) -> Void)? = nil) throws
         -> Bool {
+        let packName = GLM52SidecarPack.expertsFileName(
+            sourcePath: reader.path)
         let existing = (try? open(directory: directory, layer: layer,
                                   weights: weights,
                                   expertCount: expertCount,
+                                  sourcePath: reader.path,
                                   sourceFileSize: reader.fileSize)) ?? nil
-        if existing != nil { return false }
+        if let existing {
+            if existing.fromPack { return false }
+            // Bundle valido ma ancora file per-layer: MIGRAZIONE nel pack
+            // unico — copia grezza e rimozione del file solo dopo.
+            try GLM52SidecarPack.append(
+                directory: directory, fileName: packName,
+                legacyFileName: GLM52SidecarPack.legacyExpertsFileName,
+                layer: layer,
+                contentsOf: path(directory: directory, layer: layer),
+                sourceFileSize: reader.fileSize)
+            try? FileManager.default.removeItem(
+                atPath: path(directory: directory, layer: layer))
+            return true
+        }
         try FileManager.default.createDirectory(
             atPath: directory, withIntermediateDirectories: true)
         let finalPath = path(directory: directory, layer: layer)
@@ -318,9 +374,16 @@ public final class GLM52ExpertBundle {
         }
         try handle.synchronize()
         try handle.close()
-        _ = try FileManager.default.replaceItemAt(
-            URL(fileURLWithPath: finalPath),
-            withItemAt: URL(fileURLWithPath: partPath))
+        // Nel PACK UNICO (stesso contenitore a sezioni del sidecar Q4): la
+        // sezione è l'immagine del .part; un eventuale file per-layer
+        // stantio viene reclamato solo DOPO che il pack è durabile.
+        try GLM52SidecarPack.append(
+            directory: directory, fileName: packName,
+            legacyFileName: GLM52SidecarPack.legacyExpertsFileName,
+            layer: layer,
+            contentsOf: partPath, sourceFileSize: reader.fileSize)
+        try? FileManager.default.removeItem(atPath: partPath)
+        try? FileManager.default.removeItem(atPath: finalPath)
         return true
     }
 }

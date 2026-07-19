@@ -18,7 +18,9 @@ import DS4Core
 // Built once next to the model (.tmp + rename, torn files impossible);
 // validated by size/geometry + per-layer content fingerprints; any failure
 // logs and falls back to the plain GGUF reads.
-public final class ExpertBundle: @unchecked Sendable {
+public final class ExpertBundle: @unchecked Sendable, DS4Logging {
+    public static let logTag = "expbundle"
+
     let fd: Int32
     let layers: Range<Int>
     let nExpert: Int
@@ -53,10 +55,6 @@ public final class ExpertBundle: @unchecked Sendable {
     static let magic: UInt32 = 0x4245_5344   // "DSEB" little-endian
     static let version: UInt32 = 1
     static let align = 4096
-
-    static func log(_ s: String) {
-        FileHandle.standardError.write(Data(("DS4 expbundle: " + s + "\n").utf8))
-    }
 
     deinit { close(fd) }
 

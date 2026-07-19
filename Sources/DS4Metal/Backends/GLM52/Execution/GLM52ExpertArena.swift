@@ -27,6 +27,10 @@ final class GLM52ExpertArena {
         var hitBytes: UInt64 = 0
         var readBytes: UInt64 = 0
         var speculativeBytes: UInt64 = 0
+        // Conteggi in record, per le righe hit/miss del profilo per-fase.
+        var hitCount = 0
+        var readCount = 0
+        var speculativeCount = 0
     }
 
     let buffer: MTLBuffer
@@ -95,7 +99,10 @@ final class GLM52ExpertArena {
             let key = Self.key(layer: layer, id: id)
             if let slot = map[key] {
                 slots[slot].tick = tick
-                if !speculative { stats.hitBytes += UInt64(recordBytes) }
+                if !speculative {
+                    stats.hitBytes += UInt64(recordBytes)
+                    stats.hitCount += 1
+                }
                 reservations.append(Reservation(
                     rank: rank, id: id, slot: slot, fresh: false,
                     inFlight: slots[slot].filling))
@@ -126,8 +133,10 @@ final class GLM52ExpertArena {
             slots[victim].filling = group
             if speculative {
                 stats.speculativeBytes += UInt64(recordBytes)
+                stats.speculativeCount += 1
             } else {
                 stats.readBytes += UInt64(recordBytes)
+                stats.readCount += 1
             }
             reservations.append(Reservation(
                 rank: rank, id: id, slot: victim, fresh: true,

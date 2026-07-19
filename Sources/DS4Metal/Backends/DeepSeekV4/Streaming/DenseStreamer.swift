@@ -154,10 +154,10 @@ public final class DenseStreamer: @unchecked Sendable {
             maxSlot = max(maxSlot, off)
         }
         if scoringDeferred > 0 {
-            FileHandle.standardError.write(Data(
-                ("DS4 lazy-idx: indexer.attn_q_b/proj fuori dal piano per-token — " +
-                 "\(scoringDeferred / (1 << 20)) MB/token in meno dal disco; " +
-                 "caricamento residente una sola volta alla soglia live\n").utf8))
+            DS4Log.info("lazy-idx",
+                "indexer.attn_q_b/proj fuori dal piano per-token — " +
+                "\(scoringDeferred / (1 << 20)) MB/token in meno dal disco; " +
+                "caricamento residente una sola volta alla soglia live")
         }
         if !compJobs.isEmpty {
             if compQ8 {
@@ -190,9 +190,9 @@ public final class DenseStreamer: @unchecked Sendable {
                     }
                     residentBytes += bytes
                 }
-                FileHandle.standardError.write(Data(
-                    ("DS4 dense-stream: proiezioni compressori NSA residenti — " +
-                     "\(residentBytes / (1 << 20)) MB wired, altrettanti MB/token in meno dal disco\n").utf8))
+                DS4Log.info("dense-stream",
+                    "proiezioni compressori NSA residenti — " +
+                    "\(residentBytes / (1 << 20)) MB wired, altrettanti MB/token in meno dal disco")
             }
         }
         if !q4Jobs.isEmpty {
@@ -465,9 +465,9 @@ public final class DenseStreamer: @unchecked Sendable {
         }
         indexerScoringActivated = true
         lazyIndexerJobs.removeAll(keepingCapacity: false)
-        FileHandle.standardError.write(Data(
-            ("DS4 lazy-idx: scoring attivato — \(residentBytes / (1 << 20)) MB " +
-             "caricati una volta in buffer residenti" +
-             (lockIndexerResident ? " (mlock richiesto)" : "") + "\n").utf8))
+        DS4Log.info("lazy-idx",
+            "scoring attivato — \(residentBytes / (1 << 20)) MB " +
+            "caricati una volta in buffer residenti" +
+            (lockIndexerResident ? " (mlock richiesto)" : ""))
     }
 }

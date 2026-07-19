@@ -66,8 +66,7 @@ extension DenseStreamer {
             }
             bytes += t.byteLength
         }
-        FileHandle.standardError.write(Data(
-            "DS4 comp-q8: \(jobs.count) proiezioni residenti, \(bytes >> 20) MB; cache: \(path)\n".utf8))
+        DS4Log.info("comp-q8", "\(jobs.count) proiezioni residenti, \(bytes >> 20) MB; cache: \(path)")
     }
 
     private static func quantizeCompressorQ8(rt: MetalRuntime, fd: Int32,

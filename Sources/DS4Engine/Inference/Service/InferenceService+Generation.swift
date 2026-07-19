@@ -59,9 +59,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 committedIds = hit.tokens
                 suffixIds.removeFirst(hit.tokens.count)
                 lastDiskStoreCount = hit.tokens.count
-                FileHandle.standardError.write(Data(String(
-                    format: "DS4 diskkv: ripristino streaming %d token in %.2fs (F_NOCACHE, per-layer)\n",
-                    hit.tokens.count, Date().timeIntervalSince(t0)).utf8))
+                DiskKVStore.log(String(
+                    format: "ripristino streaming %d token in %.2fs (F_NOCACHE, per-layer)",
+                    hit.tokens.count, Date().timeIntervalSince(t0)))
             } else {
                 committedIds = []          // fall back to a cold prefill
                 kvDirty = true             // a partial import may have touched the KV
@@ -130,9 +130,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 continuation.yield(.progress("checkpoint del prefisso su disco (\(startPos + pfDone) token)…"))
                 let t0 = Date()
                 let box = DiskKVStore.SnapshotBox(decoder.exportKV(nKeys: startPos + pfDone))
-                FileHandle.standardError.write(Data(String(
-                    format: "DS4 diskkv: snapshot prefisso %d token esportato in %.2fs\n",
-                    startPos + pfDone, Date().timeIntervalSince(t0)).utf8))
+                DiskKVStore.log(String(
+                    format: "snapshot prefisso %d token esportato in %.2fs",
+                    startPos + pfDone, Date().timeIntervalSince(t0)))
                 let idsSnap = resumablePrefill ? committedIds
                                                : committedIds + Array(suffixIds[0..<pfDone])
                 let name = modelName
@@ -286,9 +286,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                 regime = String(format: " — regime %.2f tok/s (%.0f ms/token)",
                                 rTok / max(rWall, 0.001), rWall / rTok * 1000)
             }
-            FileHandle.standardError.write(Data(String(
-                format: "DS4 gui: %d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f%@\n",
-                produced, wall, wall * per, engine * per, sampleS * per, other * per, regime).utf8))
+            DS4Log.info("gui", String(
+                format: "%d token in %.1f s — %.0f ms/token = motore %.0f + sampler %.0f + stream/UI %.0f%@",
+                produced, wall, wall * per, engine * per, sampleS * per, other * per, regime))
             // La STESSA attribuzione anche nello stream (→ log del pannello
             // Server): "il server è lento" si diagnostica solo sapendo se il
             // tempo è nel motore (gather/GPU: pressione di memoria, es. Xcode
@@ -337,9 +337,9 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             // scrittura invece di tenere l'intero checkpoint fino alla fine.
             let box = DiskKVStore.SnapshotBox(decoder.exportKV(nKeys: committedIds.count))
             let snapS = Date().timeIntervalSince(t0)
-            FileHandle.standardError.write(Data(String(
-                format: "DS4 diskkv: snapshot %d token esportato in %.2fs\n",
-                committedIds.count, snapS).utf8))
+            DiskKVStore.log(String(
+                format: "snapshot %d token esportato in %.2fs",
+                committedIds.count, snapS))
             // La SCRITTURA va fuori dal percorso critico del turno: l'ultimo
             // token è già sullo schermo, ma prima il turno restava "aperto"
             // finché il checkpoint non era su disco (secondi percepiti come

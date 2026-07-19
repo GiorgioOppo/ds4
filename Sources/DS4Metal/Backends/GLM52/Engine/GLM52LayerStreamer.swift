@@ -215,7 +215,13 @@ public final class GLM52LayerStreamer {
     /// Callers may keep up to `prefetchDepth` prefetches outstanding (one
     /// slot is always the one being consumed); fills run CONCURRENTLY and
     /// the caller consumes them strictly in prefetch order.
-    func prefetch(_ tensors: GLM52StreamedLayerTensors) {
+    /// `parallel` sceglie il fill a chunk concorrenti (misurato −11% sul
+    /// prefill layer-major, dove il layer si ammortizza su tutti i token) o
+    /// quello seriale (decode: a piena coda il prefetch affamava le letture
+    /// demand degli esperti — gather 2.6 → 1.6 GB/s — e perdeva più dello
+    /// stallo che eliminava).
+    func prefetch(_ tensors: GLM52StreamedLayerTensors,
+                  parallel: Bool = false) {
         stateLock.lock()
         let slot = slots[nextSlot]
         nextSlot = (nextSlot + 1) % slots.count
@@ -277,35 +283,117 @@ public final class GLM52LayerStreamer {
                 self.disableMetalIO()
             }
             do {
-                func fill(_ descriptor: GLM52WeightDescriptor?,
-                          _ buffer: MTLBuffer) throws {
-                    guard let descriptor else { return }
-                    guard Int(descriptor.bytes) <= buffer.length else {
-                        throw MetalError.unsupported(
-                            "streamed tensor \(descriptor.name) exceeds its "
-                            + "staging slot")
-                    }
-                    try reader.read(descriptor, into:
-                        UnsafeMutableRawBufferPointer(
-                            start: buffer.contents(),
-                            count: Int(descriptor.bytes)))
-                }
-                try fill(tensors.qA, slot.buffers.qA)
-                try fill(tensors.qB, slot.buffers.qB)
-                try fill(tensors.kvA, slot.buffers.kvA)
-                try fill(tensors.keyB, slot.buffers.keyB)
-                try fill(tensors.valueB, slot.buffers.valueB)
-                try fill(tensors.attnOutput, slot.buffers.attnOutput)
-                try fill(tensors.indexerKey, slot.buffers.indexerKey)
-                try fill(tensors.indexerQueryB, slot.buffers.indexerQueryB)
-                try fill(tensors.sharedGate, slot.buffers.sharedGate)
-                try fill(tensors.sharedUp, slot.buffers.sharedUp)
-                try fill(tensors.sharedDown, slot.buffers.sharedDown)
+                try Self.chunkedFill(tensors: tensors, slot: slot,
+                                     reader: reader, parallel: parallel)
             } catch {
                 slot.fillError = error
             }
             slot.ready.signal()
         }
+    }
+
+    /// Sotto-intervalli per tensore del fill parallelo (DS4_GLM_READ_SPLIT,
+    /// default 4, 1 ripristina di fatto una pread per tensore). Latch
+    /// per-load via GLM52DispatchKnobs.refresh, come gli altri knob.
+    nonisolated(unsafe) private static var readSplit = max(1, min(8,
+        ProcessInfo.processInfo.environment["DS4_GLM_READ_SPLIT"]
+            .flatMap(Int.init) ?? 4))
+
+    static func refreshReadSplit(_ value: Int?) {
+        readSplit = max(1, min(8, value ?? 4))
+    }
+
+    /// Fill dello slot a chunk. `parallel` = fan-out su tutti i tensori del
+    /// layer più split dei grandi in sotto-intervalli (più pread concorrenti
+    /// = coda NVMe profonda; giusto per il PREFILL layer-major); altrimenti
+    /// i chunk vengono letti in serie sul thread di fill (decode: il ritmo
+    /// lento lascia la banda alle letture demand). Le letture ranged del
+    /// reader sono stateless e sicure verso destinazioni disgiunte.
+    private static func chunkedFill(tensors: GLM52StreamedLayerTensors,
+                                    slot: Slot,
+                                    reader: GLM52PayloadReader,
+                                    parallel: Bool) throws {
+        struct Chunk {
+            let descriptor: GLM52WeightDescriptor
+            let offset: UInt64
+            let length: UInt64
+            let destination: UnsafeMutableRawPointer
+        }
+        var chunks: [Chunk] = []
+        func plan(_ descriptor: GLM52WeightDescriptor?,
+                  _ buffer: MTLBuffer) throws {
+            guard let descriptor else { return }
+            let total = descriptor.bytes
+            guard total <= UInt64(buffer.length) else {
+                throw MetalError.unsupported(
+                    "streamed tensor \(descriptor.name) exceeds its "
+                    + "staging slot")
+            }
+            // Split solo dove ripaga: sotto-intervalli da almeno 4 MiB.
+            let minChunk: UInt64 = 4 << 20
+            let parts = max(1, min(UInt64(readSplit),
+                                   max(1, total / minChunk)))
+            let stride = (total + parts - 1) / parts
+            var offset: UInt64 = 0
+            while offset < total {
+                let length = min(stride, total - offset)
+                chunks.append(Chunk(
+                    descriptor: descriptor, offset: offset, length: length,
+                    destination: buffer.contents() + Int(offset)))
+                offset += length
+            }
+        }
+        try plan(tensors.qA, slot.buffers.qA)
+        try plan(tensors.qB, slot.buffers.qB)
+        try plan(tensors.kvA, slot.buffers.kvA)
+        try plan(tensors.keyB, slot.buffers.keyB)
+        try plan(tensors.valueB, slot.buffers.valueB)
+        try plan(tensors.attnOutput, slot.buffers.attnOutput)
+        try plan(tensors.indexerKey, slot.buffers.indexerKey)
+        try plan(tensors.indexerQueryB, slot.buffers.indexerQueryB)
+        try plan(tensors.sharedGate, slot.buffers.sharedGate)
+        try plan(tensors.sharedUp, slot.buffers.sharedUp)
+        try plan(tensors.sharedDown, slot.buffers.sharedDown)
+
+        func read(_ job: Chunk) throws {
+            try reader.read(job.descriptor, byteOffset: job.offset,
+                            byteCount: job.length,
+                            into: UnsafeMutableRawBufferPointer(
+                                start: job.destination,
+                                count: Int(job.length)))
+        }
+        // Decode: letture in serie ESATTAMENTE come lo storico — il ritmo
+        // lento del fill è ciò che lascia banda alle letture demand degli
+        // esperti (misurato: ogni variante più aggressiva o più throttled
+        // sposta il collo e perde).
+        guard parallel else {
+            for job in chunks { try read(job) }
+            return
+        }
+        nonisolated(unsafe) let jobs = chunks
+        nonisolated(unsafe) var failure: Error?
+        let failureLock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
+            // Priorità I/O UTILITY per la durata della pread: nel prefill
+            // layer-major il fan-out convive con le letture demand della
+            // fase esperti, che restano prioritarie. Ripristinata subito:
+            // i thread del pool sono condivisi con l'arena.
+            let previous = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
+            _ = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD,
+                               IOPOL_UTILITY)
+            defer {
+                _ = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD,
+                                   previous)
+            }
+            do {
+                try read(jobs[i])
+            } catch {
+                failureLock.lock()
+                if failure == nil { failure = error }
+                failureLock.unlock()
+            }
+        }
+        if let failure { throw failure }
     }
 
     /// Drop every outstanding prefetch — the heal after a pass abortito a

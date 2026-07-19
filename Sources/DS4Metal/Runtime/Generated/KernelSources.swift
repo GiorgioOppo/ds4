@@ -11125,7 +11125,7 @@ kernel void kernel_dsv4_softmax_pool(
     *((device float *) (dst + id*args.nb0 + ic*args.nb1)) = acc/sum;
 }
 """###,
-        "glm52": ###"""
+        "glm52_router": ###"""
 // GLM 5.2 (`glm-dsa`) kernels.
 //
 // Keep these kernels architecture-owned instead of adding GLM branches to the
@@ -11236,6 +11236,445 @@ kernel void kernel_glm52_router_select(
     }
 }
 
+"""###,
+        "glm52_quant": ###"""
+// GLM 5.2 — helper di dequant/dot per i K-quant (per-thread e simdgroup) — PRIMA di glm52_moe nell'\''ordine
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float glm52_half_at(device const uchar *p) {
+    return (float)(*(device const half *)p);
+}
+
+static inline uchar2 glm52_scale_min_k4(uint j, device const uchar *q) {
+    if (j < 4u) {
+        return uchar2(q[j] & 63u, q[j + 4u] & 63u);
+    }
+    return uchar2((q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u),
+                  (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u));
+}
+
+static inline float glm52_dot_q2_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 84u;
+        device const uchar *qs = base + 16u;
+        const float d = glm52_half_at(base + 80u);
+        const float dmin = glm52_half_at(base + 82u);
+        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
+            for (uint plane = 0u; plane < 4u; plane++) {
+                for (uint l = 0u; l < 32u; l++) {
+                    const uchar sc = base[half128 / 16u + plane * 2u + l / 16u];
+                    const uint q = (qs[half128 / 4u + l] >> (plane * 2u)) & 3u;
+                    const float w = d * (float)(sc & 0x0Fu) * (float)q -
+                        dmin * (float)(sc >> 4u);
+                    acc += w * x[sb * 256u + half128 + plane * 32u + l];
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q4_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 144u;
+        const float d = glm52_half_at(base);
+        const float dmin = glm52_half_at(base + 2u);
+        device const uchar *scales = base + 4u;
+        device const uchar *qs = base + 16u;
+        for (uint j = 0u; j < 8u; j++) {
+            const uchar2 sm = glm52_scale_min_k4(j, scales);
+            const float dj = d * (float)sm.x;
+            const float mj = dmin * (float)sm.y;
+            const uint chunk = (j / 2u) * 32u;
+            const uint shift = (j & 1u) * 4u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint q = (qs[chunk + l] >> shift) & 0x0Fu;
+                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q5_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 176u;
+        const float d = glm52_half_at(base);
+        const float dmin = glm52_half_at(base + 2u);
+        device const uchar *scales = base + 4u;
+        device const uchar *qh = base + 16u;
+        device const uchar *qs = base + 48u;
+        for (uint j = 0u; j < 8u; j++) {
+            const uchar2 sm = glm52_scale_min_k4(j, scales);
+            const float dj = d * (float)sm.x;
+            const float mj = dmin * (float)sm.y;
+            const uint chunk = (j / 2u) * 32u;
+            const uint shift = (j & 1u) * 4u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint q = ((qs[chunk + l] >> shift) & 0x0Fu) +
+                    ((qh[l] >> j) & 1u) * 16u;
+                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q6_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 210u;
+        device const uchar *ql = base;
+        device const uchar *qh = base + 128u;
+        device const char *scales = (device const char *)(base + 192u);
+        const float d = glm52_half_at(base + 208u);
+        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
+            const uint qlHalf = half128 / 2u;
+            const uint qhHalf = half128 / 4u;
+            const uint scHalf = half128 / 16u;
+            for (uint l = 0u; l < 32u; l++) {
+                const uint sub = l / 16u;
+                const uchar high = qh[qhHalf + l];
+                const int q1 = (int)((ql[qlHalf + l] & 0x0Fu) | ((high << 4u) & 0x30u)) - 32;
+                const int q2 = (int)((ql[qlHalf + l + 32u] & 0x0Fu) | ((high << 2u) & 0x30u)) - 32;
+                const int q3 = (int)((ql[qlHalf + l] >> 4u) | (high & 0x30u)) - 32;
+                const int q4 = (int)((ql[qlHalf + l + 32u] >> 4u) | ((high >> 2u) & 0x30u)) - 32;
+                const uint out0 = sb * 256u + half128 + l;
+                acc += d * (float)scales[scHalf + sub] * (float)q1 * x[out0];
+                acc += d * (float)scales[scHalf + sub + 2u] * (float)q2 * x[out0 + 32u];
+                acc += d * (float)scales[scHalf + sub + 4u] * (float)q3 * x[out0 + 64u];
+                acc += d * (float)scales[scHalf + sub + 6u] * (float)q4 * x[out0 + 96u];
+            }
+        }
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q8_0_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint b = 0u; b < width / 32u; b++) {
+        device const uchar *base = row + b * 34u;
+        const float d = glm52_half_at(base);
+        device const char *qs = (device const char *)(base + 2u);
+        for (uint i = 0u; i < 32u; i++) {
+            acc += d * (float)qs[i] * x[b * 32u + i];
+        }
+    }
+    return acc;
+}
+
+// IQ2_XXS: 66-byte superblocks of 256 — f16 scale + 32 uint16 words. Each
+// 32-value group decodes four 8-value cells through the shared grid/sign
+// tables the DeepSeek prelude already embeds (same concatenated library),
+// with db = d * (0.5 + top-nibble) * 0.25. Same emission order as
+// Quantize.dequantIQ2_XXS, the CPU reference.
+static inline float glm52_dot_iq2_xxs_row(device const uchar *row,
+                                          device const float *x,
+                                          uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 66u;
+        const float d = glm52_half_at(base);
+        device const ushort *qs = (device const ushort *)(base + 2u);
+        for (uint ib = 0u; ib < 8u; ib++) {
+            const uint aux0 = (uint)qs[4u * ib]
+                | ((uint)qs[4u * ib + 1u] << 16u);
+            const uint aux1 = (uint)qs[4u * ib + 2u]
+                | ((uint)qs[4u * ib + 3u] << 16u);
+            const float db = d * (0.5f + (float)(aux1 >> 28u)) * 0.25f;
+            for (uint l = 0u; l < 4u; l++) {
+                constant uchar *grid = (constant uchar *)
+                    (ds4_metal_iq2xxs_grid + ((aux0 >> (8u * l)) & 255u));
+                const uchar signs =
+                    ds4_metal_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
+                const uint out0 = sb * 256u + ib * 32u + l * 8u;
+                for (uint j = 0u; j < 8u; j++) {
+                    const float w = db * (float)grid[j]
+                        * (((signs >> j) & 1u) != 0u ? -1.0f : 1.0f);
+                    acc += w * x[out0 + j];
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+static inline uint glm52_kquant_row_bytes(uint type, uint width) {
+    switch (type) {
+        case 8u:  return (width / 32u) * 34u;
+        case 10u: return (width / 256u) * 84u;
+        case 12u: return (width / 256u) * 144u;
+        case 13u: return (width / 256u) * 176u;
+        case 14u: return (width / 256u) * 210u;
+        case 16u: return (width / 256u) * 66u;
+        default:  return 0u;
+    }
+}
+
+static inline float glm52_dot_kquant_row(uint type,
+                                         device const uchar *row,
+                                         device const float *x,
+                                         uint width) {
+    switch (type) {
+        case 8u:  return glm52_dot_q8_0_row(row, x, width);
+        case 10u: return glm52_dot_q2_K_row(row, x, width);
+        case 12u: return glm52_dot_q4_K_row(row, x, width);
+        case 13u: return glm52_dot_q5_K_row(row, x, width);
+        case 14u: return glm52_dot_q6_K_row(row, x, width);
+        case 16u: return glm52_dot_iq2_xxs_row(row, x, width);
+        default:  return 0.0f;
+    }
+}
+
+static inline float glm52_silu(float value) {
+    // Stable sigmoid, matching upstream sigmoid_stable.
+    const float s = value >= 0.0f
+        ? 1.0f / (1.0f + exp(-value))
+        : exp(value) / (1.0f + exp(value));
+    return value * s;
+}
+
+// MARK: - Cooperative (simdgroup-per-row) matvec variants
+//
+// The per-thread kernels above walk a WHOLE row per thread — a strided,
+// cache-hostile access pattern that leaves most of the memory bandwidth on
+// the table. These variants put one SIMD group on each row: the 32 lanes
+// stride the row's 32-element quant groups (so consecutive lanes read
+// consecutive weight blocks) and reduce with simd_sum. Same math, same
+// inputs, float-accumulation order differs only by the reduction tree.
+// The per-thread originals remain the reference and the DS4_GLM_SG=0
+// fallback.
+
+// Partial dot of ONE 32-element group `g` of a row: sb = g/8 selects the
+// 256-wide superblock (g IS the block for q8_0), j = g%8 the 32-chunk
+// inside it. Emission matches the row helpers above exactly.
+// VETTORIZZATO: letture short (il blocco q8_0 è largo 34 B, qs parte a +2 —
+// allineamento 2, mai 4: char4/uint sarebbero UB) spacchettate con as_type e
+// FMA float4. Stessa matematica del loop scalare a meno dell'ordine delle
+// somme (4 corsie parallele, d fattorizzato): entro la tolleranza dei test.
+static inline float glm52_dot_q8_0_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    device const uchar *base = row + g * 34u;
+    const float d = glm52_half_at(base);
+    device const short *qs = (device const short *)(base + 2u);
+    device const float4 *xv = (device const float4 *)(x + g * 32u);
+    float4 acc = 0.0f;
+    for (uint i = 0u; i < 8u; i++) {
+        const char2 a = as_type<char2>(qs[2u * i]);
+        const char2 b = as_type<char2>(qs[2u * i + 1u]);
+        acc += float4((float)a.x, (float)a.y,
+                      (float)b.x, (float)b.y) * xv[i];
+    }
+    return d * (acc.x + acc.y + acc.z + acc.w);
+}
+
+static inline float glm52_dot_q2_K_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    const uint sb = g / 8u;
+    const uint j = g % 8u;
+    const uint half128 = (j / 4u) * 128u;
+    const uint plane = j % 4u;
+    device const uchar *base = row + sb * 84u;
+    device const uchar *qs = base + 16u;
+    const float d = glm52_half_at(base + 80u);
+    const float dmin = glm52_half_at(base + 82u);
+    float acc = 0.0f;
+    for (uint l = 0u; l < 32u; l++) {
+        const uchar sc = base[half128 / 16u + plane * 2u + l / 16u];
+        const uint q = (qs[half128 / 4u + l] >> (plane * 2u)) & 3u;
+        const float w = d * (float)(sc & 0x0Fu) * (float)q -
+            dmin * (float)(sc >> 4u);
+        acc += w * x[sb * 256u + half128 + plane * 32u + l];
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q4_K_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    const uint sb = g / 8u;
+    const uint j = g % 8u;
+    device const uchar *base = row + sb * 144u;
+    const float d = glm52_half_at(base);
+    const float dmin = glm52_half_at(base + 2u);
+    const uchar2 sm = glm52_scale_min_k4(j, base + 4u);
+    const float dj = d * (float)sm.x;
+    const float mj = dmin * (float)sm.y;
+    device const uchar *qs = base + 16u;
+    const uint chunk = (j / 2u) * 32u;
+    const uint shift = (j & 1u) * 4u;
+    // VETTORIZZATO: il blocco q4_K è largo 144 B e qs parte a +16 con chunk
+    // multipli di 32 — letture uchar4 allineate; nibble e FMA in float4.
+    device const uchar4 *qv = (device const uchar4 *)(qs + chunk);
+    device const float4 *xv =
+        (device const float4 *)(x + sb * 256u + j * 32u);
+    float4 acc = 0.0f;
+    for (uint l = 0u; l < 8u; l++) {
+        const uchar4 q = qv[l];
+        acc += (dj * float4((float)((q.x >> shift) & 0x0Fu),
+                            (float)((q.y >> shift) & 0x0Fu),
+                            (float)((q.z >> shift) & 0x0Fu),
+                            (float)((q.w >> shift) & 0x0Fu))
+                - mj) * xv[l];
+    }
+    return acc.x + acc.y + acc.z + acc.w;
+}
+
+static inline float glm52_dot_q5_K_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    const uint sb = g / 8u;
+    const uint j = g % 8u;
+    device const uchar *base = row + sb * 176u;
+    const float d = glm52_half_at(base);
+    const float dmin = glm52_half_at(base + 2u);
+    const uchar2 sm = glm52_scale_min_k4(j, base + 4u);
+    const float dj = d * (float)sm.x;
+    const float mj = dmin * (float)sm.y;
+    device const uchar *qh = base + 16u;
+    device const uchar *qs = base + 48u;
+    const uint chunk = (j / 2u) * 32u;
+    const uint shift = (j & 1u) * 4u;
+    float acc = 0.0f;
+    for (uint l = 0u; l < 32u; l++) {
+        const uint q = ((qs[chunk + l] >> shift) & 0x0Fu) +
+            ((qh[l] >> j) & 1u) * 16u;
+        acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
+    }
+    return acc;
+}
+
+static inline float glm52_dot_q6_K_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    const uint sb = g / 8u;
+    const uint j = g % 8u;
+    const uint half128 = (j / 4u) * 128u;
+    const uint k = j % 4u;
+    device const uchar *base = row + sb * 210u;
+    device const uchar *ql = base;
+    device const uchar *qh = base + 128u;
+    device const char *scales = (device const char *)(base + 192u);
+    const float d = glm52_half_at(base + 208u);
+    const uint qlHalf = half128 / 2u;
+    const uint qhHalf = half128 / 4u;
+    const uint scHalf = half128 / 16u;
+    float acc = 0.0f;
+    for (uint l = 0u; l < 32u; l++) {
+        const uint sub = l / 16u;
+        const uchar high = qh[qhHalf + l];
+        int q;
+        float scale;
+        switch (k) {
+            case 0u:
+                q = (int)((ql[qlHalf + l] & 0x0Fu) | ((high << 4u) & 0x30u)) - 32;
+                scale = (float)scales[scHalf + sub];
+                break;
+            case 1u:
+                q = (int)((ql[qlHalf + l + 32u] & 0x0Fu) | ((high << 2u) & 0x30u)) - 32;
+                scale = (float)scales[scHalf + sub + 2u];
+                break;
+            case 2u:
+                q = (int)((ql[qlHalf + l] >> 4u) | (high & 0x30u)) - 32;
+                scale = (float)scales[scHalf + sub + 4u];
+                break;
+            default:
+                q = (int)((ql[qlHalf + l + 32u] >> 4u) | ((high >> 2u) & 0x30u)) - 32;
+                scale = (float)scales[scHalf + sub + 6u];
+                break;
+        }
+        acc += d * scale * (float)q * x[sb * 256u + half128 + k * 32u + l];
+    }
+    return acc;
+}
+
+static inline float glm52_dot_iq2_xxs_group(device const uchar *row,
+                                            device const float *x,
+                                            uint g) {
+    const uint sb = g / 8u;
+    const uint ib = g % 8u;
+    device const uchar *base = row + sb * 66u;
+    const float d = glm52_half_at(base);
+    device const ushort *qs = (device const ushort *)(base + 2u);
+    const uint aux0 = (uint)qs[4u * ib] | ((uint)qs[4u * ib + 1u] << 16u);
+    const uint aux1 = (uint)qs[4u * ib + 2u]
+        | ((uint)qs[4u * ib + 3u] << 16u);
+    const float db = d * (0.5f + (float)(aux1 >> 28u)) * 0.25f;
+    // VETTORIZZATO: la voce di griglia è UNA lettura ulong dalla constant
+    // memory (8 byte = 8 valori), i segni un byte; unpack e FMA in float4.
+    // db fattorizzato fuori dal loop: stessa matematica del percorso
+    // scalare a meno dell'ordine delle somme, entro la tolleranza dei test.
+    device const float4 *xv =
+        (device const float4 *)(x + sb * 256u + ib * 32u);
+    float4 acc = 0.0f;
+    for (uint l = 0u; l < 4u; l++) {
+        const ulong grid = ds4_metal_iq2xxs_grid[(aux0 >> (8u * l)) & 255u];
+        const uchar signs = ds4_metal_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
+        const float4 g0 = float4((float)((grid >>  0u) & 0xFFu),
+                                 (float)((grid >>  8u) & 0xFFu),
+                                 (float)((grid >> 16u) & 0xFFu),
+                                 (float)((grid >> 24u) & 0xFFu));
+        const float4 g1 = float4((float)((grid >> 32u) & 0xFFu),
+                                 (float)((grid >> 40u) & 0xFFu),
+                                 (float)((grid >> 48u) & 0xFFu),
+                                 (float)((grid >> 56u) & 0xFFu));
+        const float4 s0 = float4((signs & 1u) ? -1.0f : 1.0f,
+                                 (signs & 2u) ? -1.0f : 1.0f,
+                                 (signs & 4u) ? -1.0f : 1.0f,
+                                 (signs & 8u) ? -1.0f : 1.0f);
+        const float4 s1 = float4((signs & 16u) ? -1.0f : 1.0f,
+                                 (signs & 32u) ? -1.0f : 1.0f,
+                                 (signs & 64u) ? -1.0f : 1.0f,
+                                 (signs & 128u) ? -1.0f : 1.0f);
+        acc += g0 * s0 * xv[2u * l];
+        acc += g1 * s1 * xv[2u * l + 1u];
+    }
+    return db * (acc.x + acc.y + acc.z + acc.w);
+}
+
+static inline float glm52_dot_kquant_group(uint type,
+                                           device const uchar *row,
+                                           device const float *x,
+                                           uint g) {
+    switch (type) {
+        case 8u:  return glm52_dot_q8_0_group(row, x, g);
+        case 10u: return glm52_dot_q2_K_group(row, x, g);
+        case 12u: return glm52_dot_q4_K_group(row, x, g);
+        case 13u: return glm52_dot_q5_K_group(row, x, g);
+        case 14u: return glm52_dot_q6_K_group(row, x, g);
+        case 16u: return glm52_dot_iq2_xxs_group(row, x, g);
+        default:  return 0.0f;
+    }
+}
+
+// Dispatch: threadsPerThreadgroup = (32, NSG, 1) — each y-slice is exactly
+// one SIMD group — threadgroups = (ceil(row_count / NSG), 1, 1).
+"""###,
+        "glm52_kv": ###"""
+// GLM 5.2 — primitive della cache compatta DSA e store dei piani KV/indexer
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
+
 // MARK: - Compact DSA cache primitives
 
 // Cache-ready GLM KV rows contain a normalized 512-wide KV-LoRA prefix and the
@@ -11286,80 +11725,6 @@ kernel void kernel_glm52_store_compact_kv_f16(
             dst[i] = (half)src[KV_LORA_WIDTH + i];
         }
     }
-}
-
-// MARK: - DSA indexer scoring
-
-struct ds4_metal_args_glm52_indexer_scores {
-    uint32_t n_rows;
-    uint32_t n_tokens;
-    uint32_t pos0;
-    float    scale;
-};
-
-// Exact GLM 5.2 indexer geometry: 32 query heads of width 128 against one
-// shared F16 key row. A 128-lane group consists of four SIMD-groups; each SIMD
-// group evaluates one head at a time. Output is token-major [n_tokens, n_rows].
-// Rows after pos0 + token are causal future rows and are written as -INFINITY.
-kernel void kernel_glm52_indexer_scores_f16(
-        constant ds4_metal_args_glm52_indexer_scores &args,
-        device const float *queries,
-        device const float *head_weights,
-        device const half  *indexer_key_cache,
-        device float       *scores,
-        threadgroup float  *shared [[threadgroup(0)]],
-        uint3 group [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint N_HEAD = 32u;
-    constexpr uint HEAD_DIM = 128u;
-    constexpr uint HEADS_PER_WAVE = 4u;
-    const uint row = group.x;
-    const uint token = group.y;
-
-    if (row >= args.n_rows || token >= args.n_tokens) return;
-
-    device float *dst = scores + (uint64_t)token * args.n_rows + row;
-    if (args.pos0 >= args.n_rows ||
-        token >= args.n_rows - args.pos0 ||
-        row > args.pos0 + token) {
-        if (tid == 0u) *dst = -INFINITY;
-        return;
-    }
-
-    threadgroup float *key = shared;
-    threadgroup float *partial_scores = shared + HEAD_DIM;
-    if (tid < HEAD_DIM) {
-        key[tid] = (float)indexer_key_cache[(uint64_t)row * HEAD_DIM + tid];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float score = 0.0f;
-    for (uint head0 = 0u; head0 < N_HEAD; head0 += HEADS_PER_WAVE) {
-        const uint head = head0 + (uint)simd_group;
-        device const float4 *q4 = (device const float4 *)(queries +
-            ((uint64_t)token * N_HEAD + head) * HEAD_DIM);
-        threadgroup const float4 *k4 = (threadgroup const float4 *)key;
-
-        float dot_product = dot(q4[lane], k4[lane]);
-        dot_product = simd_sum(dot_product);
-        if (lane == 0u) {
-            const float weight = head_weights[(uint64_t)token * N_HEAD + head];
-            partial_scores[simd_group] =
-                max(dot_product * args.scale, 0.0f) * weight;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0u) {
-            score += partial_scores[0];
-            score += partial_scores[1];
-            score += partial_scores[2];
-            score += partial_scores[3];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) *dst = score;
 }
 
 // MARK: - GLM KV-LoRA normalization
@@ -11505,6 +11870,123 @@ kernel void kernel_glm52_store_indexer_k_f16(
         }
     }
 }
+
+kernel void kernel_glm52_store_compact_row_f16(
+        constant ds4_metal_args_glm52_store_compact_kv &args,
+        device const float *rows,
+        device half        *compact_cache,
+        uint3 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 threads [[threads_per_threadgroup]]) {
+    constexpr uint ROW_WIDTH = 576u;
+    const uint token = group.x;
+    const uint nth = threads.x;
+    if (token >= args.n_tokens ||
+        args.pos0 >= args.cache_cap ||
+        token >= args.cache_cap - args.pos0) {
+        return;
+    }
+    device const float *src = rows + (uint64_t)token * ROW_WIDTH;
+    device half *dst = compact_cache +
+        (uint64_t)(args.pos0 + token) * ROW_WIDTH;
+    for (uint i = tid; i < ROW_WIDTH; i += nth) {
+        dst[i] = (half)src[i];
+    }
+}
+
+// Rotate the n_rot-wide PREFIX of every head in place — the indexer-side
+// convention: upstream forces rot_offset = 0 for the 128-wide indexer
+// queries and keys, while the MLA query rotates its tail. Same adjacent-pair
+// linear GLM RoPE as the tail kernel; only the span origin differs.
+"""###,
+        "glm52_indexer": ###"""
+// GLM 5.2 — scoring dell'\''indexer DSA
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
+
+// MARK: - DSA indexer scoring
+
+struct ds4_metal_args_glm52_indexer_scores {
+    uint32_t n_rows;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    float    scale;
+};
+
+// Exact GLM 5.2 indexer geometry: 32 query heads of width 128 against one
+// shared F16 key row. A 128-lane group consists of four SIMD-groups; each SIMD
+// group evaluates one head at a time. Output is token-major [n_tokens, n_rows].
+// Rows after pos0 + token are causal future rows and are written as -INFINITY.
+kernel void kernel_glm52_indexer_scores_f16(
+        constant ds4_metal_args_glm52_indexer_scores &args,
+        device const float *queries,
+        device const float *head_weights,
+        device const half  *indexer_key_cache,
+        device float       *scores,
+        threadgroup float  *shared [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint N_HEAD = 32u;
+    constexpr uint HEAD_DIM = 128u;
+    constexpr uint HEADS_PER_WAVE = 4u;
+    const uint row = group.x;
+    const uint token = group.y;
+
+    if (row >= args.n_rows || token >= args.n_tokens) return;
+
+    device float *dst = scores + (uint64_t)token * args.n_rows + row;
+    if (args.pos0 >= args.n_rows ||
+        token >= args.n_rows - args.pos0 ||
+        row > args.pos0 + token) {
+        if (tid == 0u) *dst = -INFINITY;
+        return;
+    }
+
+    threadgroup float *key = shared;
+    threadgroup float *partial_scores = shared + HEAD_DIM;
+    if (tid < HEAD_DIM) {
+        key[tid] = (float)indexer_key_cache[(uint64_t)row * HEAD_DIM + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float score = 0.0f;
+    for (uint head0 = 0u; head0 < N_HEAD; head0 += HEADS_PER_WAVE) {
+        const uint head = head0 + (uint)simd_group;
+        device const float4 *q4 = (device const float4 *)(queries +
+            ((uint64_t)token * N_HEAD + head) * HEAD_DIM);
+        threadgroup const float4 *k4 = (threadgroup const float4 *)key;
+
+        float dot_product = dot(q4[lane], k4[lane]);
+        dot_product = simd_sum(dot_product);
+        if (lane == 0u) {
+            const float weight = head_weights[(uint64_t)token * N_HEAD + head];
+            partial_scores[simd_group] =
+                max(dot_product * args.scale, 0.0f) * weight;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            score += partial_scores[0];
+            score += partial_scores[1];
+            score += partial_scores[2];
+            score += partial_scores[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) *dst = score;
+}
+
+"""###,
+        "glm52_attention": ###"""
+// GLM 5.2 — nucleo dell'\''attenzione compatta DSA (F32 e Q8_0)
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
 
 // MARK: - Compact DSA attention core
 
@@ -11774,6 +12256,14 @@ kernel void kernel_glm52_value_project_q8_0(
     }
 }
 
+"""###,
+        "glm52_moe": ###"""
+// GLM 5.2 — FFN esperti: kernel scalari di riferimento, varianti simdgroup e MoE batched
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
+
 // MARK: - Routed expert FFN (K-quant weights)
 
 // Validation kernels for the quantized FFN matvec stages: one thread owns one
@@ -11790,212 +12280,6 @@ struct ds4_metal_args_glm52_moe {
     uint32_t input_width;    // dot width, multiple of 256
     float    route_weight;   // pair kernel: multiplies the SwiGLU mid
 };
-
-static inline float glm52_half_at(device const uchar *p) {
-    return (float)(*(device const half *)p);
-}
-
-static inline uchar2 glm52_scale_min_k4(uint j, device const uchar *q) {
-    if (j < 4u) {
-        return uchar2(q[j] & 63u, q[j + 4u] & 63u);
-    }
-    return uchar2((q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u),
-                  (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u));
-}
-
-static inline float glm52_dot_q2_K_row(device const uchar *row,
-                                       device const float *x,
-                                       uint width) {
-    float acc = 0.0f;
-    for (uint sb = 0u; sb < width / 256u; sb++) {
-        device const uchar *base = row + sb * 84u;
-        device const uchar *qs = base + 16u;
-        const float d = glm52_half_at(base + 80u);
-        const float dmin = glm52_half_at(base + 82u);
-        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
-            for (uint plane = 0u; plane < 4u; plane++) {
-                for (uint l = 0u; l < 32u; l++) {
-                    const uchar sc = base[half128 / 16u + plane * 2u + l / 16u];
-                    const uint q = (qs[half128 / 4u + l] >> (plane * 2u)) & 3u;
-                    const float w = d * (float)(sc & 0x0Fu) * (float)q -
-                        dmin * (float)(sc >> 4u);
-                    acc += w * x[sb * 256u + half128 + plane * 32u + l];
-                }
-            }
-        }
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q4_K_row(device const uchar *row,
-                                       device const float *x,
-                                       uint width) {
-    float acc = 0.0f;
-    for (uint sb = 0u; sb < width / 256u; sb++) {
-        device const uchar *base = row + sb * 144u;
-        const float d = glm52_half_at(base);
-        const float dmin = glm52_half_at(base + 2u);
-        device const uchar *scales = base + 4u;
-        device const uchar *qs = base + 16u;
-        for (uint j = 0u; j < 8u; j++) {
-            const uchar2 sm = glm52_scale_min_k4(j, scales);
-            const float dj = d * (float)sm.x;
-            const float mj = dmin * (float)sm.y;
-            const uint chunk = (j / 2u) * 32u;
-            const uint shift = (j & 1u) * 4u;
-            for (uint l = 0u; l < 32u; l++) {
-                const uint q = (qs[chunk + l] >> shift) & 0x0Fu;
-                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
-            }
-        }
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q5_K_row(device const uchar *row,
-                                       device const float *x,
-                                       uint width) {
-    float acc = 0.0f;
-    for (uint sb = 0u; sb < width / 256u; sb++) {
-        device const uchar *base = row + sb * 176u;
-        const float d = glm52_half_at(base);
-        const float dmin = glm52_half_at(base + 2u);
-        device const uchar *scales = base + 4u;
-        device const uchar *qh = base + 16u;
-        device const uchar *qs = base + 48u;
-        for (uint j = 0u; j < 8u; j++) {
-            const uchar2 sm = glm52_scale_min_k4(j, scales);
-            const float dj = d * (float)sm.x;
-            const float mj = dmin * (float)sm.y;
-            const uint chunk = (j / 2u) * 32u;
-            const uint shift = (j & 1u) * 4u;
-            for (uint l = 0u; l < 32u; l++) {
-                const uint q = ((qs[chunk + l] >> shift) & 0x0Fu) +
-                    ((qh[l] >> j) & 1u) * 16u;
-                acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
-            }
-        }
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q6_K_row(device const uchar *row,
-                                       device const float *x,
-                                       uint width) {
-    float acc = 0.0f;
-    for (uint sb = 0u; sb < width / 256u; sb++) {
-        device const uchar *base = row + sb * 210u;
-        device const uchar *ql = base;
-        device const uchar *qh = base + 128u;
-        device const char *scales = (device const char *)(base + 192u);
-        const float d = glm52_half_at(base + 208u);
-        for (uint half128 = 0u; half128 < 256u; half128 += 128u) {
-            const uint qlHalf = half128 / 2u;
-            const uint qhHalf = half128 / 4u;
-            const uint scHalf = half128 / 16u;
-            for (uint l = 0u; l < 32u; l++) {
-                const uint sub = l / 16u;
-                const uchar high = qh[qhHalf + l];
-                const int q1 = (int)((ql[qlHalf + l] & 0x0Fu) | ((high << 4u) & 0x30u)) - 32;
-                const int q2 = (int)((ql[qlHalf + l + 32u] & 0x0Fu) | ((high << 2u) & 0x30u)) - 32;
-                const int q3 = (int)((ql[qlHalf + l] >> 4u) | (high & 0x30u)) - 32;
-                const int q4 = (int)((ql[qlHalf + l + 32u] >> 4u) | ((high >> 2u) & 0x30u)) - 32;
-                const uint out0 = sb * 256u + half128 + l;
-                acc += d * (float)scales[scHalf + sub] * (float)q1 * x[out0];
-                acc += d * (float)scales[scHalf + sub + 2u] * (float)q2 * x[out0 + 32u];
-                acc += d * (float)scales[scHalf + sub + 4u] * (float)q3 * x[out0 + 64u];
-                acc += d * (float)scales[scHalf + sub + 6u] * (float)q4 * x[out0 + 96u];
-            }
-        }
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q8_0_row(device const uchar *row,
-                                       device const float *x,
-                                       uint width) {
-    float acc = 0.0f;
-    for (uint b = 0u; b < width / 32u; b++) {
-        device const uchar *base = row + b * 34u;
-        const float d = glm52_half_at(base);
-        device const char *qs = (device const char *)(base + 2u);
-        for (uint i = 0u; i < 32u; i++) {
-            acc += d * (float)qs[i] * x[b * 32u + i];
-        }
-    }
-    return acc;
-}
-
-// IQ2_XXS: 66-byte superblocks of 256 — f16 scale + 32 uint16 words. Each
-// 32-value group decodes four 8-value cells through the shared grid/sign
-// tables the DeepSeek prelude already embeds (same concatenated library),
-// with db = d * (0.5 + top-nibble) * 0.25. Same emission order as
-// Quantize.dequantIQ2_XXS, the CPU reference.
-static inline float glm52_dot_iq2_xxs_row(device const uchar *row,
-                                          device const float *x,
-                                          uint width) {
-    float acc = 0.0f;
-    for (uint sb = 0u; sb < width / 256u; sb++) {
-        device const uchar *base = row + sb * 66u;
-        const float d = glm52_half_at(base);
-        device const ushort *qs = (device const ushort *)(base + 2u);
-        for (uint ib = 0u; ib < 8u; ib++) {
-            const uint aux0 = (uint)qs[4u * ib]
-                | ((uint)qs[4u * ib + 1u] << 16u);
-            const uint aux1 = (uint)qs[4u * ib + 2u]
-                | ((uint)qs[4u * ib + 3u] << 16u);
-            const float db = d * (0.5f + (float)(aux1 >> 28u)) * 0.25f;
-            for (uint l = 0u; l < 4u; l++) {
-                constant uchar *grid = (constant uchar *)
-                    (ds4_metal_iq2xxs_grid + ((aux0 >> (8u * l)) & 255u));
-                const uchar signs =
-                    ds4_metal_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
-                const uint out0 = sb * 256u + ib * 32u + l * 8u;
-                for (uint j = 0u; j < 8u; j++) {
-                    const float w = db * (float)grid[j]
-                        * (((signs >> j) & 1u) != 0u ? -1.0f : 1.0f);
-                    acc += w * x[out0 + j];
-                }
-            }
-        }
-    }
-    return acc;
-}
-
-static inline uint glm52_kquant_row_bytes(uint type, uint width) {
-    switch (type) {
-        case 8u:  return (width / 32u) * 34u;
-        case 10u: return (width / 256u) * 84u;
-        case 12u: return (width / 256u) * 144u;
-        case 13u: return (width / 256u) * 176u;
-        case 14u: return (width / 256u) * 210u;
-        case 16u: return (width / 256u) * 66u;
-        default:  return 0u;
-    }
-}
-
-static inline float glm52_dot_kquant_row(uint type,
-                                         device const uchar *row,
-                                         device const float *x,
-                                         uint width) {
-    switch (type) {
-        case 8u:  return glm52_dot_q8_0_row(row, x, width);
-        case 10u: return glm52_dot_q2_K_row(row, x, width);
-        case 12u: return glm52_dot_q4_K_row(row, x, width);
-        case 13u: return glm52_dot_q5_K_row(row, x, width);
-        case 14u: return glm52_dot_q6_K_row(row, x, width);
-        case 16u: return glm52_dot_iq2_xxs_row(row, x, width);
-        default:  return 0.0f;
-    }
-}
-
-static inline float glm52_silu(float value) {
-    // Stable sigmoid, matching upstream sigmoid_stable.
-    const float s = value >= 0.0f
-        ? 1.0f / (1.0f + exp(-value))
-        : exp(value) / (1.0f + exp(value));
-    return value * s;
-}
 
 // mid[r] = silu(gate_r · x) * (up_r · x) * route_weight — GLM SwiGLU has no
 // clamp and the route weight multiplies the mid BEFORE the down projection.
@@ -12035,189 +12319,6 @@ kernel void kernel_glm52_moe_down(
                                     mid, args.input_width);
 }
 
-// MARK: - Cooperative (simdgroup-per-row) matvec variants
-//
-// The per-thread kernels above walk a WHOLE row per thread — a strided,
-// cache-hostile access pattern that leaves most of the memory bandwidth on
-// the table. These variants put one SIMD group on each row: the 32 lanes
-// stride the row's 32-element quant groups (so consecutive lanes read
-// consecutive weight blocks) and reduce with simd_sum. Same math, same
-// inputs, float-accumulation order differs only by the reduction tree.
-// The per-thread originals remain the reference and the DS4_GLM_SG=0
-// fallback.
-
-// Partial dot of ONE 32-element group `g` of a row: sb = g/8 selects the
-// 256-wide superblock (g IS the block for q8_0), j = g%8 the 32-chunk
-// inside it. Emission matches the row helpers above exactly.
-static inline float glm52_dot_q8_0_group(device const uchar *row,
-                                         device const float *x,
-                                         uint g) {
-    device const uchar *base = row + g * 34u;
-    const float d = glm52_half_at(base);
-    device const char *qs = (device const char *)(base + 2u);
-    float acc = 0.0f;
-    for (uint i = 0u; i < 32u; i++) {
-        acc += d * (float)qs[i] * x[g * 32u + i];
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q2_K_group(device const uchar *row,
-                                         device const float *x,
-                                         uint g) {
-    const uint sb = g / 8u;
-    const uint j = g % 8u;
-    const uint half128 = (j / 4u) * 128u;
-    const uint plane = j % 4u;
-    device const uchar *base = row + sb * 84u;
-    device const uchar *qs = base + 16u;
-    const float d = glm52_half_at(base + 80u);
-    const float dmin = glm52_half_at(base + 82u);
-    float acc = 0.0f;
-    for (uint l = 0u; l < 32u; l++) {
-        const uchar sc = base[half128 / 16u + plane * 2u + l / 16u];
-        const uint q = (qs[half128 / 4u + l] >> (plane * 2u)) & 3u;
-        const float w = d * (float)(sc & 0x0Fu) * (float)q -
-            dmin * (float)(sc >> 4u);
-        acc += w * x[sb * 256u + half128 + plane * 32u + l];
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q4_K_group(device const uchar *row,
-                                         device const float *x,
-                                         uint g) {
-    const uint sb = g / 8u;
-    const uint j = g % 8u;
-    device const uchar *base = row + sb * 144u;
-    const float d = glm52_half_at(base);
-    const float dmin = glm52_half_at(base + 2u);
-    const uchar2 sm = glm52_scale_min_k4(j, base + 4u);
-    const float dj = d * (float)sm.x;
-    const float mj = dmin * (float)sm.y;
-    device const uchar *qs = base + 16u;
-    const uint chunk = (j / 2u) * 32u;
-    const uint shift = (j & 1u) * 4u;
-    float acc = 0.0f;
-    for (uint l = 0u; l < 32u; l++) {
-        const uint q = (qs[chunk + l] >> shift) & 0x0Fu;
-        acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q5_K_group(device const uchar *row,
-                                         device const float *x,
-                                         uint g) {
-    const uint sb = g / 8u;
-    const uint j = g % 8u;
-    device const uchar *base = row + sb * 176u;
-    const float d = glm52_half_at(base);
-    const float dmin = glm52_half_at(base + 2u);
-    const uchar2 sm = glm52_scale_min_k4(j, base + 4u);
-    const float dj = d * (float)sm.x;
-    const float mj = dmin * (float)sm.y;
-    device const uchar *qh = base + 16u;
-    device const uchar *qs = base + 48u;
-    const uint chunk = (j / 2u) * 32u;
-    const uint shift = (j & 1u) * 4u;
-    float acc = 0.0f;
-    for (uint l = 0u; l < 32u; l++) {
-        const uint q = ((qs[chunk + l] >> shift) & 0x0Fu) +
-            ((qh[l] >> j) & 1u) * 16u;
-        acc += (dj * (float)q - mj) * x[sb * 256u + j * 32u + l];
-    }
-    return acc;
-}
-
-static inline float glm52_dot_q6_K_group(device const uchar *row,
-                                         device const float *x,
-                                         uint g) {
-    const uint sb = g / 8u;
-    const uint j = g % 8u;
-    const uint half128 = (j / 4u) * 128u;
-    const uint k = j % 4u;
-    device const uchar *base = row + sb * 210u;
-    device const uchar *ql = base;
-    device const uchar *qh = base + 128u;
-    device const char *scales = (device const char *)(base + 192u);
-    const float d = glm52_half_at(base + 208u);
-    const uint qlHalf = half128 / 2u;
-    const uint qhHalf = half128 / 4u;
-    const uint scHalf = half128 / 16u;
-    float acc = 0.0f;
-    for (uint l = 0u; l < 32u; l++) {
-        const uint sub = l / 16u;
-        const uchar high = qh[qhHalf + l];
-        int q;
-        float scale;
-        switch (k) {
-            case 0u:
-                q = (int)((ql[qlHalf + l] & 0x0Fu) | ((high << 4u) & 0x30u)) - 32;
-                scale = (float)scales[scHalf + sub];
-                break;
-            case 1u:
-                q = (int)((ql[qlHalf + l + 32u] & 0x0Fu) | ((high << 2u) & 0x30u)) - 32;
-                scale = (float)scales[scHalf + sub + 2u];
-                break;
-            case 2u:
-                q = (int)((ql[qlHalf + l] >> 4u) | (high & 0x30u)) - 32;
-                scale = (float)scales[scHalf + sub + 4u];
-                break;
-            default:
-                q = (int)((ql[qlHalf + l + 32u] >> 4u) | ((high >> 2u) & 0x30u)) - 32;
-                scale = (float)scales[scHalf + sub + 6u];
-                break;
-        }
-        acc += d * scale * (float)q * x[sb * 256u + half128 + k * 32u + l];
-    }
-    return acc;
-}
-
-static inline float glm52_dot_iq2_xxs_group(device const uchar *row,
-                                            device const float *x,
-                                            uint g) {
-    const uint sb = g / 8u;
-    const uint ib = g % 8u;
-    device const uchar *base = row + sb * 66u;
-    const float d = glm52_half_at(base);
-    device const ushort *qs = (device const ushort *)(base + 2u);
-    const uint aux0 = (uint)qs[4u * ib] | ((uint)qs[4u * ib + 1u] << 16u);
-    const uint aux1 = (uint)qs[4u * ib + 2u]
-        | ((uint)qs[4u * ib + 3u] << 16u);
-    const float db = d * (0.5f + (float)(aux1 >> 28u)) * 0.25f;
-    float acc = 0.0f;
-    for (uint l = 0u; l < 4u; l++) {
-        constant uchar *grid = (constant uchar *)
-            (ds4_metal_iq2xxs_grid + ((aux0 >> (8u * l)) & 255u));
-        const uchar signs = ds4_metal_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
-        const uint out0 = sb * 256u + ib * 32u + l * 8u;
-        for (uint j = 0u; j < 8u; j++) {
-            const float w = db * (float)grid[j]
-                * (((signs >> j) & 1u) != 0u ? -1.0f : 1.0f);
-            acc += w * x[out0 + j];
-        }
-    }
-    return acc;
-}
-
-static inline float glm52_dot_kquant_group(uint type,
-                                           device const uchar *row,
-                                           device const float *x,
-                                           uint g) {
-    switch (type) {
-        case 8u:  return glm52_dot_q8_0_group(row, x, g);
-        case 10u: return glm52_dot_q2_K_group(row, x, g);
-        case 12u: return glm52_dot_q4_K_group(row, x, g);
-        case 13u: return glm52_dot_q5_K_group(row, x, g);
-        case 14u: return glm52_dot_q6_K_group(row, x, g);
-        case 16u: return glm52_dot_iq2_xxs_group(row, x, g);
-        default:  return 0.0f;
-    }
-}
-
-// Dispatch: threadsPerThreadgroup = (32, NSG, 1) — each y-slice is exactly
-// one SIMD group — threadgroups = (ceil(row_count / NSG), 1, 1).
 kernel void kernel_glm52_moe_pair_swiglu_sg(
         constant ds4_metal_args_glm52_moe &args,
         device const float *x,
@@ -12275,6 +12376,150 @@ kernel void kernel_glm52_moe_down_sg(
     }
 }
 
+// Varianti ACCUMULANTI (out[row] += dot): fondono il residual add nel
+// matvec — un dispatch e una passata su out in meno per ogni proiezione
+// seguita da un add (attn output, down dense/shared/esperti).
+kernel void kernel_glm52_moe_down_acc(
+        constant ds4_metal_args_glm52_moe &args,
+        device const float *mid,
+        device const uchar *down_rows,
+        device float       *out,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.row_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    out[tid] += glm52_dot_kquant_row(args.weight_type,
+                                     down_rows + (uint64_t)tid * row_bytes,
+                                     mid, args.input_width);
+}
+
+kernel void kernel_glm52_moe_down_acc_sg(
+        constant ds4_metal_args_glm52_moe &args,
+        device const float *mid,
+        device const uchar *down_rows,
+        device float       *out,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    if (row >= args.row_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.weight_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    device const uchar *row_ptr = down_rows + (uint64_t)row * row_bytes;
+    const uint groups = args.input_width / 32u;
+    float acc = 0.0f;
+    for (uint g = (uint)tiisg; g < groups; g += 32u) {
+        acc += glm52_dot_kquant_group(args.weight_type, row_ptr, mid, g);
+    }
+    const float total = simd_sum(acc);
+    if (tiisg == 0u) {
+        out[row] += total;
+    }
+}
+
+// MARK: - MoE batched
+
+// Tutti gli esperti routed di un layer in DUE dispatch (prima: swiglu +
+// down + add PER esperto, 18 dispatch per 6 esperti — matvec piccole dove
+// l'overhead di lancio e i vuoti fra kernel dominano). Gli offset dei
+// record (contigui nell'arena/staging) e i pesi del router viaggiano nella
+// struct di argomenti: max 8 esperti, nessun buffer aggiuntivo.
+struct ds4_metal_args_glm52_moe_batch {
+    uint32_t gate_up_type;
+    uint32_t hidden_width;        // righe di mid per esperto
+    uint32_t input_width;         // embedding
+    uint32_t expert_count;        // esperti routed attivi (<= 8)
+    uint32_t up_offset;           // byte: inizio righe up nel record
+    uint32_t down_offset;         // byte: inizio righe down nel record
+    uint32_t down_type;
+    uint32_t pad0;
+    uint32_t record_offsets[8];   // base byte di ogni record nel buffer
+    uint32_t route_weights[8];    // float bits (peso del router)
+};
+
+// Dispatch: tptg (32, NSG, 1); threadgroups (ceil(hidden/NSG), 1, E).
+kernel void kernel_glm52_moe_batch_swiglu_sg(
+        constant ds4_metal_args_glm52_moe_batch &args,
+        device const float *x,
+        device const uchar *records,
+        device float       *mids,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    const uint expert = tgpig.z;
+    if (row >= args.hidden_width || expert >= args.expert_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.gate_up_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    device const uchar *record = records + args.record_offsets[expert];
+    device const uchar *gate_row = record + (uint64_t)row * row_bytes;
+    device const uchar *up_row = record + args.up_offset
+        + (uint64_t)row * row_bytes;
+    const uint groups = args.input_width / 32u;
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+    for (uint g = (uint)tiisg; g < groups; g += 32u) {
+        acc_gate += glm52_dot_kquant_group(args.gate_up_type, gate_row,
+                                           x, g);
+        acc_up += glm52_dot_kquant_group(args.gate_up_type, up_row, x, g);
+    }
+    const float gate = simd_sum(acc_gate);
+    const float up = simd_sum(acc_up);
+    if (tiisg == 0u) {
+        const float w = as_type<float>(args.route_weights[expert]);
+        mids[expert * args.hidden_width + row] =
+            glm52_silu(gate) * up * w;
+    }
+}
+
+// hidden[row] += somma dei contributi down di TUTTI gli esperti: la
+// riduzione per corsia attraversa gli esperti prima della simd_sum —
+// stessa matematica della sequenza matvec+add per esperto a meno
+// dell'ordine delle somme (entro la tolleranza dei test di parità).
+// Dispatch: tptg (32, NSG, 1); threadgroups (ceil(embedding/NSG), 1, 1).
+kernel void kernel_glm52_moe_batch_down_sg(
+        constant ds4_metal_args_glm52_moe_batch &args,
+        device const float *mids,
+        device const uchar *records,
+        device float       *hidden,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    if (row >= args.input_width) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.down_type,
+                                                  args.hidden_width);
+    if (row_bytes == 0u) return;
+    const uint groups = args.hidden_width / 32u;
+    float acc = 0.0f;
+    for (uint e = 0u; e < args.expert_count; e++) {
+        device const uchar *down_row = records + args.record_offsets[e]
+            + args.down_offset + (uint64_t)row * row_bytes;
+        device const float *mid = mids + e * args.hidden_width;
+        for (uint g = (uint)tiisg; g < groups; g += 32u) {
+            acc += glm52_dot_kquant_group(args.down_type, down_row, mid, g);
+        }
+    }
+    const float total = simd_sum(acc);
+    if (tiisg == 0u) {
+        hidden[row] += total;
+    }
+}
+
+"""###,
+        "glm52_rope": ###"""
+// GLM 5.2 — RoPE della coda query/K e del prefisso indexer
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
+
 // MARK: - Query/K-tail RoPE
 
 struct ds4_metal_args_glm52_rope_tail {
@@ -12310,6 +12555,33 @@ kernel void kernel_glm52_rope_tail_f32(
     tail[0] = x0 * c - x1 * s;
     tail[1] = x0 * s + x1 * c;
 }
+
+kernel void kernel_glm52_rope_prefix_f32(
+        constant ds4_metal_args_glm52_rope_tail &args,
+        device float *values,
+        uint tid [[thread_position_in_grid]]) {
+    constexpr float FREQ_BASE = 8000000.0f;
+    const uint pairs = args.n_rot / 2u;
+    if (tid >= args.n_head * pairs) return;
+    const uint head = tid / pairs;
+    const uint pair = tid % pairs;
+    device float *span = values + (uint64_t)head * args.head_dim + pair * 2u;
+    const float theta = (float)args.pos
+        * pow(FREQ_BASE, -2.0f * (float)pair / (float)args.n_rot);
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const float x0 = span[0];
+    const float x1 = span[1];
+    span[0] = x0 * c - x1 * s;
+    span[1] = x0 * s + x1 * c;
+}
+"""###,
+        "glm52_misc": ###"""
+// GLM 5.2 — primitive generiche del grafo di decode (RMSNorm, matvec F32, add)
+// Parte della libreria concatenata: vedi MetalRuntime.kernelFiles per l'ordine.
+
+#include <metal_stdlib>
+using namespace metal;
 
 // MARK: - Resident decode graph primitives
 
@@ -12400,51 +12672,134 @@ kernel void kernel_glm52_add_f32(
 // (normalized KV-LoRA prefix + RAW K-RoPE tail) converted to F16 at their
 // absolute positions — the exact layout kernel_glm52_attention_indexed_f16
 // reads. The two-plane store kernel remains for the upstream-shaped caches.
-kernel void kernel_glm52_store_compact_row_f16(
-        constant ds4_metal_args_glm52_store_compact_kv &args,
-        device const float *rows,
-        device half        *compact_cache,
-        uint3 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
-        uint3 threads [[threads_per_threadgroup]]) {
-    constexpr uint ROW_WIDTH = 576u;
-    const uint token = group.x;
-    const uint nth = threads.x;
-    if (token >= args.n_tokens ||
-        args.pos0 >= args.cache_cap ||
-        token >= args.cache_cap - args.pos0) {
-        return;
+
+// MARK: - Matvec Q8/K-quant a COPPIA (qA + kvA condividono l'input normato)
+
+// Le due proiezioni dell'attenzione che leggono lo stesso vettore normato
+// in un solo dispatch: righe [0, rows_a) → out_a, [rows_a, rows_a+rows_b)
+// → out_b. Un lancio in meno per layer; stessa matematica dei due matvec.
+struct ds4_metal_args_glm52_matvec_pair {
+    uint32_t type_a;
+    uint32_t rows_a;
+    uint32_t type_b;
+    uint32_t rows_b;
+    uint32_t input_width;
+    uint32_t pad0, pad1, pad2;
+};
+
+kernel void kernel_glm52_matvec_pair_sg(
+        constant ds4_metal_args_glm52_matvec_pair &args,
+        device const float *x,
+        device const uchar *weights_a,
+        device const uchar *weights_b,
+        device float       *out_a,
+        device float       *out_b,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    if (row >= args.rows_a + args.rows_b) return;
+    const bool second = row >= args.rows_a;
+    const uint type = second ? args.type_b : args.type_a;
+    const uint local_row = second ? row - args.rows_a : row;
+    const uint row_bytes = glm52_kquant_row_bytes(type, args.input_width);
+    if (row_bytes == 0u) return;
+    device const uchar *weight_row = (second ? weights_b : weights_a)
+        + (uint64_t)local_row * row_bytes;
+    const uint groups = args.input_width / 32u;
+    float acc = 0.0f;
+    for (uint g = (uint)tiisg; g < groups; g += 32u) {
+        acc += glm52_dot_kquant_group(type, weight_row, x, g);
     }
-    device const float *src = rows + (uint64_t)token * ROW_WIDTH;
-    device half *dst = compact_cache +
-        (uint64_t)(args.pos0 + token) * ROW_WIDTH;
-    for (uint i = tid; i < ROW_WIDTH; i += nth) {
-        dst[i] = (half)src[i];
+    const float total = simd_sum(acc);
+    if (tiisg == 0u) {
+        (second ? out_b : out_a)[local_row] = total;
     }
 }
 
-// Rotate the n_rot-wide PREFIX of every head in place — the indexer-side
-// convention: upstream forces rot_offset = 0 for the 128-wide indexer
-// queries and keys, while the MLA query rotates its tail. Same adjacent-pair
-// linear GLM RoPE as the tail kernel; only the span origin differs.
-kernel void kernel_glm52_rope_prefix_f32(
-        constant ds4_metal_args_glm52_rope_tail &args,
-        device float *values,
-        uint tid [[thread_position_in_grid]]) {
-    constexpr float FREQ_BASE = 8000000.0f;
-    const uint pairs = args.n_rot / 2u;
-    if (tid >= args.n_head * pairs) return;
-    const uint head = tid / pairs;
-    const uint pair = tid % pairs;
-    device float *span = values + (uint64_t)head * args.head_dim + pair * 2u;
-    const float theta = (float)args.pos
-        * pow(FREQ_BASE, -2.0f * (float)pair / (float)args.n_rot);
-    const float c = cos(theta);
-    const float s = sin(theta);
-    const float x0 = span[0];
-    const float x1 = span[1];
-    span[0] = x0 * c - x1 * s;
-    span[1] = x0 * s + x1 * c;
+// MARK: - Argmax del head (decode greedy)
+
+// Due stadi: riduzione parziale per threadgroup, poi riduzione finale in un
+// threadgroup singolo. Pareggi: vince l'indice più basso — la stessa regola
+// dell'argmax CPU, per un decode greedy deterministico e identico.
+struct ds4_metal_args_glm52_argmax {
+    uint32_t count;
+    uint32_t chunk;      // elementi per threadgroup (stadio parziale)
+    uint32_t pad0, pad1;
+};
+
+static inline void glm52_argmax_reduce(threadgroup float *values,
+                                       threadgroup int32_t *indices,
+                                       uint tid, uint width) {
+    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < stride) {
+            const float a = values[tid];
+            const float b = values[tid + stride];
+            if (b > a || (b == a && indices[tid + stride] < indices[tid])) {
+                values[tid] = b;
+                indices[tid] = indices[tid + stride];
+            }
+        }
+    }
+}
+
+kernel void kernel_glm52_argmax_partial_f32(
+        constant ds4_metal_args_glm52_argmax &args,
+        device const float   *values,
+        device float         *partial_values,
+        device int32_t       *partial_indices,
+        threadgroup float    *scratch [[threadgroup(0)]],
+        uint tg  [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tptg [[threads_per_threadgroup]]) {
+    threadgroup int32_t *indices = (threadgroup int32_t *)(scratch + tptg);
+    const uint begin = tg * args.chunk;
+    const uint end = min(begin + args.chunk, args.count);
+    float best = -INFINITY;
+    int32_t bestIndex = 0;
+    for (uint i = begin + tid; i < end; i += tptg) {
+        const float v = values[i];
+        if (v > best) {
+            best = v;
+            bestIndex = (int32_t)i;
+        }
+    }
+    scratch[tid] = best;
+    indices[tid] = bestIndex;
+    glm52_argmax_reduce(scratch, indices, tid, tptg);
+    if (tid == 0u) {
+        partial_values[tg] = scratch[0];
+        partial_indices[tg] = indices[0];
+    }
+}
+
+kernel void kernel_glm52_argmax_final_f32(
+        constant ds4_metal_args_glm52_argmax &args,
+        device const float   *partial_values,
+        device const int32_t *partial_indices,
+        device int32_t       *result,
+        threadgroup float    *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tptg [[threads_per_threadgroup]]) {
+    threadgroup int32_t *indices = (threadgroup int32_t *)(scratch + tptg);
+    float best = -INFINITY;
+    int32_t bestIndex = 0;
+    for (uint i = tid; i < args.count; i += tptg) {
+        const float v = partial_values[i];
+        const int32_t index = partial_indices[i];
+        if (v > best || (v == best && index < bestIndex)) {
+            best = v;
+            bestIndex = index;
+        }
+    }
+    scratch[tid] = best;
+    indices[tid] = bestIndex;
+    glm52_argmax_reduce(scratch, indices, tid, tptg);
+    if (tid == 0u) {
+        result[0] = indices[0];
+    }
 }
 """###,
         "argsort": ###"""

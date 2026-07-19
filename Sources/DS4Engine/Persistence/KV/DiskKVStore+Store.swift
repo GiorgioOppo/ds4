@@ -135,9 +135,9 @@ extension DiskKVStore {
         close(fd)
         if ok { ok = (rename(tmp, url.path) == 0) }
         if !ok { unlink(tmp); return false }
-        FileHandle.standardError.write(Data(String(
-            format: "DS4 diskkv: checkpoint %d token (%.0f MB) scritto in %.2fs (F_NOCACHE)\n",
-            tokens.count, Double(total) / 1_048_576, Date().timeIntervalSince(t0)).utf8))
+        log(String(
+            format: "checkpoint %d token (%.0f MB) scritto in %.2fs (F_NOCACHE)",
+            tokens.count, Double(total) / 1_048_576, Date().timeIntervalSince(t0)))
         return true
     }
 

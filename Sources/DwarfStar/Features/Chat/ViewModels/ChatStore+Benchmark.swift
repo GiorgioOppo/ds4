@@ -42,7 +42,7 @@ extension ChatStore {
             // il MainActor del contesto).
             @MainActor func log(_ s: String) {
                 benchResults += s + "\n"
-                FileHandle.standardError.write(Data(("DS4 bench: " + s + "\n").utf8))
+                DS4Log.info("bench", s)
             }
             do {
                 // 1) unione esperti, a chunk fisso 512. Il rapido (256 token)
@@ -183,6 +183,65 @@ extension ChatStore {
             benchRunning = false
             benchTask = nil
             activityGate.release(lease)
+        }
+    }
+
+    /// Auto-tune GLM dei knob di CARICAMENTO (l'analogo pragmatico del
+    /// record-holder DeepSeek): scarica il modello (un solo motore alla
+    /// volta — ogni misura costruisce e getta il suo), prova le alternative
+    /// esatte un gradino alla volta, applica i vincitori alle proprietà
+    /// persistite e ricarica con la configurazione campione. Non tocca i
+    /// knob di qualità (esperti attivi, sidecar Q4).
+    func runGLMAutoTune() {
+        guard !benchRunning, !isGenerating, phase == .ready,
+              !modelPath.isEmpty else { return }
+        benchRunning = true
+        benchSucceeded = nil
+        benchResults = ""
+        benchStatus = "Auto-tune GLM in corso… (~10 min; il modello viene "
+            + "scaricato e ricaricato con la configurazione campione)"
+        benchTask = Task {
+            // Teardown del servizio vivo, stessa disciplina del load: mai
+            // due motori model-sized insieme su questa RAM.
+            _ = await waitForEngineSetup()
+            await glmService?.quiesceForTeardown()
+            await service?.quiesceForTeardown()
+            service = nil
+            glmService = nil
+            phase = .needsModel
+            let path = ProcessStream.absolutePath(modelPath)
+            do {
+                let outcome = try await Task.detached(
+                    priority: .userInitiated) {
+                    try GLM52ChatService.autoTune(modelPath: path)
+                }.value
+                if let value = outcome.winners["DS4_GLM_MTLIO"] {
+                    glmMetalIOEnabled = value != "0"
+                }
+                if let value = outcome.winners["DS4_GLM_STREAM_SLOTS"] {
+                    glmStreamSlots = Int(value) ?? 0
+                }
+                if let value = outcome.winners["DS4_GLM_EXPERT_ARENA"] {
+                    glmExpertArena = Int(value) ?? 0
+                }
+                if let value = outcome.winners["DS4_GLM_RESIDENT_LAYERS"] {
+                    glmResidentLayers = Int(value) ?? 0
+                }
+                if let value = outcome.winners["DS4_GLM_FUSE"] {
+                    glmFuseEnabled = value != "0"
+                }
+                benchResults = outcome.report
+                benchSucceeded = true
+                benchStatus = "Auto-tune completato — ricarico il modello "
+                    + "con la configurazione campione."
+                DS4Log.info("bench", "GLM auto-tune:\n" + outcome.report)
+            } catch {
+                benchSucceeded = false
+                benchStatus = "Auto-tune fallito: \(error)"
+            }
+            benchRunning = false
+            benchTask = nil
+            load()
         }
     }
 

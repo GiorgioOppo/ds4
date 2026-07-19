@@ -213,15 +213,15 @@ extension StreamingDecoder {
         // The bundle STATE must be visible in the engine log at EVERY load —
         // silence ("is it even on?") is the one outcome that cannot be triaged.
         if !bundleEnabled {
-            FileHandle.standardError.write(Data("DS4 expbundle: disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF\n".utf8))
+            ExpertBundle.log("disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF")
         } else if bundle == nil {
-            FileHandle.standardError.write(Data("DS4 expbundle: NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF\n".utf8))
+            ExpertBundle.log("NON attivo per questo load (motivo nelle righe sopra) — gather dal GGUF")
         }
         let metalIORequested = ProcessInfo.processInfo.environment["DS4_MTLIO"] == "1"
         if metalIORequested {
             if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
             else {
-                FileHandle.standardError.write(Data("DS4 expbundle: DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF\n".utf8))
+                ExpertBundle.log("DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF")
             }
         }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in
@@ -258,8 +258,8 @@ extension StreamingDecoder {
                 cacheableLayers: allLayers)
             multiCacheActive = requestedMulti && fallbackPlan != nil
             if requestedMulti && !multiCacheActive {
-                FileHandle.standardError.write(Data(
-                    "DS4 multi-quant cache: budget legacy insufficiente per il floor di tutti i layer; uso cache mono-classe\n".utf8))
+                DS4Log.info("multi-quant cache",
+                    "budget legacy insufficiente per il floor di tutti i layer; uso cache mono-classe")
             }
             // Readahead every missing slab (3 matrices × N ids) BEFORE the
             // copies: the NVMe serves all the regions concurrently. With
@@ -386,8 +386,8 @@ extension StreamingDecoder {
                     warm: warm, slotsPlan: slotsPlan)
                 let allocated = fallbackPlan.values.reduce(0, +)
                 let bytes = fallbackPlan.reduce(0) { $0 + ($1.value * layouts[$1.key].record) }
-                FileHandle.standardError.write(Data(
-                    "DS4 multi-quant cache: attiva, \(allocated) slot su \(routedLayers.count) layer, \(bytes >> 20) MiB / budget legacy \(legacyBudget >> 20) MiB\n".utf8))
+                DS4Log.info("multi-quant cache",
+                    "attiva, \(allocated) slot su \(routedLayers.count) layer, \(bytes >> 20) MiB / budget legacy \(legacyBudget >> 20) MiB")
             } else {
                 cache = ExpertSlotCache(slotsPerLayer: S, bytesPerExpert: recordBytes,
                                         makePool: { try makePoolForLayer(0, $0) },
@@ -526,14 +526,13 @@ extension StreamingDecoder {
             teardownDrains.append { streamer.quiesceForTeardown() }
             if lazyIndexerScoring, indexerCanActivate {
                 activateIndexerScoring = { try streamer.activateIndexerScoring() }
-                FileHandle.standardError.write(Data(
-                    "DS4 lazy-idx: attivazione live abilitata; scorer esclusi dallo stream fino alla soglia\n".utf8))
+                DS4Log.info("lazy-idx",
+                    "attivazione live abilitata; scorer esclusi dallo stream fino alla soglia")
             } else {
                 activateIndexerScoring = nil
-                let message = lazyIndexerScoring
-                    ? "DS4 lazy-idx: il contesto non può raggiungere la soglia; scorer mai caricati\n"
-                    : "DS4 lazy-idx: disattivato (DS4_LAZY_IDX=0); scorer nello stream per-token storico\n"
-                FileHandle.standardError.write(Data(message.utf8))
+                DS4Log.info("lazy-idx", lazyIndexerScoring
+                    ? "il contesto non può raggiungere la soglia; scorer mai caricati"
+                    : "disattivato (DS4_LAZY_IDX=0); scorer nello stream per-token storico")
             }
         } else if residentDense {
             let denseCache = CachedLayerProvider { try GGUFWeights.layer(rt, model, $0, loadExperts: false) }
@@ -615,7 +614,7 @@ extension StreamingDecoder {
         if env["DS4_MTLIO"] == "1" {
             if let bundle { _ = bundle.enableMetalIO(device: rt.device) }
             else {
-                FileHandle.standardError.write(Data("DS4 expbundle: DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF\n".utf8))
+                ExpertBundle.log("DS4_MTLIO=1 richiede un expert-bundle valido — uso pread GGUF")
             }
         }
         let gather: (Int, [Int32]) throws -> (GPUTensor, GPUTensor, GPUTensor) = { il, ids in

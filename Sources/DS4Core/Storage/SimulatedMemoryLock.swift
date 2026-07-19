@@ -7,7 +7,9 @@ import Darwin
 // Reserves and mlock()s a block of anonymous memory so streaming behavior can
 // be measured under reduced available RAM (--simulate-used-memory).
 
-public final class SimulatedMemoryLock {
+public final class SimulatedMemoryLock: DS4Logging {
+    public static let logTag = "mlock"
+
     private var ptr: UnsafeMutableRawPointer?
     private var bytes: UInt64 = 0
 
@@ -24,7 +26,7 @@ public final class SimulatedMemoryLock {
         bytes = 0
         if wanted == 0 { return true }
         if wanted > UInt64(Int.max) {
-            err("ds4: --simulate-used-memory is too large for this process")
+            log("--simulate-used-memory is too large for this process")
             return false
         }
 
@@ -33,7 +35,7 @@ public final class SimulatedMemoryLock {
                                 MAP_PRIVATE | MAP_ANON,
                                 -1, 0),
               region != MAP_FAILED else {
-            err(String(format: "ds4: --simulate-used-memory mmap %.2f GiB failed: %@",
+            log(String(format: "--simulate-used-memory mmap %.2f GiB failed: %@",
                        gib(wanted), String(cString: strerror(errno))))
             return false
         }
@@ -59,7 +61,7 @@ public final class SimulatedMemoryLock {
             if len != 0 { p[Int(off + len - 1)] = 1 }
 
             if mlock(region + Int(off), Int(len)) != 0 {
-                err(String(format: "ds4: --simulate-used-memory mlock failed after %.2f/%.2f GiB: %@",
+                log(String(format: "--simulate-used-memory mlock failed after %.2f/%.2f GiB: %@",
                            gib(locked), gib(wanted), String(cString: strerror(errno))))
                 if locked != 0 { munlock(region, Int(locked)) }
                 munmap(region, Int(wanted))
@@ -71,7 +73,7 @@ public final class SimulatedMemoryLock {
 
         ptr = region
         bytes = wanted
-        err(String(format: "ds4: simulated used memory: locked %.2f GiB before model load",
+        log(String(format: "simulated used memory: locked %.2f GiB before model load",
                    gib(wanted)))
         return true
     }
@@ -87,8 +89,4 @@ public final class SimulatedMemoryLock {
     deinit { release() }
 
     private func gib(_ b: UInt64) -> Double { Double(b) / Double(SSDStreaming.gib) }
-
-    private func err(_ message: String) {
-        FileHandle.standardError.write(Data((message + "\n").utf8))
-    }
 }

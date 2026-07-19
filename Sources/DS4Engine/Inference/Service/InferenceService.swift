@@ -14,7 +14,9 @@ import DS4Metal
 // is a clean token-level extension. Tool calls are parsed via DS4Core.ToolCallParser;
 // the tool/declaration format follows the model's chat_template (ChatRenderer).
 
-public actor InferenceService {
+public actor InferenceService: DS4Logging {
+    public static let logTag = "engine"
+
     /// Executor dedicato su coda GCD SERIALE (SE-0392): tutto il lavoro
     /// dell'actor — prefill, decode, warmup, benchmark — gira su un thread
     /// GCD classico, lo stesso contesto della demo CLI (main thread). Il
@@ -88,7 +90,7 @@ public actor InferenceService {
     public init(modelPath: String, contextSize: Int, systemPrompt: String?,
                 expertCacheSlots: Int? = nil,
                 frozenUsageSeed: Data? = nil) throws {
-        FileHandle.standardError.write(Data("DS4 engine: revisione \(Self.engineRevision)\n".utf8))
+        Self.log("revisione \(Self.engineRevision)")
         // Active DS4_* knobs, in the log of EVERY consumer (GUI included): "does
         // the app even see the env vars?" must be answerable from the log alone.
         let knobs = ["DS4_EXPERT_CACHE_SLOTS", "DS4_EXPERT_CACHE_UNIFORM", "DS4_MULTI_QUANT_CACHE", "DS4_EXPERT_PREAD",
@@ -104,8 +106,8 @@ public actor InferenceService {
                      "DS4_MLOCK", "DS4_PROFILE_ROUTE", "DS4_Q4_CACHE_DIR"]
         let env = ProcessInfo.processInfo.environment
         let knobLine = knobs.map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  ")
-        FileHandle.standardError.write(Data("DS4 engine: knob \(knobLine)\n".utf8))
-        FileHandle.standardError.write(Data("DS4 engine: contextSize=\(contextSize) cacheSlots=\(expertCacheSlots.map(String.init) ?? "env/off")\n".utf8))
+        Self.log("knob \(knobLine)")
+        Self.log("contextSize=\(contextSize) cacheSlots=\(expertCacheSlots.map(String.init) ?? "env/off")")
         // Inspect and select BEFORE constructing the DeepSeek tokenizer/config.
         // A recognized Qwen GGUF must fail as "backend non ancora implementato",
         // never as a missing deepseek4.* key after an expensive Metal bring-up.
@@ -128,8 +130,7 @@ public actor InferenceService {
         }
         self.model = openedModel
         self.backendDescriptor = selection.descriptor
-        FileHandle.standardError.write(Data(
-            "DS4 engine: backend=\(selection.backend.rawValue) architecture=\(selection.descriptor.architecture.rawValue) model=\(selection.descriptor.displayName)\n".utf8))
+        Self.log("backend=\(selection.backend.rawValue) architecture=\(selection.descriptor.architecture.rawValue) model=\(selection.descriptor.displayName)")
         // Kernels are embedded in the binary — no metal/ folder needed.
         self.rt = try MetalRuntime()
         self.tok = try Tokenizer(model: model)
@@ -153,8 +154,7 @@ public actor InferenceService {
             let cacheMode = multiQuantCache
                 ? "served by byte-budgeted per-layer expert pools"
                 : "bypassing legacy single-class expert cache"
-            FileHandle.standardError.write(Data(
-                "ds4: mixed-precision GGUF: \(mixed)/\(geometry.nLayers) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); \(cacheMode)\n".utf8))
+            Self.log("mixed-precision GGUF: \(mixed)/\(geometry.nLayers) routed layers outside class \(mq.gate)/\(mq.up)/\(mq.down); \(cacheMode)")
         }
         // Optional active-experts override (DS4_ACTIVE_EXPERTS=2..6): fewer experts
         // per token = less expert I/O, lower quality. Honored by the streaming path.

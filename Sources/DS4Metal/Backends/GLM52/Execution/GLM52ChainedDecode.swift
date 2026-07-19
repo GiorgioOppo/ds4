@@ -36,6 +36,20 @@ public final class GLM52DecodeScratch {
     let indexerWeights: MTLBuffer
     let scores: MTLBuffer
     let mid: MTLBuffer
+    /// Piani mid del percorso MoE batched: [8 esperti][expertHiddenWidth].
+    let midBatch: MTLBuffer
+    /// Scratch del ROUTER FUSO: logits (256), top-8 selezionati (id int32),
+    /// pesi normalizzati e probabilità — il readback per layer scende a
+    /// 64 byte + 1 KB di probabilità per la usage imatrix.
+    let routerLogits: MTLBuffer
+    let routerSelected: MTLBuffer
+    let routerWeights: MTLBuffer
+    let routerProbs: MTLBuffer
+    /// Scratch del top-k indexer su device (contesti > topK): indici
+    /// selezionati e ping-pong dei run del merge — niente readback degli
+    /// score né secondo command buffer.
+    let indexerTopKOut: MTLBuffer
+    let indexerSortScratch: MTLBuffer
     let geometry: GLM52DecodeGeometry
 
     public init(runtime: MetalRuntime,
@@ -70,6 +84,13 @@ public final class GLM52DecodeScratch {
         indexerWeights = try make(geometry.indexerHeadCount)
         scores = try make(scoreCapacity)
         mid = try make(max(layer.denseHiddenWidth, layer.expertHiddenWidth))
+        midBatch = try make(8 * layer.expertHiddenWidth)
+        routerLogits = try make(GLM52RouterReference.expertCount)
+        routerSelected = try make(GLM52RouterReference.expertsUsed)
+        routerWeights = try make(GLM52RouterReference.expertsUsed)
+        routerProbs = try make(GLM52RouterReference.expertCount)
+        indexerTopKOut = try make(Int(geometry.indexerTopK))
+        indexerSortScratch = try make(2 * scoreCapacity)
     }
 
     /// Load the embedded token into the resident hidden state.
@@ -87,6 +108,26 @@ public final class GLM52DecodeScratch {
             to: Float.self, capacity: count)
         return Array(UnsafeBufferPointer(start: pointer, count: count))
     }
+}
+
+/// Tempi wall-clock per fase di UN layer chained, nello stesso spirito del
+/// DecodeProfile DeepSeek. I confini coincidono con i commit sincroni già
+/// presenti (trunk attn/router → staging esperti → FFN): misurarli non
+/// aggiunge alcun punto di sincronizzazione. Un layer dense è UN solo
+/// command buffer end-to-end, quindi non separabile: finisce in denseS
+/// (la voce "layer (alt)" del report).
+public struct GLM52LayerPhases: Sendable {
+    public var routeS = 0.0    // trunk attenzione + indexer + router (CPU incluso)
+    public var gatherS = 0.0   // lettura record esperti (arena/SSD, sincrona)
+    public var expertsS = 0.0  // FFN shared + esperti routed (encode + commit)
+    public var denseS = 0.0    // layer dense a commit unico (non splittabile)
+    // Quota di ESECUZIONE GPU dentro le fasi wall-clock qui sopra (dai
+    // timestamp gpuStart/gpuEnd dei commit): la differenza è host —
+    // encode, round-trip di sync, router CPU, allocazioni.
+    public var routeGpuS = 0.0
+    public var expertsGpuS = 0.0
+    public var denseGpuS = 0.0
+    public init() {}
 }
 
 extension MetalRuntime {
@@ -138,8 +179,14 @@ extension MetalRuntime {
         reusedSelection: [UInt32]?,
         position: Int,
         activeExperts: Int? = nil,
-        deferSparseFFN: Bool = false) throws
-        -> (routing: GLM52RouterOutput?, selection: [UInt32]) {
+        deferSparseFFN: Bool = false,
+        fusedDecode: Bool = false,
+        carry: inout MTLCommandBuffer?) throws
+        -> (routing: GLM52RouterOutput?, selection: [UInt32],
+            phases: GLM52LayerPhases) {
+        let tLayer = Date()
+        var phases = GLM52LayerPhases()
+        let gpuStart = GLM52GraphTelemetry.gpuSeconds
         let g = weights.geometry
         let layer = g.layer
         let headsWidth = layer.headCount * layer.valueDimension
@@ -165,8 +212,21 @@ extension MetalRuntime {
             }
         }
 
-        guard var commandBuffer = queue.makeCommandBuffer() else {
-            throw MetalError.bufferAlloc
+        var commandBuffer: MTLCommandBuffer
+        if let carried = carry {
+            // FUSIONE COMMIT: il buffer arriva col FFN (o il layer dense) del
+            // layer precedente già codificato e non ancora committato — il
+            // trunk di QUESTO layer vi si accoda e le due metà pagano UNA
+            // sola attesa. L'ordinamento è garantito dall'hazard tracking di
+            // Metal sugli scratch condivisi (encoder in sequenza nello
+            // stesso command buffer).
+            commandBuffer = carried
+            carry = nil
+        } else {
+            guard let fresh = queue.makeCommandBuffer() else {
+                throw MetalError.bufferAlloc
+            }
+            commandBuffer = fresh
         }
 
         // Shared trunk (all on scratch buffers, hidden untouched so far).
@@ -174,16 +234,18 @@ extension MetalRuntime {
                                weight: weights.attnNorm,
                                output: scratch.normed,
                                width: layer.embeddingWidth)
-        try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.normed,
-                                weights: weights.qA, output: scratch.qRank,
-                                rowCount: g.qLoraRank,
-                                inputWidth: layer.embeddingWidth,
-                                weightType: weights.types.qA)
-        try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.normed,
-                                weights: weights.kvA, output: scratch.kvRaw,
-                                rowCount: layer.kvRawWidth,
-                                inputWidth: layer.embeddingWidth,
-                                weightType: weights.types.kvA)
+        // qA e kvA leggono lo stesso vettore normato: UN dispatch a coppia.
+        try glm52EncodeMatvecQ8Pair(into: commandBuffer,
+                                    input: scratch.normed,
+                                    weightsA: weights.qA,
+                                    outputA: scratch.qRank,
+                                    rowsA: g.qLoraRank,
+                                    typeA: weights.types.qA,
+                                    weightsB: weights.kvA,
+                                    outputB: scratch.kvRaw,
+                                    rowsB: layer.kvRawWidth,
+                                    typeB: weights.types.kvA,
+                                    inputWidth: layer.embeddingWidth)
         try glm52EncodeRMSNorm(into: commandBuffer, input: scratch.qRank,
                                weight: weights.qANorm,
                                output: scratch.qRankNorm,
@@ -276,12 +338,21 @@ extension MetalRuntime {
                                                    depth: 1),
                     threadgroupMemoryLength:
                         (128 + 4) * MemoryLayout<Float>.stride)
+                // TOP-K sul DEVICE: gli score non tornano più sul host (e
+                // niente re-upload + secondo command buffer come faceva il
+                // wrapper standalone); il commit resta — gli indici servono
+                // alla CPU per il binding e il riuso IndexShare — ma
+                // rilegge solo topK int32.
+                try glm52EncodeIndexerTopK(
+                    into: commandBuffer, scores: scratch.scores,
+                    rowCount: visible, topK: g.indexerTopK,
+                    output: scratch.indexerTopKOut,
+                    sortScratch: scratch.indexerSortScratch)
                 try glm52GraphCommit(commandBuffer)
-                let hostScores = glm52GraphReadback(scratch.scores,
-                                                    count: visible)
-                selection = try glm52IndexerTopK(
-                    scores: hostScores, rowCount: visible, tokenCount: 1,
-                    topK: g.indexerTopK)
+                let top = scratch.indexerTopKOut.contents()
+                    .bindMemory(to: UInt32.self, capacity: g.indexerTopK)
+                selection = Array(UnsafeBufferPointer(start: top,
+                                                      count: g.indexerTopK))
                 guard let fresh = queue.makeCommandBuffer() else {
                     throw MetalError.bufferAlloc
                 }
@@ -336,13 +407,11 @@ extension MetalRuntime {
             threadsPerThreadgroup: MTLSize(width: 32, height: 4, depth: 1))
         try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.heads,
                                 weights: weights.attnOutput,
-                                output: scratch.attnOut,
+                                output: scratch.hidden,
                                 rowCount: layer.embeddingWidth,
                                 inputWidth: headsWidth,
-                                weightType: weights.types.attnOutput)
-        try glm52EncodeAdd(into: commandBuffer, a: scratch.hidden,
-                           b: scratch.attnOut, output: scratch.hidden,
-                           count: layer.embeddingWidth)
+                                weightType: weights.types.attnOutput,
+                                accumulate: true)
         try glm52EncodeRMSNorm(into: commandBuffer, input: scratch.hidden,
                                weight: ffn.ffnNorm, output: scratch.ffnIn,
                                width: layer.embeddingWidth)
@@ -357,25 +426,77 @@ extension MetalRuntime {
                 hiddenWidth: layer.denseHiddenWidth,
                 inputWidth: layer.embeddingWidth, routeWeight: 1)
             try glm52EncodeMatvecQ8(into: commandBuffer, input: scratch.mid,
-                                    weights: down, output: scratch.ffnOut,
+                                    weights: down, output: scratch.hidden,
                                     rowCount: layer.embeddingWidth,
-                                    inputWidth: layer.denseHiddenWidth)
-            try glm52EncodeAdd(into: commandBuffer, a: scratch.hidden,
-                               b: scratch.ffnOut, output: scratch.hidden,
-                               count: layer.embeddingWidth)
-            try glm52GraphCommit(commandBuffer)
+                                    inputWidth: layer.denseHiddenWidth,
+                                    accumulate: true)
+            if fusedDecode {
+                // Nessun tap host in un layer dense: l'INTERO layer viaggia
+                // col commit del trunk successivo — zero attese qui.
+                carry = commandBuffer
+            } else {
+                try glm52GraphCommit(commandBuffer)
+            }
+            phases.denseS = Date().timeIntervalSince(tLayer)
+            phases.denseGpuS = GLM52GraphTelemetry.gpuSeconds - gpuStart
 
         case .sparse(let routerRows, let routerBias, let sharedGate,
                      let sharedUp, let sharedDown, let expertProvider):
-            try glm52GraphCommit(commandBuffer)
-            // The one genuine host tap of a sparse layer: the F32 router.
-            let ffnInHost = glm52GraphReadback(
-                scratch.ffnIn, count: layer.embeddingWidth)
-            let logits = try GLM52FFNCPUReference.matvec(
-                rows: routerRows, input: ffnInHost,
-                rowCount: GLM52RouterReference.expertCount)
-            let routed = try glm52Route(logits: logits, bias: routerBias)
+            let routed: GLM52RouterOutput
+            if GLM52GpuRouterDispatch.enabled {
+                // ROUTER FUSO: matvec F32 + sigmoid/bias/top-8 viaggiano nel
+                // commit del trunk; il tap host si riduce a leggere id, pesi
+                // e probabilità dagli scratch condivisi.
+                try glm52EncodeMatvecF32(
+                    into: commandBuffer, rows: routerRows,
+                    input: scratch.ffnIn, output: scratch.routerLogits,
+                    rowCount: GLM52RouterReference.expertCount,
+                    inputWidth: layer.embeddingWidth)
+                try glm52GraphEncode(
+                    into: commandBuffer,
+                    pipelineName: "kernel_glm52_router_select",
+                    arguments: [UInt32(GLM52RouterReference.expertCount),
+                                UInt32(GLM52RouterReference.expertsUsed),
+                                GLM52RouterReference.expertWeightScale
+                                    .bitPattern, 0],
+                    buffers: [scratch.routerLogits, routerBias,
+                              scratch.routerSelected, scratch.routerWeights,
+                              scratch.routerProbs],
+                    threadgroups: MTLSize(width: 1, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 256, height: 1,
+                                                   depth: 1),
+                    threadgroupMemoryLength: 256 * 2
+                        * MemoryLayout<Float>.stride)
+                try glm52GraphCommit(commandBuffer)
+                let used = GLM52RouterReference.expertsUsed
+                let ids = scratch.routerSelected.contents()
+                    .bindMemory(to: Int32.self, capacity: used)
+                let weights = scratch.routerWeights.contents()
+                    .bindMemory(to: Float.self, capacity: used)
+                let probs = scratch.routerProbs.contents()
+                    .bindMemory(to: Float.self,
+                                capacity: GLM52RouterReference.expertCount)
+                routed = GLM52RouterOutput(
+                    selected: Array(UnsafeBufferPointer(start: ids,
+                                                        count: used)),
+                    weights: Array(UnsafeBufferPointer(start: weights,
+                                                       count: used)),
+                    probabilities: Array(UnsafeBufferPointer(
+                        start: probs,
+                        count: GLM52RouterReference.expertCount)))
+            } else {
+                try glm52GraphCommit(commandBuffer)
+                // Fallback di riferimento: router su CPU dai buffer.
+                let ffnInHost = glm52GraphReadback(
+                    scratch.ffnIn, count: layer.embeddingWidth)
+                routed = try glm52RouteFromBuffers(
+                    rows: routerRows, bias: routerBias, ffnIn: ffnInHost)
+            }
             routing = routed
+            let tRoute = Date()
+            phases.routeS = tRoute.timeIntervalSince(tLayer)
+            let routeGpuEnd = GLM52GraphTelemetry.gpuSeconds
+            phases.routeGpuS = routeGpuEnd - gpuStart
 
             guard let ffnBuffer = queue.makeCommandBuffer() else {
                 throw MetalError.bufferAlloc
@@ -388,14 +509,11 @@ extension MetalRuntime {
                 weightType: ffn.sharedWeightTypes.gateUp)
             try glm52EncodeMatvecQ8(into: ffnBuffer, input: scratch.mid,
                                     weights: sharedDown,
-                                    output: scratch.contribution,
+                                    output: scratch.hidden,
                                     rowCount: layer.embeddingWidth,
                                     inputWidth: hidden,
-                                    weightType: ffn.sharedWeightTypes.down)
-            try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
-                               b: scratch.contribution,
-                               output: scratch.hidden,
-                               count: layer.embeddingWidth)
+                                    weightType: ffn.sharedWeightTypes.down,
+                                    accumulate: true)
             if deferSparseFFN {
                 // Two-phase prefill, phase A: the shared expert is already
                 // encoded above; the ROUTED experts are applied later by
@@ -403,8 +521,11 @@ extension MetalRuntime {
                 // record once for the whole prompt). scratch.ffnIn and
                 // scratch.hidden are the per-token planes it snapshots.
                 try glm52GraphCommit(ffnBuffer)
+                phases.expertsS = Date().timeIntervalSince(tRoute)
+                phases.expertsGpuS =
+                    GLM52GraphTelemetry.gpuSeconds - routeGpuEnd
                 caches.appendedRow()
-                return (routing, selection)
+                return (routing, selection, phases)
             }
             let usedExperts = min(routed.selected.count,
                                   max(1, activeExperts
@@ -418,7 +539,23 @@ extension MetalRuntime {
                 let ids = (0..<usedExperts).map {
                     UInt32(bitPattern: routed.selected[$0])
                 }
+                let tStage = Date()
                 let staged = try stage(ids)
+                phases.gatherS = Date().timeIntervalSince(tStage)
+                if GLM52MatvecDispatch.cooperative,
+                   GLM52MoEBatchDispatch.enabled, usedExperts <= 8 {
+                    // MoE BATCHED: tutti gli esperti in due dispatch —
+                    // l'analogo del kernel moe DeepSeek. Il fallback
+                    // per-esperto sotto resta il riferimento (DS4_GLM_SG=0
+                    // o DS4_GLM_MOE_BATCH=0).
+                    try glm52EncodeMoEBatch(
+                        into: ffnBuffer, staged: staged,
+                        weights: Array(routed.weights[0..<usedExperts]),
+                        input: scratch.ffnIn, mids: scratch.midBatch,
+                        accumulate: scratch.hidden,
+                        hiddenWidth: hidden,
+                        inputWidth: layer.embeddingWidth)
+                } else {
                 for rank in 0..<usedExperts {
                     let base = staged.recordOffsets[rank]
                     try glm52EncodePairSwiGLU(
@@ -433,21 +570,21 @@ extension MetalRuntime {
                     try glm52EncodeMatvecQ8(
                         into: ffnBuffer, input: scratch.mid,
                         weights: staged.buffer,
-                        output: scratch.contribution,
+                        output: scratch.hidden,
                         rowCount: layer.embeddingWidth,
                         inputWidth: hidden,
                         weightType: staged.downType,
                         weightsOffset: base + staged.gateBytes
-                            + staged.upBytes)
-                    try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
-                                       b: scratch.contribution,
-                                       output: scratch.hidden,
-                                       count: layer.embeddingWidth)
+                            + staged.upBytes,
+                        accumulate: true)
+                }
                 }
             } else {
                 for rank in 0..<usedExperts {
+                    let tRead = Date()
                     let record = try expertProvider(
                         UInt32(bitPattern: routed.selected[rank]))
+                    phases.gatherS += Date().timeIntervalSince(tRead)
                     let gate = try glm52GraphBuffer(record.gate)
                     let up = try glm52GraphBuffer(record.up)
                     let down = try glm52GraphBuffer(record.down)
@@ -460,21 +597,28 @@ extension MetalRuntime {
                     try glm52EncodeMatvecQ8(into: ffnBuffer,
                                             input: scratch.mid,
                                             weights: down,
-                                            output: scratch.contribution,
+                                            output: scratch.hidden,
                                             rowCount: layer.embeddingWidth,
                                             inputWidth: hidden,
-                                            weightType: record.downType)
-                    try glm52EncodeAdd(into: ffnBuffer, a: scratch.hidden,
-                                       b: scratch.contribution,
-                                       output: scratch.hidden,
-                                       count: layer.embeddingWidth)
+                                            weightType: record.downType,
+                                            accumulate: true)
                 }
             }
-            try glm52GraphCommit(ffnBuffer)
+            if fusedDecode {
+                // Il FFN non committa: sarà il trunk del layer successivo (o
+                // il flush di fine token) a pagarne l'attesa. Gli slot arena
+                // della selezione restano validi: il prossimo stage() avviene
+                // DOPO quel commit fuso, mai prima.
+                carry = ffnBuffer
+            } else {
+                try glm52GraphCommit(ffnBuffer)
+            }
+            phases.expertsS = Date().timeIntervalSince(tRoute) - phases.gatherS
+            phases.expertsGpuS = GLM52GraphTelemetry.gpuSeconds - routeGpuEnd
         }
 
         caches.appendedRow()
-        return (routing, selection)
+        return (routing, selection, phases)
     }
 
     /// Two-phase prefill, phase B: apply ONE staged batch of routed experts

@@ -7,12 +7,51 @@ import Metal
 /// telemetry demanded once I/O stalls stopped dominating. DS4_GLM_SG=0
 /// reverts to the per-thread reference kernels; DS4_GLM_NSG picks the rows
 /// (simdgroups) per threadgroup, default 4 = 128 threads.
+/// I knob di dispatch sono LATCH per-load, non per-processo: letti
+/// dall'ambiente a ogni init del motore (GLM52DispatchKnobs.refresh) così
+/// un toggle GUI applicato al reload ha effetto, mentre il percorso caldo
+/// legge statiche senza lookup d'ambiente per dispatch.
 enum GLM52MatvecDispatch {
-    static let cooperative =
+    nonisolated(unsafe) static var cooperative =
         ProcessInfo.processInfo.environment["DS4_GLM_SG"] != "0"
-    static let rowsPerThreadgroup = max(1, min(8,
+    nonisolated(unsafe) static var rowsPerThreadgroup = max(1, min(8,
         ProcessInfo.processInfo.environment["DS4_GLM_NSG"]
             .flatMap(Int.init) ?? 4))
+}
+
+/// MoE BATCHED nel decode (DS4_GLM_MOE_BATCH=0 per disattivare): tutti gli
+/// esperti routed in due dispatch invece di swiglu+down+add per esperto —
+/// l'analogo del kernel moe DeepSeek. Richiede il dispatch cooperativo.
+enum GLM52MoEBatchDispatch {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
+        .environment["DS4_GLM_MOE_BATCH"] != "0"
+}
+
+/// ROUTER FUSO su GPU (DS4_GLM_GPU_ROUTER=0 per disattivare — l'analogo di
+/// DS4_FUSED_ROUTER_PROBS/_FINALIZE DeepSeek): matvec F32 + sigmoid + bias
+/// + top-8 dentro il commit del trunk, readback di 64 byte (id + pesi)
+/// invece di 24 KB di attivazioni + matvec e top-k su CPU per ogni layer
+/// sparse. Il kernel è il gemello validato del router CPU (stessi tie-break
+/// deterministici — GLM52RouterTests).
+enum GLM52GpuRouterDispatch {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
+        .environment["DS4_GLM_GPU_ROUTER"] != "0"
+}
+
+/// Rilegge TUTTI i knob di dispatch dall'ambiente — chiamata all'init di
+/// ogni motore (disciplina single-driver: mai durante un decode).
+public enum GLM52DispatchKnobs {
+    public static func refresh() {
+        let env = ProcessInfo.processInfo.environment
+        GLM52MatvecDispatch.cooperative = env["DS4_GLM_SG"] != "0"
+        GLM52MatvecDispatch.rowsPerThreadgroup = max(1, min(8,
+            env["DS4_GLM_NSG"].flatMap(Int.init) ?? 4))
+        GLM52MoEBatchDispatch.enabled = env["DS4_GLM_MOE_BATCH"] != "0"
+        GLM52GpuRouterDispatch.enabled = env["DS4_GLM_GPU_ROUTER"] != "0"
+        GLM52ResidentWiring.enabled = env["DS4_GLM_MLOCK"] != "0"
+        GLM52LayerStreamer.refreshReadSplit(env["DS4_GLM_READ_SPLIT"]
+            .flatMap(Int.init))
+    }
 }
 
 /// Telemetry of the synchronous graph commits — splits REAL GPU execution
@@ -26,6 +65,39 @@ enum GLM52GraphTelemetry {
     static func reset() {
         gpuSeconds = 0
         commits = 0
+    }
+}
+
+/// L'UNICO compute encoder aperto di ogni command buffer del grafo GLM:
+/// glm52GraphEncode lo riusa per tutti i dispatch e glm52GraphCommit lo
+/// chiude al commit. Acceduto dal solo thread di decode (disciplina
+/// single-driver del motore — stessa assunzione dei contatori qui sopra).
+/// La purga a soglia chiude gli encoder di command buffer abbandonati da un
+/// error path (mai committati): innocuo, e il registro resta minuscolo.
+enum GLM52EncoderCache {
+    nonisolated(unsafe) private static var entries:
+        [(buffer: MTLCommandBuffer, encoder: MTLComputeCommandEncoder)] = []
+
+    static func encoder(for commandBuffer: MTLCommandBuffer) throws
+        -> MTLComputeCommandEncoder {
+        if let hit = entries.first(where: { $0.buffer === commandBuffer }) {
+            return hit.encoder
+        }
+        if entries.count > 3 {
+            entries.removeFirst().encoder.endEncoding()
+        }
+        guard let fresh = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalError.bufferAlloc
+        }
+        entries.append((commandBuffer, fresh))
+        return fresh
+    }
+
+    static func finish(_ commandBuffer: MTLCommandBuffer) {
+        guard let index = entries.firstIndex(
+            where: { $0.buffer === commandBuffer }) else { return }
+        entries[index].encoder.endEncoding()
+        entries.remove(at: index)
     }
 }
 
@@ -56,6 +128,22 @@ public struct GLM52StreamedWeightTypes: Sendable {
     public var sharedGateUp = GLM52TensorSchema.q8_0
     public var sharedDown = GLM52TensorSchema.q8_0
     public init() {}
+}
+
+/// DS4_GLM_MLOCK (default ON, =0 per disattivare — l'analogo di DS4_MLOCK
+/// DeepSeek): blocca in RAM i pesi RESIDENTI (head, proiezioni attn e FFN
+/// dei layer residenti). Sotto pressione il sistema li comprime/pagina e
+/// ogni token ne ripaga la residency al driver: misurato −394 ms/token sul
+/// solo head (433 → 39 ms). Gli slot di staging dei layer streamati NON
+/// passano da qui: sono riscritti da SSD di continuo, mai freddi.
+enum GLM52ResidentWiring {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
+        .environment["DS4_GLM_MLOCK"] != "0"
+
+    static func wire(_ buffer: MTLBuffer) {
+        guard enabled else { return }
+        _ = mlock(buffer.contents(), buffer.length)
+    }
 }
 
 /// One layer's decode weights resident on the GPU. Upload happens once at
@@ -137,6 +225,13 @@ public final class GLM52ResidentDecodeWeights {
                 proj: quantizedIndexer.proj)
         } else {
             indexer = nil
+        }
+        for buffer in [qA, qB, kvA, keyB, valueB, attnOutput] {
+            GLM52ResidentWiring.wire(buffer)
+        }
+        if let indexer {
+            GLM52ResidentWiring.wire(indexer.key)
+            GLM52ResidentWiring.wire(indexer.queryB)
         }
     }
 }
@@ -293,7 +388,10 @@ public struct GLM52StagedExpertSelection {
 public final class GLM52ResidentFFN {
     enum Kind {
         case dense(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
-        case sparse(routerRows: [Float], routerBias: [Float],
+        // Router rows/bias come BUFFER condivisi (upload una volta): il
+        // router fuso li legge su GPU, e il fallback CPU legge gli stessi
+        // byte dal puntatore shared — una sola copia residente.
+        case sparse(routerRows: MTLBuffer, routerBias: MTLBuffer,
                     sharedGate: MTLBuffer, sharedUp: MTLBuffer,
                     sharedDown: MTLBuffer,
                     expertProvider: (UInt32) throws -> GLM52QuantizedExpert)
@@ -344,9 +442,13 @@ public final class GLM52ResidentFFN {
                         "dense up")
             try require(down.count, layer.embeddingWidth * hiddenBytes,
                         "dense down")
-            kind = .dense(gate: try runtime.glm52GraphBuffer(gate),
-                          up: try runtime.glm52GraphBuffer(up),
-                          down: try runtime.glm52GraphBuffer(down))
+            let gateBuffer = try runtime.glm52GraphBuffer(gate)
+            let upBuffer = try runtime.glm52GraphBuffer(up)
+            let downBuffer = try runtime.glm52GraphBuffer(down)
+            for buffer in [gateBuffer, upBuffer, downBuffer] {
+                GLM52ResidentWiring.wire(buffer)
+            }
+            kind = .dense(gate: gateBuffer, up: upBuffer, down: downBuffer)
         case .sparse(let routerRows, let routerBias, let sharedGate,
                      let sharedUp, let sharedDown, let expertProvider):
             let hiddenBytes = MetalRuntime.glm52Q8RowBytes(
@@ -362,10 +464,17 @@ public final class GLM52ResidentFFN {
                         layer.expertHiddenWidth * embedBytes, "shared up")
             try require(sharedDown.count,
                         layer.embeddingWidth * hiddenBytes, "shared down")
-            kind = .sparse(routerRows: routerRows, routerBias: routerBias,
-                           sharedGate: try runtime.glm52GraphBuffer(sharedGate),
-                           sharedUp: try runtime.glm52GraphBuffer(sharedUp),
-                           sharedDown: try runtime.glm52GraphBuffer(sharedDown),
+            let gateBuffer = try runtime.glm52GraphBuffer(sharedGate)
+            let upBuffer = try runtime.glm52GraphBuffer(sharedUp)
+            let downBuffer = try runtime.glm52GraphBuffer(sharedDown)
+            for buffer in [gateBuffer, upBuffer, downBuffer] {
+                GLM52ResidentWiring.wire(buffer)
+            }
+            kind = .sparse(routerRows: try runtime.glm52GraphBuffer(routerRows),
+                           routerBias: try runtime.glm52GraphBuffer(routerBias),
+                           sharedGate: gateBuffer,
+                           sharedUp: upBuffer,
+                           sharedDown: downBuffer,
                            expertProvider: expertProvider)
         }
     }
@@ -378,6 +487,12 @@ public final class GLM52ResidentOutputHead {
     let head: MTLBuffer
     public let vocabularySize: Int
     let embeddingWidth: Int
+    /// Scratch dell'argmax greedy su device (riduzione a due stadi):
+    /// il readback del decode greedy scende da ~600 KB di logits a 4 byte.
+    let argmaxPartialValues: MTLBuffer
+    let argmaxPartialIndices: MTLBuffer
+    let argmaxResult: MTLBuffer
+    static let argmaxPartials = 64
 
     public init(runtime: MetalRuntime,
                 geometry: GLM52DecodeGeometry,
@@ -394,6 +509,15 @@ public final class GLM52ResidentOutputHead {
         }
         norm = try runtime.glm52GraphBuffer(outputNorm)
         head = try runtime.glm52GraphBuffer(outputHead)
+        // Le righe Q8 del head (~0.8 GB) sono il caso più pagato: 433 → 39
+        // ms/token misurati col wiring (vedi GLM52ResidentWiring).
+        GLM52ResidentWiring.wire(norm)
+        GLM52ResidentWiring.wire(head)
+        argmaxPartialValues = try runtime.glm52GraphOutputBuffer(
+            floats: Self.argmaxPartials)
+        argmaxPartialIndices = try runtime.glm52GraphOutputBuffer(
+            floats: Self.argmaxPartials)
+        argmaxResult = try runtime.glm52GraphOutputBuffer(floats: 1)
         self.vocabularySize = vocabularySize
         embeddingWidth = embed
     }
@@ -454,9 +578,12 @@ extension MetalRuntime {
         return Array(UnsafeBufferPointer(start: pointer, count: count))
     }
 
-    /// Encode one kernel dispatch into an open command buffer. Sequential
-    /// encoders in one command buffer execute in order with automatic hazard
-    /// tracking on the shared buffers.
+    /// Encode one kernel dispatch into an open command buffer, RIUSANDO
+    /// l'unico compute encoder del buffer: creare/chiudere un encoder per
+    /// dispatch costava ~0.9 ms l'uno — con ~1900 dispatch per token era il
+    /// costo host dominante del decode GLM (~1.7 s/token misurati). Un
+    /// encoder .serial garantisce ordine e barriere fra dispatch su risorse
+    /// tracked, esattamente come la sequenza di encoder che sostituisce.
     func glm52GraphEncode(
         into commandBuffer: MTLCommandBuffer,
         pipelineName: String,
@@ -467,9 +594,7 @@ extension MetalRuntime {
         threadsPerThreadgroup: MTLSize,
         threadgroupMemoryLength: Int? = nil) throws {
         let pipeline = try pipeline(pipelineName)
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw MetalError.bufferAlloc
-        }
+        let encoder = try GLM52EncoderCache.encoder(for: commandBuffer)
         encoder.setComputePipelineState(pipeline)
         arguments.withUnsafeBytes {
             encoder.setBytes($0.baseAddress!, length: $0.count, index: 0)
@@ -486,10 +611,10 @@ extension MetalRuntime {
         }
         encoder.dispatchThreadgroups(
             threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
-        encoder.endEncoding()
     }
 
     func glm52GraphCommit(_ commandBuffer: MTLCommandBuffer) throws {
+        GLM52EncoderCache.finish(commandBuffer)
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         GLM52GraphTelemetry.gpuSeconds += max(
@@ -513,17 +638,23 @@ extension MetalRuntime {
             threadgroupMemoryLength: 256 * MemoryLayout<Float>.stride)
     }
 
+    /// `accumulate`: fonde il residual add nel matvec (out[r] += dot) — un
+    /// dispatch e una passata su out in meno per ogni proiezione seguita
+    /// da un add (attn output, down dense/shared/esperti).
     func glm52EncodeMatvecQ8(
         into commandBuffer: MTLCommandBuffer,
         input: MTLBuffer, weights: MTLBuffer,
         output: MTLBuffer, rowCount: Int, inputWidth: Int,
         weightType: UInt32 = GLM52TensorSchema.q8_0,
-        weightsOffset: Int = 0) throws {
+        weightsOffset: Int = 0,
+        accumulate: Bool = false) throws {
         if GLM52MatvecDispatch.cooperative {
             let rows = GLM52MatvecDispatch.rowsPerThreadgroup
             try glm52GraphEncode(
                 into: commandBuffer,
-                pipelineName: "kernel_glm52_moe_down_sg",
+                pipelineName: accumulate
+                    ? "kernel_glm52_moe_down_acc_sg"
+                    : "kernel_glm52_moe_down_sg",
                 arguments: [weightType, UInt32(rowCount),
                             UInt32(inputWidth), Float(1).bitPattern],
                 buffers: [input, weights, output],
@@ -536,7 +667,10 @@ extension MetalRuntime {
         }
         let width = 256
         try glm52GraphEncode(
-            into: commandBuffer, pipelineName: "kernel_glm52_moe_down",
+            into: commandBuffer,
+            pipelineName: accumulate
+                ? "kernel_glm52_moe_down_acc"
+                : "kernel_glm52_moe_down",
             arguments: [weightType, UInt32(rowCount),
                         UInt32(inputWidth), Float(1).bitPattern],
             buffers: [input, weights, output],
@@ -544,6 +678,70 @@ extension MetalRuntime {
             threadgroups: MTLSize(width: (rowCount + width - 1) / width,
                                   height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+    }
+
+    /// Router CPU di riferimento leggendo righe/bias dai BUFFER condivisi
+    /// (fallback DS4_GLM_GPU_ROUTER=0 e percorso di validazione per-stage).
+    func glm52RouteFromBuffers(rows: MTLBuffer, bias: MTLBuffer,
+                               ffnIn: [Float]) throws -> GLM52RouterOutput {
+        let expertCount = GLM52RouterReference.expertCount
+        let width = ffnIn.count
+        let rowsPointer = rows.contents().bindMemory(
+            to: Float.self, capacity: expertCount * width)
+        let logits = try GLM52FFNCPUReference.matvec(
+            rows: Array(UnsafeBufferPointer(start: rowsPointer,
+                                            count: expertCount * width)),
+            input: ffnIn, rowCount: expertCount)
+        let biasPointer = bias.contents().bindMemory(
+            to: Float.self, capacity: expertCount)
+        return try glm52Route(
+            logits: logits,
+            bias: Array(UnsafeBufferPointer(start: biasPointer,
+                                            count: expertCount)))
+    }
+
+    /// I due dispatch del MoE batched: mid di TUTTI gli esperti (griglia 3D,
+    /// z = esperto), poi hidden += somma dei loro contributi down. Offset
+    /// dei record e pesi del router nella struct di argomenti (max 8).
+    func glm52EncodeMoEBatch(into commandBuffer: MTLCommandBuffer,
+                             staged: GLM52StagedExpertSelection,
+                             weights: [Float],
+                             input: MTLBuffer, mids: MTLBuffer,
+                             accumulate hidden: MTLBuffer,
+                             hiddenWidth: Int, inputWidth: Int) throws {
+        var arguments = [UInt32](repeating: 0, count: 24)
+        arguments[0] = staged.gateUpType
+        arguments[1] = UInt32(hiddenWidth)
+        arguments[2] = UInt32(inputWidth)
+        arguments[3] = UInt32(weights.count)
+        arguments[4] = UInt32(staged.gateBytes)
+        arguments[5] = UInt32(staged.gateBytes + staged.upBytes)
+        arguments[6] = staged.downType
+        for (index, offset) in staged.recordOffsets.prefix(8).enumerated() {
+            arguments[8 + index] = UInt32(offset)
+        }
+        for (index, weight) in weights.prefix(8).enumerated() {
+            arguments[16 + index] = weight.bitPattern
+        }
+        let rows = GLM52MatvecDispatch.rowsPerThreadgroup
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_batch_swiglu_sg",
+            arguments: arguments,
+            buffers: [input, staged.buffer, mids],
+            threadgroups: MTLSize(width: (hiddenWidth + rows - 1) / rows,
+                                  height: 1, depth: weights.count),
+            threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                           depth: 1))
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_batch_down_sg",
+            arguments: arguments,
+            buffers: [mids, staged.buffer, hidden],
+            threadgroups: MTLSize(width: (inputWidth + rows - 1) / rows,
+                                  height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                           depth: 1))
     }
 
     func glm52EncodePairSwiGLU(
@@ -927,10 +1125,8 @@ extension MetalRuntime {
                                    width: embed)
             try glm52GraphCommit(normBuffer)
             let ffnInHost = glm52GraphReadback(ffnIn, count: embed)
-            let logits = try GLM52FFNCPUReference.matvec(
-                rows: routerRows, input: ffnInHost,
-                rowCount: GLM52RouterReference.expertCount)
-            let routed = try glm52Route(logits: logits, bias: routerBias)
+            let routed = try glm52RouteFromBuffers(
+                rows: routerRows, bias: routerBias, ffnIn: ffnInHost)
 
             // Stage 2: shared expert plus the streamed routed experts, all
             // accumulated on GPU (out = afterAttn + shared + sum experts).
@@ -1063,6 +1259,91 @@ extension MetalRuntime {
                                 inputWidth: hidden.count)
         try glm52GraphCommit(commandBuffer)
         return glm52GraphReadback(logits, count: outputHead.vocabularySize)
+    }
+
+    /// Variante GREEDY del head: norm + matvec + ARGMAX sul device (due
+    /// stadi di riduzione, pareggi all'indice più basso come l'argmax CPU)
+    /// — il readback per token scende da ~600 KB di logits a 4 byte.
+    public func glm52ResidentGreedyToken(outputHead: GLM52ResidentOutputHead,
+                                         hidden: [Float]) throws -> Int32 {
+        guard hidden.count == outputHead.embeddingWidth else {
+            throw MetalError.unsupported(
+                "GLM 5.2 resident head expects a "
+                + "\(outputHead.embeddingWidth)-wide hidden state")
+        }
+        let hiddenBuffer = try glm52GraphBuffer(hidden)
+        let normalized = try glm52GraphOutputBuffer(floats: hidden.count)
+        let logits = try glm52GraphOutputBuffer(
+            floats: outputHead.vocabularySize)
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalError.bufferAlloc
+        }
+        try glm52EncodeRMSNorm(into: commandBuffer, input: hiddenBuffer,
+                               weight: outputHead.norm, output: normalized,
+                               width: hidden.count)
+        try glm52EncodeMatvecQ8(into: commandBuffer, input: normalized,
+                                weights: outputHead.head, output: logits,
+                                rowCount: outputHead.vocabularySize,
+                                inputWidth: hidden.count)
+        let partials = GLM52ResidentOutputHead.argmaxPartials
+        let chunk = (outputHead.vocabularySize + partials - 1) / partials
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_argmax_partial_f32",
+            arguments: [UInt32(outputHead.vocabularySize), UInt32(chunk),
+                        0, 0],
+            buffers: [logits, outputHead.argmaxPartialValues,
+                      outputHead.argmaxPartialIndices],
+            threadgroups: MTLSize(width: partials, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1),
+            threadgroupMemoryLength: 256 * 2 * MemoryLayout<Float>.stride)
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_argmax_final_f32",
+            arguments: [UInt32(partials), 0, 0, 0],
+            buffers: [outputHead.argmaxPartialValues,
+                      outputHead.argmaxPartialIndices,
+                      outputHead.argmaxResult],
+            threadgroups: MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1),
+            threadgroupMemoryLength: 64 * 2 * MemoryLayout<Float>.stride)
+        try glm52GraphCommit(commandBuffer)
+        return outputHead.argmaxResult.contents()
+            .bindMemory(to: Int32.self, capacity: 1).pointee
+    }
+
+    /// Le due proiezioni che condividono l'input normato (qA + kvA) in un
+    /// solo dispatch (percorso cooperativo; altrimenti due matvec).
+    func glm52EncodeMatvecQ8Pair(into commandBuffer: MTLCommandBuffer,
+                                 input: MTLBuffer,
+                                 weightsA: MTLBuffer, outputA: MTLBuffer,
+                                 rowsA: Int, typeA: UInt32,
+                                 weightsB: MTLBuffer, outputB: MTLBuffer,
+                                 rowsB: Int, typeB: UInt32,
+                                 inputWidth: Int) throws {
+        guard GLM52MatvecDispatch.cooperative else {
+            try glm52EncodeMatvecQ8(into: commandBuffer, input: input,
+                                    weights: weightsA, output: outputA,
+                                    rowCount: rowsA, inputWidth: inputWidth,
+                                    weightType: typeA)
+            try glm52EncodeMatvecQ8(into: commandBuffer, input: input,
+                                    weights: weightsB, output: outputB,
+                                    rowCount: rowsB, inputWidth: inputWidth,
+                                    weightType: typeB)
+            return
+        }
+        let rows = GLM52MatvecDispatch.rowsPerThreadgroup
+        let total = rowsA + rowsB
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_matvec_pair_sg",
+            arguments: [typeA, UInt32(rowsA), typeB, UInt32(rowsB),
+                        UInt32(inputWidth), 0, 0, 0],
+            buffers: [input, weightsA, weightsB, outputA, outputB],
+            threadgroups: MTLSize(width: (total + rows - 1) / rows,
+                                  height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                           depth: 1))
     }
 
     /// Validation wrapper for the generic-width RMSNorm kernel.

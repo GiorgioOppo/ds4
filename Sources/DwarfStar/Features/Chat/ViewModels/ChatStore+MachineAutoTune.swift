@@ -1,5 +1,6 @@
 import Foundation
 import DS4Engine
+import DS4Core
 
 private struct GUIAutoTuneTrial: Codable, Sendable {
     let pass: Int
@@ -2173,7 +2174,7 @@ extension ChatStore {
 
     private func autoTuneLog(_ line: String) {
         benchResults += line + "\n"
-        FileHandle.standardError.write(Data(("DS4 GUI autotune: " + line + "\n").utf8))
+        DS4Log.info("autotune", line)
     }
 
     private func machineAutoTuneSummary(_ configuration: MachineAutoTuneConfiguration) -> String {

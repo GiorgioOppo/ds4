@@ -77,6 +77,40 @@ public final class GLM52PayloadReader: @unchecked Sendable {
     public let path: String
     public let fileSize: UInt64
     private let fd: Int32
+    /// Base della vista FINESTRATA (0 = file intero): ogni pread trasla di
+    /// questo offset e `fileSize` riporta la lunghezza della finestra, così
+    /// tutta la validazione dei chiamanti resta relativa alla sezione. È il
+    /// meccanismo con cui una sezione del pack unico si comporta esattamente
+    /// come un file per-layer autonomo.
+    private let windowBase: UInt64
+
+    /// Vista finestrata su un sotto-intervallo di questo file (una sezione
+    /// del pack). Il descrittore è DUPLICATO: la vista ha vita propria e il
+    /// deinit chiude solo il proprio fd (F_NOCACHE segue la descrizione di
+    /// file condivisa).
+    public func windowed(offset: UInt64, length: UInt64) throws
+        -> GLM52PayloadReader {
+        guard length > 0, offset <= fileSize, length <= fileSize - offset
+        else {
+            throw GLM52PayloadReaderError.rangeOutsideFile(
+                name: "window", end: offset + length, fileSize: fileSize)
+        }
+        let duplicated = dup(fd)
+        guard duplicated >= 0 else {
+            throw GLM52PayloadReaderError.cannotOpen(path: path, code: errno)
+        }
+        return GLM52PayloadReader(fd: duplicated, path: path,
+                                  windowBase: windowBase + offset,
+                                  fileSize: length)
+    }
+
+    private init(fd: Int32, path: String, windowBase: UInt64,
+                 fileSize: UInt64) {
+        self.fd = fd
+        self.path = path
+        self.windowBase = windowBase
+        self.fileSize = fileSize
+    }
 
     public init(path: String) throws {
         let fd = open(path, O_RDONLY)
@@ -89,8 +123,17 @@ public final class GLM52PayloadReader: @unchecked Sendable {
             close(fd)
             throw GLM52PayloadReaderError.cannotStat(path: path, code: code)
         }
+        // F_NOCACHE opzionale (DS4_GLM_NOCACHE=1), MISURATO CONTROPRODUCENTE
+        // come default su M1 Pro 16 GB (0.17→0.15 tok/s): il riuso della page
+        // cache sui record esperti è basso ma non nullo, e il costo host del
+        // decode viene dalla contesa MTLIO/commit, non dallo sfratto cache.
+        // Lasciato come knob per macchine con più RAM o pattern diversi.
+        if ProcessInfo.processInfo.environment["DS4_GLM_NOCACHE"] == "1" {
+            _ = fcntl(fd, F_NOCACHE, 1)
+        }
         self.fd = fd
         self.path = path
+        self.windowBase = 0
         self.fileSize = UInt64(st.st_size)
     }
 
@@ -124,7 +167,8 @@ public final class GLM52PayloadReader: @unchecked Sendable {
         }
         guard let base = destination.baseAddress,
               GGUFWeights.preadFull(fd, into: base, bytes: bytes,
-                                    offset: Int(descriptor.absOffset)) else {
+                                    offset: Int(windowBase
+                                        + descriptor.absOffset)) else {
             throw GLM52PayloadReaderError.readFailed(
                 name: descriptor.name,
                 offset: descriptor.absOffset,
@@ -184,7 +228,7 @@ public final class GLM52PayloadReader: @unchecked Sendable {
         }
         guard let base = destination.baseAddress,
               GGUFWeights.preadFull(fd, into: base, bytes: bytes,
-                                    offset: Int(absolute)) else {
+                                    offset: Int(windowBase + absolute)) else {
             throw GLM52PayloadReaderError.readFailed(
                 name: descriptor.name, offset: absolute, bytes: byteCount)
         }
@@ -245,11 +289,13 @@ public final class GLM52PayloadReader: @unchecked Sendable {
             nonisolated(unsafe) var failure: GLM52PayloadReaderError?
             let lock = NSLock()
             let fd = self.fd
+            let windowBase = self.windowBase
             DispatchQueue.concurrentPerform(iterations: jobList.count) { i in
                 let job = jobList[i]
                 let dst = destinationBase + job.destinationOffset
                 if !GGUFWeights.preadFull(fd, into: dst, bytes: job.bytes,
-                                          offset: Int(job.fileOffset)) {
+                                          offset: Int(windowBase
+                                              + job.fileOffset)) {
                     lock.lock()
                     if failure == nil {
                         failure = .readFailed(name: job.name,
@@ -264,7 +310,8 @@ public final class GLM52PayloadReader: @unchecked Sendable {
             for job in jobs {
                 let dst = base + job.destinationOffset
                 guard GGUFWeights.preadFull(fd, into: dst, bytes: job.bytes,
-                                            offset: Int(job.fileOffset)) else {
+                                            offset: Int(windowBase
+                                                + job.fileOffset)) else {
                     throw GLM52PayloadReaderError.readFailed(
                         name: job.name,
                         offset: job.fileOffset,

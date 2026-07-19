@@ -17,6 +17,80 @@ import Metal
 // lowest-index rule — validation fixtures use distinct scores.
 
 extension MetalRuntime {
+    /// Variante ENCODE del top-k: gli STESSI stadi del wrapper standalone
+    /// qui sotto, ma dentro il command buffer del chiamante — gli score
+    /// restano sul device (niente readback + re-upload né secondo command
+    /// buffer) e il chiamante rilegge SOLO i topK indici dopo il commit.
+    /// `sortScratch` deve tenere 2×workWidth int32 (lo scratch del decode
+    /// è dimensionato a 2×scoreCapacity).
+    func glm52EncodeIndexerTopK(into commandBuffer: MTLCommandBuffer,
+                                scores: MTLBuffer, rowCount: Int, topK: Int,
+                                output: MTLBuffer,
+                                sortScratch: MTLBuffer) throws {
+        let sortPipeline = try pipeline("kernel_argsort_f32_i32_desc")
+        var maxThreads = sortPipeline.maxTotalThreadsPerThreadgroup
+        if maxThreads == 0 { maxThreads = 256 }
+        var nth = 1
+        while nth < rowCount && 2 * nth <= maxThreads { nth *= 2 }
+        let blockCount = (rowCount + nth - 1) / nth
+        let blockTopK = min(topK, nth)
+        var workWidth = topK
+        if blockCount > 1 {
+            let lastBlock = rowCount - (blockCount - 1) * nth
+            workWidth = (blockCount - 1) * blockTopK
+                + min(lastBlock, blockTopK)
+        }
+        let onePass = blockCount <= 1
+        func words(_ bytes: [UInt8]) -> [UInt32] {
+            bytes.withUnsafeBytes { raw in
+                (0..<bytes.count / 4).map {
+                    raw.loadUnaligned(fromByteOffset: $0 * 4,
+                                      as: UInt32.self)
+                }
+            }
+        }
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_argsort_f32_i32_desc",
+            arguments: words(Self.argsortArgs(n: rowCount, rows: 1,
+                                              ne0: workWidth,
+                                              topK: blockTopK)),
+            buffers: [scores, onePass ? output : sortScratch],
+            threadgroups: MTLSize(width: blockCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1),
+            threadgroupMemoryLength:
+                ((nth * MemoryLayout<Int32>.stride) + 15) & ~15)
+        let scratchRowBytes = workWidth * MemoryLayout<Int32>.stride
+        var currentOffset = 0
+        var nextOffset = scratchRowBytes
+        var runLength = blockTopK
+        let mergePipeline = try pipeline("kernel_argsort_merge_f32_i32_desc")
+        while runLength < workWidth {
+            let mergeCount = (workWidth + 2 * runLength - 1)
+                / (2 * runLength)
+            let finalMerge = mergeCount == 1
+            var mergeThreads = mergePipeline.maxTotalThreadsPerThreadgroup
+            if mergeThreads == 0 || mergeThreads > 512 { mergeThreads = 512 }
+            mergeThreads = max(1, min(mergeThreads, runLength))
+            try glm52GraphEncode(
+                into: commandBuffer,
+                pipelineName: "kernel_argsort_merge_f32_i32_desc",
+                arguments: words(Self.glm52ArgsortMergeArgs(
+                    n: rowCount, rows: 1, ne0: workWidth,
+                    topK: finalMerge ? topK : workWidth,
+                    runLength: runLength)),
+                buffers: [scores, sortScratch,
+                          finalMerge ? output : sortScratch],
+                offsets: [0, currentOffset, finalMerge ? 0 : nextOffset],
+                threadgroups: MTLSize(width: mergeCount, height: 1,
+                                      depth: 1),
+                threadsPerThreadgroup: MTLSize(width: mergeThreads,
+                                               height: 1, depth: 1))
+            swap(&currentOffset, &nextOffset)
+            runLength <<= 1
+        }
+    }
+
     /// Top-`topK` row indices of each token-major score row, descending by
     /// score. `scores` is `[tokenCount][rowCount]`; the result is
     /// `[tokenCount][topK]`.

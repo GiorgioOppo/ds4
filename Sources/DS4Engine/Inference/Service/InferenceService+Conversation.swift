@@ -157,9 +157,9 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         let ids = tok.tokenizeRenderedChat(suffix).map { Int($0) }
         let prepS = Date().timeIntervalSince(tPrep)
         if prepS > 0.25 {
-            FileHandle.standardError.write(Data(String(
-                format: "DS4 server: render+tokenizzazione %d char → %d token in %.2fs\n",
-                suffix.count, ids.count, prepS).utf8))
+            DS4Log.info("server", String(
+                format: "render+tokenizzazione %d char → %d token in %.2fs",
+                suffix.count, ids.count, prepS))
         }
         // CONTINUITÀ KV per il server STATELESS (Xcode & co. ri-inviano
         // l'intero transcript a ogni richiesta, system prompt di migliaia di
@@ -170,8 +170,7 @@ public func resetDecodeProfile() { decoder.resetProfile() }
         // reset di sempre: prefill freddo, correttezza invariata.
         if !kvDirty, !committedIds.isEmpty, ids.count > committedIds.count,
            ids.starts(with: committedIds) {
-            FileHandle.standardError.write(Data(
-                "DS4 server: KV riusato in memoria (\(committedIds.count) token già caldi)\n".utf8))
+            DS4Log.info("server", "KV riusato in memoria (\(committedIds.count) token già caldi)")
             return run(suffixIds: Array(ids.dropFirst(committedIds.count)),
                        think: thinkMode, sampling: sampling, maxTokens: maxTokens,
                        resumablePrefill: true)

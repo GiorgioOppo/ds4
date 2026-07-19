@@ -224,12 +224,16 @@ final class ChatStore {
     var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 22 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
-    /// GLM 5.2: layer residenti (0 = adattivo alla RAM fisica). Ogni layer
-    /// residente in più toglie ~230 MiB di SSD da ogni token generato.
-    /// Si applica al prossimo caricamento del modello.
+    /// GLM 5.2: layer residenti (0 = adattivo alla RAM fisica). MISURATO su
+    /// 16 GB: pochi residenti extra sono controproducenti (il sistema li
+    /// pagina e ogni commit ne ripaga la residency, ~+750 ms/token con 11
+    /// contro 3); l'adattivo resta al floor dense sotto pressione. Si
+    /// applica al prossimo caricamento del modello.
     var glmResidentLayers: Int = (UserDefaults.standard.object(forKey: "GLMResidentLayers") as? Int) ?? 0 {
         didSet { UserDefaults.standard.set(glmResidentLayers, forKey: "GLMResidentLayers") }
     }
+    /// Hit/miss dell'arena esperti GLM (riga di tuning; refresh esplicito).
+    var glmArenaCounters: (hits: Int, misses: Int)?
     /// GLM 5.2: esperti eseguiti per token (0 = tutti gli 8 del router).
     /// Meno esperti = meno I/O, qualità ridotta.
     var glmActiveExperts: Int = (UserDefaults.standard.object(forKey: "GLMActiveExperts") as? Int) ?? 0 {
@@ -259,6 +263,35 @@ final class ChatStore {
     /// OFF = layer Q8 dal GGUF; gli esperti unificati restano attivi.
     var glmUseQ4Sidecar: Bool = (UserDefaults.standard.object(forKey: "GLMUseQ4Sidecar") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(glmUseQ4Sidecar, forKey: "GLMUseQ4Sidecar") }
+    }
+    /// GLM 5.2: fusione dei commit (FFN layer N + trunk N+1 in un command
+    /// buffer — ~metà delle attese sincrone). OFF = percorso storico.
+    var glmFuseEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMFuse") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmFuseEnabled, forKey: "GLMFuse") }
+    }
+    /// GLM 5.2: MoE batched (tutti gli esperti instradati in due dispatch).
+    /// OFF = swiglu+down+add per esperto, il percorso di riferimento.
+    var glmMoEBatchEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMMoEBatch") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmMoEBatchEnabled, forKey: "GLMMoEBatch") }
+    }
+    /// GLM 5.2: router fuso su GPU (matvec+sigmoid+top-8 nel commit del
+    /// trunk; −18% di prefill misurato). OFF = router CPU di riferimento.
+    var glmGpuRouterEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMGpuRouter") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmGpuRouterEnabled, forKey: "GLMGpuRouter") }
+    }
+    /// GLM 5.2: mlock dei pesi residenti (head ~0.8 GB + attn/FFN dei layer
+    /// residenti; misurato −394 ms/token sul head). OFF = paginabili.
+    var glmMlockEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMMlock") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmMlockEnabled, forKey: "GLMMlock") }
+    }
+    /// GLM 5.2: sotto-intervalli pread del fill parallelo nel PREFILL
+    /// (0 = default 4; −15% di prefill misurato). Il decode resta seriale.
+    var glmReadSplit: Int = (UserDefaults.standard.object(forKey: "GLMReadSplit") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmReadSplit, forKey: "GLMReadSplit") }
+    }
+    /// GLM 5.2: simdgroup per threadgroup dei kernel matvec (0 = default 4).
+    var glmNSG: Int = (UserDefaults.standard.object(forKey: "GLMNSG") as? Int) ?? 0 {
+        didSet { UserDefaults.standard.set(glmNSG, forKey: "GLMNSG") }
     }
     /// Layer-aware expert-cache layout for mixed-quant GGUFs. Each routed layer
     /// gets a pool with its real IQ2/Q4 record size, while the allocator keeps

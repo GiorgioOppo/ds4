@@ -39,6 +39,171 @@ public enum GLM52LayerQuantSidecarError: Error, Sendable,
     }
 }
 
+/// PACK UNICO — un solo file per modello, come il .expbundle DeepSeek, con
+/// la semantica a checkpoint del q4cache DeepSeek: dentro ci sono le stesse
+/// sezioni per-layer del formato v2, appese una alla volta. Ogni sezione è
+/// l'immagine ESATTA di un file .layerq4 (il reader la serve tramite una
+/// vista finestrata, quindi tutta la validazione v2 si riusa invariata).
+/// La scansione si ferma alla prima sezione invalida: una coda strappata da
+/// una build interrotta viene troncata e riscritta dalla build successiva.
+/// QUALSIASI sottoinsieme di layer resta utile; identità = dimensione GGUF.
+public enum GLM52SidecarPack {
+    public static let magic: UInt32 = 0x314B_5047        // "GPK1"
+    static let sectionMagic: UInt32 = 0x4345_5347        // "GSEC"
+    static let headerBytes: UInt64 = 16
+    static let sectionHeaderBytes: UInt64 = 16
+    /// Nomi standard, parità DeepSeek: il sidecar Q4 unificato è
+    /// "<gguf>.q4dense" e il bundle esperti "<gguf>.expbundle", nella
+    /// directory risolta. I pack coi nomi storici glm52-*.glmsidecar
+    /// vengono RINOMINATI al nome nuovo alla prima scansione (stesso
+    /// volume: rename atomico, le sezioni già costruite si conservano).
+    public static func q4FileName(sourcePath: String) -> String {
+        (sourcePath as NSString).lastPathComponent + ".q4dense"
+    }
+    public static func expertsFileName(sourcePath: String) -> String {
+        (sourcePath as NSString).lastPathComponent + ".expbundle"
+    }
+    static let legacyQ4FileName = "glm52-pack.glmsidecar"
+    static let legacyExpertsFileName = "glm52-experts.glmsidecar"
+
+    public static func path(directory: String, fileName: String) -> String {
+        (directory as NSString).appendingPathComponent(fileName)
+    }
+
+    struct Index {
+        let path: String
+        let sections: [Int: (offset: UInt64, length: UInt64)]
+        /// Fine dell'ultima sezione valida: punto di troncamento/append.
+        let validEnd: UInt64
+    }
+
+    /// Scansiona il pack: nil se il file non esiste; throws se esiste ma
+    /// appartiene a un ALTRO GGUF (rifiuto a voce alta, mai silenzioso).
+    /// `legacyFileName`: nome storico da rinominare al nome nuovo quando
+    /// il file nuovo manca (migrazione one-shot, atomica).
+    static func scan(directory: String,
+                     fileName: String,
+                     legacyFileName: String? = nil,
+                     sourceFileSize: UInt64) throws
+        -> Index? {
+        let packPath = path(directory: directory, fileName: fileName)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: packPath), let legacyFileName {
+            let legacyPath = path(directory: directory,
+                                  fileName: legacyFileName)
+            if fm.fileExists(atPath: legacyPath) {
+                try fm.moveItem(atPath: legacyPath, toPath: packPath)
+            }
+        }
+        guard fm.fileExists(atPath: packPath) else {
+            return nil
+        }
+        let reader = try GLM52PayloadReader(path: packPath)
+        guard reader.fileSize >= headerBytes else {
+            throw GLM52LayerQuantSidecarError.invalidHeader(path: packPath)
+        }
+        func bytes(_ offset: UInt64, _ count: UInt64) throws -> [UInt8] {
+            try reader.bytes(of: GLM52WeightDescriptor(
+                name: "pack.header", type: GLM52TensorSchema.q8_0,
+                dims: [], absOffset: offset, bytes: count))
+        }
+        let head = try bytes(0, headerBytes)
+        func u32(_ o: Int, of b: [UInt8]) -> UInt32 {
+            b.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: o, as: UInt32.self)
+            }
+        }
+        func u64(_ o: Int, of b: [UInt8]) -> UInt64 {
+            b.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: o, as: UInt64.self)
+            }
+        }
+        guard u32(0, of: head) == magic, u32(4, of: head) == 1 else {
+            throw GLM52LayerQuantSidecarError.invalidHeader(path: packPath)
+        }
+        guard u64(8, of: head) == sourceFileSize else {
+            throw GLM52LayerQuantSidecarError.sourceMismatch(path: packPath)
+        }
+        var sections: [Int: (offset: UInt64, length: UInt64)] = [:]
+        var cursor = headerBytes
+        while cursor + sectionHeaderBytes <= reader.fileSize {
+            let header = try bytes(cursor, sectionHeaderBytes)
+            let layer = u32(4, of: header)
+            let length = u64(8, of: header)
+            guard u32(0, of: header) == sectionMagic, layer < 4096,
+                  length > 0,
+                  length <= reader.fileSize
+                      - cursor - sectionHeaderBytes else { break }
+            // Ultima vince: un upgrade v1→v2 appende una sezione nuova per
+            // lo stesso layer (lo spazio della vecchia resta: raro, accettato).
+            sections[Int(layer)] = (cursor + sectionHeaderBytes, length)
+            cursor = (cursor + sectionHeaderBytes + length + 15) & ~15
+        }
+        return Index(path: packPath, sections: sections, validEnd: cursor)
+    }
+
+    /// Appende una sezione (l'immagine di un file .layerq4) al pack: crea il
+    /// pack se manca, TRONCA una coda strappata, scrive header + contenuto +
+    /// padding e sincronizza. Il chiamante cancella la sorgente solo dopo.
+    static func append(directory: String,
+                       fileName: String,
+                       legacyFileName: String? = nil,
+                       layer: Int,
+                       contentsOf source: String,
+                       sourceFileSize: UInt64) throws {
+        let fm = FileManager.default
+        let packPath = path(directory: directory, fileName: fileName)
+        var validEnd = headerBytes
+        if let index = try scan(directory: directory, fileName: fileName,
+                                legacyFileName: legacyFileName,
+                                sourceFileSize: sourceFileSize) {
+            validEnd = index.validEnd
+        } else {
+            try fm.createDirectory(atPath: directory,
+                                   withIntermediateDirectories: true)
+            fm.createFile(atPath: packPath, contents: nil)
+            guard let handle = FileHandle(forWritingAtPath: packPath) else {
+                throw GLM52PayloadReaderError.cannotOpen(path: packPath,
+                                                         code: errno)
+            }
+            var head = Data()
+            withUnsafeBytes(of: magic.littleEndian) { head.append(contentsOf: $0) }
+            withUnsafeBytes(of: UInt32(1).littleEndian) { head.append(contentsOf: $0) }
+            withUnsafeBytes(of: sourceFileSize.littleEndian) { head.append(contentsOf: $0) }
+            try handle.write(contentsOf: head)
+            try handle.synchronize()
+            try handle.close()
+        }
+        guard let sourceSize = (try? fm.attributesOfItem(atPath: source))?[
+            .size] as? UInt64, sourceSize > 0 else {
+            throw GLM52LayerQuantSidecarError.shortFile(path: source)
+        }
+        guard let handle = FileHandle(forWritingAtPath: packPath),
+              let input = FileHandle(forReadingAtPath: source) else {
+            throw GLM52PayloadReaderError.cannotOpen(path: packPath,
+                                                     code: errno)
+        }
+        defer { try? handle.close(); try? input.close() }
+        try handle.truncate(atOffset: validEnd)
+        try handle.seek(toOffset: validEnd)
+        var header = Data()
+        withUnsafeBytes(of: sectionMagic.littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt32(layer).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: sourceSize.littleEndian) { header.append(contentsOf: $0) }
+        try handle.write(contentsOf: header)
+        while let chunk = try input.read(upToCount: 64 << 20),
+              !chunk.isEmpty {
+            try handle.write(contentsOf: chunk)
+        }
+        let end = validEnd + sectionHeaderBytes + sourceSize
+        let padded = (end + 15) & ~15
+        if padded > end {
+            try handle.write(contentsOf: Data(count: Int(padded - end)))
+        }
+        try handle.synchronize()
+    }
+}
+
 /// One validated, opened per-layer sidecar (v1: tensors only; v2: tensors
 /// plus the embedded expert payload).
 public final class GLM52LayerQuantSidecar {
@@ -50,13 +215,17 @@ public final class GLM52LayerQuantSidecar {
 
     public let layer: Int
     public let path: String
+    /// True quando la sezione vive nel pack unico; false = file per-layer
+    /// legacy (candidato alla migrazione nel pack alla prossima build).
+    public let fromPack: Bool
     /// Synthetic streamed-tensor view whose descriptors point INTO the
     /// sidecar file (requantized types included).
     public let tensors: GLM52StreamedLayerTensors
     /// Bundle-compatible view over the embedded expert payload (nil on a
     /// version-1 file).
     public let expertView: GLM52ExpertBundle?
-    /// Open pread reader over the sidecar file, handed to the streamer.
+    /// Open pread reader over the sidecar file (o la vista finestrata sulla
+    /// sezione del pack), handed to the streamer.
     public let reader: GLM52PayloadReader
 
     public static func fileName(layer: Int) -> String {
@@ -67,12 +236,13 @@ public final class GLM52LayerQuantSidecar {
         (directory as NSString).appendingPathComponent(fileName(layer: layer))
     }
 
-    private init(layer: Int, path: String,
+    private init(layer: Int, path: String, fromPack: Bool,
                  tensors: GLM52StreamedLayerTensors,
                  expertView: GLM52ExpertBundle?,
                  reader: GLM52PayloadReader) {
         self.layer = layer
         self.path = path
+        self.fromPack = fromPack
         self.tensors = tensors
         self.expertView = expertView
         self.reader = reader
@@ -119,20 +289,53 @@ public final class GLM52LayerQuantSidecar {
 
     // MARK: - Open
 
-    /// Open and validate a layer sidecar against the live GGUF; nil if the
-    /// file does not exist, throws if it exists but does not match. Accepts
-    /// version 1 (tensors only — `expertView` nil) and version 2.
+    /// Open and validate a layer sidecar against the live GGUF; nil when
+    /// assente, throws se esiste ma non corrisponde. Ordine di ricerca:
+    /// prima la sezione nel PACK UNICO, poi il file per-layer legacy (che
+    /// resta leggibile e viene migrato nel pack alla prossima build).
+    /// Accepts version 1 (tensors only — `expertView` nil) and version 2.
     public static func open(directory: String, layer: Int,
                             source: GLM52StreamedLayerTensors,
                             routed: GLM52RoutedExpertWeights,
                             expertCount: Int,
+                            sourcePath: String,
                             sourceFileSize: UInt64) throws
         -> GLM52LayerQuantSidecar? {
+        if let index = try GLM52SidecarPack.scan(
+               directory: directory,
+               fileName: GLM52SidecarPack.q4FileName(sourcePath: sourcePath),
+               legacyFileName: GLM52SidecarPack.legacyQ4FileName,
+               sourceFileSize: sourceFileSize),
+           let section = index.sections[layer] {
+            let pack = try GLM52PayloadReader(path: index.path)
+            return try open(
+                reader: try pack.windowed(offset: section.offset,
+                                          length: section.length),
+                at: index.path + "#blk\(layer)", fromPack: true,
+                layer: layer, source: source, routed: routed,
+                expertCount: expertCount, sourceFileSize: sourceFileSize)
+        }
         let sidecarPath = path(directory: directory, layer: layer)
         guard FileManager.default.fileExists(atPath: sidecarPath) else {
             return nil
         }
         let reader = try GLM52PayloadReader(path: sidecarPath)
+        return try open(reader: reader, at: sidecarPath, fromPack: false,
+                        layer: layer, source: source, routed: routed,
+                        expertCount: expertCount,
+                        sourceFileSize: sourceFileSize)
+    }
+
+    /// Validazione comune: il reader è il file per-layer O la vista
+    /// finestrata sulla sezione del pack — gli offset interni sono identici
+    /// per costruzione (la sezione è l'immagine esatta del file).
+    private static func open(reader: GLM52PayloadReader, at sidecarPath: String,
+                             fromPack: Bool, layer: Int,
+                             source: GLM52StreamedLayerTensors,
+                             routed: GLM52RoutedExpertWeights,
+                             expertCount: Int,
+                             sourceFileSize: UInt64) throws
+        -> GLM52LayerQuantSidecar? {
         let entries = orderedEntries(of: source)
         guard reader.fileSize >= UInt64(fixedHeaderBytes) else {
             throw GLM52LayerQuantSidecarError.invalidHeader(path: sidecarPath)
@@ -256,8 +459,8 @@ public final class GLM52LayerQuantSidecar {
             sharedUp: synthetic[sharedStart + 1],
             sharedDown: synthetic[sharedStart + 2])
         return GLM52LayerQuantSidecar(
-            layer: layer, path: sidecarPath, tensors: tensors,
-            expertView: expertView, reader: reader)
+            layer: layer, path: sidecarPath, fromPack: fromPack,
+            tensors: tensors, expertView: expertView, reader: reader)
     }
 
     // MARK: - Build
@@ -276,11 +479,25 @@ public final class GLM52LayerQuantSidecar {
                              reader: GLM52PayloadReader,
                              legacyBundleDirectory: String? = nil) throws
         -> Bool {
+        let packName = GLM52SidecarPack.q4FileName(sourcePath: reader.path)
         let existing = (try? open(directory: directory, layer: layer,
                                   source: source, routed: routed,
                                   expertCount: expertCount,
+                                  sourcePath: reader.path,
                                   sourceFileSize: reader.fileSize)) ?? nil
-        if existing?.expertView != nil { return false }
+        if let existing, existing.expertView != nil {
+            if existing.fromPack { return false }
+            // V2 valido ma ancora file per-layer: MIGRAZIONE nel pack unico
+            // — copia grezza della sezione e rimozione del file solo dopo
+            // (uso disco netto invariato, transiente = un layer).
+            try GLM52SidecarPack.append(
+                directory: directory, fileName: packName,
+                legacyFileName: GLM52SidecarPack.legacyQ4FileName,
+                layer: layer, contentsOf: existing.path,
+                sourceFileSize: reader.fileSize)
+            try? FileManager.default.removeItem(atPath: existing.path)
+            return true
+        }
         try FileManager.default.createDirectory(
             atPath: directory, withIntermediateDirectories: true)
         let finalPath = path(directory: directory, layer: layer)
@@ -292,7 +509,8 @@ public final class GLM52LayerQuantSidecar {
         let legacyBundle = try legacyBundleDirectory.flatMap {
             try GLM52ExpertBundle.open(
                 directory: $0, layer: layer, weights: routed,
-                expertCount: expertCount, sourceFileSize: reader.fileSize)
+                expertCount: expertCount, sourcePath: reader.path,
+                sourceFileSize: reader.fileSize)
         }
 
         let entries = orderedEntries(of: source)
@@ -423,13 +641,22 @@ public final class GLM52LayerQuantSidecar {
         }
         try handle.synchronize()
         try handle.close()
-        _ = try FileManager.default.replaceItemAt(
-            URL(fileURLWithPath: finalPath),
-            withItemAt: URL(fileURLWithPath: partPath))
-        // Migration: the v1 was replaced by the rename; the legacy bundle
-        // is now redundant — reclaim its ~2.4 GiB only AFTER the pack is
-        // durably in place.
-        if let legacyBundleDirectory, legacyBundle != nil {
+        // Nel PACK UNICO: la sezione è l'immagine del .part appena scritto.
+        try GLM52SidecarPack.append(directory: directory, fileName: packName,
+                                    legacyFileName:
+                                        GLM52SidecarPack.legacyQ4FileName,
+                                    layer: layer, contentsOf: partPath,
+                                    sourceFileSize: reader.fileSize)
+        try? FileManager.default.removeItem(atPath: partPath)
+        // Migration: un eventuale file per-layer (v1 appena assorbito o v2
+        // stantio) e il bundle legacy sono ora ridondanti — reclamati solo
+        // DOPO che il pack è durabile su disco. Un bundle nel pack esperti
+        // non è reclamabile per-sezione (no-op qui): si libera cancellando
+        // l'intero glm52-experts.glmsidecar quando tutti i layer sono
+        // unificati.
+        try? FileManager.default.removeItem(atPath: finalPath)
+        if let legacyBundleDirectory, legacyBundle != nil,
+           !legacyBundle!.fromPack {
             try? FileManager.default.removeItem(
                 atPath: GLM52ExpertBundle.path(
                     directory: legacyBundleDirectory, layer: layer))
@@ -500,6 +727,7 @@ public final class GLM52LayerQuantSidecar {
             let existing = (try? open(
                 directory: directory, layer: layer, source: source,
                 routed: routed, expertCount: expertCount,
+                sourcePath: reader.path,
                 sourceFileSize: reader.fileSize)) ?? nil
             if existing?.expertView == nil, free < perLayer + minFreeBytes {
                 stopped = "spazio disco insufficiente (liberi "

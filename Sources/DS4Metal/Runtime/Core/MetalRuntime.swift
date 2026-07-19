@@ -50,7 +50,12 @@ public final class MetalRuntime {
         // devono precedere ogni kernel che le usa, DeepSeek e GLM.
         "quant_tables",
         "flash_attn", "dense", "moe", "dsv4_hc", "unary", "dsv4_kv", "dsv4_rope",
-        "dsv4_misc", "glm52", "argsort", "cpy", "concat", "get_rows", "sum_rows",
+        "dsv4_misc",
+        // GLM 5.2, un file per famiglia come metal/deepseek/: glm52_quant
+        // (helper di dot) DEVE precedere glm52_moe che li usa.
+        "glm52_router", "glm52_quant", "glm52_kv", "glm52_indexer",
+        "glm52_attention", "glm52_moe", "glm52_rope", "glm52_misc",
+        "argsort", "cpy", "concat", "get_rows", "sum_rows",
         "softmax", "repeat", "glu", "norm", "bin", "set_rows",
     ]
 

@@ -24,7 +24,9 @@ import DS4Metal
 /// writes from a uniquely-owned snapshot whose layers are dropped as they hit
 /// the disk. Both sides read/write with F_NOCACHE so checkpoint bytes never
 /// displace the hot page cache (dense weights / expert bundle).
-public final class DiskKVStore: @unchecked Sendable {
+public final class DiskKVStore: @unchecked Sendable, DS4Logging {
+    public static let logTag = "diskkv"
+
     public struct Options: Sendable {
         /// Don't checkpoint tiny prefixes (C default is 512; local chats have
         /// shorter useful prefixes, so we default lower).

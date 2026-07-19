@@ -227,6 +227,22 @@ do {
                     sidecarDir))
                 exit(0)
             }
+            // Auto-tune dei knob di caricamento (DS4_GLM_AUTOTUNE=1):
+            // l'analogo pragmatico del record-holder DeepSeek — prova le
+            // alternative ESATTE un gradino alla volta ricaricando il
+            // motore (~3 s a load) e stampa il campione. Solo knob a
+            // logits invariati; l'ambiente resta sulla config vincente.
+            if environment["DS4_GLM_AUTOTUNE"] == "1" {
+                let tuneTokens = try tokenizer.encodeChatPrompt(
+                    prompt: prompt)
+                let outcome = try GLM52ResidentModel.autoTune(
+                    runtime: runtime, path: ggufPath, prompt: tuneTokens,
+                    genTokens: min(16, maxNew)) {
+                    log("DS4Demo: autotune " + $0)
+                }
+                log("DS4Demo: auto-tune GLM completato\n" + outcome.report)
+                exit(0)
+            }
 
             let loadStart = Date()
             let glm = try GLM52ResidentModel(
@@ -248,7 +264,8 @@ do {
                        tokens.count, prefillSeconds,
                        Double(tokens.count) / max(prefillSeconds, 0.001)))
             log("")
-            log("DS4Demo: profilo prefill — " + glm.streamingReport())
+            log(glm.profileReport(title: "Profilo prefill"))
+            log("DS4Demo: streaming prefill — " + glm.streamingReport())
             glm.resetStreamingStats()
 
             let stdout = FileHandle.standardOutput
@@ -337,16 +354,17 @@ do {
                                    : 0))
                 }
             } else {
-            while produced < maxNew {
-                guard let token = GLM52GreedyDecoding.argmax(logits) else {
-                    break
-                }
+            // Greedy con ARGMAX SUL DEVICE: dal secondo token in poi i
+            // logits non tornano sul host (readback 4 byte, stessa regola
+            // di pareggio dell'argmax CPU — output identico).
+            var current = GLM52GreedyDecoding.argmax(logits)
+            while produced < maxNew, let token = current {
                 produced += 1
                 if tokenizer.isStopToken(token, reasoning: .none) { break }
                 stdout.write(Data(tokenizer.tokenText(token)))
                 if produced == maxNew { break }
                 let t0 = Date()
-                logits = try glm.forwardNext(token)
+                current = try glm.forwardNextGreedy(token)
                 let dt = Date().timeIntervalSince(t0)
                 log(String(format: "  [tok %d  %.1fs  %.2f tok/s]",
                            produced, dt, dt > 0 ? 1.0 / dt : 0))
@@ -372,7 +390,8 @@ do {
                            Double(steadyTokens) / max(steadySeconds, 0.001)))
             }
             log("")
-            log("DS4Demo: profilo decode — " + glm.streamingReport())
+            log(glm.profileReport(title: "Profilo decode"))
+            log("DS4Demo: streaming decode — " + glm.streamingReport())
             log(String(format: "DS4Demo: totale %.1fs (load %.1f + prefill %.1f + decode %.1f)",
                        Date().timeIntervalSince(loadStart), loadSeconds,
                        prefillSeconds, decodeSeconds))
@@ -437,10 +456,10 @@ do {
                 let side = try MTPSidecar(path: p)
                 log(side.report(vocab: Int(dims.vocab), nEmbd: Int(dims.nEmbd)))
             } catch {
-                log("DS4 mtp: apertura sidecar FALLITA (\(p)): \(error)")
+                MTPSidecar.log("apertura sidecar FALLITA (\(p)): \(error)")
             }
         } else {
-            log("DS4 mtp: sidecar non trovato (DS4_MTP_GGUF=\(mtpEnv)) — scaricalo dal catalogo " +
+            MTPSidecar.log("sidecar non trovato (DS4_MTP_GGUF=\(mtpEnv)) — scaricalo dal catalogo " +
                 "(id 'mtp': DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf) o passa il percorso esplicito")
         }
     }

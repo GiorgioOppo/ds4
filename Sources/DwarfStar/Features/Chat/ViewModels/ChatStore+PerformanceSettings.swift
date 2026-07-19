@@ -87,6 +87,37 @@ extension ChatStore {
         }
     }
 
+    /// Preset veloce GLM misurato (M1 Pro 16 GB, 2026-07-19): MetalIO OFF
+    /// (+18% decode — accodava lavoro GPU davanti ai commit sincroni),
+    /// 6 esperti attivi (−25% I/O esperti, lieve trade-off qualità), resto
+    /// ai default adattivi del motore (residenza al floor su RAM stretta,
+    /// fusione commit e fill parallelo del prefill sono già default).
+    /// Complessivo misurato: 6.0 → 4.2 s/token di decode.
+    func applyGLMFastDefaults() {
+        glmMetalIOEnabled = false
+        glmActiveExperts = 6
+        glmResidentLayers = 0
+        glmExpertArena = 0
+        glmStreamSlots = 0
+        glmSpeculativeExperts = false
+        glmUseQ4Sidecar = true
+        glmFuseEnabled = true
+        glmMoEBatchEnabled = true
+        glmGpuRouterEnabled = true
+        glmMlockEnabled = true
+        glmReadSplit = 0
+        glmNSG = 0
+    }
+
+    /// Snapshot hit/miss dell'arena esperti GLM nella riga di tuning.
+    func refreshGLMArenaCounters() {
+        guard let glmService else { glmArenaCounters = nil; return }
+        Task { [weak self] in
+            let counters = await glmService.expertArenaCounters()
+            await MainActor.run { self?.glmArenaCounters = counters }
+        }
+    }
+
     static var residentDenseAuto: Bool { MemoryInfo.physicalBytes >= 24 * 1_073_741_824 }
 
     static var diskKVDirectory: URL {
@@ -111,36 +142,55 @@ extension ChatStore {
 
     /// Sidecar GLM (layer Q4 unificati + bundle legacy da migrare): l'engine
     /// li cerca in DS4_GLM_LAYERQ4_DIR / DS4_GLM_BUNDLE_DIR con default
-    /// ACCANTO al GGUF. In sandbox la cartella del modello può non essere
-    /// scrivibile — stessa ragione per cui DS4_Q4_CACHE_DIR DeepSeek punta
-    /// ad Application Support. Politica per load: sidecar già presente
-    /// accanto al modello → riusalo (es. costruito dalla demo); cartella
-    /// scrivibile → costruisci lì, condiviso con la demo; altrimenti
-    /// Application Support in una directory per-modello (nome-dimensione,
-    /// stessa scopatura del checkpoint disk-KV GLM). Deterministico a ogni
-    /// chiamata, come le directory DeepSeek fissate in init.
+    /// ACCANTO al GGUF. STESSA politica del bundle DeepSeek: in lettura si
+    /// riusa il sibling quando esiste GIÀ (es. costruito dalla demo CLI — e
+    /// un sidecar parziale avviato lì non va frammentato su due cartelle);
+    /// altrimenti l'app POSSIEDE i suoi artefatti sotto Application Support
+    /// (sopravvivono allo spostamento del modello, la cartella dell'utente
+    /// non viene mai toccata — anche se scrivibile). La demo senza env
+    /// continua a costruire accanto al modello, come la demo DeepSeek.
+    /// Deterministico a ogni chiamata, come le directory DeepSeek in init.
     nonisolated static func prepareGLMSidecarEnvironment(modelPath: String) {
         guard !modelPath.isEmpty else { return }
-        let fm = FileManager.default
-        let parent = (modelPath as NSString).deletingLastPathComponent
-        let siblingQ4 = modelPath + ".glm-layers-q4"
-        let siblingLegacy = modelPath + ".glm-experts"
-        let managed = glmSidecarDirectory(modelPath: modelPath)
-        let q4Dir: String
-        if fm.fileExists(atPath: siblingQ4) || fm.isWritableFile(atPath: parent) {
-            q4Dir = siblingQ4
-        } else {
-            q4Dir = managed.appendingPathComponent("layers-q4", isDirectory: true).path
+        _ = setenv("DS4_GLM_LAYERQ4_DIR",
+                   glmResolvedLayerQ4Directory(modelPath: modelPath), 1)
+        _ = setenv("DS4_GLM_BUNDLE_DIR",
+                   glmResolvedLegacyBundleDirectory(modelPath: modelPath), 1)
+    }
+
+    /// Directory EFFETTIVA del sidecar Q4 per questo modello (la stessa che
+    /// prepareGLMSidecarEnvironment esporta): sibling se contiene già un
+    /// pack (<gguf>.q4dense, o i nomi storici .glmsidecar) o file per-layer
+    /// legacy (.layerq4), altrimenti la casa gestita in Application Support.
+    nonisolated static func glmResolvedLayerQ4Directory(modelPath: String)
+        -> String {
+        let sibling = modelPath + ".glm-layers-q4"
+        let contents = (try? FileManager.default
+            .contentsOfDirectory(atPath: sibling)) ?? []
+        if contents.contains(where: {
+            $0.hasSuffix(".layerq4") || $0.hasSuffix(".glmsidecar")
+                || $0.hasSuffix(".q4dense") || $0.hasSuffix(".expbundle")
+        }) {
+            return sibling
         }
-        let legacyDir = fm.fileExists(atPath: siblingLegacy)
-            ? siblingLegacy
-            : managed.appendingPathComponent("experts", isDirectory: true).path
-        _ = setenv("DS4_GLM_LAYERQ4_DIR", q4Dir, 1)
-        _ = setenv("DS4_GLM_BUNDLE_DIR", legacyDir, 1)
+        return glmSidecarDirectory(modelPath: modelPath)
+            .appendingPathComponent("layers-q4", isDirectory: true).path
+    }
+
+    /// Come sopra per il bundle esperti legacy (.glm-experts, in migrazione
+    /// verso il sidecar unificato).
+    nonisolated static func glmResolvedLegacyBundleDirectory(
+        modelPath: String) -> String {
+        let sibling = modelPath + ".glm-experts"
+        if FileManager.default.fileExists(atPath: sibling) { return sibling }
+        return glmSidecarDirectory(modelPath: modelPath)
+            .appendingPathComponent("experts", isDirectory: true).path
     }
 
     /// Application Support/DwarfStar/glm-sidecar/<file>-<size>: la casa dei
-    /// sidecar GLM quando la cartella del modello non è scrivibile.
+    /// sidecar GLM costruiti dall'app (politica DeepSeek: l'app possiede i
+    /// suoi artefatti qui e non tocca la cartella del modello; il sibling
+    /// vale solo se già popolato, es. dalla demo CLI).
     nonisolated static func glmSidecarDirectory(modelPath: String) -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let file = (modelPath as NSString).lastPathComponent

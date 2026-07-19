@@ -35,13 +35,18 @@ public struct DecodeProfile: Sendable {
     public var expertPrefilledBytes = 0 // physical look-ahead I/O omitted from gatherS/gatherBytes
     public var gatherBytes = 0    // expert bytes copied from the mmap (EXPERT I/O volume)
     public var expertBypassBytes = 0 // subset of gatherBytes caused by bypass selections
+    /// Attesa sul prefetch dei LAYER streamati (GLM: pesi attn/shared da SSD,
+    /// I/O distinto dagli esperti). DeepSeek non la usa: a zero la riga
+    /// non viene stampata e il report resta identico allo storico.
+    public var layerStreamS = 0.0
+    public var layerStreamBytes = 0
 
     public init() {}
 
     /// Engine-side seconds accounted by the per-phase counters (what report()
     /// calls "totale"). Wall-clock minus this = time spent OUTSIDE the engine
     /// (sampler, streaming, UI) — the GUI logs that split per turn.
-    public var totalS: Double { embedS + routeS + gatherS + expertsS + layerOtherS + headS }
+    public var totalS: Double { embedS + routeS + gatherS + expertsS + layerOtherS + headS + layerStreamS }
 
     public var expertCacheableHitRate: Double? {
         let total = expertHits + expertMisses
@@ -66,7 +71,7 @@ public struct DecodeProfile: Sendable {
     public func report(title: String = "Profilo decode") -> String {
         guard forwards > 0 else { return "\(title): nessun forward registrato." }
         let f = Double(forwards)
-        let total = embedS + routeS + gatherS + expertsS + layerOtherS + headS
+        let total = totalS
         func ms(_ s: Double) -> String { String(format: "%6.1f", s / f * 1000) }
         func pct(_ s: Double) -> String { String(format: "%2.0f%%", total > 0 ? s / total * 100 : 0) }
         let tps = total > 0 ? f / total : 0
@@ -120,11 +125,18 @@ public struct DecodeProfile: Sendable {
                        + "\n     ├ hc   \(ms(routeHcFfnS)) ms/token (pre-FFN HC reduce)"
                        + "\n     └ rtr  \(ms(routeRouterS)) ms/token (router proj + top-k)"
         }
+        var layerStream = ""   // solo GLM: attesa del prefetch layer da SSD
+        if layerStreamS > 0 {
+            let volume = layerStreamBytes > 0
+                ? String(format: ", %.2f GiB/token", Double(layerStreamBytes) / f / 1_073_741_824)
+                : ""
+            layerStream = "\n  layer IO     \(ms(layerStreamS)) ms/token  (\(pct(layerStreamS)))   <- attesa stream layer (prefetch SSD\(volume))"
+        }
         return """
         \(title) — \(forwards) token, \(layers) iterazioni-layer
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
           route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute\(routeSplit)
-          gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)
+          gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)\(layerStream)
           experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
           output head  \(ms(headS)) ms/token  (\(pct(headS)))\(cacheLine)

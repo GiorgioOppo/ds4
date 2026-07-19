@@ -33,7 +33,7 @@ extension DenseStreamer {
     /// stderr into the engine log). The cache is infrastructure the user can't
     /// see failing otherwise.
     static func logQ4(_ s: String) {
-        FileHandle.standardError.write(Data(("DS4 q4cache: " + s + "\n").utf8))
+        DS4Log.info("q4cache", s)
     }
 
     /// Load the requant cache if it exists and matches the model. Returns an

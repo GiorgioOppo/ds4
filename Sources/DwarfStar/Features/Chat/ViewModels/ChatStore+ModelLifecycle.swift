@@ -167,6 +167,16 @@ extension ChatStore {
         _ = setenv("DS4_GLM_SPEC_EXPERTS",
                    glmSpeculativeExperts ? "1" : "0", 1)
         _ = setenv("DS4_GLM_LAYERQ4", glmUseQ4Sidecar ? "1" : "0", 1)
+        // Knob delle ottimizzazioni misurate in sessione: il motore li
+        // rilegge a ogni init (GLM52DispatchKnobs.refresh), quindi un
+        // toggle qui ha effetto al reload.
+        _ = setenv("DS4_GLM_FUSE", glmFuseEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_MOE_BATCH", glmMoEBatchEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_GPU_ROUTER", glmGpuRouterEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_MLOCK", glmMlockEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_READ_SPLIT",
+                   glmReadSplit > 0 ? String(glmReadSplit) : "4", 1)
+        _ = setenv("DS4_GLM_NSG", glmNSG > 0 ? String(glmNSG) : "4", 1)
         let loadEngineSignature = machineAutoTuneEngineSignature()
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudgetTokens = diskKVBudgetKTok * 1000

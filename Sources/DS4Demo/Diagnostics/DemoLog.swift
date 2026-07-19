@@ -1,6 +1,9 @@
 import Foundation
+import DS4Core
 
-func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
+/// Output CLI del demo (header, righe per-token): testo libero, ma sulla
+/// STESSA destinazione e con le stesse proprietà del log unificato.
+func log(_ s: String) { DS4Log.raw(s) }
 
 // MARK: - Opt-in A/B logit trace
 

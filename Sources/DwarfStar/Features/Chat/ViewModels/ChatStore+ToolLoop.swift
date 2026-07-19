@@ -86,7 +86,7 @@ extension ChatStore {
             let prefill = await service.prefillProfileReport()
             let report = await service.decodeProfileReport()
             guard let self, self.conversationEpoch == epoch else { return }
-            FileHandle.standardError.write(Data(("\n" + prefill + "\n\n" + report + "\n").utf8))
+            DS4Log.raw("\n" + prefill + "\n\n" + report)
         }
     }
 

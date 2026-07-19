@@ -37,15 +37,21 @@ public struct GLM52ResidentModelOptions: Sendable {
 
     /// RAM-adaptive resident budget: half the physical memory minus a 6 GiB
     /// reserve (output head, dense layers, caches, staging, OS), at ~230 MiB
-    /// per resident sparse layer. Floor: the three dense layers. Every
-    /// resident layer removes ~230 MiB of SSD reads from EVERY decoded
-    /// token, so this is the single biggest tok/s lever on streaming.
+    /// per resident sparse layer. Floor: the three dense layers.
+    /// MISURATO (M1 Pro 16 GB): un budget PICCOLO (8 layer su 75) è
+    /// controproducente — sotto pressione il sistema comprime/pagina quei
+    /// "residenti" e ogni commit ne ripaga la residency al driver
+    /// (~+750 ms/token di host), mentre lo stream li avrebbe serviti in
+    /// overlap quasi gratis (3 → 11 residenti: 4.2 → 5.0 s/token). Sotto un
+    /// quarto di copertura della coda streamata si resta quindi al floor
+    /// dense: la residenza paga solo quando copre una quota sostanziale.
     public static func adaptiveResidentLayerCount(
         totalLayers: Int = 78) -> Int {
         let physical = Double(ProcessInfo.processInfo.physicalMemory)
         let budget = physical * 0.5 - 6.0 * 1_073_741_824
         let perLayer = 230.0 * 1_048_576
         let extra = budget > 0 ? Int(budget / perLayer) : 0
+        guard extra >= (totalLayers - 3) / 4 else { return 3 }
         return max(3, min(totalLayers, 3 + extra))
     }
 
@@ -81,8 +87,10 @@ public final class GLM52ResidentModel {
         let indexerKeyNorm: MTLBuffer?
         let indexerKeyNormBias: MTLBuffer?
         let proj: [Float]?
-        let routerRows: [Float]
-        let routerBias: [Float]
+        /// Buffer condivisi, upload una volta al load: il router fuso li
+        /// legge su GPU, il fallback CPU dagli stessi byte.
+        let routerRows: MTLBuffer
+        let routerBias: MTLBuffer
         let provider: GLM52StreamedExpertProvider
         let caches: GLM52ResidentDecodeCaches
 
@@ -120,6 +128,15 @@ public final class GLM52ResidentModel {
     private let vocabulary: Int
     private let embeddingWidth: Int
     private let counters: GLM52StreamingCounters
+    /// Profilo per-fase in stile DeepSeek: STESSA struttura e stesso report
+    /// del decoder DeepSeek (DecodeProfile), alimentato dai confini di commit
+    /// già sincroni del chained decode. Azzerato con resetStreamingStats().
+    public private(set) var profile = DecodeProfile()
+    /// Quota GPU delle fasi (dai timestamp dei commit): wall − gpu = host.
+    private var gpuRouteS = 0.0
+    private var gpuExpertsS = 0.0
+    private var gpuDenseS = 0.0
+    private var gpuHeadS = 0.0
     /// Prefetches kept in flight on the layer streamer (slots - 1).
     private let prefetchDepth: Int
     /// Keyed LRU arena the staged fetches resolve into (nil when no sparse
@@ -131,13 +148,27 @@ public final class GLM52ResidentModel {
     private let stagedFetch:
         [Int: ([UInt32]) throws -> GLM52StagedExpertSelection]
     /// Last token's routed selection per layer — the speculative warm-up's
-    /// guess. OPT-IN (DS4_GLM_SPEC_EXPERTS=1): measured on the M1 Pro it
-    /// read the full selection to serve ~40% hits, and on a saturated SSD
-    /// the extra traffic stole exactly the bandwidth the demand reads
-    /// needed — net zero. Worth retrying on machines with SSD headroom.
+    /// guess. OPT-IN (DS4_GLM_SPEC_EXPERTS): "1" specula l'INTERA selezione
+    /// (storico — misurato net-zero su SSD saturo: ~40-46% hit ma il traffico
+    /// extra ruba banda alle letture demand e fa stallare il prefetch layer);
+    /// un valore N >= 2 specula solo i TOP-N esperti per peso di routing —
+    /// i più stabili tra token consecutivi — dimezzando o più il traffico
+    /// speculativo a parità della parte di hit che conta.
     private var lastRouted: [Int: [UInt32]] = [:]
-    private let speculationEnabled = ProcessInfo.processInfo
-        .environment["DS4_GLM_SPEC_EXPERTS"] == "1"
+    private let speculationTop: Int? = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["DS4_GLM_SPEC_EXPERTS"], let n = Int(raw), n >= 1
+        else { return nil }
+        return n
+    }()
+    private var speculationEnabled: Bool { speculationTop != nil }
+    /// Fusione dei commit nel decode (DS4_GLM_FUSE=0 per disattivare): FFN
+    /// del layer N e trunk del layer N+1 in UN command buffer — una attesa
+    /// sincrona per layer invece di due (~154 → ~78 commit/token). Esclusa
+    /// quando la speculazione esperti è attiva: i suoi fill potrebbero
+    /// sfrattare slot arena ancora referenziati dal FFN non committato.
+    private lazy var fuseCommits: Bool = speculationTop == nil
+        && ProcessInfo.processInfo.environment["DS4_GLM_FUSE"] != "0"
     private let speculationQueue = DispatchQueue(
         label: "glm52.expert.speculation", qos: .userInitiated,
         attributes: .concurrent)
@@ -145,6 +176,9 @@ public final class GLM52ResidentModel {
     public init(runtime: MetalRuntime,
                 path: String,
                 options: GLM52ResidentModelOptions = .init()) throws {
+        // Latch dei knob di dispatch per QUESTO load: un setenv della GUI
+        // (o dell'auto-tune) prima del reload ha effetto qui.
+        GLM52DispatchKnobs.refresh()
         let model = try GGUFModel(path: path, metalMapping: false,
                                   prefetchCPU: false)
         let configuration = try GLM52Configuration(model: model)
@@ -253,6 +287,7 @@ public final class GLM52ResidentModel {
                         index: index, map: map, fullIndexer: isFull),
                     routed: routed,
                     expertCount: Int(shape.nExpert),
+                    sourcePath: path,
                     sourceFileSize: reader.fileSize)
                 let provider: GLM52StreamedExpertProvider
                 if let view = sidecar?.expertView {
@@ -311,6 +346,7 @@ public final class GLM52ResidentModel {
                 directory: layerQ4Directory, layer: index,
                 source: ggufTensors, routed: routed,
                 expertCount: Int(shape.nExpert),
+                sourcePath: path,
                 sourceFileSize: reader.fileSize)
             let provider: GLM52StreamedExpertProvider
             if let view = sidecar?.expertView {
@@ -349,8 +385,10 @@ public final class GLM52ResidentModel {
                     try f32(map.layer(index, .indexerKeyNormBias))) : nil,
                 proj: isFull
                     ? try f32(map.layer(index, .indexerProjection)) : nil,
-                routerRows: try f32(map.layer(index, .router)),
-                routerBias: try f32(map.layer(index, .routerBias)),
+                routerRows: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .router))),
+                routerBias: try runtime.glm52GraphBuffer(
+                    try f32(map.layer(index, .routerBias))),
                 provider: provider,
                 caches: try GLM52ResidentDecodeCaches(
                     runtime: runtime, geometry: geometry,
@@ -360,20 +398,37 @@ public final class GLM52ResidentModel {
         if !sidecarReaders.isEmpty {
             DS4Log.info("glm", "sidecar Q4 layer attivo su "
                 + "\(sidecarReaders.count)/\(streamed.count) layer "
-                + "streamati (\(unifiedExpertLayers) con esperti unificati)")
+                + "streamati (\(unifiedExpertLayers) con esperti unificati)"
+                + " — dir: \(layerQ4Directory)")
+        } else if !streamed.isEmpty {
+            // Come il bundle DeepSeek: dire DOVE si è cercato risolve dal
+            // solo log i misteri "il file c'è!" da path/nome sbagliato.
+            DS4Log.info("glm", "nessun sidecar Q4 valido in: \(layerQ4Directory)"
+                + " — layer Q8 dal GGUF")
         }
         // The template always sizes the indexer slots (every layer stores
         // indexer tensors in the schema, so the descriptors exist even for
         // IndexShare layers) and always uses the FULL Q8_0 GGUF sizes —
         // sidecar tensors are smaller and share the same slots.
+        // Con la fusione dei commit serve uno slot in più e profondità
+        // slots-2: il refill non deve MAI toccare lo slot il cui FFN è nel
+        // carry non ancora committato (il fill CPU lo sovrascriverebbe
+        // mentre la GPU lo legge).
+        let speculating = ProcessInfo.processInfo
+            .environment["DS4_GLM_SPEC_EXPERTS"].flatMap(Int.init)
+            .map { $0 >= 1 } ?? false
+        let fusing = !speculating && ProcessInfo.processInfo
+            .environment["DS4_GLM_FUSE"] != "0"
+        let slotCount = fusing
+            ? max(4, options.streamSlotCount + 1) : options.streamSlotCount
         streamer = streamed.isEmpty ? nil : try GLM52LayerStreamer(
             runtime: runtime, reader: reader,
             template: try GLM52StreamedLayerTensors(
                 index: streamed[0].tensors.index, map: map,
                 fullIndexer: true),
-            slotCount: options.streamSlotCount,
+            slotCount: slotCount,
             sidecarReaders: sidecarReaders)
-        prefetchDepth = max(1, options.streamSlotCount - 1)
+        prefetchDepth = max(1, slotCount - (fusing ? 2 : 1))
 
         self.providers = providers
         scratch = try GLM52DecodeScratch(
@@ -432,6 +487,23 @@ public final class GLM52ResidentModel {
         for layer in stack {
             layer.ffn.stagedSelection = staged[layer.index]
         }
+        // Knob attivi nel log a OGNI init, come il motore DeepSeek: "l'app
+        // vede davvero le env var?" deve essere rispondibile dal solo log.
+        let knobs = ["DS4_GLM_MTLIO", "DS4_GLM_ACTIVE_EXPERTS",
+                     "DS4_GLM_RESIDENT_LAYERS", "DS4_GLM_FUSE",
+                     "DS4_GLM_READ_SPLIT", "DS4_GLM_SPEC_EXPERTS",
+                     "DS4_GLM_SPEC_K", "DS4_GLM_EXPERT_ARENA",
+                     "DS4_GLM_STREAM_SLOTS", "DS4_GLM_EXPERT_SLOTS",
+                     "DS4_GLM_SG", "DS4_GLM_NSG", "DS4_GLM_NOCACHE",
+                     "DS4_GLM_MLOCK", "DS4_GLM_MOE_BATCH",
+                     "DS4_GLM_GPU_ROUTER", "DS4_GLM_LAYERQ4",
+                     "DS4_GLM_USAGE_FILE"]
+        let env = ProcessInfo.processInfo.environment
+        DS4Log.info("glm", "knob " + knobs
+            .map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  "))
+        DS4Log.info("glm", "config: residenti=\(residentCount)/\(count)  "
+            + "fusione=\(fusing ? "on" : "off")  slot stream=\(slotCount)  "
+            + "esperti attivi=\(activeExperts.map(String.init) ?? "8")")
         loadUsageProfile()
     }
 
@@ -440,13 +512,17 @@ public final class GLM52ResidentModel {
     /// of experts): the read overlaps the GPU attention instead of
     /// stalling the FFN. Best-effort by design.
     private func speculateExperts(layer index: Int) {
-        guard speculationEnabled, let arena,
+        guard let top = speculationTop, let arena,
               stagedFetch[index] != nil,
               let ids = lastRouted[index],
               let provider = providers[index] else { return }
+        // lastRouted è in ordine di peso del router: con DS4_GLM_SPEC_EXPERTS
+        // >= 2 il prefisso top-N è la parte della selezione più probabile
+        // da rivedere al token successivo. "1" = selezione intera (storico).
+        let guess = top >= 2 ? Array(ids.prefix(top)) : ids
         let recordBytes = provider.recordBytes
         speculationQueue.async { [arena] in
-            arena.speculate(layer: index, ids: ids,
+            arena.speculate(layer: index, ids: guess,
                             recordBytes: recordBytes) { id, slice in
                 try provider.readRecord(id, into: slice)
             }
@@ -491,9 +567,15 @@ public final class GLM52ResidentModel {
     /// with per-token traffic far beyond RAM the page cache cannot retain
     /// speculative reads until the next token, so they only stole SSD
     /// bandwidth from the real ones.
-    public func forwardNext(_ token: Int32) throws -> [Float] {
+    /// Corpo comune del forward di un token: embed, layer residenti e
+    /// streamati, flush del carry — lascia lo hidden in scratch. I due
+    /// wrapper sotto differiscono solo per il head (logits interi o argmax
+    /// greedy sul device).
+    private func advance(_ token: Int32) throws {
+        let tEmbed = Date()
         let embedded = try embeddingRow(token)
         scratch.loadHidden(embedded)
+        profile.embedS += Date().timeIntervalSince(tEmbed)
         var lastSelection: (source: Int, rows: [UInt32])?
         counters.tokens += 1
 
@@ -514,6 +596,8 @@ public final class GLM52ResidentModel {
             return last.rows
         }
 
+        let fuse = fuseCommits
+        var carry: MTLCommandBuffer?
         for layer in stack {
             let isFull = GLM52IndexSharePolicy.isFullIndexerLayer(layer.index)
             speculateExperts(layer: layer.index)
@@ -521,7 +605,9 @@ public final class GLM52ResidentModel {
                 weights: layer.weights, ffn: layer.ffn, caches: layer.caches,
                 scratch: scratch,
                 reusedSelection: try reuse(for: layer.index, isFull: isFull),
-                position: position, activeExperts: activeExperts)
+                position: position, activeExperts: activeExperts,
+                fusedDecode: fuse, carry: &carry)
+            accumulate(result.phases)
             if isFull { lastSelection = (layer.index, result.selection) }
             noteRouting(layer.index, result.routing)
         }
@@ -532,8 +618,14 @@ public final class GLM52ResidentModel {
             let index = streamedLayer.tensors.index
             let waitStart = Date()
             let buffers = try streamer!.wait(for: index)
-            counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
+            let stall = Date().timeIntervalSince(waitStart)
+            counters.layerStallSeconds += stall
             counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
+            profile.layerStreamS += stall
+            profile.layerStreamBytes += streamedLayer.bigTensorBytes
+            // Il refill è sicuro anche col carry in volo: con la fusione la
+            // profondità è slots-2, quindi lo slot bersaglio non è mai
+            // quello referenziato dal FFN non ancora committato.
             if rank + prefetchDepth < streamedLayers.count {
                 streamer!.prefetch(
                     streamedLayers[rank + prefetchDepth].tensors)
@@ -575,14 +667,69 @@ public final class GLM52ResidentModel {
                 weights: weights, ffn: ffn, caches: streamedLayer.caches,
                 scratch: scratch,
                 reusedSelection: try reuse(for: index, isFull: isFull),
-                position: position, activeExperts: activeExperts)
+                position: position, activeExperts: activeExperts,
+                fusedDecode: fuse, carry: &carry)
+            accumulate(result.phases)
             if isFull { lastSelection = (index, result.selection) }
             noteRouting(index, result.routing)
         }
+        // Flush del carry: il FFN dell'ultimo layer paga qui la sua unica
+        // attesa, prima del head — attribuito alla fase experts.
+        if let pending = carry {
+            let tFlush = Date()
+            let gpuFlush = GLM52GraphTelemetry.gpuSeconds
+            try runtime.glm52GraphCommit(pending)
+            profile.expertsS += Date().timeIntervalSince(tFlush)
+            gpuExpertsS += GLM52GraphTelemetry.gpuSeconds - gpuFlush
+            carry = nil
+        }
         position += 1
+    }
+
+    /// Advance the model by one token; returns the full logits row.
+    public func forwardNext(_ token: Int32) throws -> [Float] {
+        try advance(token)
+        let tHead = Date()
+        let gpuHead = GLM52GraphTelemetry.gpuSeconds
+        defer {
+            profile.headS += Date().timeIntervalSince(tHead)
+            gpuHeadS += GLM52GraphTelemetry.gpuSeconds - gpuHead
+            profile.forwards += 1
+        }
         return try runtime.glm52ResidentLogits(
             outputHead: head,
             hidden: scratch.readHidden(count: embeddingWidth))
+    }
+
+    /// Variante GREEDY: stesso forward, ma il head fa norm + matvec +
+    /// argmax SUL DEVICE — readback di 4 byte invece dei ~600 KB di
+    /// logits. Pareggi all'indice più basso, come l'argmax CPU: il decode
+    /// greedy resta deterministico e identico.
+    public func forwardNextGreedy(_ token: Int32) throws -> Int32 {
+        try advance(token)
+        let tHead = Date()
+        let gpuHead = GLM52GraphTelemetry.gpuSeconds
+        defer {
+            profile.headS += Date().timeIntervalSince(tHead)
+            gpuHeadS += GLM52GraphTelemetry.gpuSeconds - gpuHead
+            profile.forwards += 1
+        }
+        return try runtime.glm52ResidentGreedyToken(
+            outputHead: head,
+            hidden: scratch.readHidden(count: embeddingWidth))
+    }
+
+    /// Somma le fasi di un layer chained nel profilo stile DeepSeek: i layer
+    /// dense (commit unico, non splittabile) finiscono in "layer (alt)".
+    private func accumulate(_ phases: GLM52LayerPhases) {
+        profile.routeS += phases.routeS
+        profile.gatherS += phases.gatherS
+        profile.expertsS += phases.expertsS
+        profile.layerOtherS += phases.denseS
+        profile.layers += 1
+        gpuRouteS += phases.routeGpuS
+        gpuExpertsS += phases.expertsGpuS
+        gpuDenseS += phases.denseGpuS
     }
 
     /// Remember this token's routed selection (clamped to the experts the
@@ -774,6 +921,12 @@ public final class GLM52ResidentModel {
         }
         if tokens.count == 1 { return try forwardNext(tokens[0]) }
         let hiddens = try runLayerMajor(tokens)
+        let tHead = Date()
+        let gpuHead = GLM52GraphTelemetry.gpuSeconds
+        defer {
+            profile.headS += Date().timeIntervalSince(tHead)
+            gpuHeadS += GLM52GraphTelemetry.gpuSeconds - gpuHead
+        }
         return try runtime.glm52ResidentLogits(
             outputHead: head, hidden: hiddens[hiddens.count - 1])
     }
@@ -788,6 +941,12 @@ public final class GLM52ResidentModel {
         }
         if tokens.count == 1 { return [try forwardNext(tokens[0])] }
         let hiddens = try runLayerMajor(tokens)
+        let tHead = Date()
+        let gpuHead = GLM52GraphTelemetry.gpuSeconds
+        defer {
+            profile.headS += Date().timeIntervalSince(tHead)
+            gpuHeadS += GLM52GraphTelemetry.gpuSeconds - gpuHead
+        }
         return try hiddens.map {
             try runtime.glm52ResidentLogits(outputHead: head, hidden: $0)
         }
@@ -805,7 +964,10 @@ public final class GLM52ResidentModel {
     }
 
     private func runLayerMajor(_ tokens: [Int32]) throws -> [[Float]] {
+        let tEmbed = Date()
         var hiddens: [[Float]] = try tokens.map { try embeddingRow($0) }
+        profile.embedS += Date().timeIntervalSince(tEmbed)
+        profile.forwards += tokens.count
         let basePosition = position
         counters.tokens += tokens.count
         var lastSelections: [(source: Int, rows: [UInt32])?] =
@@ -848,6 +1010,9 @@ public final class GLM52ResidentModel {
                    weights: GLM52ResidentDecodeWeights,
                    ffn: GLM52ResidentFFN,
                    caches: GLM52ResidentDecodeCaches) throws {
+            // Prefill layer-major: niente fusione (ogni chiamata committa),
+            // il carry resta inerte.
+            var noCarry: MTLCommandBuffer?
             // TWO-PHASE expert path for sparse layers on the staged fetch:
             // phase A runs attention+router+shared per token (routed FFN
             // deferred) snapshotting hidden/ffnIn planes; phase B stages
@@ -868,7 +1033,8 @@ public final class GLM52ResidentModel {
                             index: index, isFull: isFull, token: t),
                         position: basePosition + t,
                         activeExperts: activeExperts,
-                        deferSparseFFN: true)
+                        deferSparseFFN: true, carry: &noCarry)
+                    accumulate(result.phases)
                     if isFull {
                         lastSelections[t] = (index, result.selection)
                     }
@@ -896,7 +1062,11 @@ public final class GLM52ResidentModel {
                 while start < order.count {
                     let batch = Array(
                         order[start..<min(start + 8, order.count)])
+                    let tStage = Date()
                     let staged = try stage(batch)
+                    let tApply = Date()
+                    let gpuApply = GLM52GraphTelemetry.gpuSeconds
+                    profile.gatherS += tApply.timeIntervalSince(tStage)
                     var applications:
                         [(slot: Int, token: Int, weight: Float)] = []
                     for (slot, id) in batch.enumerated() {
@@ -911,6 +1081,8 @@ public final class GLM52ResidentModel {
                         scratch: scratch, embeddingWidth: embeddingWidth,
                         expertHiddenWidth:
                             geometry.layer.expertHiddenWidth)
+                    profile.expertsS += Date().timeIntervalSince(tApply)
+                    gpuExpertsS += GLM52GraphTelemetry.gpuSeconds - gpuApply
                     start += 8
                 }
                 for t in 0..<tokens.count {
@@ -930,7 +1102,8 @@ public final class GLM52ResidentModel {
                     reusedSelection: try reusedSelection(
                         index: index, isFull: isFull, token: t),
                     position: basePosition + t,
-                    activeExperts: activeExperts)
+                    activeExperts: activeExperts, carry: &noCarry)
+                accumulate(result.phases)
                 if isFull {
                     lastSelections[t] = (index, result.selection)
                 }
@@ -941,7 +1114,8 @@ public final class GLM52ResidentModel {
 
         if let streamer {
             for ahead in 0..<min(prefetchDepth, streamedLayers.count) {
-                streamer.prefetch(streamedLayers[ahead].tensors)
+                streamer.prefetch(streamedLayers[ahead].tensors,
+                                  parallel: true)
             }
         }
         for layer in stack {
@@ -955,11 +1129,15 @@ public final class GLM52ResidentModel {
             let index = streamedLayer.tensors.index
             let waitStart = Date()
             let buffers = try streamer!.wait(for: index)
-            counters.layerStallSeconds += Date().timeIntervalSince(waitStart)
+            let stall = Date().timeIntervalSince(waitStart)
+            counters.layerStallSeconds += stall
             counters.layerBytes += UInt64(streamedLayer.bigTensorBytes)
+            profile.layerStreamS += stall
+            profile.layerStreamBytes += streamedLayer.bigTensorBytes
             if rank + prefetchDepth < streamedLayers.count {
                 streamer!.prefetch(
-                    streamedLayers[rank + prefetchDepth].tensors)
+                    streamedLayers[rank + prefetchDepth].tensors,
+                    parallel: true)
             }
             let isFull = streamedLayer.proj != nil
             let weights = GLM52ResidentDecodeWeights(
@@ -1027,10 +1205,59 @@ public final class GLM52ResidentModel {
             gpuCommits: GLM52GraphTelemetry.commits)
     }
 
+    /// Hit/miss dell'arena esperti in record dall'ultimo reset — per la riga
+    /// di tuning della GUI. Snapshot lock-protetto: sicuro da ogni thread
+    /// anche durante una generazione.
+    public func expertArenaCounters() -> (hits: Int, misses: Int)? {
+        guard let arena else { return nil }
+        let stats = arena.statsSnapshot()
+        return (stats.hitCount, stats.readCount)
+    }
+
     public func resetStreamingStats() {
         counters.reset()
         arena?.resetStats()
         GLM52GraphTelemetry.reset()
+        // Il profilo per-fase e le stats dell'arena vivono e muoiono insieme:
+        // profileReport() innesta le seconde nel primo.
+        profile = DecodeProfile()
+        gpuRouteS = 0; gpuExpertsS = 0; gpuDenseS = 0; gpuHeadS = 0
+    }
+
+    /// Report per-fase nello STESSO formato del decoder DeepSeek
+    /// (DecodeProfile.report): ms/token e percentuali per embed, route/attn,
+    /// gather IO, experts, layer IO (attesa stream layer, solo GLM), output
+    /// head, più le righe cache con i contatori dell'arena esperti — hit e
+    /// miss in record e in byte, speculativi come "look-ahead" (I/O nascosto
+    /// sotto il compute dell'attenzione).
+    public func profileReport(title: String = "Profilo decode") -> String {
+        var merged = profile
+        if let arena {
+            let stats = arena.statsSnapshot()
+            merged.expertHits = stats.hitCount
+            merged.expertMisses = stats.readCount
+            merged.expertHitBytes = Int(stats.hitBytes)
+            merged.expertMissBytes = Int(stats.readBytes)
+            merged.gatherBytes = Int(stats.readBytes)
+            merged.expertPrefilled = stats.speculativeCount
+            merged.expertPrefilledBytes = Int(stats.speculativeBytes)
+        }
+        var report = merged.report(title: title)
+        // Scomposizione GPU/host per fase (solo GLM: i commit sincroni la
+        // rendono gratuita): quanto delle fasi qui sopra è ESECUZIONE GPU.
+        // wall − gpu = host: encode, sync round-trip, router CPU, allocazioni.
+        if profile.forwards > 0 {
+            let f = Double(profile.forwards)
+            func ms(_ s: Double) -> String {
+                String(format: "%.0f", s / f * 1000)
+            }
+            report += "\n  gpu          route/attn \(ms(gpuRouteS))"
+                + " · experts \(ms(gpuExpertsS))"
+                + " · layer(alt) \(ms(gpuDenseS))"
+                + " · head \(ms(gpuHeadS)) ms/token — il resto è host"
+                + " (encode/sync/router)"
+        }
+        return report
     }
 
     /// One-line human report of where the token time goes on the SSD path.
@@ -1053,16 +1280,23 @@ public final class GLM52ResidentModel {
         func rate(_ bytes: UInt64, _ seconds: Double) -> Double {
             seconds > 0.001 ? Double(bytes) / 1e9 / seconds : 0
         }
+        // Con stallo sotto la soglia i GiB/stallo esplodono in un numero
+        // privo di senso fisico (byte serviti dal prefetch, non dal wait):
+        // il dato utile è "overlap completo", non una banda.
+        let layerStall = stats.layerStallSeconds >= 0.05
+            ? String(format: "stallo %.1fs, %.1f GB/s",
+                     stats.layerStallSeconds,
+                     rate(stats.layerBytes, stats.layerStallSeconds))
+            : "stallo ~0s, overlap completo"
         return String(
             format: "streaming: %d token · layer %.1f GiB "
-                + "(%.2f GiB/token, stallo %.1fs, %.1f GB/s) · esperti "
+                + "(%.2f GiB/token, %@) · esperti "
                 + "%.2f GiB letti (stallo %.1fs, %.1f GB/s) · riuso arena "
                 + "%.2f GiB · speculativi %.2f GiB · gpu %.1fs "
                 + "(%d commit)",
             stats.tokens, gib(stats.layerBytes),
             gib(stats.layerBytes) / Double(stats.tokens),
-            stats.layerStallSeconds,
-            rate(stats.layerBytes, stats.layerStallSeconds),
+            layerStall,
             gib(stats.expertBytes),
             stats.expertStallSeconds,
             rate(stats.expertBytes, stats.expertStallSeconds),
@@ -1105,5 +1339,124 @@ final class GLM52StreamingCounters {
         layerBytes = 0
         layerStallSeconds = 0
         expertStallSeconds = 0
+    }
+}
+
+// MARK: - Auto-tune
+
+/// Esito dell'auto-tune GLM: report leggibile più i knob vincenti
+/// (nome env → valore; assente = default del motore).
+public struct GLM52AutoTuneOutcome: Sendable {
+    public let report: String
+    public let winners: [String: String]
+}
+
+extension GLM52ResidentModel {
+    /// I knob di CARICAMENTO che l'auto-tune esplora: tutti ESATTI (stessi
+    /// logits) e tutti letti a init del motore, quindi applicabili con
+    /// setenv + reload (~3 s: il load streaming GLM rende possibile ciò che
+    /// per DeepSeek è proibitivo). Esclusi per costruzione: i knob di
+    /// qualità (DS4_GLM_ACTIVE_EXPERTS, sidecar Q4 lossy) e quelli
+    /// process-static (DS4_GLM_NSG/SG, DS4_GLM_MLOCK, DS4_GLM_READ_SPLIT —
+    /// cache in static let, un setenv a metà processo non li muove).
+    static let autoTuneKnobs: [(knob: String, alternatives: [String?])] = [
+        ("DS4_GLM_MTLIO", ["0", "1"]),
+        ("DS4_GLM_STREAM_SLOTS", [nil, "5"]),
+        ("DS4_GLM_EXPERT_ARENA", [nil, "48"]),
+        ("DS4_GLM_RESIDENT_LAYERS", [nil, "7"]),
+        ("DS4_GLM_FUSE", [nil, "0"]),
+    ]
+
+    /// Auto-tune "un gradino alla volta" — l'analogo pragmatico del
+    /// record-holder DeepSeek: misura la baseline, poi prova l'alternativa
+    /// di OGNI knob tenendo il vincitore solo se batte il campione oltre la
+    /// soglia di rumore. Ogni misura è un motore NUOVO (config al load) su
+    /// prefill sintetico + decode greedy. A fine corsa l'ambiente del
+    /// processo resta impostato sulla configurazione campione.
+    public static func autoTune(runtime: MetalRuntime, path: String,
+                                prompt: [Int32], genTokens: Int = 12,
+                                progress: ((String) -> Void)? = nil) throws
+        -> GLM52AutoTuneOutcome {
+        /// Sopra il 3% il decode dei run brevi è segnale, sotto è rumore
+        /// (misurato ±2-3% fra run identici in questa stessa sessione).
+        let noiseThreshold = 1.03
+        var report: [String] = []
+        var winners: [String: String] = [:]
+
+        func apply(_ knob: String, _ value: String?) {
+            if let value { _ = setenv(knob, value, 1) }
+            else { unsetenv(knob) }
+        }
+
+        func measure(_ label: String) throws -> Double {
+            // Le opzioni si costruiscono dall'ambiente COME FA IL DEMO:
+            // residenza e slot stream passano dalle options (non dall'env
+            // del motore) e il default delle options è tutto-residente —
+            // esattamente ciò che qui non si vuole mai.
+            let env = ProcessInfo.processInfo.environment
+            var options = GLM52ResidentModelOptions()
+            options.residentLayerCount = env["DS4_GLM_RESIDENT_LAYERS"]
+                .flatMap(Int.init)
+                ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
+            options.activeExperts = env["DS4_GLM_ACTIVE_EXPERTS"]
+                .flatMap(Int.init)
+            if let slots = env["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {
+                options.expertSlotCount = slots
+            }
+            if let slots = env["DS4_GLM_STREAM_SLOTS"].flatMap(Int.init) {
+                options.streamSlotCount = slots
+            }
+            // Motore nuovo per ogni config; ARC libera il precedente (e i
+            // suoi mlock) all'uscita dello scope, prima del load successivo.
+            let engine = try GLM52ResidentModel(runtime: runtime, path: path,
+                                                options: options)
+            var logits = try engine.prefill(prompt)
+            let start = Date()
+            var produced = 0
+            for _ in 0..<genTokens {
+                guard let token = GLM52GreedyDecoding.argmax(logits) else {
+                    break
+                }
+                logits = try engine.forwardNext(token)
+                produced += 1
+            }
+            let tps = Double(produced)
+                / max(Date().timeIntervalSince(start), 0.001)
+            progress?(String(format: "%@: %.2f tok/s", label, tps))
+            return tps
+        }
+
+        var best = try measure("baseline")
+        report.append(String(format: "baseline: %.2f tok/s", best))
+        for (knob, alternatives) in autoTuneKnobs {
+            let original = ProcessInfo.processInfo.environment[knob]
+            for candidate in alternatives where candidate != original {
+                // "nil vs nil" e valori già attivi non si rimisurano.
+                if candidate == nil && original == nil { continue }
+                apply(knob, candidate)
+                let label = "\(knob)=\(candidate ?? "default")"
+                let tps = try measure(label)
+                if tps > best * noiseThreshold {
+                    best = tps
+                    winners[knob] = candidate ?? ""
+                    report.append(String(
+                        format: "%@: %.2f tok/s — PROMOSSO", label, tps))
+                    // Un gradino alla volta: promosso il primo che vince,
+                    // si passa al knob successivo (stile DeepSeek).
+                    break
+                } else {
+                    report.append(String(
+                        format: "%@: %.2f tok/s — scartato", label, tps))
+                    apply(knob, original)
+                }
+            }
+        }
+        report.append(String(
+            format: "campione finale: %.2f tok/s — %@", best,
+            winners.isEmpty ? "configurazione di partenza"
+                : winners.map { "\($0.key)=\($0.value.isEmpty ? "default" : $0.value)" }
+                    .sorted().joined(separator: "  ")))
+        return GLM52AutoTuneOutcome(
+            report: report.joined(separator: "\n"), winners: winners)
     }
 }
