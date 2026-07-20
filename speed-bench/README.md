@@ -26,3 +26,17 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
+
+To overlay two runs on shared axes for an A/B comparison (for example SSD
+streaming with and without the expert-bundle sidecar):
+
+```
+python3 speed-bench/plot_speed_compare.py \
+  speed-bench/no_bundle.csv speed-bench/bundle.csv \
+  --label-a "senza bundle" --label-b "con bundle"
+```
+
+The first CSV is the baseline (drawn dashed), the second the candidate (drawn
+solid). The subtitle reports the candidate's average prefill and generation
+delta over the context points the two runs share. Output defaults to
+`<candidate>_vs_<baseline>_ts.svg` next to the candidate CSV.
