@@ -14,9 +14,10 @@ DwarfStar is both:
   native HTTP server, the benchmark panel, diagnostics, and distributed workers.
 
 Qwen is currently recognized from GGUF metadata but not executable. GLM 5.2 is
-cataloged for resumable, integrity-checked download and now has a registered
-detector, strict GGUF contract and native tokenizer/chat frontend. Its Metal
-decoder is incomplete, so `glm-dsa` files remain non-selectable. See the
+cataloged for resumable, integrity-checked download and runs end to end
+through its own streaming backend: registered detector, strict GGUF contract,
+native tokenizer/chat frontend and a per-token expert-gather Metal engine
+(chat, demo, server, benchmark). See the
 [support matrix](ARCHITETTURE-SUPPORTATE.md) for the precise distinction
 between recognized and supported models.
 
@@ -47,8 +48,8 @@ DwarfStar currently runs DeepSeek V4 Flash and the single-file Pro Q2 profile
 locally on Apple Silicon by streaming routed MoE weights from SSD. Only a small
 routed subset of the selected model is touched for each token. Pro Q4 remains
 download-only because its catalog artifact is split across two GGUF shards;
-three monolithic GLM 5.2 quantizations are also download-only while their
-DSA/MoE decoder, streaming loader and remaining Metal kernels are developed;
+three monolithic GLM 5.2 quantizations are selectable and run through the GLM
+streaming backend with per-token expert gather from SSD;
 distributed Pro Q2 uses geometry-aware horizontal and expert-shard paths, with
 real-model multi-Mac numerical validation still pending. Backend selection is
 explicit, so a future Qwen
@@ -898,8 +899,8 @@ downloadable, selectable and runnable locally. The two-shard Pro Q4 package is
 visible/downloadable but explicitly `downloadOnly`; neither shard becomes an
 independent local model. The GLM 5.2 IQ2_XXS, Q2_K and Q4_K entries from
 `antirez/glm-5.2-gguf` are downloadable with pinned revision, byte count and
-SHA-256. They can be inspected and tokenized but remain non-selectable until
-the decoder passes logits validation. Pro distribution remains under verification. MTP is
+SHA-256, and are selectable and runnable through the GLM streaming backend.
+Pro distribution remains under verification. MTP is
 an accessory outside the main-model GUI catalog, and no current load path
 consumes it. Manual **Browse** remains available, but validates the GGUF with
 the runtime selector before changing the active model.

@@ -3,10 +3,10 @@
 # GLM 5.2
 
 This folder describes the native port of GLM 5.2 (`glm-dsa`) in DwarfStar.
-The current state is no longer just "download": detector, GGUF contract,
-tokenizer and chat protocol are implemented and verified. The decoder however
-remains intentionally non-runnable; GUI, demo, server and benchmark cannot yet
-select GLM.
+The port is **operational end to end**: the streaming engine
+(`GLM52ResidentModel`) runs prefill and decode from the real GGUF on a
+16 GB machine, and GUI, demo, local server, benchmark, auto-tune and disk-KV
+checkpoints all select GLM natively. Only distribution remains DeepSeek-only.
 
 ## Current state
 
@@ -14,21 +14,53 @@ select GLM.
 |---|---|
 | Catalog and GUI download | yes, three monolithic GGUFs with pinned revision/size/SHA |
 | Recognition of `general.architecture = glm-dsa` | yes |
-| Frontend/tokenizer selection | yes |
-| Configuration and GGUF schema | yes, strict geometry and 1,809 tensors |
-| Weight map and top-8 read plan | yes, payload-free and quant-block-aware |
-| Payload reads from the GGUF | yes, bounded `pread` over descriptors and top-8 plans (gate\|up\|down records) |
-| GPT-2 tokenizer + `glm4` pretokenizer | yes |
-| Native chat template, reasoning and XML tools | yes |
-| CPU oracle for router, DSA/IndexShare and compact cache | yes |
-| GLM Metal kernels | all phases as validated primitives; GPU composition of the first-token layer and of the decode step against the oracles |
-| End-to-end prefill, decode and logits output | no |
-| GUI or `DS4Demo` selection | no |
-| Server, benchmark, KV checkpoints and distribution | no |
+| Configuration, GGUF schema, tokenizer, chat/tool protocol | yes |
+| End-to-end prefill, decode and logits output | **yes** — streaming engine, layer-major prefill, greedy/sampled decode |
+| GUI and `DS4Demo` selection | **yes** (chat, settings per-backend, tuning) |
+| Local server (stateless OpenAI/Anthropic semantics) | **yes**, with incremental-KV prefix reuse |
+| Benchmark and auto-tune | **yes** (GUI button and `DS4_GLM_AUTOTUNE=1`) |
+| Disk-KV checkpoint | yes, single `state.glmkv` per model (longest-prefix restore) |
+| Per-phase profiling | yes — DeepSeek-style report plus GPU/host split |
+| Distribution | no (DeepSeek-only) |
 
-The catalog entries remain `downloadOnly`. A completed file can be inspected
-and tokenized, but `BackendSelector` rejects it with a "backend not yet
-implemented" error; there is no fallback to the DeepSeek V4 decoder.
+## Engine and measured optimizations (M1 Pro 16 GB, IQ2_XXS)
+
+The engine streams: 3 leading dense layers resident (adaptive floor under
+RAM pressure — more residents get paged by the OS and cost ~750 ms/token of
+driver residency, measured), the 75 sparse layers stream their big tensors
+per token with double-buffered prefetch, and the routed experts arrive as
+contiguous records through the staging arena. Optimizations are engine
+defaults, each with a measured verdict:
+
+- **commit fusion** (`DS4_GLM_FUSE`): layer N's FFN and layer N+1's trunk in
+  one command buffer — half the synchronous waits (~154 → ~77/token);
+- **vectorized kernels**: IQ2_XXS/Q8_0/Q4_K dots with float4 FMA and wide
+  loads (−19% GPU);
+- **batched MoE** (`DS4_GLM_MOE_BATCH`): every routed expert in two
+  dispatches; the shared expert (always active) stays separate;
+- **fused GPU router** (`DS4_GLM_GPU_ROUTER`): matvec + sigmoid + top-8 in
+  the trunk commit, 64-byte readback (−18% prefill);
+- **device argmax** for greedy decode (4-byte readback), **paired qA+kvA
+  matvec**, **device indexer top-k** (contexts beyond 2,048);
+- **mlock of resident weights** (`DS4_GLM_MLOCK`): head 433 → 39 ms/token;
+- **parallel prefill reads** (`DS4_GLM_READ_SPLIT`, prefill only — measured
+  counterproductive in decode, where the serial fill pace is what leaves
+  SSD bandwidth to the demand expert reads);
+- **Q4 layer sidecar** as a single pack (`<gguf>.q4dense`, sections per
+  layer, resumable, any subset useful) plus the expert bundle
+  (`<gguf>.expbundle`) in the same container format.
+
+Measured on the published IQ2_XXS with a 58/75-layer sidecar: **prefill
+~1.05 s/token, decode ~3.0 s/token (0.33 tok/s)** sustained over 64 tokens —
+from a 6.0 s/token baseline at the start of the optimization campaign. The
+remaining decode profile is ~69% SSD I/O: the next levers are completing the
+sidecar (disk-bound) and self-speculative decode.
+
+Rejected by measurement (kept as opt-in knobs, verdicts in the code
+comments): expert speculation on a saturated SSD, F_NOCACHE reads, MetalIO
+for decode layer streaming, usage-driven expert cache (GLM routing is almost
+uniform: top experts cover ~15% of routes at a 2 GB budget, against
+DeepSeek's 69% hit rate).
 
 ## Contract verified against the real GGUF
 
@@ -61,9 +93,7 @@ The compact F16 layout keeps per token:
 The total is 95,232 bytes/token, roughly 372 MiB at 4,096 tokens and 8.87 GiB
 at 100,000 tokens. The DwarfStar planner grows in append-only slabs and can
 enforce a resident budget: a large logical window therefore does not, by
-itself, trigger the immediate allocation of the entire cache. The runtime will
-still have to decide how to handle contexts that exceed RAM and SSD budget
-before declaring the one-million-token context supported.
+itself, trigger the immediate allocation of the entire cache.
 
 ## Download manifest
 
@@ -77,46 +107,15 @@ These are monolithic alternatives, not shards. The downloader writes to
 `.part`, uses bounded buffers, supports resume and verifies the SHA in blocks
 without loading the GGUF into RAM.
 
-## Runtime progress
+## What remains
 
-The enablement sequence is binding:
-
-1. wire the validated weight map to the top-8 SSD/MetalIO reads and to the
-   caches — started: `GLM52PayloadReader` executes descriptors and top-8 plans
-   with bounded `pread` (double bounds check, rejection of truncated GGUFs at
-   open) and `GLM52ExpertSlotCache` provides the per-expert LRU cache with
-   byte-identical hits and batch pinning; MetalIO and residency remain;
-2. complete Q/KV-LoRA, RoPE, indexer, DSA attention and IndexShare
-   — done at the validation level: the decode step is composed on GPU
-   (`glm52DecodeLayer`) with the exact upstream wiring — cache stores BEFORE
-   selection/attention (normed KV-LoRA prefix + raw K-RoPE tail), indexer key
-   with centered LayerNorm and RoPE on the prefix, `visible = pos+1` with
-   fill-range or score+top-k, verbatim IndexShare, and per-row rotation of the
-   K tail at attention time — judged by the `GLM52DecodeCPUReference` oracle.
-   The persistent graph is composed: resident quantized weights loaded once
-   (attention, dense/shared FFN, output head), compact cache and resident
-   indexer keys updated in place, activations chained on buffers (a single
-   command buffer on the fill-range path), expert accumulation on GPU with
-   per-token streaming of the selected records, and the multi-layer forward
-   `glm52ResidentDecodeForward` with the real IndexShare policy on absolute
-   indices. The real engine `GLM52ResidentModel` loads the validated weight
-   map from the GGUF into resident buffers (embedding row per token, routed
-   experts via slot cache), runs token-by-token prefill and greedy decode;
-   the IQ2_XXS kernel (routed format of the published file) is validated
-   against the reference dequant, so the entire 78-layer stack is loadable
-   from the real GGUF. The parity gate is ready in opt-in form:
-   `GLM52LogitsParityIntegrationTests` compares engine and CPU oracle on the
-   real dequantized weights (truncated 4-layer stack: dense + first sparse
-   with IndexShare and IQ2_XXS experts), exact selections and router and all
-   154,880 logits within |delta| <= 0.05 + 1% with identical argmax; the
-   extension to the full 78-layer stack remains;
-3. complete dense layers, routed/shared MoE, residual RMS and output head;
-4. compare embedding, every layer and logits against an independent oracle;
-5. verify prefill and decode on real prompts, including chat and tool calls;
-6. measure RAM, pressure, SSD and session deletion;
-7. only then flip the catalog from `downloadOnly` and enable GUI/demo;
-8. server, benchmark, KV checkpoints and distribution come after the local
-   runtime.
+1. self-speculative decode (cheap draft + `forwardBatch` verify — the only
+   way past the per-token layer-stream I/O ceiling) and, later, MTP on the
+   unexecuted nextn block (blk78);
+2. prefill progress/cancellation and mid-prefill checkpointing (DeepSeek
+   parity for long prompts);
+3. full sidecar coverage (disk-bound: ~2.4 GB per remaining layer);
+4. distribution.
 
 The detailed map against the upstream branch is in
 [`PORTING-ANTIREZ.md`](PORTING-ANTIREZ.md); GGUF names, shapes and types are

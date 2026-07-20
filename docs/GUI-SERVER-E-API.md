@@ -79,16 +79,17 @@ repositories:
 | DeepSeek V4 Flash | Q2, mixed Q2/Q4, Q4 | yes | yes |
 | DeepSeek V4 Pro | single Q2 | yes | yes |
 | DeepSeek V4 Pro | two-shard Q4 split | yes | no |
-| GLM 5.2 | monolithic IQ2_XXS, Q2_K, Q4_K | yes | no |
+| GLM 5.2 | monolithic IQ2_XXS, Q2_K, Q4_K | yes | yes |
 
 For each entry the GUI shows approximate size, local status, free space,
 aggregate progress, and runtime availability. A complete Flash entry or a
 single Pro Q2 can be selected; when the download finishes it becomes the
 active model and the choice persists without a security-scoped bookmark,
-because the file belongs to the app container. Pro Q4 split and all GLM
-entries remain `downloadOnly`: the selection button does not appear and the
-download does not change the active model. MTP is an accessory and does not
-appear in the main catalog.
+because the file belongs to the app container. GLM entries are selectable
+and runnable through the GLM backend; the Pro Q4 split package remains
+`downloadOnly`: its selection button does not appear and the download does
+not change the active model. MTP is an accessory and does not appear in the
+main catalog.
 
 ### Paths and reuse
 
@@ -103,9 +104,8 @@ in the destination, in the development root and its `gguf/` subfolder, and in
 the directory of the currently configured model. A regular, non-empty final
 file is reused in place and is not downloaded again; when the catalog knows
 the exact size, as for GLM, the byte count must also match. The model menu's
-automatic scans include only the three Flash variants and Pro Q2 declared
-selectable by the catalog. Complete GLM files remain visible in the download
-sheet, not in the load menu.
+automatic scans include the entries declared selectable by the catalog: the
+three Flash variants, the single Pro Q2 and the three GLM GGUFs.
 
 An incomplete transfer remains as `<name>.part`; **Resume** uses HTTP Range.
 The UI allows cancellation and keeps the partial file. The downloader checks

@@ -147,9 +147,8 @@ GUI. The three DeepSeek V4 Flash variants and the single-file DeepSeek V4 Pro
 Q2 model can be downloaded, selected and run locally. The two-file Pro Q4
 package remains download-only because the local loader does not assemble split
 GGUF shards. The three GLM 5.2 variants from `antirez/glm-5.2-gguf` are also
-downloadable, resumable and integrity-checked. Their metadata and frontend can
-be inspected, but they remain non-selectable until the native GLM decoder is
-complete. Downloads live
+downloadable, resumable and integrity-checked, and can be selected and run
+through the native GLM streaming backend. Downloads live
 under `~/Library/Application Support/DwarfStar/models/`, resume from `.part`
 files and reuse an already present regular file instead of downloading it
 again; entries with a pinned byte count, including GLM 5.2, require an exact
@@ -743,17 +742,14 @@ Authentication precedence is: token saved in **Settings → Hugging Face**
 | `q4-imatrix` | DeepSeek V4 Flash, Q4_K experts | selectable and runnable | 165 GB |
 | `pro-q2-imatrix` | DeepSeek V4 Pro, single Q2 GGUF | selectable and runnable locally | 465 GB |
 | `pro-q4-split` | DeepSeek V4 Pro, two Q4 shards (`00…30` and `31…output`) | download only; neither shard is a local selectable model | 900 GB |
-| `glm-5.2-iq2-xxs` | GLM 5.2, IQ2_XXS routed experts | download only; GLM runtime not implemented yet | 211 GB |
-| `glm-5.2-q2-k` | GLM 5.2, Q2_K routed experts | download only; GLM runtime not implemented yet | 262 GB |
-| `glm-5.2-q4-k` | GLM 5.2, Q4_K routed experts | download only; GLM runtime not implemented yet | 434 GB |
+| `glm-5.2-iq2-xxs` | GLM 5.2, IQ2_XXS routed experts | selectable and runnable (GLM streaming engine) | 211 GB |
+| `glm-5.2-q2-k` | GLM 5.2, Q2_K routed experts | selectable and runnable (GLM streaming engine) | 262 GB |
+| `glm-5.2-q4-k` | GLM 5.2, Q4_K routed experts | selectable and runnable (GLM streaming engine) | 434 GB |
 
-The three Flash entries and the single-file Pro Q2 entry appear in automatic
-local-model selection. Pro Q4 remains visible in the download sheet with its
-explicit unavailable reason; downloading that split package never changes the
-active model. The three GLM 5.2 variants follow the same download-only rule:
-they are shown in the sheet but excluded from automatic discovery and model
-selection until the `glm-dsa` runtime is implemented. Detector, tokenizer and
-schema support do not override this gate. The MTP
+The three Flash entries, the single-file Pro Q2 entry and the three GLM 5.2
+entries appear in automatic local-model selection. Pro Q4 remains visible in
+the download sheet with its explicit unavailable reason; downloading that
+split package never changes the active model. The MTP
 companion is deliberately outside the main-model GUI catalog and is not shown
 as a selectable/downloadable model row.
 

@@ -209,3 +209,16 @@ marked `NOT FINAL`.
 Do not use `--allow-active-download` for a measurement meant for promotion: it
 exists only for deliberate diagnostics, and the resulting report would be
 contaminated by the external I/O.
+
+## GLM 5.2 auto-tune
+
+GLM has its own pragmatic auto-tune (GUI button "Auto-tune GLM" in the GLM
+settings, or `DS4_GLM_AUTOTUNE=1` in the demo): it climbs one knob at a time
+over the EXACT load-time knobs only (`DS4_GLM_MTLIO`, `DS4_GLM_STREAM_SLOTS`,
+`DS4_GLM_EXPERT_ARENA`, `DS4_GLM_RESIDENT_LAYERS`, `DS4_GLM_FUSE`), reloading
+the engine per configuration — the ~3 s streaming load makes per-config
+reloads affordable, which the DeepSeek record-holder cannot do. Quality
+knobs (active experts, lossy Q4) are never touched, and winners are applied
+to the persisted GUI settings before the model is reloaded. There is no
+transactional journal or stability metric yet: measurements are single-shot
+and the champion threshold is 3% over run noise.

@@ -307,9 +307,9 @@ public enum DeepSeekV4ModelCatalog {
 
 /// Download catalog for the GLM 5.2 GGUF publication by antirez.
 ///
-/// These entries deliberately remain download-only. The current build has no
-/// GLM tokenizer, tensor schema, DSA/MoE decoder or Metal backend, so making a
-/// monolithic file selectable would misrepresent runtime support.
+/// Availability is keyed off `GLM52RuntimeGate.enabled`: with the gate on,
+/// the entries are `runnable` and selectable through the GLM streaming
+/// backend; with the gate off they fall back to download-only.
 public enum GLM52ModelCatalog {
     // Keyed off the single enablement switch: selectable the moment the
     // real-GGUF logits parity gate flips GLM52RuntimeGate.enabled.

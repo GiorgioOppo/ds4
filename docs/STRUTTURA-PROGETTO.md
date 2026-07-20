@@ -72,8 +72,9 @@ same name: layout, special tokens and semantics must be genuinely compatible.
   dense and expert weights, sidecars and DeepSeek-specific streaming.
 - `Backends/DeepSeekV4/Decode`: execution, generation, attention, cache,
   KV, prefill, diagnostics, reference and state of the concrete decoder.
-- `Backends/GLM52`: tensor schema, DSA/IndexShare references and progressive
-  Metal primitives; the decoder is not yet runnable.
+- `Backends/GLM52`: tensor schema, DSA/IndexShare references, the streaming
+  engine (`GLM52ResidentModel` + `GLM52ChainedDecode`) and the per-family
+  Metal kernels; runnable end to end (chat, demo, server, benchmark).
 - `Backends/Qwen`: documented placeholder; no fake kernels or decoder.
 
 A data structure holding Metal buffers or resources belongs in this

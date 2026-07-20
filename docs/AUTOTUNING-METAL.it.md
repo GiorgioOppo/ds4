@@ -209,3 +209,17 @@ risultato avrà stato `complete_unvalidated` e `final-env.sh` resterà marcato
 Non usare `--allow-active-download` per una misura da promuovere: esiste solo
 per diagnosi consapevoli e il report risultante sarebbe contaminato dall'I/O
 esterno.
+
+## Auto-tune GLM 5.2
+
+GLM ha il suo auto-tune pragmatico (bottone "Auto-tune GLM" nelle
+impostazioni GLM, o `DS4_GLM_AUTOTUNE=1` nel demo): sale un gradino alla
+volta sui soli knob ESATTI di caricamento (`DS4_GLM_MTLIO`,
+`DS4_GLM_STREAM_SLOTS`, `DS4_GLM_EXPERT_ARENA`, `DS4_GLM_RESIDENT_LAYERS`,
+`DS4_GLM_FUSE`), ricaricando il motore per configurazione — il load
+streaming da ~3 s rende sostenibile il reload per config, cosa preclusa al
+record-holder DeepSeek. I knob di qualità (esperti attivi, Q4 lossy) non
+vengono mai toccati, e i vincitori vengono applicati alle impostazioni GUI
+persistite prima del ricaricamento del modello. Non esistono ancora journal
+transazionale né metrica di stabilità: misure one-shot con soglia di
+promozione al 3% oltre il rumore.

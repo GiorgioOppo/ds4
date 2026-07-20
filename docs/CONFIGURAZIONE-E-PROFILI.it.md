@@ -146,3 +146,37 @@ Quando viene introdotto un nuovo parametro:
 4. aggiornare il README della cartella proprietaria;
 5. se viene propagato ai worker, aggiornare e testare la whitelist;
 6. aggiungere un A/B riproducibile quando è un knob prestazionale.
+
+## Knob GLM 5.2
+
+Il backend GLM ha il suo namespace `DS4_GLM_*` (impostare un knob DeepSeek
+`DS4_*` non tocca mai GLM, e viceversa). Le ottimizzazioni del motore sono
+tutte default; i knob esistono per A/B e diagnosi, sono speculari nella UI
+delle impostazioni GLM, e ogni valore viene stampato a init del motore nel
+Log motore (`DS4 glm: knob …`). I verdetti misurati sono su M1 Pro 16 GB
+con l'IQ2_XXS pubblicato.
+
+| Knob | Default | Note |
+|---|---|---|
+| `DS4_GLM_MTLIO` | 1 | 0 misurato +18% di decode su 16 GB (MetalIO contende i commit del decode); il preset GUI imposta 0 |
+| `DS4_GLM_ACTIVE_EXPERTS` | 8 | esperti instradati per token; il condiviso è sempre attivo. 6 = −25% di I/O esperti, lieve trade-off qualità |
+| `DS4_GLM_RESIDENT_LAYERS` | adattivo | floor di 3 layer dense sotto pressione RAM (residenti extra vengono paginati: ~+750 ms/token misurati) |
+| `DS4_GLM_FUSE` | 1 | fusione dei commit (metà delle attese sincrone) |
+| `DS4_GLM_MOE_BATCH` | 1 | MoE batched (tutti gli esperti instradati in due dispatch) |
+| `DS4_GLM_GPU_ROUTER` | 1 | router fuso su GPU (−18% di prefill) |
+| `DS4_GLM_MLOCK` | 1 | wiring dei pesi residenti (head da 433 a 39 ms/token) |
+| `DS4_GLM_READ_SPLIT` | 4 | letture layer parallele nel prefill (solo prefill; il decode resta seriale per scelta misurata) |
+| `DS4_GLM_SG` / `DS4_GLM_NSG` | 1 / 4 | dispatch cooperativo dei kernel e simdgroup per threadgroup |
+| `DS4_GLM_STREAM_SLOTS` | 3 (4 con fusione) | slot di staging dei layer (~250 MiB l'uno) |
+| `DS4_GLM_EXPERT_ARENA` | 24 | slot dell'arena condivisa degli esperti staged (~10 MiB l'uno) |
+| `DS4_GLM_SPEC_EXPERTS` | off | speculazione esperti; N ≥ 2 = solo top-N. Misurata net-zero su SSD saturo |
+| `DS4_GLM_SPEC_K` | off | decode speculativo prompt-lookup (demo) |
+| `DS4_GLM_LAYERQ4` / `DS4_GLM_LAYERQ4_DIR` | 1 / sibling→gestita | pack sidecar Q4 dei layer (`<gguf>.q4dense`) |
+| `DS4_GLM_BUNDLE_DIR` | sibling→gestita | pack del bundle esperti legacy (`<gguf>.expbundle`) |
+| `DS4_GLM_NOCACHE` | off | letture F_NOCACHE; misurate controproducenti come default |
+| `DS4_GLM_USAGE_FILE` | `<gguf>.glm-usage.json` | persistenza della usage imatrix ("off" disattiva) |
+| `DS4_GLM_AUTOTUNE` / `DS4_GLM_BUILD_LAYERQ4` | off | prepass del demo: auto-tune / build del pack sidecar |
+
+I knob di dispatch vengono riletti a ogni init del motore
+(`GLM52DispatchKnobs`): un toggle della GUI ha effetto al prossimo
+caricamento del modello, senza riavviare l'app.

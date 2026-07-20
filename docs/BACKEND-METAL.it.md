@@ -13,7 +13,7 @@ backend DeepSeek sono approfondite in
 
 ```text
 Backend concreto (oggi DeepSeekV4/StreamingDecoder;
-GLM52 resta in tranche isolate non collegate)
+o GLM52/GLM52ChainedDecode con lo stato hidden residente sulla GPU)
              |
              v
 decoder, stato KV e provider dei pesi del backend

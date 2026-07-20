@@ -162,8 +162,8 @@ DeepSeek V4 Pro Q2 a file singolo possono essere scaricati, selezionati ed
 eseguiti localmente. Il pacchetto Pro Q4 a due file resta solo scaricabile
 perché il loader locale non assembla shard GGUF divisi. Anche le tre varianti
 GLM 5.2 di `antirez/glm-5.2-gguf` sono scaricabili, riprendibili e con
-verifica di integrità. I loro metadati e frontend possono essere ispezionati,
-ma restano non selezionabili finché il decoder GLM nativo non sarà completo. I
+verifica di integrità, e possono essere selezionate ed eseguite col backend
+streaming GLM nativo. I
 download vivono sotto `~/Library/Application Support/DwarfStar/models/`,
 riprendono dai file `.part` e riusano un file regolare già presente invece di
 scaricarlo di nuovo; le voci con un conteggio di byte fissato, incluse quelle
@@ -786,18 +786,15 @@ token.
 | `q4-imatrix` | DeepSeek V4 Flash, esperti Q4_K | selezionabile ed eseguibile | 165 GB |
 | `pro-q2-imatrix` | DeepSeek V4 Pro, GGUF Q2 singolo | selezionabile ed eseguibile localmente | 465 GB |
 | `pro-q4-split` | DeepSeek V4 Pro, due shard Q4 (`00…30` e `31…output`) | solo download; nessuno dei due shard è un modello locale selezionabile | 900 GB |
-| `glm-5.2-iq2-xxs` | GLM 5.2, esperti instradati IQ2_XXS | solo download; runtime GLM non ancora implementato | 211 GB |
-| `glm-5.2-q2-k` | GLM 5.2, esperti instradati Q2_K | solo download; runtime GLM non ancora implementato | 262 GB |
-| `glm-5.2-q4-k` | GLM 5.2, esperti instradati Q4_K | solo download; runtime GLM non ancora implementato | 434 GB |
+| `glm-5.2-iq2-xxs` | GLM 5.2, esperti instradati IQ2_XXS | selezionabile ed eseguibile (motore streaming GLM) | 211 GB |
+| `glm-5.2-q2-k` | GLM 5.2, esperti instradati Q2_K | selezionabile ed eseguibile (motore streaming GLM) | 262 GB |
+| `glm-5.2-q4-k` | GLM 5.2, esperti instradati Q4_K | selezionabile ed eseguibile (motore streaming GLM) | 434 GB |
 
-Le tre voci Flash e la voce Pro Q2 a file singolo compaiono nella selezione
-automatica dei modelli locali. Pro Q4 resta visibile nel foglio di download
-con la sua esplicita ragione di indisponibilità; scaricare quel pacchetto
-diviso non cambia mai il modello attivo. Le tre varianti GLM 5.2 seguono la
-stessa regola solo-download: sono mostrate nel foglio ma escluse dalla
-scoperta automatica e dalla selezione dei modelli finché il runtime `glm-dsa`
-non sarà implementato. Il supporto di detector, tokenizer e schema non
-scavalca questo cancello. Il compagno MTP è deliberatamente fuori dal catalogo
+Le tre voci Flash, la voce Pro Q2 a file singolo e le tre voci GLM 5.2
+compaiono nella selezione automatica dei modelli locali. Pro Q4 resta visibile
+nel foglio di download con la sua esplicita ragione di indisponibilità;
+scaricare quel pacchetto diviso non cambia mai il modello attivo. Il compagno
+MTP è deliberatamente fuori dal catalogo
 GUI dei modelli principali e non è mostrato come riga di modello
 selezionabile/scaricabile.
 

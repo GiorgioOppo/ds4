@@ -13,7 +13,7 @@ already available.
 |---|---:|---:|---:|---:|---:|---|
 | DeepSeek V4 Flash | yes | yes | yes | yes | yes | Three complete quantizations are downloadable, selectable and runnable. |
 | DeepSeek V4 Pro | yes | yes | yes, single-file Q2 | yes, single-file Q2 | yes, single-file Q2 | The distributed path is implemented and tested at the protocol level; the numerical validation with the real Pro GGUF is still pending. The Q4 split package remains download-only. |
-| GLM 5.2 (`glm-dsa`) | yes | yes | no | no, explicit rejection | no | Detector, shape/schema, tokenizer/chat/tool and the first DSA/Metal primitives are implemented; the end-to-end decoder is not yet available. |
+| GLM 5.2 (`glm-dsa`) | yes | yes | yes, streaming engine | yes (chat, demo, server, benchmark, auto-tune) | no | End-to-end runnable: streaming engine with per-token expert gather, Q4 layer sidecar pack, incremental-KV server reuse and disk-KV checkpoint. Measured ~0.33 tok/s decode on the IQ2_XXS at 16 GB (see `architectures/glm-5.2/`). |
 | Qwen | yes | no | no | no, explicit rejection | no | Structure is in place; decoder and templates are not yet implemented. |
 | Unknown | yes | no | no | no, explicit rejection | no | The GGUF identifier is reported without attempting a DeepSeek load. |
 
@@ -39,15 +39,17 @@ The current entries are:
 - DeepSeek V4 Pro Q4: `downloadOnly` package of two shards; the shards are not
   presented as independent local models;
 - GLM 5.2 IQ2_XXS, Q2_K and Q4_K: three alternative monolithic GGUFs from the
-  `antirez/glm-5.2-gguf` repository, all `downloadOnly`;
+  `antirez/glm-5.2-gguf` repository, selectable and runnable through the GLM
+  backend;
 - MTP: separate accessory, excluded from the main model catalog and from GUI
   selection.
 
-The GUI's automatic scan filters on the filenames of the three selectable Flash
-entries and the single Pro Q2. **Browse** allows an external file, but first
-performs the metadata-only inspection and backend selection: a Pro Q4 shard, a
-GLM 5.2 GGUF, MTP, Qwen and unknown architectures cannot silently replace the
-active model.
+The GUI's automatic scan filters on the filenames the catalog declares
+selectable: the three Flash entries, the single Pro Q2 and the three GLM
+GGUFs. **Browse** allows an external file, but first
+performs the metadata-only inspection and backend selection: a Pro Q4 shard,
+MTP, Qwen and unknown architectures cannot silently replace the active model,
+while a GLM 5.2 GGUF routes to its own concrete backend.
 
 Pro Q2 support covers both the local decoder and distributed pipeline and
 expert-parallelism. The distributed geometry is covered by protocol and
@@ -90,8 +92,7 @@ Loading follows this sequence:
 
 An architecture that is recognized but not implemented produces an error
 distinct from a corrupt file or from an unsupported profile of the same family.
-This is the expected behavior for Qwen and GLM during their respective
-preparatory phases. A valid DeepSeek V4 Pro Q2, on the other hand, goes through
+This is the expected behavior for Qwen during its preparatory phase. A valid DeepSeek V4 Pro Q2, on the other hand, goes through
 the same concrete backend as Flash, but with a `DSV4RuntimeGeometry` built from
 the metadata: 61 layers, 7168 channels, 128 heads, 384 experts, top-1024
 indexer and router scale 2.5 are not replaced by the Flash constants.
@@ -128,16 +129,18 @@ No generic "Qwen" is chosen in advance: Qwen2, Qwen2-MoE, Qwen3 and their
 variants may have different contracts. Implementation will start from a
 declared GGUF file and variant, not from the commercial name alone.
 
-## Requirements before the GLM 5.2 backend
+## GLM 5.2 backend status
 
 The GLM catalog pins repository, revision, filename, byte count and SHA-256.
-`glm-dsa` is now registered, the real IQ2_XXS header has been validated, and
-the frontend, schema, router and DSA/IndexShare policies have dedicated tests.
-Before making an entry `runnable`, what remains is the complete MLA/DSA graph,
-routed/shared MoE, weight loader and streaming, runtime KV, logits output and
-numerical prefill/decode comparisons. MTP is not part of the first
-autoregressive path. DeepSeek knobs must not be implicitly reused. The
-checklist is in the [GLM 5.2 README](architectures/glm-5.2/README.md).
+The requirements that gated the `runnable` state have been met: `glm-dsa` is
+registered, the complete MLA/DSA graph, routed/shared MoE, weight loader and
+streaming, runtime KV and logits output are implemented, and prefill/decode
+have been validated numerically against the real IQ2_XXS GGUF
+(`GLM52RuntimeGate.enabled` is on, which flips the catalog entries to
+`runnable`). MTP (the nextn block) is not part of the autoregressive path.
+GLM uses its own `DS4_GLM_*` knob namespace; DeepSeek knobs are not
+implicitly reused. Engine details and measured optimizations are in the
+[GLM 5.2 README](architectures/glm-5.2/README.md).
 
 ## Per-family documents
 
@@ -146,7 +149,7 @@ checklist is in the [GLM 5.2 README](architectures/glm-5.2/README.md).
 - [`architectures/qwen/README.md`](architectures/qwen/README.md) describes the
   groundwork and what remains to be implemented.
 - [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.md)
-  describes the verified contract, implemented tranches and gates of the GLM
-  backend.
+  describes the verified contract, the streaming engine and the measured
+  optimizations of the GLM backend.
 - [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.md) indicates where to place
   files.

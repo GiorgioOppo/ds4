@@ -15,10 +15,10 @@ DwarfStar è al tempo stesso:
   benchmark, dalla diagnostica e dai worker distribuiti.
 
 Qwen è attualmente riconosciuto dai metadati GGUF ma non eseguibile. GLM 5.2 è
-catalogato per il download ripristinabile con verifica di integrità e ora ha un
-detector registrato, un contratto GGUF rigoroso e un frontend nativo per
-tokenizer/chat. Il suo decoder Metal è incompleto, quindi i file `glm-dsa`
-restano non selezionabili. Vedi la
+catalogato per il download ripristinabile con verifica di integrità ed è
+eseguibile end-to-end col proprio backend streaming: detector registrato,
+contratto GGUF rigoroso, frontend nativo tokenizer/chat e motore Metal con
+gather degli esperti per token (chat, demo, server, benchmark). Vedi la
 [matrice di supporto](ARCHITETTURE-SUPPORTATE.it.md) per la distinzione precisa
 tra modelli riconosciuti e supportati.
 
@@ -50,9 +50,9 @@ DwarfStar esegue attualmente DeepSeek V4 Flash e il profilo Pro Q2 a file
 singolo in locale su Apple Silicon, facendo streaming da SSD dei pesi MoE
 instradati. Per ogni token viene toccato solo un piccolo sottoinsieme
 instradato del modello selezionato. Pro Q4 resta solo scaricabile perché il suo
-artefatto di catalogo è diviso in due shard GGUF; anche tre quantizzazioni
-monolitiche di GLM 5.2 sono solo scaricabili mentre vengono sviluppati il loro
-decoder DSA/MoE, il loader in streaming e i kernel Metal rimanenti; il Pro Q2
+artefatto di catalogo è diviso in due shard GGUF; le tre quantizzazioni
+monolitiche di GLM 5.2 sono selezionabili ed eseguibili col backend streaming
+GLM, con gather degli esperti per token da SSD; il Pro Q2
 distribuito usa percorsi orizzontali e a shard di esperti consapevoli della
 geometria, con la validazione numerica multi-Mac su modello reale ancora in
 sospeso. La selezione del backend è esplicita, quindi una futura
@@ -986,8 +986,8 @@ scaricabili, selezionabili ed eseguibili in locale. Il pacchetto Pro Q4 a due
 shard è visibile/scaricabile ma esplicitamente `downloadOnly`; nessuno dei due
 shard diventa un modello locale indipendente. Le voci GLM 5.2 IQ2_XXS, Q2_K e
 Q4_K da `antirez/glm-5.2-gguf` sono scaricabili con revisione, conteggio di
-byte e SHA-256 fissati. Possono essere ispezionate e tokenizzate ma restano non
-selezionabili finché il decoder non supera la validazione dei logit. La
+byte e SHA-256 fissati, e sono selezionabili ed eseguibili col backend
+streaming GLM. La
 distribuzione del Pro resta in verifica. MTP è un accessorio fuori dal catalogo
 GUI del modello principale, e nessun percorso di caricamento attuale lo
 consuma. Il **Browse** manuale resta disponibile, ma valida il GGUF con il

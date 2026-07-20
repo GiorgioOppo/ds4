@@ -13,7 +13,7 @@ is defined in
 
 ```text
 Concrete backend (today DeepSeekV4/StreamingDecoder;
-GLM52 remains in isolated, unconnected tranches)
+or GLM52/GLM52ChainedDecode with the hidden state resident on the GPU)
              |
              v
 decoder, KV state and the backend's weight provider
