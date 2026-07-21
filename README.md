@@ -334,12 +334,39 @@ in place and `expert bundle in use` once misses are actually served from it.
 The file format is shared with the DwarfStar Swift port, so a bundle built by
 either implementation is reused by the other.
 
-Measured on an M1 Pro with 16 GiB of RAM (2-bit Flash imatrix GGUF, auto
-cache budget of 193 experts, `--ssd-streaming-cold`, page cache purged, 200
-greedy tokens): decode went from 3.06 to 3.34 tokens/s (+9%) with the sidecar
-serving every miss. That configuration is nearly all misses, so it isolates
-the per-miss read improvement; machines where decode is less I/O-bound will
-see a smaller end-to-end delta.
+Measured on an M1 Pro with 16 GiB of RAM after the upstream GLM 5.2/TP merge
+(2-bit Flash imatrix GGUF, `--ssd-streaming-cold`, page cache purged, 200
+greedy tokens, cache of 193 experts): decode went from 2.20 to 2.95 tokens/s
+(+34%) with the sidecar serving every miss. Decode in that configuration is
+SSD-bandwidth-bound (~1.1 GiB of routed experts read per token), so the
+sequential record layout is worth far more than any further syscall shaping:
+single-preadv record reads, coalesced `F_RDADVISE` advisories, and
+`F_NOCACHE` bundle reads were all tried on top and each measured neutral
+within noise, so they are intentionally not part of the sidecar.
+
+Cache sizing matters as much as the sidecar on small-RAM machines: the
+routed working set of a single token on this model is ~258 experts
+(routed layers x experts used per token), and a cache below that line loses
+every token-to-token reuse -- consecutive tokens evict each other's experts
+before they can be rehit. Raising the budget past the line with an explicit
+count kept paying until ~360 (hit rate 0.33 -> 0.43):
+
+| cache experts | decode t/s |
+|---|---|
+| 193 | 2.95 |
+| 280 | 3.04 |
+| 320 | 3.24 |
+| 360 | 3.29 |
+
+The recommended daily configuration on a 16 GiB machine is:
+
+```sh
+DS4_EXPERT_BUNDLE=1 ./ds4 -m model.gguf --ssd-streaming --ssd-streaming-cache-experts 320
+```
+
+(explicit expert counts skip the byte-budget prefill reserve accounting;
+watch `memory_pressure` and step back to 280 if long contexts push the
+machine into the yellow).
 
 ### Practical SSD streaming examples
 
