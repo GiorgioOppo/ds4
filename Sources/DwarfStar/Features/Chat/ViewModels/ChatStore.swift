@@ -166,6 +166,7 @@ final class ChatStore {
         _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)                           // M1 Pro: pread arriva a ~5 GB/s
         _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)                            // un record contiguo per slot/esperto
         _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)                          // un command buffer FFN per gruppo
+        _ = setenv("DS4_PREFILL_MM", "1", 1)                                 // esperti prefill in GEMM (misurato: 48.9 → 20.7 ms/token su M1 Pro)
         _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)                           // evita top-k/readback sulla CPU
         _ = setenv("DS4_DENSE_Q4_KERNEL", "1", 1)                            // matvec Q4 dense senza wrapper MoE k=1
         _ = setenv("DS4_FUSED_ROUTER_PROBS", "1", 1)                         // softplus+sqrt in un dispatch
@@ -273,6 +274,11 @@ final class ChatStore {
     /// OFF = swiglu+down+add per esperto, il percorso di riferimento.
     var glmMoEBatchEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMMoEBatch") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(glmMoEBatchEnabled, forKey: "GLMMoEBatch") }
+    }
+    /// Fase B del prefill multi-token (DS4_GLM_PREFILL_MOE): pesi esperti
+    /// letti una volta per tile di token invece che una volta per token.
+    var glmPrefillMoEEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMPrefillMoE") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(glmPrefillMoEEnabled, forKey: "GLMPrefillMoE") }
     }
     /// GLM 5.2: router fuso su GPU (matvec+sigmoid+top-8 nel commit del
     /// trunk; −18% di prefill misurato). OFF = router CPU di riferimento.
@@ -726,7 +732,8 @@ final class ChatStore {
     var service: InferenceService?
     /// GLM 5.2 chat service — mutually exclusive with `service`. The chat
     /// send path branches on whichever is live; DeepSeek-only surfaces
-    /// (benchmark, auto-tune, tools) stay disabled while this is set.
+    /// (decode profiles, sub-agents, distributed) stay disabled while this
+    /// is set, while benchmark/correctness/diagnostics have GLM paths.
     var glmService: GLM52ChatService?
     /// Full load signature of `service`, including fixed knobs and context.
     var loadedEngineSignature: LoadedEngineSignature?
@@ -760,6 +767,8 @@ final class ChatStore {
     /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
     /// KV, so it's refused while the chat is mid-generation.
     var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }
+    /// GLM counterpart of `benchmarkService`, same KV-mutating gate.
+    var glmBenchmarkService: GLM52ChatService? { (isReady && !isGenerating) ? glmService : nil }
     var loadedModelPath: String? { isReady ? modelPath : nil }
 
     var isReady: Bool { if case .ready = phase { return true } else { return false } }

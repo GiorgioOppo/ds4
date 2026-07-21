@@ -13,7 +13,7 @@ already available.
 |---|---:|---:|---:|---:|---:|---|
 | DeepSeek V4 Flash | yes | yes | yes | yes | yes | Three complete quantizations are downloadable, selectable and runnable. |
 | DeepSeek V4 Pro | yes | yes | yes, single-file Q2 | yes, single-file Q2 | yes, single-file Q2 | The distributed path is implemented and tested at the protocol level; the numerical validation with the real Pro GGUF is still pending. The Q4 split package remains download-only. |
-| GLM 5.2 (`glm-dsa`) | yes | yes | yes, streaming engine | yes (chat, demo, server, benchmark, auto-tune) | no | End-to-end runnable: streaming engine with per-token expert gather, Q4 layer sidecar pack, incremental-KV server reuse and disk-KV checkpoint. Measured ~0.33 tok/s decode on the IQ2_XXS at 16 GB (see `architectures/glm-5.2/`). |
+| GLM 5.2 (`glm-dsa`) | yes | yes | yes, streaming engine | yes (chat, demo, server, benchmark, auto-tune) | no | End-to-end runnable: streaming engine with per-token expert gather, Q4 layer sidecar pack, incremental-KV server reuse and a prefix-keyed disk-KV store with token budget and eviction. Measured ~0.33 tok/s decode on the IQ2_XXS at 16 GB (see `architectures/glm-5.2/`). |
 | Qwen | yes | no | no | no, explicit rejection | no | Structure is in place; decoder and templates are not yet implemented. |
 | Unknown | yes | no | no | no, explicit rejection | no | The GGUF identifier is reported without attempting a DeepSeek load. |
 

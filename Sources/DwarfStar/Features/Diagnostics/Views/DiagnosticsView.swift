@@ -8,12 +8,12 @@ struct DiagnosticsView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section("Tokenization (native, DS4Core.Tokenizer)") {
+                Section("Tokenization (native, backend tokenizer)") {
                     LabeledContent("Model (from Settings)",
                                    value: (controller.modelPath as NSString).lastPathComponent)
                     TextField("Text", text: $controller.text, axis: .vertical)
                         .lineLimit(2...6)
-                    Text("Opens the GGUF only for the tokenizer (pure Swift, no subprocess). Choose the model in Settings.")
+                    Text("Opens the GGUF only for the tokenizer (pure Swift, no subprocess), selected by the model's architecture — DeepSeek or GLM. Choose the model in Settings.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {

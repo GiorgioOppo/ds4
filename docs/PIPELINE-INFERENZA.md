@@ -94,6 +94,30 @@ number of synchronizations. The prefill is not a decode repeated in a loop: it
 uses dedicated structures under
 `DS4Metal/Backends/DeepSeekV4/Decode/Prefill`.
 
+With `DS4_PREFILL_BATCH_ATTN` (default on) the route/attention stage runs ONE
+multi-query FlashAttention per route-batch run — the C engine's prefill kernel
+(8 query rows per threadgroup, simdgroup MMA) over the union KV span, with a
+per-query mask reproducing exactly the per-token visibility (causal + SWA
+window + compressed rows emitted up to each token) — instead of one
+single-query vec dispatch per token. Same math over the same visible keys;
+only the accumulation order differs, so outputs are close but not
+bit-identical to the per-token path (`=0` restores it for A/B parity). Runs
+that would overflow the `DS4_RAW_RING` raw cache fall back automatically.
+
+On top of that, `DS4_PREFILL_DENSE_MM` (default on) turns EVERY dense
+projection of the batched run — q_a, q_b, kv, the grouped low-rank attention
+output, output_b, the router — plus both HyperConnection reduces into
+matrix-matrix kernels over the whole run: dense weights are read once per
+route batch instead of once per token, which is the C engine's layer-major
+prefill shape. Per-token work shrinks to the recurrent NSA compressor state
+update, the fp8 KV row store and the router top-6 finalize (the compressor
+kv/score projections are batched too). Each projection dispatches on its
+RESIDENT quant — Q8_0/F16 by default, Q4_K (`kernel_mul_mm_q4_K_f32`) when
+`DS4_DENSE_Q4`/`DS4_QKV_Q4` requantized it — so the batched prefill stays
+active in the decode-oriented resident-Q4 profile. `=0` restores the
+per-token dense projections for A/B. The profile counters
+`prefillFlashRuns`/`prefillDenseRuns` report how many runs took each path.
+
 ## 4. Decoding one token
 
 For each token the decoder runs all layers in order:

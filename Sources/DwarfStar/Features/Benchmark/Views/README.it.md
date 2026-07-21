@@ -16,6 +16,13 @@ grafico cumulativo mostra l'accuratezza aggregata progressiva, mentre il
 grafico per brano tiene i campioni separati così la variabilità legata alla
 posizione nel corpus resta visibile.
 
+`ChartExport.swift` salva un grafico come PNG autodescrittivo (titolo,
+modello, parametri, data) tramite `ImageRenderer` a dimensione fissa e
+aspetto chiaro, oppure i suoi dati come CSV, attraverso l'`NSSavePanel`
+compatibile con la sandbox. Ogni sezione grafico espone pulsanti PNG/CSV; gli
+errori di export finiscono nel log del benchmark. I valori CSV mantengono le
+unità grezze dell'engine (frazioni di accuratezza in `0...1`).
+
 Gli indici dei brani nei risultati e nelle osservazioni dell'engine partono da
 zero. Le etichette mostrate alle persone usano `index + 1`; non reimmettere
 quel valore di visualizzazione nella ricerca dei risultati o nell'identità del

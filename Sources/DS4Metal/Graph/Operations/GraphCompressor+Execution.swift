@@ -75,8 +75,23 @@ extension GraphContext {
             try matmulF16(weight: kv, x: x, out: comp.kvCur, inDim: x.count, outDim: width)
             try matmulF16(weight: gate, x: x, out: comp.scCur, inDim: x.count, outDim: width)
         }
+        return try runCompressorTail(kvCur: comp.kvCur, scCur: comp.scCur, ape: ape, normW: normW,
+                                     comp: comp, rope: rope, pos: pos, rmsEps: rmsEps,
+                                     nRot: nRot, finalize: finalize)
+    }
+
+    /// The recurrent half of the compressor step — state store (+APE) and the
+    /// possible comp-row emit — with the kv/score projections provided by the
+    /// caller. The per-token path passes comp.kvCur/scCur (computed just
+    /// above); the batched prefill precomputes the projections for the WHOLE
+    /// run as two GEMMs and passes each token's row view. Dispatches and order
+    /// are identical to the historical body.
+    func runCompressorTail(kvCur: GPUTensor, scCur: GPUTensor, ape: GPUTensor, normW: GPUTensor,
+                           comp: CompressorState, rope: RopeParams, pos: Int, rmsEps: Float,
+                           nRot: Int, finalize: CompressorFinalize) throws -> Int {
+        let h = comp.headDim, ratio = comp.ratio, width = comp.width
         // 2) store into recurrent state (+ APE, F16 -> ape_type 1).
-        try compressorStoreOneEnc(kvCur: comp.kvCur, scCur: comp.scCur, ape: ape, apeType: 1,
+        try compressorStoreOneEnc(kvCur: kvCur, scCur: scCur, ape: ape, apeType: 1,
                                   stateKv: comp.stateKv, stateScore: comp.stateScore, width: width, ratio: ratio, pos: pos)
         let emit = ((pos + 1) % ratio) == 0
         if !emit { return comp.count }

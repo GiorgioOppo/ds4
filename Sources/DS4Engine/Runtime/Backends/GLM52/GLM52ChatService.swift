@@ -14,8 +14,9 @@ import Foundation
 /// prefilled when it extends what the engine already holds — otherwise a
 /// context reset and a full layer-major batched prefill), the reasoning
 /// stream (`<think>` split on special-token IDs) and native XML tool calls
-/// with observation turns. Not mirrored (by design): decode profiles,
-/// DeepSeek disk-KV budget, sub-agents, distributed execution; top-P/min-P
+/// with observation turns, and the disk-KV store (prefix-keyed checkpoints
+/// with token budget and eviction, `GLM52DiskKVStore`). Not mirrored (by
+/// design): decode profiles, sub-agents, distributed execution; top-P/min-P
 /// and the seeded RNG are DeepSeek-sampler-only for now.
 public actor GLM52ChatService {
     public let service: GLM52InferenceService
@@ -32,31 +33,38 @@ public actor GLM52ChatService {
     /// di due passi nello stesso streamer.
     private var lastEnginePass: Task<Void, Never>?
 
-    /// Disk-KV checkpoint file (nil = disabled): per-model scoped like the
-    /// DeepSeek store, one live checkpoint holding the LAST conversation's
-    /// caches — reopening a chat restores the longest matching prefix
-    /// instead of re-prefilling from zero.
-    private let checkpointURL: URL?
+    /// Disk-KV store (nil = disabled): per-model scoped directory of
+    /// prefix-keyed checkpoints with token budget and eviction, like the
+    /// DeepSeek `DiskKVStore` — reopening ANY recent chat restores its
+    /// longest stored prefix instead of re-prefilling from zero.
+    private let kvStore: GLM52DiskKVStore?
 
     /// `residentLayers`/`activeExperts` are the GUI settings (nil = env,
-    /// then RAM-adaptive / full top-8).
+    /// then RAM-adaptive / full top-8). `diskKVBudgetTokens` caps the
+    /// checkpoint store (0 = byte safety cap only).
     public init(modelPath: String,
                 contextSize: Int,
                 systemPrompt: String?,
                 residentLayers: Int? = nil,
                 activeExperts: Int? = nil,
-                diskKVDirectory: String? = nil) throws {
+                diskKVDirectory: String? = nil,
+                diskKVBudgetTokens: Int = 0) throws {
         if let diskKVDirectory {
             let file = (modelPath as NSString).lastPathComponent
             let attributes = try? FileManager.default
                 .attributesOfItem(atPath: modelPath)
             let size = (attributes?[.size] as? UInt64) ?? 0
-            checkpointURL = URL(fileURLWithPath: diskKVDirectory)
-                .appendingPathComponent("\(file)-\(size)",
-                                        isDirectory: true)
-                .appendingPathComponent("state.glmkv")
+            let scoped = URL(fileURLWithPath: diskKVDirectory)
+                .appendingPathComponent("\(file)-\(size)", isDirectory: true)
+            let store = try? GLM52DiskKVStore(
+                directory: scoped, budgetTokens: diskKVBudgetTokens)
+            // Pre-store upgrade: the old single live checkpoint becomes a
+            // regular entry, so the caches it holds survive the migration.
+            store?.adoptLegacyCheckpoint(at: scoped.appendingPathComponent(
+                GLM52DiskKVStore.legacyFileName))
+            kvStore = store
         } else {
-            checkpointURL = nil
+            kvStore = nil
         }
         let environment = ProcessInfo.processInfo.environment
         var options = GLM52ResidentModelOptions()
@@ -136,10 +144,19 @@ public actor GLM52ChatService {
     }
 
     public struct BenchmarkNumbers: Sendable {
+        public let contextTokens: Int
         public let prefillTps: Double
         public let genTps: Double
+        /// p99 of the per-token decode speed — the reached steady state,
+        /// insensitive to the cold first token (same metric DeepSeek charts).
+        public let genTpsP99: Double
+        public let kvBytes: UInt64
         public let report: String
     }
+
+    /// KV bytes per cached token (compact MLA rows + indexer keys), the same
+    /// constant `modelInfo` reports.
+    private static let kvBytesPerToken: UInt64 = 95_232
 
     /// Synthetic MEASUREMENT benchmark — the DeepSeek analog sweeps prefill
     /// knobs, but GLM v1 has none worth tuning in place, so this reports
@@ -153,17 +170,22 @@ public actor GLM52ChatService {
         let prior = lastEnginePass
         let pass = Task.detached(priority: .userInitiated) {
             await prior?.value
-            return try await Self.benchmarkPass(
+            return try Self.benchmarkPass(
                 service: service, limit: limit, genTokens: genTokens)
         }
         lastEnginePass = Task { _ = try? await pass.value }
-        return try await pass.value
+        // Stop del pannello → cancel del task staccato: i loop del pass
+        // controllano la cancellazione tra un token e l'altro.
+        return try await withTaskCancellationHandler {
+            try await pass.value
+        } onCancel: {
+            pass.cancel()
+        }
     }
 
     private static func benchmarkPass(service: GLM52InferenceService,
                                       limit: Int, genTokens: Int)
-        async throws -> BenchmarkNumbers {
-        return try await Task.detached(priority: .userInitiated) {
+        throws -> BenchmarkNumbers {
             var tokens = service.tokenizer.tokenizeRenderedChat(
                 "benchmark sintetico DwarfStar — misura di prefill e decode ")
             if tokens.isEmpty { tokens = [1] }
@@ -183,11 +205,17 @@ public actor GLM52ChatService {
             service.engine.resetStreamingStats()
             let decodeStart = Date()
             var produced = 0
+            var tokenSpeeds: [Double] = []
+            tokenSpeeds.reserveCapacity(genTokens)
             for _ in 0..<genTokens {
+                try Task.checkCancellation()
                 guard let token = GLM52GreedyDecoding.argmax(logits) else {
                     break
                 }
+                let tokenStart = Date()
                 logits = try service.engine.forwardNext(token)
+                let tokenSeconds = Date().timeIntervalSince(tokenStart)
+                if tokenSeconds > 0 { tokenSpeeds.append(1.0 / tokenSeconds) }
                 produced += 1
             }
             let decodeSeconds = max(
@@ -196,12 +224,195 @@ public actor GLM52ChatService {
                 title: "Profilo decode")
                 + "\n" + service.engine.streamingReport()
             service.engine.resetContext()
+            var p99 = 0.0
+            if !tokenSpeeds.isEmpty {
+                let sorted = tokenSpeeds.sorted()
+                p99 = sorted[min(sorted.count - 1,
+                                 Int(Double(sorted.count - 1) * 0.99))]
+            }
             return BenchmarkNumbers(
+                contextTokens: tokens.count,
                 prefillTps: Double(tokens.count) / prefillSeconds,
                 genTps: Double(produced) / decodeSeconds,
+                genTpsP99: p99,
+                kvBytes: Self.kvBytesPerToken * UInt64(tokens.count),
                 report: "prefill: " + prefillReport
                     + "\ndecode: " + decodeReport)
-        }.value
+    }
+
+    /// Teacher-forced Top-1/2/3 next-token accuracy — the GLM counterpart of
+    /// the DeepSeek `accuracyBenchmark`, sharing its pure sampling plan,
+    /// accumulator and result types so the Benchmark panel renders both
+    /// backends identically. Each sampled piece runs an independent
+    /// layer-major `forwardBatch` (weights read once per piece), which
+    /// returns the logits of EVERY position: scoring happens at prefill
+    /// speed, not at the much slower per-token decode speed.
+    public func accuracyBenchmark(
+        text: String,
+        minContextTokens: Int,
+        maxContextTokens: Int,
+        maxTokensPerPiece: Int,
+        pieceCount: Int,
+        seed: UInt64,
+        bucketSize: Int,
+        onObservation: @escaping @Sendable (InferenceService.AccuracyObservation) -> Void = { _ in }
+    ) async throws -> InferenceService.AccuracyResult {
+        let service = self.service
+        let contextSize = self.contextSize
+        primedTokens = []
+        let prior = lastEnginePass
+        let pass = Task.detached(priority: .userInitiated) {
+            await prior?.value
+            return try Self.accuracyPass(
+                service: service, contextSize: contextSize, text: text,
+                minContextTokens: minContextTokens,
+                maxContextTokens: maxContextTokens,
+                maxTokensPerPiece: maxTokensPerPiece,
+                pieceCount: pieceCount, seed: seed, bucketSize: bucketSize,
+                onObservation: onObservation)
+        }
+        lastEnginePass = Task { _ = try? await pass.value }
+        return try await withTaskCancellationHandler {
+            try await pass.value
+        } onCancel: {
+            pass.cancel()
+        }
+    }
+
+    private static func accuracyPass(
+        service: GLM52InferenceService,
+        contextSize: Int,
+        text: String,
+        minContextTokens: Int,
+        maxContextTokens: Int,
+        maxTokensPerPiece: Int,
+        pieceCount: Int,
+        seed: UInt64,
+        bucketSize: Int,
+        onObservation: @Sendable (InferenceService.AccuracyObservation) -> Void
+    ) throws -> InferenceService.AccuracyResult {
+        // Plain-text tokenization: the corpus is data, not chat markup.
+        let source = service.tokenizer.tokenize(text).map(Int.init)
+        guard source.count >= 2 else {
+            throw InferenceService.AccuracyBenchmarkError
+                .insufficientTokens(actual: source.count)
+        }
+        guard contextSize >= 4 else {
+            throw InferenceService.AccuracyBenchmarkError
+                .contextTooSmall(actual: contextSize)
+        }
+        // Every GLM prompt starts with `[gMASK]<sop>`; the evaluation feeds
+        // the same two-token prefix so scored positions see the trained
+        // distribution. The plan reserves one leading token itself (the
+        // DeepSeek BOS), so only the second prefix token is subtracted here.
+        let prefix: [Int32] = [service.tokenizer.special.mask,
+                               service.tokenizer.special.startOfPrompt]
+        let plan = InferenceService.makeAccuracySamplingPlan(
+            sourceTokenCount: source.count,
+            contextSize: contextSize - (prefix.count - 1),
+            minContextTokens: minContextTokens,
+            maxContextTokens: maxContextTokens,
+            maxTokensPerPiece: maxTokensPerPiece,
+            pieceCount: pieceCount,
+            seed: seed
+        )
+        try Task.checkCancellation()
+
+        var accumulator = InferenceService.AccuracyAccumulator(bucketSize: bucketSize)
+        var pieceResults: [InferenceService.AccuracyPieceResult] = []
+        pieceResults.reserveCapacity(plan.pieces.count)
+        // Cache coerenti anche su errore/cancellazione a metà piece.
+        defer { service.engine.resetContext() }
+        let started = Date()
+
+        for piece in plan.pieces {
+            try Task.checkCancellation()
+            let beforeEvaluated = accumulator.evaluatedTokens
+            let beforeTop1 = accumulator.top1CorrectTokens
+            let beforeTop2 = accumulator.top2CorrectTokens
+            let beforeTop3 = accumulator.top3CorrectTokens
+
+            let sourceInputEnd = piece.targetStartTokenIndex
+                + piece.evaluatedTokens - 1
+            var inputs = prefix
+            inputs.append(contentsOf: source[
+                piece.sourceStartTokenIndex..<sourceInputEnd
+            ].map(Int32.init))
+            service.engine.resetContext()
+            let rows = try service.engine.forwardBatch(inputs)
+            // rows[j] is the distribution after inputs[0...j]: the prediction
+            // for source index targetStart+k sits at row
+            // prefix.count + contextTokens + k - 1 (see the DeepSeek
+            // position derivation; here BOS is the two-token prefix).
+            let base = prefix.count + piece.contextTokens - 1
+            for k in 0..<piece.evaluatedTokens {
+                try Task.checkCancellation()
+                let sourceIndex = piece.targetStartTokenIndex + k
+                let candidates = topCandidates(rows[base + k], count: 3)
+                let observation = accumulator.append(
+                    sourceTokenIndex: sourceIndex,
+                    expectedTokenId: source[sourceIndex],
+                    predictedTokenIds: candidates,
+                    pieceIndex: piece.index
+                )
+                onObservation(observation)
+            }
+
+            let evaluated = accumulator.evaluatedTokens - beforeEvaluated
+            let top1Correct = accumulator.top1CorrectTokens - beforeTop1
+            let top2Correct = accumulator.top2CorrectTokens - beforeTop2
+            let top3Correct = accumulator.top3CorrectTokens - beforeTop3
+            let denominator = Double(max(1, evaluated))
+            pieceResults.append(InferenceService.AccuracyPieceResult(
+                index: piece.index,
+                sourceStartTokenIndex: piece.sourceStartTokenIndex,
+                targetStartTokenIndex: piece.targetStartTokenIndex,
+                contextTokens: piece.contextTokens,
+                evaluatedTokens: evaluated,
+                top1CorrectTokens: top1Correct,
+                top2CorrectTokens: top2Correct,
+                top3CorrectTokens: top3Correct,
+                top1Accuracy: evaluated > 0 ? Double(top1Correct) / denominator : 0,
+                top2Accuracy: evaluated > 0 ? Double(top2Correct) / denominator : 0,
+                top3Accuracy: evaluated > 0 ? Double(top3Correct) / denominator : 0,
+                truncated: piece.truncated || evaluated < piece.evaluatedTokens
+            ))
+        }
+
+        let duration = Date().timeIntervalSince(started)
+        return accumulator.result(
+            originalTokens: source.count,
+            contextTokens: plan.effectiveMaxContextTokens,
+            duration: duration,
+            truncated: plan.truncated,
+            pieces: pieceResults,
+            requestedPieceCount: plan.requestedPieceCount,
+            seed: plan.seed,
+            effectiveMinContextTokens: plan.effectiveMinContextTokens,
+            effectiveMaxContextTokens: plan.effectiveMaxContextTokens
+        )
+    }
+
+    /// Top-`count` token ids by logit, one partial-selection pass over the
+    /// vocabulary. Strict `>` keeps the LOWEST id on ties — the same rule as
+    /// the greedy argmax kernels. Internal for the unit test.
+    static func topCandidates(_ logits: [Float], count: Int) -> [Int] {
+        var best: [(id: Int, value: Float)] = []
+        best.reserveCapacity(count)
+        for (id, value) in logits.enumerated() {
+            if best.count < count {
+                best.append((id, value))
+                best.sort { $0.value > $1.value }
+            } else if value > best[count - 1].value {
+                best[count - 1] = (id, value)
+                var i = count - 1
+                while i > 0 && best[i].value > best[i - 1].value {
+                    best.swapAt(i, i - 1)
+                    i -= 1
+                }
+            }
+        }
+        return best.map(\.id)
     }
 
     public func setAgent(systemPrompt: String?) {
@@ -390,7 +601,7 @@ public actor GLM52ChatService {
         let contextSize = self.contextSize
         let primed = self.primedTokens
         let declaredTools = self.tools
-        let checkpoint = self.checkpointURL
+        let kvStore = self.kvStore
         let (stream, continuation) =
             AsyncThrowingStream<GenEvent, Error>.makeStream()
         let prior = lastEnginePass
@@ -459,21 +670,24 @@ public actor GLM52ChatService {
                             + "(+\(common) in cache)"))
                     } else {
                         service.engine.resetContext()
-                        // Disk KV: il checkpoint dell'ultima conversazione
-                        // viene ripristinato quando è un PREFISSO stretto
-                        // della nuova — si prefilla solo il resto.
+                        // Disk KV: lo store cerca tra TUTTI i checkpoint il
+                        // prefisso stretto più lungo della nuova
+                        // conversazione — si prefilla solo il resto.
                         var restored = 0
-                        if let checkpoint,
-                           let saved = service.engine.peekKVCheckpoint(
-                               at: checkpoint),
-                           saved.count >= 32, saved.count < tokens.count,
-                           Array(tokens.prefix(saved.count)) == saved,
-                           (try? service.engine.restoreKVCheckpoint(
-                               from: checkpoint)) != nil {
-                            restored = saved.count
-                            continuation.yield(.progress(
-                                "KV da disco: \(restored) token "
-                                + "ripristinati"))
+                        if let kvStore,
+                           let hit = kvStore.findLongestPrefix(of: tokens) {
+                            if (try? service.engine.restoreKVCheckpoint(
+                                    from: hit.url)) != nil {
+                                restored = hit.tokens.count
+                                kvStore.bumpHit(hit.name)
+                                continuation.yield(.progress(
+                                    "KV da disco: \(restored) token "
+                                    + "ripristinati"))
+                            } else {
+                                // Un restore parziale lascia righe appese:
+                                // torna a zero righe prima del prefill.
+                                service.engine.resetContext()
+                            }
                         }
                         suffix = Array(tokens[restored...])
                         continuation.yield(.progress(
@@ -561,14 +775,24 @@ public actor GLM52ChatService {
                                               assistant: parsed.visibleText,
                                               calls: parsed.calls)
                     // Checkpoint disk-KV a fine generazione (best-effort,
-                    // ~96 KB/token): la prossima riapertura riparte da qui.
-                    if let checkpoint, fed.count >= 64 {
-                        try? service.engine.saveKVCheckpoint(
-                            to: checkpoint, tokens: fed)
+                    // ~96 KB/token): dedup sui token esatti e intervallo
+                    // minimo dall'ultimo prefisso salvato; lo store evicta
+                    // sotto budget prima di pubblicare.
+                    if let kvStore, kvStore.shouldStore(tokens: fed) {
+                        kvStore.store(tokens: fed) { url in
+                            try service.engine.saveKVCheckpoint(
+                                to: url, tokens: fed)
+                        }
                     }
                     service.engine.saveUsageProfile()
                     continuation.finish()
                 } catch {
+                    // Un prefill abortito (Stop, disconnessione, errore
+                    // Metal) lascia righe parziali e prefetch dello
+                    // streamer non consumati: il reset drena e azzera —
+                    // il prossimo turno ricostruisce da disk-KV/zero via
+                    // mismatch di posizione.
+                    service.engine.resetContext()
                     continuation.finish(throwing: error)
                 }
         }

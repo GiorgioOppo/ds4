@@ -93,6 +93,32 @@ numero di sincronizzazioni. Il prefill non è un decode ripetuto in un ciclo:
 usa strutture dedicate sotto
 `DS4Metal/Backends/DeepSeekV4/Decode/Prefill`.
 
+Con `DS4_PREFILL_BATCH_ATTN` (default attivo) la fase route/attention esegue
+UNA FlashAttention multi-query per run di route-batch — il kernel di prefill
+del motore C (8 righe di query per threadgroup, MMA simdgroup) sull'unione
+dello span KV, con una maschera per-query che riproduce esattamente la
+visibilità per-token (causale + finestra SWA + righe compresse emesse fino a
+ciascun token) — invece di un dispatch vec a query singola per token. Stessa
+matematica sulle stesse chiavi visibili; cambia solo l'ordine di accumulo,
+quindi gli output sono vicini ma non bit-identici al percorso per-token (`=0`
+lo ripristina per parità A/B). I run che sforerebbero la cache raw
+`DS4_RAW_RING` ricadono automaticamente sul percorso per-token.
+
+In aggiunta, `DS4_PREFILL_DENSE_MM` (default attivo) trasforma OGNI proiezione
+densa del run batchato — q_a, q_b, kv, l'output low-rank a gruppi, output_b,
+il router — più le due riduzioni HyperConnection in kernel matrice-matrice
+sull'intero run: i pesi densi si leggono una volta per route-batch invece che
+una volta per token, cioè la forma layer-major del prefill del motore C. Il
+lavoro per-token si riduce all'aggiornamento di stato del compressore NSA,
+allo store fp8 della riga KV e alla finalize top-6 del router (anche le
+proiezioni kv/score del compressore sono batchate). Ogni proiezione dispatcha
+sul quant RESIDENTE — Q8_0/F16 di default, Q4_K (`kernel_mul_mm_q4_K_f32`)
+quando `DS4_DENSE_Q4`/`DS4_QKV_Q4` l'ha riquantizzata — quindi il prefill
+batchato resta attivo anche nel profilo residente-Q4 orientato al decode.
+`=0` ripristina il denso per-token per A/B. I contatori di profilo
+`prefillFlashRuns`/`prefillDenseRuns` riportano quanti run hanno preso ciascun
+percorso.
+
 ## 4. Decode di un token
 
 Per ogni token il decoder esegue tutti i layer in ordine:

@@ -128,6 +128,13 @@ public final class GraphContext {
 
     public init(_ rt: MetalRuntime) { self.rt = rt }
 
+    /// An error thrown between begin() and commit() unwinds with the encoder
+    /// still open; releasing it that way is a hard Metal assertion that MASKS
+    /// the original Swift error. Ending the encoding here turns that crash
+    /// into a normally reportable failure (the un-committed buffer is simply
+    /// dropped).
+    deinit { enc?.endEncoding() }
+
     public func begin() throws {
         guard let c = rt.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder() else {
             throw MetalError.bufferAlloc

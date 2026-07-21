@@ -88,11 +88,13 @@ class BackendSettingsUI {
             extras: benchmarkExtras()))
     }
 
-    /// Righe Disk KV condivise: il toggle è comune, il budget e la semantica
-    /// no (DeepSeek: store con budget in token e riuso prefissi tra sessioni;
-    /// GLM: un checkpoint per modello dell'ultima conversazione).
-    func diskKVRows(showBudget: Bool, note: String?) -> AnyView {
-        AnyView(DiskKVRows(store: store, showBudget: showBudget, note: note))
+    /// Righe Disk KV condivise: toggle e budget in token sono comuni a
+    /// entrambi gli store (riuso prefissi tra sessioni con eviction);
+    /// cambia solo il costo per token, da cui la stima in GB.
+    func diskKVRows(showBudget: Bool, gbPerKTok: Double = 0.022,
+                    note: String?) -> AnyView {
+        AnyView(DiskKVRows(store: store, showBudget: showBudget,
+                           gbPerKTok: gbPerKTok, note: note))
     }
 }
 
@@ -152,13 +154,14 @@ private struct BackendBenchmarkSection: View {
 private struct DiskKVRows: View {
     @Bindable var store: ChatStore
     let showBudget: Bool
+    let gbPerKTok: Double
     let note: String?
 
     var body: some View {
         Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
         if store.diskKVEnabled {
             if showBudget {
-                Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * 0.022)) GB)",
+                Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * gbPerKTok)) GB)",
                         value: $store.diskKVBudgetKTok, in: 128...4096, step: 128)
             }
             if let note {

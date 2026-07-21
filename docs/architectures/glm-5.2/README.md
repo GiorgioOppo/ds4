@@ -6,7 +6,12 @@ This folder describes the native port of GLM 5.2 (`glm-dsa`) in DwarfStar.
 The port is **operational end to end**: the streaming engine
 (`GLM52ResidentModel`) runs prefill and decode from the real GGUF on a
 16 GB machine, and GUI, demo, local server, benchmark, auto-tune and disk-KV
-checkpoints all select GLM natively. Only distribution remains DeepSeek-only.
+checkpoints all select GLM natively. The Benchmark panel runs both Speed
+(throughput sweep, p99 decode) and Correctness (teacher-forced Top-1/2/3 on
+layer-major `forwardBatch`, shared sampling plan and result types with
+DeepSeek), and the Diagnostics panel tokenizes and dumps the chat/tool
+template with the GLM tokenizer and renderer. Only distribution remains
+DeepSeek-only.
 
 ## Current state
 
@@ -19,7 +24,7 @@ checkpoints all select GLM natively. Only distribution remains DeepSeek-only.
 | GUI and `DS4Demo` selection | **yes** (chat, settings per-backend, tuning) |
 | Local server (stateless OpenAI/Anthropic semantics) | **yes**, with incremental-KV prefix reuse |
 | Benchmark and auto-tune | **yes** (GUI button and `DS4_GLM_AUTOTUNE=1`) |
-| Disk-KV checkpoint | yes, single `state.glmkv` per model (longest-prefix restore) |
+| Disk-KV checkpoint | yes, prefix-keyed store like DeepSeek (`GLM52DiskKVStore`): multiple conversations side by side, longest-prefix restore, token budget with eviction, legacy `state.glmkv` auto-adopted |
 | Per-phase profiling | yes — DeepSeek-style report plus GPU/host split |
 | Distribution | no (DeepSeek-only) |
 
@@ -38,6 +43,13 @@ defaults, each with a measured verdict:
   loads (−19% GPU);
 - **batched MoE** (`DS4_GLM_MOE_BATCH`): every routed expert in two
   dispatches; the shared expert (always active) stays separate;
+- **multi-token prefill phase B** (`DS4_GLM_PREFILL_MOE`, after the ds4
+  fused-GEMM technique): the token loop lives inside the kernels, so each
+  staged expert's weights cross DRAM once per 4-token tile instead of once
+  per token, and one wave is 3 dispatches instead of 3 per application —
+  bit-exact vs the per-application path (pinned by tests; the end-to-end
+  prefill gain still needs a measurement run, baseline "experts" phase
+  253 ms/token);
 - **fused GPU router** (`DS4_GLM_GPU_ROUTER`): matvec + sigmoid + top-8 in
   the trunk commit, 64-byte readback (−18% prefill);
 - **device argmax** for greedy decode (4-byte readback), **paired qA+kvA

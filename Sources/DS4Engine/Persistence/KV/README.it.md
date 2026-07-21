@@ -14,6 +14,10 @@ prefill completo.
 - `+Store`: snapshot, scrittura atomica e manutenzione budget.
 - `+Streaming`: import/export un layer alla volta.
 - `+Serialization`: primitive del corpo binario.
+- `GLM52DiskKVStore.swift`: la controparte GLM sui file `GKV1` nativi del
+  motore — stesso lookup per prefisso, budget in token ed eviction con
+  `KVCFile.evictionScore`, con hit/lastUsed in un `index.json` a lato così
+  il formato wire del motore resta intatto.
 
 Il layout è documentato in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.it.md).
 

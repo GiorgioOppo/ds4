@@ -62,6 +62,27 @@ public final class StreamingDecoder {
         let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
         return max(1, v)
     }
+    /// DS4_PREFILL_BATCH_ATTN (default ON): the batched prefill route phase
+    /// runs ONE multi-query FlashAttention (the C prefill's nqptg=8 MMA
+    /// kernel) per run of route-batch tokens, instead of one single-query vec
+    /// dispatch per token. Visibility is identical to the per-token path
+    /// (causal + SWA window + per-token comp rows, enforced by a per-query
+    /// mask); only the accumulation order differs (simdgroup MMA blocks), so
+    /// outputs are close but not bit-identical. `=0` restores the per-token
+    /// attention for A/B parity. Runs that would overflow the raw ring
+    /// (DS4_RAW_RING) fall back automatically.
+    let prefillBatchAttn = ProcessInfo.processInfo.environment["DS4_PREFILL_BATCH_ATTN"] != "0"
+    /// DS4_PREFILL_DENSE_MM (default ON, requires the batched-attention path):
+    /// inside a batched route run, EVERY dense projection (q_a, q_b, kv, the
+    /// grouped low-rank output, output_b, router) and both HC reduces run as
+    /// matrix-matrix kernels over the whole run — weights read once per run
+    /// instead of once per token (the C engine's layer-major prefill shape).
+    /// Per-token work shrinks to the recurrent compressor, the KV row store
+    /// and the router finalize. Same math, MMA accumulation order — outputs
+    /// close but not bit-identical; `=0` restores per-token dense projections
+    /// for A/B. Layers with Q4-requantized dense weights (DS4_DENSE_Q4 /
+    /// DS4_QKV_Q4) fall back automatically.
+    let prefillDenseMM = ProcessInfo.processInfo.environment["DS4_PREFILL_DENSE_MM"] != "0"
     /// DS4_PREFILL_MM=1 (OPT-IN): the group's routed FFN runs through the
     /// mul_mm_id matrix-matrix kernels (expert weights read once per tile for
     /// ALL the group's tokens) instead of one matvec chain per token. Same

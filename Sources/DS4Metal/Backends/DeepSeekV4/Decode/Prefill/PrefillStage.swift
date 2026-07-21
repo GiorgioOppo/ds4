@@ -33,6 +33,84 @@ extension StreamingDecoder {
             let ones: GPUTensor      // n × f32 = 1 (unit route weights for the rows-swiglu)
         }
         let mm: MMBuffers?
+        /// Buffers for the batched multi-query prefill attention
+        /// (DS4_PREFILL_BATCH_ATTN): ONE FlashAttention dispatch per run of
+        /// route-batch tokens instead of one vec dispatch per token. Sized once
+        /// per chunk for the route-batch capacity and the chunk-end KV span.
+        struct FlashBatch {
+            let nq: Int          // run capacity (route batch)
+            let maxKv: Int       // raw-span + comp capacity, pad margin included
+            let qMat: GPUTensor  // nq × nHead·512 f32 (row-major query rows)
+            let heads: GPUTensor // nq × nHead·512 f32 (attention output rows)
+            let mask: GPUTensor  // nq × maxKv f16 (CPU-filled per run)
+            let kvF16: GPUTensor // maxKv × 512 f16 (staged raw span + comp rows)
+            let pad: GPUTensor   // final partial 64-block K/V/mask padding
+            let blk: GPUTensor   // mask block map (skip fully-masked tiles)
+            let splitA: GPUTensor    // nq × 24 f32 slab (attention HC split)
+            let split: [GPUTensor]   // row views into splitA (per-token use)
+            /// Dense-GEMM staging (DS4_PREFILL_DENSE_MM): token-major activation
+            /// matrices so every dense projection of the route reads its weights
+            /// ONCE per run instead of once per token.
+            let hcMat: GPUTensor      // nq × nHC·nEmbd (packed input HC states)
+            let flatMat: GPUTensor    // nq × nHC·nEmbd (HC rms-norm scratch)
+            let mixMat: GPUTensor     // nq × 24 (HC mixer output)
+            let embdMat: GPUTensor    // nq × nEmbd (HC collapse scratch)
+            let curMat: GPUTensor     // nq × nEmbd (attn-normed rows)
+            let qrMat: GPUTensor      // nq × qRank
+            let qrNormMat: GPUTensor  // nq × qRank
+            let kvMat: GPUTensor      // nq × headDim (latent rows pre-store)
+            let lowMat: GPUTensor     // nq × attnLowDim (grouped low-rank out)
+            let blockOutMat: GPUTensor // nq × nEmbd (output projection)
+            let afterAttnMat: GPUTensor // nq × nHC·nEmbd (post-attn residual)
+            let splitF: GPUTensor     // nq × 24 slab (pre-FFN HC split)
+            let curMat2: GPUTensor    // nq × nEmbd (FFN input rows)
+            let logitsMat: GPUTensor  // nq × nExperts (router logits)
+            /// Batched NSA compressor projections: kv/score rows for the whole
+            /// run (attention compressor: width ≤ 2·headDim; indexer
+            /// compressor: width = 2·nIndexerHeadDim). The recurrent state
+            /// update reads each token's row.
+            let compKvMat: GPUTensor  // nq × 2·headDim
+            let compScMat: GPUTensor  // nq × 2·headDim
+            let idxKvMat: GPUTensor   // nq × 2·nIndexerHeadDim
+            let idxScMat: GPUTensor   // nq × 2·nIndexerHeadDim
+
+            init(_ rt: MetalRuntime, nq: Int, maxKv: Int, d: DSV4Dims) throws {
+                let sb = GraphContext.flashPrefillScratchBytes(nHead: d.nHead, nQ: nq, maxKv: maxKv)
+                self.nq = nq
+                self.maxKv = maxKv
+                qMat = try .zerosBytes(rt, byteLength: sb.q)
+                heads = try .zerosBytes(rt, byteLength: sb.heads)
+                mask = try .zerosBytes(rt, byteLength: sb.mask)
+                kvF16 = try .zerosBytes(rt, byteLength: sb.kvF16)
+                pad = try .zerosBytes(rt, byteLength: sb.pad)
+                blk = try .zerosBytes(rt, byteLength: sb.blk)
+                let splitSlab = try GPUTensor.zeros(rt, floatCount: nq * 24)
+                splitA = splitSlab
+                split = (0..<nq).map {
+                    splitSlab.subview(byteOffset: $0 * 24 * 4, byteLength: 24 * 4, count: 24)
+                }
+                let hcDim = d.nHC * d.nEmbd
+                hcMat = try .zeros(rt, floatCount: nq * hcDim)
+                flatMat = try .zeros(rt, floatCount: nq * hcDim)
+                mixMat = try .zeros(rt, floatCount: nq * 24)
+                embdMat = try .zeros(rt, floatCount: nq * d.nEmbd)
+                curMat = try .zeros(rt, floatCount: nq * d.nEmbd)
+                qrMat = try .zeros(rt, floatCount: nq * d.qRank)
+                qrNormMat = try .zeros(rt, floatCount: nq * d.qRank)
+                kvMat = try .zeros(rt, floatCount: nq * d.headDim)
+                lowMat = try .zeros(rt, floatCount: nq * d.attnLowDim)
+                blockOutMat = try .zeros(rt, floatCount: nq * d.nEmbd)
+                afterAttnMat = try .zeros(rt, floatCount: nq * hcDim)
+                splitF = try .zeros(rt, floatCount: nq * 24)
+                curMat2 = try .zeros(rt, floatCount: nq * d.nEmbd)
+                logitsMat = try .zeros(rt, floatCount: nq * d.nExperts)
+                compKvMat = try .zeros(rt, floatCount: nq * 2 * d.headDim)
+                compScMat = try .zeros(rt, floatCount: nq * 2 * d.headDim)
+                idxKvMat = try .zeros(rt, floatCount: nq * 2 * d.nIndexerHeadDim)
+                idxScMat = try .zeros(rt, floatCount: nq * 2 * d.nIndexerHeadDim)
+            }
+        }
+        let flash: FlashBatch?
 
         /// Allocate one zeroed Metal slab and expose `n` fixed-size logical
         /// rows as GPUTensor views. Before this helper PrefillStage allocated
@@ -49,7 +127,11 @@ extension StreamingDecoder {
             }
         }
 
-        init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int) throws {
+        init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int,
+             flashBatch: (nq: Int, maxKv: Int)? = nil) throws {
+            flash = try flashBatch.flatMap { fb in
+                fb.nq >= 2 ? try FlashBatch(rt, nq: fb.nq, maxKv: fb.maxKv, d: d) : nil
+            }
             cur = try Self.rowViews(rt, n: n, rowBytes: d.nEmbd * 4,
                                     rowCount: d.nEmbd)
             attn = try Self.rowViews(rt, n: n, rowBytes: d.nHC * d.nEmbd * 4,

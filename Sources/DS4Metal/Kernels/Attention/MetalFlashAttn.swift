@@ -60,6 +60,103 @@ extension MetalRuntime {
         return b
     }
 
+    /// Batched (non-vector) prefill FlashAttention: nqptg query rows per
+    /// threadgroup through simdgroup MMA — the C prefill's
+    /// ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec pipeline.
+    func flashPrefillPipeline(nsg: Int32, hasSinks: Bool, hasKvpad: Bool,
+                              bcMask: Bool) throws -> MTLComputePipelineState {
+        let key = "flash_prefill_nsg=\(nsg)_sinks=\(hasSinks)_kvpad=\(hasKvpad)_bc=\(bcMask)"
+        if let p = mulMVPipelineCache[key] { return p }
+        let c = MTLFunctionConstantValues()
+        var hasMask = true, hs = hasSinks, hasBias = false, hasScap = false
+        var kvpad = hasKvpad, bc = bcMask
+        var ns10: Int32 = 512, ns20: Int32 = 512, nsgv = nsg
+        c.setConstantValue(&hasMask, type: .bool, index: 300)
+        c.setConstantValue(&hs, type: .bool, index: 301)
+        c.setConstantValue(&hasBias, type: .bool, index: 302)
+        c.setConstantValue(&hasScap, type: .bool, index: 303)
+        c.setConstantValue(&kvpad, type: .bool, index: 304)
+        c.setConstantValue(&bc, type: .bool, index: 310)
+        c.setConstantValue(&ns10, type: .int, index: 320)
+        c.setConstantValue(&ns20, type: .int, index: 321)
+        c.setConstantValue(&nsgv, type: .int, index: 322)
+        let fn = try library.makeFunction(name: "kernel_flash_attn_ext_f16_dk512_dv512", constantValues: c)
+        let pso = try device.makeComputePipelineState(function: fn)
+        mulMVPipelineCache[key] = pso
+        return pso
+    }
+
+    /// Mask block-scan for the batched kernel: marks 8x64 tiles as skip /
+    /// process / process-without-mask so fully-masked chunks cost nothing.
+    func flashBlkPipeline(nqptg: Int32, ncpsg: Int32) throws -> MTLComputePipelineState {
+        let key = "flash_blk_nqptg=\(nqptg)_ncpsg=\(ncpsg)"
+        if let p = mulMVPipelineCache[key] { return p }
+        let c = MTLFunctionConstantValues()
+        var q = nqptg, cc = ncpsg
+        c.setConstantValue(&q, type: .int, index: 224)
+        c.setConstantValue(&cc, type: .int, index: 225)
+        let fn = try library.makeFunction(name: "kernel_flash_attn_ext_blk", constantValues: c)
+        let pso = try device.makeComputePipelineState(function: fn)
+        mulMVPipelineCache[key] = pso
+        return pso
+    }
+
+    /// 48-byte ds4_metal_args_flash_attn_ext_blk (single plane, per-query mask rows).
+    static func flashBlkArgs(nQ: Int, nKv: Int) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: 48)
+        func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        let maskRow = UInt64(nKv) * 2
+        i32(0, Int32(nQ))                                              // ne01
+        i32(4, Int32(nKv)); i32(8, Int32(nQ)); i32(12, 1); i32(16, 1)  // ne30, ne31, ne32, ne33
+        u64(24, maskRow); u64(32, UInt64(nQ) * maskRow); u64(40, UInt64(nQ) * maskRow) // nb31, nb32, nb33
+        return b
+    }
+
+    /// 104-byte pad args for the batched prefill (per-query mask rows: ne31 = nQ).
+    static func flashPrefillPadArgs(nQ: Int, nKv: Int, headDim: Int) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: 104)
+        func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        let rowF16 = UInt64(headDim) * 2
+        let plane = UInt64(nKv) * rowF16
+        let maskRow = UInt64(nKv) * 2
+        i32(0, Int32(nKv)); i32(4, 1); i32(8, 1)                        // ne11, ne_12_2, ne_12_3
+        u64(16, rowF16); u64(24, plane); u64(32, plane)                 // nb11, nb12, nb13
+        u64(40, rowF16); u64(48, plane); u64(56, plane)                 // nb21, nb22, nb23
+        i32(64, Int32(nQ)); i32(68, 1); i32(72, 1)                      // ne31, ne32, ne33
+        u64(80, maskRow); u64(88, UInt64(nQ) * maskRow); u64(96, UInt64(nQ) * maskRow) // nb31, nb32, nb33
+        return b
+    }
+
+    /// 192-byte args for the batched prefill kernel. Q and dst share the
+    /// row-major [nQ][nHead][headDim] F32 layout; K==V==the F16 latent span;
+    /// the mask holds one nKv-wide F16 row PER QUERY (causal+window+comp).
+    static func flashPrefillArgs(nHead: Int, nQ: Int, nKv: Int, headDim: Int, scale: Float) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: 192)
+        func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        func f32(_ off: Int, _ v: Float) { withUnsafeBytes(of: v.bitPattern.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        let rowBytes = UInt64(headDim) * 4
+        let rowF16 = UInt64(headDim) * 2
+        let kvPlane = UInt64(nKv) * rowF16
+        let maskRow = UInt64(nKv) * 2
+        i32(0, Int32(nQ)); i32(4, Int32(nHead)); i32(8, 1)               // ne01, ne02, ne03
+        u64(16, UInt64(nHead) * rowBytes)                                // nb01 (query-row stride)
+        u64(24, rowBytes)                                                // nb02 (head stride)
+        u64(32, UInt64(nQ) * UInt64(nHead) * rowBytes)                   // nb03
+        i32(40, Int32(nKv)); i32(44, 1); i32(48, 1); i32(52, Int32(headDim)) // ne11, ne_12_2, ne_12_3, ns10
+        u64(56, rowF16); u64(64, kvPlane); u64(72, kvPlane)              // nb11, nb12, nb13
+        i32(80, Int32(headDim))                                          // ns20
+        u64(88, rowF16); u64(96, kvPlane); u64(104, kvPlane)             // nb21, nb22, nb23
+        i32(112, Int32(nQ)); i32(116, 1); i32(120, 1)                    // ne31, ne32, ne33
+        u64(128, maskRow); u64(136, UInt64(nQ) * maskRow); u64(144, UInt64(nQ) * maskRow) // nb31, nb32, nb33
+        i32(152, Int32(nHead)); i32(156, Int32(nQ)); i32(160, 1)         // ne1, ne2, ne3
+        f32(164, scale); f32(168, 0); f32(172, 0); f32(176, 0)           // scale, max_bias, m0, m1
+        i32(180, 0); f32(184, 0)                                         // n_head_log2, logit_softcap
+        return b
+    }
+
     func flashReducePipeline(dv: Int32, nwg: Int32) throws -> MTLComputePipelineState {
         let key = "flash_reduce_dv=\(dv)_nwg=\(nwg)"
         if let p = mulMVPipelineCache[key] { return p }

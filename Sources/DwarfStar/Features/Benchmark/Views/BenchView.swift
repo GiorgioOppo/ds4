@@ -188,6 +188,14 @@ struct BenchView: View {
         } else {
             VStack(spacing: 0) {
                 if controller.isRunning { runningBadge.padding(.horizontal).padding(.top, 8) }
+                HStack {
+                    Spacer()
+                    exportButtons(baseName: "dwarfstar-speed",
+                                  title: "Prefill and generation throughput",
+                                  subtitle: speedExportSubtitle,
+                                  csv: speedCSV) { throughputChart }
+                }
+                .padding(.horizontal).padding(.top, 8)
                 throughputChart.padding()
             }
         }
@@ -218,8 +226,17 @@ struct BenchView: View {
                                 .foregroundStyle(.orange)
                         }
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Cumulative candidate-token accuracy")
-                                .font(.headline)
+                            HStack {
+                                Text("Cumulative candidate-token accuracy")
+                                    .font(.headline)
+                                Spacer()
+                                exportButtons(baseName: "dwarfstar-correctness-cumulative",
+                                              title: "Cumulative candidate-token accuracy",
+                                              subtitle: accuracyExportSubtitle(result),
+                                              csv: { bucketsCSV(result) }) {
+                                    bucketTopKAccuracyChart(result)
+                                }
+                            }
                             Text("Each line shows whether the source token was found within the first 1, 2 or 3 candidates proposed by the model.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -227,8 +244,17 @@ struct BenchView: View {
                                 .frame(minHeight: 280)
                         }
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Accuracy by sampled piece")
-                                .font(.headline)
+                            HStack {
+                                Text("Accuracy by sampled piece")
+                                    .font(.headline)
+                                Spacer()
+                                exportButtons(baseName: "dwarfstar-correctness-pieces",
+                                              title: "Accuracy by sampled piece",
+                                              subtitle: accuracyExportSubtitle(result),
+                                              csv: { piecesCSV(result) }) {
+                                    pieceTopKAccuracyChart(result)
+                                }
+                            }
                             Text("Each point is one independently sampled context and target segment.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -517,6 +543,85 @@ struct BenchView: View {
                 .font(.callout)
             Spacer(minLength: 0)
         }
+    }
+
+    /// PNG + CSV export controls for one chart. Failures are appended to the
+    /// benchmark log; a cancelled save panel is not an error. The chart closure
+    /// re-renders the chart for export at a fixed size, independent of the
+    /// on-screen layout.
+    private func exportButtons<C: View>(baseName: String,
+                                        title: String,
+                                        subtitle: String,
+                                        csv: @escaping () -> String,
+                                        @ViewBuilder chart: @escaping () -> C) -> some View {
+        HStack(spacing: 2) {
+            Button {
+                if let error = ChartExport.savePNG(title: title, subtitle: subtitle,
+                                                   suggestedFileName: ChartExport.stampedName(baseName),
+                                                   chart: chart()) {
+                    controller.log += error
+                }
+            } label: {
+                Label("PNG", systemImage: "photo")
+            }
+            .help("Export this chart as a PNG image")
+            Button {
+                if let error = ChartExport.saveCSV(csv(),
+                                                   suggestedFileName: ChartExport.stampedName(baseName)) {
+                    controller.log += error
+                }
+            } label: {
+                Label("CSV", systemImage: "tablecells")
+            }
+            .help("Export this chart's data as CSV")
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+    }
+
+    private var speedExportSubtitle: String {
+        let model = (controller.modelPath as NSString).lastPathComponent
+        return "\(model) · \(controller.mode.rawValue) engine" +
+               " · \(controller.genTokens) generated tokens per point · generation is p99" +
+               " · \(Date.now.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    private func accuracyExportSubtitle(_ result: InferenceService.AccuracyResult) -> String {
+        let model = (controller.modelPath as NSString).lastPathComponent
+        return "\(model) · seed \(result.seed) · \(result.pieces.count) pieces" +
+               " · context \(result.effectiveMinContextTokens)...\(result.effectiveMaxContextTokens) tokens" +
+               " · \(result.evaluatedTokens) evaluated tokens" +
+               " · \(Date.now.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    private func speedCSV() -> String {
+        var out = "context_tokens,prefill_tps,gen_tps_p99,kvcache_bytes\n"
+        for row in controller.rows {
+            out += "\(row.ctxTokens),\(row.prefillTps),\(row.genTps),\(row.kvcacheBytes)\n"
+        }
+        return out
+    }
+
+    private func bucketsCSV(_ result: InferenceService.AccuracyResult) -> String {
+        var out = "block,block_size,cumulative_top1_accuracy,cumulative_top2_accuracy,cumulative_top3_accuracy\n"
+        for bucket in result.buckets {
+            out += "\(bucket.index + 1),\(result.bucketSize)," +
+                   "\(bucket.cumulativeTop1Accuracy),\(bucket.cumulativeTop2Accuracy)," +
+                   "\(bucket.cumulativeTop3Accuracy)\n"
+        }
+        return out
+    }
+
+    private func piecesCSV(_ result: InferenceService.AccuracyResult) -> String {
+        var out = "piece,source_start_token,target_start_token,context_tokens," +
+                  "evaluated_tokens,top1_accuracy,top2_accuracy,top3_accuracy,truncated\n"
+        for piece in result.pieces {
+            out += "\(piece.index + 1),\(piece.sourceStartTokenIndex)," +
+                   "\(piece.targetStartTokenIndex),\(piece.contextTokens)," +
+                   "\(piece.evaluatedTokens),\(piece.top1Accuracy)," +
+                   "\(piece.top2Accuracy),\(piece.top3Accuracy),\(piece.truncated)\n"
+        }
+        return out
     }
 
     private var throughputChart: some View {

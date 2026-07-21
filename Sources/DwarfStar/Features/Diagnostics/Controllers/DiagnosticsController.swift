@@ -1,9 +1,11 @@
 import Foundation
 import DS4Engine
 
-/// Tokenizer diagnostic — NATIVE (DS4Engine.Diagnostics over DS4Core.Tokenizer),
-/// no `ds4 --dump-tokens` subprocess. Tokenizes a string exactly as written
-/// (recognizing DS4 protocol specials). Opens the GGUF for its tokenizer tables.
+/// Tokenizer diagnostic — NATIVE (DS4Engine.Diagnostics over the backend
+/// tokenizer selected by the GGUF's architecture, DeepSeek or GLM), no
+/// `ds4 --dump-tokens` subprocess. Tokenizes a string exactly as written
+/// (recognizing the backend's protocol specials). Opens the GGUF for its
+/// tokenizer tables.
 @MainActor
 @Observable
 final class DiagnosticsController {

@@ -163,6 +163,7 @@ con l'IQ2_XXS pubblicato.
 | `DS4_GLM_RESIDENT_LAYERS` | adattivo | floor di 3 layer dense sotto pressione RAM (residenti extra vengono paginati: ~+750 ms/token misurati) |
 | `DS4_GLM_FUSE` | 1 | fusione dei commit (metà delle attese sincrone) |
 | `DS4_GLM_MOE_BATCH` | 1 | MoE batched (tutti gli esperti instradati in due dispatch) |
+| `DS4_GLM_PREFILL_MOE` | 1 | fase B del prefill multi-token (pesi esperti letti una volta per tile di 4 token; 3 dispatch per wave, bit-esatto vs il percorso per-applicazione) |
 | `DS4_GLM_GPU_ROUTER` | 1 | router fuso su GPU (−18% di prefill) |
 | `DS4_GLM_MLOCK` | 1 | wiring dei pesi residenti (head da 433 a 39 ms/token) |
 | `DS4_GLM_READ_SPLIT` | 4 | letture layer parallele nel prefill (solo prefill; il decode resta seriale per scelta misurata) |

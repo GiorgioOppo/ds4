@@ -252,3 +252,156 @@ kernel void kernel_glm52_moe_batch_down_sg(
     }
 }
 
+
+// MARK: - Prefill fase B multi-token: esperti staged su TUTTI i loro token
+
+// Il percorso per-applicazione paga la rilettura dei pesi dell'esperto una
+// volta PER TOKEN e serializza ogni tripla di dispatch sugli scratch
+// condivisi. Qui il loop sui token sta DENTRO il kernel (tile da 4): i byte
+// del gruppo pesi attraversano la DRAM una volta per tile, e un'unica
+// coppia di dispatch copre tutti gli esperti della wave (griglia z).
+// La matematica per token è ESATTAMENTE quella dei kernel per-applicazione
+// (stesso stride di gruppo per corsia, stessa simd_sum), e la riduzione
+// finale somma i contributi in ordine di applicazione ascendente partendo
+// dal valore corrente di hidden: il risultato è bit-identico alla sequenza
+// matvec+add del percorso legacy.
+
+struct ds4_metal_args_glm52_moe_prefill {
+    uint32_t gate_up_type;      // GGUF id dei record gate/up
+    uint32_t hidden_width;      // expert hidden (2048)
+    uint32_t input_width;       // embedding (6144)
+    uint32_t expert_count;      // esperti nella wave
+    uint32_t up_offset;         // byte: inizio del blocco up nel record
+    uint32_t down_offset;       // byte: inizio del blocco down nel record
+    uint32_t down_type;         // GGUF id dei record down
+    uint32_t token_entry_count; // voci token della riduzione
+};
+
+// mids[app][hidden]: SwiGLU pesato per ogni (esperto, token applicato).
+// expert_meta: triple u32 per esperto {record_offset, app_start, app_count};
+// app_tokens/app_weights: per applicazione, indice token e peso di route.
+// Dispatch: tptg (32, NSG, 1); threadgroups (ceil(hidden/NSG), 1, esperti).
+kernel void kernel_glm52_moe_prefill_swiglu_sg(
+        constant ds4_metal_args_glm52_moe_prefill &args,
+        device const uint  *expert_meta,
+        device const uint  *app_tokens,
+        device const float *app_weights,
+        device const float *x_all,
+        device const uchar *records,
+        device float       *mids,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    const uint expert = tgpig.z;
+    if (row >= args.hidden_width || expert >= args.expert_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.gate_up_type,
+                                                  args.input_width);
+    if (row_bytes == 0u) return;
+    device const uchar *record = records + expert_meta[3u * expert];
+    device const uchar *gate_row = record + (uint64_t)row * row_bytes;
+    device const uchar *up_row = record + args.up_offset
+        + (uint64_t)row * row_bytes;
+    const uint start = expert_meta[3u * expert + 1u];
+    const uint count = expert_meta[3u * expert + 2u];
+    const uint groups = args.input_width / 32u;
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint tile = min(4u, count - t0);
+        float acc_gate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float acc_up[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint g = (uint)tiisg; g < groups; g += 32u) {
+            for (uint i = 0u; i < tile; i++) {
+                device const float *x = x_all
+                    + (uint64_t)app_tokens[start + t0 + i]
+                        * args.input_width;
+                acc_gate[i] += glm52_dot_kquant_group(args.gate_up_type,
+                                                      gate_row, x, g);
+                acc_up[i] += glm52_dot_kquant_group(args.gate_up_type,
+                                                    up_row, x, g);
+            }
+        }
+        for (uint i = 0u; i < tile; i++) {
+            const float gate = simd_sum(acc_gate[i]);
+            const float up = simd_sum(acc_up[i]);
+            if (tiisg == 0u) {
+                mids[(uint64_t)(start + t0 + i) * args.hidden_width + row] =
+                    glm52_silu(gate) * up * app_weights[start + t0 + i];
+            }
+        }
+    }
+}
+
+// contribs[app][embedding]: proiezione down di ogni applicazione, stessa
+// forma multi-token del kernel qui sopra (righe su input_width).
+// Dispatch: tptg (32, NSG, 1); threadgroups (ceil(embedding/NSG), 1, esperti).
+kernel void kernel_glm52_moe_prefill_down_sg(
+        constant ds4_metal_args_glm52_moe_prefill &args,
+        device const uint  *expert_meta,
+        device const float *mids,
+        device const uchar *records,
+        device float       *contribs,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.x * ntg.y + (uint)sgitg;
+    const uint expert = tgpig.z;
+    if (row >= args.input_width || expert >= args.expert_count) return;
+    const uint row_bytes = glm52_kquant_row_bytes(args.down_type,
+                                                  args.hidden_width);
+    if (row_bytes == 0u) return;
+    device const uchar *down_row = records + expert_meta[3u * expert]
+        + args.down_offset + (uint64_t)row * row_bytes;
+    const uint start = expert_meta[3u * expert + 1u];
+    const uint count = expert_meta[3u * expert + 2u];
+    const uint groups = args.hidden_width / 32u;
+    for (uint t0 = 0u; t0 < count; t0 += 4u) {
+        const uint tile = min(4u, count - t0);
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint g = (uint)tiisg; g < groups; g += 32u) {
+            for (uint i = 0u; i < tile; i++) {
+                device const float *mid = mids
+                    + (uint64_t)(start + t0 + i) * args.hidden_width;
+                acc[i] += glm52_dot_kquant_group(args.down_type, down_row,
+                                                 mid, g);
+            }
+        }
+        for (uint i = 0u; i < tile; i++) {
+            const float total = simd_sum(acc[i]);
+            if (tiisg == 0u) {
+                contribs[(uint64_t)(start + t0 + i) * args.input_width
+                         + row] = total;
+            }
+        }
+    }
+}
+
+// hidden[token] += contributi in ordine di applicazione ASCENDENTE partendo
+// dal valore corrente: ((h + c1) + c2)…, la stessa associatività della
+// sequenza add del percorso legacy. token_meta: triple u32
+// {token_index, list_start, list_count}; token_apps: indici applicazione.
+// Dispatch: tptg (256, 1, 1); threadgroups (ceil(embedding/256), voci, 1).
+kernel void kernel_glm52_moe_prefill_reduce(
+        constant ds4_metal_args_glm52_moe_prefill &args,
+        device const uint  *token_meta,
+        device const uint  *token_apps,
+        device const float *contribs,
+        device float       *hidden_all,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    const uint r = tgpig.x * ntg.x + tpitg.x;
+    const uint entry = tgpig.y;
+    if (r >= args.input_width || entry >= args.token_entry_count) return;
+    const uint token = token_meta[3u * entry];
+    const uint start = token_meta[3u * entry + 1u];
+    const uint count = token_meta[3u * entry + 2u];
+    const uint64_t base = (uint64_t)token * args.input_width + r;
+    float acc = hidden_all[base];
+    for (uint j = 0u; j < count; j++) {
+        acc += contribs[(uint64_t)token_apps[start + j] * args.input_width
+                        + r];
+    }
+    hidden_all[base] = acc;
+}

@@ -795,7 +795,8 @@ public final class GLM52ResidentModel {
 
     // MARK: - Disk KV checkpoints
 
-    static let kvMagic: UInt32 = 0x3156_4B47   // "GKV1"
+    /// Public: the disk-KV store scans entry headers in this wire format.
+    public static let kvMagic: UInt32 = 0x3156_4B47   // "GKV1"
 
     private var allCaches: [GLM52ResidentDecodeCaches] {
         stack.map(\.caches) + streamedLayers.map(\.caches)
@@ -1025,6 +1026,11 @@ public final class GLM52ResidentModel {
                 var users: [UInt32: [(token: Int, weight: Float)]] = [:]
                 var order: [UInt32] = []
                 for t in 0..<tokens.count {
+                    // Stop/disconnessione durante un prefill lungo: la cella
+                    // (layer, token) è la granularità giusta (~ms). Chi
+                    // chiama risana con resetContext (che drena anche i
+                    // prefetch dello streamer).
+                    try Task.checkCancellation()
                     scratch.loadHidden(hiddens[t])
                     let result = try runtime.glm52ChainedDecodeLayer(
                         weights: weights, ffn: ffn, caches: caches,
@@ -1060,6 +1066,7 @@ public final class GLM52ResidentModel {
                 }
                 var start = 0
                 while start < order.count {
+                    try Task.checkCancellation()
                     let batch = Array(
                         order[start..<min(start + 8, order.count)])
                     let tStage = Date()
@@ -1095,6 +1102,7 @@ public final class GLM52ResidentModel {
                 return
             }
             for t in 0..<tokens.count {
+                try Task.checkCancellation()
                 scratch.loadHidden(hiddens[t])
                 let result = try runtime.glm52ChainedDecodeLayer(
                     weights: weights, ffn: ffn, caches: caches,
@@ -1126,6 +1134,7 @@ public final class GLM52ResidentModel {
                       caches: layer.caches)
         }
         for (rank, streamedLayer) in streamedLayers.enumerated() {
+            try Task.checkCancellation()
             let index = streamedLayer.tensors.index
             let waitStart = Date()
             let buffers = try streamer!.wait(for: index)

@@ -13,6 +13,10 @@ allowing chat, stateless API, sub-agents and workers to avoid a full prefill.
 - `+Store`: snapshot, atomic write and budget maintenance.
 - `+Streaming`: import/export one layer at a time.
 - `+Serialization`: binary body primitives.
+- `GLM52DiskKVStore.swift`: the GLM counterpart over the engine-native
+  `GKV1` files — same prefix-keyed lookup, token budget and
+  `KVCFile.evictionScore` eviction, with hits/lastUsed in a sidecar
+  `index.json` so the engine wire format stays untouched.
 
 The layout is documented in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.md).
 

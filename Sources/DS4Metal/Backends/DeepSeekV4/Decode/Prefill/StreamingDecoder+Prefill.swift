@@ -159,8 +159,17 @@ extension StreamingDecoder {
         var other: [GPUTensor] = try (0..<n).map { _ in try .zeros(rt, floatCount: hcDim) }
         let chunkTokens = Array(tokens[start..<end])
         try embedTokensBatch(chunkTokens, into: cur)
+        // Batched-attention staging: run capacity = the route batch, KV span
+        // capacity = the chunk-end scratch high-water (raw window + comp rows)
+        // plus the extra span rows a multi-token run adds (nq-1) and one pad
+        // block of margin. prepareLiveContext already sized attentionRows for
+        // this chunk's last position.
+        let routeBatch = prefillRouteBatch
+        let flashBatch: (nq: Int, maxKv: Int)? = (prefillBatchAttn && routeBatch >= 2)
+            ? (nq: min(routeBatch, n), maxKv: scratch.attentionRows + routeBatch + 64) : nil
         let stage: PrefillStage? = (expertGather != nil && n > 1)
-            ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts) : nil
+            ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: maxUnionExperts,
+                               flashBatch: flashBatch) : nil
         for i in 0..<nLayers {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
@@ -447,30 +456,57 @@ extension StreamingDecoder {
                 continue
             }
             let t = Date()
-            try autoreleasepool {
-                try Task.checkCancellation()
-                clearMaskIfDirty()
-                let c = GraphContext(rt); try c.begin()
-                for jj in j..<jEnd {
-                    let pos = posBase + jj
-                    try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
-                                        pos: pos, nKeys: pos + 1, token: tokens[jj])
-                    // Snapshot ids/weights into stage.ids/rw too: phase B reads
-                    // them back and REWRITES both buffers (remapped + padded)
-                    // strictly after this buffer completes — no aliasing.
-                    var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
-                        (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
-                        (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
-                        (scratch.split, 0, stage.split[jj], 0, 24 * 4),
-                        (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
-                        (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
-                    ]
-                    if let mm = stage.mm {
-                        copies.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
-                    }
-                    try c.blitCopies(copies)
+            // Batched multi-query attention (DS4_PREFILL_BATCH_ATTN): eligible
+            // when the run fits the staging capacity AND the union raw span
+            // [first window start, last pos] is fully resident — with the
+            // DS4_RAW_RING cache the newest stores overwrite the oldest rows,
+            // so a span longer than the ring must use the per-token path
+            // (each token attends BEFORE later tokens overwrite its window).
+            let nqRun = jEnd - j
+            let posFirst = posBase + j
+            let rawLo0 = max(0, posFirst + 1 - d.nSWA)
+            let nRawSpan = posBase + jEnd - rawLo0
+            let rawRows = rawCaches[i].count / d.headDim
+            let compBound = (compStates[i]?.count ?? 0) + nqRun / max(1, compStates[i]?.ratio ?? 4) + 1
+            // The flash run pays for itself through the dense GEMMs (measured:
+            // attention-only batching LOSES to the historical packed loop).
+            // Default: take it only where the dense path applies; layers with
+            // Q4-requantized dense weights use the historical loop. With
+            // DS4_PREFILL_DENSE_MM=0 the lever-1 mode stays reachable for A/B.
+            if let fb = stage.flash, nqRun >= 2, nqRun <= fb.nq,
+               nRawSpan <= rawRows, nRawSpan + compBound <= fb.maxKv,
+               prefillDenseEligible(w) || !prefillDenseMM {
+                try autoreleasepool {
+                    try Task.checkCancellation()
+                    try encodeFlashRun(fb, i, w: w, layerRope: layerRope, cur: cur, stage: stage,
+                                       j: j, jEnd: jEnd, posBase: posBase, tokens: tokens)
                 }
-                c.commit()
+            } else {
+                try autoreleasepool {
+                    try Task.checkCancellation()
+                    clearMaskIfDirty()
+                    let c = GraphContext(rt); try c.begin()
+                    for jj in j..<jEnd {
+                        let pos = posBase + jj
+                        try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
+                                            pos: pos, nKeys: pos + 1, token: tokens[jj])
+                        // Snapshot ids/weights into stage.ids/rw too: phase B reads
+                        // them back and REWRITES both buffers (remapped + padded)
+                        // strictly after this buffer completes — no aliasing.
+                        var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
+                            (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
+                            (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
+                            (scratch.split, 0, stage.split[jj], 0, 24 * 4),
+                            (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
+                            (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
+                        ]
+                        if let mm = stage.mm {
+                            copies.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
+                        }
+                        try c.blitCopies(copies)
+                    }
+                    c.commit()
+                }
             }
             profile.routeS += Date().timeIntervalSince(t)
             for jj in j..<jEnd {
@@ -654,6 +690,400 @@ extension StreamingDecoder {
                 }
                 // g/u/dn drop here (pool drain) -> the group's packed union tensors are freed
             }
+        }
+    }
+
+    /// Dense-GEMM eligibility for a layer: every dense weight of the route is
+    /// Q8_0/F16 (no Q4 resident requant) so the whole run can go through the
+    /// matrix kernels. Q4-requantized layers (DS4_DENSE_Q4/DS4_QKV_Q4) keep
+    /// the historical per-token loop.
+    private func prefillDenseEligible(_ w: LayerWeights) -> Bool {
+        guard d.nHC == 4 && d.nLoraO % 64 == 0 && d.attnGroupDim % 32 == 0 else { return false }
+        // Q4-requantized projections (DS4_DENSE_Q4/DS4_QKV_Q4) go through the
+        // Q4_K dense GEMM, which needs a 256-aligned reduction dim.
+        if w.qAQ4 && d.nEmbd % 256 != 0 { return false }
+        if w.kvQ4 && d.nEmbd % 256 != 0 { return false }
+        if w.qBQ4 && d.qRank % 256 != 0 { return false }
+        if w.attnOutAQ4 && d.attnGroupDim % 256 != 0 { return false }
+        if w.attnOutQ4 && d.attnLowDim % 256 != 0 { return false }
+        return true
+    }
+
+    /// Dense GEMM on the projection's RESIDENT quant: Q8_0 by default, Q4_K
+    /// when the DS4_DENSE_Q4/DS4_QKV_Q4 requant replaced the weight.
+    @_optimize(none)   // stesso bug LICM di Swift 6.3 delle altre funzioni di encode
+    private func encodeMMDense(_ c: GraphContext, weight: GPUTensor, q4: Bool,
+                               act: GPUTensor, out: GPUTensor,
+                               inDim: Int, outDim: Int, nTok: Int) throws {
+        if q4 {
+            try c.encodeMMDenseQ4K(weight: weight, act: act, actBase: 0, out: out,
+                                   inDim: inDim, outDim: outDim, nTok: nTok)
+        } else {
+            try c.encodeMMDenseQ8(weight: weight, act: act, actBase: 0, out: out,
+                                  inDim: inDim, outDim: outDim, nTok: nTok)
+        }
+    }
+
+    /// Phase A run with BATCHED attention (DS4_PREFILL_BATCH_ATTN), one command
+    /// buffer, one sync — the C prefill's shape adapted to the route batch:
+    ///  A1 (per token, in order): pre-attention half (HC reduce, compressor
+    ///     state update + possible comp-row emit, Q/KV projections, fp8 raw
+    ///     store) — unchanged decodeRoutePre — then blit the token's Q row into
+    ///     the batched Q matrix and its attention HC split into a per-token
+    ///     buffer (later tokens' A1 overwrites both scratch slots).
+    ///  A2 (once): ONE multi-query FlashAttention over the union span (raw SWA
+    ///     window rows + comp rows, staged F16 after ALL the run's KV stores)
+    ///     with a CPU-filled per-query mask reproducing exactly the per-token
+    ///     visibility: causal + SWA window + comp rows emitted up to each token.
+    ///  A3 (per token, in order): blit the token's heads row back and encode
+    ///     the unchanged tail (inverse RoPE, output projection, pre-FFN HC,
+    ///     router) + the phase-B snapshot blits.
+    /// Same math over the same visible keys as the per-token path; only the
+    /// attention accumulation order differs (simdgroup MMA blocks vs vec).
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodeFlashRun(_ fb: PrefillStage.FlashBatch, _ i: Int, w: LayerWeights,
+                                layerRope: RopeParams, cur: [GPUTensor], stage: PrefillStage,
+                                j: Int, jEnd: Int, posBase: Int, tokens: [Int]) throws {
+        let nq = jEnd - j
+        let posFirst = posBase + j
+        let rawLo0 = max(0, posFirst + 1 - d.nSWA)
+        let nRawSpan = posBase + jEnd - rawLo0
+        let denseMM = prefillDenseMM && prefillDenseEligible(w)
+        let c = GraphContext(rt); try c.begin()
+        var nCompVis = [Int](repeating: 0, count: nq)
+
+        // ── A1: pre-attention halves (split into helper methods — one big
+        // function here crashes the release optimizer's LICM pass).
+        if denseMM {
+            try encodeDensePre(c, fb, i, w: w, layerRope: layerRope, cur: cur,
+                               j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis)
+        } else {
+            try encodePerTokenPre(c, fb, i, w: w, layerRope: layerRope, cur: cur,
+                                  j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis)
+        }
+
+        // ── A2: ONE multi-query FlashAttention over the whole run.
+        let nComp = nCompVis[nq - 1]
+        // CPU mask fill BEFORE commit: the buffer is only ever read by this
+        // run's command buffer (the previous run committed with a blocking
+        // wait), so a CPU write here cannot race a GPU reader.
+        let maskPtr = (fb.mask.buffer.contents() + fb.mask.byteOffset)
+            .bindMemory(to: UInt16.self, capacity: nq * (nRawSpan + nComp))
+        GraphContext.fillPrefillAttnMask(maskPtr, nQ: nq, posFirst: posFirst,
+                                         rawStart: rawLo0, rawSpan: nRawSpan,
+                                         window: d.nSWA, nCompVis: nCompVis, nComp: nComp)
+        try c.flashAttnPrefill(q: fb.qMat, kvF32: rawCaches[i], kvF16: fb.kvF16,
+                               mask: fb.mask, sinks: w.attnSinks, pad: fb.pad, blk: fb.blk,
+                               heads: fb.heads, nHead: d.nHead, nQ: nq,
+                               rawSpan: nRawSpan, rawStartRow: rawLo0,
+                               comp: compStates[i]?.cache, nComp: nComp)
+
+        // ── A3: post-attention tails.
+        if denseMM {
+            try encodeDenseTail(c, fb, w: w, layerRope: layerRope, stage: stage,
+                                j: j, jEnd: jEnd, posBase: posBase, tokens: tokens)
+        } else {
+            try encodePerTokenTail(c, fb, w: w, layerRope: layerRope, cur: cur, stage: stage,
+                                   j: j, jEnd: jEnd, posBase: posBase, tokens: tokens)
+        }
+        c.commit()               // one sync for the whole run
+        profile.prefillFlashRuns += 1
+        if denseMM { profile.prefillDenseRuns += 1 }
+    }
+
+    /// Batched pre/post HC reduce: rms -> mixer GEMM -> Sinkhorn split ->
+    /// collapse -> norm, all over the run's rows. Same dispatches as the
+    /// per-token hcReduce with rows = nq.
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodeHCReduceBatched(_ c: GraphContext, _ fb: PrefillStage.FlashBatch,
+                                       x: GPUTensor, mixerFn: GPUTensor, scale: GPUTensor,
+                                       base: GPUTensor, norm: GPUTensor,
+                                       split: GPUTensor, out: GPUTensor, nq: Int) throws {
+        let hcDim = d.nHC * d.nEmbd
+        try c.rmsNorm(x, weight: nil, out: fb.flatMat, rows: nq, n: hcDim, eps: rmsEps)
+        try c.encodeMMDenseF16(weight: mixerFn, act: fb.flatMat, actBase: 0, out: fb.mixMat,
+                               inDim: hcDim, outDim: 24, nTok: nq)
+        if d.fusedHC {
+            try c.hcSplitWeightedSumNorm4(mix: fb.mixMat, scale: scale, base: base, x: x,
+                                          split: split, embd: fb.embdMat, normWeight: norm,
+                                          normOut: out, nEmbd: d.nEmbd, nRows: nq,
+                                          sinkhornIters: d.sinkhornIterations,
+                                          eps: hcEps, normEps: rmsEps)
+        } else {
+            try c.hcSplitSinkhorn(mix: fb.mixMat, scale: scale, base: base, out: split,
+                                  nRows: nq, sinkhornIters: d.sinkhornIterations, eps: hcEps)
+            try c.hcWeightedSum(x: x, weights: split, out: fb.embdMat, nEmbd: d.nEmbd,
+                                nHC: d.nHC, nTokens: nq, weightsTokenStride: 24 * 4)
+            try c.rmsNorm(fb.embdMat, weight: norm, out: out, rows: nq, n: d.nEmbd, eps: rmsEps)
+        }
+    }
+
+    /// Dense-GEMM A1: pack HC states, batched pre-attn HC reduce, per-token
+    /// compressor recurrences, batched Q/KV GEMMs + norms + RoPE, per-token
+    /// fp8 ring stores.
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodeDensePre(_ c: GraphContext, _ fb: PrefillStage.FlashBatch, _ i: Int,
+                                w: LayerWeights, layerRope: RopeParams, cur: [GPUTensor],
+                                j: Int, jEnd: Int, posBase: Int, nCompVis: inout [Int]) throws {
+        let nq = jEnd - j
+        let posFirst = posBase + j
+        let hcDim = d.nHC * d.nEmbd
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil    // state-only gate (see encodeRoute)
+        // ── A0: pack the run's input HC states into one token-major matrix.
+        try c.blitCopies((0..<nq).map { r in
+            (cur[j + r], 0, fb.hcMat, r * hcDim * 4, hcDim * 4)
+        })
+        // ── A1a: batched pre-attention HC reduce -> attn-normed rows + split.
+        try encodeHCReduceBatched(c, fb, x: fb.hcMat, mixerFn: w.hcAttnFn, scale: w.attnScale,
+                                  base: w.attnBase, norm: w.attnNorm,
+                                  split: fb.splitA, out: fb.curMat, nq: nq)
+        // ── A1b: compressor recurrences. The kv/score PROJECTIONS are batched:
+        // one GEMM per weight for the whole run instead of two matvecs per
+        // token (~520 MB/token of aggregate weight re-reads across the
+        // compressed layers); only the recurrent state update + emit stays
+        // token-sequential. Widths (2·headDim / headDim / 2·nIndexerHeadDim)
+        // are all multiples of 64 by construction.
+        if let comp = compStates[i], let ckv = w.compKv, let cgate = w.compGate,
+           let cape = w.compApe, let cnorm = w.compNorm {
+            try encodeCompProjBatched(c, kv: ckv, gate: cgate, act: fb.curMat,
+                                      kvOut: fb.compKvMat, scOut: fb.compScMat,
+                                      width: comp.width, nq: nq, q8: w.compQ8)
+            let wb = comp.width * 4
+            for r in 0..<nq {
+                nCompVis[r] = try c.runCompressorTail(
+                    kvCur: fb.compKvMat.subview(byteOffset: r * wb, byteLength: wb, count: comp.width),
+                    scCur: fb.compScMat.subview(byteOffset: r * wb, byteLength: wb, count: comp.width),
+                    ape: cape, normW: cnorm, comp: comp, rope: layerRope,
+                    pos: posFirst + r, rmsEps: rmsEps, nRot: d.nRot, finalize: .fp8)
+            }
+        } else if let comp = compStates[i] {
+            // Missing compressor weights: historical no-op semantics.
+            for r in 0..<nq { nCompVis[r] = comp.count }
+        }
+        if hasIdxState, let idx = indexStates[i], let ikv = w.idxKv, let igate = w.idxGate,
+           let iape = w.idxApe, let inorm = w.idxNorm {
+            try encodeCompProjBatched(c, kv: ikv, gate: igate, act: fb.curMat,
+                                      kvOut: fb.idxKvMat, scOut: fb.idxScMat,
+                                      width: idx.width, nq: nq, q8: w.idxCompQ8)
+            let wb = idx.width * 4
+            for r in 0..<nq {
+                _ = try c.runCompressorTail(
+                    kvCur: fb.idxKvMat.subview(byteOffset: r * wb, byteLength: wb, count: idx.width),
+                    scCur: fb.idxScMat.subview(byteOffset: r * wb, byteLength: wb, count: idx.width),
+                    ape: iape, normW: inorm, comp: idx, rope: layerRope,
+                    pos: posFirst + r, rmsEps: rmsEps, nRot: d.nRot, finalize: .indexerQat)
+            }
+        }
+        // ── A1c: batched Q path (GEMM + norms + RoPE over all rows).
+        try encodeMMDense(c, weight: w.qA, q4: w.qAQ4, act: fb.curMat, out: fb.qrMat,
+                          inDim: d.nEmbd, outDim: d.qRank, nTok: nq)
+        try c.rmsNorm(fb.qrMat, weight: w.qANorm, out: fb.qrNormMat, rows: nq, n: d.qRank, eps: rmsEps)
+        try encodeMMDense(c, weight: w.qB, q4: w.qBQ4, act: fb.qrNormMat, out: fb.qMat,
+                          inDim: d.qRank, outDim: d.qDim, nTok: nq)
+        try c.rmsNorm(fb.qMat, weight: nil, out: fb.qMat, rows: nq * d.nHead, n: d.headDim, eps: rmsEps)
+        try c.ropeTail(x: fb.qMat, nTok: nq, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot,
+                       nCtxOrig: layerRope.nCtxOrig, freqBase: layerRope.freqBase,
+                       freqScale: layerRope.freqScale, extFactor: layerRope.extFactor,
+                       attnFactor: layerRope.attnFactor, betaFast: layerRope.betaFast,
+                       betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1)
+        // ── A1d: batched KV path + per-token fp8 ring store.
+        try encodeMMDense(c, weight: w.kvW, q4: w.kvQ4, act: fb.curMat, out: fb.kvMat,
+                          inDim: d.nEmbd, outDim: d.headDim, nTok: nq)
+        try c.rmsNorm(fb.kvMat, weight: w.kvNorm, out: fb.kvMat, rows: nq, n: d.headDim, eps: rmsEps)
+        try c.ropeTail(x: fb.kvMat, nTok: nq, nHead: 1, headDim: d.headDim, nRot: d.nRot,
+                       nCtxOrig: layerRope.nCtxOrig, freqBase: layerRope.freqBase,
+                       freqScale: layerRope.freqScale, extFactor: layerRope.extFactor,
+                       attnFactor: layerRope.attnFactor, betaFast: layerRope.betaFast,
+                       betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1)
+        let rawRows = rawCaches[i].count / d.headDim
+        for r in 0..<nq {
+            let kvRow = fb.kvMat.subview(byteOffset: r * d.headDim * 4,
+                                         byteLength: d.headDim * 4, count: d.headDim)
+            try c.kvFP8Store(kv: kvRow, rawCache: rawCaches[i], headDim: d.headDim,
+                             nRot: d.nRot, rawRow: (posFirst + r) % rawRows)
+        }
+    }
+
+    /// Batched compressor kv/score projections: two dense GEMMs over the run's
+    /// attn-normed rows (F16, or Q8_0 with the DS4_COMP_Q8 resident requant).
+    /// NOTE: the mm kernel stages the activation tile to f16 — same tolerance
+    /// class as the other dense GEMMs of this path.
+    @_optimize(none)   // stesso bug LICM di Swift 6.3 delle altre funzioni di encode
+    private func encodeCompProjBatched(_ c: GraphContext, kv: GPUTensor, gate: GPUTensor,
+                                       act: GPUTensor, kvOut: GPUTensor, scOut: GPUTensor,
+                                       width: Int, nq: Int, q8: Bool) throws {
+        if q8 {
+            try c.encodeMMDenseQ8(weight: kv, act: act, actBase: 0, out: kvOut,
+                                  inDim: d.nEmbd, outDim: width, nTok: nq)
+            try c.encodeMMDenseQ8(weight: gate, act: act, actBase: 0, out: scOut,
+                                  inDim: d.nEmbd, outDim: width, nTok: nq)
+        } else {
+            try c.encodeMMDenseF16(weight: kv, act: act, actBase: 0, out: kvOut,
+                                   inDim: d.nEmbd, outDim: width, nTok: nq)
+            try c.encodeMMDenseF16(weight: gate, act: act, actBase: 0, out: scOut,
+                                   inDim: d.nEmbd, outDim: width, nTok: nq)
+        }
+    }
+
+    /// Attention-only A1 (lever-1 fallback): per-token pre halves, Q rows blitted.
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodePerTokenPre(_ c: GraphContext, _ fb: PrefillStage.FlashBatch, _ i: Int,
+                                   w: LayerWeights, layerRope: RopeParams, cur: [GPUTensor],
+                                   j: Int, jEnd: Int, posBase: Int, nCompVis: inout [Int]) throws {
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil    // state-only gate (see encodeRoute)
+        let qBytes = d.qDim * 4
+        for (r, jj) in (j..<jEnd).enumerated() {
+            let pos = posBase + jj
+            nCompVis[r] = try c.decodeRoutePre(curHc: cur[jj], w: w, s: scratch, d: d,
+                                               rope: layerRope, rawCache: rawCaches[i], pos: pos,
+                                               rmsEps: rmsEps, hcEps: hcEps,
+                                               comp: compStates[i],
+                                               idx: hasIdxState ? indexStates[i] : nil,
+                                               indexerScoring: false)  // caller guarantees no scoring
+            try c.blitCopies([
+                (scratch.q, 0, fb.qMat, r * qBytes, qBytes),
+                (scratch.split, 0, fb.split[r], 0, 24 * 4),
+            ])
+        }
+    }
+
+    /// Dense-GEMM A3: batched inverse RoPE, grouped low-rank output, out_b,
+    /// HC expand + pre-FFN reduce, batched router logits, per-token finalize
+    /// + phase-B snapshots.
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodeDenseTail(_ c: GraphContext, _ fb: PrefillStage.FlashBatch,
+                                 w: LayerWeights, layerRope: RopeParams, stage: PrefillStage,
+                                 j: Int, jEnd: Int, posBase: Int, tokens: [Int]) throws {
+        let nq = jEnd - j
+        let posFirst = posBase + j
+        let hcDim = d.nHC * d.nEmbd
+        // ── A3a: batched inverse RoPE + grouped low-rank output + out_b.
+        try c.ropeTail(x: fb.heads, nTok: nq, nHead: d.nHead, headDim: d.headDim, nRot: d.nRot,
+                       nCtxOrig: layerRope.nCtxOrig, freqBase: layerRope.freqBase,
+                       freqScale: layerRope.freqScale, extFactor: layerRope.extFactor,
+                       attnFactor: layerRope.attnFactor, betaFast: layerRope.betaFast,
+                       betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1, inverse: true)
+        let groupRowBytes = w.attnOutAQ4 ? (d.attnGroupDim / 256) * 144
+                                         : (d.attnGroupDim / 32) * 34
+        for g in 0..<d.nOutGroup {
+            if w.attnOutAQ4 {
+                try c.encodeMMDenseQ4KStrided(weight: w.attnOutA,
+                                              weightOffset: g * d.nLoraO * groupRowBytes,
+                                              act: fb.heads, actBase: g * d.attnGroupDim * 4,
+                                              actRowStride: d.qDim * 4,
+                                              out: fb.lowMat, outBase: g * d.nLoraO * 4,
+                                              outRowStrideElems: d.attnLowDim,
+                                              inDim: d.attnGroupDim, outDim: d.nLoraO, nTok: nq)
+            } else {
+                try c.encodeMMDenseQ8Strided(weight: w.attnOutA,
+                                             weightOffset: g * d.nLoraO * groupRowBytes,
+                                             act: fb.heads, actBase: g * d.attnGroupDim * 4,
+                                             actRowStride: d.qDim * 4,
+                                             out: fb.lowMat, outBase: g * d.nLoraO * 4,
+                                             outRowStrideElems: d.attnLowDim,
+                                             inDim: d.attnGroupDim, outDim: d.nLoraO, nTok: nq)
+            }
+        }
+        try encodeMMDense(c, weight: w.attnOut, q4: w.attnOutQ4, act: fb.lowMat, out: fb.blockOutMat,
+                          inDim: d.attnLowDim, outDim: d.nEmbd, nTok: nq)
+        // ── A3b: batched attention-residual HC expand + pre-FFN HC reduce.
+        try c.hcExpand4(blockOut: fb.blockOutMat, residual: fb.hcMat,
+                        post: fb.splitA, comb: fb.splitA, blockAdd: nil,
+                        out: fb.afterAttnMat, nEmbd: d.nEmbd, nTokens: nq,
+                        postByteOffset: 4 * 4, combByteOffset: 8 * 4,
+                        splitTokenStride: 24 * 4)
+        try encodeHCReduceBatched(c, fb, x: fb.afterAttnMat, mixerFn: w.hcFfnFn, scale: w.ffnScale,
+                                  base: w.ffnBase, norm: w.ffnNorm,
+                                  split: fb.splitF, out: fb.curMat2, nq: nq)
+        // ── A3c: batched router logits, per-token finalize + snapshots.
+        if d.routerF16 {
+            try c.encodeMMDenseF16(weight: w.routerW, act: fb.curMat2, actBase: 0,
+                                   out: fb.logitsMat, inDim: d.nEmbd, outDim: d.nExperts, nTok: nq)
+        } else {
+            try c.encodeMMDenseQ8(weight: w.routerW, act: fb.curMat2, actBase: 0,
+                                  out: fb.logitsMat, inDim: d.nEmbd, outDim: d.nExperts, nTok: nq)
+        }
+        for (r, jj) in (j..<jEnd).enumerated() {
+            let logitsRow = fb.logitsMat.subview(byteOffset: r * d.nExperts * 4,
+                                                 byteLength: d.nExperts * 4, count: d.nExperts)
+            if d.fusedRouterProbs {
+                try c.routerProbabilities(logits: logitsRow, probabilities: scratch.probs,
+                                          width: d.nExperts)
+            } else {
+                try c.unary(logitsRow, op: .softplus, out: scratch.sp, width: d.nExperts)
+                try c.unary(scratch.sp, op: .sqrt, out: scratch.probs, width: d.nExperts)
+            }
+            // Finalize writes the per-token stage buffers DIRECTLY (the
+            // per-token path blits the same bytes from the shared scratch).
+            try c.routerFinalizeTop6(probs: scratch.probs, selected: stage.ids[jj],
+                                     bias: w.expBias, hashTable: w.tid2eid,
+                                     hashRows: w.tid2eidRows, token: tokens[jj],
+                                     weights: d.fusedRouterFinalize ? stage.rw[jj] : nil,
+                                     nExperts: d.nExperts,
+                                     expertWeightScale: d.expertWeightScale)
+            if !d.fusedRouterFinalize {
+                try c.routerWeights(probs: scratch.probs, selected: stage.ids[jj],
+                                    weights: stage.rw[jj], nExperts: d.nExperts,
+                                    expertWeightScale: d.expertWeightScale)
+            }
+            var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
+                (fb.curMat2, r * d.nEmbd * 4, stage.cur[jj], 0, d.nEmbd * 4),
+                (fb.afterAttnMat, r * hcDim * 4, stage.attn[jj], 0, hcDim * 4),
+                (fb.splitF, r * 24 * 4, stage.split[jj], 0, 24 * 4),
+            ]
+            if let mm = stage.mm {
+                copies.append((fb.curMat2, r * d.nEmbd * 4, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
+            }
+            try c.blitCopies(copies)
+        }
+    }
+
+    /// Attention-only A3 (lever-1 fallback): per-token heads blit + unchanged
+    /// tail + phase-B snapshot blits.
+    // @_optimize(none): il pass LoopInvariantCodeMotion di Swift 6.3 crasha
+    // (SIGSEGV in getBorrowIntroducers) ottimizzando questi encoder in -O.
+    // Sono orchestrazione di dispatch Metal: il costo CPU è trascurabile.
+    @_optimize(none)
+    private func encodePerTokenTail(_ c: GraphContext, _ fb: PrefillStage.FlashBatch,
+                                    w: LayerWeights, layerRope: RopeParams,
+                                    cur: [GPUTensor], stage: PrefillStage,
+                                    j: Int, jEnd: Int, posBase: Int, tokens: [Int]) throws {
+        let qBytes = d.qDim * 4
+        for (r, jj) in (j..<jEnd).enumerated() {
+            let pos = posBase + jj
+            try c.blitCopies([(fb.heads, r * qBytes, scratch.heads, 0, qBytes)])
+            try c.decodeRouteAttnTail(curHc: cur[jj], w: w, s: scratch, d: d, rope: layerRope,
+                                      pos: pos, token: tokens[jj], rmsEps: rmsEps, hcEps: hcEps,
+                                      attnSplit: fb.split[r])
+            // Same phase-B snapshots as the per-token run (see encodeRouteInto
+            // call site): FFN inputs + router selection, blitted before the
+            // next token's tail overwrites the scratch.
+            var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [
+                (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
+                (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
+                (scratch.split, 0, stage.split[jj], 0, 24 * 4),
+                (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
+                (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
+            ]
+            if let mm = stage.mm {
+                copies.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
+            }
+            try c.blitCopies(copies)
         }
     }
 }

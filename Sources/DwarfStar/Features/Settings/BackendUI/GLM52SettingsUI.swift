@@ -26,8 +26,9 @@ final class GLM52SettingsUI: BackendSettingsUI {
         AnyView(GLM52MemorySection(
             store: store,
             diskKVRows: diskKVRows(
-                showBudget: false,
-                note: "GLM usa un checkpoint singolo per modello (state.glmkv): riaprire una chat ripristina il prefisso più lungo dell'ultima conversazione. Il budget in token si applica solo allo store DeepSeek.")))
+                showBudget: true,
+                gbPerKTok: 0.096,
+                note: "Store di checkpoint per prefisso come DeepSeek: riaprire una chat recente ripristina il suo prefisso più lungo e prefilla solo il resto. ~96 KB/token; sotto budget vengono rimossi prima i checkpoint meno usati. Il budget si applica al modello caricato.")))
     }
 
     override func tuningPanel() -> AnyView? {
@@ -97,6 +98,8 @@ private struct GLM52MemorySection: View {
                        isOn: $store.glmFuseEnabled)
                 Toggle("MoE batched (esperti instradati in 2 dispatch)",
                        isOn: $store.glmMoEBatchEnabled)
+                Toggle("Prefill esperti multi-token (pesi letti 1 volta per tile)",
+                       isOn: $store.glmPrefillMoEEnabled)
                 Toggle("Router fuso su GPU (−18% prefill misurato)",
                        isOn: $store.glmGpuRouterEnabled)
                 Toggle("mlock dei pesi residenti (−394 ms/token sul head)",

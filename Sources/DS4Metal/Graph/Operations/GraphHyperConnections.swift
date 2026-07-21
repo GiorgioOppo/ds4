@@ -6,10 +6,13 @@ extension GraphContext {
     /// out[t][k][d] = (blockOut+blockAdd?)[t][d]*post[t][k] + sum_j comb[t][j][k]*residual[t][j][d].
     public func hcExpand4(blockOut: GPUTensor, residual: GPUTensor, post: GPUTensor, comb: GPUTensor,
                           blockAdd: GPUTensor?, out: GPUTensor, nEmbd: Int, nTokens: Int,
-                          postByteOffset: Int = 0, combByteOffset: Int = 0) throws {
+                          postByteOffset: Int = 0, combByteOffset: Int = 0,
+                          splitTokenStride: Int? = nil) throws {
         let nHC = 4
         let hasAdd = blockAdd != nil
-        let args = MetalRuntime.hcExpandArgs(nEmbd: nEmbd, nHC: nHC, nTokens: nTokens, hasAdd: hasAdd)
+        let args = MetalRuntime.hcExpandArgs(nEmbd: nEmbd, nHC: nHC, nTokens: nTokens, hasAdd: hasAdd,
+                                             postTokenStride: splitTokenStride,
+                                             combTokenStride: splitTokenStride)
         let pso = try rt.pipeline("kernel_dsv4_hc_expand4")
         let nElem = nEmbd * nTokens
         let nth = min(256, max(1, nElem))
@@ -86,8 +89,10 @@ extension GraphContext {
 
     /// Encode-form HC weighted sum (collapse n_hc streams): out[t][d] = sum_h x[t][h][d]*w[t][h].
     public func hcWeightedSum(x: GPUTensor, weights: GPUTensor, out: GPUTensor,
-                              nEmbd: Int, nHC: Int, nTokens: Int) throws {
-        let args = MetalRuntime.hcWeightedSumArgs(nEmbd: nEmbd, nHC: nHC, nTokens: nTokens)
+                              nEmbd: Int, nHC: Int, nTokens: Int,
+                              weightsTokenStride: Int? = nil) throws {
+        let args = MetalRuntime.hcWeightedSumArgs(nEmbd: nEmbd, nHC: nHC, nTokens: nTokens,
+                                                  weightsTokenStride: weightsTokenStride)
         let pso = try rt.pipeline("kernel_dsv4_hc_weighted_sum")
         let nElem = nEmbd * nTokens
         let nth = min(256, max(1, nElem))

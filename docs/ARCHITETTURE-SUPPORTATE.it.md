@@ -13,7 +13,7 @@ decoder sia già disponibile.
 |---|---:|---:|---:|---:|---:|---|
 | DeepSeek V4 Flash | sì | sì | sì | sì | sì | Tre quantizzazioni complete sono scaricabili, selezionabili ed eseguibili. |
 | DeepSeek V4 Pro | sì | sì | sì, Q2 singolo | sì, Q2 singolo | sì, Q2 singolo | Il percorso distribuito è implementato e testato sul protocollo; la prova numerica con il GGUF Pro reale resta da eseguire. Il package Q4 split resta download-only. |
-| GLM 5.2 (`glm-dsa`) | sì | sì | sì, motore streaming | sì (chat, demo, server, benchmark, auto-tune) | no | Eseguibile end-to-end: motore streaming con gather esperti per token, pack sidecar Q4 dei layer, riuso incrementale del KV lato server e checkpoint disk-KV. Misurato ~0,33 tok/s di decode sull'IQ2_XXS a 16 GB (vedi `architectures/glm-5.2/`). |
+| GLM 5.2 (`glm-dsa`) | sì | sì | sì, motore streaming | sì (chat, demo, server, benchmark, auto-tune) | no | Eseguibile end-to-end: motore streaming con gather esperti per token, pack sidecar Q4 dei layer, riuso incrementale del KV lato server e store disk-KV per prefisso con budget in token ed eviction. Misurato ~0,33 tok/s di decode sull'IQ2_XXS a 16 GB (vedi `architectures/glm-5.2/`). |
 | Qwen | sì | no | no | no, rifiuto esplicito | no | Struttura predisposta; decoder e template non sono ancora implementati. |
 | Sconosciuta | sì | no | no | no, rifiuto esplicito | no | L'identificatore GGUF viene riportato senza tentare un caricamento DeepSeek. |
 

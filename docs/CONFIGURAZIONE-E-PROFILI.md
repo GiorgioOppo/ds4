@@ -165,6 +165,7 @@ published IQ2_XXS.
 | `DS4_GLM_RESIDENT_LAYERS` | adaptive | floor of 3 dense layers under RAM pressure (extra residents get paged: ~+750 ms/token measured) |
 | `DS4_GLM_FUSE` | 1 | commit fusion (half the synchronous waits) |
 | `DS4_GLM_MOE_BATCH` | 1 | batched MoE (all routed experts in two dispatches) |
+| `DS4_GLM_PREFILL_MOE` | 1 | multi-token prefill phase B (expert weights read once per 4-token tile; 3 dispatches per wave, bit-exact vs the per-application path) |
 | `DS4_GLM_GPU_ROUTER` | 1 | fused GPU router (−18% prefill) |
 | `DS4_GLM_MLOCK` | 1 | wire resident weights (head 433 → 39 ms/token) |
 | `DS4_GLM_READ_SPLIT` | 4 | parallel prefill layer reads (prefill only; serial in decode by design) |

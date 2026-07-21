@@ -172,6 +172,7 @@ extension ChatStore {
         // toggle qui ha effetto al reload.
         _ = setenv("DS4_GLM_FUSE", glmFuseEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_MOE_BATCH", glmMoEBatchEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_PREFILL_MOE", glmPrefillMoEEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_GPU_ROUTER", glmGpuRouterEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_MLOCK", glmMlockEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_READ_SPLIT",
@@ -205,9 +206,8 @@ extension ChatStore {
                     if self.modelPath == path { self.inspectedModelDescriptor = inspected }
                 }
                 // GLM 5.2: chat served by the GLM resident/streaming engine,
-                // not the DeepSeek loop. Deliberately minimal surface: no
-                // disk KV, roles, tools, benchmark or auto-tune — greedy
-                // chat with layer-major prefill.
+                // not the DeepSeek loop — with tools, disk-KV store,
+                // benchmark and auto-tune on its own backend surfaces.
                 if inspected.architecture
                        == GLM52BackendDefinition.supportedArchitecture,
                    GLM52BackendDefinition.runtimeEnabled {
@@ -226,7 +226,8 @@ extension ChatStore {
                                         ? glmResident : nil,
                                     activeExperts: glmExperts > 0
                                         ? glmExperts : nil,
-                                    diskKVDirectory: kvDir?.path))
+                                    diskKVDirectory: kvDir?.path,
+                                    diskKVBudgetTokens: kvBudgetTokens))
                             } catch {
                                 cont.resume(throwing: error)
                             }

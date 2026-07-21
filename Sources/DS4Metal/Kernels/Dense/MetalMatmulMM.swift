@@ -76,6 +76,25 @@ extension MetalRuntime {
         return Array(UnsafeBufferPointer(start: p, count: outDim * nTok))
     }
 
+    /// mulMMArgs with explicit activation row stride and output row stride
+    /// (elements). ne0 doubles as the dst row stride in the mm kernel, so a
+    /// strided output view lies ne0 = outRowStrideElems and dispatches only
+    /// the real column tiles (caller guards outDim % 64 == 0).
+    static func mulMMArgsStrided(inDim: Int, nTok: Int, rowBytes: UInt64,
+                                 actRowStride: UInt64, outRowStrideElems: Int) -> [UInt8] {
+        var b = [UInt8](repeating: 0, count: 88)
+        func i32(_ off: Int, _ v: Int32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { b[off+k] = $0[k] } } }
+        func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
+        func i16(_ off: Int, _ v: Int16) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<2 { b[off+k] = $0[k] } } }
+        i32(0, Int32(inDim)); i32(4, 1)                                   // ne00, ne02
+        u64(8, rowBytes); u64(16, 0); u64(24, 0)                          // nb01, nb02, nb03 (im = 0)
+        i32(32, 1)                                                        // ne12
+        u64(40, 4); u64(48, actRowStride); u64(56, 0); u64(64, 0)         // nb10..nb13 (im = 0)
+        i32(72, Int32(outRowStrideElems)); i32(76, Int32(nTok))           // ne0 (dst row stride), ne1
+        i16(80, 1); i16(82, 1)                                            // r2, r3
+        return b
+    }
+
     /// 88-byte ds4_gpu_mul_mm_args (matches ds4_gpu_make_mm_args).
     static func mulMMArgs(inDim: Int, outDim: Int, nTok: Int, rowBytes: UInt64) -> [UInt8] {
         var b = [UInt8](repeating: 0, count: 88)

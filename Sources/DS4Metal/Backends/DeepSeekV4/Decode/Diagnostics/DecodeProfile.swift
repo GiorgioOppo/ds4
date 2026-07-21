@@ -21,6 +21,15 @@ public struct DecodeProfile: Sendable {
     public var headS = 0.0        // output head
     public var forwards = 0       // number of forward() calls (= tokens)
     public var layers = 0         // total per-layer iterations
+    /// Batched multi-query prefill attention runs (DS4_PREFILL_BATCH_ATTN):
+    /// each counts ONE FlashAttention dispatch that served a whole route-batch
+    /// run. Zero when the per-token fallback served every run.
+    public var prefillFlashRuns = 0
+    /// Subset of prefillFlashRuns that ALSO ran every dense projection and HC
+    /// reduce as batched matrix kernels (DS4_PREFILL_DENSE_MM). A gap between
+    /// the two counters means Q4-requantized dense weights forced the
+    /// per-token dense fallback on some runs.
+    public var prefillDenseRuns = 0
     public var expertHits = 0     // expert slot-cache hits (persistent experts)
     public var expertMisses = 0   // expert slot-cache misses (changed experts)
     public var expertHitBytes = 0 // bytes not gathered because of cache hits

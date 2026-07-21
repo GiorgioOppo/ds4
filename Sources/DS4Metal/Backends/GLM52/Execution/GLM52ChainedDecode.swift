@@ -38,6 +38,9 @@ public final class GLM52DecodeScratch {
     let mid: MTLBuffer
     /// Piani mid del percorso MoE batched: [8 esperti][expertHiddenWidth].
     let midBatch: MTLBuffer
+    /// Piani di wave del prefill fase B multi-token (mids/contribs per
+    /// applicazione), cresciuti on demand fino al cap di wave.
+    let prefillWave = GLM52PrefillWaveScratch()
     /// Scratch del ROUTER FUSO: logits (256), top-8 selezionati (id int32),
     /// pesi normalizzati e probabilità — il readback per layer scende a
     /// 64 byte + 1 KB di probabilità per la usage imatrix.
@@ -622,14 +625,164 @@ extension MetalRuntime {
     }
 
     /// Two-phase prefill, phase B: apply ONE staged batch of routed experts
-    /// to every (token, weight) that selected them, expert-major, in one
-    /// command buffer. `hiddenAll`/`ffnInAll` are `[token][embeddingWidth]`
-    /// F32 planes snapshotted by phase A; each token's hidden accumulates
-    /// its contributions in place. Note the float-order caveat: per-token
+    /// to every (token, weight) that selected them, expert-major.
+    /// `hiddenAll`/`ffnInAll` are `[token][embeddingWidth]` F32 planes
+    /// snapshotted by phase A; each token's hidden accumulates its
+    /// contributions in place. Note the float-order caveat: per-token
     /// contributions land in union order instead of router rank order, so
     /// prefill and token-by-token decode agree within accumulation
     /// tolerance, no longer bit-exactly.
+    ///
+    /// Default path (DS4_GLM_PREFILL_MOE): the token loop lives INSIDE the
+    /// multi-token kernels — expert weights cross DRAM once per 4-token
+    /// tile instead of once per token, and one wave is 3 dispatches instead
+    /// of 3 per application. Per-token math and per-token accumulation
+    /// order are identical to the legacy per-application path, so the two
+    /// agree bit-for-bit (pinned by GLM52MoEPrefillTests).
     public func glm52ApplyRoutedExperts(
+        staged: GLM52StagedExpertSelection,
+        applications: [(slot: Int, token: Int, weight: Float)],
+        hiddenAll: MTLBuffer, ffnInAll: MTLBuffer,
+        scratch: GLM52DecodeScratch,
+        embeddingWidth: Int, expertHiddenWidth: Int) throws {
+        guard !applications.isEmpty else { return }
+        guard GLM52PrefillMoEDispatch.enabled,
+              GLM52MatvecDispatch.cooperative else {
+            try glm52ApplyRoutedExpertsLegacy(
+                staged: staged, applications: applications,
+                hiddenAll: hiddenAll, ffnInAll: ffnInAll, scratch: scratch,
+                embeddingWidth: embeddingWidth,
+                expertHiddenWidth: expertHiddenWidth)
+            return
+        }
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalError.bufferAlloc
+        }
+        // Wave cap: bounds the mids/contribs planes (~32 MB at 1024). A
+        // token's applications may split across waves; each wave reduces
+        // its own contributions in ascending application order, so the
+        // per-token order stays the legacy one.
+        let waveCap = max(1, GLM52PrefillMoEDispatch.waveCap)
+        var index = 0
+        while index < applications.count {
+            let wave = Array(applications[index..<min(
+                index + waveCap, applications.count)])
+            try glm52EncodeRoutedExpertsWave(
+                into: commandBuffer, staged: staged, wave: wave,
+                hiddenAll: hiddenAll, ffnInAll: ffnInAll, scratch: scratch,
+                embeddingWidth: embeddingWidth,
+                expertHiddenWidth: expertHiddenWidth)
+            index += wave.count
+        }
+        try glm52GraphCommit(commandBuffer)
+    }
+
+    private func glm52EncodeRoutedExpertsWave(
+        into commandBuffer: MTLCommandBuffer,
+        staged: GLM52StagedExpertSelection,
+        wave: [(slot: Int, token: Int, weight: Float)],
+        hiddenAll: MTLBuffer, ffnInAll: MTLBuffer,
+        scratch: GLM52DecodeScratch,
+        embeddingWidth: Int, expertHiddenWidth: Int) throws {
+        // Expert entries: consecutive equal slots (the wave is expert-major
+        // by construction).
+        var expertMeta: [UInt32] = []
+        var appTokens: [UInt32] = []
+        var appWeights: [Float] = []
+        var entryStart = 0
+        for (i, application) in wave.enumerated() {
+            appTokens.append(UInt32(application.token))
+            appWeights.append(application.weight)
+            let isLast = i == wave.count - 1
+            if isLast || wave[i + 1].slot != application.slot {
+                expertMeta.append(UInt32(
+                    staged.recordOffsets[application.slot]))
+                expertMeta.append(UInt32(entryStart))
+                expertMeta.append(UInt32(i - entryStart + 1))
+                entryStart = i + 1
+            }
+        }
+        let expertEntries = expertMeta.count / 3
+        // Token entries: each wave token with its ascending application
+        // list (ascending == expert-major == the legacy add order).
+        var byToken: [Int: [Int]] = [:]
+        for (i, application) in wave.enumerated() {
+            byToken[application.token, default: []].append(i)
+        }
+        var tokenMeta: [UInt32] = []
+        var tokenApps: [UInt32] = []
+        for (token, apps) in byToken.sorted(by: { $0.key < $1.key }) {
+            tokenMeta.append(UInt32(token))
+            tokenMeta.append(UInt32(tokenApps.count))
+            tokenMeta.append(UInt32(apps.count))
+            tokenApps.append(contentsOf: apps.map(UInt32.init))
+        }
+        let tokenEntries = tokenMeta.count / 3
+
+        let device = staged.buffer.device
+        let mids = try scratch.prefillWave.mids(
+            device: device,
+            bytes: wave.count * expertHiddenWidth
+                * MemoryLayout<Float>.stride)
+        let contribs = try scratch.prefillWave.contribs(
+            device: device,
+            bytes: wave.count * embeddingWidth * MemoryLayout<Float>.stride)
+        func upload(_ words: [UInt32]) throws -> MTLBuffer {
+            guard let buffer = device.makeBuffer(
+                bytes: words, length: words.count * 4,
+                options: .storageModeShared) else {
+                throw MetalError.bufferAlloc
+            }
+            return buffer
+        }
+        let expertMetaBuffer = try upload(expertMeta)
+        let appTokensBuffer = try upload(appTokens)
+        let appWeightsBuffer = try upload(appWeights.map(\.bitPattern))
+        let tokenMetaBuffer = try upload(tokenMeta)
+        let tokenAppsBuffer = try upload(tokenApps)
+
+        let arguments: [UInt32] = [
+            staged.gateUpType, UInt32(expertHiddenWidth),
+            UInt32(embeddingWidth), UInt32(expertEntries),
+            UInt32(staged.gateBytes),
+            UInt32(staged.gateBytes + staged.upBytes),
+            staged.downType, UInt32(tokenEntries),
+        ]
+        let rows = GLM52MatvecDispatch.rowsPerThreadgroup
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_prefill_swiglu_sg",
+            arguments: arguments,
+            buffers: [expertMetaBuffer, appTokensBuffer, appWeightsBuffer,
+                      ffnInAll, staged.buffer, mids],
+            threadgroups: MTLSize(
+                width: (expertHiddenWidth + rows - 1) / rows,
+                height: 1, depth: expertEntries),
+            threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                           depth: 1))
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_prefill_down_sg",
+            arguments: arguments,
+            buffers: [expertMetaBuffer, mids, staged.buffer, contribs],
+            threadgroups: MTLSize(
+                width: (embeddingWidth + rows - 1) / rows,
+                height: 1, depth: expertEntries),
+            threadsPerThreadgroup: MTLSize(width: 32, height: rows,
+                                           depth: 1))
+        try glm52GraphEncode(
+            into: commandBuffer,
+            pipelineName: "kernel_glm52_moe_prefill_reduce",
+            arguments: arguments,
+            buffers: [tokenMetaBuffer, tokenAppsBuffer, contribs, hiddenAll],
+            threadgroups: MTLSize(width: (embeddingWidth + 255) / 256,
+                                  height: tokenEntries, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// Legacy per-application path (DS4_GLM_PREFILL_MOE=0 or scalar-dot
+    /// mode): three dispatches per (expert, token), shared scratch.
+    func glm52ApplyRoutedExpertsLegacy(
         staged: GLM52StagedExpertSelection,
         applications: [(slot: Int, token: Int, weight: Float)],
         hiddenAll: MTLBuffer, ffnInAll: MTLBuffer,
@@ -666,5 +819,36 @@ extension MetalRuntime {
                 aOffset: tokenOffset, outputOffset: tokenOffset)
         }
         try glm52GraphCommit(commandBuffer)
+    }
+}
+
+/// Lazily-grown wave planes for the multi-token prefill phase B. Grown to
+/// the wave high-water mark (~32 MB at the 1024-application cap) and kept
+/// for the engine's lifetime; the single-driver decode discipline makes the
+/// unguarded mutation safe.
+public final class GLM52PrefillWaveScratch {
+    private var midsBuffer: MTLBuffer?
+    private var contribsBuffer: MTLBuffer?
+
+    func mids(device: MTLDevice, bytes: Int) throws -> MTLBuffer {
+        if let midsBuffer, midsBuffer.length >= bytes { return midsBuffer }
+        guard let grown = device.makeBuffer(
+            length: bytes, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        midsBuffer = grown
+        return grown
+    }
+
+    func contribs(device: MTLDevice, bytes: Int) throws -> MTLBuffer {
+        if let contribsBuffer, contribsBuffer.length >= bytes {
+            return contribsBuffer
+        }
+        guard let grown = device.makeBuffer(
+            length: bytes, options: .storageModeShared) else {
+            throw MetalError.bufferAlloc
+        }
+        contribsBuffer = grown
+        return grown
     }
 }

@@ -153,6 +153,112 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
     }
 
+    /// Dense F16 matmul over a token-major activation matrix (the batched
+    /// prefill's HC mixer and the IQ2 model's F16 router): out[nTok x outDim]
+    /// f32 = act[nTok x inDim] f32 x W(F16)[outDim x inDim]. NOTE: the mm
+    /// kernel stages the activation tile to f16 in threadgroup memory, so
+    /// outputs are close but not bit-identical to the matvec path.
+    public func encodeMMDenseF16(weight: GPUTensor, act: GPUTensor, actBase: Int,
+                                 out: GPUTensor, inDim: Int, outDim: Int, nTok: Int) throws {
+        let rowBytes = inDim * 2
+        let args = MetalRuntime.mulMMArgs(inDim: inDim, outDim: outDim, nTok: nTok,
+                                          rowBytes: UInt64(rowBytes))
+        let bcInp = (inDim % 32) != 0
+        let bcOut = (outDim % 64) != 0 || (nTok % 32) != 0
+        let pso = try rt.mulMMPipeline("kernel_mul_mm_f16_f32", bcInp: bcInp, bcOut: bcOut)
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)
+        e.setBuffer(act.buffer, offset: act.byteOffset + actBase, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
+        e.setThreadgroupMemoryLength(bcOut ? 8192 : 6144, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (nTok + 31) / 32, height: (outDim + 63) / 64, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
+    /// Dense Q4_K matmul over a token-major activation matrix — the batched
+    /// prefill on resident Q4-requantized weights (DS4_DENSE_Q4/DS4_QKV_Q4).
+    /// Same portable kernel family as encodeMMDenseQ8; requires inDim % 256.
+    public func encodeMMDenseQ4K(weight: GPUTensor, act: GPUTensor, actBase: Int,
+                                 out: GPUTensor, inDim: Int, outDim: Int, nTok: Int) throws {
+        precondition(inDim % 256 == 0)
+        let rowBytes = (inDim / 256) * 144
+        let args = MetalRuntime.mulMMArgs(inDim: inDim, outDim: outDim, nTok: nTok,
+                                          rowBytes: UInt64(rowBytes))
+        let bcOut = (outDim % 64) != 0 || (nTok % 32) != 0
+        let pso = try rt.mulMMPipeline("kernel_mul_mm_q4_K_f32", bcInp: false, bcOut: bcOut)
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(weight.buffer, offset: weight.byteOffset, index: 1)
+        e.setBuffer(act.buffer, offset: act.byteOffset + actBase, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
+        e.setThreadgroupMemoryLength(bcOut ? 8192 : 6144, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (nTok + 31) / 32, height: (outDim + 63) / 64, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
+    /// Q4_K twin of encodeMMDenseQ8Strided (grouped attention output when
+    /// output_a is Q4-requantized). Same ne0-as-row-stride contract.
+    public func encodeMMDenseQ4KStrided(weight: GPUTensor, weightOffset: Int,
+                                        act: GPUTensor, actBase: Int, actRowStride: Int,
+                                        out: GPUTensor, outBase: Int, outRowStrideElems: Int,
+                                        inDim: Int, outDim: Int, nTok: Int) throws {
+        precondition(inDim % 256 == 0)
+        precondition(outRowStrideElems == outDim || outDim % 64 == 0,
+                     "strided mm output requires full 64-wide tiles")
+        let rowBytes = (inDim / 256) * 144
+        let args = MetalRuntime.mulMMArgsStrided(inDim: inDim, nTok: nTok,
+                                                 rowBytes: UInt64(rowBytes),
+                                                 actRowStride: UInt64(actRowStride),
+                                                 outRowStrideElems: outRowStrideElems)
+        let bcOut = (nTok % 32) != 0
+        let pso = try rt.mulMMPipeline("kernel_mul_mm_q4_K_f32", bcInp: false, bcOut: bcOut)
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(weight.buffer, offset: weight.byteOffset + weightOffset, index: 1)
+        e.setBuffer(act.buffer, offset: act.byteOffset + actBase, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset + outBase, index: 3)
+        e.setThreadgroupMemoryLength(bcOut ? 8192 : 6144, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (nTok + 31) / 32, height: (outDim + 63) / 64, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
+    /// Dense Q8_0 matmul over STRIDED activation/output row views — the
+    /// batched prefill's grouped low-rank attention output: group g reads
+    /// activation columns [g·groupDim, (g+1)·groupDim) of each token row
+    /// (actBase + row stride actRowStride) and writes output columns
+    /// [g·outDim, (g+1)·outDim) (outBase + row stride outRowStrideElems). The
+    /// mm kernel derives BOTH the dst row stride and the r0 tile clamp from
+    /// ne0, so a strided view requires outDim % 64 == 0 (every dispatched
+    /// tile fully populated) — guarded here.
+    public func encodeMMDenseQ8Strided(weight: GPUTensor, weightOffset: Int,
+                                       act: GPUTensor, actBase: Int, actRowStride: Int,
+                                       out: GPUTensor, outBase: Int, outRowStrideElems: Int,
+                                       inDim: Int, outDim: Int, nTok: Int) throws {
+        precondition(inDim % 32 == 0)
+        precondition(outRowStrideElems == outDim || outDim % 64 == 0,
+                     "strided mm output requires full 64-wide tiles")
+        let rowBytes = (inDim / 32) * 34
+        let args = MetalRuntime.mulMMArgsStrided(inDim: inDim, nTok: nTok,
+                                                 rowBytes: UInt64(rowBytes),
+                                                 actRowStride: UInt64(actRowStride),
+                                                 outRowStrideElems: outRowStrideElems)
+        let bcOut = (nTok % 32) != 0
+        let pso = try rt.mulMMPipeline("kernel_mul_mm_q8_0_f32", bcInp: false, bcOut: bcOut)
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(weight.buffer, offset: weight.byteOffset + weightOffset, index: 1)
+        e.setBuffer(act.buffer, offset: act.byteOffset + actBase, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset + outBase, index: 3)
+        e.setThreadgroupMemoryLength(bcOut ? 8192 : 6144, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: (nTok + 31) / 32, height: (outDim + 63) / 64, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+    }
+
     /// Down projection over the (already weighted, f16) mid rows via
     /// kernel_mul_mm_id_q2_K_f16 -> down6 [nTok x k x outDim] f32.
     public func encodeMMIdDownQ2K(down: GPUTensor, mid: GPUTensor,

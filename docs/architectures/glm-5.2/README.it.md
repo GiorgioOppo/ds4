@@ -6,8 +6,12 @@ Questa cartella descrive il port nativo di GLM 5.2 (`glm-dsa`) in DwarfStar.
 Il port è **operativo end to end**: il motore streaming
 (`GLM52ResidentModel`) esegue prefill e decode dal GGUF reale su una
 macchina da 16 GB, e GUI, demo, server locale, benchmark, auto-tune e
-checkpoint disk-KV selezionano GLM nativamente. Resta solo la distribuzione,
-per ora esclusiva DeepSeek.
+checkpoint disk-KV selezionano GLM nativamente. Il pannello Benchmark esegue
+sia Speed (sweep di throughput, decode p99) sia Correctness (Top-1/2/3
+teacher-forced su `forwardBatch` layer-major, piano di campionamento e tipi
+di risultato condivisi con DeepSeek), e il pannello Diagnostica tokenizza e
+mostra template chat/tool col tokenizer e renderer GLM. Resta solo la
+distribuzione, per ora esclusiva DeepSeek.
 
 ## Stato corrente
 
@@ -20,7 +24,7 @@ per ora esclusiva DeepSeek.
 | Selezione GUI e `DS4Demo` | **sì** (chat, settings per-backend, tuning) |
 | Server locale (semantica stateless OpenAI/Anthropic) | **sì**, con riuso incrementale del prefisso KV |
 | Benchmark e auto-tune | **sì** (bottone GUI e `DS4_GLM_AUTOTUNE=1`) |
-| Checkpoint disk-KV | sì, singolo `state.glmkv` per modello (restore del prefisso più lungo) |
+| Checkpoint disk-KV | sì, store per prefisso come DeepSeek (`GLM52DiskKVStore`): più conversazioni affiancate, restore del prefisso più lungo, budget in token con eviction, `state.glmkv` legacy adottato automaticamente |
 | Profiling per fase | sì — report in stile DeepSeek più split GPU/host |
 | Distribuzione | no (solo DeepSeek) |
 
@@ -37,6 +41,13 @@ ottimizzazioni sono default del motore, ognuna con verdetto misurato:
   N+1 in un command buffer — metà delle attese sincrone (~154 → ~77/token);
 - **kernel vettorizzati**: dot IQ2_XXS/Q8_0/Q4_K con FMA float4 e letture
   larghe (−19% GPU);
+- **fase B del prefill multi-token** (`DS4_GLM_PREFILL_MOE`, sulla tecnica
+  GEMM fusa di ds4): il loop sui token sta dentro i kernel, così i pesi di
+  ogni esperto staged attraversano la DRAM una volta per tile di 4 token
+  invece che una volta per token, e una wave è 3 dispatch invece di 3 per
+  applicazione — bit-esatto rispetto al percorso per-applicazione (fissato
+  dai test; il guadagno end-to-end sul prefill va ancora misurato, fase
+  "experts" baseline 253 ms/token);
 - **MoE batched** (`DS4_GLM_MOE_BATCH`): tutti gli esperti instradati in due
   dispatch; l'esperto condiviso (sempre attivo) resta separato;
 - **router fuso su GPU** (`DS4_GLM_GPU_ROUTER`): matvec + sigmoid + top-8

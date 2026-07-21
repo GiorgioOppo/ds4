@@ -12,6 +12,11 @@ Primitive CPU portabili per conversione e requantizzazione dei pesi.
   f32 -> Q4_K coerenti con i quantizzatori di riferimento ggml; dequant di
   riferimento Q2_K/Q5_K/Q6_K (esperti routed GLM 5.2) senza quantizzatore
   locale — i byte GGUF sono la fixture.
+- [`QuantEncode.swift`](QuantEncode.swift) e
+  [`QuantEncodeIQ2XXS.swift`](QuantEncodeIQ2XXS.swift): gli ENCODER per il
+  writer GGUF (q8_0, q2_K, q4_K, q8_K, iq2_xxs; varianti reference e pesate
+  imatrix), port Swift di `gguf-tools/quants.c` di ds4, fissato
+  byte-per-byte contro il riferimento C compilato in `QuantEncodeTests`.
 
 ## Flusso
 

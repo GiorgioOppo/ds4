@@ -172,13 +172,19 @@ final class BenchController {
     /// resident Q4 + mlocked buffers and OOM-crashes on a 16 GB Mac. The run
     /// rewrites the shared KV — the next chat turn rebuilds from committed ids.
     private func runLocal(frontiers: [Int], gen: Int) {
-        guard let svc = store.benchmarkService else {
+        if let svc = store.benchmarkService {
+            runLocalDeepSeek(svc: svc, frontiers: frontiers, gen: gen)
+        } else if let glm = store.glmBenchmarkService {
+            runLocalGLM(svc: glm, frontiers: frontiers, gen: gen)
+        } else {
             log = store.isReady
                 ? "The engine is generating. Wait for the chat turn to finish, then run the benchmark.\n"
                 : "No model loaded. Load the model in Settings first — the benchmark reuses that single engine.\n"
             clearRunningState()
-            return
         }
+    }
+
+    private func runLocalDeepSeek(svc: InferenceService, frontiers: [Int], gen: Int) {
         let (logCont, rowCont) = makeChannels()
         let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
 
@@ -201,6 +207,35 @@ final class BenchController {
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
                     onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
                                  p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
+                }
+                return nil
+            } catch is CancellationError { return nil }
+            catch { return "\(error)" }
+        }
+        finish(benchWork: benchWork, logCont: logCont, rowCont: rowCont)
+    }
+
+    /// Same sweep on the GLM streaming engine: identical chart semantics
+    /// (p99 decode speed, kv bytes per frontier) plus the per-phase
+    /// streaming profile appended to the log for each point.
+    private func runLocalGLM(svc: GLM52ChatService, frontiers: [Int], gen: Int) {
+        let (logCont, rowCont) = makeChannels()
+        let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
+
+        let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
+            do {
+                onLog("Running on the shared GLM streaming engine (no second model copy)...\n")
+                await svc.warmup()
+                for c in frontiers {
+                    try Task.checkCancellation()
+                    onLog("context \(c): prefill + \(gen) tokens...\n")
+                    let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
+                    rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
+                                           genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
+                    onLog(p.report.split(separator: "\n")
+                        .map { "    \($0)\n" }.joined())
                 }
                 return nil
             } catch is CancellationError { return nil }
@@ -257,7 +292,9 @@ final class BenchController {
             clearRunningState()
             return
         }
-        guard let svc = store.benchmarkService else {
+        let deepSeek = store.benchmarkService
+        let glm = store.glmBenchmarkService
+        guard deepSeek != nil || glm != nil else {
             log = store.isReady
                 ? "The engine is generating. Wait for the chat turn to finish, then run the benchmark.\n"
                 : "No model loaded. Load the model in Settings first — the benchmark reuses that single engine.\n"
@@ -298,6 +335,30 @@ final class BenchController {
         let onObservation: @Sendable (InferenceService.AccuracyObservation) -> Void = {
             observationCont.yield($0)
         }
+        // Same parameters, same result type: only the backend call differs.
+        let runEvaluation: @Sendable () async throws -> InferenceService.AccuracyResult
+        if let deepSeek {
+            runEvaluation = {
+                try await deepSeek.accuracyBenchmark(
+                    text: text, minContextTokens: minContextTokens,
+                    maxContextTokens: maxContextTokens,
+                    maxTokensPerPiece: maxTokensPerPiece,
+                    pieceCount: pieceCount, seed: seed,
+                    bucketSize: bucketSize, onObservation: onObservation)
+            }
+        } else if let glm {
+            runEvaluation = {
+                try await glm.accuracyBenchmark(
+                    text: text, minContextTokens: minContextTokens,
+                    maxContextTokens: maxContextTokens,
+                    maxTokensPerPiece: maxTokensPerPiece,
+                    pieceCount: pieceCount, seed: seed,
+                    bucketSize: bucketSize, onObservation: onObservation)
+            }
+        } else {
+            clearRunningState()
+            return
+        }
 
         let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
             do {
@@ -310,16 +371,7 @@ final class BenchController {
                 if bucketSize > requestedBucketSize {
                     onLog("  chart block automatically raised from \(requestedBucketSize) to \(bucketSize) to cap rendering at about \(chartPointLimit) points\n")
                 }
-                let result = try await svc.accuracyBenchmark(
-                    text: text,
-                    minContextTokens: minContextTokens,
-                    maxContextTokens: maxContextTokens,
-                    maxTokensPerPiece: maxTokensPerPiece,
-                    pieceCount: pieceCount,
-                    seed: seed,
-                    bucketSize: bucketSize,
-                    onObservation: onObservation
-                )
+                let result = try await runEvaluation()
                 resultCont.yield(result)
                 onLog(
                     "  sampled \(result.pieces.count)/\(result.requestedPieceCount) pieces" +

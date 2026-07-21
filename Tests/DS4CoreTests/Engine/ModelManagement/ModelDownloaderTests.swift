@@ -33,7 +33,8 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertEqual(ModelCatalogRegistry.entries.count, 8)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
-            Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix])
+            Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix,
+                 .glm52IQ2XXS, .glm52Q2K, .glm52Q4K])
         )
 
         let proQ2 = DeepSeekV4ModelCatalog.entry(.proQ2Imatrix)
@@ -66,7 +67,7 @@ final class ModelDownloaderTests: XCTestCase {
         }, "every downloadable main-model artifact must have a pinned lowercase SHA-256")
     }
 
-    func testGLM52CatalogIsPinnedDownloadOnlyAndUsesItsOwnRepository() throws {
+    func testGLM52CatalogIsPinnedRunnableAndUsesItsOwnRepository() throws {
         let expected: [(ModelCatalogID, String, Int64, String)] = [
             (
                 .glm52IQ2XXS,
@@ -92,8 +93,9 @@ final class ModelDownloaderTests: XCTestCase {
             let entry = try XCTUnwrap(ModelCatalogRegistry.entry(id))
             let target = try XCTUnwrap(entry.artifacts.first)
             XCTAssertEqual(entry.profile, .glm52)
-            XCTAssertFalse(entry.isSelectable)
-            XCTAssertFalse(entry.runtimeAvailability.isRunnable)
+            // The GLM runtime gate is on: entries are selectable/runnable.
+            XCTAssertTrue(entry.isSelectable)
+            XCTAssertTrue(entry.runtimeAvailability.isRunnable)
             XCTAssertEqual(entry.expectedSizeBytes, byteCount)
             XCTAssertEqual(target.file, file)
             XCTAssertEqual(target.expectedSizeBytes, byteCount)
@@ -111,7 +113,7 @@ final class ModelDownloaderTests: XCTestCase {
             )
         }
 
-        XCTAssertTrue(GLM52ModelCatalog.entries.allSatisfy { !$0.isSelectable })
+        XCTAssertTrue(GLM52ModelCatalog.entries.allSatisfy(\.isSelectable))
         XCTAssertTrue(
             Set(GLM52ModelCatalog.entries.map(\.id))
                 .isDisjoint(with: Set(DeepSeekV4ModelCatalog.entries.map(\.id)))

@@ -92,20 +92,31 @@ extension MetalRuntime {
     }
 
     /// 80-byte ds4_gpu_hc_weighted_sum_args.
-    static func hcWeightedSumArgs(nEmbd: Int, nHC: Int, nTokens: Int) -> [UInt8] {
+    /// `weightsTokenStride`: bytes between one token's weight row and the
+    /// next. Default = compact [nTokens][nHC] (the decode layout); the batched
+    /// prefill passes the 24-float HC-split row stride to read the `pre` slice
+    /// straight out of the split matrix.
+    static func hcWeightedSumArgs(nEmbd: Int, nHC: Int, nTokens: Int,
+                                  weightsTokenStride: Int? = nil) -> [UInt8] {
         var b = [UInt8](repeating: 0, count: 80)
         func i64(_ off: Int, _ v: Int64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
         func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
         let e = UInt64(nEmbd) * 4
         i64(0, Int64(nEmbd)); i64(8, Int64(nHC)); i64(16, Int64(nTokens))  // n_embd, n_hc, n_tokens
         u64(24, 4); u64(32, e); u64(40, UInt64(nHC) * e)                   // nb_x0, nb_x1, nb_x2
-        u64(48, 4); u64(56, UInt64(nHC) * 4)                              // nb_w0, nb_w1
+        u64(48, 4); u64(56, UInt64(weightsTokenStride ?? nHC * 4))        // nb_w0, nb_w1
         u64(64, 4); u64(72, e)                                            // nb0, nb1
         return b
     }
 
-    /// 152-byte ds4_gpu_hc_expand_args.
-    static func hcExpandArgs(nEmbd: Int, nHC: Int, nTokens: Int, hasAdd: Bool) -> [UInt8] {
+    /// 152-byte ds4_gpu_hc_expand_args. `postTokenStride`/`combTokenStride`:
+    /// bytes between one token's post/comb values and the next. Default =
+    /// compact arrays ([nTokens][nHC] and [nTokens][nHC*nHC], the decode
+    /// layout); the batched prefill passes the 24-float HC-split row stride
+    /// so post/comb are read straight out of the split matrix.
+    static func hcExpandArgs(nEmbd: Int, nHC: Int, nTokens: Int, hasAdd: Bool,
+                             postTokenStride: Int? = nil,
+                             combTokenStride: Int? = nil) -> [UInt8] {
         var b = [UInt8](repeating: 0, count: 152)
         func i64(_ off: Int, _ v: Int64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
         func u64(_ off: Int, _ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<8 { b[off+k] = $0[k] } } }
@@ -116,8 +127,8 @@ extension MetalRuntime {
         u64(24, 4); u64(32, e)                                            // nb_block0, nb_block1
         u64(40, 4); u64(48, e)                                            // nb_add0, nb_add1
         u64(56, 4); u64(64, e); u64(72, UInt64(nHC) * e)                  // nb_res0, nb_res1, nb_res2
-        u64(80, 4); u64(88, hc)                                           // nb_post0, nb_post1
-        u64(96, 4); u64(104, hc); u64(112, UInt64(nHC) * hc)             // nb_comb0, nb_comb1, nb_comb2
+        u64(80, 4); u64(88, UInt64(postTokenStride ?? Int(hc)))           // nb_post0, nb_post1
+        u64(96, 4); u64(104, hc); u64(112, UInt64(combTokenStride ?? Int(nHC) * Int(hc))) // nb_comb0, nb_comb1, nb_comb2
         u64(120, 4); u64(128, e); u64(136, UInt64(nHC) * e)              // nb0, nb1, nb2
         i32(144, hasAdd ? 1 : 0)                                          // has_add
         return b

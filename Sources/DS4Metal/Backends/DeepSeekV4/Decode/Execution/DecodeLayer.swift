@@ -231,6 +231,23 @@ extension GraphContext {
                           comp: comp?.cache, nComp: nComp)
         encoder.popDebugGroup()                       // attention
         try phase("attn")                             // DS4_PROFILE_ROUTE boundary (flash-attn)
+        try decodeRouteAttnTail(curHc: curHc, w: w, s: s, d: d, rope: rope, pos: pos,
+                                token: token, rmsEps: rmsEps, hcEps: hcEps)
+    }
+
+    /// The post-attention half of decodeRouteAttn: inverse RoPE on s.heads ->
+    /// low-rank output projection -> HC expand -> pre-FFN HC reduce -> router.
+    /// Split out so the batched prefill can run ONE multi-query FlashAttention
+    /// for a whole token run (heads blitted into s.heads per token) and then
+    /// encode this tail per token — identical dispatches in identical order.
+    /// `attnSplit` overrides the post/comb HC split of the attention residual
+    /// expand (the batched prefill snapshots it per token in phase A1, because
+    /// later tokens' pre-attention HC reduces overwrite s.split).
+    public func decodeRouteAttnTail(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                    rope: RopeParams, pos: Int, token: Int = -1,
+                                    rmsEps: Float, hcEps: Float,
+                                    attnSplit: GPUTensor? = nil) throws {
+        let split = attnSplit ?? s.split
         encoder.pushDebugGroup("attn-out")
         // 5) post-attn heads RoPE (inverse) + faithful low-rank output projection:
         //    attn_low = attnOutLowQ8(output_a, heads); blockOut = matmulQ8(output_b, attn_low);
@@ -263,7 +280,7 @@ extension GraphContext {
         } else {
             try matmulQ8_0(weight: w.attnOut, x: s.attnLow, out: s.blockOut, inDim: d.attnLowDim, outDim: d.nEmbd)
         }
-        try hcExpand4(blockOut: s.blockOut, residual: curHc, post: s.split, comb: s.split,
+        try hcExpand4(blockOut: s.blockOut, residual: curHc, post: split, comb: split,
                       blockAdd: nil, out: s.afterAttn, nEmbd: d.nEmbd, nTokens: 1,
                       postByteOffset: 4 * 4, combByteOffset: 8 * 4)
         encoder.popDebugGroup()                       // attn-out

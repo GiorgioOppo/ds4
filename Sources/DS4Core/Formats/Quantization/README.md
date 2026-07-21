@@ -12,6 +12,11 @@ Portable CPU primitives for weight conversion and requantization.
   quantization consistent with the ggml reference quantizers; reference
   Q2_K/Q5_K/Q6_K dequant (GLM 5.2 routed experts) with no local quantizer —
   the GGUF bytes are the fixture.
+- [`QuantEncode.swift`](QuantEncode.swift) and
+  [`QuantEncodeIQ2XXS.swift`](QuantEncodeIQ2XXS.swift): the GGUF-writer
+  ENCODERS (q8_0, q2_K, q4_K, q8_K, iq2_xxs; reference and imatrix-weighted
+  variants), a Swift port of ds4 `gguf-tools/quants.c` pinned byte-for-byte
+  against the compiled C reference in `QuantEncodeTests`.
 
 ## Flow
 

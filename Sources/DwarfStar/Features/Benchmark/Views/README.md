@@ -15,6 +15,12 @@ counts. A cumulative chart shows progressive aggregate accuracy, while the
 per-piece chart keeps samples separate so corpus-position variability remains
 visible.
 
+`ChartExport.swift` saves a chart as a self-describing PNG (title, model,
+parameters, date) via `ImageRenderer` at fixed size and light appearance, or
+its underlying data as CSV, through the sandbox-safe `NSSavePanel`. Each chart
+section exposes PNG/CSV buttons; export failures go to the benchmark log.
+CSV values keep the engine's raw units (accuracy fractions in `0...1`).
+
 Piece indices in engine results and observations are zero-based. Labels shown
 to people use `index + 1`; do not feed that display value back into result
 lookup or chart identity.

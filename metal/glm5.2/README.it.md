@@ -12,7 +12,7 @@ famiglia — lo stesso layout di `metal/deepseek/`:
 | `glm52_kv.metal` | store/normalizzazione della KV-LoRA compatta, store delle chiavi indexer, store delle righe compatte |
 | `glm52_indexer.metal` | scoring dell'indexer DSA |
 | `glm52_attention.metal` | core della compact-attention a stadi (`qk_lowrank`, `attention_indexed` sulle righe di cache selezionate, `value_project`; F32 e Q8_0) |
-| `glm52_moe.metal` | FFN esperti: kernel di riferimento per-thread, varianti simdgroup e la coppia MoE batched (tutti gli esperti instradati in due dispatch) |
+| `glm52_moe.metal` | FFN esperti: kernel di riferimento per-thread, varianti simdgroup, la coppia MoE batched (tutti gli esperti instradati in due dispatch) e il trio fase-B del prefill multi-token (pesi esperti letti una volta per tile di 4 token, bit-esatto vs il percorso per-applicazione) |
 | `glm52_rope.metal` | RoPE della coda query/K e del prefisso indexer |
 | `glm52_misc.metal` | primitive del grafo di decode residente (RMSNorm, matvec F32, add) |
 

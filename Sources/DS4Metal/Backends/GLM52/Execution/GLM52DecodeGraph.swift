@@ -27,6 +27,18 @@ enum GLM52MoEBatchDispatch {
         .environment["DS4_GLM_MOE_BATCH"] != "0"
 }
 
+/// Fase B del prefill multi-token (DS4_GLM_PREFILL_MOE=0 per il percorso
+/// legacy per-applicazione): loop sui token dell'esperto dentro il kernel —
+/// pesi letti una volta per tile invece che una volta per token, tre
+/// dispatch per wave invece di tre per applicazione.
+enum GLM52PrefillMoEDispatch {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
+        .environment["DS4_GLM_PREFILL_MOE"] != "0"
+    /// Applications per wave: bounds the mids/contribs planes (~32 MB at
+    /// 1024). Var so the parity test can force multi-wave splits.
+    nonisolated(unsafe) static var waveCap = 1024
+}
+
 /// ROUTER FUSO su GPU (DS4_GLM_GPU_ROUTER=0 per disattivare — l'analogo di
 /// DS4_FUSED_ROUTER_PROBS/_FINALIZE DeepSeek): matvec F32 + sigmoid + bias
 /// + top-8 dentro il commit del trunk, readback di 64 byte (id + pesi)
@@ -47,6 +59,7 @@ public enum GLM52DispatchKnobs {
         GLM52MatvecDispatch.rowsPerThreadgroup = max(1, min(8,
             env["DS4_GLM_NSG"].flatMap(Int.init) ?? 4))
         GLM52MoEBatchDispatch.enabled = env["DS4_GLM_MOE_BATCH"] != "0"
+        GLM52PrefillMoEDispatch.enabled = env["DS4_GLM_PREFILL_MOE"] != "0"
         GLM52GpuRouterDispatch.enabled = env["DS4_GLM_GPU_ROUTER"] != "0"
         GLM52ResidentWiring.enabled = env["DS4_GLM_MLOCK"] != "0"
         GLM52LayerStreamer.refreshReadSplit(env["DS4_GLM_READ_SPLIT"]
