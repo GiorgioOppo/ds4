@@ -25,6 +25,13 @@ public struct DecodeProfile: Sendable {
     /// each counts ONE FlashAttention dispatch that served a whole route-batch
     /// run. Zero when the per-token fallback served every run.
     public var prefillFlashRuns = 0
+    /// DS4_PROFILE_PREFILL: phase-B (experts) sub-phases of the full-layer
+    /// MM prefill — routed pair GEMM (gate+up+swiglu), routed down GEMM,
+    /// batched shared FFN, and the batched tail (sum6+add+HC expand).
+    public var prefillPairS = 0.0
+    public var prefillDownS = 0.0
+    public var prefillSharedS = 0.0
+    public var prefillTailS = 0.0
     /// Subset of prefillFlashRuns that ALSO ran every dense projection and HC
     /// reduce as batched matrix kernels (DS4_PREFILL_DENSE_MM). A gap between
     /// the two counters means Q4-requantized dense weights forced the
@@ -124,7 +131,15 @@ public struct DecodeProfile: Sendable {
             let gbs = Double(gatherBytes) / gatherS / 1e9
             cacheLine += "\n  gather IO    \(String(format: "%6.1f", mbTok)) MB/token — banda effettiva \(String(format: "%.2f", gbs)) GB/s"
         }
-        var routeSplit = ""   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commits)
+        var expertsSplit = ""
+        if prefillPairS + prefillDownS + prefillSharedS + prefillTailS > 0 {
+            expertsSplit = "\n     ├ pair  \(ms(prefillPairS)) ms/token (map0 + gate/up mm + swiglu)"
+                         + "\n     ├ down  \(ms(prefillDownS)) ms/token (down mm)"
+                         + "\n     ├ shar  \(ms(prefillSharedS)) ms/token (shared FFN mm)"
+                         + "\n     ├ tail  \(ms(prefillTailS)) ms/token (sum6 + add + HC expand)"
+        }
+        var routeSplit = ""
+   // DS4_PROFILE_ROUTE: ratios meaningful, absolutes inflated (extra commits)
         if routeCompS + routeQS + routeKvS + routeAttnPhaseS + routeOutProjS + routeHcFfnS + routeRouterS > 0 {
             routeSplit = "\n     ├ comp \(ms(routeCompS)) ms/token (hc-pre + NSA compressor)"
                        + "\n     ├ q    \(ms(routeQS)) ms/token (q_a + q_b proj)"
@@ -146,7 +161,7 @@ public struct DecodeProfile: Sendable {
           embed        \(ms(embedS)) ms/token  (\(pct(embedS)))
           route/attn   \(ms(routeS)) ms/token  (\(pct(routeS)))   compute\(routeSplit)
           gather IO    \(ms(gatherS)) ms/token  (\(pct(gatherS)))   <- streaming esperti (SSD/page cache)\(layerStream)
-          experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute
+          experts      \(ms(expertsS)) ms/token  (\(pct(expertsS)))   compute\(expertsSplit)
           layer (alt)  \(ms(layerOtherS)) ms/token  (\(pct(layerOtherS)))
           output head  \(ms(headS)) ms/token  (\(pct(headS)))\(cacheLine)
           ----------------------------------------

@@ -139,6 +139,65 @@ extension GraphContext {
         }
     }
 
+    /// Batched-prefill APE bias (LEVA 7): sc[t] += ape[(pos0+t) % ratio], in
+    /// place over the run's projected score rows — the same arithmetic the
+    /// per-token store applies at state-write time.
+    func compApeAddEnc(sc: GPUTensor, ape: GPUTensor, width: Int, ratio: Int,
+                       pos0: Int, nTok: Int) throws {
+        var args = [UInt8](repeating: 0, count: 16)
+        func u32(_ off: Int, _ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { args[off+k] = $0[k] } } }
+        u32(0, UInt32(width)); u32(4, UInt32(ratio)); u32(8, UInt32(pos0)); u32(12, UInt32(nTok))
+        let pso = try rt.pipeline("kernel_dsv4_comp_ape_add")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: 16, index: 0) }
+        e.setBuffer(sc.buffer, offset: sc.byteOffset, index: 1)
+        e.setBuffer(ape.buffer, offset: ape.byteOffset, index: 2)
+        let n = nTok * width
+        let width0 = min(256, pso.maxTotalThreadsPerThreadgroup)
+        e.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                          threadsPerThreadgroup: MTLSize(width: width0, height: 1, depth: 1))
+    }
+
+    /// Batched-prefill compressor pool (LEVA 7): every emission of the run in
+    /// ONE dispatch, reading the position-ordered combined window. Math equals
+    /// the per-token pool (softmax-weighted sum per dim); reduction order is
+    /// serial per lane — tolerance-class, not bit-identical (same caveat as
+    /// the fused pool the decode deliberately avoids).
+    func compPoolBatchEnc(kv: GPUTensor, sc: GPUTensor, out: GPUTensor,
+                          headDim: Int, width: Int, ratio: Int, win: Int,
+                          nEmit: Int, firstRow: Int) throws {
+        var args = [UInt8](repeating: 0, count: 24)
+        func u32(_ off: Int, _ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { args[off+k] = $0[k] } } }
+        u32(0, UInt32(headDim)); u32(4, UInt32(width)); u32(8, UInt32(ratio))
+        u32(12, UInt32(win)); u32(16, UInt32(nEmit)); u32(20, UInt32(firstRow))
+        let pso = try rt.pipeline("kernel_dsv4_comp_pool_batch")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: 24, index: 0) }
+        e.setBuffer(kv.buffer, offset: kv.byteOffset, index: 1)
+        e.setBuffer(sc.buffer, offset: sc.byteOffset, index: 2)
+        e.setBuffer(out.buffer, offset: out.byteOffset, index: 3)
+        let w0 = min(headDim, 64)
+        e.dispatchThreads(MTLSize(width: headDim, height: nEmit, depth: 1),
+                          threadsPerThreadgroup: MTLSize(width: w0, height: 1, depth: 1))
+    }
+
+    /// Multi-row twin of fp8QuantizeRowEnc (contiguous [rows x headDim]).
+    func fp8QuantizeRowsEnc(_ x: GPUTensor, rows: Int, headDim: Int, nRot: Int) throws {
+        if nRot == headDim || rows == 0 { return }
+        let args = MetalRuntime.fp8KVQuantizeArgs(headDim: headDim, nTok: rows, nRot: nRot)
+        let pso = try rt.pipeline("kernel_dsv4_fp8_kv_quantize_f32")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 1)
+        e.setBuffer(x.buffer, offset: x.byteOffset, index: 2)
+        e.setThreadgroupMemoryLength(64 * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
     /// Compressor pool into `out` (headDim). ratio-128: pool the `ratio` single-lane
     /// rows directly. ratio-4: gather two lanes (prev rows0..3 cols0..headDim ; cur
     /// rows4..7 cols headDim..2headDim) into packed 8 x headDim then pool.

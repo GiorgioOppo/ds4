@@ -526,7 +526,14 @@ do {
             prompt = text
         }
         let tok = try Tokenizer(model: model)
-        var ids = tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
+        // DS4_RAW_PROMPT=1: equivalente di `ds4 --raw-prompt` — testo puro,
+        // niente template chat e niente BOS (ds4_tokenize_text non lo mette).
+        // Serve agli A/B cross-engine: stessa sequenza di token nei due motori.
+        let rawPrompt = ProcessInfo.processInfo.environment["DS4_RAW_PROMPT"] == "1"
+        var ids = rawPrompt
+            ? tok.tokenize(prompt).map { Int($0) }
+            : tok.encodeChatPrompt(system: nil, prompt: prompt, think: .none).map { Int($0) }
+        if rawPrompt { log("DS4Demo: prompt RAW (senza template): \(ids.count) token") }
         if let target = syntheticLiveContext {
             // Exact live-context benchmark: preserve a valid chat frame while
             // tiling only ordinary user-text tokens. This avoids depending on
@@ -545,6 +552,13 @@ do {
             synthetic.append(contentsOf: suffix)
             ids = synthetic
             log("DS4Demo: contesto sintetico esatto: \(ids.count) token (frame BOS/User/Assistant preservato)")
+        }
+        // DS4_DUMP_TOKENS=/path: scrive la sequenza token nel formato di
+        // `ds4 --dump-tokens` ("[id, id, ...]") per il diff cross-engine.
+        if let dumpPath = ProcessInfo.processInfo.environment["DS4_DUMP_TOKENS"], !dumpPath.isEmpty {
+            let line = "[" + ids.map(String.init).joined(separator: ", ") + "]\n"
+            try? line.write(toFile: dumpPath, atomically: true, encoding: .utf8)
+            log("DS4Demo: dump token → \(dumpPath) (\(ids.count) token)")
         }
         // Sampling defaults remain greedy for benchmark/backward compatibility,
         // but the 2-bit model can fall into a coherent yet unrelated greedy

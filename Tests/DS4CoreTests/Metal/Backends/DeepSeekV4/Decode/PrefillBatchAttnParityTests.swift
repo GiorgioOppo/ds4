@@ -28,7 +28,23 @@ final class PrefillBatchAttnParityTests: XCTestCase {
         return out
     }
 
+    /// Full-layer phase B (DS4_PREFILL_FULL_LAYER, leva 6): the whole-layer
+    /// slab with GLOBAL ids must match the forward() reference exactly like
+    /// the union path does. The threshold is lowered via env so the 12-token
+    /// fixture chunk qualifies; restored afterwards for the other test.
+    func testFullLayerPrefillMatchesForward() throws {
+        setenv("DS4_PREFILL_FULL_LAYER_MIN", "8", 1)
+        defer { unsetenv("DS4_PREFILL_FULL_LAYER_MIN") }
+        try runPrefillParity(expectFullLayer: true)
+    }
+
     func testBatchedPrefillMatchesForward() throws {
+        setenv("DS4_PREFILL_FULL_LAYER_MIN", "99999", 1)   // keep the union path under test
+        defer { unsetenv("DS4_PREFILL_FULL_LAYER_MIN") }
+        try runPrefillParity(expectFullLayer: false)
+    }
+
+    private func runPrefillParity(expectFullLayer: Bool) throws {
         let rt = try makeRuntime()
         let d = DSV4Dims(nEmbd: 512, nHC: 4, headDim: 512, nHead: 2, qRank: 256, qDim: 1024,
                          sharedFfn: 512, nExperts: 256, expertFfn: 256, k: 6, nRot: 64, vocab: 1024,
@@ -64,13 +80,21 @@ final class PrefillBatchAttnParityTests: XCTestCase {
                                              out: oh, maxKeys: nKeys)
         // Batched prefill: the expert-gather path (packed zero experts) routes
         // phase A through encodeFlashRun when DS4_PREFILL_BATCH_ATTN is on.
+        // The widest gather seen tells which phase-B path ran (full-layer
+        // requests ALL nExperts; the union path never exceeds 6·tokens).
+        final class MaxIds: @unchecked Sendable {
+            private let lock = NSLock(); private(set) var v = 0
+            func note(_ n: Int) { lock.lock(); v = max(v, n); lock.unlock() }
+        }
+        let maxIds = MaxIds()
         let prefiller = try StreamingDecoder(rt: rt, dims: d, rope: rope, nLayers: nLayer,
                                              layerProvider: { layers[$0] }, embedTable: embedTable,
                                              out: oh, maxKeys: nKeys,
                                              expertGather: { _, ids in
-                                                 (try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes),
-                                                  try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes),
-                                                  try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes))
+                                                 maxIds.note(ids.count)
+                                                 return (try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes),
+                                                         try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes),
+                                                         try GPUTensor.zerosBytes(rt, byteLength: ids.count * expertBytes))
                                              })
         try XCTSkipUnless(prefiller.prefillBatchAttn, "DS4_PREFILL_BATCH_ATTN disabled in env")
 
@@ -84,6 +108,11 @@ final class PrefillBatchAttnParityTests: XCTestCase {
         if prefiller.prefillDenseMM {
             XCTAssertEqual(prefiller.profile.prefillDenseRuns, prefiller.profile.prefillFlashRuns,
                            "dense-GEMM path was expected on every run (all-Q8 fixture)")
+        }
+        if expectFullLayer {
+            XCTAssertEqual(maxIds.v, d.nExperts, "full-layer phase B was not taken")
+        } else {
+            XCTAssertLessThan(maxIds.v, d.nExperts, "union phase B expected, saw a full-layer gather")
         }
         XCTAssertEqual(want.count, got.count)
         var maxRel: Float = 0

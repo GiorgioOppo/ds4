@@ -84,8 +84,10 @@ extension GraphContext {
         e.setBuffer(ids.buffer, offset: ids.byteOffset, index: 1)
         e.setBuffer(htpe.buffer, offset: htpe.byteOffset, index: 2)
         e.setBuffer(hids.buffer, offset: hids.byteOffset, index: 3)
-        // Staging: ntg tokens per sweep, kPerTok u16 each.
-        e.setThreadgroupMemoryLength(max(64, nExperts * kPerTok * 2), index: 0)
+        // Staging: ntg tokens per sweep, kPerTok u16 each. Metal requires the
+        // threadgroup length to be a multiple of 16 bytes (the debug layer
+        // asserts under Xcode; terminal runs silently accept) — round up.
+        e.setThreadgroupMemoryLength((max(64, nExperts * kPerTok * 2) + 15) & ~15, index: 0)
         e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: nExperts, height: 1, depth: 1))
     }

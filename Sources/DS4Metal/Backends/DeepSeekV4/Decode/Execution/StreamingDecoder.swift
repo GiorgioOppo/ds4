@@ -72,6 +72,12 @@ public final class StreamingDecoder {
     /// attention for A/B parity. Runs that would overflow the raw ring
     /// (DS4_RAW_RING) fall back automatically.
     let prefillBatchAttn = ProcessInfo.processInfo.environment["DS4_PREFILL_BATCH_ATTN"] != "0"
+    /// DS4_PROFILE_PREFILL=1: time the BATCHED prefill run's sub-phases
+    /// (dense path only) with commit boundaries, accumulated under the same
+    /// route-split labels the decode profiler prints (comp/q/kv/attn/out-proj/
+    /// hc-ffn/router). Forces synchronous commits — absolute numbers inflate,
+    /// read the RATIOS (same caveat as DS4_PROFILE_ROUTE).
+    let profilePrefill = ProcessInfo.processInfo.environment["DS4_PROFILE_PREFILL"] == "1"
     /// DS4_PREFILL_DENSE_MM (default ON, requires the batched-attention path):
     /// inside a batched route run, EVERY dense projection (q_a, q_b, kv, the
     /// grouped low-rank output, output_b, router) and both HC reduces run as
@@ -83,6 +89,38 @@ public final class StreamingDecoder {
     /// for A/B. Layers with Q4-requantized dense weights (DS4_DENSE_Q4 /
     /// DS4_QKV_Q4) fall back automatically.
     let prefillDenseMM = ProcessInfo.processInfo.environment["DS4_PREFILL_DENSE_MM"] != "0"
+    /// DS4_PREFILL_FULL_LAYER (default ON): when the chunk has at least
+    /// DS4_PREFILL_FULL_LAYER_MIN tokens (512), prefill phase B streams the
+    /// WHOLE routed layer once (all experts, global ids — no unions, no
+    /// remap) and double-buffers the NEXT layer's slab during this layer's
+    /// FFNs — the C engine's prefill shape (its 3.38 GiB "prefill expert
+    /// reserve"). Bytes/token = layerBytes/chunkTokens (26 MB/token at 2.7k
+    /// measured on ds4) vs the union path's ~155 MB/token; sequential reads
+    /// instead of per-union re-reads. Below the threshold the union path is
+    /// cheaper (reads only the selected experts) and remains in charge.
+    /// `=0` restores the union grouping everywhere.
+    let prefillFullLayer = ProcessInfo.processInfo.environment["DS4_PREFILL_FULL_LAYER"] != "0"
+    /// DS4_PREFILL_RESIDENT_IDS (default ON, leva 8): in full-layer phase B
+    /// the router selections/weights are consumed straight from the GPU
+    /// slabs (no CPU readback, no restaging, no snapshot blits); usage stats
+    /// are recorded from the slab after the commit. `=0` restores the CPU
+    /// round-trip for A/B (bit-identical expected: same kernels, same bytes).
+    let prefillResidentIds = ProcessInfo.processInfo.environment["DS4_PREFILL_RESIDENT_IDS"] != "0"
+    /// Minimum chunk tokens for the full-layer path (crossover ≈ 500 on the
+    /// 2-bit Flash: below it the union of selected experts is fewer bytes).
+    let prefillFullLayerMin = max(8, ProcessInfo.processInfo.environment["DS4_PREFILL_FULL_LAYER_MIN"].flatMap(Int.init) ?? 512)
+    /// In-flight NEXT-layer full-slab gather (full-layer prefill pipeline):
+    /// kicked when layer i's phase B starts computing, consumed by layer
+    /// i+1's phase B. Never crosses a chunk (the last layer kicks nothing);
+    /// error paths must drainFullLayerGather() before unwinding.
+    var fullLayerPending: (layer: Int, pending: PrefillGather.Pending)?
+
+    /// Join the in-flight full-layer slab gather (error/teardown paths).
+    func drainFullLayerGather() {
+        fullLayerPending?.pending.join()
+        fullLayerPending = nil
+    }
+
     /// DS4_PREFILL_MM=1 (OPT-IN): the group's routed FFN runs through the
     /// mul_mm_id matrix-matrix kernels (expert weights read once per tile for
     /// ALL the group's tokens) instead of one matvec chain per token. Same

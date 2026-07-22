@@ -118,6 +118,20 @@ active in the decode-oriented resident-Q4 profile. `=0` restores the
 per-token dense projections for A/B. The profile counters
 `prefillFlashRuns`/`prefillDenseRuns` report how many runs took each path.
 
+With `DS4_PREFILL_FULL_LAYER` (default on) and a chunk of at least
+`DS4_PREFILL_FULL_LAYER_MIN` tokens (512), phase B streams the WHOLE routed
+layer once — all experts, GLOBAL ids, no unions, no remap — and
+double-buffers the next layer's slab during this layer's FFNs (the C
+engine's prefill shape; ~2×1.7 GiB transient, released after the prefill).
+Bytes/token become layerBytes/chunkTokens, so long chunks pay: measured
+26.8 MB/token at a 4096-token chunk vs ~155 MB/token on the union path,
+with the exposed gather time dropping to ~0. The MM paths' routed tail is
+batched too (unit-weight collapse + rows-add + one HC expand per run,
+bit-identical to the per-token tail). Best measured prefill env on the
+2-bit Flash: `DS4_PREFILL_ROUTE_BATCH=128 DS4_PREFILL_CHUNK=4096
+DS4_PREFILL_MM=1 DS4_EXPERT_PREAD=1 DS4_PREAD_SPLIT=4` — 26 tok/s on a
+2.7k-token real prompt (M1 Pro), from 3.6 before this work.
+
 ## 4. Decoding one token
 
 For each token the decoder runs all layers in order:

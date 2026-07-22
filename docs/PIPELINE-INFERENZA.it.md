@@ -119,6 +119,20 @@ batchato resta attivo anche nel profilo residente-Q4 orientato al decode.
 `prefillFlashRuns`/`prefillDenseRuns` riportano quanti run hanno preso ciascun
 percorso.
 
+Con `DS4_PREFILL_FULL_LAYER` (default attivo) e un chunk di almeno
+`DS4_PREFILL_FULL_LAYER_MIN` token (512), la fase B streama il layer routed
+INTERO una sola volta — tutti gli esperti, id GLOBALI, niente unioni né
+remap — e mette in double-buffer lo slab del layer successivo durante le FFN
+di quello corrente (la forma di prefill del motore C; ~2×1.7 GiB transienti,
+rilasciati a fine prefill). I byte/token diventano byteLayer/tokenChunk:
+misurati 26.8 MB/token con chunk 4096 contro ~155 del percorso a unioni, con
+il gather esposto che scende a ~0. Anche la coda routed dei percorsi MM è
+batchata (collasso a pesi unitari + add a righe + un HC expand per run,
+bit-identica alla coda per-token). Miglior env di prefill misurato sul Flash
+2-bit: `DS4_PREFILL_ROUTE_BATCH=128 DS4_PREFILL_CHUNK=4096 DS4_PREFILL_MM=1
+DS4_EXPERT_PREAD=1 DS4_PREAD_SPLIT=4` — 26 tok/s su un prompt reale da 2.7k
+token (M1 Pro), dai 3.6 di partenza.
+
 ## 4. Decode di un token
 
 Per ogni token il decoder esegue tutti i layer in ordine:

@@ -8369,7 +8369,13 @@ kernel void kernel_dsv4_hc_split_weighted_sum_norm4(
 
     sumf = sum_shmem[tiisg];
     sumf = simd_sum(sumf);
+#ifdef DS4_METAL_NORM_RSQRT_DISABLE
+    // Stessa formula di kernel_rms_norm_fuse_impl: rsqrt() e 1.0f/sqrt()
+    // possono differire di ~1 ULP e la differenza si accumula sui 43 layer.
+    const float norm_scale = 1.0f / sqrt(sumf / float(n_embd) + args.norm_eps);
+#else
     const float norm_scale = rsqrt(sumf / float(n_embd) + args.norm_eps);
+#endif
 
     device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args.nb1);
     device const float4 *w4 = (device const float4 *)norm_weight;
@@ -9331,6 +9337,74 @@ kernel void kernel_dsv4_ratio4_shift_f32(
 
     state_kv[gid] = state_kv[n + gid];
     state_score[gid] = state_score[n + gid];
+}
+
+struct ds4_metal_args_dsv4_comp_ape_add {
+    uint32_t width;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t n_tok;
+};
+
+// Batched-prefill APE bias: sc[t][g] += ape[(pos0+t) % ratio][g] over the
+// run's projected score rows — the same arithmetic the per-token store
+// applies, hoisted out of the recurrence so the pool can read the projection
+// matrix directly. APE is F16 (ape_type 1, the only type this engine stores).
+kernel void kernel_dsv4_comp_ape_add(
+        constant ds4_metal_args_dsv4_comp_ape_add & args,
+        device       float * sc,
+        device const half  * ape,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_tok * args.width;
+    if (gid >= n || args.ratio == 0) return;
+    const uint t = gid / args.width;
+    const uint g = gid % args.width;
+    const uint pm = (args.pos0 + t) % args.ratio;
+    sc[gid] += (float)ape[pm * args.width + g];
+}
+
+struct ds4_metal_args_dsv4_comp_pool_batch {
+    uint32_t head_dim;    // h (pooled row width)
+    uint32_t width;       // combined row width: h (ratio-128) or 2h (ratio-4)
+    uint32_t ratio;
+    uint32_t win;         // pool window rows: coff*ratio (8 or 128)
+    uint32_t n_emit;
+    uint32_t first_row;   // combined row of the FIRST emission's own position
+};
+
+// Batched-prefill compressor pool: for each emission e and dim g, softmax
+// over the window's APE-biased scores weighting the projected kv, exactly the
+// per-token pool's math (permutation-invariant, serial reduce per lane).
+// Combined kv/sc rows are position-ordered (head from the persistent state,
+// then the run's projections); never-written head positions carry the state
+// init score -1e30, whose weight underflows to zero like the per-token ring.
+// ratio-4 lane rule (see kernel_dsv4_compressor_store_one + the pool packer):
+// the window's OLDER group reads the FIRST column half, the newer group the
+// SECOND half of the full-width rows.
+kernel void kernel_dsv4_comp_pool_batch(
+        constant ds4_metal_args_dsv4_comp_pool_batch & args,
+        device const float * kv,
+        device const float * sc,
+        device       float * out,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= args.head_dim || gid.y >= args.n_emit) return;
+    const uint g = gid.x;
+    const uint last = args.first_row + gid.y * args.ratio;   // newest window row
+    float m = -FLT_MAX;
+    for (uint w = 0; w < args.win; w++) {
+        const uint row = last + 1 + w - args.win;
+        const uint col = (args.ratio == 4u && w >= 4u) ? args.head_dim + g : g;
+        m = max(m, sc[row * args.width + col]);
+    }
+    float sum = 0.0f, acc = 0.0f;
+    for (uint w = 0; w < args.win; w++) {
+        const uint row = last + 1 + w - args.win;
+        const uint col = (args.ratio == 4u && w >= 4u) ? args.head_dim + g : g;
+        const float e = exp(sc[row * args.width + col] - m);
+        sum += e;
+        acc += e * kv[row * args.width + col];
+    }
+    out[gid.y * args.head_dim + g] = acc / sum;
 }
 
 // One-token compressor frontier update. Decode appends exactly one projected KV

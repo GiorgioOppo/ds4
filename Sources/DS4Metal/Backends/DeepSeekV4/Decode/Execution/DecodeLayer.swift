@@ -59,7 +59,9 @@ extension GraphContext {
         args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
         e.setBuffer(scores.buffer, offset: scores.byteOffset, index: 1)
         e.setBuffer(mask.buffer, offset: mask.byteOffset, index: 2)
-        e.setThreadgroupMemoryLength(max(1, keep) * 4, index: 0)
+        // Multiple-of-16 API requirement (see encodeMoEMap0): odd `keep` counts
+        // would trip the Xcode debug layer.
+        e.setThreadgroupMemoryLength((max(1, keep) * 4 + 15) & ~15, index: 0)
         e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
     }

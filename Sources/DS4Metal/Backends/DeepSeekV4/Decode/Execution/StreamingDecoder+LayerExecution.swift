@@ -32,6 +32,7 @@ extension StreamingDecoder {
     /// and dense-stream reads all run on background queues and may retain the
     /// old model. Draining them makes the following A/B load independent.
     public func quiesceForTeardown() {
+        drainFullLayerGather()
         drainFFN()
         lookaheadQ.sync {}
         teardownIODrain?()
@@ -351,8 +352,10 @@ extension StreamingDecoder {
         }
     }
 
-    /// Accumulate per-sub-phase route timings (DS4_PROFILE_ROUTE) into the profile.
-    private func accumulateRoutePhases(_ a: GraphContext, _ b: GraphContext?) {
+    /// Accumulate per-sub-phase route timings (DS4_PROFILE_ROUTE, and the
+    /// batched prefill's DS4_PROFILE_PREFILL — same phase names) into the
+    /// profile. Internal: +Prefill accumulates its batched runs through this.
+    func accumulateRoutePhases(_ a: GraphContext, _ b: GraphContext?) {
         func add(_ pt: [String: Double]) {
             profile.routeCompS += pt["comp", default: 0]
             profile.routeQS += pt["q", default: 0]

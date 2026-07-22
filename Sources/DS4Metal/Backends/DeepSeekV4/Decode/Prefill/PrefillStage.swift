@@ -13,6 +13,18 @@ extension StreamingDecoder {
         let split: [GPUTensor]   // n × 24           (HC split)
         let ids: [GPUTensor]     // n × k Int32      (remapped ids, padded to k)
         let rw: [GPUTensor]      // n × k Float      (route weights, 0-padded)
+        /// Whole-slab views of attn/split (the per-token entries above are row
+        /// views into these): the batched phase-B tail reads residuals and HC
+        /// splits as matrices (hcExpand4 with nTokens = run length).
+        let attnSlab: GPUTensor
+        let splitSlab: GPUTensor
+        let curSlab: GPUTensor
+        /// LEVA 8: router selections/weights stay GPU-resident — these slabs
+        /// have EXACTLY the [n × k] token-major layout mul_mm_id's map0 and
+        /// pair kernels consume, so the full-layer phase B binds them directly
+        /// (no CPU readback, no restaging).
+        let idsSlab: GPUTensor
+        let rwSlab: GPUTensor
         /// Extra buffers for the mul_mm_id path (DS4_PREFILL_MM), rewritten per
         /// group: token-major activation matrix, group-local ids/weights, the
         /// expert-major map (htpe/hids) and the mid/down6 outputs.
@@ -31,6 +43,7 @@ extension StreamingDecoder {
             let sMid: GPUTensor      // n × sharedFfn f32
             let sOut: GPUTensor      // n × nEmbd f32
             let ones: GPUTensor      // n × f32 = 1 (unit route weights for the rows-swiglu)
+            let routedMat: GPUTensor // n × nEmbd f32 (batched sum6 -> +shared, in place)
         }
         let mm: MMBuffers?
         /// Buffers for the batched multi-query prefill attention
@@ -43,6 +56,11 @@ extension StreamingDecoder {
             let qMat: GPUTensor  // nq × nHead·512 f32 (row-major query rows)
             let heads: GPUTensor // nq × nHead·512 f32 (attention output rows)
             let mask: GPUTensor  // nq × maxKv f16 (CPU-filled per run)
+            /// Second mask for the ASYNC phase-A pipeline: run r+1's CPU mask
+            /// fill must not race run r's in-flight GPU reads — runs alternate
+            /// between the two buffers by parity. Everything else in the batch
+            /// is GPU-written, so the in-order queue serializes it.
+            let maskB: GPUTensor
             let kvF16: GPUTensor // maxKv × 512 f16 (staged raw span + comp rows)
             let pad: GPUTensor   // final partial 64-block K/V/mask padding
             let blk: GPUTensor   // mask block map (skip fully-masked tiles)
@@ -73,6 +91,13 @@ extension StreamingDecoder {
             let compScMat: GPUTensor  // nq × 2·headDim
             let idxKvMat: GPUTensor   // nq × 2·nIndexerHeadDim
             let idxScMat: GPUTensor   // nq × 2·nIndexerHeadDim
+            /// LEVA 7 — batched compressor pool: position-ordered combined
+            /// window (state head + run projections, APE'd scores) and the
+            /// pooled emission rows. Sized for the widest case (ratio-128
+            /// head of 127 rows, attention-compressor width 2·headDim).
+            let compCombKv: GPUTensor  // (128 + nq) × 2·headDim
+            let compCombSc: GPUTensor  // (128 + nq) × 2·headDim
+            let compPooled: GPUTensor  // (nq/4 + 2) × headDim
 
             init(_ rt: MetalRuntime, nq: Int, maxKv: Int, d: DSV4Dims) throws {
                 let sb = GraphContext.flashPrefillScratchBytes(nHead: d.nHead, nQ: nq, maxKv: maxKv)
@@ -81,6 +106,7 @@ extension StreamingDecoder {
                 qMat = try .zerosBytes(rt, byteLength: sb.q)
                 heads = try .zerosBytes(rt, byteLength: sb.heads)
                 mask = try .zerosBytes(rt, byteLength: sb.mask)
+                maskB = try .zerosBytes(rt, byteLength: sb.mask)
                 kvF16 = try .zerosBytes(rt, byteLength: sb.kvF16)
                 pad = try .zerosBytes(rt, byteLength: sb.pad)
                 blk = try .zerosBytes(rt, byteLength: sb.blk)
@@ -108,6 +134,9 @@ extension StreamingDecoder {
                 compScMat = try .zeros(rt, floatCount: nq * 2 * d.headDim)
                 idxKvMat = try .zeros(rt, floatCount: nq * 2 * d.nIndexerHeadDim)
                 idxScMat = try .zeros(rt, floatCount: nq * 2 * d.nIndexerHeadDim)
+                compCombKv = try .zeros(rt, floatCount: (128 + nq) * 2 * d.headDim)
+                compCombSc = try .zeros(rt, floatCount: (128 + nq) * 2 * d.headDim)
+                compPooled = try .zeros(rt, floatCount: (nq / 4 + 2) * d.headDim)
             }
         }
         let flash: FlashBatch?
@@ -120,11 +149,17 @@ extension StreamingDecoder {
         /// preserving every call site's existing GPUTensor API.
         private static func rowViews(_ rt: MetalRuntime, n: Int,
                                      rowBytes: Int, rowCount: Int) throws -> [GPUTensor] {
+            try slabViews(rt, n: n, rowBytes: rowBytes, rowCount: rowCount).views
+        }
+
+        static func slabViews(_ rt: MetalRuntime, n: Int, rowBytes: Int,
+                              rowCount: Int) throws -> (slab: GPUTensor, views: [GPUTensor]) {
             let slab = try GPUTensor.zerosBytes(rt, byteLength: n * rowBytes)
-            return (0..<n).map {
+            let views = (0..<n).map {
                 slab.subview(byteOffset: $0 * rowBytes, byteLength: rowBytes,
                              count: rowCount)
             }
+            return (slab, views)
         }
 
         init(_ rt: MetalRuntime, n: Int, d: DSV4Dims, mmPath: Bool, maxUnion: Int,
@@ -132,13 +167,18 @@ extension StreamingDecoder {
             flash = try flashBatch.flatMap { fb in
                 fb.nq >= 2 ? try FlashBatch(rt, nq: fb.nq, maxKv: fb.maxKv, d: d) : nil
             }
-            cur = try Self.rowViews(rt, n: n, rowBytes: d.nEmbd * 4,
-                                    rowCount: d.nEmbd)
-            attn = try Self.rowViews(rt, n: n, rowBytes: d.nHC * d.nEmbd * 4,
-                                     rowCount: d.nHC * d.nEmbd)
-            split = try Self.rowViews(rt, n: n, rowBytes: 24 * 4, rowCount: 24)
-            ids = try Self.rowViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
-            rw = try Self.rowViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
+            let curPair = try Self.slabViews(rt, n: n, rowBytes: d.nEmbd * 4,
+                                             rowCount: d.nEmbd)
+            curSlab = curPair.slab; cur = curPair.views
+            let attnPair = try Self.slabViews(rt, n: n, rowBytes: d.nHC * d.nEmbd * 4,
+                                              rowCount: d.nHC * d.nEmbd)
+            attnSlab = attnPair.slab; attn = attnPair.views
+            let splitPair = try Self.slabViews(rt, n: n, rowBytes: 24 * 4, rowCount: 24)
+            splitSlab = splitPair.slab; split = splitPair.views
+            let idsPair = try Self.slabViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
+            idsSlab = idsPair.slab; ids = idsPair.views
+            let rwPair = try Self.slabViews(rt, n: n, rowBytes: d.k * 4, rowCount: d.k)
+            rwSlab = rwPair.slab; rw = rwPair.views
             if mmPath {
                 let onesBuf = try GPUTensor.zeros(rt, floatCount: n)
                 let op = (onesBuf.buffer.contents() + onesBuf.byteOffset)
@@ -156,7 +196,8 @@ extension StreamingDecoder {
                     sUp: try .zeros(rt, floatCount: n * d.sharedFfn),
                     sMid: try .zeros(rt, floatCount: n * d.sharedFfn),
                     sOut: try .zeros(rt, floatCount: n * d.nEmbd),
-                    ones: onesBuf)
+                    ones: onesBuf,
+                    routedMat: try .zeros(rt, floatCount: n * d.nEmbd))
             } else {
                 mm = nil
             }

@@ -523,7 +523,13 @@ kernel void kernel_dsv4_hc_split_weighted_sum_norm4(
 
     sumf = sum_shmem[tiisg];
     sumf = simd_sum(sumf);
+#ifdef DS4_METAL_NORM_RSQRT_DISABLE
+    // Stessa formula di kernel_rms_norm_fuse_impl: rsqrt() e 1.0f/sqrt()
+    // possono differire di ~1 ULP e la differenza si accumula sui 43 layer.
+    const float norm_scale = 1.0f / sqrt(sumf / float(n_embd) + args.norm_eps);
+#else
     const float norm_scale = rsqrt(sumf / float(n_embd) + args.norm_eps);
+#endif
 
     device float4 *dst4 = (device float4 *)(dst + (uint64_t)row * args.nb1);
     device const float4 *w4 = (device const float4 *)norm_weight;

@@ -65,9 +65,23 @@ public final class MetalRuntime {
     public init() throws {
         guard let dev = MTLCreateSystemDefaultDevice() else { throw MetalError.noDevice }
         guard let q = dev.makeCommandQueue() else { throw MetalError.noQueue }
-        self.library = try dev.makeLibrary(source: MetalRuntime.buildSourceEmbedded(), options: MTLCompileOptions())
+        self.library = try dev.makeLibrary(source: MetalRuntime.buildSourceEmbedded(), options: MetalRuntime.compileOptions())
         self.device = dev
         self.queue = q
+    }
+
+    /// Opzioni di compilazione condivise. Le due macro replicano i default di
+    /// produzione di ds4 (drift-patch hc_stable/norm_unify, ON di default là):
+    /// sigmoide HC in forma tanh e RMSNorm con 1/sqrt al posto di rsqrt.
+    /// Senza queste macro gli #ifdef già presenti negli shader cadono sul ramo
+    /// storico e i logit divergono da ds4 di ~0.24 medi a parità di GGUF.
+    static func compileOptions() -> MTLCompileOptions {
+        let opts = MTLCompileOptions()
+        opts.preprocessorMacros = [
+            "DS4_METAL_HC_STABLE": NSNumber(value: 1),
+            "DS4_METAL_NORM_RSQRT_DISABLE": NSNumber(value: 1),
+        ]
+        return opts
     }
 
     /// Explicit override: compile kernels from an on-disk metal/ folder (used by
@@ -76,7 +90,7 @@ public final class MetalRuntime {
         guard let dev = MTLCreateSystemDefaultDevice() else { throw MetalError.noDevice }
         guard let q = dev.makeCommandQueue() else { throw MetalError.noQueue }
         let source = try MetalRuntime.buildSource(metalDir: metalDir)
-        let opts = MTLCompileOptions()
+        let opts = MetalRuntime.compileOptions()
         // Throws MTLLibraryError with the compiler diagnostics on failure.
         self.library = try dev.makeLibrary(source: source, options: opts)
         self.device = dev
