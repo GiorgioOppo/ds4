@@ -64,6 +64,11 @@ public enum GLM52DispatchKnobs {
         GLM52ResidentWiring.enabled = env["DS4_GLM_MLOCK"] != "0"
         GLM52LayerStreamer.refreshReadSplit(env["DS4_GLM_READ_SPLIT"]
             .flatMap(Int.init))
+        // Leva 1 del prefill (route a gruppi): opt-in finché la parità sul
+        // GGUF reale non è certificata; rilettura qui = toggle GUI al reload.
+        GLM52PrefillBatchDispatch.enabled = env["DS4_GLM_PREFILL_BATCH"] == "1"
+        GLM52PrefillBatchDispatch.groupSize = max(2,
+            env["DS4_GLM_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 16)
     }
 }
 

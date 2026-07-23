@@ -189,6 +189,7 @@ extension StreamingDecoder {
             // for the whole chunk instead of freeing at each EVICT.
             try autoreleasepool {
                 try Task.checkCancellation()
+                prefillLayerProgress?(i, nLayers, n)     // progresso vivo per la GUI
                 let w = try layerProvider(i)            // LOAD layer i ONCE for all chunk tokens
                 if i + 1 < nLayers { prefetch?(i + 1) }   // read-ahead next layer (overlaps its I/O)
                 let layerRope = ropeParams(layer: i)

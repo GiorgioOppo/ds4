@@ -109,6 +109,9 @@ private struct DeepSeekMemorySection: View {
                     value: $store.expertLookahead, in: 0...12, step: 2)
             Text("Prefills the NEXT layer's cache slots while the current one computes: exact for the hash layers (always on), top-N from the usage prior when > 0. Speculative I/O runs in the SSD-idle window and yields to the real gather; a wrong guess only wastes idle bandwidth. Applies on the next model load — A/B the tok/s.")
                 .font(.caption).foregroundStyle(.secondary)
+            Toggle("Indexed DSA attention (contesti >4k) — prefill lungo ~2.7×", isOn: $store.indexedAttnEnabled)
+            Text("Oltre la soglia dell'indexer (~4k token) l'attention legge SOLO le 512 righe compresse selezionate invece dell'intero contesto: prefill 8k misurato 686→256 s (32.3 tok/s, sopra il motore C di riferimento), decode −5-8% nella fascia 4-8k, inerte sotto soglia. Stesso set di righe del percorso a maschera (parità nei test). Si applica al prossimo caricamento del modello.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Experts via direct pread (F_NOCACHE) - recommended <=16 GB", isOn: $store.expertPreadEnabled)
             if store.expertPreadEnabled {
                 Stepper("Pread split: \(store.preadSplit)", value: $store.preadSplit,

@@ -171,6 +171,7 @@ extension ChatStore {
         // rilegge a ogni init (GLM52DispatchKnobs.refresh), quindi un
         // toggle qui ha effetto al reload.
         _ = setenv("DS4_GLM_FUSE", glmFuseEnabled ? "1" : "0", 1)
+        _ = setenv("DS4_GLM_PREFILL_BATCH", glmPrefillBatchEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_MOE_BATCH", glmMoEBatchEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_PREFILL_MOE", glmPrefillMoEEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_GPU_ROUTER", glmGpuRouterEnabled ? "1" : "0", 1)

@@ -114,6 +114,13 @@ public final class StreamingDecoder {
     /// i+1's phase B. Never crosses a chunk (the last layer kicks nothing);
     /// error paths must drainFullLayerGather() before unwinding.
     var fullLayerPending: (layer: Int, pending: PrefillGather.Pending)?
+    /// Progresso VIVO del prefill per la GUI: (layer, nLayers, tokenChunk),
+    /// chiamato all'inizio di ogni layer del chunk. Il prefill è layer-major
+    /// (tutti i token attraversano il layer i prima del layer i+1), quindi
+    /// dentro un chunk il progresso naturale è per LAYER — la stessa UX del
+    /// "gpu prefill layer N/43" del motore C. Chiamato sul thread del
+    /// decode; il chiamante fa throttling e hop verso la UI.
+    public var prefillLayerProgress: ((_ layer: Int, _ nLayers: Int, _ chunkTokens: Int) -> Void)?
 
     /// Join the in-flight full-layer slab gather (error/teardown paths).
     func drainFullLayerGather() {

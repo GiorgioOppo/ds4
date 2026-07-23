@@ -100,6 +100,8 @@ private struct GLM52MemorySection: View {
                        isOn: $store.glmMoEBatchEnabled)
                 Toggle("Prefill esperti multi-token (pesi letti 1 volta per tile)",
                        isOn: $store.glmPrefillMoEEnabled)
+                Toggle("Prefill route a gruppi (leva 1 — sperimentale, OFF finché non validata sul modello reale)",
+                       isOn: $store.glmPrefillBatchEnabled)
                 Toggle("Router fuso su GPU (−18% prefill misurato)",
                        isOn: $store.glmGpuRouterEnabled)
                 Toggle("mlock dei pesi residenti (−394 ms/token sul head)",

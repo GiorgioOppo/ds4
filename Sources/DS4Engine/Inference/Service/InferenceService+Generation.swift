@@ -106,6 +106,28 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
         var lastLogits: [Float] = []
         var pfDone = 0
         let pfT0 = Date()
+        // Progresso VIVO durante il chunk (il prefill è layer-major: dentro
+        // un chunk non esistono "token completati", il progresso naturale è
+        // per layer — la UX del "gpu prefill layer N/43" del motore C). Il
+        // rate stimato pesa il chunk in corso per la frazione di layer
+        // attraversati. Callback sul thread del decode, throttling qui.
+        final class PrefillProgressClock { var last = Date.distantPast }
+        let pfClock = PrefillProgressClock()
+        let pfTotal = suffixIds.count
+        decoder.prefillLayerProgress = { [weak self] layer, nLayers, chunkTokens in
+            let now = Date()
+            guard now.timeIntervalSince(pfClock.last) >= 0.25, self != nil else { return }
+            pfClock.last = now
+            let done = Double(pfDone) + Double(chunkTokens) * Double(layer) / Double(max(1, nLayers))
+            let dt = now.timeIntervalSince(pfT0)
+            let tps = dt > 0.5 ? done / dt : 0
+            continuation.yield(.progress(tps > 0
+                ? String(format: "prefill %d/%d token · layer %d/%d · ~%.1f tok/s",
+                         pfDone, pfTotal, layer + 1, nLayers, tps)
+                : String(format: "prefill %d/%d token · layer %d/%d",
+                         pfDone, pfTotal, layer + 1, nLayers)))
+        }
+        defer { decoder.prefillLayerProgress = nil }
         while pfDone < suffixIds.count {
             if Task.isCancelled {
                 // A inizio giro lo stato è coerente per costruzione (l'ultimo
@@ -147,6 +169,17 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
                                                     pfDone, suffixIds.count, tps)))
             }
         }
+        // Riepilogo FINALE del prefill, come già fa il backend GLM: il rate
+        // per-chunk qui sopra esce solo TRA i chunk (mai coi prompt sotto
+        // DS4_PREFILL_CHUNK), e senza questa riga la velocità del prompt
+        // non sarebbe mai visibile in GUI. Resta nello status finché il
+        // primo progress del decode non la sostituisce (e il decode la
+        // ripropone in coda alla sua riga).
+        let pfElapsed = Date().timeIntervalSince(pfT0)
+        let pfRate = pfElapsed > 0 ? Double(suffixIds.count) / pfElapsed : 0
+        continuation.yield(.progress(String(
+            format: "prefill %d token in %.1fs · %.1f tok/s",
+            suffixIds.count, pfElapsed, pfRate)))
         if !resumablePrefill { committedIds.append(contentsOf: suffixIds) }
         // Profile the DECODE only (not the prefill), matching DS4Demo: reset the
         // per-phase counters at the prefill→decode boundary so decodeProfileReport()

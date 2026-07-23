@@ -145,6 +145,7 @@ final class ChatStore {
             UserDefaults.standard.set(true, forKey: "DS4MultiQuantCache")
         }
         _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)   // apply the persisted value at startup
+        _ = setenv("DS4_INDEXED_ATTN", indexedAttnEnabled ? "1" : "0", 1) // attention DSA indicizzata (>4k)
         _ = setenv("DS4_MULTI_QUANT_CACHE", multiQuantCacheEnabled ? "1" : "0", 1) // default ON; exact mixed IQ2/Q4 pools
         _ = setenv("DS4_EXPERT_CACHE_UNIFORM", expertCacheUniform ? "1" : "0", 1) // auto-tune: usage-driven vs uniforme
         _ = setenv("DS4_WILLNEED_EXPERTS", willNeedEnabled ? "1" : "0", 1)   // default ON
@@ -288,6 +289,12 @@ final class ChatStore {
     }
     /// GLM 5.2: fusione dei commit (FFN layer N + trunk N+1 in un command
     /// buffer — ~metà delle attese sincrone). OFF = percorso storico.
+    /// Leva 1 del prefill GLM (DS4_GLM_PREFILL_BATCH): route a gruppi con
+    /// due commit per gruppo invece di 2-3 per token. Parità bit-esatta nei
+    /// test sintetici; OFF finché non validata sul GGUF reale.
+    var glmPrefillBatchEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMPrefillBatch") as? Bool) ?? false {
+        didSet { UserDefaults.standard.set(glmPrefillBatchEnabled, forKey: "GLMPrefillBatch") }
+    }
     var glmFuseEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMFuse") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(glmFuseEnabled, forKey: "GLMFuse") }
     }
@@ -425,6 +432,18 @@ final class ChatStore {
         didSet {
             UserDefaults.standard.set(rawRingEnabled, forKey: "DS4RawRing")
             _ = setenv("DS4_RAW_RING", rawRingEnabled ? "1" : "0", 1)
+        }
+    }
+    /// Attention DSA INDICIZZATA (DS4_INDEXED_ATTN): oltre la soglia
+    /// dell'indexer (~4k token) attende SOLO sulle 512 righe compresse
+    /// selezionate — prefill 8k misurato 686→256s (32.3 t/s, sopra ds4),
+    /// decode −5-8% nella fascia 4-8k. Sotto soglia è inerte. Default ON in
+    /// GUI (l'attesa dell'utente sui contesti lunghi è il prefill); il
+    /// toggle serve all'A/B. Si applica al prossimo caricamento.
+    var indexedAttnEnabled: Bool = (UserDefaults.standard.object(forKey: "DS4IndexedAttn") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(indexedAttnEnabled, forKey: "DS4IndexedAttn")
+            _ = setenv("DS4_INDEXED_ATTN", indexedAttnEnabled ? "1" : "0", 1)
         }
     }
     /// madvise(WILLNEED) sui 6 esperti selezionati prima del gather: anticipa e

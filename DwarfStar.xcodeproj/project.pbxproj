@@ -115,6 +115,7 @@
 		3C11C34301FE7B2D2569FCB8 /* DistExpertMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5118ADDA0AC0DD48F1BB3ADF /* DistExpertMessages.swift */; };
 		3C38AE9E802F52AFC6F942C6 /* DistFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1A90027BDE7386BDDE4D447 /* DistFiles.swift */; };
 		3CF956331BB626D69B1C5628 /* GraphTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 222AB13980D8A80A87CD3E89 /* GraphTests.swift */; };
+		3D81E0B7D20492A5C935C7FB /* GraphIndexedAttention.swift in Sources */ = {isa = PBXBuildFile; fileRef = 621E830AACF830B175C5DB28 /* GraphIndexedAttention.swift */; };
 		3EB0EF4498508218D9EC1983 /* GLM52DiskKVStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6076532D4470272D13210922 /* GLM52DiskKVStore.swift */; };
 		3EC045EC3E97A902D8ED3993 /* MetalArgsortTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D71DDB280D173937A38AD22A /* MetalArgsortTests.swift */; };
 		3F031832514A98DBBCCE54F0 /* DownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3770186B2A83314A7E0477 /* DownloadView.swift */; };
@@ -162,6 +163,7 @@
 		59542B0EB58960E0C655E3E2 /* GLM52MoETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10464DC6A8B776C7BAE03037 /* GLM52MoETests.swift */; };
 		5980804EDEB5A2ED48B0E3E0 /* MachineAutoTuneTransactionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94C669A65835A7979E614D5C /* MachineAutoTuneTransactionStoreTests.swift */; };
 		59C4DD3580AFEADC5AC03711 /* MetalMoEIQ2XXSTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EE0AAF64F37D5214638F89A /* MetalMoEIQ2XXSTests.swift */; };
+		5A5D8A2933A178690DF61E50 /* GraphIndexedAttentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99E52EB4E39CFAF58FFAAA6D /* GraphIndexedAttentionTests.swift */; };
 		5B372E5C073F896507CA5366 /* MetalSoftmaxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA42134584A9542349688BE4 /* MetalSoftmaxTests.swift */; };
 		5B43FC446E8C42ED548016FB /* ProjectTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 187E43FE4AB8A95FB2A621C4 /* ProjectTree.swift */; };
 		5C54D217714D5E65F247B515 /* ThinkMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193C599A088D61AA0D1D3609 /* ThinkMode.swift */; };
@@ -762,6 +764,7 @@
 		6076532D4470272D13210922 /* GLM52DiskKVStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52DiskKVStore.swift; sourceTree = "<group>"; };
 		60FDA6097E7E3D20D80502A6 /* GraphHCReduceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphHCReduceTests.swift; sourceTree = "<group>"; };
 		6152F5AA9713B6AF38A1490E /* GraphCompressorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphCompressorTests.swift; sourceTree = "<group>"; };
+		621E830AACF830B175C5DB28 /* GraphIndexedAttention.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphIndexedAttention.swift; sourceTree = "<group>"; };
 		6231132B8C0E05AF0496FA91 /* DS4Log.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DS4Log.swift; sourceTree = "<group>"; };
 		63DD5F2796B511C4FF6E3857 /* GGUFModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GGUFModel.swift; sourceTree = "<group>"; };
 		65ED24D0A24D5A861FF26F5C /* ChatStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStore.swift; sourceTree = "<group>"; };
@@ -864,6 +867,7 @@
 		98B276318C750CF84428E31F /* MetalScatterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalScatterTests.swift; sourceTree = "<group>"; };
 		995062952C10403845BC7283 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		99CA4772320EE6B0FF89EDDB /* GLM52CompactKVTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52CompactKVTests.swift; sourceTree = "<group>"; };
+		99E52EB4E39CFAF58FFAAA6D /* GraphIndexedAttentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphIndexedAttentionTests.swift; sourceTree = "<group>"; };
 		9AC3E6E56608452C79C5B205 /* MetalCopyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalCopyTests.swift; sourceTree = "<group>"; };
 		9ADDC8888371871EDC4D0A4F /* GLM52SidecarPackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52SidecarPackTests.swift; sourceTree = "<group>"; };
 		9AEFA70C09C14418ADA57DD2 /* MachineAutoTuneSwapCounterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineAutoTuneSwapCounterTests.swift; sourceTree = "<group>"; };
@@ -2613,6 +2617,7 @@
 				C02CB092BF38074BE1B2B211 /* GraphCompressor+Indexer.swift */,
 				182C46364F216DAD23D6B070 /* GraphCompressor+Pooling.swift */,
 				2AD0D7E7A0DEC53FB4755678 /* GraphHyperConnections.swift */,
+				621E830AACF830B175C5DB28 /* GraphIndexedAttention.swift */,
 				C848750AA4CABE5FAE7537A0 /* GraphMoE.swift */,
 				68D56DB75D659E9B264D92E2 /* GraphMoEMM.swift */,
 				9FFEDDBECE45D1587F578F58 /* GraphOutput.swift */,
@@ -3097,6 +3102,7 @@
 		DF3594F2D85B73CCE03827FB /* Attention */ = {
 			isa = PBXGroup;
 			children = (
+				99E52EB4E39CFAF58FFAAA6D /* GraphIndexedAttentionTests.swift */,
 				3D49C9B136F17D65AABC664C /* MetalAttnOutLowTests.swift */,
 				3B72C747BAF71971EB6EB399 /* MetalFlashAttnTests.swift */,
 				81B0F7914C178C9CEB2015CA /* MetalIndexerPoolTests.swift */,
@@ -3821,6 +3827,7 @@
 				D9230458EDC596C7B5EFC8B3 /* GraphCompressor.swift in Sources */,
 				FA11805B54B2B753626B0DFB /* GraphContext.swift in Sources */,
 				9A0093B282614AAA62A8EADE /* GraphHyperConnections.swift in Sources */,
+				3D81E0B7D20492A5C935C7FB /* GraphIndexedAttention.swift in Sources */,
 				FECA5A67BC450A11B675BDA9 /* GraphMoE.swift in Sources */,
 				EFC0272ACF4E407D435A3427 /* GraphMoEMM.swift in Sources */,
 				CF60897D48DA6D908480B574 /* GraphOutput.swift in Sources */,
@@ -4066,6 +4073,7 @@
 				8209853C01D7745B94FBBE30 /* GraphDecoderTests.swift in Sources */,
 				5EC28242E2A62410F4DE0B87 /* GraphFFNTests.swift in Sources */,
 				6838683866B5BC83E62AD81D /* GraphHCReduceTests.swift in Sources */,
+				5A5D8A2933A178690DF61E50 /* GraphIndexedAttentionTests.swift in Sources */,
 				608DFA36CDC7B3956D645AF4 /* GraphKVStageABTests.swift in Sources */,
 				43882F3E17D38778B86F17EC /* GraphMoETests.swift in Sources */,
 				64225C3CA98741925B0E2D6B /* GraphPrefillAttnTests.swift in Sources */,
@@ -4262,7 +4270,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -4292,7 +4300,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 15;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
