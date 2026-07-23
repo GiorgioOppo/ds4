@@ -435,6 +435,54 @@ kernel void kernel_dsv4_indexer_topk_mask_one(
     }
 }
 
+// Variante a INDICI di kernel_dsv4_indexer_topk_mask_one: stesso min-heap su
+// thread 0 (stesso SET selezionato: score decrescente, id crescente sui pari),
+// ma l'uscita sono i top_k id di riga COMPRESSA (int32, -1 di riempimento)
+// per l'attention indicizzata — niente maschera densa né staging F16 di tutto
+// lo span visibile. n_raw/n_comp restano negli args per condividere la struct.
+kernel void kernel_dsv4_indexer_topk_indices_one(
+        constant ds4_metal_args_dsv4_indexer_topk_mask_one & args,
+        device const float * scores,
+        device       int   * out,
+        threadgroup  int   * heap [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    const uint keep = min(args.top_k, args.n_scores);
+    if (tid == 0 && keep > 0) {
+        uint heap_count = 0;
+        for (uint candidate = 0; candidate < args.n_scores; ++candidate) {
+            if (heap_count < keep) {
+                uint i = heap_count++;
+                heap[i] = (int)candidate;
+                while (i > 0) {
+                    const uint p = (i - 1) >> 1;
+                    if (!dsv4_indexer_better(scores, heap[p], heap[i])) break;
+                    const int tmp = heap[p]; heap[p] = heap[i]; heap[i] = tmp;
+                    i = p;
+                }
+            } else if (dsv4_indexer_better(scores, (int)candidate, heap[0])) {
+                heap[0] = (int)candidate;
+                uint i = 0;
+                while (true) {
+                    const uint l = 2 * i + 1;
+                    const uint r = l + 1;
+                    uint worst = i;
+                    if (l < heap_count && dsv4_indexer_better(scores, heap[worst], heap[l])) worst = l;
+                    if (r < heap_count && dsv4_indexer_better(scores, heap[worst], heap[r])) worst = r;
+                    if (worst == i) break;
+                    const int tmp = heap[i]; heap[i] = heap[worst]; heap[worst] = tmp;
+                    i = worst;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < args.top_k; i += ntg) {
+        out[i] = i < keep ? heap[i] : -1;
+    }
+}
+
 // Sorts each token's selected compressed rows by row id. The indexer selects by
 // score, but attention scans compressed K/V in cache order in the dense graph.
 // Sorting preserves that order while still letting the indexed attention kernel

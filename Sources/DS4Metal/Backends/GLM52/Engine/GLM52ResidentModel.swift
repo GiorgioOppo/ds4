@@ -979,6 +979,22 @@ public final class GLM52ResidentModel {
         // freed with the prefill).
         let planeStride = embeddingWidth * MemoryLayout<Float>.stride
         var planes: (hidden: MTLBuffer, ffnIn: MTLBuffer)?
+        // Leva 1 del prefill (DS4_GLM_PREFILL_BATCH=1): pool di scratch
+        // per-token per attraversare ogni layer a GRUPPI di token con due
+        // soli commit per gruppo (GLM52PrefillBatch.swift) invece di 2-3
+        // commit per token. Richiede il router fuso per leggere il routing
+        // dai buffer; nil = percorso per-token storico.
+        let batchPool: GLM52PrefillScratchPool?
+        if GLM52PrefillBatchDispatch.enabled, GLM52GpuRouterDispatch.enabled,
+           tokens.count >= 2 {
+            batchPool = try GLM52PrefillScratchPool(
+                runtime: runtime, geometry: geometry,
+                scoreCapacity: scratch.scores.length
+                    / MemoryLayout<Float>.stride,
+                count: min(GLM52PrefillBatchDispatch.groupSize, tokens.count))
+        } else {
+            batchPool = nil
+        }
         func expertPlanes() throws -> (hidden: MTLBuffer, ffnIn: MTLBuffer) {
             if let planes { return planes }
             guard let hidden = runtime.device.makeBuffer(
@@ -1025,6 +1041,60 @@ public final class GLM52ResidentModel {
                 let planes = try expertPlanes()
                 var users: [UInt32: [(token: Int, weight: Float)]] = [:]
                 var order: [UInt32] = []
+                if let pool = batchPool {
+                    // Leva 1: fase A a gruppi (due commit per gruppo);
+                    // piani e dedup degli esperti identici al per-token.
+                    var g0 = 0
+                    while g0 < tokens.count {
+                        let n = min(pool.sets.count, tokens.count - g0)
+                        try Task.checkCancellation()
+                        let base = g0
+                        let outcome = try runtime.glm52PrefillGroupLayer(
+                            weights: weights, ffn: ffn, caches: caches,
+                            pool: pool, count: n,
+                            hiddenAt: { hiddens[base + $0] },
+                            reusedSelectionAt: {
+                                try reusedSelection(index: index,
+                                                    isFull: isFull,
+                                                    token: base + $0)
+                            },
+                            basePosition: basePosition + g0)
+                        accumulate(outcome.phases)
+                        for i in 0..<n {
+                            let t = g0 + i
+                            if isFull {
+                                lastSelections[t] =
+                                    (index, outcome.selections[i])
+                            }
+                            noteRouting(index, outcome.routings[i])
+                            if let routing = outcome.routings[i] {
+                                let used = min(
+                                    routing.selected.count,
+                                    max(1, activeExperts
+                                            ?? routing.selected.count))
+                                for rank in 0..<used {
+                                    let id = UInt32(
+                                        bitPattern: routing.selected[rank])
+                                    if users[id] == nil {
+                                        users[id] = []
+                                        order.append(id)
+                                    }
+                                    users[id]?.append(
+                                        (t, routing.weights[rank]))
+                                }
+                            }
+                            memcpy(planes.hidden.contents()
+                                       + t * planeStride,
+                                   pool.sets[i].hidden.contents(),
+                                   planeStride)
+                            memcpy(planes.ffnIn.contents()
+                                       + t * planeStride,
+                                   pool.sets[i].ffnIn.contents(),
+                                   planeStride)
+                        }
+                        g0 += n
+                    }
+                } else {
                 for t in 0..<tokens.count {
                     // Stop/disconnessione durante un prefill lungo: la cella
                     // (layer, token) è la granularità giusta (~ms). Chi
@@ -1064,6 +1134,7 @@ public final class GLM52ResidentModel {
                     memcpy(planes.ffnIn.contents() + t * planeStride,
                            scratch.ffnIn.contents(), planeStride)
                 }
+                }
                 var start = 0
                 while start < order.count {
                     try Task.checkCancellation()
@@ -1098,6 +1169,40 @@ public final class GLM52ResidentModel {
                             to: Float.self, capacity: embeddingWidth)
                     hiddens[t] = Array(UnsafeBufferPointer(
                         start: pointer, count: embeddingWidth))
+                }
+                return
+            }
+            // Leva 1 per i layer dense: gruppo con due commit. I layer
+            // sparse SENZA staged fetch restano per-token: lì gli esperti
+            // routed sono applicati subito dal provider, che il percorso a
+            // gruppi differisce sempre.
+            if let pool = batchPool, case .dense = ffn.kind {
+                var g0 = 0
+                while g0 < tokens.count {
+                    let n = min(pool.sets.count, tokens.count - g0)
+                    try Task.checkCancellation()
+                    let base = g0
+                    let outcome = try runtime.glm52PrefillGroupLayer(
+                        weights: weights, ffn: ffn, caches: caches,
+                        pool: pool, count: n,
+                        hiddenAt: { hiddens[base + $0] },
+                        reusedSelectionAt: {
+                            try reusedSelection(index: index,
+                                                isFull: isFull,
+                                                token: base + $0)
+                        },
+                        basePosition: basePosition + g0)
+                    accumulate(outcome.phases)
+                    for i in 0..<n {
+                        let t = g0 + i
+                        if isFull {
+                            lastSelections[t] = (index, outcome.selections[i])
+                        }
+                        noteRouting(index, outcome.routings[i])
+                        hiddens[t] = pool.sets[i].readHidden(
+                            count: embeddingWidth)
+                    }
+                    g0 += n
                 }
                 return
             }

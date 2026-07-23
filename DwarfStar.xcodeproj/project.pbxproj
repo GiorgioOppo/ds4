@@ -80,6 +80,7 @@
 		2BE51F67278B1662E756E544 /* MetalHyperConnections.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6062241FD553451659CC09F3 /* MetalHyperConnections.swift */; };
 		2BE864ED2CD6EA882012B71A /* QuantEncode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2878BFE9EDD0AC7C66772868 /* QuantEncode.swift */; };
 		2C4ED9A87F8D1AA3BC5B3317 /* ChatStore+Generation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9F906520B38631BD3E8AE8F /* ChatStore+Generation.swift */; };
+		2C9DE1EDDFBD4FC6F262B8D7 /* GLM52PrefillBatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3472E73C75497C0434D0AE79 /* GLM52PrefillBatchTests.swift */; };
 		2D5DDFCA5D5821AE72D22A90 /* libDS4Engine.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AE55E668DADBC37930F51C9C /* libDS4Engine.a */; };
 		2DB10171A507C6EA23D47EC7 /* GLM52CompactAttentionQ8Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 152AE04FBE77F60AF70B646A /* GLM52CompactAttentionQ8Tests.swift */; };
 		2DB9234FB61AEC60ECD0918E /* ProjectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1000B0404D25B66E1AEEEB73 /* ProjectView.swift */; };
@@ -141,9 +142,11 @@
 		4C685AF9E144FCAB50BA5F7D /* DecodeLayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 252CD6BBFD0DEB702F749EFD /* DecodeLayer.swift */; };
 		4C8110FE1B0BF5D31B7B7D20 /* KVCFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47E6AE05A1CF523F17B31393 /* KVCFile.swift */; };
 		4CCADEF2240B859B65937EE5 /* GLM52ExpertStreamPlannerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30DA0E6D89D3D4794B46D95E /* GLM52ExpertStreamPlannerTests.swift */; };
+		4EEA1D95A3FE72671D491EF6 /* GLM52PrefillBatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06FD24F96EB2A9DED9409DB6 /* GLM52PrefillBatch.swift */; };
 		4F21C79C02F267C0D9D1BC4F /* GLM52DecodeGraphTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B898ED1BD6611C00465D0E5 /* GLM52DecodeGraphTests.swift */; };
 		4FA9357F0BB77F4B81338855 /* BackendSelectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D3CDBAD6E49494CCDE5FF5D /* BackendSelectorTests.swift */; };
 		4FEE5368987AE7B8B80A6C69 /* SubagentSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DA21CCCF780EA1F9CADBB29 /* SubagentSearch.swift */; };
+		4FF468A81EBC88DEFFBCFC43 /* GraphPrefillTailTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F39ECC659BC5F6642D03AE90 /* GraphPrefillTailTests.swift */; };
 		509FB4C4E1684456A9B97A29 /* GLM52SidecarPackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9ADDC8888371871EDC4D0A4F /* GLM52SidecarPackTests.swift */; };
 		51BA6FD4E1D0CA8AE309A390 /* GLM52RealHeaderIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21DEAFF4D6781CDDCF59DFF3 /* GLM52RealHeaderIntegrationTests.swift */; };
 		51FAE8DB3852E35930790D9D /* QwenBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4DB725980E5A8074AB67BF /* QwenBackend.swift */; };
@@ -163,6 +166,7 @@
 		5B43FC446E8C42ED548016FB /* ProjectTree.swift in Sources */ = {isa = PBXBuildFile; fileRef = 187E43FE4AB8A95FB2A621C4 /* ProjectTree.swift */; };
 		5C54D217714D5E65F247B515 /* ThinkMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 193C599A088D61AA0D1D3609 /* ThinkMode.swift */; };
 		5CAEC31A6240ACC638039E78 /* DS4Log.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6231132B8C0E05AF0496FA91 /* DS4Log.swift */; };
+		5D10A884675178620D2708E4 /* PrefillDenseBenchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FEF762B22FDE4D1AD4E725B /* PrefillDenseBenchTests.swift */; };
 		5D99879F63421A7C44604564 /* MachineAutoTuneSwapCounterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9AEFA70C09C14418ADA57DD2 /* MachineAutoTuneSwapCounterTests.swift */; };
 		5EB36B75D6E182E0F59D84C4 /* MachineAutoTuneSwapCounter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4903F429FC90007EFBDD47A4 /* MachineAutoTuneSwapCounter.swift */; };
 		5EC28242E2A62410F4DE0B87 /* GraphFFNTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 704A7924F7BE37060EB20E81 /* GraphFFNTests.swift */; };
@@ -315,6 +319,7 @@
 		A65E86F3A6AC23A537176742 /* FileDelete.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD0DDFC659908DFDB667097 /* FileDelete.swift */; };
 		A68EF9E879B3C2B4A239E2D8 /* GPUTensor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B7BD631EA8CB22DCECA288B /* GPUTensor.swift */; };
 		A69C15118EAB8E68ACFAE90F /* ChatRequestParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBD465907BCFC64B11A586F5 /* ChatRequestParser.swift */; };
+		A882A41F3205BF39DD37443E /* MetalDenseQ4KMMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3393CFCEECDCC827E514A17D /* MetalDenseQ4KMMTests.swift */; };
 		A89A69840CDFCC95DA891175 /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67257572F7FFF7B5A6A73135 /* ModelCatalog.swift */; };
 		AA55AC3A3353DEB306E87B08 /* ModelDownloadTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = B43486BAE0299D6F90104A92 /* ModelDownloadTypes.swift */; };
 		AA945419236386C15C7BC839 /* ActivationCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4524F35AF94B35C4E56FE74D /* ActivationCodec.swift */; };
@@ -573,6 +578,7 @@
 		051A34AB7CF42B660CBD1A3F /* MoEQuant.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MoEQuant.swift; sourceTree = "<group>"; };
 		055DD359D898A5BDF87C36AF /* GLM52MoEPrefillTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52MoEPrefillTests.swift; sourceTree = "<group>"; };
 		06EF364D0991CF7640953F91 /* GLM52RouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52RouterTests.swift; sourceTree = "<group>"; };
+		06FD24F96EB2A9DED9409DB6 /* GLM52PrefillBatch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52PrefillBatch.swift; sourceTree = "<group>"; };
 		07BFC548FFE5CA86034C66C8 /* GLM52DecodeGraph.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52DecodeGraph.swift; sourceTree = "<group>"; };
 		088A1BC71A4E1077818EC559 /* GraphAttentionPrefill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphAttentionPrefill.swift; sourceTree = "<group>"; };
 		09C0044DBC374AA6504218E7 /* MetalDenseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDenseTests.swift; sourceTree = "<group>"; };
@@ -660,6 +666,8 @@
 		30DA0E6D89D3D4794B46D95E /* GLM52ExpertStreamPlannerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52ExpertStreamPlannerTests.swift; sourceTree = "<group>"; };
 		31A1A3BD6F60788FF38AB97F /* MetalGetRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalGetRows.swift; sourceTree = "<group>"; };
 		32B6B3A5C9B6B85F424B9658 /* GLM52PayloadReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52PayloadReader.swift; sourceTree = "<group>"; };
+		3393CFCEECDCC827E514A17D /* MetalDenseQ4KMMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalDenseQ4KMMTests.swift; sourceTree = "<group>"; };
+		3472E73C75497C0434D0AE79 /* GLM52PrefillBatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52PrefillBatchTests.swift; sourceTree = "<group>"; };
 		35A938B19481B8BED241F7E6 /* QuantEncodeFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantEncodeFixtures.swift; sourceTree = "<group>"; };
 		36AAC9FC6BA4C1AA65ED0053 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		36C37C829EB6FC048045E80C /* AppEnvironment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironment.swift; sourceTree = "<group>"; };
@@ -803,6 +811,7 @@
 		7EEEE141248AAA763D8F3B21 /* DistCoordinator+Connections.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DistCoordinator+Connections.swift"; sourceTree = "<group>"; };
 		7F23AFF600220C431611980C /* DenseStreamer+Pipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DenseStreamer+Pipeline.swift"; sourceTree = "<group>"; };
 		7FD681EF1237424D4EF370C1 /* ChatStore+MachineAutoTune.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatStore+MachineAutoTune.swift"; sourceTree = "<group>"; };
+		7FEF762B22FDE4D1AD4E725B /* PrefillDenseBenchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrefillDenseBenchTests.swift; sourceTree = "<group>"; };
 		8152D3EC335AE274094B077C /* SubagentRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentRun.swift; sourceTree = "<group>"; };
 		818A3C7728A1FF42F42716ED /* softmax.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = softmax.metal; sourceTree = "<group>"; };
 		81B0F7914C178C9CEB2015CA /* MetalIndexerPoolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalIndexerPoolTests.swift; sourceTree = "<group>"; };
@@ -1040,6 +1049,7 @@
 		F2AD603869FA54B5B4940BD3 /* WebClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebClient.swift; sourceTree = "<group>"; };
 		F314C336EAEA2A759E06982F /* MetalRoPETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRoPETests.swift; sourceTree = "<group>"; };
 		F3550012912D98BA724FAF4C /* GLM52RopePrefixTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52RopePrefixTests.swift; sourceTree = "<group>"; };
+		F39ECC659BC5F6642D03AE90 /* GraphPrefillTailTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GraphPrefillTailTests.swift; sourceTree = "<group>"; };
 		F3E84CE840AFA843A6EC1C1A /* DiskKVStore+Index.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DiskKVStore+Index.swift"; sourceTree = "<group>"; };
 		F578C26A8572AD4C9BC01E3A /* ProjectCache+Indexing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ProjectCache+Indexing.swift"; sourceTree = "<group>"; };
 		F5B8B7A328A6F4AE55204A6E /* GLM52DecodeReferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GLM52DecodeReferenceTests.swift; sourceTree = "<group>"; };
@@ -1317,6 +1327,7 @@
 		198A7BEF283DE2F69C43AA30 /* Dense */ = {
 			isa = PBXGroup;
 			children = (
+				3393CFCEECDCC827E514A17D /* MetalDenseQ4KMMTests.swift */,
 				09C0044DBC374AA6504218E7 /* MetalDenseTests.swift */,
 				B3C61E7E2FCA95867B5B6018 /* MetalMatmulMMTests.swift */,
 			);
@@ -1948,6 +1959,7 @@
 				2231CC93EA7A841005056B2A /* GLM52DecodeExecutorTests.swift */,
 				9B898ED1BD6611C00465D0E5 /* GLM52DecodeGraphTests.swift */,
 				C8CB6869724CC5EBFFE8977E /* GLM52LayerExecutorTests.swift */,
+				3472E73C75497C0434D0AE79 /* GLM52PrefillBatchTests.swift */,
 				C50BDD59764ABB7816E57C87 /* GLM52ResidentForwardTests.swift */,
 			);
 			path = Execution;
@@ -2400,6 +2412,7 @@
 				28588A7EA09CFE69888C43B9 /* ExpertUsageAllocationTests.swift */,
 				EDE6492D25BA4C8DC74C83D8 /* IndexerSelectTests.swift */,
 				D5BF4A67776884A0E3FCAFBC /* PrefillBatchAttnParityTests.swift */,
+				7FEF762B22FDE4D1AD4E725B /* PrefillDenseBenchTests.swift */,
 				97C63105C53D2AE9BB807F5C /* StreamingDecoderTests.swift */,
 			);
 			path = Decode;
@@ -2421,6 +2434,7 @@
 				07BFC548FFE5CA86034C66C8 /* GLM52DecodeGraph.swift */,
 				94DB92FD5F6FD0F33B3A86EC /* GLM52ExpertArena.swift */,
 				410BAF74850602AC82319C4B /* GLM52LayerExecutor.swift */,
+				06FD24F96EB2A9DED9409DB6 /* GLM52PrefillBatch.swift */,
 			);
 			path = Execution;
 			sourceTree = "<group>";
@@ -3204,6 +3218,7 @@
 				B52D7AB14224469345DAD054 /* GraphKVStageABTests.swift */,
 				B0D9D47C68C0EEADBF9F5819 /* GraphMoETests.swift */,
 				1C2EFD097851550ADB1BC4DE /* GraphPrefillAttnTests.swift */,
+				F39ECC659BC5F6642D03AE90 /* GraphPrefillTailTests.swift */,
 				7E034133EE1C27BD3F81A97E /* GraphQKVTests.swift */,
 				D1FFD25EBD4D7B4BBFC7FC76 /* GraphRawRingAttnTests.swift */,
 				5BC86BE4339EA2EA6E9840C1 /* GraphRouterTests.swift */,
@@ -3786,6 +3801,7 @@
 				D1B966673C93CB7ADBBE4165 /* GLM52LayerStreamer.swift in Sources */,
 				72FEB3654D43F339EA644C3D /* GLM52MoE.swift in Sources */,
 				ACE365E1929748158DCBFF65 /* GLM52PayloadReader.swift in Sources */,
+				4EEA1D95A3FE72671D491EF6 /* GLM52PrefillBatch.swift in Sources */,
 				32F19E760D748B8757D26C81 /* GLM52ResidentModel.swift in Sources */,
 				F82A13AB4688E71E018D23AD /* GLM52RopeTail.swift in Sources */,
 				CEFE3D89CCBD3509440DEFA1 /* GLM52Router.swift in Sources */,
@@ -4026,6 +4042,7 @@
 				E9AEECAD24D228B3DB96EFFA /* GLM52MoEPrefillTests.swift in Sources */,
 				59542B0EB58960E0C655E3E2 /* GLM52MoETests.swift in Sources */,
 				28AF573E87157EF72009C150 /* GLM52PayloadReaderTests.swift in Sources */,
+				2C9DE1EDDFBD4FC6F262B8D7 /* GLM52PrefillBatchTests.swift in Sources */,
 				51BA6FD4E1D0CA8AE309A390 /* GLM52RealHeaderIntegrationTests.swift in Sources */,
 				675B4765EFF6A9C7C08C71FB /* GLM52ResidentForwardTests.swift in Sources */,
 				79D4EB8CACC7B434B00EA75D /* GLM52ResidentModelIntegrationTests.swift in Sources */,
@@ -4052,6 +4069,7 @@
 				608DFA36CDC7B3956D645AF4 /* GraphKVStageABTests.swift in Sources */,
 				43882F3E17D38778B86F17EC /* GraphMoETests.swift in Sources */,
 				64225C3CA98741925B0E2D6B /* GraphPrefillAttnTests.swift in Sources */,
+				4FF468A81EBC88DEFFBCFC43 /* GraphPrefillTailTests.swift in Sources */,
 				15CEBBA5502E280F5B255E03 /* GraphQKVTests.swift in Sources */,
 				E9E524BF81ACA0EE2A79EB7E /* GraphRawRingAttnTests.swift in Sources */,
 				27831EBFE6486E58DA3F11EA /* GraphRouterTests.swift in Sources */,
@@ -4073,6 +4091,7 @@
 				8DECD5B6F8D26A55595B7070 /* MetalCompressorTests.swift in Sources */,
 				7BB73C969CF43C47B8003CB0 /* MetalConcatTests.swift in Sources */,
 				10DE8FC438FB3C4936C5CE6B /* MetalCopyTests.swift in Sources */,
+				A882A41F3205BF39DD37443E /* MetalDenseQ4KMMTests.swift in Sources */,
 				DC681A66DE884BD3E2420D62 /* MetalDenseTests.swift in Sources */,
 				877378D0658D457C5419588E /* MetalFlashAttnTests.swift in Sources */,
 				C996A702790893861A28BCAA /* MetalGLUTests.swift in Sources */,
@@ -4105,6 +4124,7 @@
 				8161DD52EDA5C565013C8785 /* ModelFileDiagnosticsTests.swift in Sources */,
 				3F6ED94E14CC733C0EB0B391 /* ModelInspectorGLM52Tests.swift in Sources */,
 				4547B1C31B83714C9F6EF501 /* PrefillBatchAttnParityTests.swift in Sources */,
+				5D10A884675178620D2708E4 /* PrefillDenseBenchTests.swift in Sources */,
 				2176A77164A2B5376BCE042C /* ProjectCacheTests.swift in Sources */,
 				EB565C6F4A6B197EC9E95224 /* PromptLookupTests.swift in Sources */,
 				5F426AFD1E048F59638B224C /* QuantEncodeFixtures.swift in Sources */,
@@ -4242,7 +4262,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 13;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -4272,7 +4292,7 @@
 				CODE_SIGN_ENTITLEMENTS = packaging/DwarfStar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 13;
+				CURRENT_PROJECT_VERSION = 14;
 				DEVELOPMENT_TEAM = U4V89TP978;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;

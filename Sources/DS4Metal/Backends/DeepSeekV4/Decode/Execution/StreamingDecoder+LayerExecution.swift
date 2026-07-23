@@ -268,6 +268,37 @@ extension StreamingDecoder {
         let hasIdxState = w.idxKv != nil && w.idxGate != nil
         let hasIdxScoring = hasIdxState && w.idxQB != nil && w.idxProj != nil
         let active = hasIdxScoring && indexerActive(i, pos: pos)
+        if active, let idx, gpuIndexerTopK, d.indexedAttn,
+           let compState = compStates[i] {
+            // DS4_INDEXED_ATTN: score -> top-K a INDICI (stesso heap del
+            // percorso a maschera: set identico) -> sort per id crescente ->
+            // attention SOLO su raw SWA + topK righe selezionate. Niente
+            // maschera e niente staging F16 dell'intero span: il costo per
+            // token resta O(nSWA + topK) al crescere del contesto.
+            let c = GraphContext(rt); if profileRoute { c.phaseTimes = [:] }; try c.begin()
+            let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                             rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                             comp: compStates[i], idx: hasIdxState ? idx : nil,
+                                             indexerScoring: true)
+            try c.indexerTopKIndices(scores: scratch.idxScores, out: scratch.idxTopK,
+                                     nScores: idx.count, topK: d.indexerTopK)
+            try c.sortTopKAsc(indices: scratch.idxTopK, sorted: scratch.idxTopKSorted,
+                              topK: d.indexerTopK)
+            try c.decodeRouteAttnIndexed(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                         rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token,
+                                         rmsEps: rmsEps, hcEps: hcEps, nComp: nComp,
+                                         comp: compState, topk: scratch.idxTopKSorted)
+            if profileRoute {
+                try c.phase("router")
+                c.commit()
+                accumulateRoutePhases(c, nil)
+            } else if asyncRoute {
+                c.commitAsync()
+            } else {
+                c.commit()
+            }
+            return c
+        }
         if active, let idx, gpuIndexerTopK {
             // Score -> exact top-K mask -> attention in ONE command buffer. The
             // recurrent compressor advances idx.count synchronously while these
@@ -438,6 +469,54 @@ extension StreamingDecoder {
         try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope, rawCache: rawCaches[i],
                               nKeys: nKeys, pos: pos, token: token, rmsEps: rmsEps, hcEps: hcEps,
                               nComp: nComp, comp: compStates[i])
+    }
+
+    /// Leva 9 (coda prefill oltre la soglia indexer): la route di UN token
+    /// codificata in un ctx CONDIVISO senza commit, replicando ESATTAMENTE i
+    /// rami di encodeRoute — indexer attivo indicizzato (DS4_INDEXED_ATTN),
+    /// attivo a maschera GPU (mask_one), o inattivo/scorer non staged (il
+    /// corpo di encodeRouteInto). Richiede gpuIndexerTopK: il percorso con
+    /// top-k CPU ha un tap host tra pre e attention e NON è raggruppabile
+    /// (il chiamante gata e resta per-token in quel caso).
+    func encodeRouteGroupedInto(_ c: GraphContext, _ i: Int, w: LayerWeights, layerRope: RopeParams,
+                                curHc: GPUTensor, pos: Int, nKeys: Int, token: Int) throws {
+        let idx = indexStates[i]
+        let hasIdxState = w.idxKv != nil && w.idxGate != nil
+        let hasIdxScoring = hasIdxState && w.idxQB != nil && w.idxProj != nil
+        let active = hasIdxScoring && indexerActive(i, pos: pos)
+        guard active, let idx else {
+            try encodeRouteInto(c, i, w: w, layerRope: layerRope, curHc: curHc,
+                                pos: pos, nKeys: nKeys, token: token)
+            return
+        }
+        guard gpuIndexerTopK else {
+            throw MetalError.unsupported(
+                "encodeRouteGroupedInto richiede il top-k GPU (DS4_GPU_INDEXER_TOPK)")
+        }
+        let nComp = try c.decodeRoutePre(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                         rawCache: rawCaches[i], pos: pos, rmsEps: rmsEps, hcEps: hcEps,
+                                         comp: compStates[i], idx: hasIdxState ? idx : nil,
+                                         indexerScoring: true)
+        if d.indexedAttn, let compState = compStates[i] {
+            try c.indexerTopKIndices(scores: scratch.idxScores, out: scratch.idxTopK,
+                                     nScores: idx.count, topK: d.indexerTopK)
+            try c.sortTopKAsc(indices: scratch.idxTopK, sorted: scratch.idxTopKSorted,
+                              topK: d.indexerTopK)
+            try c.decodeRouteAttnIndexed(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                         rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token,
+                                         rmsEps: rmsEps, hcEps: hcEps, nComp: nComp,
+                                         comp: compState, topk: scratch.idxTopKSorted)
+        } else {
+            let nRaw = min(nKeys, d.nSWA)
+            try c.indexerTopKMask(scores: scratch.idxScores, mask: scratch.mask,
+                                  nRaw: nRaw, nComp: nComp, nScores: idx.count,
+                                  topK: d.indexerTopK)
+            maskDirtyCount = max(maskDirtyCount, nRaw + nComp)
+            try c.decodeRouteAttn(curHc: curHc, w: w, s: scratch, d: d, rope: layerRope,
+                                  rawCache: rawCaches[i], nKeys: nKeys, pos: pos, token: token,
+                                  rmsEps: rmsEps, hcEps: hcEps, nComp: nComp,
+                                  comp: compStates[i])
+        }
     }
 
     /// CPU top-K over the indexer scores (s.idxScores[0..nIdxComp)) → f16 mask:

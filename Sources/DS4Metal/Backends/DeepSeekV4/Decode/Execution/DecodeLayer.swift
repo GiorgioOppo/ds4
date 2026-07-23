@@ -237,6 +237,35 @@ extension GraphContext {
                                 token: token, rmsEps: rmsEps, hcEps: hcEps)
     }
 
+    /// Variante INDICIZZATA di decodeRouteAttn (DS4_INDEXED_ATTN, indexer
+    /// attivo): stessa semantica ma l'attention consuma SOLO la finestra raw
+    /// SWA dal ring + le topK righe compresse in `topk` (id crescenti, -1 di
+    /// riempimento) — niente staging F16 dello span né maschera. La coda
+    /// (decodeRouteAttnTail) è la stessa, quindi tutto il resto del grafo
+    /// resta identico al percorso storico.
+    public func decodeRouteAttnIndexed(curHc: GPUTensor, w: LayerWeights, s: DecodeScratch, d: DSV4Dims,
+                                       rope: RopeParams, rawCache: GPUTensor, nKeys: Int, pos: Int,
+                                       token: Int = -1, rmsEps: Float, hcEps: Float, nComp: Int,
+                                       comp: CompressorState, topk: GPUTensor) throws {
+        let rawLo = max(0, nKeys - d.nSWA)
+        // Stessa geometria ring di flashAttnCore: righe assolute modulo la
+        // capacità fisica del ring raw (lineare = nessun wrap).
+        let rawRows = rawCache.count / d.headDim
+        precondition(rawRows > 0 && nKeys - rawLo <= rawRows)
+        let physStart = ((rawLo % rawRows) + rawRows) % rawRows
+        encoder.pushDebugGroup("attention-indexed")
+        try indexedMixedAttention(q: s.q, rawKv: rawCache, comp: comp.cache,
+                                  topk: topk, sinks: w.attnSinks, heads: s.heads,
+                                  nHead: d.nHead, nRaw: nKeys - rawLo,
+                                  rawCap: rawRows, rawStart: physStart,
+                                  nComp: nComp, topK: d.indexerTopK, pos: pos,
+                                  window: d.nSWA, ratio: comp.ratio)
+        encoder.popDebugGroup()
+        try phase("attn")                             // DS4_PROFILE_ROUTE boundary
+        try decodeRouteAttnTail(curHc: curHc, w: w, s: s, d: d, rope: rope, pos: pos,
+                                token: token, rmsEps: rmsEps, hcEps: hcEps)
+    }
+
     /// The post-attention half of decodeRouteAttn: inverse RoPE on s.heads ->
     /// low-rank output projection -> HC expand -> pre-FFN HC reduce -> router.
     /// Split out so the batched prefill can run ONE multi-query FlashAttention

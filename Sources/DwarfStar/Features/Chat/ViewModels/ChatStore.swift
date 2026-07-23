@@ -197,6 +197,27 @@ final class ChatStore {
             prefillUnion = 192
             UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
         }
+        // Migrazione una-tantum ai knob prefill misurati con le leve 1-8
+        // (2026-07-22, testo reale 2.7k: 17.5 → 26+ t/s): chunk 2048
+        // (4096 rende di più ma i transienti + slab full-layer stringono i
+        // 16 GB con lo stack decode attivo), route batch 128, union 192 + MM
+        // (256 + MM misurato PEGGIORE: GEMM esperti diluito). Applicata solo
+        // ai valori dei vecchi default, non a scelte esplicite più alte.
+        if !UserDefaults.standard.bool(forKey: "DS4PrefillLevers2026_07_22") {
+            UserDefaults.standard.set(true, forKey: "DS4PrefillLevers2026_07_22")
+            if prefillChunk < 2048 {
+                prefillChunk = 2048
+                UserDefaults.standard.set(2048, forKey: "DS4PrefillChunk")
+            }
+            if prefillRouteBatch < 128 {
+                prefillRouteBatch = 128
+                UserDefaults.standard.set(128, forKey: "DS4PrefillRouteBatch")
+            }
+            if prefillUnion > 192 {
+                prefillUnion = 192
+                UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
+            }
+        }
         // Knob del prefill regolabili a caldo (persistiti dal benchmark in
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
@@ -541,7 +562,7 @@ final class ChatStore {
             _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
         }
     }
-    var prefillChunk: Int = (UserDefaults.standard.object(forKey: "DS4PrefillChunk") as? Int) ?? 512 {
+    var prefillChunk: Int = (UserDefaults.standard.object(forKey: "DS4PrefillChunk") as? Int) ?? 2048 {
         didSet {
             UserDefaults.standard.set(prefillChunk, forKey: "DS4PrefillChunk")
             _ = setenv("DS4_PREFILL_CHUNK", String(prefillChunk), 1)
@@ -553,7 +574,7 @@ final class ChatStore {
     /// stesso ordine, ma si riducono commit e attese CPU↔GPU. È letto a ogni layer
     /// di prefill, quindi il benchmark può regolarlo senza ricaricare il modello.
     var prefillRouteBatch: Int =
-        (UserDefaults.standard.object(forKey: "DS4PrefillRouteBatch") as? Int) ?? 32 {
+        (UserDefaults.standard.object(forKey: "DS4PrefillRouteBatch") as? Int) ?? 128 {
         didSet {
             UserDefaults.standard.set(prefillRouteBatch, forKey: "DS4PrefillRouteBatch")
             _ = setenv("DS4_PREFILL_ROUTE_BATCH", String(prefillRouteBatch), 1)

@@ -43,6 +43,9 @@ public final class DecodeScratch {
     let gate6, up6, mid6, down6, routed: GPUTensor
     let sgate, sup, smid, sdown, sharedOut, ffnOut: GPUTensor
     let idxQ, idxW, idxScores: GPUTensor   // NSA indexer: q [64×128], weights [64], scores [maxComp]
+    // DS4_INDEXED_ATTN: top-K dell'indexer a INDICI (grezzi dallo heap +
+    // ordinati per id crescente), int32 [indexerTopK] ciascuno.
+    let idxTopK, idxTopKSorted: GPUTensor
     let id0: GPUTensor   // [Int32 0] — dense matvec via the MoE id-kernel (k=1, DS4_DENSE_Q4)
     let idsGroup: GPUTensor   // [0..nOutGroup-1] — grouped attn-out as an all-selected "MoE" (DS4_DENSE_Q4)
 
@@ -74,6 +77,8 @@ public final class DecodeScratch {
         idxQ = try .zeros(rt, floatCount: d.nIndexerHead * d.nIndexerHeadDim)
         idxW = try .zeros(rt, floatCount: d.nIndexerHead)
         idxScores = try .zeros(rt, floatCount: attentionRows)   // ≥ maxComp rows, generous
+        idxTopK = try .zerosBytes(rt, byteLength: max(1, d.indexerTopK) * 4)
+        idxTopKSorted = try .zerosBytes(rt, byteLength: max(1, d.indexerTopK) * 4)
         id0 = try .zerosBytes(rt, byteLength: 4)          // Int32(0)
         idsGroup = try .bytes(rt, Array(0..<Int32(d.nOutGroup)).withUnsafeBytes { Array($0) },
                               elementCount: d.nOutGroup)

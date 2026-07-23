@@ -16,10 +16,13 @@ extension ChatStore {
         mlockEnabled = true
         denseQ4Enabled = true
         qkvQ4Enabled = true        // +10% misurato (2.78 → 3.06 tok/s), output coerente
-        sharedQ4Enabled = true     // +7% misurato (3.13 → 3.36 tok/s), output coerente
-        prefillUnion = 256         // +19% di prefill misurato a 3.5k token (8.63 tok/s)
-        prefillChunk = 512         // stabile su prompt brevi/lunghi entro il budget RAM
-        prefillRouteBatch = 32     // baseline stabile; il benchmark completo prova 16/32/64/128
+        sharedQ4Enabled = false    // +7% decode a contesto corto ma AFFOSSA il prefill
+                                   // (bisect 2026-07-22: experts 368 ms/token) — per
+                                   // carichi misti chat il netto è negativo
+        prefillUnion = 192         // 256+PREFILL_MM misurato PEGGIORE (GEMM diluito)
+        prefillChunk = 2048        // leve 1-8: 4096 rende di più in demo nuda, ma con
+                                   // lo stack decode i transienti stringono i 16 GB
+        prefillRouteBatch = 128    // misurato 2026-07-22: 21.4 → 24.2 t/s su 2.7k reali
         expertBundleEnabled = true
         metalIOEnabled = true      // fallback automatico a pread sotto 4.0 GB/s sul M1 Pro
         expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
@@ -41,10 +44,10 @@ extension ChatStore {
             d.set(true, forKey: "DS4MLock")
             d.set(true, forKey: "DS4DenseQ4")
             d.set(true, forKey: "DS4QkvQ4")
-            d.set(true, forKey: "DS4SharedQ4")
-            d.set(256, forKey: "DS4PrefillUnion")
-            d.set(512, forKey: "DS4PrefillChunk")
-            d.set(32, forKey: "DS4PrefillRouteBatch")
+            d.set(false, forKey: "DS4SharedQ4")
+            d.set(192, forKey: "DS4PrefillUnion")
+            d.set(2048, forKey: "DS4PrefillChunk")
+            d.set(128, forKey: "DS4PrefillRouteBatch")
             d.set(true, forKey: "DS4ExpertBundle")
             d.set(true, forKey: "DS4MetalIO")
             d.set(0, forKey: "DS4ExpertLookahead")
@@ -63,10 +66,10 @@ extension ChatStore {
             _ = setenv("DS4_MLOCK", "1", 1)
             _ = setenv("DS4_DENSE_Q4", "1", 1)
             _ = setenv("DS4_QKV_Q4", "1", 1)
-            _ = setenv("DS4_SHARED_Q4", "1", 1)
-            _ = setenv("DS4_PREFILL_UNION", "256", 1)
-            _ = setenv("DS4_PREFILL_CHUNK", "512", 1)
-            _ = setenv("DS4_PREFILL_ROUTE_BATCH", "32", 1)
+            _ = setenv("DS4_SHARED_Q4", "0", 1)
+            _ = setenv("DS4_PREFILL_UNION", "192", 1)
+            _ = setenv("DS4_PREFILL_CHUNK", "2048", 1)
+            _ = setenv("DS4_PREFILL_ROUTE_BATCH", "128", 1)
             _ = setenv("DS4_EXPERT_BUNDLE", "1", 1)
             _ = setenv("DS4_MTLIO", "1", 1)
             _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)

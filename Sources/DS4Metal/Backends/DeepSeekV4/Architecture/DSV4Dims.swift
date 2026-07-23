@@ -34,6 +34,11 @@ public struct DSV4Dims: Sendable {
     /// One vector kernel for router softplus+sqrt instead of two scalar passes.
     /// `=0` restores the historical two-dispatch graph.
     public var fusedRouterProbs: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_ROUTER_PROBS"] != "0"
+    /// DS4_INDEXED_ATTN=1 (opt-in): quando l'indexer DSA è attivo, attention
+    /// SOLO sulle topK righe compresse selezionate (kernel indicizzato rb16)
+    /// invece di maschera + flash sull'intero span — costo per token
+    /// O(nSWA + topK) costante col contesto. `assente/0` = percorso storico.
+    public var indexedAttn: Bool = ProcessInfo.processInfo.environment["DS4_INDEXED_ATTN"] == "1"
     /// Fuse top-6 selection and its bit-identical six-term weight normalization.
     /// `=0` restores the historical second router-weight dispatch.
     public var fusedRouterFinalize: Bool = ProcessInfo.processInfo.environment["DS4_FUSED_ROUTER_FINALIZE"] != "0"

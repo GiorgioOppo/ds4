@@ -98,6 +98,15 @@ extension StreamingDecoder {
             let compCombKv: GPUTensor  // (128 + nq) × 2·headDim
             let compCombSc: GPUTensor  // (128 + nq) × 2·headDim
             let compPooled: GPUTensor  // (nq/4 + 2) × headDim
+            /// LEVA 9 v2 — run indexer-attivi (DS4_INDEXED_ATTN): query e pesi
+            /// dell'indexer per il run (GEMM), righe di score per query e
+            /// indici top-K per query (grezzi dallo heap + ordinati per id).
+            let idxQMat: GPUTensor      // nq × nIndexerHead·nIndexerHeadDim
+            let idxWMat: GPUTensor      // nq × nIndexerHead
+            let idxScoresMat: GPUTensor // nq × maxKv f32 (score per query)
+            let idxTopKMat: GPUTensor   // nq × indexerTopK int32
+            let idxTopKSortMat: GPUTensor // nq × indexerTopK int32 (id crescenti)
+            let idxSortScratch: GPUTensor // 2 × nq × maxKv int32 (ping-pong argsort)
 
             init(_ rt: MetalRuntime, nq: Int, maxKv: Int, d: DSV4Dims) throws {
                 let sb = GraphContext.flashPrefillScratchBytes(nHead: d.nHead, nQ: nq, maxKv: maxKv)
@@ -137,6 +146,12 @@ extension StreamingDecoder {
                 compCombKv = try .zeros(rt, floatCount: (128 + nq) * 2 * d.headDim)
                 compCombSc = try .zeros(rt, floatCount: (128 + nq) * 2 * d.headDim)
                 compPooled = try .zeros(rt, floatCount: (nq / 4 + 2) * d.headDim)
+                idxQMat = try .zeros(rt, floatCount: nq * d.nIndexerHead * d.nIndexerHeadDim)
+                idxWMat = try .zeros(rt, floatCount: nq * d.nIndexerHead)
+                idxScoresMat = try .zeros(rt, floatCount: nq * maxKv)
+                idxTopKMat = try .zerosBytes(rt, byteLength: nq * max(1, d.indexerTopK) * 4)
+                idxTopKSortMat = try .zerosBytes(rt, byteLength: nq * max(1, d.indexerTopK) * 4)
+                idxSortScratch = try .zerosBytes(rt, byteLength: 2 * nq * maxKv * 4)
             }
         }
         let flash: FlashBatch?

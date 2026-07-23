@@ -487,8 +487,43 @@ extension StreamingDecoder {
                     jEnd += 1
                 }
             }
-            if jEnd <= j {
-                // Per-token path (indexer active, or batching off): reads and
+            if jEnd <= j, !profileRoute, !profilePrefill, gpuIndexerTopK, d.indexedAttn,
+               prefillDenseMM, prefillDenseEligible(w),
+               let fb = stage.flash, compStates[i] != nil, indexStates[i] != nil,
+               w.idxQB != nil, w.idxProj != nil {
+                // LEVA 9 v2: run batchato con indexer ATTIVO — l'attivazione è
+                // monotona in pos (da qui in poi tutto il chunk è idoneo);
+                // l'estensione rispetta capacità del run, ring raw e righe di
+                // score per query. Niente maschera CPU né staging F16: la
+                // pipeline async non alterna la parità della mask.
+                var iEnd = min(n, j + max(2, min(routeBatch, fb.nq)))
+                let rawRowsI = rawCaches[i].count / d.headDim
+                while iEnd > j + 1 {
+                    let rawLo0i = max(0, posBase + j + 1 - d.nSWA)
+                    let span = posBase + iEnd - rawLo0i
+                    let scoreBound = (indexStates[i]?.count ?? 0) + (iEnd - j) / 4 + 2
+                    if span <= rawRowsI && scoreBound <= fb.maxKv { break }
+                    iEnd -= 1
+                }
+                if iEnd - j >= 2 {
+                    let t = Date()
+                    let ctx = try autoreleasepool { () -> GraphContext in
+                        try Task.checkCancellation()
+                        return try encodeIndexedFlashRun(fb, i, w: w, layerRope: layerRope,
+                                                         cur: cur, stage: stage,
+                                                         j: j, jEnd: iEnd, posBase: posBase,
+                                                         tokens: tokens, slabDirect: slabDirect)
+                    }
+                    ctx.commitAsync()
+                    profile.routeS += Date().timeIntervalSince(t)
+                    drainPendingRun()               // r-1: GPU done under our encoding
+                    pendingRun = (ctx, j..<iEnd)
+                    j = iEnd
+                    continue
+                }
+            }
+            if jEnd <= j, profileRoute || !gpuIndexerTopK {
+                // Per-token path (diagnostica DS4_PROFILE_ROUTE): reads and
                 // writes the shared scratch CPU-side — join the pipeline first.
                 drainPendingRun()
                 try autoreleasepool {
@@ -513,6 +548,48 @@ extension StreamingDecoder {
                     profile.layers += 1
                 }
                 j += 1
+                continue
+            } else if jEnd <= j {
+                // LEVA 9 v1 — coda indexer-attiva a GRUPPI (l'attivazione è
+                // monotona in pos: da qui in poi tutto il chunk è per-token).
+                // Stessi encode nello stesso ordine del fallback storico, ma
+                // R token in UN command buffer con snapshot blit negli slab
+                // (lo schema di specVerifyBatchedLayer): la sync per token
+                // diventa una sync per gruppo. Il route per token dentro il
+                // cb è autonomo (mask_one o ramo indicizzato riscrivono per
+                // intero il loro scratch; l'in-order queue serializza).
+                drainPendingRun()
+                let gEnd = min(n, j + max(1, routeBatch))
+                try autoreleasepool {
+                    try Task.checkCancellation()
+                    let t = Date()
+                    clearMaskIfDirty()
+                    let c = GraphContext(rt); try c.begin()
+                    for jj in j..<gEnd {
+                        let pos = posBase + jj
+                        try encodeRouteGroupedInto(c, i, w: w, layerRope: layerRope, curHc: cur[jj],
+                                                   pos: pos, nKeys: pos + 1, token: tokens[jj])
+                        var blits: [(GPUTensor, Int, GPUTensor, Int, Int)] = [
+                            (scratch.cur, 0, stage.cur[jj], 0, d.nEmbd * 4),
+                            (scratch.afterAttn, 0, stage.attn[jj], 0, d.nHC * d.nEmbd * 4),
+                            (scratch.split, 0, stage.split[jj], 0, 24 * 4),
+                            (scratch.selected, 0, stage.ids[jj], 0, d.k * 4),
+                            (scratch.rw, 0, stage.rw[jj], 0, d.k * 4),
+                        ]
+                        if let mm = stage.mm {
+                            blits.append((scratch.cur, 0, mm.curMat, jj * d.nEmbd * 4, d.nEmbd * 4))
+                        }
+                        try c.blitCopies(blits)
+                    }
+                    c.commit()               // UNA sync per l'intero gruppo
+                    profile.routeS += Date().timeIntervalSince(t)
+                    for jj in j..<gEnd {
+                        let (ids, rw) = selection(sel: stage.ids[jj], weights: stage.rw[jj], layer: i)
+                        idsT.append(ids); rwT.append(rw)
+                        profile.layers += 1
+                    }
+                }
+                j = gEnd
                 continue
             }
             let t = Date()
@@ -1115,8 +1192,10 @@ extension StreamingDecoder {
         // ── A1: pre-attention halves (split into helper methods — one big
         // function here crashes the release optimizer's LICM pass).
         if denseMM {
+            var idxVis = [Int](repeating: 0, count: nq)   // inerti: indexer inattivo nei run flash
             try encodeDensePre(c, fb, i, w: w, layerRope: layerRope, cur: cur,
-                               j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis)
+                               j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis,
+                               idxVis: &idxVis)
         } else {
             try encodePerTokenPre(c, fb, i, w: w, layerRope: layerRope, cur: cur,
                                   j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis)
@@ -1151,6 +1230,90 @@ extension StreamingDecoder {
         }
         profile.prefillFlashRuns += 1
         if denseMM { profile.prefillDenseRuns += 1 }
+        return c                 // caller commits (pipeline) — no sync here
+    }
+
+    /// LEVA 9 v2 — run batchato con indexer ATTIVO (DS4_INDEXED_ATTN): la
+    /// stessa A1 dense-GEMM dei run flash (encodeDensePre, che già batcha il
+    /// compressore indexer e ne espone i conteggi idxVis), poi scoring
+    /// batchato (GEMM query/pesi + score/top-k/sort per query, tutto su GPU)
+    /// e UN dispatch di attention indicizzata multi-token al posto di
+    /// maschera CPU + staging F16 + flash. La coda A3 è identica ai run
+    /// flash. NUMERICA: stessa classe del percorso per-token indicizzato
+    /// (kernel heads8 vs rb16: stesso set di righe, tiling diverso).
+    // @_optimize(none): stesso bug LICM di Swift 6.3 degli altri encoder.
+    @_optimize(none)
+    private func encodeIndexedFlashRun(_ fb: PrefillStage.FlashBatch, _ i: Int, w: LayerWeights,
+                                       layerRope: RopeParams, cur: [GPUTensor], stage: PrefillStage,
+                                       j: Int, jEnd: Int, posBase: Int, tokens: [Int],
+                                       slabDirect: Bool) throws -> GraphContext {
+        let nq = jEnd - j
+        let posFirst = posBase + j
+        let rawLo0 = max(0, posFirst + 1 - d.nSWA)
+        let nRawSpan = posBase + jEnd - rawLo0
+        guard let idx = indexStates[i], let iqb = w.idxQB, let iproj = w.idxProj,
+              let comp = compStates[i] else {
+            throw MetalError.unsupported("encodeIndexedFlashRun senza scoring indexer")
+        }
+        let c = GraphContext(rt)
+        if profilePrefill { c.phaseTimes = [:] }
+        try c.begin()
+        var nCompVis = [Int](repeating: 0, count: nq)
+        var idxVis = [Int](repeating: 0, count: nq)
+        try encodeDensePre(c, fb, i, w: w, layerRope: layerRope, cur: cur,
+                           j: j, jEnd: jEnd, posBase: posBase, nCompVis: &nCompVis,
+                           idxVis: &idxVis)
+        // ── A2i: scoring batchato — proiezioni in GEMM sul run, poi per
+        // query: score sulla SUA finestra di righe + top-K a indici + sort.
+        let ih = d.nIndexerHeadDim, inH = d.nIndexerHead
+        if w.idxQBF16 {
+            try c.encodeMMDenseF16(weight: iqb, act: fb.qrNormMat, actBase: 0, out: fb.idxQMat,
+                                   inDim: d.qRank, outDim: inH * ih, nTok: nq)
+        } else {
+            try encodeMMDense(c, weight: iqb, q4: false, act: fb.qrNormMat, out: fb.idxQMat,
+                              inDim: d.qRank, outDim: inH * ih, nTok: nq)
+        }
+        try c.ropeTail(x: fb.idxQMat, nTok: nq, nHead: inH, headDim: ih, nRot: d.nRot,
+                       nCtxOrig: layerRope.nCtxOrig, freqBase: layerRope.freqBase,
+                       freqScale: layerRope.freqScale, extFactor: layerRope.extFactor,
+                       attnFactor: layerRope.attnFactor, betaFast: layerRope.betaFast,
+                       betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1)
+        try c.indexerHadamardFp4Enc(fb.idxQMat, rows: nq * inH, rowStrideBytes: ih * 4)
+        try c.encodeMMDenseF16(weight: iproj, act: fb.curMat, actBase: 0, out: fb.idxWMat,
+                               inDim: d.nEmbd, outDim: inH, nTok: nq)
+        let scoreScale = 1.0 / Float(ih * inH).squareRoot()
+        // v2.1 (port fedele del C): score TILED in una dispatch (visibilità
+        // causale per token in-kernel, -inf oltre → righe uniformi), top-K
+        // batch con argsort+merge, sort per id in una dispatch per run.
+        let nScAll = idxVis[nq - 1]
+        precondition(nScAll > 0 && nScAll <= fb.maxKv,
+                     "leva 9 v2: score fuori capacità (\(nScAll)/\(fb.maxKv))")
+        try c.indexerScoresTiledBatch(q: fb.idxQMat, weights: fb.idxWMat,
+                                      indexComp: idx.cache, scores: fb.idxScoresMat,
+                                      nComp: nScAll, nTokens: nq, pos0: posFirst,
+                                      ratio: idx.ratio, nHead: inH, headDim: ih,
+                                      scale: scoreScale)
+        try c.indexerTopKIndicesBatch(scores: fb.idxScoresMat, nComp: nScAll,
+                                      nTokens: nq, topK: d.indexerTopK,
+                                      out: fb.idxTopKMat, scratch: fb.idxSortScratch)
+        try c.sortTopKAsc(indices: fb.idxTopKMat, sorted: fb.idxTopKSortMat,
+                          topK: d.indexerTopK, nTokens: nq)
+        // ── A2ii: UN dispatch di attention indicizzata per l'intero run.
+        let rawRows = rawCaches[i].count / d.headDim
+        let physStart = ((rawLo0 % rawRows) + rawRows) % rawRows
+        try c.indexedMixedAttentionBatch(q: fb.qMat, rawKv: rawCaches[i], comp: comp.cache,
+                                         topk: fb.idxTopKSortMat, sinks: w.attnSinks,
+                                         heads: fb.heads, nTokens: nq, nHead: d.nHead,
+                                         nRaw: nRawSpan, rawCap: rawRows, rawStart: physStart,
+                                         nComp: nCompVis[nq - 1], topK: d.indexerTopK,
+                                         pos0: posFirst, window: d.nSWA, ratio: comp.ratio)
+        try c.phase("attn")                       // DS4_PROFILE_PREFILL boundary
+        // ── A3: coda dense identica ai run flash.
+        try encodeDenseTail(c, fb, w: w, layerRope: layerRope, stage: stage,
+                            j: j, jEnd: jEnd, posBase: posBase, tokens: tokens,
+                            slabDirect: slabDirect)
+        profile.prefillFlashRuns += 1
+        profile.prefillDenseRuns += 1
         return c                 // caller commits (pipeline) — no sync here
     }
 
@@ -1193,7 +1356,8 @@ extension StreamingDecoder {
     @_optimize(none)
     private func encodeDensePre(_ c: GraphContext, _ fb: PrefillStage.FlashBatch, _ i: Int,
                                 w: LayerWeights, layerRope: RopeParams, cur: [GPUTensor],
-                                j: Int, jEnd: Int, posBase: Int, nCompVis: inout [Int]) throws {
+                                j: Int, jEnd: Int, posBase: Int, nCompVis: inout [Int],
+                                idxVis: inout [Int]) throws {
         let nq = jEnd - j
         let posFirst = posBase + j
         let hcDim = d.nHC * d.nEmbd
@@ -1232,7 +1396,8 @@ extension StreamingDecoder {
             try encodeCompProjBatched(c, kv: ikv, gate: igate, act: fb.curMat,
                                       kvOut: fb.idxKvMat, scOut: fb.idxScMat,
                                       width: idx.width, nq: nq, q8: w.idxCompQ8)
-            var idxVis = [Int](repeating: 0, count: nq)   // scoring inactive here: discarded
+            // idxVis: conteggi righe indexer visibili per query — inerti nei
+            // run inattivi, input dello scoring batchato (leva 9 v2).
             try encodeCompressorRunBatched(c, fb: fb, comp: idx,
                                            kvMat: fb.idxKvMat, scMat: fb.idxScMat,
                                            ape: iape, normW: inorm, rope: layerRope,
