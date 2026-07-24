@@ -452,15 +452,28 @@ public final class StreamingDecoder {
         remotePartialA = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
         remotePartialB = try GPUTensor.zeros(rt, floatCount: dims.nEmbd)
         embedRowStage = try GPUTensor.zerosBytes(rt, byteLength: max(2, embedTable.byteLength / max(1, dims.vocab)))
-        // Raw-KV cache rows: the full context (default) or a ring-buffer of nSWA when
-        // DS4_RAW_RING=1. Attention only ever reads the last nSWA raw rows (NSA), so
+        // Raw-KV cache rows: the full context (default) or a ring-buffer of
+        // nSWA + route-batch when DS4_RAW_RING=1 (vedi sotto perché non nSWA
+        // secchi). Attention only ever reads the last nSWA raw rows (NSA), so
         // the older rows need not stay resident — the ring cuts the raw-KV RAM from
         // O(contextSize) to a constant. The write slot, attention staging and
         // export/import all key off `rawCache.count/headDim`, so the full cache is a
         // no-wrap special case (behaviour identical). Opt-in: validate the parity
         // tests (StreamingDecoder/GraphAttn/KV-snapshot) before making it the default.
         let ringOn = getenv("DS4_RAW_RING").map { String(cString: $0) == "1" } ?? false   // live (set from the UI toggle)
-        let rawRows = ringOn ? min(dims.nSWA, maxKeys) : maxKeys
+        // Il ring deve contenere la FINESTRA di un intero run di prefill, non
+        // solo nSWA: un run di R query copre le righe [posFirst+1-nSWA, posFirst+R-1]
+        // = R + nSWA - 1 righe, e il gate del run batchato le richiede TUTTE
+        // residenti (`nRawSpan <= rawRows`, StreamingDecoder+Prefill.swift). Con
+        // un ring di soli nSWA quel gate diventa insoddisfacibile oltre la
+        // posizione nSWA-1 (servirebbe R <= 1 mentre ne chiede >= 2) e l'intero
+        // prefill batchato — leve 1-9 — si spegne silenziosamente, ricadendo
+        // sulla coda per-token. Costa nSWA·routeBatch·headDim·4 B per layer in
+        // più (≈11 MB a route-batch 128) e resta O(1) nel contesto, che è il
+        // motivo per cui il ring esiste.
+        let ringRouteBatch = max(1, ProcessInfo.processInfo
+            .environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32)
+        let rawRows = ringOn ? min(maxKeys, dims.nSWA + ringRouteBatch) : maxKeys
         // Compile the wrap-aware copy before generation reaches the first wrap;
         // otherwise lazy PSO creation would create a one-token latency spike at
         // position nSWA. The pipeline is cached by MetalRuntime afterwards.
