@@ -60,7 +60,16 @@ public final class StreamingDecoder {
     /// top-k sits between the two halves of their route).
     var prefillRouteBatch: Int {
         let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
-        return max(1, v)
+        // CLAMP sul ring raw EFFETTIVO: un run di R query copre R + nSWA - 1
+        // righe raw e il gate del run batchato le vuole tutte residenti. Il
+        // ring è dimensionato al LOAD mentre questo knob è vivo (la GUI lo
+        // cambia a caldo): senza clamp, alzarlo oltre la capacità del ring
+        // rende il gate insoddisfacibile e spegne in silenzio tutto il
+        // prefill batchato — il bug misurato il 2026-07-24 (11 vs 30 t/s).
+        // Meglio un run più corto del richiesto che nessun run.
+        let rawRows = (rawCaches.first?.count ?? 0) / max(1, d.headDim)
+        let ringCap = rawRows > 0 ? max(1, rawRows - d.nSWA + 1) : v
+        return max(1, min(v, ringCap))
     }
     /// DS4_PREFILL_BATCH_ATTN (default ON): the batched prefill route phase
     /// runs ONE multi-query FlashAttention (the C prefill's nqptg=8 MMA
@@ -203,6 +212,10 @@ public final class StreamingDecoder {
     let indexStates: [CompressorState?]
     /// Halves of s.mask dirtied by the last indexer selection (0 = clean).
     var maskDirtyCount = 0
+    /// La diagnostica "percorso batchato mai attivo" si stampa una volta sola
+    /// per sessione (vedi il defer in prefillChunk): serve a rendere RUMOROSO
+    /// un degrado che altrimenti è silenzioso, non a inondare il log.
+    var warnedNoFlashRuns = false
     /// Layers with real KV allocation (full model: 0..<nLayers; distributed slice: its range).
     let kvRange: Range<Int>
     /// KV capacity in tokens (raw rows per layer).

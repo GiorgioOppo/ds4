@@ -183,6 +183,26 @@ extension StreamingDecoder {
         let stage: PrefillStage? = (expertGather != nil && n > 1)
             ? try PrefillStage(rt, n: n, d: d, mmPath: prefillMM, maxUnion: stageUnion,
                                flashBatch: flashBatch) : nil
+        // SPIA del percorso batchato: i gate del run flash hanno condizioni di
+        // CAPACITÀ (ring raw, staging KV) che, se violate, non producono alcun
+        // errore — degradano alla coda per-token e basta. È così che il ring a
+        // nSWA secchi ha tenuto spento l'intero prefill batchato in GUI per
+        // giorni a 1/3 della velocità, invisibile nei log. Qui il caso viene
+        // diagnosticato UNA volta con il motivo, invece di restare muto.
+        let flashRunsBefore = profile.prefillFlashRuns
+        defer {
+            if n >= 64, prefillBatchAttn, routeBatch >= 2,
+               profile.prefillFlashRuns == flashRunsBefore, !warnedNoFlashRuns {
+                warnedNoFlashRuns = true
+                let rawRows = rawCaches.first.map { $0.count / d.headDim } ?? 0
+                let needed = min(routeBatch, n) + d.nSWA - 1
+                DS4Log.info("prefill", "percorso batchato MAI attivo su un chunk da \(n) token — "
+                    + "ring raw \(rawRows) righe, servono \(needed) (route-batch \(routeBatch) + nSWA \(d.nSWA) - 1)"
+                    + (rawRows > 0 && needed > rawRows
+                       ? "  ⇒ il ring e' troppo corto: abbassa DS4_PREFILL_ROUTE_BATCH o allarga il ring"
+                       : "  ⇒ causa diversa dalla capacita' del ring (quant densi Q4? staging KV?)"))
+            }
+        }
         for i in 0..<nLayers {
             // Per-layer pool drain: the layer weights and per-token command
             // buffers are autoreleased ObjC objects — without this they pile up
