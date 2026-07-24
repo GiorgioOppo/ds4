@@ -219,6 +219,20 @@ final class ChatStore {
                 UserDefaults.standard.set(192, forKey: "DS4PrefillUnion")
             }
         }
+        // Migrazione una-tantum: SHARED_Q4 OFF (2026-07-24). Il +7% di decode
+        // a contesto corto non ripaga il crollo del prefill misurato col
+        // bisect (experts 147 → 368 ms/token, anche dopo aver batchato la
+        // shared-FFN Q4). Il preset era già stato corretto, ma il VALORE
+        // PERSISTITO vince all'avvio: senza questa migrazione chi lo aveva
+        // acceso resta lento per sempre — è il caso che ha prodotto un
+        // prefill a ~1 t/s in GUI mentre la CLI ne faceva 32.
+        if !UserDefaults.standard.bool(forKey: "DS4SharedQ4Off2026_07_24") {
+            UserDefaults.standard.set(true, forKey: "DS4SharedQ4Off2026_07_24")
+            if sharedQ4Enabled {
+                sharedQ4Enabled = false
+                UserDefaults.standard.set(false, forKey: "DS4SharedQ4")
+            }
+        }
         // Knob del prefill regolabili a caldo (persistiti dal benchmark in
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)

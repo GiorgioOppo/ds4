@@ -140,8 +140,15 @@ func run(suffix: String, think: DS4ThinkMode, sampling: SamplingParams,
             }
             var end = min(pfDone + pfChunk, suffixIds.count)
             if checkpointRel > pfDone && checkpointRel < end { end = checkpointRel }
+            // `chunk:` va passato ESPLICITAMENTE: il default del decoder è 512,
+            // quindi ometterlo faceva risuddividere a 512 la fetta che questo
+            // ciclo aveva già tagliato a DS4_PREFILL_CHUNK — il knob della GUI
+            // era di fatto ignorato e, sotto i 512 token per chunk, la fase B
+            // full-layer (leva 6, soglia prefillFullLayerMin) non si attivava
+            // mai. Qui la granularità esterna e quella interna coincidono.
             lastLogits = try decoder.prefill(tokens: Array(suffixIds[pfDone..<end]),
-                                             startPos: startPos + pfDone)
+                                             startPos: startPos + pfDone,
+                                             chunk: pfChunk)
             if resumablePrefill { committedIds.append(contentsOf: suffixIds[pfDone..<end]) }
             pfDone = end
             if checkpointRel > 0 && pfDone == checkpointRel, let store = diskKV {

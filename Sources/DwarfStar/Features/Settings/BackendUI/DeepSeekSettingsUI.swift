@@ -151,7 +151,13 @@ private struct DeepSeekMemorySection: View {
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
                 Toggle("Q4 also q_a/kv projections (LOSSY, ~+10% measured)", isOn: $store.qkvQ4Enabled)
-                Toggle("Q4 shared-expert FFN (LOSSY, ~+7% measured)", isOn: $store.sharedQ4Enabled)
+                Toggle("Q4 shared-expert FFN (LOSSY, +7% decode but SLOWS PREFILL)",
+                       isOn: $store.sharedQ4Enabled)
+                if store.sharedQ4Enabled {
+                    Label("Not recommended for chat: the +7% short-context decode is paid for by a prefill collapse (routed-expert phase measured 147 → 368 ms/token, bisected 2026-07-22). Leave it off unless you decode long answers from very short prompts.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
                 if store.qkvQ4Enabled {
                     Label("Also requantizes the remaining mid-size attention projections (q_a, kv) Q8→Q4_K: ~0.7 GB/token off the SSD stream for ~0.35 GB resident (+10% decode measured on M1 Pro). The existing Q4 cache is extended incrementally (~30 s once). A/B output quality before adopting.",
                           systemImage: "exclamationmark.triangle")
