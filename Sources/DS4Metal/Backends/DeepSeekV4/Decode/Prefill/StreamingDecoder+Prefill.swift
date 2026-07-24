@@ -1448,12 +1448,20 @@ extension StreamingDecoder {
                        freqScale: layerRope.freqScale, extFactor: layerRope.extFactor,
                        attnFactor: layerRope.attnFactor, betaFast: layerRope.betaFast,
                        betaSlow: layerRope.betaSlow, pos0: posFirst, posStep: 1)
+        // Store fp8 del ring in UN dispatch invece di nq (le righe del run
+        // cadono in slot distinti per costruzione: il clamp di routeBatch
+        // garantisce nq + nSWA - 1 <= rawRows, quindi nq < rawRows).
         let rawRows = rawCaches[i].count / d.headDim
-        for r in 0..<nq {
-            let kvRow = fb.kvMat.subview(byteOffset: r * d.headDim * 4,
-                                         byteLength: d.headDim * 4, count: d.headDim)
-            try c.kvFP8Store(kv: kvRow, rawCache: rawCaches[i], headDim: d.headDim,
-                             nRot: d.nRot, rawRow: (posFirst + r) % rawRows)
+        if prefillMicroBatch {
+            try c.kvFP8StoreBatch(kv: fb.kvMat, rawCache: rawCaches[i], headDim: d.headDim,
+                                  nRot: d.nRot, pos0: posFirst, rawRows: rawRows, nTok: nq)
+        } else {
+            for r in 0..<nq {
+                let kvRow = fb.kvMat.subview(byteOffset: r * d.headDim * 4,
+                                             byteLength: d.headDim * 4, count: d.headDim)
+                try c.kvFP8Store(kv: kvRow, rawCache: rawCaches[i], headDim: d.headDim,
+                                 nRot: d.nRot, rawRow: (posFirst + r) % rawRows)
+            }
         }
         try c.phase("kv")                         // DS4_PROFILE_PREFILL boundary (KV GEMM + stores)
     }
@@ -1691,28 +1699,56 @@ extension StreamingDecoder {
             try c.encodeMMDenseQ8(weight: w.routerW, act: curOut, actBase: 0,
                                   out: fb.logitsMat, inDim: d.nEmbd, outDim: d.nExperts, nTok: nq)
         }
+        // Probabilità + finalize BATCHATI (un dispatch ciascuno invece di uno
+        // per token): stesso corpo per riga ⇒ bit-identico. I layer HASH
+        // restano per token — leggono l'id del token per indicizzare tid2eid e
+        // batcharli richiederebbe un buffer token per run, con la stessa
+        // parità double-buffer della mask; sono 3 layer su 43.
+        // (stage.ids/rw sono viste contigue su idsSlab/rwSlab con stride d.k —
+        // vedi PrefillStage.slabViews — quindi il batch può indirizzarle a
+        // stride senza restaging.)
+        let batchedRouter = prefillMicroBatch && d.fusedRouterProbs
+            && d.fusedRouterFinalize && w.tid2eid == nil
+        if batchedRouter {
+            try c.routerProbabilitiesBatch(logits: fb.logitsMat, probabilities: fb.probsMat,
+                                           width: d.nExperts, rows: nq)
+            try c.routerFinalizeTop6Batch(
+                probs: fb.probsMat,
+                selected: stage.idsSlab.subview(byteOffset: j * d.k * 4,
+                                                byteLength: nq * d.k * 4, count: nq * d.k),
+                bias: w.expBias, hashTable: nil, hashRows: 0, tokens: nil,
+                weights: stage.rwSlab.subview(byteOffset: j * d.k * 4,
+                                              byteLength: nq * d.k * 4, count: nq * d.k),
+                nExperts: d.nExperts, nTok: nq,
+                probsRow: d.nExperts, selRow: d.k, weightsRow: d.k,
+                expertWeightScale: d.expertWeightScale)
+        }
         for (r, jj) in (j..<jEnd).enumerated() {
             let logitsRow = fb.logitsMat.subview(byteOffset: r * d.nExperts * 4,
                                                  byteLength: d.nExperts * 4, count: d.nExperts)
-            if d.fusedRouterProbs {
+            if batchedRouter {
+                // già fatto sopra per l'intero run
+            } else if d.fusedRouterProbs {
                 try c.routerProbabilities(logits: logitsRow, probabilities: scratch.probs,
                                           width: d.nExperts)
             } else {
                 try c.unary(logitsRow, op: .softplus, out: scratch.sp, width: d.nExperts)
                 try c.unary(scratch.sp, op: .sqrt, out: scratch.probs, width: d.nExperts)
             }
-            // Finalize writes the per-token stage buffers DIRECTLY (the
-            // per-token path blits the same bytes from the shared scratch).
-            try c.routerFinalizeTop6(probs: scratch.probs, selected: stage.ids[jj],
-                                     bias: w.expBias, hashTable: w.tid2eid,
-                                     hashRows: w.tid2eidRows, token: tokens[jj],
-                                     weights: d.fusedRouterFinalize ? stage.rw[jj] : nil,
-                                     nExperts: d.nExperts,
-                                     expertWeightScale: d.expertWeightScale)
-            if !d.fusedRouterFinalize {
-                try c.routerWeights(probs: scratch.probs, selected: stage.ids[jj],
-                                    weights: stage.rw[jj], nExperts: d.nExperts,
-                                    expertWeightScale: d.expertWeightScale)
+            if !batchedRouter {
+                // Finalize writes the per-token stage buffers DIRECTLY (the
+                // per-token path blits the same bytes from the shared scratch).
+                try c.routerFinalizeTop6(probs: scratch.probs, selected: stage.ids[jj],
+                                         bias: w.expBias, hashTable: w.tid2eid,
+                                         hashRows: w.tid2eidRows, token: tokens[jj],
+                                         weights: d.fusedRouterFinalize ? stage.rw[jj] : nil,
+                                         nExperts: d.nExperts,
+                                         expertWeightScale: d.expertWeightScale)
+                if !d.fusedRouterFinalize {
+                    try c.routerWeights(probs: scratch.probs, selected: stage.ids[jj],
+                                        weights: stage.rw[jj], nExperts: d.nExperts,
+                                        expertWeightScale: d.expertWeightScale)
+                }
             }
             if !slabDirect {
                 var copies: [(src: GPUTensor, srcOff: Int, dst: GPUTensor, dstOff: Int, bytes: Int)] = [

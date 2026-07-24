@@ -92,6 +92,19 @@ struct ds4_metal_args_dsv4_router_select_one {
     float    expert_weight_scale;
 };
 
+struct ds4_metal_args_dsv4_router_select_batch {
+    uint32_t has_bias;
+    uint32_t hash_mode;
+    uint32_t hash_rows;
+    uint32_t write_weights;
+    uint32_t n_experts;
+    uint32_t n_tok;
+    uint32_t probs_row;   // float per riga di probs
+    uint32_t sel_row;     // int32 per riga di selected
+    uint32_t w_row;       // float per riga di weights
+    float    expert_weight_scale;
+};
+
 struct ds4_metal_args_dsv4_router_weights_one {
     uint32_t n_experts;
     float    expert_weight_scale;
@@ -313,6 +326,90 @@ kernel void kernel_dsv4_router_finalize_one(
         }
         sum = max(sum, 6.103515625e-5f);
         weights[tid] = probs[selected[tid]] / sum * args.expert_weight_scale;
+    }
+}
+
+// Variante BATCHATA del finalize: un threadgroup per token del run di
+// prefill, righe di probs/selected/weights individuate dagli stride. Il corpo
+// per riga è IDENTICO a kernel_dsv4_router_finalize_one — stessa rete
+// bitonica dentro il threadgroup, stessa somma a sei termini nello stesso
+// ordine — quindi il risultato è bit-identico; sparisce solo il costo fisso
+// di nq dispatch da un threadgroup l'uno (misurato ~14.9 us ciascuno).
+// I layer hash leggono l'id del token da tokens[tg].
+kernel void kernel_dsv4_router_finalize_batch(
+        constant ds4_metal_args_dsv4_router_select_batch & args,
+        device const float *probs,
+        device const float *bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tg  [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    if (tg >= args.n_tok) return;
+    const uint n_experts = min(args.n_experts, ntg);
+
+    device const float *probs_row = probs + (uint64_t)tg * args.probs_row;
+    device int32_t *sel_row = selected + (uint64_t)tg * args.sel_row;
+    device float *w_row = weights + (uint64_t)tg * args.w_row;
+
+    threadgroup float *sel_scores = scratch;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + ntg);
+    if (tid < n_experts) {
+        const float p = probs_row[tid];
+        sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    } else {
+        sel_scores[tid] = -INFINITY;
+    }
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.hash_mode) {
+        if (tid == 0) {
+            const uint token = (uint)tokens[tg];
+            const uint row = min(token, args.hash_rows - 1u);
+            device const int32_t *src = hash + row * 6u;
+            for (uint i = 0; i < 6; i++) {
+                sel_row[i] = src[i];
+            }
+        }
+    } else {
+        for (uint k = 2; k <= ntg; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                const uint other = tid ^ j;
+                if (other > tid) {
+                    if ((tid & k) == 0) {
+                        if (sel_scores[(uint)idx[tid]] < sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    } else {
+                        if (sel_scores[(uint)idx[tid]] > sel_scores[(uint)idx[other]]) {
+                            const int32_t tmp = idx[tid];
+                            idx[tid] = idx[other];
+                            idx[other] = tmp;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        if (tid < 6) {
+            sel_row[tid] = idx[tid];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.write_weights && tid < 6) {
+        float sum = 0.0f;
+        for (uint i = 0; i < 6; i++) {
+            sum += probs_row[sel_row[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        w_row[tid] = probs_row[sel_row[tid]] / sum * args.expert_weight_scale;
     }
 }
 

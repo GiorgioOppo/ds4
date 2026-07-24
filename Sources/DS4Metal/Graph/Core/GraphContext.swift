@@ -389,6 +389,28 @@ public final class GraphContext {
     }
 
     /// Decode router probability transform in one vectorized pass.
+    /// Variante BATCHATA: softplus+sqrt su `rows` righe di logit token-major in
+    /// UN dispatch. Il kernel è già per-riga (ne01/nb01), quindi l'aritmetica
+    /// per riga è identica al percorso per token — bit-identico.
+    public func routerProbabilitiesBatch(logits: GPUTensor, probabilities: GPUTensor,
+                                         width: Int, rows: Int) throws {
+        precondition(width % 4 == 0 && rows > 0)
+        let args = MetalRuntime.unaryArgs(width: width, rows: rows,
+                                          minV: 0, maxV: 0, scale: 0, bias: 0, val: 0)
+        let pso = try rt.pipeline("kernel_dsv4_softplus_sqrt_f32_4")
+        let vectors = width / 4
+        let nth = min(vectors, pso.maxTotalThreadsPerThreadgroup)
+        let blocks = (vectors + nth - 1) / nth
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(logits.buffer, offset: logits.byteOffset, index: 1)
+        e.setBuffer(probabilities.buffer, offset: probabilities.byteOffset, index: 2)
+        // tgpig.x è (k0 * ne01 + i01): un blocco per riga per fetta di larghezza.
+        e.dispatchThreadgroups(MTLSize(width: blocks * rows, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: nth, height: 1, depth: 1))
+    }
+
     public func routerProbabilities(logits: GPUTensor, probabilities: GPUTensor,
                                     width: Int) throws {
         precondition(width % 4 == 0)

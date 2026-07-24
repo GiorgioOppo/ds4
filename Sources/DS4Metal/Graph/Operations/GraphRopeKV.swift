@@ -69,6 +69,29 @@ extension GraphContext {
 
     /// Encode-form fused KV FP8 store: FP8 (E4M3) the non-RoPE part of `kv` in
     /// place and write the row (F16-rounded) into rawCache[rawRow]. 12-byte args.
+    /// Store fp8 BATCHATO: le `nTok` righe di `kv` (token-major) finiscono nel
+    /// ring in UN dispatch, con lo slot `(pos0 + t) % rawRows` calcolato in
+    /// kernel. Bit-identico al loop per token (stesso corpo per riga), toglie
+    /// nTok-1 dispatch da un threadgroup l'uno dentro i run di prefill.
+    public func kvFP8StoreBatch(kv: GPUTensor, rawCache: GPUTensor, headDim: Int,
+                                nRot: Int, pos0: Int, rawRows: Int, nTok: Int) throws {
+        precondition(nTok > 0 && rawRows > 0)
+        var args = [UInt8](repeating: 0, count: 20)
+        func i32(_ off: Int, _ v: Int) {
+            withUnsafeBytes(of: Int32(v).littleEndian) { for k in 0..<4 { args[off + k] = $0[k] } }
+        }
+        i32(0, headDim); i32(4, nRot); i32(8, pos0); i32(12, rawRows); i32(16, nTok)
+        let pso = try rt.pipeline("kernel_dsv4_kv_fp8_store_batch_f32")
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(kv.buffer, offset: kv.byteOffset, index: 1)
+        e.setBuffer(rawCache.buffer, offset: rawCache.byteOffset, index: 2)
+        e.setThreadgroupMemoryLength(64 * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: nTok, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
     public func kvFP8Store(kv: GPUTensor, rawCache: GPUTensor, headDim: Int, nRot: Int, rawRow: Int) throws {
         var args = [UInt8](repeating: 0, count: 12)
         withUnsafeBytes(of: Int32(headDim).littleEndian) { for k in 0..<4 { args[k] = $0[k] } }

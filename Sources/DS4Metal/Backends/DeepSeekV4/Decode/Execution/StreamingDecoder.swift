@@ -60,16 +60,18 @@ public final class StreamingDecoder {
     /// top-k sits between the two halves of their route).
     var prefillRouteBatch: Int {
         let v = ProcessInfo.processInfo.environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32
-        // CLAMP sul ring raw EFFETTIVO: un run di R query copre R + nSWA - 1
-        // righe raw e il gate del run batchato le vuole tutte residenti. Il
-        // ring è dimensionato al LOAD mentre questo knob è vivo (la GUI lo
-        // cambia a caldo): senza clamp, alzarlo oltre la capacità del ring
-        // rende il gate insoddisfacibile e spegne in silenzio tutto il
-        // prefill batchato — il bug misurato il 2026-07-24 (11 vs 30 t/s).
-        // Meglio un run più corto del richiesto che nessun run.
-        let rawRows = (rawCaches.first?.count ?? 0) / max(1, d.headDim)
-        let ringCap = rawRows > 0 ? max(1, rawRows - d.nSWA + 1) : v
-        return max(1, min(v, ringCap))
+        // CLAMP sulla capacità del ring raw: un run di R query copre
+        // R + nSWA - 1 righe e il gate del run batchato le vuole tutte
+        // residenti. Il ring è dimensionato al LOAD mentre questo knob è vivo
+        // (la GUI lo cambia a caldo): senza clamp, alzarlo oltre la capacità
+        // rende il gate insoddisfacibile e spegne in silenzio tutto il prefill
+        // batchato — il bug misurato il 2026-07-24 (11 vs 30 t/s). Meglio un
+        // run più corto del richiesto che nessun run.
+        // Vale SOLO col ring: con la cache piena le righe non vengono mai
+        // sovrascritte e lo span è limitato dal contesto, non dalla capacità
+        // (applicarlo comunque spegneva il batch sui contesti più corti di
+        // nSWA — preso dai test di parità).
+        return max(1, min(v, prefillRouteBatchCap))
     }
     /// DS4_PREFILL_BATCH_ATTN (default ON): the batched prefill route phase
     /// runs ONE multi-query FlashAttention (the C prefill's nqptg=8 MMA
@@ -212,6 +214,15 @@ public final class StreamingDecoder {
     let indexStates: [CompressorState?]
     /// Halves of s.mask dirtied by the last indexer selection (0 = clean).
     var maskDirtyCount = 0
+    /// DS4_PREFILL_MICRO_BATCH (default ON): dentro i run già batchati del
+    /// prefill, i tre dispatch che restavano PER TOKEN (store fp8 del ring,
+    /// probabilità del router, finalize top-6) diventano uno ciascuno per
+    /// l'intero run. Stesso corpo per riga ⇒ bit-identico; `=0` ripristina il
+    /// percorso per token per l'A/B.
+    let prefillMicroBatch = ProcessInfo.processInfo.environment["DS4_PREFILL_MICRO_BATCH"] != "0"
+    /// Tetto del route-batch imposto dalla capacità del ring raw (Int.max con
+    /// la cache piena). Fissato al load, quando il ring viene dimensionato.
+    let prefillRouteBatchCap: Int
     /// La diagnostica "percorso batchato mai attivo" si stampa una volta sola
     /// per sessione (vedi il defer in prefillChunk): serve a rendere RUMOROSO
     /// un degrado che altrimenti è silenzioso, non a inondare il log.
@@ -487,6 +498,10 @@ public final class StreamingDecoder {
         let ringRouteBatch = max(1, ProcessInfo.processInfo
             .environment["DS4_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 32)
         let rawRows = ringOn ? min(maxKeys, dims.nSWA + ringRouteBatch) : maxKeys
+        // Tetto vivo per DS4_PREFILL_ROUTE_BATCH (vedi prefillRouteBatch): col
+        // ring le righe si sovrascrivono, quindi un run non può eccedere
+        // rawRows - nSWA + 1; con la cache piena non c'è tetto.
+        prefillRouteBatchCap = ringOn ? max(1, rawRows - dims.nSWA + 1) : Int.max
         // Compile the wrap-aware copy before generation reaches the first wrap;
         // otherwise lazy PSO creation would create a one-token latency spike at
         // position nSWA. The pipeline is cached by MetalRuntime afterwards.

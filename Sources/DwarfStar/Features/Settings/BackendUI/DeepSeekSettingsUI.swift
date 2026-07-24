@@ -169,11 +169,11 @@ private struct DeepSeekMemorySection: View {
                 }
             }
             diskKVRows
-            Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
+            Toggle("Raw-KV ring: constant KV RAM", isOn: $store.rawRingEnabled)
             if store.rawRingEnabled {
-                Label("Keeps only the attention window (128 rows) in RAM instead of the full context. Experimental: verify outputs after a long context.",
-                      systemImage: "flask")
-                    .font(.caption).foregroundStyle(.orange)
+                Label("Keeps the attention window plus one prefill run (\(128 + store.prefillRouteBatch) rows) in RAM instead of the full context, so raw-KV memory stays constant as the conversation grows. Verified bit-identical to the full cache.",
+                      systemImage: "checkmark.seal")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Text("Applies on the next model load.")
                 .font(.caption).foregroundStyle(.tertiary)

@@ -50,6 +50,54 @@ extension GraphContext {
                                threadsPerThreadgroup: MTLSize(width: sortWidth, height: 1, depth: 1))
     }
 
+    /// Finalize BATCHATO: selezione top-6 (+ normalizzazione fusa) per `nTok`
+    /// token in UN dispatch, un threadgroup per token. Righe individuate dagli
+    /// stride su probs/selected/weights; i layer hash leggono l'id del token da
+    /// `tokens[t]`. Corpo per riga identico a routerFinalizeTop6 ⇒ bit-identico.
+    public func routerFinalizeTop6Batch(probs: GPUTensor, selected: GPUTensor,
+                                        bias: GPUTensor? = nil,
+                                        hashTable: GPUTensor? = nil, hashRows: Int = 0,
+                                        tokens: GPUTensor? = nil,
+                                        weights: GPUTensor? = nil,
+                                        nExperts: Int, nTok: Int,
+                                        probsRow: Int, selRow: Int, weightsRow: Int,
+                                        expertWeightScale: Float) throws {
+        guard nExperts == 256 || nExperts == 384 else {
+            throw MetalError.unsupported("router expert count \(nExperts); expected 256 or 384")
+        }
+        precondition(expertWeightScale.isFinite && expertWeightScale >= 0)
+        precondition(nTok > 0 && probsRow >= nExperts && selRow >= 6)
+        precondition(probs.count >= nTok * probsRow)
+        precondition(selected.byteLength >= nTok * selRow * 4)
+        if let weights { precondition(weights.count >= (nTok - 1) * weightsRow + 6) }
+        if hashTable != nil { precondition(tokens != nil, "layer hash: serve il buffer dei token") }
+
+        let sortWidth = nExperts == 256 ? 256 : 512
+        var args = [UInt8](repeating: 0, count: 40)
+        func u32(_ off: Int, _ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { for k in 0..<4 { args[off+k] = $0[k] } } }
+        u32(0, bias != nil ? 1 : 0); u32(4, hashTable != nil ? 1 : 0)
+        u32(8, UInt32(max(1, hashRows))); u32(12, weights != nil ? 1 : 0)
+        u32(16, UInt32(nExperts)); u32(20, UInt32(nTok))
+        u32(24, UInt32(probsRow)); u32(28, UInt32(selRow)); u32(32, UInt32(weightsRow))
+        u32(36, expertWeightScale.bitPattern)
+        let pso = try rt.pipeline("kernel_dsv4_router_finalize_batch")
+        guard sortWidth <= pso.maxTotalThreadsPerThreadgroup else {
+            throw MetalError.unsupported("router requires \(sortWidth) threads, GPU supports \(pso.maxTotalThreadsPerThreadgroup)")
+        }
+        let e = encoder
+        e.setComputePipelineState(pso)
+        args.withUnsafeBytes { e.setBytes($0.baseAddress!, length: args.count, index: 0) }
+        e.setBuffer(probs.buffer, offset: probs.byteOffset, index: 1)
+        e.setBuffer((bias ?? probs).buffer, offset: (bias ?? probs).byteOffset, index: 2)
+        e.setBuffer((hashTable ?? probs).buffer, offset: (hashTable ?? probs).byteOffset, index: 3)
+        e.setBuffer((tokens ?? probs).buffer, offset: (tokens ?? probs).byteOffset, index: 4)
+        e.setBuffer(selected.buffer, offset: selected.byteOffset, index: 5)
+        e.setBuffer((weights ?? probs).buffer, offset: (weights ?? probs).byteOffset, index: 6)
+        e.setThreadgroupMemoryLength(sortWidth * 4 + sortWidth * 4, index: 0)
+        e.dispatchThreadgroups(MTLSize(width: nTok, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: sortWidth, height: 1, depth: 1))
+    }
+
     /// Encode-form router weight normalization using the architecture's scale.
     public func routerWeights(probs: GPUTensor, selected: GPUTensor, weights: GPUTensor,
                               nExperts: Int, expertWeightScale: Float) throws {

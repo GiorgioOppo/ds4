@@ -79,6 +79,9 @@ extension ChatStore {
             _ = setenv("DS4_DENSE_Q4_KERNEL", "1", 1)
             _ = setenv("DS4_FUSED_ROUTER_PROBS", "1", 1)
             _ = setenv("DS4_FUSED_ROUTER_FINALIZE", "1", 1)
+            // Store fp8 del ring + probabilita'/finalize del router batchati
+            // per l'intero run invece che per token (bit-identico).
+            _ = setenv("DS4_PREFILL_MICRO_BATCH", "1", 1)
             _ = setenv("DS4_FUSED_COMP_PROJ", "1", 1)
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)

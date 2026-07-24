@@ -83,6 +83,10 @@ extension StreamingDecoder {
             let splitF: GPUTensor     // nq × 24 slab (pre-FFN HC split)
             let curMat2: GPUTensor    // nq × nEmbd (FFN input rows)
             let logitsMat: GPUTensor  // nq × nExperts (router logits)
+            /// Probabilità del router per l'intero run: sqrt(softplus(logit)).
+            /// Il percorso per token riusava la riga condivisa scratch.probs —
+            /// con il finalize batchato ogni token deve avere la SUA riga.
+            let probsMat: GPUTensor   // nq × nExperts
             /// Batched NSA compressor projections: kv/score rows for the whole
             /// run (attention compressor: width ≤ 2·headDim; indexer
             /// compressor: width = 2·nIndexerHeadDim). The recurrent state
@@ -139,6 +143,7 @@ extension StreamingDecoder {
                 splitF = try .zeros(rt, floatCount: nq * 24)
                 curMat2 = try .zeros(rt, floatCount: nq * d.nEmbd)
                 logitsMat = try .zeros(rt, floatCount: nq * d.nExperts)
+                probsMat = try .zeros(rt, floatCount: nq * d.nExperts)
                 compKvMat = try .zeros(rt, floatCount: nq * 2 * d.headDim)
                 compScMat = try .zeros(rt, floatCount: nq * 2 * d.headDim)
                 idxKvMat = try .zeros(rt, floatCount: nq * 2 * d.nIndexerHeadDim)
