@@ -92,8 +92,8 @@ private struct DeepSeekMemorySection: View {
             }
             Stepper("Expert cache: \(store.expertCacheSlots) slots/layer\(store.expertCacheSlots == 0 ? " (off)" : "")",
                     value: $store.expertCacheSlots, in: 0...64, step: 4)
-            if store.expertCacheSlots > 20 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
-                Label("The measured 16 GB Flash preset uses 22 slots. On Flash each extra legacy-size slot costs ~0.25 GB across the IQ2 layers; Pro has 61 layers and larger experts, so do not reuse this RAM estimate. Excessive memory pressure or other heavy apps can trigger swap and collapse decode speed.",
+            if store.expertCacheSlots > 12 && MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
+                Label("On 16 GB the engine caps the wired cache automatically (≈12 slots ≈ 3.1 GB): above that, the prefill's transient buffers (~3.4 GB) plus the cache overflow RAM and swap — measured 1275s vs 123s prefill at 22 vs 11 slots. The engine log's 'budget cache esperti' line shows the value actually used; set DS4_EXPERT_CACHE_NO_CLAMP=1 to override. Closing Xcode frees ~3-4 GB more.",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.orange)
             }

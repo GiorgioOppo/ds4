@@ -233,6 +233,20 @@ final class ChatStore {
                 UserDefaults.standard.set(false, forKey: "DS4SharedQ4")
             }
         }
+        // Migrazione una-tantum: slot cache ≤ 12 su <24 GB (2026-07-26). A 22
+        // slot la cache wired è 6.2 GB su 16: i transienti del prefill batchato
+        // (slab full-layer 3.4 GB + flash + GEMM) sfondano la RAM → swap →
+        // prefill 1275s invece di 123s (A/B misurato, argmax identico). Il
+        // motore ora clampa comunque a runtime, ma allineare il VALORE PERSISTITO
+        // evita che la GUI mostri 22 mentre il motore ne usa 11.
+        if !UserDefaults.standard.bool(forKey: "DS4CacheSlotsRAM2026_07_26"),
+           MemoryInfo.physicalBytes < 24 * 1_073_741_824 {
+            UserDefaults.standard.set(true, forKey: "DS4CacheSlotsRAM2026_07_26")
+            if expertCacheSlots > 12 {
+                expertCacheSlots = 12
+                UserDefaults.standard.set(12, forKey: "DS4ExpertCacheSlots")
+            }
+        }
         // Knob del prefill regolabili a caldo (persistiti dal benchmark in
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
