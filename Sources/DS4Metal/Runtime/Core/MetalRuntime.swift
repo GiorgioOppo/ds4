@@ -81,10 +81,21 @@ public final class MetalRuntime {
     /// regressione numerica). Vedi `applyMathMode`.
     static func compileOptions() -> MTLCompileOptions {
         let opts = MTLCompileOptions()
-        opts.preprocessorMacros = [
+        var macros: [String: NSObject] = [
             "DS4_METAL_HC_STABLE": NSNumber(value: 1),
             "DS4_METAL_NORM_RSQRT_DISABLE": NSNumber(value: 1),
         ]
+        // DS4_IQ2XXS_VEC (opt-in, default OFF): compile the vectorized inner
+        // product in the IQ2_XXS matvecs (moe.metal). Added ONLY when the env
+        // var is set, so the default library never even parses the new branch —
+        // the scalar path is byte-for-byte today's behavior. Reassociates the
+        // reduction (close, not bit-identical): A/B against the logit-parity
+        // tests before adopting. Re-read at every model load.
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["DS4_IQ2XXS_VEC"], v == "1" || v.lowercased() == "true" || v.lowercased() == "on" {
+            macros["DS4_IQ2XXS_VEC"] = NSNumber(value: 1)
+        }
+        opts.preprocessorMacros = macros
         applyMathMode(to: opts)
         return opts
     }

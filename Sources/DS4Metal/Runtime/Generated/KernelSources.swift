@@ -3357,6 +3357,33 @@ kernel void kernel_dsv4_moe_sum6_f32(
     }
 }
 
+#ifdef DS4_IQ2XXS_VEC
+// OPT-IN (DS4_IQ2XXS_VEC): vectorized inner product for one 8-element IQ2_XXS
+// grid block, replacing the scalar j=0..7 accumulation in the iq2_xxs matvecs
+// (the hottest per-token decode loop: routed gate+up on the 2-bit model).
+// Loads the 8 grid bytes as two float4, builds the ±1 sign vectors from the
+// SAME kmask table, and reduces with two `dot`s. Result is `sum(y*grid*sign)`,
+// identical operands to the scalar path — but the reduction is REASSOCIATED
+// (and `dot` may fuse), so outputs are close, NOT bit-identical: an A/B
+// candidate to validate against the logit-parity tests, never a silent change.
+// Guarded so the default embedded library compiles only the scalar branch.
+inline float ds4_iq2xxs_block_dot(thread const float * yl8,
+                                  threadgroup const uint64_t * svalues,
+                                  uint8_t gid, uint8_t signs) {
+    threadgroup const uint8_t * grid = (threadgroup const uint8_t *)(svalues + gid);
+    const float4 y0 = float4(yl8[0], yl8[1], yl8[2], yl8[3]);
+    const float4 y1 = float4(yl8[4], yl8[5], yl8[6], yl8[7]);
+    const float4 g0 = float4((float)grid[0], (float)grid[1], (float)grid[2], (float)grid[3]);
+    const float4 g1 = float4((float)grid[4], (float)grid[5], (float)grid[6], (float)grid[7]);
+    float4 s0, s1;
+    for (short j = 0; j < 4; ++j) {
+        s0[j] = (signs & ds4_metal_kmask_iq2xs[j])     ? -1.0f : 1.0f;
+        s1[j] = (signs & ds4_metal_kmask_iq2xs[4 + j]) ? -1.0f : 1.0f;
+    }
+    return dot(y0 * g0, s0) + dot(y1 * g1, s1);
+}
+#endif
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
@@ -3810,6 +3837,12 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             const float d = db * (0.5f + (aux32 >> 28));
 
             float sum = 0;
+#ifdef DS4_IQ2XXS_VEC
+            for (short l = 0; l < 4; ++l) {
+                sum += ds4_iq2xxs_block_dot(&yl[8*l], svalues, aux8[l],
+                                            ssigns[(aux32 >> 7*l) & 127]);
+            }
+#else
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
                 const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
@@ -3817,6 +3850,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
                     sum += yl[8*l + j] * grid[j] * (signs & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
+#endif
             sumf[row] += d * sum;
 
             dh += args.nb01/2;
@@ -3919,6 +3953,14 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
 
             float sg = 0;
             float su = 0;
+#ifdef DS4_IQ2XXS_VEC
+            for (short l = 0; l < 4; ++l) {
+                sg += ds4_iq2xxs_block_dot(&yl[8*l], svalues, aux8g[l],
+                                           ssigns[(aux32g >> 7*l) & 127]);
+                su += ds4_iq2xxs_block_dot(&yl[8*l], svalues, aux8u[l],
+                                           ssigns[(aux32u >> 7*l) & 127]);
+            }
+#else
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
@@ -3930,6 +3972,7 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
                     su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
+#endif
             sumg[row] += dg * sg;
             sumu[row] += du * su;
 
@@ -4326,6 +4369,14 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
 
             float sg = 0;
             float su = 0;
+#ifdef DS4_IQ2XXS_VEC
+            for (short l = 0; l < 4; ++l) {
+                sg += ds4_iq2xxs_block_dot(&yl[8 * l], svalues, aux8g[l],
+                                           ssigns[(aux32g >> 7 * l) & 127]);
+                su += ds4_iq2xxs_block_dot(&yl[8 * l], svalues, aux8u[l],
+                                           ssigns[(aux32u >> 7 * l) & 127]);
+            }
+#else
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
@@ -4337,6 +4388,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
                     su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
+#endif
             sumg[row] += dg * sg;
             sumu[row] += du * su;
 
