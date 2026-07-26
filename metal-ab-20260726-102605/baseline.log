@@ -1,0 +1,17 @@
+DS4Demo: Metal runtime up on Apple M1 Pro, 177 kernels compiled
+DS4Demo: GPU self-test PASSED
+DS4Demo: A/B logit trace attiva — max 9 frame, output /Users/oppog/Documents/Project/DeepSeek v4 Metal/DeepSeek-V4-Pro-MacOS/metal-ab-20260726-102605/baseline.{json,f32}
+DS4Demo: capacita' contesto = 4096 token (DS4_DEMO_CONTEXT)
+DS4Demo: opening /Users/oppog/Downloads/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf …
+DS4Demo: architecture=deepseek4 model=DeepSeek V4 Flash
+DS4Demo: profilo=DeepSeek V4 Flash layer=43 esperti=256
+DS4Demo: MoE quant gate=iq2_xxs up=iq2_xxs down=q2_K routerF16=true
+DS4 expbundle: disattivato (DS4_EXPERT_BUNDLE≠1) — gather dal GGUF
+DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…
+DS4Demo: 1 forward in 3.8s — logits[129280] finite=YES argmax=5 (logit 16.815)
+DS4Demo: prompt dal file /Users/oppog/Downloads/ds4/README.md: troncato a 12000 caratteri (DS4_PROMPT_MAX_CHARS per cambiare)
+DS4Demo: prompt '<p align="center">
+  <img src="logo.svg" alt="DwarfStar logo" width="220">
+</p>
+
+**DwarfStar** is a small native inferen…' (12000 car.) -> 3072 tokens; generating 8 (greedy, streaming)…

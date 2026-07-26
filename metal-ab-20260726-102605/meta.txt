@@ -1,0 +1,17 @@
+date: 2026-07-26 10:26:06 +0200
+git: 1d0716c7
+developer_dir: /Applications/Xcode.app/Contents/Developer
+host: arm64
+cpu: Apple M1 Pro
+ram_bytes: 17179869184
+gguf: /Users/oppog/Downloads/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+prompt: /Users/oppog/Downloads/ds4/README.md
+knob: DS4_IQ2XXS_VEC
+base: 0
+candidate: 1
+max_new: 8
+warmup: 2
+trace_frames: 9
+order: baseline-first
+
+Inherited DS4 environment (controlled values below override it):

@@ -131,6 +131,55 @@ extension StreamingDecoder {
                                     expertGather: gather, geometry: geometry)
     }
 
+    /// Numero di slot della cache esperti effettivamente allocati: logga il
+    /// footprint WIRED pianificato contro la RAM fisica e, su macchine strette,
+    /// lo clampa a un tetto che lascia respiro alla page cache degli esperti
+    /// (senza la quale il gather va in thrashing/swap a contesto lungo).
+    /// La cache è numericamente identica al gather diretto (stessi byte, stessi
+    /// kernel): ridurre gli slot cambia solo l'hit-rate, mai i logit — quindi il
+    /// clamp non tocca la parità. Disattivabile con DS4_EXPERT_CACHE_NO_CLAMP=1.
+    static func ramClampedSlots(requested: Int, layerCount: Int,
+                                recordBytes: Int, mlock: Bool) -> Int {
+        let gib = 1_073_741_824.0
+        let ram = Double(ProcessInfo.processInfo.physicalMemory)
+        let perSlot = Double(layerCount * recordBytes)         // byte per slot, tutti i layer
+        let requestedBytes = Double(requested) * perSlot
+        func gb(_ b: Double) -> String { String(format: "%.1f", b / gib) }
+
+        // Tetto sano su RAM ridotta: la cache wired non deve rubare alla page
+        // cache lo spazio per il working set del gather (~1.7 GB/token) più il
+        // margine di sistema/app/Xcode. Su <24 GB tetto ≈ 20% della RAM
+        // (≈3.2 GB su 16), che lascia ~13 GB a sistema+app+page-cache. Su
+        // macchine capienti nessun clamp: la page cache non è il collo.
+        let clampEnabled = ProcessInfo.processInfo.environment["DS4_EXPERT_CACHE_NO_CLAMP"] != "1"
+        let tightRAM = ram < 24 * gib
+        var slots = requested
+        if clampEnabled, tightRAM, perSlot > 0 {
+            let capBytes = ram * 0.20
+            if requestedBytes > capBytes {
+                let capped = max(8, Int(capBytes / perSlot))
+                if capped < requested {
+                    slots = capped
+                    DS4Log.info("mem", String(
+                        format: "cache esperti: %d slot = %@ GB WIRED sforerebbero il tetto su %@ GB di RAM — ridotti a %d (%@ GB). DS4_EXPERT_CACHE_NO_CLAMP=1 per forzare.",
+                        requested, gb(requestedBytes), gb(ram), capped, gb(Double(capped) * perSlot)))
+                }
+            }
+        }
+        // Log del budget SEMPRE (anche senza clamp): rende visibile il piano di
+        // memoria che finora si scopriva solo dal decode lento.
+        let usedBytes = Double(slots) * perSlot
+        let headroom = ram - usedBytes
+        DS4Log.info("mem", String(
+            format: "budget cache esperti: %d slot × %d layer = %@ GB%@ su %@ GB RAM — restano ~%@ GB per sistema/app/page-cache%@",
+            slots, layerCount, gb(usedBytes), mlock ? " WIRED (mlock)" : "",
+            gb(ram), gb(headroom),
+            (tightRAM && headroom < 7 * gib)
+                ? ".  ⚠︎ margine stretto: a contesto lungo il gather (~1.7 GB/token) può andare in thrashing — chiudi le altre app o riduci gli slot."
+                : "."))
+        return slots
+    }
+
     /// Fastest 16GB path (the C `--ssd-streaming` model): non-routed weights are
     /// NO-COPY mmap views (resident via the OS page cache, single copy, evictable —
     /// no per-token re-copy, no 8GB of dirty buffers that OOM), and only the 6 selected
@@ -244,11 +293,21 @@ extension StreamingDecoder {
         var slotStride: Int? = nil
         var multiCacheActive = false
         if nSlots > 0 {
-            let S = max(8, nSlots)
-            let requestedMulti = ProcessInfo.processInfo.environment["DS4_MULTI_QUANT_CACHE"] == "1"
             // Preserve the RAM actually used by the old single-class cache, not
             // S × every model layer: off-class layers previously had no pool.
             let legacyLayerCount = routedLayers.subtracting(offClass).count
+            // Il pool è memoria WIRED (mlock/anonima non-evictable): S slot ×
+            // layer × record. Su macchine strette compete con la PAGE CACHE che
+            // tiene caldi gli esperti (~1.7 GB/token letti in gather): se la
+            // cache wired la strozza, il gather va in thrashing/swap e il decode
+            // crolla (misurato 2026-07-24: 22 slot ⇒ 6.1 GB wired su 16 GB +
+            // Xcode ⇒ 0.04 t/s). Qui il footprint viene LOGGATO e, su RAM
+            // ridotta, clampato a un tetto che lascia respiro alla page cache.
+            let S = Self.ramClampedSlots(requested: max(8, nSlots),
+                                         layerCount: max(1, legacyLayerCount),
+                                         recordBytes: baseLayout.record,
+                                         mlock: lockResident)
+            let requestedMulti = ProcessInfo.processInfo.environment["DS4_MULTI_QUANT_CACHE"] == "1"
             let legacyBudget = S * legacyLayerCount * baseLayout.record
             let byteCosts = Dictionary(uniqueKeysWithValues: routedLayers.map { ($0, layouts[$0].record) })
             let allLayers = routedLayers
