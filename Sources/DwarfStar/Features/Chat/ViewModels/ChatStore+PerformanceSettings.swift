@@ -25,7 +25,7 @@ extension ChatStore {
         prefillRouteBatch = 128    // misurato 2026-07-22: 21.4 → 24.2 t/s su 2.7k reali
         expertBundleEnabled = true
         metalIOEnabled = true      // fallback automatico a pread sotto 4.0 GB/s sul M1 Pro
-        expertLookahead = 0        // speculativo misurato neutro; i layer hash restano sempre attivi
+        expertLookahead = 12       // A/B 2026-07-26: +9.1% decode a contesto lungo (nasconde I/O esperti sotto il compute), neutro a corto
         denseAhead = 2             // staging un layer avanti: +1,5% misurato
         asyncFFNEnabled = true     // pipeline FFN asincrona: +10% misurato, parita' certificata
         q8NSG = 4
@@ -50,7 +50,7 @@ extension ChatStore {
             d.set(128, forKey: "DS4PrefillRouteBatch")
             d.set(true, forKey: "DS4ExpertBundle")
             d.set(true, forKey: "DS4MetalIO")
-            d.set(0, forKey: "DS4ExpertLookahead")
+            d.set(12, forKey: "DS4ExpertLookahead")
             d.set(2, forKey: "DS4DenseAhead")
             d.set(true, forKey: "DS4AsyncFFN")
             d.set(4, forKey: "DS4Q8NSG")
@@ -83,7 +83,7 @@ extension ChatStore {
             // per l'intero run invece che per token (bit-identico).
             _ = setenv("DS4_PREFILL_MICRO_BATCH", "1", 1)
             _ = setenv("DS4_FUSED_COMP_PROJ", "1", 1)
-            _ = setenv("DS4_EXPERT_LOOKAHEAD", "0", 1)
+            _ = setenv("DS4_EXPERT_LOOKAHEAD", "12", 1)
             _ = setenv("DS4_DENSE_AHEAD", "2", 1)
             _ = setenv("DS4_ASYNC_FFN", "1", 1)
             _ = setenv("DS4_Q8_NSG", "4", 1)

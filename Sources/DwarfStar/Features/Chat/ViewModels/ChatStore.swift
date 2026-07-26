@@ -247,6 +247,19 @@ final class ChatStore {
                 UserDefaults.standard.set(12, forKey: "DS4ExpertCacheSlots")
             }
         }
+        // Migrazione una-tantum: look-ahead esperti 12 (2026-07-26). A/B
+        // misurato: a contesto lungo +9.1% di decode (2.43→2.65 t/s, nasconde
+        // 68 vs 41 MB/token di I/O esperti sotto il compute), a contesto corto
+        // NEUTRO (2.47→2.46, nel rumore). Il default 0 era prudente su misura
+        // solo a contesto corto; il demand ha priorità, quindi lo speculativo
+        // non danneggia il critical path.
+        if !UserDefaults.standard.bool(forKey: "DS4Lookahead2026_07_26") {
+            UserDefaults.standard.set(true, forKey: "DS4Lookahead2026_07_26")
+            if expertLookahead < 12 {
+                expertLookahead = 12
+                UserDefaults.standard.set(12, forKey: "DS4ExpertLookahead")
+            }
+        }
         // Knob del prefill regolabili a caldo (persistiti dal benchmark in
         // Settings): letti dal motore a ogni chiamata di prefill.
         _ = setenv("DS4_PREFILL_UNION", String(prefillUnion), 1)
@@ -385,7 +398,7 @@ final class ChatStore {
     /// I layer hash 0-2 sono SEMPRE prefetchati esatti (selezione nota dal token
     /// id), indipendentemente da questo valore. 0 = solo hash. Si applica al
     /// prossimo caricamento del modello. Speculativo: A/B per macchina.
-    var expertLookahead: Int = (UserDefaults.standard.object(forKey: "DS4ExpertLookahead") as? Int) ?? 0 {
+    var expertLookahead: Int = (UserDefaults.standard.object(forKey: "DS4ExpertLookahead") as? Int) ?? 12 {
         didSet {
             UserDefaults.standard.set(expertLookahead, forKey: "DS4ExpertLookahead")
             _ = setenv("DS4_EXPERT_LOOKAHEAD", "\(expertLookahead)", 1)
