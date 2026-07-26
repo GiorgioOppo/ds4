@@ -174,8 +174,13 @@ extension StreamingDecoder {
             format: "budget cache esperti: %d slot × %d layer = %@ GB%@ su %@ GB RAM — restano ~%@ GB per sistema/app/page-cache%@",
             slots, layerCount, gb(usedBytes), mlock ? " WIRED (mlock)" : "",
             gb(ram), gb(headroom),
-            (tightRAM && headroom < 7 * gib)
-                ? ".  ⚠︎ margine stretto: a contesto lungo il gather (~1.7 GB/token) può andare in thrashing — chiudi le altre app o riduci gli slot."
+            // Soglia 10 GB, non 7: il PREFILL batchato aggiunge ~3.4 GB di
+            // transienti (slab full-layer + flash batch + GEMM) sopra questo
+            // footprint statico, più il working set del gather (~1.7 GB/token)
+            // e il margine di sistema/app. Misurato 2026-07-26: a 9.8 GB di
+            // headroom statico il prefill andava GIÀ in swap (1275s vs 123s).
+            (tightRAM && headroom < 10 * gib)
+                ? ".  ⚠︎ margine stretto: i transienti del prefill (~3.4 GB) + il gather (~1.7 GB/token) possono andare in swap — chiudi le altre app (Xcode!) o riduci gli slot."
                 : "."))
         return slots
     }
