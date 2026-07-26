@@ -75,13 +75,47 @@ public final class MetalRuntime {
     /// sigmoide HC in forma tanh e RMSNorm con 1/sqrt al posto di rsqrt.
     /// Senza queste macro gli #ifdef già presenti negli shader cadono sul ramo
     /// storico e i logit divergono da ds4 di ~0.24 medi a parità di GGUF.
+    ///
+    /// Il math mode del compilatore Metal è lasciato al DEFAULT dell'SDK finché
+    /// `DS4_FAST_MATH` non è impostata (comportamento storico invariato: nessuna
+    /// regressione numerica). Vedi `applyMathMode`.
     static func compileOptions() -> MTLCompileOptions {
         let opts = MTLCompileOptions()
         opts.preprocessorMacros = [
             "DS4_METAL_HC_STABLE": NSNumber(value: 1),
             "DS4_METAL_NORM_RSQRT_DISABLE": NSNumber(value: 1),
         ]
+        applyMathMode(to: opts)
         return opts
+    }
+
+    /// `DS4_FAST_MATH`: leva a livello compilatore sui loop aritmetici dei kernel
+    /// (dequant IQ2/Q4/Q8, SwiGLU/`exp`, RMSNorm, RoPE). Riletto a ogni load del
+    /// modello, così uno sweep A/B non richiede di riavviare il processo.
+    ///
+    /// - non impostata → nessuna modifica: si eredita il default dell'SDK, che è
+    ///   esattamente il comportamento storico (rischio di regressione nullo);
+    /// - `safe`/`0`/`off` → IEEE stretto, baseline di parità esplicita;
+    /// - `relaxed`/`1`/`on` → riassociazione e reciproche approssimate (passo
+    ///   "gentile": tipicamente sposta solo l'ultimo ulp dei logit);
+    /// - `fast` → il più aggressivo.
+    ///
+    /// Cambia i numeri quando attiva: validare con i test di parità dei logit
+    /// (Tests/DS4CoreTests) prima di renderla un default. Su OS/SDK precedenti a
+    /// macOS 15 la variabile è un no-op (si resta sul default del compilatore).
+    static func applyMathMode(to opts: MTLCompileOptions) {
+        guard let raw = ProcessInfo.processInfo.environment["DS4_FAST_MATH"]?
+                .trimmingCharacters(in: .whitespaces).lowercased(),
+              !raw.isEmpty else { return }
+        if #available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *) {
+            switch raw {
+            case "0", "safe", "off", "false": opts.mathMode = .safe
+            case "fast":                       opts.mathMode = .fast
+            default:                           opts.mathMode = .relaxed   // "1"/"relaxed"/"on"/…
+            }
+        }
+        // SDK/OS < macOS 15: `mathMode` non esiste; la variabile resta un no-op
+        // (nessuna API deprecata referenziata, così la build non emette warning).
     }
 
     /// Explicit override: compile kernels from an on-disk metal/ folder (used by
