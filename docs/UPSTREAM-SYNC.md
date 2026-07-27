@@ -26,6 +26,32 @@ the baseline.
 | Repository | `https://github.com/antirez/ds4.git` |
 | Result | **No urgent changes required** for the standard model path. |
 
+## Update 2026-07-27 (reviewed `80ebbc3..0a7ad77`)
+
+Re-ran the comparison. Since the last baseline there are **15 upstream commits**
+(to `0a7ad77`, 2026-07-23), **12 touching the shared scope**. Reviewed at the
+commit-message + file-stat level; items marked *evaluate* still need a code read
+on a Mac.
+
+| Commit | Area | Port decision |
+|---|---|---|
+| `519c4d8` Fix PRO streaming and sampling correctness | engine/Metal/server | **NEW GAP — evaluate.** Adds an expert-cache service-thread guard and makes computed logits **independent of the SSD streaming expert-cache budget**, plus a too-small-cache warning and a sampling fix. Check the Swift expert cache (`ExpertSlotCache`, streaming) holds the same "logits ⟂ budget" invariant. |
+| `427e281` Optimize Metal prefill and decode kernels | Metal | **NEW GAP — resync.** Large kernel pass (ds4_metal.m +2572; dense/rope/misc/cpy `.metal`). The port's kernels are ported from these files and are now behind — evaluate porting the optimizations/fixes. |
+| `36cd0ca` Add native Metal session batching | server/engine | **Reference for Gap 3.** The Metal implementation of mixed prefill+decode + server slots — the port's continuous-batching gap now has a Metal reference (not only CUDA). |
+| `a185c36` Stabilize CUDA and Metal session batching | Metal/CUDA | **Deferred** — pairs with Gap 3 (Metal batching not yet in the port); CUDA out of scope. |
+| `0a7ad77` Fix batched server session recovery race | server | **Deferred** — depends on server session batching (Gap 3), which the port does not have (serialized `RequestGate`). |
+| `005afed` Add GLM 5.2 inference and quality fixtures | engine/Metal | **Relevant to GLM parity.** Upstream GLM landing + quality fixtures; the port has GLM (experimental). Use the fixtures to certify GLM logits parity. |
+| `e0824dd` Make release builds warning-free | C | **N/A** (C-only warnings). |
+| `ef8d923` Add ROCm GLM 5.2 support | ROCm | **N/A** (out of scope). |
+| `66cbce5` Unify distributed inference CLI and documentation | CLI/docs | **N/A** (distributed CLI/docs; the port has its own). |
+| `36ee8c1` Add CUDA tensor parallelism and session batching | CUDA/TP | **N/A** (out of scope). |
+| `63d9874` Add two-machine Metal tensor parallelism | TP | **N/A** (tensor-parallel + RDMA out of scope). |
+| `fc9efd1` Add DSpark speculative decoding | speculative | **N/A** (MTP/speculative family out of scope; the port has its own self-speculative). |
+
+Net new actionable items: `519c4d8` (expert-cache/sampling correctness) and
+`427e281` (Metal kernel resync) — both need on-device evaluation. Advance the
+reviewed baseline to `0a7ad77` after those two are triaged on a Mac.
+
 ## What Is in Scope
 
 DwarfStar shares only the inference-engine surface with upstream. These upstream

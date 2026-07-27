@@ -26,6 +26,32 @@ sezione finale prima di far avanzare la baseline.
 | Repository | `https://github.com/antirez/ds4.git` |
 | Risultato | **Nessuna modifica urgente richiesta** per il percorso del modello standard. |
 
+## Aggiornamento 2026-07-27 (rivisto `80ebbc3..0a7ad77`)
+
+Confronto rieseguito. Dalla baseline precedente ci sono **15 commit upstream**
+(fino a `0a7ad77`, 2026-07-23), **12 sullo scope condiviso**. Rivisti a livello
+di messaggio + statistiche file; le voci *valutare* richiedono ancora una
+lettura del codice su Mac.
+
+| Commit | Area | Decisione port |
+|---|---|---|
+| `519c4d8` Fix PRO streaming and sampling correctness | engine/Metal/server | **NUOVO GAP — valutare.** Aggiunge un guard sul service-thread della cache esperti e rende i logit calcolati **indipendenti dal budget della cache esperti in streaming SSD**, più un warning cache troppo piccola e un fix di sampling. Verificare che la cache esperti Swift (`ExpertSlotCache`, streaming) mantenga lo stesso invariante "logit ⟂ budget". |
+| `427e281` Optimize Metal prefill and decode kernels | Metal | **NUOVO GAP — resync.** Grande pass sui kernel (ds4_metal.m +2572; dense/rope/misc/cpy `.metal`). I kernel del port derivano da questi file e sono ora indietro — valutare il port delle ottimizzazioni/fix. |
+| `36cd0ca` Add native Metal session batching | server/engine | **Riferimento per il Gap 3.** L'implementazione Metal del batch misto prefill+decode + slot server — il gap di continuous batching del port ha ora un riferimento Metal (non solo CUDA). |
+| `a185c36` Stabilize CUDA and Metal session batching | Metal/CUDA | **Rimandato** — si accompagna al Gap 3 (batching Metal non ancora nel port); CUDA fuori scope. |
+| `0a7ad77` Fix batched server session recovery race | server | **Rimandato** — dipende dal session batching (Gap 3), assente nel port (`RequestGate` serializzato). |
+| `005afed` Add GLM 5.2 inference and quality fixtures | engine/Metal | **Rilevante per parità GLM.** Landing GLM upstream + fixture di qualità; il port ha GLM (sperimentale). Usare le fixture per certificare la parità dei logit GLM. |
+| `e0824dd` Make release builds warning-free | C | **N/A** (warning solo-C). |
+| `ef8d923` Add ROCm GLM 5.2 support | ROCm | **N/A** (fuori scope). |
+| `66cbce5` Unify distributed inference CLI and documentation | CLI/docs | **N/A** (CLI/docs distribuito; il port ha il proprio). |
+| `36ee8c1` Add CUDA tensor parallelism and session batching | CUDA/TP | **N/A** (fuori scope). |
+| `63d9874` Add two-machine Metal tensor parallelism | TP | **N/A** (tensor-parallel + RDMA fuori scope). |
+| `fc9efd1` Add DSpark speculative decoding | speculative | **N/A** (famiglia MTP/speculativo fuori scope; il port ha il proprio self-speculative). |
+
+Voci nuove azionabili: `519c4d8` (correttezza cache esperti/sampling) e
+`427e281` (resync kernel Metal) — entrambe da valutare on-device. Avanzare la
+baseline rivista a `0a7ad77` dopo che le due sono state triageate su Mac.
+
 ## Che cosa rientra nell'ambito
 
 DwarfStar condivide con l'upstream solo la superficie dell'engine di

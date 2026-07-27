@@ -188,3 +188,20 @@ byte-identical to the serialized path; KV isolation between sessions verified.
 
 Every step here requires a Mac (Metal) for its validation gate; this repo's
 Linux CI can build/test only the pure-Swift `DS4Core` surface.
+
+## From upstream drift (see UPSTREAM-SYNC.md, reviewed `80ebbc3..0a7ad77`)
+
+Two additional in-scope items surfaced by re-running the upstream comparison,
+both needing an on-device code read:
+
+- **`519c4d8` — expert-cache / sampling correctness.** Upstream makes computed
+  logits independent of the SSD streaming expert-cache budget (+ a too-small-cache
+  warning and a sampling fix). Verify the Swift `ExpertSlotCache`/streaming path
+  holds the same "logits ⟂ budget" invariant.
+- **`427e281` — Metal kernel resync.** A large upstream kernel-optimization pass;
+  the port's kernels (ported from `metal/*.metal`) are now behind. Evaluate
+  porting the changes and regenerate the embedded kernels.
+
+Also: `36cd0ca` (native Metal session batching) is now the Metal reference for
+Gap 3, and `005afed` (GLM 5.2 + quality fixtures) supports GLM parity
+certification.
