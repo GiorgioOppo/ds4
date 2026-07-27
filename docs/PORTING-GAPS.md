@@ -77,12 +77,23 @@ cannot be selected as a local model (`docs/ARCHITETTURE-SUPPORTATE.md`; the
 GUI/`Browse` path rejects a lone shard). This is loader/model-management work,
 largely NOT new Metal shaders.
 
-> **Progress:** the pure-Swift multi-shard loader primitive is implemented and
-> tested — `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` unions N GGUF
-> shards' tensor directories by name (disjoint names; first-shard-wins
-> metadata). What remains is the Metal-side wiring below (routing weight access
-> through the shard set) plus the catalog/GUI changes — those need on-device
-> validation.
+> **Progress:**
+> - `GGUFShardSet` (pure Swift, tested): unions N shards by name + per-layer
+>   shard routing (`shard(forLayer:)`, `shard(owning:)`, `primary`).
+> - `StreamingDecoder.fromGGUFShards` (DS4Metal, additive): builds the decoder
+>   routing each layer to its owning shard, so **`GGUFWeights` is reused
+>   unchanged** (the split is layer-disjoint, so a whole layer resolves to one
+>   shard). This is the simple resident path (analog of `fromGGUF`).
+>
+> What remains needs on-device validation: (a) the expert-streaming shard
+> variants (mapped/cached-expert pools span shards); (b) DS4Engine wiring to
+> construct a `GGUFShardSet` and call `fromGGUFShards`; (c) catalog/GUI
+> recognizing the two files as one selectable model.
+>
+> Design note: a naive "read protocol" over `GGUFWeights` was rejected — weight
+> loading uses per-tensor raw access (`mapBase`, `uncachedFD`, `path`) that is
+> per-shard, so per-layer shard routing (above) is the correct, lower-risk seam;
+> `GGUFWeights` never had to change.
 
 ### Upstream reference
 - Upstream assembles multi-file GGUFs; see the shard/loader handling in `ds4.c`

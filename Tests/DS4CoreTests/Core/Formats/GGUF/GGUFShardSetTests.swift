@@ -78,6 +78,43 @@ final class GGUFShardSetTests: XCTestCase {
         XCTAssertThrowsError(try GGUFShardSet(paths: [], metalMapping: false))
     }
 
+    func testShardRouting() throws {
+        let (au, bu) = try writeShards()
+        defer { try? FileManager.default.removeItem(at: au); try? FileManager.default.removeItem(at: bu) }
+        let set = try GGUFShardSet(paths: [au.path, bu.path], metalMapping: false)
+
+        // primary is shard 0 (holds global metadata + layer 0).
+        XCTAssertEqual(set.primary.u32("deepseek4.block_count"), 2)
+
+        // Per-layer routing sends each layer to its owning shard.
+        XCTAssertNotNil(set.shard(forLayer: 0)?.findTensor("blk.0.attn.weight"))
+        XCTAssertNotNil(set.shard(forLayer: 1)?.findTensor("blk.1.attn.weight"))
+        XCTAssertNil(set.shard(forLayer: 2))   // no such layer
+
+        // The output head is owned by shard B.
+        XCTAssertNotNil(set.shard(owning: "output.weight")?.findTensor("output.weight"))
+    }
+
+    func testLayerIndexParsing() {
+        XCTAssertEqual(GGUFShardSet.layerIndex(of: "blk.0.attn.weight"), 0)
+        XCTAssertEqual(GGUFShardSet.layerIndex(of: "blk.42.ffn_down_exps.weight"), 42)
+        XCTAssertNil(GGUFShardSet.layerIndex(of: "output.weight"))
+        XCTAssertNil(GGUFShardSet.layerIndex(of: "token_embd.weight"))
+        XCTAssertNil(GGUFShardSet.layerIndex(of: "blk.x.weight"))
+    }
+
+    /// A layer whose tensors are split across two shards is a hard error.
+    func testLayerSplitAcrossShardsThrows() throws {
+        var a = try GGUFWriter()
+        a.add(.init(name: "blk.5.attn.weight", dims: [4], type: 0, data: f32Data([1, 2, 3, 4])))
+        let au = tempURL(); try a.write(to: au.path)
+        var b = try GGUFWriter()
+        b.add(.init(name: "blk.5.ffn.weight", dims: [4], type: 0, data: f32Data([5, 6, 7, 8])))
+        let bu = tempURL(); try b.write(to: bu.path)
+        defer { try? FileManager.default.removeItem(at: au); try? FileManager.default.removeItem(at: bu) }
+        XCTAssertThrowsError(try GGUFShardSet(paths: [au.path, bu.path], metalMapping: false))
+    }
+
     /// A single shard behaves like the plain model for reads.
     func testSingleShardEquivalence() throws {
         let (au, bu) = try writeShards()

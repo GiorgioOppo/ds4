@@ -35,10 +35,15 @@ public final class GGUFShardSet {
     public let tensors: [GGUFModel.Tensor]
 
     private let located: [String: (shard: Int, tensorIndex: Int)]
+    /// Which shard owns each `blk.<il>.*` layer (all of a layer's tensors live
+    /// in one shard — the split is by layer range).
+    private let layerToShard: [Int: Int]
 
     public var n_tensors: UInt64 { UInt64(tensors.count) }
     /// Alignment of the first shard (shards are expected to agree).
     public var alignment: UInt64 { shards.first?.alignment ?? 32 }
+    /// The first shard — the authority for global (non-layer) metadata.
+    public var primary: GGUFModel { shards[0] }
 
     /// Open every path as a GGUF and merge. Throws if a tensor name appears in
     /// more than one shard, or if `paths` is empty.
@@ -55,6 +60,7 @@ public final class GGUFShardSet {
 
         var all: [GGUFModel.Tensor] = []
         var index: [String: (shard: Int, tensorIndex: Int)] = [:]
+        var layerShard: [Int: Int] = [:]
         for (si, m) in shards.enumerated() {
             for t in m.tensors {
                 if let prev = index[t.name] {
@@ -63,10 +69,26 @@ public final class GGUFShardSet {
                 }
                 index[t.name] = (si, all.count)
                 all.append(t)
+                if let il = Self.layerIndex(of: t.name) {
+                    if let prev = layerShard[il], prev != si {
+                        throw GGUFError.message(
+                            "GGUFShardSet: layer \(il) is split across shards \(prev) and \(si)")
+                    }
+                    layerShard[il] = si
+                }
             }
         }
         self.tensors = all
         self.located = index
+        self.layerToShard = layerShard
+    }
+
+    /// Parse the layer index from a `blk.<il>.…` tensor name, or nil.
+    static func layerIndex(of name: String) -> Int? {
+        guard name.hasPrefix("blk.") else { return nil }
+        let rest = name.dropFirst(4)
+        guard let dot = rest.firstIndex(of: ".") else { return nil }
+        return Int(rest[..<dot])
     }
 
     // MARK: - Tensor access (routed to the owning shard)
@@ -79,6 +101,17 @@ public final class GGUFShardSet {
 
     /// The merged tensor descriptor (bytes must still be read via `tensorData`).
     public func findTensor(_ name: String) -> GGUFModel.Tensor? { find(name)?.tensor }
+
+    /// The shard (a plain `GGUFModel`) that owns a given tensor, or nil.
+    public func shard(owning name: String) -> GGUFModel? { find(name)?.model }
+
+    /// The shard that owns layer `il`'s tensors (`blk.<il>.*`), or nil if no
+    /// shard declares that layer. Because the split is by layer range, all of a
+    /// layer's tensors live in one shard — so weight loaders can pass THIS shard
+    /// to the existing single-file `GGUFWeights` code unchanged.
+    public func shard(forLayer il: Int) -> GGUFModel? {
+        layerToShard[il].map { shards[$0] }
+    }
 
     /// Raw bytes of a tensor, read from the shard that owns it.
     public func tensorData(_ name: String) -> Data? {

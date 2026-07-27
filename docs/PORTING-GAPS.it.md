@@ -76,12 +76,23 @@ e non selezionabile come modello locale (`docs/ARCHITETTURE-SUPPORTATE.md`; il
 percorso GUI/`Browse` rifiuta uno shard isolato). È lavoro di
 loader/model-management, in gran parte NON nuovi shader Metal.
 
-> **Progresso:** la primitiva loader multi-shard puro-Swift è implementata e
-> testata — `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` unisce per nome le
-> directory dei tensori di N shard GGUF (nomi disgiunti; metadata
-> first-shard-wins). Resta la cablatura lato Metal qui sotto (instradare
-> l'accesso ai pesi attraverso lo shard set) più le modifiche a catalogo/GUI —
-> quelle richiedono validazione on-device.
+> **Progresso:**
+> - `GGUFShardSet` (puro Swift, testato): unione per nome + routing per-layer
+>   allo shard proprietario (`shard(forLayer:)`, `shard(owning:)`, `primary`).
+> - `StreamingDecoder.fromGGUFShards` (DS4Metal, additiva): costruisce il decoder
+>   instradando ogni layer al suo shard, così **`GGUFWeights` è riusato
+>   invariato** (lo split è per-layer, quindi un layer intero risolve su un solo
+>   shard). È il percorso resident semplice (analogo di `fromGGUF`).
+>
+> Resta, da validare on-device: (a) le varianti a streaming esperti per shard (i
+> pool esperti mapped/cached attraversano gli shard); (b) la cablatura DS4Engine
+> per costruire un `GGUFShardSet` e chiamare `fromGGUFShards`; (c) catalogo/GUI
+> che riconoscano i due file come un unico modello selezionabile.
+>
+> Nota di design: un "protocollo di lettura" ingenuo su `GGUFWeights` è stato
+> scartato — il caricamento pesi usa accesso raw per-tensore (`mapBase`,
+> `uncachedFD`, `path`) che è per-shard, quindi il routing per-layer (sopra) è il
+> seam corretto e a rischio minore; `GGUFWeights` non ha dovuto cambiare.
 
 ### Riferimento upstream
 - L'upstream assembla GGUF multi-file; vedi la gestione shard/loader nel

@@ -103,6 +103,41 @@ extension StreamingDecoder {
                                     hcEps: hcEps, geometry: geometry)
     }
 
+    /// Build a streaming decoder from a MULTI-SHARD GGUF (the DeepSeek V4 Pro Q4
+    /// layer-range split: `…Layers00-30.gguf` + `…Layers-31-output.gguf`). Each
+    /// layer is loaded from the shard that OWNS it, so the existing single-file
+    /// `GGUFWeights` loader is reused unchanged; the output head/embedding come
+    /// from their owning shard, and global geometry from the first shard.
+    ///
+    /// This is the simple resident path (no on-demand expert streaming) — the
+    /// analog of `fromGGUF`, suitable for a high-RAM single node that maps both
+    /// shards. The expert-cached / mapped-expert shard variants (the streaming
+    /// perf path) are a follow-up: their expert pools span shards and need the
+    /// per-layer routing threaded through the gather/pool layout. See
+    /// docs/PORTING-GAPS.md (Gap 2).
+    public static func fromGGUFShards(rt: MetalRuntime, shards: GGUFShardSet, dims: DSV4Dims,
+                                      rope: RopeParams, nLayers: Int, maxKeys: Int,
+                                      rmsEps: Float = ModelDefaults.rmsEps,
+                                      hcEps: Float = ModelDefaults.hcEps,
+                                      geometry: DSV4RuntimeGeometry) throws -> StreamingDecoder {
+        // Global geometry / routed-quant detection from the first shard (which
+        // owns the early layers and the global metadata).
+        let dims = try resolvedRuntimeDims(dims, model: shards.primary, geometry: geometry,
+                                           nLayers: nLayers)
+        let headShard = shards.shard(owning: "output.weight")
+            ?? shards.shard(owning: "token_embd.weight") ?? shards.primary
+        let (embed, head) = try GGUFWeights.outputHead(rt, headShard)
+        return try StreamingDecoder(rt: rt, dims: dims, rope: rope, nLayers: nLayers,
+                                    layerProvider: { il in
+                                        guard let m = shards.shard(forLayer: il) else {
+                                            throw GGUFError.message("no shard owns layer \(il)")
+                                        }
+                                        return try GGUFWeights.layer(rt, m, il)
+                                    },
+                                    embedTable: embed, out: head, maxKeys: maxKeys, rmsEps: rmsEps,
+                                    hcEps: hcEps, geometry: geometry)
+    }
+
     /// Expert-cache streaming decoder: per layer, only the dense weights are
     /// loaded up front; after routing, ONLY the 6 selected experts are gathered
     /// from the mmap (6/256 ~= 40x less expert IO/RAM). Numerically identical to
