@@ -84,10 +84,16 @@ loader/model-management, in gran parte NON nuovi shader Metal.
 >   invariato** (lo split è per-layer, quindi un layer intero risolve su un solo
 >   shard). È il percorso resident semplice (analogo di `fromGGUF`).
 >
+> - CLI `DS4Demo` (additiva): una lista di path separati da virgola
+>   (`DS4Demo shardA.gguf,shardB.gguf …`) apre lo split e lo esegue via
+>   `fromGGUFShards` — così l'intera catena è **eseguibile end-to-end** per la
+>   validazione on-device senza toccare la GUI.
+>
 > Resta, da validare on-device: (a) le varianti a streaming esperti per shard (i
-> pool esperti mapped/cached attraversano gli shard); (b) la cablatura DS4Engine
-> per costruire un `GGUFShardSet` e chiamare `fromGGUFShards`; (c) catalogo/GUI
-> che riconoscano i due file come un unico modello selezionabile.
+> pool esperti mapped/cached attraversano gli shard); (b) la cablatura della GUI
+> `InferenceService` (il suo init è costruito su un solo `GGUFModel`; aggiungere
+> un percorso shard che lasci invariato il single-file); (c) catalogo/GUI che
+> riconoscano i due file come un unico modello selezionabile.
 >
 > Nota di design: un "protocollo di lettura" ingenuo su `GGUFWeights` è stato
 > scartato — il caricamento pesi usa accesso raw per-tensore (`mapBase`,

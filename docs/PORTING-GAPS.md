@@ -85,10 +85,16 @@ largely NOT new Metal shaders.
 >   unchanged** (the split is layer-disjoint, so a whole layer resolves to one
 >   shard). This is the simple resident path (analog of `fromGGUF`).
 >
+> - `DS4Demo` CLI (additive): a comma-separated path list
+>   (`DS4Demo shardA.gguf,shardB.gguf …`) opens the split and runs it through
+>   `fromGGUFShards` — so the whole chain is **executable end-to-end** for
+>   on-device validation without touching the GUI.
+>
 > What remains needs on-device validation: (a) the expert-streaming shard
-> variants (mapped/cached-expert pools span shards); (b) DS4Engine wiring to
-> construct a `GGUFShardSet` and call `fromGGUFShards`; (c) catalog/GUI
-> recognizing the two files as one selectable model.
+> variants (mapped/cached-expert pools span shards); (b) GUI `InferenceService`
+> wiring (its init is built around one `GGUFModel`; add a shard path that keeps
+> the single-file path unchanged); (c) catalog/GUI recognizing the two files as
+> one selectable model.
 >
 > Design note: a naive "read protocol" over `GGUFWeights` was rejected — weight
 > loading uses per-tensor raw access (`mapBase`, `uncachedFD`, `path`) that is

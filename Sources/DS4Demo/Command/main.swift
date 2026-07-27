@@ -12,6 +12,8 @@ import Metal
 // Usage:
 //   DS4Demo                                # Metal bring-up self-test only
 //   DS4Demo <gguf-path> [maxNew] [prompt]  # + stream <maxNew> tokens (heavy I/O)
+//   DS4Demo <shardA.gguf,shardB.gguf> …    # Pro Q4 layer-range split (comma list)
+//   DS4Demo requantize <in> <out> RULE …   # offline GGUF→GGUF requant (no GPU)
 //   prompt "@/path/file" = usa il CONTENUTO del file come prompt (testi lunghi,
 //   benchmark prefill; troncato a DS4_PROMPT_MAX_CHARS, default 12000).
 
@@ -119,7 +121,23 @@ do {
     }
 
     log("DS4Demo: opening \(ggufPath) …")
-    let model = try GGUFModel(path: ggufPath, metalMapping: true, prefetchCPU: false)
+    // Multi-shard input: a comma-separated path list opens the DeepSeek V4 Pro Q4
+    // layer-range split (…Layers00-30.gguf,…Layers-31-output.gguf) as one logical
+    // model via GGUFShardSet + fromGGUFShards. The primary (first) shard supplies
+    // the tokenizer/config/global metadata; a single path keeps prior behavior.
+    let shardPaths = ggufPath.split(separator: ",").map(String.init)
+    let shardSet: GGUFShardSet? = shardPaths.count > 1
+        ? try GGUFShardSet(paths: shardPaths, metalMapping: true) : nil
+    if let shardSet {
+        log("DS4Demo: multi-shard Pro Q4 split — \(shardSet.shards.count) shards, "
+            + "\(shardSet.n_tensors) tensors merged")
+    }
+    let model: GGUFModel
+    if let shardSet {
+        model = shardSet.primary
+    } else {
+        model = try GGUFModel(path: ggufPath, metalMapping: true, prefetchCPU: false)
+    }
     // DS4Demo cannot import DS4Engine without changing the XcodeGen target graph,
     // so it shares the same canonical DS4Core detector used by the engine factory.
     // Select before constructing DeepSeek tokenizer/dims: Qwen must never fall
@@ -478,10 +496,19 @@ do {
     let rope = geometry.ropeParams(layer: 0)
     // Fast path: non-routed weights resident (memoized), only the 6 selected experts
     // gathered per token (~6/256 of expert IO) — the C --ssd-streaming model.
-    let dec = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
+    let dec: StreamingDecoder
+    if let shardSet {
+        // Pro Q4 split: resident per-layer load routed to the owning shard.
+        dec = try StreamingDecoder.fromGGUFShards(rt: rt, shards: shardSet, dims: dims, rope: rope,
+                                                  nLayers: geometry.nLayers, maxKeys: maxKeys,
+                                                  geometry: geometry)
+        log("DS4Demo: multi-shard resident decoder (Pro Q4 split, per-layer shard routing)…")
+    } else {
+        dec = try StreamingDecoder.fromGGUFExpertCachedMapped(rt: rt, model: model, dims: dims, rope: rope,
                                                               nLayers: geometry.nLayers, maxKeys: maxKeys,
                                                               geometry: geometry)
-    log("DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…")
+        log("DS4Demo: no-copy mmap non-routed + gather 6 experts/token (C --ssd-streaming model)…")
+    }
     // Persistenza della usage imatrix TRA i run della demo (l'app la persiste
     // per agente). Senza, i pool della slot-cache nascono al primo token con
     // storia vuota: l'allocazione usage-driven resterebbe un'anteprima nella

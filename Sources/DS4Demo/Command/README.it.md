@@ -19,6 +19,12 @@ validati producono una `DSV4RuntimeGeometry` specifica del profilo; il package
 di catalogo Pro Q4 non è accettato perché la CLI non assembla i suoi due
 shard.
 
+Lo **split Pro Q4 per range di layer** è accettato come lista di path separati da
+virgola (`DS4Demo shardA.gguf,shardB.gguf …`): la CLI apre un `GGUFShardSet`, usa
+il primo shard per tokenizer/config/metadata e costruisce il decoder con
+`StreamingDecoder.fromGGUFShards` (ogni layer caricato dal suo shard). È il
+percorso resident semplice — un nodo ad alta RAM che mappa entrambi gli shard.
+
 ## Sottocomando `requantize`
 
 `DS4Demo requantize <in.gguf> <out.gguf> RULE [RULE ...]` esegue una

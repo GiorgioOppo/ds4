@@ -13,8 +13,13 @@ DeepSeek tokenizer or decoder. This keeps the target graph unchanged while
 producing the same early Qwen/unknown rejection as the engine factory.
 
 Both Flash and the single-file Pro Q2 profile are accepted. Their validated
-metadata produces a profile-specific `DSV4RuntimeGeometry`; the Pro Q4 catalog
-package is not accepted because the CLI does not assemble its two shards.
+metadata produces a profile-specific `DSV4RuntimeGeometry`.
+
+The **Pro Q4 layer-range split** is accepted as a comma-separated path list
+(`DS4Demo shardA.gguf,shardB.gguf …`): the CLI opens a `GGUFShardSet`, uses the
+first shard for tokenizer/config/metadata, and builds the decoder with
+`StreamingDecoder.fromGGUFShards` (each layer loaded from its owning shard).
+This is the simple resident path — a high-RAM node that maps both shards.
 
 ## `requantize` subcommand
 
