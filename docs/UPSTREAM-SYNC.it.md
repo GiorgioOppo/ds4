@@ -7,6 +7,11 @@ upstream [`antirez/ds4`](https://github.com/antirez/ds4.git). Questo file
 registra l'ultimo confronto con l'upstream, in modo che la prossima revisione
 parta da una baseline nota invece di riscoprire la stessa cronologia di commit.
 
+Per un piano di implementazione turnkey dei gap runtime ancora aperti (routed
+Q8_K, Pro Q4 split-load, batch misto prefill+decode nel server) vedi
+[`PORTING-GAPS.it.md`](PORTING-GAPS.it.md). I gap di tooling offline (GGUF
+writer, requantizzatore offline) sono già implementati in puro Swift.
+
 Questo è uno snapshot di sincronizzazione datato, non un'affermazione
 sull'attuale HEAD upstream. La ristrutturazione della documentazione del
 2026-07-13 non ha eseguito un nuovo confronto in rete; usare i comandi nella

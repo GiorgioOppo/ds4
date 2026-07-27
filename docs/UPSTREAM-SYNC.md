@@ -7,6 +7,11 @@ DwarfStar's engine is a **pure-Swift rewrite** of the upstream C project
 upstream comparison so that the next review starts from a known baseline instead
 of rediscovering the same commit history.
 
+For a turnkey implementation plan of the still-open runtime gaps (routed Q8_K,
+Pro Q4 split-load, mixed prefill+decode server batching), see
+[`PORTING-GAPS.md`](PORTING-GAPS.md). The offline tooling gaps (GGUF writer,
+offline requantizer) are already implemented in pure Swift.
+
 This is a dated synchronization snapshot, not a statement about the current
 upstream HEAD. The documentation restructuring on 2026-07-13 did not perform a
 new network comparison; use the commands in the final section before advancing
