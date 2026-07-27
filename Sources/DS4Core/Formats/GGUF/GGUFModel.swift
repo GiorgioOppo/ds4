@@ -35,7 +35,7 @@ public final class GGUFModel {
     private let fd: Int32
     /// Lazily-opened second descriptor with F_NOCACHE (see uncachedFD()).
     private var noCacheFD: Int32 = -1
-    private let kvs: [KV]
+    let kvs: [KV]
     private let kvIndex: [String: Int]
     private let tensorIndex: [String: Int]
 

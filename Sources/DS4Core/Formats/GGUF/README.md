@@ -12,6 +12,12 @@ Validated, zero-copy reading of GGUF models.
   binary reads.
 - [`GGUFModel.swift`](GGUFModel.swift): opens and maps the file, indexes
   metadata and tensor descriptors, exposes views and prefetch hints.
+- [`GGUFWriter.swift`](GGUFWriter.swift): the reader's inverse — serializes a
+  GGUF v3 file from ordered typed metadata (`GGUFMetadataValue`) and tensors,
+  streaming payloads one at a time so large models need not fit in memory.
+- [`GGUFModel+Export.swift`](GGUFModel+Export.swift): read-back helpers
+  (`allMetadata`, `tensorData`) that feed a loaded model into the writer,
+  closing the read -> edit -> write round-trip.
 
 ## Flow
 

@@ -15,6 +15,12 @@ import Metal
 //   prompt "@/path/file" = usa il CONTENUTO del file come prompt (testi lunghi,
 //   benchmark prefill; troncato a DS4_PROMPT_MAX_CHARS, default 12000).
 
+// Offline, GPU-free subcommand: intercept BEFORE the Metal runtime is created so
+// the requantizer runs on machines without an Apple GPU.
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "requantize" {
+    exit(runRequantizeCLI(Array(CommandLine.arguments.dropFirst(2))))
+}
+
 do {
     let rt = try MetalRuntime()   // kernels embedded in the binary — no folder needed
     log("DS4Demo: Metal runtime up on \(rt.deviceName), \(rt.functionNames.count) kernels compiled")

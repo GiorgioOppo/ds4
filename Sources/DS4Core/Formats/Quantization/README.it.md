@@ -17,6 +17,12 @@ Primitive CPU portabili per conversione e requantizzazione dei pesi.
   writer GGUF (q8_0, q2_K, q4_K, q8_K, iq2_xxs; varianti reference e pesate
   imatrix), port Swift di `gguf-tools/quants.c` di ds4, fissato
   byte-per-byte contro il riferimento C compilato in `QuantEncodeTests`.
+- [`GGUFRequantizer.swift`](GGUFRequantizer.swift): requantizzazione offline
+  GGUF -> GGUF (la controparte in-process del `--tensor-type` selettivo di
+  `gguf-tools/deepseek4-quantize.c` di ds4). Dequantizza i tensori sorgente
+  (f32/f16/q8_0/q2_K/q4_K/q5_K/q6_K) in f32 e ri-codifica al tipo target via
+  `QuantEncode`, scrivendo tramite `GGUFWriter`. Puro Swift, niente GPU; i
+  tensori non gestibili passano invariati.
 
 ## Flusso
 

@@ -17,6 +17,12 @@ Portable CPU primitives for weight conversion and requantization.
   ENCODERS (q8_0, q2_K, q4_K, q8_K, iq2_xxs; reference and imatrix-weighted
   variants), a Swift port of ds4 `gguf-tools/quants.c` pinned byte-for-byte
   against the compiled C reference in `QuantEncodeTests`.
+- [`GGUFRequantizer.swift`](GGUFRequantizer.swift): offline GGUF -> GGUF
+  requantization (the in-process counterpart to ds4
+  `gguf-tools/deepseek4-quantize.c` selective `--tensor-type`). Dequantizes
+  source tensors (f32/f16/q8_0/q2_K/q4_K/q5_K/q6_K) to f32 and re-encodes to a
+  target type via `QuantEncode`, writing through `GGUFWriter`. Pure Swift, no
+  GPU; tensors it cannot handle pass through unchanged.
 
 ## Flow
 
