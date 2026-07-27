@@ -8,7 +8,9 @@ import Foundation
 /// either backend.
 ///
 /// Feature parity with the DeepSeek service so far: sampled decoding
-/// (temperature, top-K, repetition penalty via `GLM52Sampler`), stoppable
+/// (temperature, top-K, top-P, min-P, repetition penalty and a seedable
+/// C-compatible RNG via `GLM52Sampler`, which now delegates to the shared
+/// DS4Core `Sampler`), stoppable
 /// generation (the stream's termination cancels the producer), incremental
 /// KV between turns (only the rendered conversation's NEW suffix is
 /// prefilled when it extends what the engine already holds — otherwise a
@@ -16,8 +18,7 @@ import Foundation
 /// stream (`<think>` split on special-token IDs) and native XML tool calls
 /// with observation turns, and the disk-KV store (prefix-keyed checkpoints
 /// with token budget and eviction, `GLM52DiskKVStore`). Not mirrored (by
-/// design): decode profiles, sub-agents, distributed execution; top-P/min-P
-/// and the seeded RNG are DeepSeek-sampler-only for now.
+/// design): decode profiles, sub-agents, distributed execution.
 public actor GLM52ChatService {
     public let service: GLM52InferenceService
     private let contextSize: Int
@@ -710,14 +711,20 @@ public actor GLM52ChatService {
                     let decodeStart = Date()
                     let budget = min(maxTokens,
                                      contextSize - tokens.count - 1)
+                    // Seedable, C-compatible xorshift RNG (shared with DeepSeek):
+                    // same seed → same stream, so GLM sampling is reproducible.
+                    var samplerRNG = sampling.seed
                     while produced < budget, !Task.isCancelled {
                         guard let token = GLM52Sampler.sample(
                             logits: logits,
                             temperature: sampling.temperature,
                             topK: sampling.topK,
+                            topP: sampling.topP,
+                            minP: sampling.minP,
                             repetitionPenalty: sampling.repetitionPenalty,
                             recentTokens: fed.suffix(
-                                GLM52Sampler.penaltyWindow)) else { break }
+                                GLM52Sampler.penaltyWindow),
+                            rng: &samplerRNG) else { break }
                         produced += 1
                         if service.tokenizer.isStopToken(
                             token, reasoning: thinkMode.core) {

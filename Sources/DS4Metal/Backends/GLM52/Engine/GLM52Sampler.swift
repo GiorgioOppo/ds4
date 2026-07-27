@@ -1,79 +1,39 @@
 import Foundation
+import DS4Core
 
-/// Sampling for the GLM chat path, mirroring the DeepSeek service's knobs:
-/// temperature, top-K and repetition penalty over a recent-token window.
-/// Pure and injectable-RNG so every branch is unit-tested without a device.
+/// GLM chat sampling — a thin, faithful wrapper over the shared DS4Core
+/// `Sampler` (the bit-for-bit port of the C `sample_top_p_min_p`). Using the
+/// same code path as DeepSeek closes the previous GLM divergence: upstream runs
+/// GLM through the SAME sampler (defaults temp 1.0, top-p 0.95, min-p 0), so GLM
+/// must honor top-p AND min-p, draw from a seedable C-compatible xorshift RNG,
+/// and use `expf`-float softmax — not the old top-K-only, `Double`-softmax,
+/// system-RNG path.
 ///
-/// Conventions (llama.cpp-compatible, like the DeepSeek sampler):
-/// - `temperature <= 0` or `topK == 1` collapses to greedy argmax;
-/// - repetition penalty divides positive logits and multiplies negative ones
-///   for every token inside the recent window (`penaltyWindow`, default 64);
-/// - top-K keeps the K highest logits, then softmax at `temperature` and one
-///   categorical draw.
+/// Conventions (llama.cpp / C-compatible):
+/// - `temperature <= 0` collapses to argmax;
+/// - `topK <= 0` samples the full vocabulary (top-p/min-p only);
+/// - repetition penalty (>1) divides positive logits / multiplies negative ones
+///   for every token in the recent window (`penaltyWindow`, default 64).
 public enum GLM52Sampler {
     public static let penaltyWindow = 64
 
-    public static func sample<R: RandomNumberGenerator>(
+    /// Sample one token. `rng` is the caller-owned xorshift state (seed it from
+    /// `SamplingParams.seed` for reproducibility, exactly like the DeepSeek path).
+    public static func sample(
         logits: [Float],
         temperature: Float,
         topK: Int,
+        topP: Float,
+        minP: Float,
         repetitionPenalty: Float,
         recentTokens: ArraySlice<Int32>,
-        using generator: inout R) -> Int32? {
+        rng: inout UInt64) -> Int32? {
         guard !logits.isEmpty else { return nil }
-        var adjusted = logits
-        if repetitionPenalty > 0, repetitionPenalty != 1 {
-            for token in recentTokens.suffix(penaltyWindow) {
-                let index = Int(token)
-                guard index >= 0, index < adjusted.count else { continue }
-                adjusted[index] = adjusted[index] > 0
-                    ? adjusted[index] / repetitionPenalty
-                    : adjusted[index] * repetitionPenalty
-            }
-        }
-        guard temperature > 0, topK != 1 else {
-            return GLM52GreedyDecoding.argmax(adjusted)
-        }
-
-        // Top-K candidate set (K <= 0 means the full vocabulary).
-        let limit = topK > 0 ? min(topK, adjusted.count) : adjusted.count
-        var candidates = Array(adjusted.enumerated())
-        candidates.sort { lhs, rhs in
-            lhs.element != rhs.element
-                ? lhs.element > rhs.element
-                : lhs.offset < rhs.offset
-        }
-        candidates.removeSubrange(limit...)
-
-        // Stable softmax at temperature, then one categorical draw.
-        let peak = candidates[0].element
-        var weights = [Double](repeating: 0, count: candidates.count)
-        var total = 0.0
-        for (rank, candidate) in candidates.enumerated() {
-            let weight = exp(Double((candidate.element - peak) / temperature))
-            weights[rank] = weight
-            total += weight
-        }
-        guard total > 0, total.isFinite else {
-            return Int32(candidates[0].offset)
-        }
-        var threshold = Double.random(in: 0..<1, using: &generator) * total
-        for (rank, candidate) in candidates.enumerated() {
-            threshold -= weights[rank]
-            if threshold <= 0 { return Int32(candidate.offset) }
-        }
-        return Int32(candidates[candidates.count - 1].offset)
-    }
-
-    /// System-RNG convenience used by the chat service.
-    public static func sample(logits: [Float],
-                              temperature: Float,
-                              topK: Int,
-                              repetitionPenalty: Float,
-                              recentTokens: ArraySlice<Int32>) -> Int32? {
-        var generator = SystemRandomNumberGenerator()
-        return sample(logits: logits, temperature: temperature, topK: topK,
-                      repetitionPenalty: repetitionPenalty,
-                      recentTokens: recentTokens, using: &generator)
+        let recent = recentTokens.suffix(penaltyWindow).map(Int.init)
+        let id = Sampler.sample(logits, temperature: temperature,
+                                topK: topK, topP: topP, minP: minP,
+                                repetitionPenalty: repetitionPenalty,
+                                recent: recent[...], rng: &rng)
+        return Int32(id)
     }
 }
