@@ -76,6 +76,13 @@ e non selezionabile come modello locale (`docs/ARCHITETTURE-SUPPORTATE.md`; il
 percorso GUI/`Browse` rifiuta uno shard isolato). È lavoro di
 loader/model-management, in gran parte NON nuovi shader Metal.
 
+> **Progresso:** la primitiva loader multi-shard puro-Swift è implementata e
+> testata — `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` unisce per nome le
+> directory dei tensori di N shard GGUF (nomi disgiunti; metadata
+> first-shard-wins). Resta la cablatura lato Metal qui sotto (instradare
+> l'accesso ai pesi attraverso lo shard set) più le modifiche a catalogo/GUI —
+> quelle richiedono validazione on-device.
+
 ### Riferimento upstream
 - L'upstream assembla GGUF multi-file; vedi la gestione shard/loader nel
   percorso di apertura modello in `ds4.c` e `download_model.sh` (target shard
@@ -83,23 +90,27 @@ loader/model-management, in gran parte NON nuovi shader Metal.
 - `docs/ARCHITETTURE-SUPPORTATE.md` documenta già il confine previsto.
 
 ### Punti d'innesto Swift
-- `Sources/DS4Core/Formats/GGUF/GGUFModel.swift`: oggi apre un solo file.
-  Aggiungi un'apertura multi-shard che presenta una singola directory logica di
-  tensori su N mmap (tensore → (indice shard, absOffset)).
+- `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` — **FATTO**: directory
+  unificata dei tensori su N mmap (`find`/`tensorData` instradano sullo shard
+  proprietario; metadata first-shard-wins).
 - `Sources/DS4Metal/Backends/DeepSeekV4/Model/GGUFWeights.swift`: l'accesso ai
-  byte deve risolvere sullo shard che possiede ogni tensore.
+  byte deve risolvere sullo shard proprietario — accetta un `GGUFShardSet` (o un
+  piccolo protocollo soddisfatto sia da `GGUFModel` che da `GGUFShardSet`)
+  invece di un solo `GGUFModel`.
 - `Sources/DS4Engine/ModelManagement/Catalog/ModelCatalog.swift`: marca il
   pacchetto Pro Q4 `runnable` una volta pronto l'assemblaggio; lo scan/`Browse`
   della GUI deve riconoscere l'insieme di shard come un unico modello.
 
 ### Passi
-1. Definisci il manifest/naming degli shard usato dal pacchetto (da
-   `download_model.sh` e dai nomi file).
-2. Implementa `GGUFModel(shards: [String])`: parse dell'header di ogni shard,
-   indice unificato dei tensori, proprietà per-tensore dello shard; riusa i
-   controlli overflow/range per shard.
-3. Instrada `mapBase`/`tensorData`/gather esperti verso lo shard proprietario.
-4. Attiva `runnable` nel catalogo; insegna il raggruppamento shard allo scanner.
+1. ~~Manifest/naming degli shard~~ — il pacchetto è due GGUF per range di layer
+   (`…Layers00-30.gguf`, `…Layers-31-output.gguf`), nomi tensori disgiunti.
+2. ~~Apertura multi-shard con indice unificato~~ — fatto in `GGUFShardSet`.
+3. Instrada l'accesso ai pesi (`GGUFWeights`, gather esperti) attraverso lo
+   shard set — più semplice via un protocollo di lettura implementato sia da
+   `GGUFModel` che da `GGUFShardSet` (`findTensor`, `tensorData`, accessori
+   metadata).
+4. Attiva `runnable` nel catalogo; insegna alla GUI a raggruppare i due file
+   Pro Q4 come un unico modello selezionabile.
 
 ### Gate di validazione
 Il Pro Q4 carica e produce logit uguali al riferimento C; il percorso Pro

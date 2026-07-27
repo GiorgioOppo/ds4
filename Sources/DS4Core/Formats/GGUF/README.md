@@ -18,6 +18,10 @@ Validated, zero-copy reading of GGUF models.
 - [`GGUFModel+Export.swift`](GGUFModel+Export.swift): read-back helpers
   (`allMetadata`, `tensorData`) that feed a loaded model into the writer,
   closing the read -> edit -> write round-trip.
+- [`GGUFShardSet.swift`](GGUFShardSet.swift): presents several GGUF shards as
+  one logical model by unioning their tensor directories by name (the DeepSeek
+  V4 Pro Q4 layer-range split). Tensor names must be disjoint; global metadata
+  is first-shard-wins.
 
 ## Flow
 

@@ -77,29 +77,39 @@ cannot be selected as a local model (`docs/ARCHITETTURE-SUPPORTATE.md`; the
 GUI/`Browse` path rejects a lone shard). This is loader/model-management work,
 largely NOT new Metal shaders.
 
+> **Progress:** the pure-Swift multi-shard loader primitive is implemented and
+> tested — `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` unions N GGUF
+> shards' tensor directories by name (disjoint names; first-shard-wins
+> metadata). What remains is the Metal-side wiring below (routing weight access
+> through the shard set) plus the catalog/GUI changes — those need on-device
+> validation.
+
 ### Upstream reference
 - Upstream assembles multi-file GGUFs; see the shard/loader handling in `ds4.c`
   model open path and `download_model.sh` (the Pro Q4 shard targets).
 - `docs/ARCHITETTURE-SUPPORTATE.md` already documents the intended boundary.
 
 ### Swift touch-points
-- `Sources/DS4Core/Formats/GGUF/GGUFModel.swift`: today opens exactly one file.
-  Add a multi-shard open that presents a single logical tensor directory over N
-  mmaps (tensor → (shard index, absOffset)).
+- `Sources/DS4Core/Formats/GGUF/GGUFShardSet.swift` — **DONE**: unified tensor
+  directory over N mmaps (`find`/`tensorData` route to the owning shard;
+  metadata first-shard-wins).
 - `Sources/DS4Metal/Backends/DeepSeekV4/Model/GGUFWeights.swift`: tensor byte
-  access must resolve through the shard that owns each tensor.
+  access must resolve through the shard that owns each tensor — accept a
+  `GGUFShardSet` (or a small protocol both `GGUFModel` and `GGUFShardSet`
+  satisfy) instead of a single `GGUFModel`.
 - `Sources/DS4Engine/ModelManagement/Catalog/ModelCatalog.swift`: mark the Pro
   Q4 package `runnable` once assembly exists; the GUI scan/`Browse` filter must
   recognize the shard set as one model.
 
 ### Steps
-1. Define the shard manifest / naming the package uses (from `download_model.sh`
-   and the shard file names).
-2. Implement `GGUFModel(shards: [String])`: parse each shard's header, build a
-   unified tensor index, keep per-tensor shard ownership; reuse existing
-   overflow/range checks per shard.
-3. Route `mapBase`/`tensorData`/expert gather to the owning shard.
-4. Flip catalog `runnable`; teach the GUI scanner the shard grouping.
+1. ~~Shard manifest / naming~~ — the package is two layer-range GGUFs
+   (`…Layers00-30.gguf`, `…Layers-31-output.gguf`), tensor names disjoint.
+2. ~~Multi-shard open with a unified tensor index~~ — done in `GGUFShardSet`.
+3. Route weight access (`GGUFWeights`, expert gather) through the shard set —
+   simplest via a read protocol implemented by both `GGUFModel` and
+   `GGUFShardSet` (`findTensor`, `tensorData`, metadata accessors).
+4. Flip catalog `runnable`; teach the GUI scanner the shard grouping (recognize
+   the two Pro Q4 files as one selectable model).
 
 ### Validation gate
 Pro Q4 loads and produces logits matching the C reference; the distributed Pro

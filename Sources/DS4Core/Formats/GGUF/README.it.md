@@ -19,6 +19,10 @@ Lettura validata e a copia zero dei modelli GGUF.
 - [`GGUFModel+Export.swift`](GGUFModel+Export.swift): helper di ri-lettura
   (`allMetadata`, `tensorData`) che passano un modello caricato al writer,
   chiudendo il round-trip lettura -> modifica -> scrittura.
+- [`GGUFShardSet.swift`](GGUFShardSet.swift): presenta più shard GGUF come un
+  unico modello logico unendo le directory dei tensori per nome (lo split per
+  range di layer del DeepSeek V4 Pro Q4). I nomi dei tensori devono essere
+  disgiunti; i metadata globali sono first-shard-wins.
 
 ## Flusso
 
