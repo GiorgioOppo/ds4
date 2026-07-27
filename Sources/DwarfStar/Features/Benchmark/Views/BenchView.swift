@@ -624,9 +624,30 @@ struct BenchView: View {
         return out
     }
 
+    // Colors shared between each series and its own axis, so the reader maps the
+    // LEFT axis to prefill and the RIGHT axis to generation by color alone.
+    private static let prefillColor = Color.blue
+    private static let generationColor = Color.green
+
+    /// Dual-scale throughput chart: prefill on the LEFT axis, generation (p99) on
+    /// the RIGHT axis. Prefill (tens–thousands t/s) and generation (~0.05–0.3 t/s)
+    /// differ by orders of magnitude, so a single shared axis squashes generation
+    /// flat. Swift Charts has no native second Y scale, so generation is plotted
+    /// rescaled onto the prefill axis and the trailing axis relabels those
+    /// positions back to real generation t/s.
     private var throughputChart: some View {
-        Chart {
-            ForEach(controller.rows) { row in
+        let rows = controller.rows
+        let maxPrefill = max(rows.map(\.prefillTps).max() ?? 1, 0.0001)
+        let maxGen = max(rows.map(\.genTps).max() ?? 1, 0.0001)
+        // Factor that maps a generation value onto the prefill axis (and its
+        // inverse relabels the right axis). Same relative headroom on both axes.
+        let genToPrefill = maxPrefill / maxGen
+        let top = max(maxPrefill * 1.08, 0.0001)
+        let prefillColor = Self.prefillColor
+        let generationColor = Self.generationColor
+
+        return Chart {
+            ForEach(rows) { row in
                 LineMark(x: .value("Context", row.ctxTokens),
                          y: .value("t/s", row.prefillTps),
                          series: .value("Series", "Prefill"))
@@ -635,29 +656,45 @@ struct BenchView: View {
                           y: .value("t/s", row.prefillTps))
                     .foregroundStyle(by: .value("Series", "Prefill"))
             }
-            ForEach(controller.rows) { row in
+            ForEach(rows) { row in
+                // Rescaled onto the prefill axis; the right axis shows real t/s.
                 LineMark(x: .value("Context", row.ctxTokens),
-                         y: .value("t/s", row.genTps),
+                         y: .value("t/s", row.genTps * genToPrefill),
                          series: .value("Series", "Generation (p99)"))
                     .foregroundStyle(by: .value("Series", "Generation (p99)"))
                 PointMark(x: .value("Context", row.ctxTokens),
-                          y: .value("t/s", row.genTps))
+                          y: .value("t/s", row.genTps * genToPrefill))
                     .foregroundStyle(by: .value("Series", "Generation (p99)"))
             }
         }
+        .chartForegroundStyleScale([
+            "Prefill": prefillColor,
+            "Generation (p99)": generationColor,
+        ])
         .chartXAxisLabel("Context Tokens")
-        .chartYAxisLabel("Tokens/second")
-        // Fine-grained scale: the A/B differences that matter are 0.05-0.3 t/s,
-        // invisible on the default auto-stride. Gridline every 0.1 t/s (faint),
-        // labelled line every 0.5 to keep the axis readable.
+        .chartYScale(domain: 0...top)
+        .chartYAxisLabel("Prefill t/s (left) — Generation t/s (right)")
         .chartYAxis {
-            AxisMarks(values: .stride(by: 0.1)) {
+            // LEFT: prefill, real values.
+            AxisMarks(position: .leading) { value in
                 AxisGridLine().foregroundStyle(.quaternary)
-            }
-            AxisMarks(values: .stride(by: 0.5)) {
-                AxisGridLine()
                 AxisTick()
-                AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.precision(.fractionLength(1)))
+                AxisValueLabel {
+                    if let v = value.as(Double.self) {
+                        Text(v, format: .number.precision(.fractionLength(2)))
+                            .foregroundStyle(prefillColor)
+                    }
+                }
+            }
+            // RIGHT: same tick positions, relabeled to real generation t/s.
+            AxisMarks(position: .trailing) { value in
+                AxisTick()
+                AxisValueLabel {
+                    if let v = value.as(Double.self) {
+                        Text(v / genToPrefill, format: .number.precision(.fractionLength(2)))
+                            .foregroundStyle(generationColor)
+                    }
+                }
             }
         }
         .chartLegend(position: .top)
