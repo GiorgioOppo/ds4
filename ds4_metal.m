@@ -295,6 +295,9 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/* Second model descriptor with F_NOCACHE for the streaming expert preads
+ * (DS4_METAL_STREAMING_EXPERT_NOCACHE); -1 = use the cached g_model_fd. */
+static int g_model_fd_nocache = -1;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -9233,6 +9236,10 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_fd = -1;
+        if (g_model_fd_nocache >= 0) {
+            close(g_model_fd_nocache);
+            g_model_fd_nocache = -1;
+        }
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -10185,8 +10192,45 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
 
+/* DS4_METAL_STREAMING_EXPERT_NOCACHE: serve the streaming expert preads from
+ * a second F_NOCACHE descriptor so the ~1 GB/token of expert churn stops
+ * evicting the mapped dense weights from the page cache. On tight-RAM
+ * machines the dense working set (attention projections, shared experts,
+ * routing) is re-read every token through the page cache: with the default
+ * cached preads the expert traffic keeps pushing it out and decode collapses
+ * to SSD fault speed. Opt-in: on machines where everything fits in RAM the
+ * cached preads are strictly better (second touch is free). */
+static int ds4_gpu_stream_expert_nocache_requested(void) {
+    const char *env = getenv("DS4_METAL_STREAMING_EXPERT_NOCACHE");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    if (g_model_fd_nocache >= 0) {
+        close(g_model_fd_nocache);
+        g_model_fd_nocache = -1;
+    }
+    if (fd >= 0 && ds4_gpu_stream_expert_nocache_requested()) {
+        /* A dup() would share the file description (and its F_NOCACHE flag)
+         * with the mmap-backed descriptor, so reopen the model by path. */
+        char path[1024] = {0};
+        int nfd = -1;
+        if (fcntl(fd, F_GETPATH, path) == 0) nfd = open(path, O_RDONLY);
+        if (nfd >= 0) {
+            (void)fcntl(nfd, F_SETFD, FD_CLOEXEC);
+            (void)fcntl(nfd, F_NOCACHE, 1);
+            g_model_fd_nocache = nfd;
+            fprintf(stderr,
+                    "ds4: Metal streaming expert preads on a F_NOCACHE descriptor; "
+                    "page cache reserved for the dense weights (readahead hints off)\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: WARNING: F_NOCACHE expert descriptor unavailable (%s); "
+                    "using cached preads\n",
+                    strerror(errno));
+        }
+    }
     return 1;
 }
 
@@ -10677,7 +10721,11 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
 }
 
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
+    /* F_RDADVISE warms the PAGE CACHE: with the F_NOCACHE expert descriptor
+     * active those pages would never be consumed by the preads and only evict
+     * the dense weights — the exact pollution that mode exists to stop. */
     return g_ssd_streaming_mode &&
+           g_model_fd_nocache < 0 &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
@@ -10829,7 +10877,8 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    const int fd = g_model_fd_nocache >= 0 ? g_model_fd_nocache : g_model_fd;
+    if (fd < 0 ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -10845,7 +10894,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
