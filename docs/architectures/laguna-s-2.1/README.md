@@ -4,9 +4,15 @@
 
 Laguna S 2.1 is Poolside's GQA + MoE model, supported natively by the
 reference C engine on the `laguna-s2.1` branch of `antirez/ds4`. In this port
-the family is **recognized and fully validated, but not runnable**: the
-complete frontend is implemented and unit-tested, and inference is refused
-behind `LagunaRuntimeGate` until the Metal decoder is ported.
+the family is **recognized and fully validated, but not runnable by
+default**: the complete frontend is implemented and unit-tested, the
+first-cut resident Metal engine is written (pending its on-hardware parity
+gate), and inference stays refused behind `LagunaRuntimeGate` —
+`DS4_LAGUNA_RUNTIME=1` opts a single process in for bring-up runs.
+
+The whole frontend has been re-reviewed line by line against the reference C
+at head `448d569`, with every divergence fixed or documented as a deliberate
+deviation: see [`C-PARITY-REVIEW.md`](C-PARITY-REVIEW.md).
 
 ## Geometry (exact `DS4_SHAPE_LAGUNA_S21`)
 
@@ -29,9 +35,15 @@ shared expert · RMS epsilon 1e-6 · shipped context 262144.
   (`LagunaTokenizer`);
 - native chat template: `〈|EOS|〉` opener, `<system>`/`<user>`/
   `<tool_response>` text tags, `<assistant>…</assistant>` turns with
-  interleaved `<think>` reasoning (`LagunaChatRenderer`);
-- tagged tool calls (`<tool_call>name<arg_key>…<arg_value>…`), strict and
-  streaming parsers, untrusted-content neutralization (`LagunaToolCodec`);
+  server-exact `<think>` reasoning framing (`LagunaChatMessage` carries the
+  reasoning and raw tool text separately, like upstream `chat_msg`), plus the
+  live tool tail and the malformed-tool-call recovery suffix
+  (`LagunaChatRenderer`);
+- tagged tool calls (`<tool_call>name<arg_key>…<arg_value>…`) with schema
+  declaration-order arguments and XML-entity decoding: the exact
+  reference-server parser (`parseServer`), the stricter agent-grade parser
+  (`parseStrict`), and a chunk-safe incremental parser
+  (`LagunaToolCodec`);
 - reference sampling defaults: temperature 0.7, top-k 20, top-p 0.95,
   min-p 0.05;
 - tensor schema of the published recipes — Q8_0 signal path, legacy Q4_K/F16,

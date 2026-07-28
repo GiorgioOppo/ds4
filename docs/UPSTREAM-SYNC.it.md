@@ -51,6 +51,21 @@ gate di validazione richiede hardware Apple e i GGUF reali.
 `LagunaRuntimeGate.enabled` resta spento finché quel gate non passa. Il codice
 Laguna CUDA/ROCm resta fuori scope.
 
+**Ri-revisione di parità (stesso giorno, stesso head).** L'intero frontend
+Laguna portato è stato ri-revisionato riga per riga contro `448d569` con
+verifica indipendente di ogni segnalazione; tutte le divergenze confermate
+sono state corrette (framing del think server-exact e replay del raw tool
+text, argomenti nell'ordine di dichiarazione dello schema, decodifica delle
+entity XML, il parser esatto del server `parseServer`, i letterali
+cross-famiglia dello scanner, il percorso di encode del prompt CLI con BOS,
+gli stop think-aware, i default di sampling cablati, il clamp SWA
+dell'oracolo) oppure documentate come deviazioni deliberate. Report completo:
+[`architectures/laguna-s-2.1/C-PARITY-REVIEW.it.md`](architectures/laguna-s-2.1/C-PARITY-REVIEW.it.md).
+Lo sweep di completezza ha inoltre fatto emergere quattro gap lato server
+prima non dichiarati (alias modello + `/v1/models`, cablaggio del recovery su
+tool call malformate, suffissi della cache di sessione Laguna, fixture QA
+`laguna-openrouter-100`), ora elencati sotto il Gap 4.
+
 ## Aggiornamento 2026-07-27 (rivisto `80ebbc3..0a7ad77`)
 
 Confronto rieseguito. Dalla baseline precedente ci sono **15 commit upstream**

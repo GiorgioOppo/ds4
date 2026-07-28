@@ -4,10 +4,15 @@
 
 Laguna S 2.1 è il modello GQA + MoE di Poolside, supportato nativamente dal
 motore C di riferimento sul branch `laguna-s2.1` di `antirez/ds4`. In questo
-port la famiglia è **riconosciuta e completamente validata, ma non
-eseguibile**: il frontend completo è implementato e coperto da unit test, e
-l'inferenza è rifiutata dietro `LagunaRuntimeGate` finché il decoder Metal non
-sarà portato.
+port la famiglia è **riconosciuta e completamente validata, ma non eseguibile
+di default**: il frontend completo è implementato e coperto da unit test, il
+motore Metal residente di primo taglio è scritto (in attesa del suo gate di
+parità su hardware), e l'inferenza resta rifiutata dietro `LagunaRuntimeGate`
+— `DS4_LAGUNA_RUNTIME=1` abilita un singolo processo per i run di bring-up.
+
+L'intero frontend è stato ri-revisionato riga per riga contro il C di
+riferimento a head `448d569`, con ogni divergenza corretta o documentata come
+deviazione deliberata: vedi [`C-PARITY-REVIEW.it.md`](C-PARITY-REVIEW.it.md).
 
 ## Geometria (esatta `DS4_SHAPE_LAGUNA_S21`)
 
@@ -30,10 +35,15 @@ gated con RMS-norm per-testa di Q/K · un blocco denso iniziale (FFN 12288) ·
   gruppi in forma GLM4 a una cifra) e i token di controllo della famiglia
   (`LagunaTokenizer`);
 - template chat nativo: apertura `〈|EOS|〉`, tag testuali `<system>`/`<user>`/
-  `<tool_response>`, turni `<assistant>…</assistant>` con reasoning
-  interlacciato `<think>` (`LagunaChatRenderer`);
-- tool-call taggati (`<tool_call>nome<arg_key>…<arg_value>…`), parser strict
-  e streaming, neutralizzazione del contenuto non fidato (`LagunaToolCodec`);
+  `<tool_response>`, turni `<assistant>…</assistant>` con framing del
+  reasoning server-exact (`LagunaChatMessage` porta reasoning e raw tool text
+  separati, come `chat_msg` upstream), più il live tool tail e il suffisso di
+  recovery per tool call malformate (`LagunaChatRenderer`);
+- tool-call taggati (`<tool_call>nome<arg_key>…<arg_value>…`) con argomenti
+  nell'ordine di dichiarazione dello schema e decodifica delle entity XML: il
+  parser esatto del server di riferimento (`parseServer`), il parser strict
+  agent-grade (`parseStrict`) e un parser incrementale chunk-safe
+  (`LagunaToolCodec`);
 - default di sampling di riferimento: temperatura 0.7, top-k 20, top-p 0.95,
   min-p 0.05;
 - schema tensori delle ricette pubblicate — signal path Q8_0, legacy

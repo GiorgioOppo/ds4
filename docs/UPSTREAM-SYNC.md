@@ -50,6 +50,20 @@ Out of this pass: `metal/laguna.metal` + drivers and DFlash — tracked as
 gate needs Apple hardware and the real GGUFs. `LagunaRuntimeGate.enabled`
 stays off until that gate passes. CUDA/ROCm Laguna code remains out of scope.
 
+**Parity re-review (same day, same head).** The whole ported Laguna frontend
+was re-reviewed line by line against `448d569` with independent verification
+of every finding; all confirmed divergences were fixed (server-exact think
+framing and raw-tool-text replay, schema declaration-order arguments,
+XML-entity decoding, the exact server parser `parseServer`, cross-family
+scanner literals, the BOS/CLI prompt-encode path, think-mode stops, wired
+sampling defaults, the oracle SWA clamp) or documented as deliberate
+deviations. Full report:
+[`architectures/laguna-s-2.1/C-PARITY-REVIEW.md`](architectures/laguna-s-2.1/C-PARITY-REVIEW.md).
+The completeness sweep also surfaced four previously undeclared server-level
+gaps (model aliases + `/v1/models`, malformed-tool-call recovery wiring,
+Laguna session-cache suffixes, the `laguna-openrouter-100` QA fixtures), now
+listed under Gap 4.
+
 ## Update 2026-07-27 (reviewed `80ebbc3..0a7ad77`)
 
 Re-ran the comparison. Since the last baseline there are **15 upstream commits**

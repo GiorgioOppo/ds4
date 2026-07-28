@@ -223,6 +223,17 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
   wrap and the split reduction.
 - `LagunaWeightMap` (payload-free directory with the detected quantization
   layout retained).
+- **C-parity re-review of the whole frontend** against `448d569`
+  ([`architectures/laguna-s-2.1/C-PARITY-REVIEW.md`](architectures/laguna-s-2.1/C-PARITY-REVIEW.md)):
+  server-exact think framing with `LagunaChatMessage` (separate reasoning,
+  raw-tool-text replay), schema declaration-order tool arguments with
+  XML-entity decoding, the exact reference-server parser
+  (`LagunaToolCodec.parseServer`) next to the strict one, a truly
+  incremental streaming parser, the cross-family scanner literals, the
+  CLI-path `encodeChatPrompt` (BOS id, no default system), think-mode-aware
+  stops, the live tool tail and the malformed-call recovery suffix, sampling
+  defaults wired into the demo, and the oracle SWA `min(512, ctx)` clamp.
+  `DS4_LAGUNA_RUNTIME=1` opts a process into the runtime for bring-up.
 
 ### Also landed (compiles-on-Mac pending — written without a toolchain)
 - First-cut resident engine
@@ -257,6 +268,14 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
 5. Catalog: pin byte counts and SHA-256 digests for the three artifacts,
    then flip `LagunaRuntimeGate.enabled` (`ModelDownloaderTests` enforces
    "runnable ⇒ pinned digest").
+6. Server-level Laguna surfaces (surfaced by the parity-review completeness
+   sweep, needed once the runtime is on): the upstream model-alias system
+   (`laguna-s-2.1-chat/-no-think/-nothink/-reasoner` think-mode mapping and
+   the multi-variant `/v1/models` listing), wiring
+   `LagunaChatRenderer.invalidToolCallRecoverySuffix` and `liveToolTail`
+   into the server loop and session cache (`</assistant>\n` checkpoints),
+   and the upstream `laguna-openrouter-100` QA fixture flow for quality
+   certification.
 
 ### Validation gate
 End-to-end logits parity against the reference C engine on the real

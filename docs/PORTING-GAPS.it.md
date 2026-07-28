@@ -228,6 +228,18 @@ validato e rifiutato con un errore distinto.
   ring wrap e riduzione split.
 - `LagunaWeightMap` (directory payload-free che conserva la ricetta quant
   rilevata).
+- **Ri-revisione di parità col C dell'intero frontend** contro `448d569`
+  ([`architectures/laguna-s-2.1/C-PARITY-REVIEW.it.md`](architectures/laguna-s-2.1/C-PARITY-REVIEW.it.md)):
+  framing del think server-exact con `LagunaChatMessage` (reasoning separato,
+  replay del raw tool text), argomenti dei tool nell'ordine di dichiarazione
+  dello schema con decodifica delle entity XML, il parser esatto del server
+  di riferimento (`LagunaToolCodec.parseServer`) accanto a quello strict, un
+  parser streaming davvero incrementale, i letterali cross-famiglia dello
+  scanner, `encodeChatPrompt` sul percorso CLI (id BOS, nessun system di
+  default), stop think-aware, live tool tail e suffisso di recovery per call
+  malformate, default di sampling cablati nel demo, e il clamp SWA
+  `min(512, ctx)` dell'oracolo. `DS4_LAGUNA_RUNTIME=1` abilita il runtime per
+  un processo in bring-up.
 
 ### Consegnato anche (compilazione su Mac pendente — scritto senza toolchain)
 - Motore residente di primo taglio
@@ -263,6 +275,15 @@ validato e rifiutato con un errore distinto.
 5. Catalogo: pinnare byte count e SHA-256 dei tre artefatti, poi accendere
    `LagunaRuntimeGate.enabled` (`ModelDownloaderTests` impone
    "runnable ⇒ digest pinnato").
+6. Superfici Laguna lato server (emerse dallo sweep di completezza della
+   revisione di parità, necessarie una volta acceso il runtime): il sistema
+   di alias modello upstream (mappatura del think-mode di
+   `laguna-s-2.1-chat/-no-think/-nothink/-reasoner` e listing `/v1/models`
+   multi-variante), il cablaggio di
+   `LagunaChatRenderer.invalidToolCallRecoverySuffix` e `liveToolTail` nel
+   loop del server e nella cache di sessione (checkpoint `</assistant>\n`),
+   e il flusso di fixture QA upstream `laguna-openrouter-100` per la
+   certificazione di qualità.
 
 ### Gate di validazione
 Parità end-to-end dei logits contro il motore C di riferimento sul GGUF
