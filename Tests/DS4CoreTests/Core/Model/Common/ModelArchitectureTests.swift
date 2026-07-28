@@ -117,6 +117,24 @@ final class ModelArchitectureTests: XCTestCase {
         }
     }
 
+    func testRecognizesLagunaWithoutClaimingRuntimeSupport() throws {
+        for value in ["laguna", "Laguna", " LAGUNA "] {
+            let detected = try ModelArchitectureDetector.detect(generalArchitecture: value)
+            XCTAssertEqual(detected.id, .laguna, value)
+            XCTAssertEqual(detected.id.ggufMetadataNamespace, "laguna", value)
+            XCTAssertEqual(detected.family, .laguna, value)
+            XCTAssertEqual(detected.backendAvailability, .recognizedButNotImplemented, value)
+
+            XCTAssertThrowsError(try ModelArchitectureDetector.requireImplemented(detected)) { error in
+                guard case ModelArchitectureError.backendNotImplemented(let id, let family) = error else {
+                    return XCTFail("unexpected error for \(value): \(error)")
+                }
+                XCTAssertEqual(id, .laguna)
+                XCTAssertEqual(family, .laguna)
+            }
+        }
+    }
+
     func testUnknownArchitectureIsDetectedButRejectedByRuntimeBoundary() throws {
         let detected = try ModelArchitectureDetector.detect(generalArchitecture: "future-llm")
         XCTAssertEqual(detected.family, .unknown)
