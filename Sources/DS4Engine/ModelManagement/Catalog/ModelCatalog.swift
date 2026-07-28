@@ -410,7 +410,7 @@ public enum LagunaModelCatalog {
         LagunaRuntimeGate.enabled
             ? .runnable
             : .downloadOnly(
-                reason: "Download disponibile; il runtime Laguna S 2.1 non è ancora abilitato (decoder Metal non ancora portato)."
+                reason: "Download disponibile; il runtime Laguna S 2.1 non è ancora abilitato (gate di parità logits del decoder — vedi docs/PORTING-GAPS, Gap 4)."
             )
 
     public static let entries: [ModelCatalogEntry] = [

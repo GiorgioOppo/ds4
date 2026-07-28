@@ -295,7 +295,7 @@ public final class LagunaResidentModel {
 
         let embedding = try embeddingRow(token)
         embedding.withUnsafeBytes {
-            memcpy(hidden.contents(), $0.baseAddress!, $0.count)
+            _ = memcpy(hidden.contents(), $0.baseAddress!, $0.count)
         }
 
         for layer in layers {

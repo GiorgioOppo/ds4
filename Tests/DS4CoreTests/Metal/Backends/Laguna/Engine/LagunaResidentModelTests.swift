@@ -47,12 +47,21 @@ final class LagunaResidentModelTests: XCTestCase {
     }
 
     func testQ8RowDequantizationRejectsOutOfRangeRows() {
+        // Kept as an explicit do/catch inside the pointer scope: `try` in an
+        // XCTAssertThrowsError autoclosure makes the compiler infer a throwing
+        // closure for the rethrows `withUnsafeBytes`.
         let bytes = [UInt8](repeating: 0, count: 34)
-        bytes.withUnsafeBytes {
-            XCTAssertThrowsError(try LagunaResidentModel.dequantizeQ8Row(
-                base: $0.baseAddress!, row: 1, rowCount: 1, width: 32
-            ))
+        let rejected = bytes.withUnsafeBytes { raw -> Bool in
+            do {
+                _ = try LagunaResidentModel.dequantizeQ8Row(
+                    base: raw.baseAddress!, row: 1, rowCount: 1, width: 32
+                )
+                return false
+            } catch {
+                return true
+            }
         }
+        XCTAssertTrue(rejected, "row 1 of a 1-row table must be rejected")
     }
 
     /// Opt-in smoke test on real weights: set DS4_LAGUNA_GGUF to the official
