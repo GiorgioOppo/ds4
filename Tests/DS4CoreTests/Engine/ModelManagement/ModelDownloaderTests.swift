@@ -25,12 +25,14 @@ final class ModelDownloaderTests: XCTestCase {
             XCTAssertEqual(ModelDownloader.target(target.id), target)
         }
         XCTAssertEqual(ModelDownloader.target("mtp")?.role, .optionalComponent)
+        XCTAssertEqual(ModelDownloader.target("laguna-dflash")?.role, .optionalComponent)
     }
 
     func testTypedCatalogSelectsFlashAndSingleFileProQ2() {
         XCTAssertEqual(DeepSeekV4ModelCatalog.entries.count, 5)
         XCTAssertEqual(GLM52ModelCatalog.entries.count, 3)
-        XCTAssertEqual(ModelCatalogRegistry.entries.count, 8)
+        XCTAssertEqual(LagunaModelCatalog.entries.count, 2)
+        XCTAssertEqual(ModelCatalogRegistry.entries.count, 10)
         XCTAssertEqual(
             Set(ModelCatalogRegistry.selectableEntries.map(\.id)),
             Set([.flashQ2Imatrix, .flashQ2Q4Imatrix, .flashQ4Imatrix, .proQ2Imatrix,
@@ -61,10 +63,27 @@ final class ModelDownloaderTests: XCTestCase {
         let artifacts = ModelCatalogRegistry.allArtifacts
         XCTAssertEqual(Set(artifacts.map(\.id)).count, artifacts.count)
         XCTAssertEqual(Set(artifacts.map(\.file)).count, artifacts.count)
-        XCTAssertTrue(artifacts.allSatisfy { target in
-            guard let digest = target.sha256, digest.count == 64 else { return false }
-            return digest.allSatisfy { $0.isHexDigit && !$0.isUppercase }
-        }, "every downloadable main-model artifact must have a pinned lowercase SHA-256")
+        // Pinning rule: a runnable entry must carry pinned lowercase SHA-256
+        // digests. The Laguna entries are download-only behind their runtime
+        // gate and follow upstream, which pins the Poolside artifact by HF
+        // revision instead of digest; they must acquire pinned digests before
+        // the gate can flip them to runnable.
+        var unpinned: Set<String> = []
+        for entry in ModelCatalogRegistry.entries {
+            for target in entry.artifacts {
+                if let digest = target.sha256 {
+                    XCTAssertEqual(digest.count, 64, target.id)
+                    XCTAssertTrue(digest.allSatisfy { $0.isHexDigit && !$0.isUppercase },
+                                  target.id)
+                } else {
+                    XCTAssertFalse(entry.runtimeAvailability.isRunnable,
+                                   "\(target.id): a runnable artifact requires a pinned SHA-256")
+                    unpinned.insert(target.id)
+                }
+            }
+        }
+        XCTAssertEqual(unpinned, ["laguna-q4", "laguna-q2-q3"],
+                       "only the gated Laguna downloads may remain digest-unpinned")
     }
 
     func testGLM52CatalogIsPinnedRunnableAndUsesItsOwnRepository() throws {
@@ -117,6 +136,53 @@ final class ModelDownloaderTests: XCTestCase {
         XCTAssertTrue(
             Set(GLM52ModelCatalog.entries.map(\.id))
                 .isDisjoint(with: Set(DeepSeekV4ModelCatalog.entries.map(\.id)))
+        )
+    }
+
+    func testLagunaCatalogIsDownloadOnlyUntilTheRuntimeGateOpens() throws {
+        let q4 = try XCTUnwrap(ModelCatalogRegistry.entry(.lagunaQ4))
+        XCTAssertEqual(q4.profile, .laguna)
+        XCTAssertEqual(q4.profile.familyDisplayName, "Laguna S 2.1")
+        XCTAssertFalse(q4.isSelectable)
+        XCTAssertFalse(q4.runtimeAvailability.isRunnable)
+        XCTAssertNotNil(q4.runtimeAvailability.unavailableReason)
+        let q4Target = try XCTUnwrap(q4.artifacts.first)
+        XCTAssertEqual(q4Target.file, "laguna-s-2.1-Q4_K_M.gguf")
+        XCTAssertEqual(q4Target.source, .lagunaPoolside)
+        XCTAssertEqual(
+            ModelDownloader.resolveURL(q4Target).absoluteString,
+            "https://huggingface.co/poolside/Laguna-S-2.1-GGUF/resolve/" +
+                "706fa69799926b6afde1af9e24ca2a4923f110a1/laguna-s-2.1-Q4_K_M.gguf",
+            "the official artifact keeps the upstream download_model.sh revision pin"
+        )
+
+        let q2q3 = try XCTUnwrap(ModelCatalogRegistry.entry(.lagunaQ2Q3))
+        XCTAssertFalse(q2q3.isSelectable)
+        let q2q3Target = try XCTUnwrap(q2q3.artifacts.first)
+        XCTAssertEqual(q2q3Target.file, "laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf")
+        XCTAssertEqual(q2q3Target.source, .lagunaAntirez)
+        XCTAssertEqual(
+            ModelDownloader.resolveURL(q2q3Target).absoluteString,
+            "https://huggingface.co/antirez/Laguna-S-2.1-GGUF/resolve/main/" +
+                "laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
+        )
+
+        // The DFlash draft is an accessory like MTP: addressable for download,
+        // excluded from the main-model catalog and from GUI selection.
+        XCTAssertFalse(
+            ModelCatalogRegistry.allArtifacts
+                .contains { $0.id == LagunaAccessoryCatalog.dflash.id }
+        )
+        XCTAssertEqual(LagunaAccessoryCatalog.dflash.file,
+                       "laguna-s-2.1-DFlash-Q8_0.gguf")
+        XCTAssertEqual(LagunaAccessoryCatalog.dflash.role, .optionalComponent)
+        XCTAssertEqual(LagunaAccessoryCatalog.dflash.source, .lagunaAntirez)
+
+        XCTAssertTrue(
+            Set(LagunaModelCatalog.entries.map(\.id))
+                .isDisjoint(with: Set(
+                    (DeepSeekV4ModelCatalog.entries + GLM52ModelCatalog.entries).map(\.id)
+                ))
         )
     }
 

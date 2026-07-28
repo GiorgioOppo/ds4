@@ -18,10 +18,11 @@ public enum ModelDownloader {
 
     /// Compatibility view for older callers. New UI code should use
     /// `ModelCatalogRegistry.entries`, which preserves package boundaries,
-    /// remote repositories and runtime availability. MTP remains addressable
-    /// as an optional accessory.
+    /// remote repositories and runtime availability. MTP and the Laguna
+    /// DFlash draft remain addressable as optional accessories.
     public static var targets: [ModelTarget] {
-        ModelCatalogRegistry.allArtifacts + [DeepSeekV4AccessoryCatalog.mtp]
+        ModelCatalogRegistry.allArtifacts
+            + [DeepSeekV4AccessoryCatalog.mtp, LagunaAccessoryCatalog.dflash]
     }
 
     public static func target(_ id: String) -> ModelTarget? {

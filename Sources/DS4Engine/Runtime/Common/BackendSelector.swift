@@ -46,7 +46,11 @@ public enum BackendSelector {
             // explicit not-implemented refusal below.
             return .glm52
         }
-        if descriptor.family == .glm || descriptor.family == .qwen {
+        // Laguna has no RuntimeBackendKind yet: LagunaRuntimeGate is off and a
+        // Laguna GGUF must reach the explicit not-implemented refusal below,
+        // never another decoder. Adding the kind is part of the decoder port.
+        if descriptor.family == .glm || descriptor.family == .laguna
+            || descriptor.family == .qwen {
             throw BackendSelectionError.backendNotImplemented(descriptor.architecture)
         }
         throw BackendSelectionError.unsupportedArchitecture(descriptor.architecture)

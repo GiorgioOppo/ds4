@@ -54,6 +54,8 @@ public enum ModelInspector {
             return DeepSeekV4BackendDefinition.modelCapabilities
         case .glm:
             return GLM52BackendDefinition.modelCapabilities
+        case .laguna:
+            return LagunaBackendDefinition.modelCapabilities
         case .qwen:
             return QwenBackendDefinition.modelCapabilities(for: detected.id)
         case .unknown:
@@ -69,22 +71,37 @@ public enum ModelInspector {
         case .implemented where detected.family == .glm,
              .recognizedButNotImplemented where detected.family == .glm:
             return GLM52BackendDefinition.runtimeCapabilities
+        case .implemented where detected.family == .laguna,
+             .recognizedButNotImplemented where detected.family == .laguna:
+            return LagunaBackendDefinition.runtimeCapabilities
         case .implemented, .recognizedButNotImplemented, .unknown:
             return QwenBackendDefinition.runtimeCapabilities
         }
     }
 
-    /// DS4Core marks GLM statically as recognized-but-not-implemented because
-    /// it cannot see the runtime gate (it lives above DS4Core). Overlay the
-    /// gate here so descriptors reflect what THIS build actually runs: with
-    /// `GLM52RuntimeGate.enabled` a `glm-dsa` file loads and generates, and
-    /// the UI must not caption it as "backend not implemented".
+    /// DS4Core marks GLM and Laguna statically as recognized-but-not-
+    /// implemented because it cannot see the runtime gates (they live above
+    /// DS4Core). Overlay the gates here so descriptors reflect what THIS
+    /// build actually runs: with `GLM52RuntimeGate.enabled` a `glm-dsa` file
+    /// loads and generates, and the UI must not caption it as "backend not
+    /// implemented". The Laguna gate follows the same contract once its
+    /// decoder lands.
     private static func gateAwareAvailability(
         _ detected: DetectedModelArchitecture) -> DetectedModelArchitecture {
-        guard detected.family == .glm,
-              detected.id == GLM52BackendDefinition.supportedArchitecture,
-              detected.backendAvailability == .recognizedButNotImplemented,
-              GLM52BackendDefinition.runtimeEnabled else { return detected }
+        let gated: Bool
+        switch detected.family {
+        case .glm:
+            gated = detected.id == GLM52BackendDefinition.supportedArchitecture
+                && GLM52BackendDefinition.runtimeEnabled
+        case .laguna:
+            gated = detected.id == LagunaBackendDefinition.supportedArchitecture
+                && LagunaBackendDefinition.runtimeEnabled
+        case .deepSeek, .qwen, .unknown:
+            gated = false
+        }
+        guard gated,
+              detected.backendAvailability == .recognizedButNotImplemented
+        else { return detected }
         return DetectedModelArchitecture(
             id: detected.id,
             family: detected.family,
@@ -95,6 +112,7 @@ public enum ModelInspector {
         switch detected.family {
         case .deepSeek: return "DeepSeek V4"
         case .glm: return "GLM 5.2"
+        case .laguna: return "Laguna S 2.1"
         case .qwen: return "Qwen (\(detected.id.rawValue))"
         case .unknown: return detected.id.rawValue.isEmpty ? "Modello GGUF" : detected.id.rawValue
         }

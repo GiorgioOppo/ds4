@@ -12,6 +12,8 @@ public enum ModelCatalogID: String, CaseIterable, Identifiable, Sendable, Hashab
     case glm52IQ2XXS = "glm-5.2-iq2-xxs"
     case glm52Q2K = "glm-5.2-q2-k"
     case glm52Q4K = "glm-5.2-q4-k"
+    case lagunaQ4 = "laguna-q4"
+    case lagunaQ2Q3 = "laguna-q2-q3"
 
     public var id: String { rawValue }
 }
@@ -28,11 +30,13 @@ public enum DeepSeekV4Edition: String, Sendable, Hashable {
 public enum ModelCatalogProfile: Sendable, Hashable {
     case deepSeekV4(DeepSeekV4Edition)
     case glm52
+    case laguna
 
     public var familyDisplayName: String {
         switch self {
         case .deepSeekV4: "DeepSeek V4"
         case .glm52: "GLM 5.2"
+        case .laguna: "Laguna S 2.1"
         }
     }
 }
@@ -56,6 +60,21 @@ public struct HuggingFaceSource: Sendable, Hashable {
     public static let glm52 = Self(
         repository: "antirez/glm-5.2-gguf",
         revision: "2638b3b878f5c6cc3ae7334b8dbea1275025f52e"
+    )
+
+    /// Official Poolside publication; the revision is the commit pinned by the
+    /// upstream `download_model.sh` (`LAGUNA_REVISION`). The repository may be
+    /// gated on Hugging Face, so downloads can require a saved HF token.
+    public static let lagunaPoolside = Self(
+        repository: "poolside/Laguna-S-2.1-GGUF",
+        revision: "706fa69799926b6afde1af9e24ca2a4923f110a1"
+    )
+
+    /// Requantized companions published by antirez (mixed Q2_K/Q3_K main model
+    /// and the Q8_0 DFlash draft). Upstream does not pin a revision for this
+    /// repository yet; pin one here as soon as the artifacts are frozen.
+    public static let lagunaAntirez = Self(
+        repository: "antirez/Laguna-S-2.1-GGUF"
     )
 }
 
@@ -378,10 +397,63 @@ public enum GLM52ModelCatalog {
     ]
 }
 
+/// Download catalog for the Laguna S 2.1 GGUF publications.
+///
+/// Availability is keyed off `LagunaRuntimeGate.enabled`: with the gate on,
+/// the entries become `runnable` and selectable through the future Laguna
+/// backend; with the gate off they are download-only, exactly like GLM 5.2
+/// before its runtime was enabled. Byte counts and checksums are not pinned
+/// yet because this environment cannot reach Hugging Face; sizes follow the
+/// upstream README (63.56 GiB and 44.95 GiB).
+public enum LagunaModelCatalog {
+    private static let unavailable: ModelRuntimeAvailability =
+        LagunaRuntimeGate.enabled
+            ? .runnable
+            : .downloadOnly(
+                reason: "Download disponibile; il runtime Laguna S 2.1 non è ancora abilitato (decoder Metal non ancora portato)."
+            )
+
+    public static let entries: [ModelCatalogEntry] = [
+        .init(
+            id: .lagunaQ4,
+            displayName: "Laguna S 2.1 · Q4_K_M",
+            profile: .laguna,
+            summary: "GGUF ufficiale Poolside quantizzato con imatrix: esperti instradati Q4_K e pesi signal-path Q8_0. Pensato per residenza completa su macchine con almeno 96 GB di memoria unificata.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.lagunaQ4.rawValue,
+                    file: "laguna-s-2.1-Q4_K_M.gguf",
+                    approxGB: 68,
+                    note: "official Poolside Q4_K_M, Q8_0 signal path",
+                    source: .lagunaPoolside
+                ),
+            ],
+            runtimeAvailability: unavailable
+        ),
+        .init(
+            id: .lagunaQ2Q3,
+            displayName: "Laguna S 2.1 · Q2_K/Q3_K misti",
+            profile: .laguna,
+            summary: "Quantizzazione mista per sistemi in classe 64 GB: pesi densi del file ufficiale, esperti instradati Q2_K nei layer 1–20 e Q3_K nei layer 21–47.",
+            artifacts: [
+                .init(
+                    id: ModelCatalogID.lagunaQ2Q3.rawValue,
+                    file: "laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf",
+                    approxGB: 48,
+                    note: "mixed Q2_K/Q3_K routed experts",
+                    source: .lagunaAntirez
+                ),
+            ],
+            runtimeAvailability: unavailable
+        ),
+    ]
+}
+
 /// Cross-family source of truth rendered by the downloader UI.
 public enum ModelCatalogRegistry {
     public static let entries: [ModelCatalogEntry] =
         DeepSeekV4ModelCatalog.entries + GLM52ModelCatalog.entries
+            + LagunaModelCatalog.entries
 
     public static let selectableEntries: [ModelCatalogEntry] = entries.filter(\.isSelectable)
     public static let allArtifacts: [ModelTarget] = entries.flatMap(\.artifacts)
@@ -403,5 +475,21 @@ public enum DeepSeekV4AccessoryCatalog {
         approxGB: 4,
         note: "optional speculative-decoding component",
         role: .optionalComponent
+    )
+}
+
+/// Optional Laguna companions, excluded from the main-model catalog and from
+/// GUI selection exactly like the DeepSeek MTP sidecar. The DFlash draft
+/// model accelerates greedy Laguna decoding without changing the generated
+/// tokens; it becomes useful only when the Laguna decoder and its DFlash path
+/// are ported.
+public enum LagunaAccessoryCatalog {
+    public static let dflash = ModelTarget(
+        id: "laguna-dflash",
+        file: "laguna-s-2.1-DFlash-Q8_0.gguf",
+        approxGB: 1,
+        note: "optional DFlash speculative-decoding draft (Q8_0)",
+        role: .optionalComponent,
+        source: .lagunaAntirez
     )
 }

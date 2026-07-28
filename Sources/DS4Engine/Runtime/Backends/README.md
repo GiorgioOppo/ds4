@@ -9,6 +9,8 @@ bridge used by DS4Engine is kept here.
 - [`DeepSeekV4/`](DeepSeekV4/README.md): operational backend.
 - [`GLM52/`](GLM52/README.md): model definition/capabilities with the runtime
   still deliberately empty.
+- [`Laguna/`](Laguna/README.md): frontend capabilities registered, runtime
+  gate off until the decoder is ported.
 - [`Qwen/`](Qwen/README.md): family recognized but not available.
 
 A new backend must add, together: detection, configuration, tokenizer and
