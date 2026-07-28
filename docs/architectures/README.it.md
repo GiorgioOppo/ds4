@@ -27,3 +27,6 @@ famiglia.
   preparazione.
 - [`glm-5.2/`](glm-5.2/README.it.md): manifest, contratto GGUF e port progressivo;
   detector/frontend disponibili, decoder ancora non eseguibile.
+- [`laguna-s-2.1/`](laguna-s-2.1/README.it.md): frontend a stadi del branch di
+  riferimento `laguna-s2.1` — geometria, tokenizer, protocollo chat/tool,
+  schema tensori e catalogo; decoder in sospeso.

@@ -179,12 +179,66 @@ byte-identical to the serialized path; KV isolation between sessions verified.
 
 ---
 
+## Gap 4 — Laguna S 2.1 decoder (and optional DFlash speculation)
+
+### Status today
+The complete Laguna frontend is in the port and unit-tested: architecture
+registration/detection (`ModelArchitectureID.laguna`), exact geometry
+validation (`LagunaConfiguration`), tokenizer (`LagunaTokenizer` with the
+newline pre-split), native chat/tool protocol (`LagunaChatRenderer`,
+`LagunaToolCodec`, reference sampling defaults), tensor schema for the two
+published recipes plus the mixed Q2_K/Q3_K file (`LagunaTensorSchema`), the
+runtime registration (`LagunaBackendDefinition`) and the download catalog
+(`LagunaModelCatalog`, DFlash accessory). `LagunaRuntimeGate.enabled` is off:
+a Laguna GGUF is recognized, validated and refused with a distinct error.
+
+### Upstream reference (branch `laguna-s2.1`, head `448d569`)
+- `ds4.c`: `DS4_SHAPE_LAGUNA_S21`, `weights_bind_laguna_layer`,
+  `layer_routed_moe_batch` Laguna paths, `ds4_laguna_layer_is_swa` — GQA
+  attention with per-layer 48/72 heads, gated attention (`attn_gate`),
+  Q/K RMS-norm per head-dim, full attention with 64 YaRN RoPE dims on every
+  fourth block, 512-token sliding window with 128 RoPE dims at base 10000 on
+  the others, one dense leading block, 256 routed experts (top-10, gating
+  func 2, scale 2.5) plus one shared expert.
+- `metal/laguna.metal` (~1.2k lines) and the `ds4_metal.m` Laguna driver
+  paths: the kernels to port into `metal/` and re-embed with
+  `make embed-kernels`.
+- DFlash (optional, separate GGUF): `metal/dflash.metal`, the
+  `DS4_DFLASH_*` constants and the `--dflash` verification pipeline; greedy
+  speculation that never changes accepted tokens, with automatic fallback
+  when it is not paying.
+
+### Swift touch-points
+1. `Sources/DS4Metal/Backends/Laguna/` — weight map + resident engine
+   (start from the `GLM52ResidentModel` structure; Laguna requires full
+   residency upstream, so no SSD streaming is needed for the first cut).
+2. `metal/laguna.metal` port + `Sources/DS4Metal/Runtime/Generated`
+   regeneration.
+3. `RuntimeBackendKind.laguna` + selector routing behind
+   `LagunaRuntimeGate` (`BackendSelector` already refuses the family
+   explicitly; the comment marks the insertion point).
+4. Sampler wiring: `LagunaConversationProtocol.SamplingDefaults` for chat,
+   server per-request overrides taking precedence.
+5. Catalog: pin byte counts and SHA-256 digests for the three artifacts
+   before flipping entries to `runnable` (`ModelDownloaderTests` enforces
+   "runnable ⇒ pinned digest").
+
+### Validation gate
+End-to-end logits parity against the reference C engine on the real
+Q4_K_M GGUF (and the mixed Q2_K/Q3_K), tokenizer golden parity on the real
+vocabulary, then flip `LagunaRuntimeGate.enabled`. DFlash afterwards, greedy
+token-exactness against ordinary decoding with a fixed verifier width.
+
+---
+
 ## Suggested order
 
 1. **Gap 3 engine primitive** (shared prefill+decode FFN) — highest value; start
    with the engine-only, unit-testable core.
 2. **Gap 2** (Pro Q4 split-load) — unlocks a shipped artifact; mostly Swift.
-3. **Gap 1** (Q8_K/Q8_0 routed) — do when a target GGUF needs it.
+3. **Gap 4** (Laguna decoder) — the frontend, schema and catalog are already
+   merged; the decoder is a self-contained resident engine.
+4. **Gap 1** (Q8_K/Q8_0 routed) — do when a target GGUF needs it.
 
 Every step here requires a Mac (Metal) for its validation gate; this repo's
 Linux CI can build/test only the pure-Swift `DS4Core` surface.

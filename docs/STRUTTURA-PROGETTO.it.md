@@ -76,6 +76,8 @@ layout, token speciali e semantica devono essere realmente compatibili.
 - `Backends/GLM52`: schema tensoriale, riferimenti DSA/IndexShare, il motore
   streaming (`GLM52ResidentModel` + `GLM52ChainedDecode`) e i kernel Metal
   per famiglia; eseguibile end-to-end (chat, demo, server, benchmark).
+- `Backends/Laguna`: schema tensoriale delle ricette S 2.1 pubblicate e gate
+  di runtime (spento); il decoder non è ancora portato.
 - `Backends/Qwen`: placeholder documentato; nessun kernel o decoder fittizio.
 
 Una struttura dati che contiene buffer o risorse Metal appartiene a questo
@@ -89,6 +91,9 @@ applicativa su come usare il modello appartiene invece a `DS4Engine`.
   capacità consumate dai client.
 - `Runtime/Backends/DeepSeekV4`: costruzione e impostazioni del backend
   operativo senza cambiare il percorso caldo del decoder.
+- `Runtime/Backends/Laguna`: registrazione delle capability dietro il gate di
+  runtime Laguna; la selezione rifiuta la famiglia finché il decoder non
+  arriva.
 - `Runtime/Backends/Qwen`: errore esplicito e punto di estensione, non una
   implementazione simulata.
 - `Inference/API`: DTO pubblici di richieste, eventi, risultati e benchmark.

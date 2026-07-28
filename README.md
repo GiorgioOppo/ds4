@@ -15,7 +15,14 @@ implemented. GLM 5.2 is in a staged native-port phase: the three monolithic
 GGUF variants from `antirez/glm-5.2-gguf` are cataloged with pinned sizes and
 SHA-256 digests; this build recognizes `glm-dsa`, validates its shape/tensors
 and provides its tokenizer/chat frontend, but still refuses inference until the
-complete Metal decoder passes end-to-end logits tests. The DeepSeek engine is a faithful
+complete Metal decoder passes end-to-end logits tests. Laguna S 2.1
+(Poolside) is in the same staged phase, ported from the upstream
+`laguna-s2.1` branch: the official Q4_K_M and the mixed Q2_K/Q3_K requant are
+cataloged as download-only; this build recognizes `laguna`, validates its
+geometry and tensor layout, and provides its native tokenizer, chat template
+with interleaved reasoning, and tagged tool-call frontend, but refuses
+inference until the Laguna Metal decoder is ported and passes logits parity
+(see `docs/PORTING-GAPS.md`). The DeepSeek engine is a faithful
 port of upstream `ds4.c` / `ds4_metal.m`: no C runtime engine, prebuilt static
 library or external process for normal inference. The Flash 2-bit GGUF runs on
 a 16 GB MacBook by streaming routed expert weights from SSD; that memory claim
@@ -152,7 +159,10 @@ through the native GLM streaming backend. Downloads live
 under `~/Library/Application Support/DwarfStar/models/`, resume from `.part`
 files and reuse an already present regular file instead of downloading it
 again; entries with a pinned byte count, including GLM 5.2, require an exact
-size match before reuse.
+size match before reuse. The two Laguna S 2.1 GGUFs (official Poolside Q4_K_M,
+revision-pinned, and the mixed Q2_K/Q3_K requant) plus the DFlash Q8_0
+accessory are download-only until the Laguna decoder port enables their
+runtime gate.
 
 **Browse** remains available for an advanced/manual GGUF. The picker inspects
 the file and accepts it only when the current runtime can execute its

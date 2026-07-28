@@ -26,6 +26,30 @@ the baseline.
 | Repository | `https://github.com/antirez/ds4.git` |
 | Result | **No urgent changes required** for the standard model path. |
 
+## Update 2026-07-28 (reviewed branch `laguna-s2.1`, head `448d569`)
+
+Reviewed the upstream **`laguna-s2.1` feature branch** (17 commits over merge
+base `efdadd4`, not yet on upstream `main`): native **Laguna S 2.1** support
+(Poolside GQA+MoE model — chat, interleaved reasoning, tagged tool calls, two
+published quant recipes plus a mixed Q2_K/Q3_K file) with Metal/CUDA/ROCm
+decoders and optional **DFlash** speculative decoding.
+
+Port decision: land the complete **frontend now, decoder as a gap**, following
+the GLM staged pattern. Ported in this pass, each with deterministic unit
+tests: architecture registration/detection, `LagunaConfiguration`
+(`config_validate_laguna_model`), `LagunaTokenizer`
+(`bpe_tokenize_text_laguna` newline pre-split + single-digit GLM4-shape
+groups), `LagunaChatRenderer`/`LagunaToolCodec`
+(`render_laguna_chat_prompt_text`, `laguna_chat_append_*`,
+`append_laguna_tool_calls_text`), the reference sampling defaults
+(`ds4_engine_sampling_defaults`), `LagunaTensorSchema`
+(`weights_validate_laguna_layout`) and the download catalog
+(`download_model.sh` targets `laguna-q4`, `laguna-q2-q3`, `laguna-dflash`).
+Out of this pass: `metal/laguna.metal` + drivers and DFlash — tracked as
+**Gap 4** in [`PORTING-GAPS.md`](PORTING-GAPS.md) because their validation
+gate needs Apple hardware and the real GGUFs. `LagunaRuntimeGate.enabled`
+stays off until that gate passes. CUDA/ROCm Laguna code remains out of scope.
+
 ## Update 2026-07-27 (reviewed `80ebbc3..0a7ad77`)
 
 Re-ran the comparison. Since the last baseline there are **15 upstream commits**

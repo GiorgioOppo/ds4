@@ -14,6 +14,7 @@ decoder sia già disponibile.
 | DeepSeek V4 Flash | sì | sì | sì | sì | sì | Tre quantizzazioni complete sono scaricabili, selezionabili ed eseguibili. |
 | DeepSeek V4 Pro | sì | sì | sì, Q2 singolo | sì, Q2 singolo | sì, Q2 singolo | Il percorso distribuito è implementato e testato sul protocollo; la prova numerica con il GGUF Pro reale resta da eseguire. Il package Q4 split resta download-only. |
 | GLM 5.2 (`glm-dsa`) | sì | sì | sì, motore streaming | sì (chat, demo, server, benchmark, auto-tune) | no | Eseguibile end-to-end: motore streaming con gather esperti per token, pack sidecar Q4 dei layer, riuso incrementale del KV lato server e store disk-KV per prefisso con budget in token ed eviction. Misurato ~0,33 tok/s di decode sull'IQ2_XXS a 16 GB (vedi `architectures/glm-5.2/`). |
+| Laguna S 2.1 (`laguna`) | sì | sì, solo download | no | no, rifiuto esplicito | no | Port a stadi del branch di riferimento `laguna-s2.1`: validazione geometria/metadati, tokenizer, chat nativa con reasoning interlacciato e tool-call taggati, schema tensori delle ricette quant pubblicate e voci a catalogo sono in place; l'inferenza è rifiutata dietro `LagunaRuntimeGate` finché il decoder Metal non è portato e non passa la parità dei logits (vedi `PORTING-GAPS.it.md`). |
 | Qwen | sì | no | no | no, rifiuto esplicito | no | Struttura predisposta; decoder e template non sono ancora implementati. |
 | Sconosciuta | sì | no | no | no, rifiuto esplicito | no | L'identificatore GGUF viene riportato senza tentare un caricamento DeepSeek. |
 
@@ -41,16 +42,20 @@ Le voci correnti sono:
   presentati come modelli locali indipendenti;
 - GLM 5.2 IQ2_XXS, Q2_K e Q4_K: tre GGUF monolitici alternativi dal repository
   `antirez/glm-5.2-gguf`, selezionabili ed eseguibili col backend GLM;
-- MTP: accessorio separato, escluso dal catalogo dei modelli principali e dalla
-  selezione GUI.
+- Laguna S 2.1 Q4_K_M (file ufficiale Poolside, con revision pinnata) e il
+  requant misto RoutedQ2_K/Last27Q3_K: `downloadOnly` dietro il gate di
+  runtime Laguna; diventeranno selezionabili solo quando il port del decoder
+  abiliterà il gate;
+- MTP e il draft DFlash Q8_0 di Laguna: accessori separati, esclusi dal
+  catalogo dei modelli principali e dalla selezione GUI.
 
 La scansione automatica della GUI filtra sui filename che il catalogo dichiara
 selezionabili: le tre voci Flash, il Pro Q2 singolo e i tre GGUF GLM.
 **Browse** consente un file esterno, ma esegue
 prima l'ispezione metadata-only e la selezione del backend: uno shard Pro Q4,
-MTP, Qwen e architetture sconosciute non possono sostituire silenziosamente il
-modello attivo, mentre un GGUF GLM 5.2 viene instradato al suo backend
-concreto.
+MTP, Laguna (finché il suo gate è spento), Qwen e architetture sconosciute non
+possono sostituire silenziosamente il modello attivo, mentre un GGUF GLM 5.2
+viene instradato al suo backend concreto.
 
 Il supporto Pro Q2 copre sia il decoder locale sia pipeline ed
 expert-parallelism distribuiti. La geometria distribuita è coperta da test di
@@ -143,6 +148,25 @@ GLM usa il proprio namespace di knob `DS4_GLM_*`; i knob DeepSeek non vengono
 riutilizzati implicitamente. Dettagli del motore e ottimizzazioni misurate nel
 [README GLM 5.2](architectures/glm-5.2/README.it.md).
 
+## Stato del backend Laguna S 2.1
+
+Laguna segue lo stesso percorso a stadi seguito da GLM. Implementato e coperto
+da unit test oggi, interamente senza file di modello: registrazione e
+rilevamento di `laguna`, la validazione dell'esatta geometria
+`DS4_SHAPE_LAGUNA_S21` (48 blocchi, GQA con 8 teste KV, l'alternanza per-layer
+48/72 delle teste query e la sua regola sliding-window, YaRN con base di
+frequenza SWA indipendente), il pre-tokenizer BPE Laguna (pre-split sulle
+sequenze di newline più gruppi a una cifra nella forma GLM4), il template chat
+nativo con reasoning interlacciato e tool-call taggati, i default di sampling
+di riferimento (temperatura 0.7, top-k 20, top-p 0.95, min-p 0.05), lo schema
+tensori delle due ricette pubblicate più il file misto Q2_K/Q3_K, e il
+catalogo download. Manca il decoder: `metal/laguna.metal` e il suo driver, più
+il compagno speculativo opzionale DFlash, sono tracciati come piano chiavi in
+mano in [`PORTING-GAPS.it.md`](PORTING-GAPS.it.md).
+`LagunaRuntimeGate.enabled` resta spento — e ogni GGUF Laguna viene rifiutato
+con un errore distinto — finché quel port non passa la parità end-to-end dei
+logits su pesi reali.
+
 ## Documenti per famiglia
 
 - [`architectures/deepseek-v4/README.md`](architectures/deepseek-v4/README.it.md)
@@ -152,4 +176,7 @@ riutilizzati implicitamente. Dettagli del motore e ottimizzazioni misurate nel
 - [`architectures/glm-5.2/README.md`](architectures/glm-5.2/README.it.md) descrive
   contratto verificato, motore streaming e ottimizzazioni misurate del
   backend GLM.
+- [`architectures/laguna-s-2.1/README.md`](architectures/laguna-s-2.1/README.it.md)
+  descrive il frontend Laguna a stadi e ciò che il port del decoder ancora
+  richiede.
 - [`STRUTTURA-PROGETTO.md`](STRUTTURA-PROGETTO.it.md) indica dove collocare i file.

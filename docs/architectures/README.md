@@ -26,3 +26,6 @@ must not silently reuse another family's decoder.
   preparation.
 - [`glm-5.2/`](glm-5.2/README.md): manifest, GGUF contract and progressive
   port; detector/frontend available, decoder not yet runnable.
+- [`laguna-s-2.1/`](laguna-s-2.1/README.md): staged frontend of the reference
+  `laguna-s2.1` branch — geometry, tokenizer, chat/tool protocol, tensor
+  schema and catalog; decoder pending.
