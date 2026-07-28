@@ -26895,6 +26895,87 @@ extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
     return 0;
 }
 
+/* Dense Q4_K matmul for the AProjQ4 GGUFs (attn_q_a/q_b/kv/output_a/output_b
+ * natively Q4_K instead of Q8_0). Activations are quantized to Q8_K rows with
+ * the routed-MoE quantizer and every weight row is reduced with the shared
+ * Q4_K x Q8_K superblock dot, so the numerics match the validated MoE Q4_K
+ * path. 8 lanes per row, same idiom as the MoE decode kernels. Grid:
+ * x = row groups of 32, y = token. Every token re-reads the weight rows from
+ * device memory: fine for decode (n_tok <= 8), and correct-but-unoptimized
+ * for prefill chunks — a dequant + GEMM path can come later if the extra
+ * traffic shows up in profiles. */
+__global__ static void matmul_q4_K_dense_kernel(
+        float *out,
+        const char *w_base,
+        const cuda_block_q8_K *xq,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;   /* 32 rows per 256-thread block */
+    uint32_t tok = blockIdx.y;
+    uint32_t row = blockIdx.x * 32u + row_lane;
+    if (tok >= n_tok || row >= out_dim) return;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    const cuda_block_q4_K *wr =
+        (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
+}
+
+static int cuda_matmul_q4_K_tensor(
+        ds4_gpu_tensor *out,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        weight_offset,
+        uint64_t        in_dim,
+        uint64_t        out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t        n_tok) {
+    if (!out || !x || !model_map || n_tok == 0) return 0;
+    if (in_dim == 0 || (in_dim % CUDA_QK_K) != 0) return 0;
+    const uint64_t blocks = in_dim / CUDA_QK_K;
+    const uint64_t row_bytes = blocks * sizeof(cuda_block_q4_K);
+    if (weight_offset > model_size || row_bytes == 0 ||
+        out_dim > UINT64_MAX / row_bytes) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                               weight_bytes, logical_tier,
+                                               "q4_K dense");
+    if (!wptr) return 0;
+    void *tmp = cuda_tmp_alloc_on(logical_tier,
+                                  n_tok * blocks * sizeof(cuda_block_q8_K),
+                                  "q4_K dense prequant");
+    if (!tmp) return 0;
+    cuda_block_q8_K *xq = (cuda_block_q8_K *)tmp;
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+    q8_K_quantize_kernel<<<qgrid, 256>>>(xq, (const float *)x->ptr,
+                                         (uint32_t)in_dim, (uint32_t)n_tok);
+    if (!cuda_ok(cudaGetLastError(), "q4_K dense quantize launch")) return 0;
+    dim3 grid(((unsigned)out_dim + 31u) / 32u, (unsigned)n_tok, 1);
+    matmul_q4_K_dense_kernel<<<grid, 256>>>((float *)out->ptr,
+                                            wptr,
+                                            xq,
+                                            row_bytes,
+                                            (uint32_t)blocks,
+                                            (uint32_t)out_dim,
+                                            (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(), "q4_K dense matmul launch");
+}
+
 extern "C" int ds4_gpu_matmul_quant_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -26910,6 +26991,10 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
                                           weight_offset, in_dim, out_dim,
                                           x, n_tok);
+    case 12u:  /* Q4_K (AProjQ4 dense attention projections) */
+        return cuda_matmul_q4_K_tensor(out, model_map, model_size,
+                                       weight_offset, in_dim, out_dim,
+                                       x, n_tok);
     case 1u:   /* F16 */
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
