@@ -9,7 +9,11 @@ validabili senza hardware Apple:
   tensori GGUF delle due ricette di quantizzazione pubblicate (signal path
   Q8_0, legacy Q4_K/F16) e del file misto con esperti instradati Q2_K/Q3_K,
   portato da `weights_validate_laguna_layout` del branch di riferimento
-  `laguna-s2.1`.
+  `laguna-s2.1`, più la directory payload-free `LagunaWeightMap`.
+- [`Reference/`](Reference/README.it.md): oracoli CPU scalari del percorso di
+  decode (norm/RoPE, attention GQA gated, router, blocchi FFN).
+- [`Kernels/`](Kernels/README.it.md): wrapper di validazione sui kernel
+  portati in `metal/laguna/`, giudicati su hardware contro gli oracoli.
 - [`Engine/`](Engine/README.it.md): l'unico interruttore di abilitazione del
   runtime, attualmente spento.
 
