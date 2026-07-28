@@ -932,6 +932,7 @@ typedef struct {
     float *routed_mid_all;
     block_q8_K *routed_xq;
     block_q8_K *routed_midq;
+    block_q8_K *dense_xq;
     int8_t *routed_q8_xq;
     float *routed_q8_xscale;
     int8_t *routed_q8_midq;
@@ -8225,6 +8226,12 @@ static void matvec_q8_0_f32_ref(
 }
 
 static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
+static void matvec_q4_K_decode_scratch(
+        float                  *out,
+        const ds4_model        *m,
+        const ds4_tensor       *w,
+        const float            *x,
+        ds4_cpu_decode_scratch *scratch);
 
 /* Decode scratch owns this temporary activation quantization so generation
  * can assert that the hot path performs no malloc. */
@@ -8266,6 +8273,8 @@ static void matvec_any_decode_scratch(
         ds4_cpu_decode_scratch * scratch) {
     if (w->type == 8) {
         matvec_q8_0_decode_scratch(out, m, w, x, scratch);
+    } else if (w->type == DS4_TENSOR_Q4_K) {
+        matvec_q4_K_decode_scratch(out, m, w, x, scratch);
     } else {
         matvec_any(out, m, w, x);
     }
@@ -8392,6 +8401,343 @@ static void matmul_q8_0_grouped_batch(
     free(xq);
 }
 
+/* =========================================================================
+ * Dense Q4_K matvec/matmul.
+ * =========================================================================
+ *
+ * The AProjQ4 GGUFs store the dense attention projections (q_a, q_b, kv,
+ * output_a, output_b) as Q4_K instead of Q8_0.  This family mirrors the
+ * Q8_0 dense functions above: the activation is quantized to Q8_K once and
+ * each Q4_K weight row is reduced with the shared ds4_vec_dot_q4_K_q8_K
+ * kernel, so the same call sites can dispatch on the tensor type.
+ */
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const block_q8_K *xq;
+    uint64_t in_dim;
+    uint64_t row_bytes;
+} matvec_q4_K_dense_ctx;
+
+static void matvec_q4_K_dense_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    matvec_q4_K_dense_ctx *ctx = vctx;
+    for (uint64_t r = row0; r < row1; r++) {
+        const block_q4_K *row = (const block_q4_K *)(ctx->data + r * ctx->row_bytes);
+        ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &ctx->out[r], row, ctx->xq);
+    }
+}
+
+static void dense_q4_K_expect(const ds4_tensor *w, uint64_t in_dim) {
+    if (w->type != DS4_TENSOR_Q4_K || w->ndim != 2) ds4_die("expected a 2D Q4_K tensor");
+    if (w->dim[0] != in_dim) ds4_die("Q4_K dense tensor has an unexpected width");
+    if ((in_dim % QK_K) != 0) ds4_die("Q4_K dense row is not QK_K aligned");
+}
+
+static void matvec_q4_K_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq) {
+    matvec_q4_K_dense_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .xq = xq,
+        .in_dim = w->dim[0],
+        .row_bytes = (w->dim[0] / QK_K) * sizeof(block_q4_K),
+    };
+    ds4_parallel_for(w->dim[1], matvec_q4_K_dense_worker, &ctx);
+}
+
+static void matvec_q4_K(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    dense_q4_K_expect(w, w->dim[0]);
+    const uint64_t blocks = w->dim[0] / QK_K;
+    block_q8_K *xq = xmalloc((size_t)blocks * sizeof(block_q8_K));
+    ds4_quantize_row_q8_K(x, xq, (int64_t)w->dim[0]);
+    matvec_q4_K_prequant(out, m, w, xq);
+    free(xq);
+}
+
+static void matvec_q4_K_decode_scratch(
+        float                  *out,
+        const ds4_model        *m,
+        const ds4_tensor       *w,
+        const float            *x,
+        ds4_cpu_decode_scratch *scratch) {
+    dense_q4_K_expect(w, w->dim[0]);
+    if (w->dim[0] > scratch->q8_cap) ds4_die("CPU decode Q4_K scratch buffer is too small");
+    ds4_quantize_row_q8_K(x, scratch->dense_xq, (int64_t)w->dim[0]);
+    matvec_q4_K_prequant(out, m, w, scratch->dense_xq);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const block_q8_K *xq;
+    uint64_t in_dim;
+    uint64_t blocks;
+    uint64_t rank;
+} matvec_q4_K_grouped_ctx;
+
+static void matvec_q4_K_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matvec_q4_K_grouped_ctx *ctx = vctx;
+    for (uint64_t idx = r0; idx < r1; idx++) {
+        const uint64_t group = idx / ctx->rank;
+        const block_q4_K *row = (const block_q4_K *)
+            (ctx->data + idx * ctx->blocks * sizeof(block_q4_K));
+        ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &ctx->out[idx], row,
+                              ctx->xq + group * ctx->blocks);
+    }
+}
+
+static void matvec_q4_K_grouped_expect(
+        const ds4_tensor *w,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    dense_q4_K_expect(w, group_dim);
+    if (w->dim[1] < (uint64_t)n_groups * rank) {
+        ds4_die("grouped Q4_K tensor has an unexpected layout");
+    }
+}
+
+static void matvec_q4_K_grouped_rows_prequant(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const block_q8_K *xq,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    matvec_q4_K_grouped_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .xq = xq,
+        .in_dim = group_dim,
+        .blocks = group_dim / QK_K,
+        .rank = rank,
+    };
+    ds4_parallel_for((uint64_t)n_groups * rank, matvec_q4_K_grouped_worker, &ctx);
+}
+
+static void matvec_q4_K_grouped_rows(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    matvec_q4_K_grouped_expect(w, n_groups, group_dim, rank);
+    const uint64_t blocks = group_dim / QK_K;
+    block_q8_K *xq = xmalloc((size_t)n_groups * blocks * sizeof(block_q8_K));
+    for (uint32_t g = 0; g < n_groups; g++) {
+        ds4_quantize_row_q8_K(x + (uint64_t)g * group_dim,
+                              xq + (uint64_t)g * blocks,
+                              (int64_t)group_dim);
+    }
+    matvec_q4_K_grouped_rows_prequant(out, m, w, xq, n_groups, group_dim, rank);
+    free(xq);
+}
+
+static void matvec_q4_K_grouped_rows_decode_scratch(
+        float                  *out,
+        const ds4_model        *m,
+        const ds4_tensor       *w,
+        const float            *x,
+        uint32_t                n_groups,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        ds4_cpu_decode_scratch *scratch) {
+    matvec_q4_K_grouped_expect(w, n_groups, group_dim, rank);
+    if ((uint64_t)n_groups * group_dim > scratch->q8_cap) {
+        ds4_die("CPU decode grouped Q4_K scratch buffer is too small");
+    }
+    const uint64_t blocks = group_dim / QK_K;
+    for (uint32_t g = 0; g < n_groups; g++) {
+        ds4_quantize_row_q8_K(x + (uint64_t)g * group_dim,
+                              scratch->dense_xq + (uint64_t)g * blocks,
+                              (int64_t)group_dim);
+    }
+    matvec_q4_K_grouped_rows_prequant(out, m, w, scratch->dense_xq,
+                                      n_groups, group_dim, rank);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const block_q8_K *xq;
+    uint64_t n_tok;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint64_t blocks;
+} matmul_q4_K_batch_ctx;
+
+static void matmul_q4_K_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matmul_q4_K_batch_ctx *ctx = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        const block_q4_K *row = (const block_q4_K *)
+            (ctx->data + r * ctx->blocks * sizeof(block_q4_K));
+        for (uint64_t t = 0; t < ctx->n_tok; t++) {
+            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim,
+                                  &ctx->out[t * ctx->out_dim + r],
+                                  row,
+                                  ctx->xq + t * ctx->blocks);
+        }
+    }
+}
+
+static void matmul_q4_K_batch(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok) {
+    dense_q4_K_expect(w, w->dim[0]);
+    const uint64_t in_dim = w->dim[0];
+    const uint64_t blocks = in_dim / QK_K;
+    block_q8_K *xq = xmalloc((size_t)n_tok * blocks * sizeof(block_q8_K));
+    for (uint64_t t = 0; t < n_tok; t++) {
+        ds4_quantize_row_q8_K(x + t * in_dim, xq + t * blocks, (int64_t)in_dim);
+    }
+    matmul_q4_K_batch_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .xq = xq,
+        .n_tok = n_tok,
+        .in_dim = in_dim,
+        .out_dim = w->dim[1],
+        .blocks = blocks,
+    };
+    ds4_parallel_for(w->dim[1], matmul_q4_K_batch_worker, &ctx);
+    free(xq);
+}
+
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    const block_q8_K *xq;
+    uint64_t n_tok;
+    uint64_t n_groups;
+    uint64_t group_dim;
+    uint64_t blocks;
+    uint64_t rank;
+} matmul_q4_K_grouped_batch_ctx;
+
+static void matmul_q4_K_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    matmul_q4_K_grouped_batch_ctx *ctx = vctx;
+    for (uint64_t idx = r0; idx < r1; idx++) {
+        const uint64_t group = idx / ctx->rank;
+        const block_q4_K *row = (const block_q4_K *)
+            (ctx->data + idx * ctx->blocks * sizeof(block_q4_K));
+        for (uint64_t t = 0; t < ctx->n_tok; t++) {
+            ds4_vec_dot_q4_K_q8_K((int)ctx->group_dim,
+                                  &ctx->out[t * ctx->n_groups * ctx->rank + idx],
+                                  row,
+                                  ctx->xq + (t * ctx->n_groups + group) * ctx->blocks);
+        }
+    }
+}
+
+static void matmul_q4_K_grouped_batch(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    matvec_q4_K_grouped_expect(w, n_groups, group_dim, rank);
+    const uint64_t blocks = group_dim / QK_K;
+    block_q8_K *xq = xmalloc((size_t)n_tok * n_groups * blocks * sizeof(block_q8_K));
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            ds4_quantize_row_q8_K(x + (t * n_groups + g) * group_dim,
+                                  xq + (t * n_groups + g) * blocks,
+                                  (int64_t)group_dim);
+        }
+    }
+    matmul_q4_K_grouped_batch_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .xq = xq,
+        .n_tok = n_tok,
+        .n_groups = n_groups,
+        .group_dim = group_dim,
+        .blocks = blocks,
+        .rank = rank,
+    };
+    ds4_parallel_for((uint64_t)n_groups * rank, matmul_q4_K_grouped_batch_worker, &ctx);
+    free(xq);
+}
+
+/* Type dispatch for the dense attention projections: the AProjQ8 GGUFs keep
+ * them Q8_0, the AProjQ4 ones use Q4_K.  Q8_0 stays on the exact functions
+ * it always used so existing models remain bit-identical. */
+
+static void matvec_dense_grouped_rows(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    if (w->type == DS4_TENSOR_Q4_K) {
+        matvec_q4_K_grouped_rows(out, m, w, x, n_groups, group_dim, rank);
+    } else {
+        matvec_q8_0_grouped_rows(out, m, w, x, n_groups, group_dim, rank);
+    }
+}
+
+static void matvec_dense_grouped_rows_decode_scratch(
+        float                  *out,
+        const ds4_model        *m,
+        const ds4_tensor       *w,
+        const float            *x,
+        uint32_t                n_groups,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        ds4_cpu_decode_scratch *scratch) {
+    if (w->type == DS4_TENSOR_Q4_K) {
+        matvec_q4_K_grouped_rows_decode_scratch(out, m, w, x, n_groups,
+                                                group_dim, rank, scratch);
+    } else {
+        matvec_q8_0_grouped_rows_decode_scratch(out, m, w, x, n_groups,
+                                                group_dim, rank, scratch);
+    }
+}
+
+static void matmul_dense_grouped_batch(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok,
+        uint32_t          n_groups,
+        uint64_t          group_dim,
+        uint64_t          rank) {
+    if (w->type == DS4_TENSOR_Q4_K) {
+        matmul_q4_K_grouped_batch(out, m, w, x, n_tok, n_groups, group_dim, rank);
+    } else {
+        matmul_q8_0_grouped_batch(out, m, w, x, n_tok, n_groups, group_dim, rank);
+    }
+}
+
+static void matmul_dense_batch(
+        float            *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        const float      *x,
+        uint64_t          n_tok) {
+    if (w->type == DS4_TENSOR_Q4_K) {
+        matmul_q4_K_batch(out, m, w, x, n_tok);
+    } else {
+        matmul_q8_0_batch(out, m, w, x, n_tok);
+    }
+}
+
 typedef struct {
     float *out;
     const float *data;
@@ -8424,12 +8770,14 @@ static void matvec_f32(float *out, const ds4_model *m, const ds4_tensor *w, cons
     ds4_parallel_for(w->dim[1], matvec_f32_worker, &ctx);
 }
 
-/* Dispatch for dense F32/F16/Q8_0 tensors used by auxiliary projections. */
+/* Dispatch for dense F32/F16/Q8_0/Q4_K tensors used by the attention and
+ * auxiliary projections. */
 static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     switch (w->type) {
     case 0: matvec_f32(out, m, w, x); break;
     case 1: matvec_f16(out, m, w, x); break;
     case 8: matvec_q8_0(out, m, w, x); break;
+    case DS4_TENSOR_Q4_K: matvec_q4_K(out, m, w, x); break;
     default:
         ds4_die("unsupported tensor type for dense matvec");
     }
@@ -10706,9 +11054,9 @@ static void layer_q_projection_normed_one(
 
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
-    matvec_q8_0(qr, model, layer->attn_q_a, norm);
+    matvec_any(qr, model, layer->attn_q_a, norm);
     rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, DS4_RMS_EPS);
-    matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
+    matvec_any(q, model, layer->attn_q_b, qr_norm);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 
     free(qr_norm);
@@ -10725,9 +11073,9 @@ static void layer_q_projection_with_lora_one(
     float *qr = xmalloc((size_t)q_rank * sizeof(qr[0]));
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
-    matvec_q8_0(qr, model, layer->attn_q_a, norm);
+    matvec_any(qr, model, layer->attn_q_a, norm);
     rms_norm_weight(qr_norm, qr, q_a_norm, q_rank, DS4_RMS_EPS);
-    matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
+    matvec_any(q, model, layer->attn_q_b, qr_norm);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 
     free(qr);
@@ -10743,7 +11091,7 @@ static void layer_kv_projection_normed_one(
 
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
-    matvec_q8_0(raw, model, layer->attn_kv, normed);
+    matvec_any(raw, model, layer->attn_kv, normed);
     rms_norm_weight(kv, raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 
     free(raw);
@@ -10758,9 +11106,9 @@ static void layer_q_projection_with_lora_one_decode_scratch(
         ds4_cpu_decode_scratch  * scratch) {
     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
 
-    matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
+    matvec_any_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
     rms_norm_weight(qr_norm, scratch->qr, q_a_norm, DS4_N_LORA_Q, DS4_RMS_EPS);
-    matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
+    matvec_any_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 }
 
@@ -10772,7 +11120,7 @@ static void layer_kv_projection_normed_one_decode_scratch(
         ds4_cpu_decode_scratch  * scratch) {
     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
 
-    matvec_q8_0_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
+    matvec_any_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
     rms_norm_weight(kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 }
 
@@ -11061,9 +11409,9 @@ static void layer_grouped_out_one(
 
     float *low = xcalloc((size_t)n_groups * rank, sizeof(low[0]));
 
-    matvec_q8_0_grouped_rows(low, model, layer->attn_output_a, heads, n_groups, group_dim, rank);
+    matvec_dense_grouped_rows(low, model, layer->attn_output_a, heads, n_groups, group_dim, rank);
 
-    matvec_q8_0(out, model, layer->attn_output_b, low);
+    matvec_any(out, model, layer->attn_output_b, low);
     free(low);
 }
 
@@ -11079,9 +11427,9 @@ static void layer_grouped_out_one_decode_scratch(
     const uint32_t rank = 1024;
 
     memset(scratch->attn_low, 0, (size_t)n_groups * rank * sizeof(scratch->attn_low[0]));
-    matvec_q8_0_grouped_rows_decode_scratch(scratch->attn_low, model, layer->attn_output_a,
-                                            heads, n_groups, group_dim, rank, scratch);
-    matvec_q8_0_decode_scratch(out, model, layer->attn_output_b, scratch->attn_low, scratch);
+    matvec_dense_grouped_rows_decode_scratch(scratch->attn_low, model, layer->attn_output_a,
+                                             heads, n_groups, group_dim, rank, scratch);
+    matvec_any_decode_scratch(out, model, layer->attn_output_b, scratch->attn_low, scratch);
 }
 
 static void layer_grouped_out_batch(
@@ -11097,9 +11445,9 @@ static void layer_grouped_out_batch(
 
     float *low = xcalloc((size_t)n_tok * n_groups * rank, sizeof(low[0]));
 
-    matmul_q8_0_grouped_batch(low, model, layer->attn_output_a, heads,
-                              n_tok, n_groups, group_dim, rank);
-    matmul_q8_0_batch(out, model, layer->attn_output_b, low, n_tok);
+    matmul_dense_grouped_batch(low, model, layer->attn_output_a, heads,
+                               n_tok, n_groups, group_dim, rank);
+    matmul_dense_batch(out, model, layer->attn_output_b, low, n_tok);
 
     free(low);
 }
@@ -12822,6 +13170,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
     scratch->routed_xq = xmalloc((size_t)(DS4_N_EMBD / QK_K) * sizeof(block_q8_K));
     scratch->routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K) * sizeof(block_q8_K));
+    scratch->dense_xq = xmalloc((size_t)((q8_cap + QK_K - 1u) / QK_K) * sizeof(block_q8_K));
     scratch->routed_q8_xq = xmalloc((size_t)routed_q8_x_blocks * 32u);
     scratch->routed_q8_xscale = xmalloc((size_t)routed_q8_x_blocks * sizeof(float));
     scratch->routed_q8_midq = xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u);
@@ -12852,6 +13201,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->routed_q8_midq);
     free(scratch->routed_q8_xscale);
     free(scratch->routed_q8_xq);
+    free(scratch->dense_xq);
     free(scratch->routed_midq);
     free(scratch->routed_xq);
     free(scratch->routed_mid_all);
@@ -13801,7 +14151,7 @@ static void layer_attention_raw_swa_batch(
     if (profile) t_hc_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
-    matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
+    matmul_dense_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
     for (uint32_t t = 0; t < n_tok; t++) {
         rms_norm_weight(qr_norm + (uint64_t)t * q_rank,
                         qr + (uint64_t)t * q_rank,
@@ -13809,7 +14159,7 @@ static void layer_attention_raw_swa_batch(
                         q_rank,
                         DS4_RMS_EPS);
     }
-    matmul_q8_0_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
+    matmul_dense_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
     for (uint32_t t = 0; t < n_tok; t++) {
         head_rms_norm_inplace(q + (uint64_t)t * q_dim,
                               DS4_N_HEAD,
@@ -13819,7 +14169,7 @@ static void layer_attention_raw_swa_batch(
     if (profile) t_q = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
-    matmul_q8_0_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
+    matmul_dense_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
     for (uint32_t t = 0; t < n_tok; t++) {
         rms_norm_weight(kv + (uint64_t)t * DS4_N_HEAD_DIM,
                         kv_raw + (uint64_t)t * DS4_N_HEAD_DIM,
@@ -22778,6 +23128,13 @@ static bool metal_graph_encode_decode_layer_phase(
     bool fuse_kv_rope_store = false;
     bool qkv_pair_quad_fused = false;
     if (!resume_after_qkv) {
+    /* AProjQ4 GGUFs carry q_a/kv (and the output pair) as Q4_K; the fused
+     * Q8_0 pair kernel and the plain Q8_0 matvec would read those blocks as
+     * Q8_0 and produce garbage, so both stay gated on the actual type and
+     * everything else goes through the type-dispatching dense-quant path. */
+    const bool qkv_proj_q8 =
+        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_kv->type == DS4_TENSOR_Q8_0;
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     /* M1-M5 decode fusion: the q_a/kv Q8 pair and the four F16 compressor
      * projections all read the same normalized attention input and write
@@ -22789,8 +23146,7 @@ static bool metal_graph_encode_decode_layer_phase(
         phase == METAL_DECODE_LAYER_FULL &&
         !g->ssd_streaming && !g->ssd_streaming_cold &&
         ds4_layer_compress_ratio(il) == 4u &&
-        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
-        layer->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        qkv_proj_q8 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj() &&
         !metal_graph_use_reference_compressor_pair_proj() &&
         layer->attn_compressor_kv && layer->attn_compressor_gate &&
@@ -22855,8 +23211,7 @@ static bool metal_graph_encode_decode_layer_phase(
         phase == METAL_DECODE_LAYER_FULL &&
         !g->ssd_streaming && !g->ssd_streaming_cold &&
         ds4_layer_compress_ratio(il) == 128u &&
-        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
-        layer->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        qkv_proj_q8 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj() &&
         !metal_graph_use_reference_compressor_pair_proj() &&
         layer->attn_compressor_kv && layer->attn_compressor_gate &&
@@ -22909,8 +23264,7 @@ static bool metal_graph_encode_decode_layer_phase(
         }
     }
     if (!resume_after_qa_kv_raw && ok && !qkv_pair_quad_fused && qkv_rms_fused &&
-        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
-        layer->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        qkv_proj_q8 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
                 metal_graph_qr(g),
@@ -23906,7 +24260,9 @@ static bool metal_graph_encode_decode_layer_phase(
         cuda_tp_attn_requested &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         cuda_tp_partner_tier >= 0 &&
-        (n_groups % 2u) == 0u;
+        (n_groups % 2u) == 0u &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0;
     ds4_gpu_tensor *tp_attn_a = NULL;   /* rank partials consumed directly */
     ds4_gpu_tensor *tp_attn_b = NULL;   /* by the HC expand */
     const bool fuse_attn_out_hc =
