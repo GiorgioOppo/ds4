@@ -92,6 +92,48 @@ static inline float glm52_dot_q5_K_row(device const uchar *row,
     return acc;
 }
 
+// Q3_K (110 B / 256 elementi): hmask[32] + qs[64] (piani a 2 bit) +
+// scales[12] (16 scale a 6 bit con segno, impacchettamento llama.cpp) + d.
+// Valore dell'elemento: (2 bit bassi | bit alto da hmask) − 4 quando il bit
+// alto è a zero. Consumatore: gli esperti instradati del file Laguna misto
+// RoutedQ2_K-Last27Q3_K (GLM non pubblica pesi Q3_K).
+static inline int glm52_q3_K_scale(device const uchar *sc, uint k) {
+    const uint low = k < 8u ? (uint)(sc[k] & 0x0Fu)
+                            : (uint)(sc[k - 8u] >> 4u);
+    const uint high = ((uint)sc[8u + (k % 4u)] >> (2u * (k / 4u))) & 3u;
+    return (int)(low | (high << 4u)) - 32;
+}
+
+static inline float glm52_dot_q3_K_row(device const uchar *row,
+                                       device const float *x,
+                                       uint width) {
+    float acc = 0.0f;
+    for (uint sb = 0u; sb < width / 256u; sb++) {
+        device const uchar *base = row + sb * 110u;
+        device const uchar *hm = base;
+        device const uchar *qs = base + 32u;
+        device const uchar *sc = base + 96u;
+        const float d = glm52_half_at(base + 108u);
+        for (uint j = 0u; j < 8u; j++) {
+            const uint plane = j % 4u;
+            const uint qbase = (j / 4u) * 32u;
+            const uint shift = plane * 2u;
+            const uchar mbit = (uchar)(1u << ((j / 4u) * 4u + plane));
+            const uint xbase = sb * 256u + (j / 4u) * 128u + plane * 32u;
+            float sums[2] = {0.0f, 0.0f};
+            for (uint l = 0u; l < 32u; l++) {
+                const int q = (int)((qs[qbase + l] >> shift) & 3u);
+                const int v = q - (((hm[l] & mbit) != 0u) ? 0 : 4);
+                sums[l / 16u] += (float)v * x[xbase + l];
+            }
+            const uint s0 = (j / 4u) * 8u + plane * 2u;
+            acc += d * (float)glm52_q3_K_scale(sc, s0) * sums[0];
+            acc += d * (float)glm52_q3_K_scale(sc, s0 + 1u) * sums[1];
+        }
+    }
+    return acc;
+}
+
 static inline float glm52_dot_q6_K_row(device const uchar *row,
                                        device const float *x,
                                        uint width) {
@@ -179,6 +221,7 @@ static inline uint glm52_kquant_row_bytes(uint type, uint width) {
     switch (type) {
         case 8u:  return (width / 32u) * 34u;
         case 10u: return (width / 256u) * 84u;
+        case 11u: return (width / 256u) * 110u;
         case 12u: return (width / 256u) * 144u;
         case 13u: return (width / 256u) * 176u;
         case 14u: return (width / 256u) * 210u;
@@ -194,6 +237,7 @@ static inline float glm52_dot_kquant_row(uint type,
     switch (type) {
         case 8u:  return glm52_dot_q8_0_row(row, x, width);
         case 10u: return glm52_dot_q2_K_row(row, x, width);
+        case 11u: return glm52_dot_q3_K_row(row, x, width);
         case 12u: return glm52_dot_q4_K_row(row, x, width);
         case 13u: return glm52_dot_q5_K_row(row, x, width);
         case 14u: return glm52_dot_q6_K_row(row, x, width);
@@ -265,6 +309,33 @@ static inline float glm52_dot_q2_K_group(device const uchar *row,
         acc += w * x[sb * 256u + half128 + plane * 32u + l];
     }
     return acc;
+}
+
+static inline float glm52_dot_q3_K_group(device const uchar *row,
+                                         device const float *x,
+                                         uint g) {
+    const uint sb = g / 8u;
+    const uint j = g % 8u;
+    const uint plane = j % 4u;
+    device const uchar *base = row + sb * 110u;
+    device const uchar *hm = base;
+    device const uchar *qs = base + 32u;
+    device const uchar *sc = base + 96u;
+    const float d = glm52_half_at(base + 108u);
+
+    const uint qbase = (j / 4u) * 32u;
+    const uint shift = plane * 2u;
+    const uchar mbit = (uchar)(1u << ((j / 4u) * 4u + plane));
+    const uint xbase = sb * 256u + (j / 4u) * 128u + plane * 32u;
+    float sums[2] = {0.0f, 0.0f};
+    for (uint l = 0u; l < 32u; l++) {
+        const int q = (int)((qs[qbase + l] >> shift) & 3u);
+        const int v = q - (((hm[l] & mbit) != 0u) ? 0 : 4);
+        sums[l / 16u] += (float)v * x[xbase + l];
+    }
+    const uint s0 = (j / 4u) * 8u + plane * 2u;
+    return d * (float)glm52_q3_K_scale(sc, s0) * sums[0] +
+           d * (float)glm52_q3_K_scale(sc, s0 + 1u) * sums[1];
 }
 
 static inline float glm52_dot_q4_K_group(device const uchar *row,
@@ -417,6 +488,7 @@ static inline float glm52_dot_kquant_group(uint type,
     switch (type) {
         case 8u:  return glm52_dot_q8_0_group(row, x, g);
         case 10u: return glm52_dot_q2_K_group(row, x, g);
+        case 11u: return glm52_dot_q3_K_group(row, x, g);
         case 12u: return glm52_dot_q4_K_group(row, x, g);
         case 13u: return glm52_dot_q5_K_group(row, x, g);
         case 14u: return glm52_dot_q6_K_group(row, x, g);

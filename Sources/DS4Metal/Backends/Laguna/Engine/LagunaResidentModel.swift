@@ -67,11 +67,17 @@ public final class LagunaResidentModel {
 
     private static let simdgroupsPerThreadgroup = 4
     private static let q8Type: UInt32 = 8
-    private static let q4KType: UInt32 = 12
+
+    /// Routed-expert types with a wired matvec path (the K-quant dot helpers
+    /// shared with GLM): Q2_K, Q3_K and Q4_K — the published official and
+    /// mixed recipes. The tensor schema already guarantees the three routed
+    /// projections of one layer share this type on the Q8_0-signal layout.
+    private static let routedTypes: Set<UInt32> = [10, 11, 12]
 
     private enum FFN {
         case dense(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
-        case moe(routerRows: MTLBuffer, routerBias: MTLBuffer,
+        case moe(routedType: UInt32,
+                 routerRows: MTLBuffer, routerBias: MTLBuffer,
                  routedGate: MTLBuffer, routedUp: MTLBuffer,
                  routedDown: MTLBuffer,
                  gateUpExpertBytes: Int, downExpertBytes: Int,
@@ -217,15 +223,14 @@ public final class LagunaResidentModel {
                 )
             } else {
                 let routed = try map.routedExperts(layer: index)
-                guard routed.gate.type == Self.q4KType,
-                      routed.up.type == Self.q4KType,
-                      routed.down.type == Self.q4KType else {
+                guard Self.routedTypes.contains(routed.gate.type),
+                      routed.up.type == routed.gate.type,
+                      routed.down.type == routed.gate.type else {
                     throw LagunaResidentModelError.unsupportedRecipe(
                         "layer \(index) routed experts are "
                         + "\(GGUF.typeName(routed.gate.type))/"
-                        + "\(GGUF.typeName(routed.down.type)); the first cut "
-                        + "runs Q4_K routed experts only (the mixed Q2_K/Q3_K "
-                        + "file needs its matvec kernels wired first)"
+                        + "\(GGUF.typeName(routed.down.type)); this engine "
+                        + "runs coherent Q2_K/Q3_K/Q4_K routed experts"
                     )
                 }
                 let gateUpExpertBytes = Int(routed.gate.bytes)
@@ -233,6 +238,7 @@ public final class LagunaResidentModel {
                 let downExpertBytes = Int(routed.down.bytes)
                     / Int(shape.nExpert)
                 ffn = .moe(
+                    routedType: routed.gate.type,
                     routerRows: try upload(map.layer(index, .router)),
                     routerBias: try upload(map.layer(index, .routerBias)),
                     routedGate: try upload(routed.gate),
@@ -399,7 +405,7 @@ public final class LagunaResidentModel {
                           count: embd)
             try endCommands(commands)
 
-        case .moe(let routerRows, let routerBias,
+        case .moe(let routedType, let routerRows, let routerBias,
                   let routedGate, let routedUp, let routedDown,
                   let gateUpExpertBytes, let downExpertBytes,
                   let sharedGate, let sharedUp, let sharedDown):
@@ -427,7 +433,7 @@ public final class LagunaResidentModel {
             for (rank, expert) in selected.enumerated() {
                 let e = Int(expert)
                 try encodePairSwiGLU(
-                    commands, type: Self.q4KType, rows: expertWidth,
+                    commands, type: routedType, rows: expertWidth,
                     inputWidth: embd,
                     gateRows: routedGate, gateOffset: e * gateUpExpertBytes,
                     upRows: routedUp, upOffset: e * gateUpExpertBytes,
@@ -435,7 +441,7 @@ public final class LagunaResidentModel {
                     mid: ffnMid
                 )
                 try encodeQuantMatvec(
-                    commands, type: Self.q4KType, rows: embd,
+                    commands, type: routedType, rows: embd,
                     inputWidth: expertWidth,
                     weights: routedDown, weightsOffset: e * downExpertBytes,
                     input: ffnMid, output: ffnOut, accumulate: rank != 0

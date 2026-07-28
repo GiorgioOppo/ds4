@@ -250,8 +250,10 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
    Q4_K_M GGUF (the branch's `ds4` with `--temp 0`), then tokenizer golden
    parity on the real vocabulary.
 4. Performance pass: batched prefill and chained decode (drop the per-phase
-   waits), then the Q2_K/Q3_K routed matvecs for the mixed file and the
-   legacy-recipe paths (`kernel_laguna_q6_K_matmul_f32` is already ported).
+   waits), then the legacy-recipe paths (`kernel_laguna_q6_K_matmul_f32` is
+   already ported). The Q2_K/Q3_K routed matvecs for the mixed file are
+   wired (Q3_K dot helpers in `glm52_quant.metal`, parity-tested in
+   `LagunaQ3KMatvecTests`).
 5. Catalog: pin byte counts and SHA-256 digests for the three artifacts,
    then flip `LagunaRuntimeGate.enabled` (`ModelDownloaderTests` enforces
    "runnable ⇒ pinned digest").

@@ -256,9 +256,10 @@ validato e rifiutato con un errore distinto.
    GGUF Q4_K_M reale (il `ds4` del branch con `--temp 0`), poi parità golden
    del tokenizer sul vocabolario reale.
 4. Passata di performance: prefill batched e decode chained (togliere le
-   attese per fase), poi i matvec instradati Q2_K/Q3_K per il file misto e i
-   percorsi della ricetta legacy (`kernel_laguna_q6_K_matmul_f32` è già
-   portato).
+   attese per fase), poi i percorsi della ricetta legacy
+   (`kernel_laguna_q6_K_matmul_f32` è già portato). I matvec instradati
+   Q2_K/Q3_K per il file misto sono cablati (helper di dot Q3_K in
+   `glm52_quant.metal`, con parità verificata in `LagunaQ3KMatvecTests`).
 5. Catalogo: pinnare byte count e SHA-256 dei tre artefatti, poi accendere
    `LagunaRuntimeGate.enabled` (`ModelDownloaderTests` impone
    "runnable ⇒ digest pinnato").

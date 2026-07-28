@@ -17,11 +17,14 @@ attivi, i matvec K-quant di `glm52_moe`) più i kernel Laguna accanto. La
 selezione del router viene riletta sull'host per indirizzare gli slab degli
 esperti, come il chained decode GLM.
 
-Limiti di scope deliberati di questo taglio, rifiutati con errori distinti al
-caricamento: la ricetta legacy F16/Q4_K e il file misto Q2_K/Q3_K (i loro
-percorsi matvec non sono cablati), lo streaming SSD e il prefill batched (i
-prompt passano token-per-token dal percorso di decode — corretto, non
-veloce). `LagunaResidentModelOptions.layerCount` tronca lo stack dal fronte
+Gli esperti instradati possono essere Q2_K, Q3_K o Q4_K per layer (coerenti,
+come garantisce lo schema), quindi girano sia il file ufficiale Q4_K_M sia il
+misto RoutedQ2_K-Last27Q3_K; gli helper di dot Q3_K vivono accanto agli altri
+K-quant in `metal/glm5.2/glm52_quant.metal`. Limiti di scope deliberati di
+questo taglio, rifiutati con errori distinti al caricamento: la ricetta
+legacy F16/Q4_K (i suoi percorsi matvec non sono cablati), lo streaming SSD e
+il prefill batched (i prompt passano token-per-token dal percorso di decode —
+corretto, non veloce). `LagunaResidentModelOptions.layerCount` tronca lo stack dal fronte
 per le prove di bring-up.
 
 `LagunaRuntimeGate.enabled` resta `false` finché questo motore non passa la

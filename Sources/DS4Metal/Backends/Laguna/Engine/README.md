@@ -16,10 +16,13 @@ them (`kernel_glm52_rms_norm_f32`, `kernel_glm52_matvec_pair_sg`,
 matvecs) plus the Laguna kernels beside them. The router selection is read
 back on the host to address expert slabs, like the GLM chained decode.
 
-Deliberate scope limits of this cut, refused with distinct errors at load:
-the legacy F16/Q4_K recipe and the mixed Q2_K/Q3_K file (their matvec paths
-are not wired), SSD streaming, and batched prefill (prompts run
-token-by-token through the decode path — correct, not fast).
+Routed experts may be Q2_K, Q3_K or Q4_K per layer (coherent, as the schema
+guarantees), so both the official Q4_K_M file and the mixed
+RoutedQ2_K-Last27Q3_K file run; the Q3_K dot helpers live beside the other
+K-quants in `metal/glm5.2/glm52_quant.metal`. Deliberate scope limits of
+this cut, refused with distinct errors at load: the legacy F16/Q4_K recipe
+(its matvec paths are not wired), SSD streaming, and batched prefill
+(prompts run token-by-token through the decode path — correct, not fast).
 `LagunaResidentModelOptions.layerCount` truncates the stack from the front
 for bring-up runs.
 

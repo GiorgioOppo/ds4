@@ -30,13 +30,16 @@ public struct GLM52QuantizedExpert: Sendable {
 
 extension MetalRuntime {
     /// Quantized row bytes for `width` elements (multiple of the type's block
-    /// size), or nil for a type outside the GLM FFN contract: Q8_0 for
-    /// dense/shared/output-head weights, the four K-quants for routed experts.
+    /// size), or nil for a type outside the FFN contract: Q8_0 for
+    /// dense/shared/output-head weights, the K-quants for routed experts.
+    /// Q3_K (11) is in the contract for the Laguna mixed file — GLM itself
+    /// publishes no Q3_K weights.
     static func glm52KQuantRowBytes(type: UInt32, width: Int) -> Int? {
         guard width > 0,
               let info = GGUF.typeInfo(type),
               width.isMultiple(of: Int(info.blockElems)),
               [GLM52TensorSchema.q8_0, GLM52TensorSchema.q2_K,
+               LagunaTensorSchema.q3_K,
                GLM52TensorSchema.q4_K, GLM52TensorSchema.q5_K,
                GLM52TensorSchema.q6_K,
                GLM52TensorSchema.iq2_XXS].contains(type)
