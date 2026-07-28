@@ -14,6 +14,8 @@ al rispettivo backend.
 - [`DeepSeekV4/`](DeepSeekV4/README.it.md): backend attualmente operativo.
 - [`GLM52/`](GLM52/README.it.md): schema, riferimenti DSA e primitive Metal in
   costruzione; non contiene ancora un decoder eseguibile.
+- [`Laguna/`](Laguna/README.it.md): solo schema tensori e gate di runtime; il
+  decoder Laguna non è ancora portato.
 - [`Qwen/`](Qwen/README.it.md): spazio riservato; Qwen non è ancora supportato.
 
 ## Regole di modifica

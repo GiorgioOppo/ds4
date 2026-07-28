@@ -9,3 +9,5 @@ e composizioni di grafo che hanno semantica specifica del backend.
 - [`DeepSeekV4/`](DeepSeekV4/README.it.md): backend attualmente implementato.
 - [`GLM52/`](GLM52/README.it.md): schema/DSA, oracoli e primitive Metal progressive;
   nessun test dichiara ancora disponibile il decoder.
+- [`Laguna/`](Laguna/README.it.md): solo contratto dello schema tensori; il
+  decoder non è ancora portato.
