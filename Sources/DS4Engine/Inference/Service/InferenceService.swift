@@ -116,17 +116,17 @@ public actor InferenceService: DS4Logging {
         }
         let openedModel = try GGUFModel(path: modelPath, metalMapping: true, prefetchCPU: false)
         let selection = try RuntimeBackendFactory.prepare(model: openedModel)
-        // This actor IS the DeepSeek hot loop. A .glm52 selection must stop
-        // HERE with an actionable message, not fall through into the DeepSeek
-        // tokenizer/config validators and their misleading refusals — the
-        // GLM chat surface is GLM52InferenceService, not yet wired into the
-        // GUI ChatStore.
+        // This actor IS the DeepSeek hot loop. A .glm52 or .laguna selection
+        // must stop HERE with an actionable message, not fall through into
+        // the DeepSeek tokenizer/config validators and their misleading
+        // refusals — those chat surfaces are their own engines, not yet
+        // wired into the GUI ChatStore.
         guard selection.backend == .deepSeekV4 else {
             throw GGUFError.cannotOpen(
-                "GLM 5.2 riconosciuto e abilitato, ma la chat GUI non è "
-                + "ancora collegata al motore GLM: usa la demo CLI "
-                + "(swift run DS4Demo <gguf> con DS4_PROMPT) in attesa "
-                + "dell'integrazione ChatStore.")
+                "backend \(selection.backend.rawValue) riconosciuto e "
+                + "abilitato, ma la chat GUI non è ancora collegata al suo "
+                + "motore: usa la demo CLI (swift run DS4Demo <gguf> con "
+                + "DS4_PROMPT) in attesa dell'integrazione ChatStore.")
         }
         self.model = openedModel
         self.backendDescriptor = selection.descriptor

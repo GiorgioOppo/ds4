@@ -6,6 +6,7 @@ import DS4Core
 public enum RuntimeBackendKind: String, Sendable, Equatable {
     case deepSeekV4
     case glm52
+    case laguna
 }
 
 public enum BackendSelectionError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -46,9 +47,13 @@ public enum BackendSelector {
             // explicit not-implemented refusal below.
             return .glm52
         }
-        // Laguna has no RuntimeBackendKind yet: LagunaRuntimeGate is off and a
-        // Laguna GGUF must reach the explicit not-implemented refusal below,
-        // never another decoder. Adding the kind is part of the decoder port.
+        if descriptor.architecture == LagunaBackendDefinition.supportedArchitecture,
+           LagunaBackendDefinition.runtimeEnabled {
+            // Same contract as GLM: the gate flips only after the first-cut
+            // resident engine passes logits parity on real weights. Until
+            // then a Laguna GGUF reaches the explicit refusal below.
+            return .laguna
+        }
         if descriptor.family == .glm || descriptor.family == .laguna
             || descriptor.family == .qwen {
             throw BackendSelectionError.backendNotImplemented(descriptor.architecture)

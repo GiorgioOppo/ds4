@@ -425,8 +425,60 @@ do {
             glm.saveUsageProfile()
             exit(0)
         }
+        if detectedArchitecture.family == .laguna, LagunaRuntimeGate.enabled {
+            // Laguna S 2.1 greedy demo on the first-cut resident engine
+            // (bring-up grade: full residency, token-by-token prefill).
+            // Prompt from DS4_PROMPT; token budget from DS4_MAX_NEW;
+            // DS4_LAGUNA_LAYERS truncates the stack for bring-up runs.
+            let environment = ProcessInfo.processInfo.environment
+            let prompt = environment["DS4_PROMPT"]
+                ?? "Ciao! Presentati in una frase."
+            let maxNew = Int(environment["DS4_MAX_NEW"] ?? "") ?? 128
+            log("DS4Demo: Laguna S 2.1 greedy — prompt: \(prompt)")
+            let tokenizer = try LagunaTokenizer(model: model)
+            let runtime = try MetalRuntime()
+            var options = LagunaResidentModelOptions()
+            options.cacheCapacity = maxKeys
+            options.layerCount = environment["DS4_LAGUNA_LAYERS"].flatMap(Int.init)
+            let loadStart = Date()
+            let laguna = try LagunaResidentModel(
+                runtime: runtime, path: ggufPath, options: options
+            )
+            log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer)",
+                       Date().timeIntervalSince(loadStart),
+                       laguna.loadedLayerCount))
+            let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
+            let prefillStart = Date()
+            var logits = try laguna.prefill(tokens)
+            log(String(format: "DS4Demo: prefill %d token in %.1fs",
+                       tokens.count, Date().timeIntervalSince(prefillStart)))
+            var generated: [Int32] = []
+            let decodeStart = Date()
+            for _ in 0..<maxNew {
+                var best = logits[0]
+                var bestIndex: Int32 = 0
+                for index in 1..<logits.count where logits[index] > best {
+                    best = logits[index]
+                    bestIndex = Int32(index)
+                }
+                if tokenizer.isStopToken(bestIndex) { break }
+                generated.append(bestIndex)
+                let piece = tokenizer.tokenText(bestIndex)
+                FileHandle.standardOutput.write(Data(piece))
+                logits = try laguna.forwardNext(bestIndex)
+            }
+            FileHandle.standardOutput.write(Data("\n".utf8))
+            let decodeSeconds = Date().timeIntervalSince(decodeStart)
+            if !generated.isEmpty {
+                log(String(format: "DS4Demo: %d token in %.1fs (%.2f tok/s)",
+                           generated.count, decodeSeconds,
+                           Double(generated.count) / max(decodeSeconds, 0.001)))
+            }
+            exit(0)
+        }
         if detectedArchitecture.family == .qwen
-            || detectedArchitecture.family == .glm {
+            || detectedArchitecture.family == .glm
+            || detectedArchitecture.family == .laguna {
             log("DS4Demo: backend \(detectedArchitecture.id.rawValue) non ancora implementato")
         } else {
             log("DS4Demo: \(error)")

@@ -224,28 +224,36 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
 - `LagunaWeightMap` (payload-free directory with the detected quantization
   layout retained).
 
-### Remaining Swift touch-points (need a Mac at every step)
-1. **Run the landed parity tests on hardware** (`LagunaKernelsTests`): they
-   are the gate for everything below.
-2. Resident engine (`Backends/Laguna/Engine/LagunaResidentModel.swift`,
-   modeled on `GLM52ResidentModel` but full-residency only): upload the
-   validated tensors into shared `MTLBuffer`s, per-layer F16 ring caches
-   sized SWA=512 / full=context, per-token loop reusing the shared GLM
-   wrappers where upstream shares the primitive (rms_norm/matvec/add from
-   `glm52_misc`, `kernel_glm52_router_select` with `expertsUsed 10`,
-   `glm52_moe` for Q8_0 shared + Q4_K routed experts) plus the Laguna
-   kernels for norm/rope, KV store and gated attention; token-by-token
-   prefill first. First cut may support the official Q8_0-signal + Q4_K
-   recipe only and refuse legacy/mixed files with a distinct error until
-   the Q3_K matvec lands (upstream `moe.metal` grew it on the branch).
-3. `RuntimeBackendKind.laguna` + selector routing behind
-   `LagunaRuntimeGate` (`BackendSelector` already refuses the family
-   explicitly; the comment marks the insertion point) and the DS4Demo
-   dispatch branch (mirror the GLM branch in `DS4Demo/Command/main.swift`).
-4. Sampler wiring: `LagunaConversationProtocol.SamplingDefaults` for chat,
-   server per-request overrides taking precedence.
-5. Catalog: pin byte counts and SHA-256 digests for the three artifacts
-   before flipping entries to `runnable` (`ModelDownloaderTests` enforces
+### Also landed (compiles-on-Mac pending — written without a toolchain)
+- First-cut resident engine
+  (`Backends/Laguna/Engine/LagunaResidentModel.swift`): full residency of
+  the official Q8_0-signal + Q4_K recipe, per-layer F16 ring caches
+  (SWA=512 / full=context), per-token graph dispatching the shared GLM
+  primitives (`kernel_glm52_rms_norm_f32`, `kernel_glm52_matvec_pair_sg`,
+  `kernel_glm52_router_select` with 10 experts, `glm52_moe` matvecs) plus
+  the Laguna kernels; host-side router readback per MoE layer;
+  token-by-token prefill. Legacy and mixed Q2_K/Q3_K files are refused with
+  distinct errors until their matvec paths are wired.
+- `RuntimeBackendKind.laguna` + selector routing behind `LagunaRuntimeGate`,
+  the DS4Demo dispatch branch (greedy loop, `DS4_LAGUNA_LAYERS` truncation)
+  and a backend-neutral GUI refusal message in `InferenceService`.
+- Engine tests: Q8_0 row-dequant parity with the shared encoder
+  (device-free) and an opt-in real-weights smoke test
+  (`DS4_LAGUNA_GGUF`).
+
+### Remaining steps (need a Mac at every one)
+1. **Compile.** The engine was written without a Swift toolchain: fix
+   whatever `swift build` reports first.
+2. **Run the parity tests on hardware** (`LagunaKernelsTests`, then the
+   `DS4_LAGUNA_GGUF` smoke test with a truncated stack): they gate the rest.
+3. **End-to-end logits parity** against the reference C engine on the real
+   Q4_K_M GGUF (the branch's `ds4` with `--temp 0`), then tokenizer golden
+   parity on the real vocabulary.
+4. Performance pass: batched prefill and chained decode (drop the per-phase
+   waits), then the Q2_K/Q3_K routed matvecs for the mixed file and the
+   legacy-recipe paths (`kernel_laguna_q6_K_matmul_f32` is already ported).
+5. Catalog: pin byte counts and SHA-256 digests for the three artifacts,
+   then flip `LagunaRuntimeGate.enabled` (`ModelDownloaderTests` enforces
    "runnable ⇒ pinned digest").
 
 ### Validation gate
