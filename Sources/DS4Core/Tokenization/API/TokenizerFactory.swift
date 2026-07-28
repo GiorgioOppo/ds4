@@ -5,6 +5,7 @@ import Foundation
 public enum TokenizerBackendID: String, Sendable, Codable, Equatable {
     case deepSeekV4
     case glm52
+    case laguna
 }
 
 public enum TokenizerFactoryError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -36,13 +37,14 @@ public enum TokenizerFactory {
         -> TokenizerBackendID {
         if detected.id == .deepSeekV4 { return .deepSeekV4 }
         if detected.id == .glmDSA { return .glm52 }
+        if detected.id == .laguna { return .laguna }
 
         switch detected.family {
         case .qwen:
             throw TokenizerFactoryError.tokenizerNotImplemented(
                 detected.id, family: detected.family
             )
-        case .deepSeek, .glm, .unknown:
+        case .deepSeek, .glm, .laguna, .unknown:
             throw TokenizerFactoryError.unsupportedArchitecture(detected.id)
         }
     }
@@ -81,6 +83,7 @@ public enum TokenizerFactory {
             switch selected {
             case .deepSeekV4: return try DeepSeekV4Tokenizer(model: model)
             case .glm52: return try GLM52Tokenizer(model: model)
+            case .laguna: return try LagunaTokenizer(model: model)
             }
         } catch {
             throw TokenizerFactoryError.invalidTokenizerMetadata(

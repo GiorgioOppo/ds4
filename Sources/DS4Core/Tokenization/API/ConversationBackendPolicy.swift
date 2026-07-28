@@ -4,6 +4,7 @@ import Foundation
 public enum ConversationBackendID: String, Sendable, Codable, Equatable {
     case deepSeekDSML
     case glm52Native
+    case lagunaNative
 }
 
 public enum ConversationBackendSelectionError: Error, Sendable, Equatable,
@@ -31,13 +32,14 @@ public enum ConversationBackendPolicy {
         -> ConversationBackendID {
         if detected.id == .deepSeekV4 { return .deepSeekDSML }
         if detected.id == .glmDSA { return .glm52Native }
+        if detected.id == .laguna { return .lagunaNative }
 
         switch detected.family {
         case .qwen:
             throw ConversationBackendSelectionError.conversationBackendNotImplemented(
                 detected.id, family: detected.family
             )
-        case .deepSeek, .glm, .unknown:
+        case .deepSeek, .glm, .laguna, .unknown:
             throw ConversationBackendSelectionError.unsupportedArchitecture(detected.id)
         }
     }

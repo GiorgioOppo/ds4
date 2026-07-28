@@ -40,6 +40,11 @@ public struct GLM52SpecialTokenIDs: Sendable, Equatable {
 ///
 /// Kept as a standalone pure splitter so its regex-equivalent boundaries can
 /// be regression-tested without a 700+ GB model or its vocabulary.
+///
+/// `maxDigits` is the digit-run cap of the number rule: GLM splits digit runs
+/// in groups of up to three, while the Laguna pre-tokenizer reuses this same
+/// split shape with single-digit groups (`bpe_tokenize_text_glm4_segment` in
+/// upstream `ds4.c` takes the cap as a parameter).
 enum GLM4Pretokenizer {
     private struct Info {
         let codepoint: UInt32
@@ -49,11 +54,11 @@ enum GLM4Pretokenizer {
         let isWhitespace: Bool
     }
 
-    static func split(_ text: String) -> [[UInt8]] {
-        split(Array(text.utf8))
+    static func split(_ text: String, maxDigits: Int = 3) -> [[UInt8]] {
+        split(Array(text.utf8), maxDigits: maxDigits)
     }
 
-    static func split(_ bytes: [UInt8]) -> [[UInt8]] {
+    static func split(_ bytes: [UInt8], maxDigits: Int = 3) -> [[UInt8]] {
         var pieces: [[UInt8]] = []
         var position = 0
         while position < bytes.count {
@@ -95,7 +100,7 @@ enum GLM4Pretokenizer {
 
             if current.isNumber {
                 var count = 0
-                while count < 3, let scan = info(bytes, at: position), scan.isNumber {
+                while count < maxDigits, let scan = info(bytes, at: position), scan.isNumber {
                     position = scan.next
                     count += 1
                 }
