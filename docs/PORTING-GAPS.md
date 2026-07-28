@@ -208,15 +208,40 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
   speculation that never changes accepted tokens, with automatic fallback
   when it is not paying.
 
-### Swift touch-points
-1. `Sources/DS4Metal/Backends/Laguna/` — weight map + resident engine
-   (start from the `GLM52ResidentModel` structure; Laguna requires full
-   residency upstream, so no SSD streaming is needed for the first cut).
-2. `metal/laguna.metal` port + `Sources/DS4Metal/Runtime/Generated`
-   regeneration.
+### Already landed (validated without hardware)
+- CPU oracles of the whole decode path
+  (`Backends/Laguna/Reference/LagunaLayerReference.swift`): per-head
+  norm/RoPE with YaRN, gated GQA attention over the F16 ring, 10-expert
+  router, FFN blocks — with hand-computable unit tests.
+- Kernel port: `metal/laguna/laguna.metal` (verbatim from upstream plus a
+  local `block_q6_K`), wired into `MetalRuntime.kernelFiles`,
+  `kernelSubdirectories` and `scripts/embed_kernels.sh`;
+  `KernelSources.swift` regenerated.
+- Validation wrappers (`Backends/Laguna/Kernels/LagunaKernels.swift`):
+  `lagunaQKHeadRMSNormRope`, `lagunaStoreKV`, `lagunaAttentionDecode`, with
+  GPU/CPU parity tests (skip without Metal) covering both block kinds, ring
+  wrap and the split reduction.
+- `LagunaWeightMap` (payload-free directory with the detected quantization
+  layout retained).
+
+### Remaining Swift touch-points (need a Mac at every step)
+1. **Run the landed parity tests on hardware** (`LagunaKernelsTests`): they
+   are the gate for everything below.
+2. Resident engine (`Backends/Laguna/Engine/LagunaResidentModel.swift`,
+   modeled on `GLM52ResidentModel` but full-residency only): upload the
+   validated tensors into shared `MTLBuffer`s, per-layer F16 ring caches
+   sized SWA=512 / full=context, per-token loop reusing the shared GLM
+   wrappers where upstream shares the primitive (rms_norm/matvec/add from
+   `glm52_misc`, `kernel_glm52_router_select` with `expertsUsed 10`,
+   `glm52_moe` for Q8_0 shared + Q4_K routed experts) plus the Laguna
+   kernels for norm/rope, KV store and gated attention; token-by-token
+   prefill first. First cut may support the official Q8_0-signal + Q4_K
+   recipe only and refuse legacy/mixed files with a distinct error until
+   the Q3_K matvec lands (upstream `moe.metal` grew it on the branch).
 3. `RuntimeBackendKind.laguna` + selector routing behind
    `LagunaRuntimeGate` (`BackendSelector` already refuses the family
-   explicitly; the comment marks the insertion point).
+   explicitly; the comment marks the insertion point) and the DS4Demo
+   dispatch branch (mirror the GLM branch in `DS4Demo/Command/main.swift`).
 4. Sampler wiring: `LagunaConversationProtocol.SamplingDefaults` for chat,
    server per-request overrides taking precedence.
 5. Catalog: pin byte counts and SHA-256 digests for the three artifacts
