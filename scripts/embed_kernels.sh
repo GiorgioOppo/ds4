@@ -12,12 +12,12 @@ cd "$(dirname "$0")/.."
 out=Sources/DS4Metal/Runtime/Generated/KernelSources.swift
 # glm52_quant DEVE precedere glm52_moe (helper di dot condivisi); gli altri
 # file GLM sono auto-contenuti.
-order="quant_tables flash_attn dense moe dsv4_hc unary dsv4_kv dsv4_rope dsv4_misc glm52_router glm52_quant glm52_kv glm52_indexer glm52_attention glm52_moe glm52_rope glm52_misc argsort cpy concat get_rows sum_rows softmax repeat glu norm bin set_rows"
+order="quant_tables flash_attn dense moe dsv4_hc unary dsv4_kv dsv4_rope dsv4_misc glm52_router glm52_quant glm52_kv glm52_indexer glm52_attention glm52_moe glm52_rope glm52_misc laguna argsort cpy concat get_rows sum_rows softmax repeat glu norm bin set_rows"
 
 # Resolve a kernel name to its file: architecture subdirectories first, then
 # the flat legacy location.
 kernel_path() {
-  for candidate in "metal/common/$1.metal" "metal/deepseek/$1.metal" "metal/glm5.2/$1.metal" "metal/$1.metal"; do
+  for candidate in "metal/common/$1.metal" "metal/deepseek/$1.metal" "metal/glm5.2/$1.metal" "metal/laguna/$1.metal" "metal/$1.metal"; do
     if [ -f "$candidate" ]; then
       echo "$candidate"
       return 0

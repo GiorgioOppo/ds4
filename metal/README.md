@@ -23,6 +23,8 @@ Kernels are grouped by architecture, one directory each:
 - [`deepseek/`](deepseek/): the DeepSeek V4 kernels plus the shared generic ops
   (norm, softmax, argsort, copy/cast, …) that the DeepSeek graph drives today.
 - [`glm5.2/`](glm5.2/): the GLM 5.2 (`glm-dsa`) kernels.
+- [`laguna/`](laguna/): the Laguna S 2.1 (`laguna`) kernels, ported from the
+  reference `laguna-s2.1` branch.
 
 Metal still compiles ONE library from the concatenation of every file, so
 kernel names remain globally unique across directories. The embedded key and
@@ -38,6 +40,9 @@ Main files by runtime weight:
 - `deepseek/dsv4_misc.metal`, `dsv4_hc.metal`, `dsv4_kv.metal`, `dsv4_rope.metal`:
   DeepSeek-V4-specific helpers.
 - `glm5.2/glm52.metal`: GLM 5.2 router and compact-DSA primitives.
+- `laguna/laguna.metal`: Laguna per-head norm/RoPE, F16 ring KV store, gated
+  GQA attention (decode and prefill), the gated flash-attention reduce and a
+  dense Q6_K projection.
 - utility kernels for normalization, softmax, argsort, unary operations, and
   related glue.
 

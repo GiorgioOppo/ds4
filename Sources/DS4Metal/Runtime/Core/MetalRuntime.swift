@@ -55,6 +55,9 @@ public final class MetalRuntime {
         // (helper di dot) DEVE precedere glm52_moe che li usa.
         "glm52_router", "glm52_quant", "glm52_kv", "glm52_indexer",
         "glm52_attention", "glm52_moe", "glm52_rope", "glm52_misc",
+        // Laguna S 2.1: dopo dsv4_rope (rope_yarn/rope_yarn_corr_dims) e
+        // flash_attn (args/function-constants del vec-reduce), che usa.
+        "laguna",
         "argsort", "cpy", "concat", "get_rows", "sum_rows",
         "softmax", "repeat", "glu", "norm", "bin", "set_rows",
     ]
@@ -168,7 +171,7 @@ public final class MetalRuntime {
     /// Architecture subdirectories of the vendored metal/ folder, searched in
     /// order by the on-disk loader. The flat legacy layout stays accepted so an
     /// older checkout keeps working.
-    public static let kernelSubdirectories = ["common", "deepseek", "glm5.2", ""]
+    public static let kernelSubdirectories = ["common", "deepseek", "glm5.2", "laguna", ""]
 
     /// Build the full kernel source: the ds4_metal.m prelude plus every vendored
     /// kernel file, concatenated in order.
