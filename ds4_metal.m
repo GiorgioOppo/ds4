@@ -12293,7 +12293,7 @@ static void ds4_gpu_stream_expert_pread_pool_shutdown(void) {
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 }
 
-static int ds4_gpu_stream_expert_pread_tasks(
+static int ds4_gpu_stream_expert_pread_tasks_run(
         ds4_gpu_stream_expert_pread_task *tasks,
         uint32_t n_tasks,
         uint64_t *total_bytes,
@@ -12454,6 +12454,101 @@ static void ds4_gpu_stream_expert_cache_cap_budget_to_locked(void) {
         cap < g_stream_expert_cache_mlock_budget_cap) {
         g_stream_expert_cache_mlock_budget_cap = cap;
     }
+}
+
+/* DS4_METAL_STREAMING_EXPERT_PREAD_SPLIT: split every expert slab pread into
+ * N disjoint ranges read concurrently. Decode misses queue only a handful of
+ * slabs per layer (~4 experts x 3 slabs), while NVMe drives reach their
+ * random-read ceiling around ~24 requests in flight: splitting raises the
+ * queue depth at identical bytes. Boundaries are 16 KB aligned so F_NOCACHE
+ * never reads the same page from two jobs. 1 (default) = historical path. */
+static uint32_t ds4_gpu_stream_expert_pread_split(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_SPLIT");
+        int v = env ? atoi(env) : 1;
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+        cached = v;
+    }
+    return (uint32_t)cached;
+}
+
+static int ds4_gpu_stream_expert_pread_tasks(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t n_tasks,
+        uint64_t *total_bytes,
+        double *wall_ms) {
+    if (total_bytes) *total_bytes = 0;
+    if (wall_ms) *wall_ms = 0.0;
+    if (!tasks || n_tasks == 0) return 1;
+
+    const uint32_t split = ds4_gpu_stream_expert_pread_split();
+    const uint64_t min_split_len = 256u << 10;
+    if (split <= 1) {
+        return ds4_gpu_stream_expert_pread_tasks_run(tasks, n_tasks, total_bytes, wall_ms);
+    }
+
+    uint32_t n_sub = 0;
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        n_sub += tasks[i].len >= min_split_len ? split : 1;
+    }
+    if (n_sub == n_tasks || n_sub < n_tasks) {
+        return ds4_gpu_stream_expert_pread_tasks_run(tasks, n_tasks, total_bytes, wall_ms);
+    }
+
+    ds4_gpu_stream_expert_pread_task *sub =
+        malloc((size_t)n_sub * sizeof(sub[0]));
+    uint32_t *owner = malloc((size_t)n_sub * sizeof(owner[0]));
+    if (!sub || !owner) {
+        free(owner);
+        free(sub);
+        return ds4_gpu_stream_expert_pread_tasks_run(tasks, n_tasks, total_bytes, wall_ms);
+    }
+
+    const uint64_t align = 16u << 10;
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        const uint64_t len = tasks[i].len;
+        if (len < min_split_len) {
+            sub[w] = tasks[i];
+            owner[w++] = i;
+            continue;
+        }
+        uint64_t chunk = (len + split - 1) / split;
+        chunk = (chunk + align - 1) / align * align;
+        uint64_t off = 0;
+        while (off < len) {
+            const uint64_t part = len - off < chunk ? len - off : chunk;
+            sub[w].offset = tasks[i].offset + off;
+            sub[w].len = part;
+            sub[w].dst = tasks[i].dst + off;
+            sub[w].read_bytes = 0;
+            sub[w].ms = 0.0;
+            sub[w].ok = 0;
+            owner[w++] = i;
+            off += part;
+        }
+    }
+
+    const int ok = ds4_gpu_stream_expert_pread_tasks_run(sub, w, total_bytes, wall_ms);
+
+    /* Fold the split results back so callers keep per-slab ok/bytes/ms. */
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        tasks[i].ok = 1;
+        tasks[i].read_bytes = 0;
+        tasks[i].ms = 0.0;
+    }
+    for (uint32_t j = 0; j < w; j++) {
+        ds4_gpu_stream_expert_pread_task *t = &tasks[owner[j]];
+        if (!sub[j].ok) t->ok = 0;
+        t->read_bytes += sub[j].read_bytes;
+        if (sub[j].ms > t->ms) t->ms = sub[j].ms;
+    }
+
+    free(owner);
+    free(sub);
+    return ok;
 }
 
 static id<MTLBuffer> ds4_gpu_stream_expert_alloc_buffer(
