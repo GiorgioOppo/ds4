@@ -426,15 +426,38 @@ do {
             exit(0)
         }
         if detectedArchitecture.family == .laguna, LagunaRuntimeGate.enabled {
-            // Laguna S 2.1 greedy demo on the first-cut resident engine
-            // (bring-up grade: full residency, token-by-token prefill).
+            // Laguna S 2.1 demo on the first-cut resident engine (bring-up
+            // grade: full residency, token-by-token prefill). Mirrors the
+            // reference CLI: default Poolside system prompt, the family
+            // sampling defaults (temp 0.7, top-k 20, top-p 0.95, min-p 0.05
+            // — DS4_DEMO_TEMPERATURE=0 for greedy parity runs), thinking on
+            // by default (DS4_NOTHINK=1 for direct replies, with the
+            // think-mode stop policy of `ds4_token_is_stop_for_think_mode`).
             // Prompt from DS4_PROMPT; token budget from DS4_MAX_NEW;
             // DS4_LAGUNA_LAYERS truncates the stack for bring-up runs.
             let environment = ProcessInfo.processInfo.environment
             let prompt = environment["DS4_PROMPT"]
                 ?? "Ciao! Presentati in una frase."
             let maxNew = Int(environment["DS4_MAX_NEW"] ?? "") ?? 128
-            log("DS4Demo: Laguna S 2.1 greedy — prompt: \(prompt)")
+            let reasoning: ThinkMode =
+                environment["DS4_NOTHINK"] == "1" ? .none : .high
+            let defaults = LagunaConversationProtocol.SamplingDefaults.self
+            let temperature = environment["DS4_DEMO_TEMPERATURE"].flatMap(Float.init)
+                ?? defaults.temperature
+            let topK = environment["DS4_DEMO_TOP_K"].flatMap(Int.init)
+                ?? defaults.topK
+            let topP = environment["DS4_DEMO_TOP_P"].flatMap(Float.init)
+                ?? defaults.topP
+            let minP = environment["DS4_DEMO_MIN_P"].flatMap(Float.init)
+                ?? defaults.minP
+            var rng = UInt64(environment["DS4_DEMO_SEED"].flatMap(Int.init) ?? 1)
+            let samplingLabel = temperature <= 0
+                ? "greedy"
+                : String(format: "temp %.2f, top-k %d, top-p %.2f, min-p %.2f",
+                         temperature, topK, topP, minP)
+            log("DS4Demo: Laguna S 2.1 (\(samplingLabel)"
+                + (reasoning.enabled ? ", think" : ", nothink")
+                + ") — prompt: \(prompt)")
             let tokenizer = try LagunaTokenizer(model: model)
             let runtime = try MetalRuntime()
             var options = LagunaResidentModelOptions()
@@ -447,7 +470,14 @@ do {
             log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer)",
                        Date().timeIntervalSince(loadStart),
                        laguna.loadedLayerCount))
-            let tokens = try tokenizer.encodeChatPrompt(prompt: prompt)
+            // The reference CLI passes the Poolside default system prompt
+            // into `ds4_encode_chat_prompt` when none is given.
+            let tokens = try tokenizer.encodeChatPrompt(
+                system: environment["DS4_SYSTEM"]
+                    ?? LagunaConversationProtocol.defaultSystemPrompt,
+                prompt: prompt,
+                reasoning: reasoning
+            )
             let prefillStart = Date()
             var logits = try laguna.prefill(tokens)
             log(String(format: "DS4Demo: prefill %d token in %.1fs",
@@ -455,17 +485,15 @@ do {
             var generated: [Int32] = []
             let decodeStart = Date()
             for _ in 0..<maxNew {
-                var best = logits[0]
-                var bestIndex: Int32 = 0
-                for index in 1..<logits.count where logits[index] > best {
-                    best = logits[index]
-                    bestIndex = Int32(index)
-                }
-                if tokenizer.isStopToken(bestIndex) { break }
-                generated.append(bestIndex)
-                let piece = tokenizer.tokenText(bestIndex)
+                let next = Int32(Sampler.sample(
+                    logits, temperature: temperature, topK: topK,
+                    topP: topP, minP: minP, rng: &rng
+                ))
+                if tokenizer.isStopToken(next, reasoning: reasoning) { break }
+                generated.append(next)
+                let piece = tokenizer.tokenText(next)
                 FileHandle.standardOutput.write(Data(piece))
-                logits = try laguna.forwardNext(bestIndex)
+                logits = try laguna.forwardNext(next)
             }
             FileHandle.standardOutput.write(Data("\n".utf8))
             let decodeSeconds = Date().timeIntervalSince(decodeStart)

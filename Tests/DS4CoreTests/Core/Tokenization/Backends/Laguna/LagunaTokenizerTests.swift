@@ -101,7 +101,9 @@ final class LagunaTokenizerTests: XCTestCase {
         let thinking = try tokenizer.encodeChatPrompt(
             system: "Be concise.", prompt: "Hello", reasoning: .high
         )
-        XCTAssertEqual(thinking.first, tokenizer.special.endOfSequence)
+        // `chat_push_bos_sequence` pushes the metadata BOS id (Poolside
+        // reuses one token for BOS and EOS, so the ids coincide here).
+        XCTAssertEqual(thinking.first, tokenizer.special.beginOfSequence)
         XCTAssertEqual(Array(thinking.suffix(2)),
                        [tokenizer.special.assistant, tokenizer.special.thinkOpen])
 
@@ -110,6 +112,60 @@ final class LagunaTokenizerTests: XCTestCase {
         )
         XCTAssertEqual(Array(direct.suffix(2)),
                        [tokenizer.special.assistant, tokenizer.special.thinkClose])
+    }
+
+    func testPromptEncodingMirrorsTheReferenceCLIPath() throws {
+        // `encode_chat_prompt` in ds4.c: BOS id + wrapped blocks scanned as
+        // contiguous rendered text + dedicated assistant/think ids.  No
+        // default system prompt on this path (the reference CLI passes it
+        // explicitly), and no server framing.
+        let tokenizer = try fixtureTokenizer()
+        let encoded = try tokenizer.encodeChatPrompt(prompt: "Hi", reasoning: .none)
+        var expected: [Int32] = [tokenizer.special.beginOfSequence]
+        expected += tokenizer.tokenizeRenderedChat("<user>Hi</user>\n")
+        expected += [tokenizer.special.assistant, tokenizer.special.thinkClose]
+        XCTAssertEqual(encoded, expected)
+        XCTAssertFalse(encoded.isEmpty)
+
+        let withSystem = try tokenizer.encodeChatPrompt(
+            system: "S.", prompt: "Hi", reasoning: .none
+        )
+        var expectedSystem: [Int32] = [tokenizer.special.beginOfSequence]
+        expectedSystem += tokenizer.tokenizeRenderedChat("<system>S.</system>\n")
+        expectedSystem += tokenizer.tokenizeRenderedChat("<user>Hi</user>\n")
+        expectedSystem += [tokenizer.special.assistant, tokenizer.special.thinkClose]
+        XCTAssertEqual(withSystem, expectedSystem)
+    }
+
+    func testCrossFamilyScannerLiteralsStayAtomicLikeUpstream() throws {
+        // `special_token_at` keeps the cross-family rows active for Laguna
+        // (their ids are set), so a rendered transcript containing them
+        // produces control tokens, exactly like the reference scanner.
+        let tokenizer = try fixtureTokenizer()
+        XCTAssertEqual(tokenizer.tokenizeRenderedChat("[gMASK]"),
+                       [tokenizer.special.beginOfSequence])
+        XCTAssertEqual(tokenizer.tokenizeRenderedChat("<｜begin▁of▁sentence｜>"),
+                       [tokenizer.special.beginOfSequence])
+        XCTAssertEqual(tokenizer.tokenizeRenderedChat("<｜end▁of▁sentence｜>"),
+                       [tokenizer.special.endOfSequence])
+        XCTAssertEqual(tokenizer.tokenizeRenderedChat("<|assistant|>"),
+                       [tokenizer.special.assistant])
+        XCTAssertEqual(tokenizer.tokenizeRenderedChat("<｜Assistant｜>"),
+                       [tokenizer.special.assistant])
+        // Raw tokenization is unaffected: the literals stay plain BPE text.
+        XCTAssertNotEqual(tokenizer.tokenize("[gMASK]"),
+                          [tokenizer.special.beginOfSequence])
+    }
+
+    func testThinkModeAwareStopPolicy() throws {
+        // `ds4_token_is_stop_for_think_mode`: with thinking disabled a
+        // generated thinking marker is a stop, in thinking mode it is not.
+        let tokenizer = try fixtureTokenizer()
+        XCTAssertTrue(tokenizer.isStopToken(tokenizer.special.thinkOpen, reasoning: .none))
+        XCTAssertTrue(tokenizer.isStopToken(tokenizer.special.thinkClose, reasoning: .none))
+        XCTAssertFalse(tokenizer.isStopToken(tokenizer.special.thinkOpen, reasoning: .high))
+        XCTAssertFalse(tokenizer.isStopToken(tokenizer.special.thinkClose, reasoning: .high))
+        XCTAssertTrue(tokenizer.isStopToken(tokenizer.special.endOfTurn, reasoning: .high))
     }
 
     func testMissingRequiredControlTokenFailsConstruction() {

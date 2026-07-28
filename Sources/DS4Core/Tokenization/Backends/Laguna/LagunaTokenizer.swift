@@ -159,9 +159,19 @@ public final class LagunaTokenizer: TokenizerProtocol {
             toolCallClose: required(p.toolCallClose)
         )
 
-        // The Laguna rows of the upstream rendered-chat scanner: the sequence
-        // marker maps onto the EOS id (Poolside reuses one token for BOS and
-        // EOS), and only the family's own control literals are atomic.
+        // The active Laguna rows of the upstream rendered-chat scanner: the
+        // sequence marker maps onto the EOS id (Poolside reuses one token for
+        // BOS and EOS), and the cross-family rows whose ids stay set for
+        // Laguna (`special_token_at` skips a row only when its id is
+        // negative) remain atomic exactly like in the reference.
+        let crossFamily: [(String, Int32)] =
+            p.crossFamilyScannerLiterals.map { row in
+                switch row.special {
+                case .beginOfSequence: return (row.literal, special.beginOfSequence)
+                case .endOfSequence: return (row.literal, special.endOfSequence)
+                case .assistant: return (row.literal, special.assistant)
+                }
+            }
         let literalIDs: [(String, Int32)] = [
             (p.bosMarker, special.endOfSequence),
             (p.assistantOpen, special.assistant),
@@ -170,7 +180,7 @@ public final class LagunaTokenizer: TokenizerProtocol {
             (p.thinkClose, special.thinkClose),
             (p.toolCallOpen, special.toolCallOpen),
             (p.toolCallClose, special.toolCallClose),
-        ]
+        ] + crossFamily
         var buckets = [[(bytes: [UInt8], id: Int32)]](repeating: [], count: 256)
         for (literal, id) in literalIDs {
             let bytes = Array(literal.utf8)
@@ -242,18 +252,44 @@ public final class LagunaTokenizer: TokenizerProtocol {
         special.generationStops.contains(id)
     }
 
+    /// `ds4_token_is_stop_for_think_mode`: with thinking disabled the prompt
+    /// already supplied the protocol close tag, so a generated `<think>` or
+    /// `</think>` is a control marker to stop on, not assistant content.
+    public func isStopToken(_ id: Int32, reasoning: ThinkMode) -> Bool {
+        if isStopToken(id) { return true }
+        if !reasoning.enabled {
+            return id == special.thinkOpen || id == special.thinkClose
+        }
+        return false
+    }
+
     public func neutralizeSpecialTokenLiterals(in text: String) -> String {
         LagunaConversationProtocol.neutralizeControlTokens(in: text)
     }
 
+    /// The reference CLI prompt encoder (`encode_chat_prompt` in `ds4.c`):
+    /// the metadata BOS id, an optional `<system>` block (no default system
+    /// prompt on this path), the `<user>` block, then the assistant opener
+    /// with the thinking marker as dedicated tokens.  Each wrapped block is
+    /// scanned as one contiguous rendered string so BPE merges can cross
+    /// tag/content boundaries (`laguna_chat_append_wrapped`).  Server-style
+    /// transcripts (default Poolside system prompt, tools section) go through
+    /// `LagunaChatRenderer.render` + `tokenizeRenderedChat` instead.
     public func encodeChatPrompt(system: String? = nil, prompt: String,
                                  reasoning: ThinkMode = .none) throws -> [Int32] {
-        let rendered = try LagunaChatRenderer.renderPrompt(
-            system: system,
-            prompt: prompt,
-            reasoning: reasoning
+        let p = LagunaConversationProtocol.self
+        var output: [Int32] = [special.beginOfSequence]
+        if let system, !system.isEmpty {
+            output += tokenizeRenderedChat(
+                p.systemOpen + system + p.systemClose + "\n"
+            )
+        }
+        output += tokenizeRenderedChat(
+            p.userOpen + prompt + p.userClose + "\n"
         )
-        return tokenizeRenderedChat(rendered)
+        output.append(special.assistant)
+        output.append(reasoning.enabled ? special.thinkOpen : special.thinkClose)
+        return output
     }
 
     private func tokenizeSpan(_ bytes: ArraySlice<UInt8>, into output: inout [Int32]) {

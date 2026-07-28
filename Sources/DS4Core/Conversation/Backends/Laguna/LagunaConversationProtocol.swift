@@ -52,14 +52,35 @@ public enum LagunaConversationProtocol {
     }
 
     /// Literal controls recognized atomically by `LagunaTokenizer` when it
-    /// consumes an already-rendered transcript.  This is the exact Laguna
-    /// subset of the upstream special-token scanner; the role/argument text
-    /// tags are deliberately absent so they keep tokenizing as plain BPE text.
+    /// consumes an already-rendered transcript: the family's own control
+    /// literals plus the cross-family rows of the upstream scanner that stay
+    /// active for Laguna (`special_token_at` skips a row only when its id is
+    /// negative, and the Laguna vocab loader leaves bos/eos/assistant ids
+    /// set).  The role/argument text tags are deliberately absent so they
+    /// keep tokenizing as plain BPE text.
     public static let atomicControlTokens: [String] = [
         bosMarker,
         assistantOpen, assistantClose,
         thinkOpen, thinkClose,
         toolCallOpen, toolCallClose,
+    ] + crossFamilyScannerLiterals.map(\.literal)
+
+    /// The upstream scanner rows shared with other families that remain
+    /// active for Laguna, with the special they map onto.  A rendered
+    /// transcript containing one of these literals produces the mapped
+    /// control token, exactly like the reference scanner.
+    public enum ScannerSpecial: Sendable, Equatable {
+        case beginOfSequence
+        case endOfSequence
+        case assistant
+    }
+
+    public static let crossFamilyScannerLiterals: [(literal: String, special: ScannerSpecial)] = [
+        ("<｜begin▁of▁sentence｜>", .beginOfSequence),
+        ("<｜end▁of▁sentence｜>", .endOfSequence),
+        ("[gMASK]", .beginOfSequence),
+        ("<｜Assistant｜>", .assistant),
+        ("<|assistant|>", .assistant),
     ]
 
     /// Everything that can open or close a protocol scope, including the
@@ -74,6 +95,38 @@ public enum LagunaConversationProtocol {
         argumentValueOpen, argumentValueClose,
         availableToolsOpen, availableToolsClose,
     ]
+
+    /// ASCII `isspace` semantics used by the reference renderer/parsers
+    /// (space, \t, \n, \v, \f, \r).  The Unicode-aware
+    /// `Character.isWhitespace` also strips NBSP and friends, which the C
+    /// code preserves.
+    static func isASCIIWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        scalar == " " || scalar == "\t" || scalar == "\n"
+            || scalar == "\u{0B}" || scalar == "\u{0C}" || scalar == "\r"
+    }
+
+    static func hasNonWhitespaceASCII(_ text: String) -> Bool {
+        text.unicodeScalars.contains { !isASCIIWhitespace($0) }
+    }
+
+    static func trimTrailingASCIIWhitespace(_ text: String) -> Substring {
+        var view = Substring(text)
+        while let last = view.unicodeScalars.last, isASCIIWhitespace(last) {
+            view.unicodeScalars.removeLast()
+        }
+        return view
+    }
+
+    static func trimASCIIWhitespace(_ text: Substring) -> Substring {
+        var view = text
+        while let first = view.unicodeScalars.first, isASCIIWhitespace(first) {
+            view.unicodeScalars.removeFirst()
+        }
+        while let last = view.unicodeScalars.last, isASCIIWhitespace(last) {
+            view.unicodeScalars.removeLast()
+        }
+        return view
+    }
 
     /// Break literal protocol controls in untrusted content without changing
     /// their visible text. This prevents a user or tool payload from creating a

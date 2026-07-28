@@ -13,9 +13,9 @@ import DS4Core
 // for per-head norm/RoPE, the F16 ring KV store and gated GQA attention.
 //
 // Scope limits of this cut, all enforced at load with distinct errors:
-// - official recipe only (Q8_0 signal path + Q4_K routed experts); the
-//   legacy F16/Q4_K recipe and the mixed Q2_K/Q3_K file are refused until
-//   their matvec kernels are wired;
+// - Q8_0-signal layout only (official Q4_K routed recipe and the mixed
+//   RoutedQ2_K/Last27Q3_K file, whose K-quant matvecs are wired); the
+//   legacy F16/Q4_K recipe is refused until its Q6_K/F16 paths are wired;
 // - prefill is token-by-token through the decode path (correct, not fast);
 // - two command-buffer syncs per MoE layer (the router selection is read
 //   back on the host to pick expert slabs, like the GLM chained decode).

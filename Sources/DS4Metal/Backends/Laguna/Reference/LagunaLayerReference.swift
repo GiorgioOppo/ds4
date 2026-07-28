@@ -74,14 +74,16 @@ public struct LagunaAttentionSpec: Sendable, Equatable {
     }
 
     /// Sliding-window blocks (72 heads): plain NeoX RoPE over the full
-    /// 128-dim head on the independent base, 512-row ring cache.
-    public static func slidingWindow(shape: LagunaShape = .s2_1) -> LagunaAttentionSpec {
+    /// 128-dim head on the independent base, 512-row ring cache. The ring
+    /// never exceeds the model context (`min(n_swa, n_ctx)` upstream).
+    public static func slidingWindow(shape: LagunaShape = .s2_1,
+                                     contextSize: Int = Int(LagunaShape.s2_1.nSWA)) -> LagunaAttentionSpec {
         LagunaAttentionSpec(
             headCount: Int(shape.nHead),
             kvHeadCount: Int(shape.nHeadKV),
             headDim: Int(shape.nHeadDim),
             rotationDims: Int(shape.nRotSWA),
-            cacheCapacity: Int(shape.nSWA),
+            cacheCapacity: min(Int(shape.nSWA), contextSize),
             ropeFrequencyBase: shape.ropeFrequencyBaseSWA,
             ropeFrequencyScale: 1,
             extrapolationFactor: 0,
@@ -97,7 +99,7 @@ public struct LagunaAttentionSpec: Sendable, Equatable {
                             shape: LagunaShape = .s2_1,
                             contextSize: Int) -> LagunaAttentionSpec {
         shape.isSlidingWindowLayer(layer)
-            ? slidingWindow(shape: shape)
+            ? slidingWindow(shape: shape, contextSize: contextSize)
             : fullAttention(shape: shape, contextSize: contextSize)
     }
 }
