@@ -4,23 +4,16 @@ import Foundation
 /// keys the backend selector and catalog off it; DS4Demo dispatches on it
 /// directly because it cannot import DS4Engine).
 ///
-/// STATE: disabled by default. The Laguna frontend (recognition, geometry
-/// validation, tokenizer, chat/tool protocol, tensor-schema validation,
-/// catalog) is in place and the first-cut resident engine is written, but the
-/// end-to-end logits-parity gate against the reference `laguna-s2.1` engine
-/// has not run on hardware yet; see `docs/PORTING-GAPS.md`.
+/// STATE: disabled by default. The frontend and the first-cut resident Metal
+/// engine (`LagunaResidentModel`) are in place, but the end-to-end
+/// logits-parity gate against the reference C engine has not run on real
+/// weights yet; see `docs/PORTING-GAPS.md` (Gap 4).
 ///
-/// Bring-up escape hatch: `DS4_LAGUNA_RUNTIME=1` enables the runtime for the
-/// current process without flipping the default, so the engine can be
-/// compiled, smoke-tested and parity-checked on a Mac before the gate is
-/// committed open.
+/// `DS4_LAGUNA_RUNTIME=1` opts a single process into the bring-up engine
+/// (demo CLI decode plus selector/catalog routing) for local experiments.
+/// Treat that output as unvalidated until the parity gate is green. Flip
+/// the compiled-in default only after it passes, like the GLM gate.
 public enum LagunaRuntimeGate {
-    public static let enabled: Bool = {
+    public static let enabled =
         ProcessInfo.processInfo.environment["DS4_LAGUNA_RUNTIME"] == "1"
-            || enabledByDefault
-    }()
-
-    /// Flip only after the end-to-end logits-parity gate passes on real
-    /// weights on hardware.
-    static let enabledByDefault = false
 }
