@@ -148,16 +148,26 @@ public final class LagunaTokenizer: TokenizerProtocol {
         }
 
         let p = LagunaConversationProtocol.self
-        self.special = try LagunaSpecialTokenIDs(
+        // `??` would wrap the fallback in an autoclosure, and a closure formed
+        // here may not capture anything through `self` before every stored
+        // property is initialized (Swift 6 definite initialization).
+        let endOfTurn: Int32
+        if let eotTokenID {
+            endOfTurn = eotTokenID
+        } else {
+            endOfTurn = try required(p.assistantClose)
+        }
+        let special = try LagunaSpecialTokenIDs(
             beginOfSequence: bosTokenID,
             endOfSequence: eosTokenID,
-            endOfTurn: eotTokenID ?? required(p.assistantClose),
+            endOfTurn: endOfTurn,
             assistant: required(p.assistantOpen),
             thinkOpen: required(p.thinkOpen),
             thinkClose: required(p.thinkClose),
             toolCallOpen: required(p.toolCallOpen),
             toolCallClose: required(p.toolCallClose)
         )
+        self.special = special
 
         // The Laguna rows of the upstream rendered-chat scanner: the sequence
         // marker maps onto the EOS id (Poolside reuses one token for BOS and
