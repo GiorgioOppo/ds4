@@ -21,10 +21,19 @@ guarantees), so both the official Q4_K_M file and the mixed
 RoutedQ2_K-Last27Q3_K file run; the Q3_K dot helpers live beside the other
 K-quants in `metal/glm5.2/glm52_quant.metal`. Deliberate scope limits of
 this cut, refused with distinct errors at load: the legacy F16/Q4_K recipe
-(its matvec paths are not wired), SSD streaming, and batched prefill
-(prompts run token-by-token through the decode path — correct, not fast).
+(its matvec paths are not wired) and batched prefill (prompts run
+token-by-token through the decode path — correct, not fast).
 `LagunaResidentModelOptions.layerCount` truncates the stack from the front
 for bring-up runs.
+
+`LagunaResidentModelOptions.expertStreaming` is an opt-in, declared
+divergence from upstream (which mandates full residency for Laguna): the
+Q8_0 signal path stays resident (~5 GiB) and the slabs of the 10 selected
+routed experts are copied from the mmap per token after the host router
+readback — same kernels, same bytes, ~1.6 GB of reads per token. It exists
+so 32 GB machines can run the 45 GiB file at all; expect low single-digit
+tok/s. `DecodeProfile` (`profileReport()`) reports the per-phase cost,
+counting the slab reads as gather IO.
 
 `LagunaRuntimeGate.enabled` stays `false` until this engine passes
 end-to-end logits parity against the reference C engine on real weights;

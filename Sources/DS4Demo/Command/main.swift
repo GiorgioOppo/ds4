@@ -517,13 +517,22 @@ do {
             var options = LagunaResidentModelOptions()
             options.cacheCapacity = maxKeys
             options.layerCount = environment["DS4_LAGUNA_LAYERS"].flatMap(Int.init)
+            // Streaming SSD sperimentale degli esperti instradati
+            // (divergenza dichiarata dal C, che per Laguna impone la
+            // residenza): segnale Q8_0 residente, ~1.6 GB di letture per
+            // token. Rende eseguibile il file da 45 GiB su macchine da
+            // 32 GB, a pochi tok/s.
+            options.expertStreaming =
+                environment["DS4_LAGUNA_SSD_STREAM"] == "1"
             let loadStart = Date()
             let laguna = try LagunaResidentModel(
                 runtime: runtime, path: ggufPath, options: options
             )
             let loadSeconds = Date().timeIntervalSince(loadStart)
-            log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer)",
-                       loadSeconds, laguna.loadedLayerCount))
+            log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer%@)",
+                       loadSeconds, laguna.loadedLayerCount,
+                       laguna.isExpertStreaming
+                           ? ", esperti in streaming SSD" : ""))
             // The reference CLI passes the Poolside default system prompt
             // into `ds4_encode_chat_prompt` when none is given.
             let tokens = try tokenizer.encodeChatPrompt(
@@ -537,6 +546,9 @@ do {
             let prefillSeconds = Date().timeIntervalSince(prefillStart)
             log(String(format: "DS4Demo: prefill %d token in %.1fs",
                        tokens.count, prefillSeconds))
+            // Il profilo per-fase riparte qui: il report a fine decode
+            // descrive solo il regime di generazione, come nella demo GLM.
+            laguna.resetProfile()
             // Come il percorso GLM: DS4_WARMUP=N esclude i primi N token dal
             // regime, così il tok/s a regime non paga caches fredde e ramp-up.
             let warmup = environment["DS4_WARMUP"].flatMap(Int.init) ?? 0
@@ -571,6 +583,8 @@ do {
                            warmup + 1, steadyTokens, steadySeconds,
                            Double(steadyTokens) / max(steadySeconds, 0.001)))
             }
+            log("")
+            log(laguna.profileReport(title: "Profilo decode"))
             log(String(format: "DS4Demo: totale %.1fs (load %.1f + prefill %.1f + decode %.1f)",
                        Date().timeIntervalSince(loadStart), loadSeconds,
                        prefillSeconds, decodeSeconds))

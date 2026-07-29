@@ -22,10 +22,19 @@ come garantisce lo schema), quindi girano sia il file ufficiale Q4_K_M sia il
 misto RoutedQ2_K-Last27Q3_K; gli helper di dot Q3_K vivono accanto agli altri
 K-quant in `metal/glm5.2/glm52_quant.metal`. Limiti di scope deliberati di
 questo taglio, rifiutati con errori distinti al caricamento: la ricetta
-legacy F16/Q4_K (i suoi percorsi matvec non sono cablati), lo streaming SSD e
-il prefill batched (i prompt passano token-per-token dal percorso di decode —
-corretto, non veloce). `LagunaResidentModelOptions.layerCount` tronca lo stack dal fronte
-per le prove di bring-up.
+legacy F16/Q4_K (i suoi percorsi matvec non sono cablati) e il prefill
+batched (i prompt passano token-per-token dal percorso di decode — corretto,
+non veloce). `LagunaResidentModelOptions.layerCount` tronca lo stack dal
+fronte per le prove di bring-up.
+
+`LagunaResidentModelOptions.expertStreaming` è una divergenza opt-in e
+dichiarata dall'upstream (che per Laguna impone la residenza completa): il
+percorso "segnale" Q8_0 resta residente (~5 GiB) e gli slab dei 10 esperti
+instradati selezionati vengono copiati dal mmap per token dopo la rilettura
+del router sull'host — stessi kernel, stessi byte, ~1,6 GB di letture per
+token. Esiste perché le macchine da 32 GB possano eseguire il file da
+45 GiB; aspettati pochi tok/s. `DecodeProfile` (`profileReport()`) riporta
+il costo per fase, contando le letture degli slab come gather IO.
 
 `LagunaRuntimeGate.enabled` resta `false` finché questo motore non passa la
 parità end-to-end dei logits contro il motore C di riferimento su pesi reali;

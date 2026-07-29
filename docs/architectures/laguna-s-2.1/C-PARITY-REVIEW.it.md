@@ -63,6 +63,8 @@ entrambi i lati prima di intervenire.
 | F7 | bassa | La spec sliding-window dell'oracolo CPU fissava il ring a 512 righe senza il clamp upstream `min(512, n_ctx)` (il motore già clampava) | Clamp aggiunto a `LagunaAttentionSpec.slidingWindow` |
 | F8 | bassa | Header del motore stantio: dichiarava rifiutato il file misto Q2_K/Q3_K (accettato da quando i matvec K-quant sono cablati) | Commento corretto |
 | — | bassa | Whitespace ASCII vs Unicode nel renderer/parser (il C usa `isspace`) | Helper ASCII usati in tutto il backend Laguna |
+| F9 | bassa | Audit profondo del motore: il residuo MoE ripiegava l'esperto condiviso nell'accumulatore instradato, cioè `after_attn + (routed + shared)`; l'`add3` upstream e l'oracolo CPU valutano `(after_attn + routed) + shared` | Somma instradata chiusa da un add dedicato, esperto condiviso aggiunto per secondo — il motore ora combacia con oracolo e upstream |
+| F10 | bassa | `kernel_glm52_rms_norm_f32` usava `rsqrt` hardware; le norm a larghezza di layer upstream usano `1.0f/sqrt` e documentano il drift da ~1 ULP del reciproco che si accumula lungo lo stack (il kernel per-testa Laguna tiene `rsqrt` perché lo fa anche l'upstream) | Kernel passato a `1.0f/sqrt`, allineando a upstream le norm di layer sia di Laguna sia di GLM |
 
 Inoltre `LagunaRuntimeGate` ora onora `DS4_LAGUNA_RUNTIME=1` come override di
 bring-up per processo; il default committato resta spento finché il gate di
@@ -91,6 +93,11 @@ parità dei logits non passa.
   dispatch del decode flash split-K (`kernel_laguna_flash_attn_reduce_gate_f32`
   è portato ma non ancora dispatchato), la ricetta legacy F16/Q6_K, DFlash, i
   digest del catalogo.
+- Riduzione del matvec dei logit del router: il `kernel_glm52_matvec_f32` del
+  port accumula seriale per riga, upstream usa una forma `float4`+`simd_sum`;
+  differenze di ULP lì possono ribaltare un quasi-pareggio tra il 10º e l'11º
+  esperto (upstream riconosce la stessa classe di sensibilità per il drift
+  low-bit). Da riplasmare se serve parità token-exact della selezione.
 - Comportamenti Laguna a livello server trovati dallo sweep di completezza e
   non ancora dichiarati altrove: il sistema di alias modello
   (`laguna-s-2.1-chat/-nothink/-reasoner` con mappatura del think-mode e

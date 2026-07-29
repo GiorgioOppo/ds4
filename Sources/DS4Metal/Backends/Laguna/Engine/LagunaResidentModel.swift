@@ -19,6 +19,14 @@ import DS4Core
 // - prefill is token-by-token through the decode path (correct, not fast);
 // - two command-buffer syncs per MoE layer (the router selection is read
 //   back on the host to pick expert slabs, like the GLM chained decode).
+//
+// Optional divergence from upstream: `options.expertStreaming` keeps only
+// the Q8_0 signal path resident (~5 GiB) and copies the routed expert
+// slabs of the 10 selected experts from the mmap per token, after the
+// host router readback. Upstream REFUSES streaming for Laguna and mandates
+// residency; this exists so 32 GB machines can run the 45 GiB file at all
+// (~1.6 GB of reads per token — expect low single-digit tok/s). Numerics
+// are unchanged: same kernels, same slabs, different storage.
 
 public struct LagunaResidentModelOptions: Sendable {
     /// Number of leading transformer blocks to run (nil = all 48). Front
@@ -29,6 +37,10 @@ public struct LagunaResidentModelOptions: Sendable {
     /// KV positions per full-attention layer (sliding-window layers stay at
     /// the 512-row ring regardless).
     public var cacheCapacity: Int = 4_096
+    /// Experimental SSD streaming of the routed experts (see the divergence
+    /// note in the file header). Off by default: the resident path is the
+    /// one whose parity against the C engine is being certified.
+    public var expertStreaming = false
 
     public init() {}
 }
@@ -58,6 +70,18 @@ public final class LagunaResidentModel {
     public private(set) var position = 0
     public var loadedLayerCount: Int { layers.count }
     public var contextCapacity: Int { cacheCapacity }
+    public var isExpertStreaming: Bool { !expertStaging.isEmpty }
+
+    /// Per-phase profile in the shared DeepSeek/GLM `DecodeProfile` format.
+    /// route/attn covers the attention batch plus the router (its host
+    /// readback shows up as the wall−gpu remainder); experts covers the
+    /// routed+shared batch; layer (alt) is the fused dense layer 0; gather
+    /// IO counts the per-token slab reads of expert streaming.
+    public private(set) var profile = DecodeProfile()
+    private var gpuAttnS = 0.0
+    private var gpuExpertsS = 0.0
+    private var gpuDenseS = 0.0
+    private var gpuHeadS = 0.0
 
     private let runtime: MetalRuntime
     private let model: GGUFModel
@@ -74,12 +98,19 @@ public final class LagunaResidentModel {
     /// projections of one layer share this type on the Q8_0-signal layout.
     private static let routedTypes: Set<UInt32> = [10, 11, 12]
 
+    private enum RoutedWeights {
+        case resident(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
+        /// Absolute file offsets of the three routed expert tables; the
+        /// slabs of the selected experts are copied per token from the mmap
+        /// into `expertStaging` before the expert batch is encoded.
+        case streamed(gate: Int, up: Int, down: Int)
+    }
+
     private enum FFN {
         case dense(gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer)
         case moe(routedType: UInt32,
                  routerRows: MTLBuffer, routerBias: MTLBuffer,
-                 routedGate: MTLBuffer, routedUp: MTLBuffer,
-                 routedDown: MTLBuffer,
+                 routed: RoutedWeights,
                  gateUpExpertBytes: Int, downExpertBytes: Int,
                  sharedGate: MTLBuffer, sharedUp: MTLBuffer,
                  sharedDown: MTLBuffer)
@@ -104,6 +135,13 @@ public final class LagunaResidentModel {
     private var layers: [Layer] = []
     private let outputNorm: MTLBuffer
     private let outputHead: MTLBuffer
+    /// One (gate, up, down) staging triple per active-expert rank, reused
+    /// across layers and tokens; empty when experts are resident. Sized for
+    /// the largest expert slab in the file, so mixed Q2_K/Q3_K files share
+    /// the same triples. All ten ranks stay alive until the expert command
+    /// batch completes, hence one triple per rank rather than one in total.
+    private var expertStaging: [(gate: MTLBuffer, up: MTLBuffer,
+                                 down: MTLBuffer)] = []
 
     // Persistent activation scratch (F32 unless noted).
     private var hidden: MTLBuffer
@@ -193,6 +231,8 @@ public final class LagunaResidentModel {
         let keptLayers = min(max(options.layerCount ?? totalLayers, 1), totalLayers)
         var layers: [Layer] = []
         layers.reserveCapacity(keptLayers)
+        var maxGateUpExpertBytes = 0
+        var maxDownExpertBytes = 0
         for index in 0..<keptLayers {
             let spec = LagunaAttentionSpec.spec(
                 forLayer: index, shape: shape,
@@ -237,13 +277,29 @@ public final class LagunaResidentModel {
                     / Int(shape.nExpert)
                 let downExpertBytes = Int(routed.down.bytes)
                     / Int(shape.nExpert)
+                let routedWeights: RoutedWeights
+                if options.expertStreaming {
+                    routedWeights = .streamed(
+                        gate: Int(routed.gate.absOffset),
+                        up: Int(routed.up.absOffset),
+                        down: Int(routed.down.absOffset)
+                    )
+                    maxGateUpExpertBytes = max(maxGateUpExpertBytes,
+                                               gateUpExpertBytes)
+                    maxDownExpertBytes = max(maxDownExpertBytes,
+                                             downExpertBytes)
+                } else {
+                    routedWeights = .resident(
+                        gate: try upload(routed.gate),
+                        up: try upload(routed.up),
+                        down: try upload(routed.down)
+                    )
+                }
                 ffn = .moe(
                     routedType: routed.gate.type,
                     routerRows: try upload(map.layer(index, .router)),
                     routerBias: try upload(map.layer(index, .routerBias)),
-                    routedGate: try upload(routed.gate),
-                    routedUp: try upload(routed.up),
-                    routedDown: try upload(routed.down),
+                    routed: routedWeights,
                     gateUpExpertBytes: gateUpExpertBytes,
                     downExpertBytes: downExpertBytes,
                     sharedGate: try upload(map.layer(index, .sharedGate)),
@@ -272,9 +328,56 @@ public final class LagunaResidentModel {
             ))
         }
         self.layers = layers
+
+        if options.expertStreaming, maxGateUpExpertBytes + maxDownExpertBytes > 0 {
+            var staging: [(gate: MTLBuffer, up: MTLBuffer,
+                           down: MTLBuffer)] = []
+            staging.reserveCapacity(LagunaRouterReference.expertsUsed)
+            for _ in 0..<LagunaRouterReference.expertsUsed {
+                guard let gate = runtime.device.makeBuffer(
+                        length: maxGateUpExpertBytes,
+                        options: .storageModeShared),
+                      let up = runtime.device.makeBuffer(
+                        length: maxGateUpExpertBytes,
+                        options: .storageModeShared),
+                      let down = runtime.device.makeBuffer(
+                        length: maxDownExpertBytes,
+                        options: .storageModeShared) else {
+                    throw LagunaResidentModelError.bufferAllocation(
+                        "expert streaming staging")
+                }
+                staging.append((gate, up, down))
+            }
+            self.expertStaging = staging
+        }
     }
 
     // MARK: Public API
+
+    public func resetProfile() {
+        profile = DecodeProfile()
+        gpuAttnS = 0; gpuExpertsS = 0; gpuDenseS = 0; gpuHeadS = 0
+    }
+
+    /// Same shape as the GLM report: the shared per-phase table plus one
+    /// line splitting REAL GPU execution from host overhead (encode, the
+    /// two syncs per MoE layer, the router readback, staging memcpy).
+    public func profileReport(title: String = "Profilo decode") -> String {
+        var report = profile.report(title: title)
+        if profile.forwards > 0 {
+            let f = Double(profile.forwards)
+            func ms(_ s: Double) -> String {
+                String(format: "%.0f", s / f * 1000)
+            }
+            report += "\n  gpu          route/attn \(ms(gpuAttnS))"
+                + " · experts \(ms(gpuExpertsS))"
+                + " · layer(alt) \(ms(gpuDenseS))"
+                + " · head \(ms(gpuHeadS)) ms/token — il resto è host"
+                + " (encode/sync/readback router"
+                + (isExpertStreaming ? "/gather)" : ")")
+        }
+        return report
+    }
 
     public func resetContext() {
         position = 0
@@ -299,21 +402,27 @@ public final class LagunaResidentModel {
             throw LagunaResidentModelError.contextFull(capacity: cacheCapacity)
         }
 
+        let embedStart = Date()
         let embedding = try embeddingRow(token)
         embedding.withUnsafeBytes {
             _ = memcpy(hidden.contents(), $0.baseAddress!, $0.count)
         }
+        profile.embedS += Date().timeIntervalSince(embedStart)
 
         for layer in layers {
             try forward(layer: layer, position: position)
         }
 
+        let headStart = Date()
         try encodeOutputHead()
         position += 1
 
         let count = Int(shape.nVocab)
         let pointer = logits.contents().bindMemory(to: Float.self, capacity: count)
-        return Array(UnsafeBufferPointer(start: pointer, count: count))
+        let result = Array(UnsafeBufferPointer(start: pointer, count: count))
+        profile.headS += Date().timeIntervalSince(headStart)
+        profile.forwards += 1
+        return result
     }
 
     public func forwardNextGreedy(_ token: Int32) throws -> Int32 {
@@ -364,6 +473,7 @@ public final class LagunaResidentModel {
         let queryWidth = spec.queryWidth
         let kvWidth = spec.keyValueWidth
 
+        let phaseStart = Date()
         var commands = try beginCommands()
 
         // Attention half: norm, projections, per-head norm/RoPE, KV store,
@@ -403,11 +513,11 @@ public final class LagunaResidentModel {
                                   accumulate: false)
             try encodeAdd(commands, a: afterAttn, b: ffnOut, out: hiddenNext,
                           count: embd)
-            try endCommands(commands)
+            try endCommands(commands, phase: .dense)
+            profile.layerOtherS += Date().timeIntervalSince(phaseStart)
 
         case .moe(let routedType, let routerRows, let routerBias,
-                  let routedGate, let routedUp, let routedDown,
-                  let gateUpExpertBytes, let downExpertBytes,
+                  let routed, let gateUpExpertBytes, let downExpertBytes,
                   let sharedGate, let sharedUp, let sharedDown):
             // Phase A ends with the router: selection is read back on the
             // host to address the expert slabs (GLM chained-decode pattern).
@@ -416,7 +526,7 @@ public final class LagunaResidentModel {
                                 inputWidth: embd, x: ffnNormed,
                                 out: routerLogits)
             try encodeRouterSelect(commands, bias: routerBias)
-            try endCommands(commands)
+            try endCommands(commands, phase: .attention)
 
             let used = LagunaRouterReference.expertsUsed
             let selectedPointer = routerSelected.contents()
@@ -427,26 +537,75 @@ public final class LagunaResidentModel {
                                                      count: used))
             let routeWeights = Array(UnsafeBufferPointer(start: weightPointer,
                                                          count: used))
+            profile.routeS += Date().timeIntervalSince(phaseStart)
 
+            // Streaming: copy the selected slabs from the mmap into the
+            // per-rank staging triples. The file bytes are identical to
+            // what the resident path uploads at load — only the storage
+            // (and this per-token I/O, counted as gather) differs.
+            if case .streamed(let gateBase, let upBase,
+                              let downBase) = routed {
+                let gatherStart = Date()
+                for (rank, expert) in selected.enumerated() {
+                    let e = Int(expert)
+                    let staging = expertStaging[rank]
+                    memcpy(staging.gate.contents(),
+                           model.mapBase + gateBase + e * gateUpExpertBytes,
+                           gateUpExpertBytes)
+                    memcpy(staging.up.contents(),
+                           model.mapBase + upBase + e * gateUpExpertBytes,
+                           gateUpExpertBytes)
+                    memcpy(staging.down.contents(),
+                           model.mapBase + downBase + e * downExpertBytes,
+                           downExpertBytes)
+                }
+                profile.gatherS += Date().timeIntervalSince(gatherStart)
+                profile.gatherBytes += selected.count
+                    * (2 * gateUpExpertBytes + downExpertBytes)
+            }
+
+            let expertsStart = Date()
             commands = try beginCommands()
             let expertWidth = Int(shape.nFFExpert)
             for (rank, expert) in selected.enumerated() {
                 let e = Int(expert)
+                let gate: MTLBuffer, up: MTLBuffer, down: MTLBuffer
+                let gateUpOffset: Int, downOffset: Int
+                switch routed {
+                case .resident(let residentGate, let residentUp,
+                               let residentDown):
+                    gate = residentGate; up = residentUp; down = residentDown
+                    gateUpOffset = e * gateUpExpertBytes
+                    downOffset = e * downExpertBytes
+                case .streamed:
+                    let staging = expertStaging[rank]
+                    gate = staging.gate; up = staging.up; down = staging.down
+                    gateUpOffset = 0
+                    downOffset = 0
+                }
                 try encodePairSwiGLU(
                     commands, type: routedType, rows: expertWidth,
                     inputWidth: embd,
-                    gateRows: routedGate, gateOffset: e * gateUpExpertBytes,
-                    upRows: routedUp, upOffset: e * gateUpExpertBytes,
+                    gateRows: gate, gateOffset: gateUpOffset,
+                    upRows: up, upOffset: gateUpOffset,
                     input: ffnNormed, routeWeight: routeWeights[rank],
                     mid: ffnMid
                 )
                 try encodeQuantMatvec(
                     commands, type: routedType, rows: embd,
                     inputWidth: expertWidth,
-                    weights: routedDown, weightsOffset: e * downExpertBytes,
+                    weights: down, weightsOffset: downOffset,
                     input: ffnMid, output: ffnOut, accumulate: rank != 0
                 )
             }
+            // Residual in the upstream association: `add3(after_attn,
+            // routed, shared)` evaluates `(after_attn + routed) + shared`,
+            // and the CPU oracle does the same. Folding the shared expert
+            // into the routed accumulator first changes the rounding, so
+            // the routed sum is closed here and the shared expert lands in
+            // a second add (C-parity audit, MoE §6).
+            try encodeAdd(commands, a: afterAttn, b: ffnOut, out: hiddenNext,
+                          count: embd)
             let sharedWidth = Int(shape.nFFShared)
             try encodePairSwiGLU(commands, type: Self.q8Type, rows: sharedWidth,
                                  inputWidth: embd, gateRows: sharedGate,
@@ -455,12 +614,14 @@ public final class LagunaResidentModel {
             try encodeQuantMatvec(commands, type: Self.q8Type, rows: embd,
                                   inputWidth: sharedWidth, weights: sharedDown,
                                   input: ffnMid, output: ffnOut,
-                                  accumulate: true)
-            try encodeAdd(commands, a: afterAttn, b: ffnOut, out: hiddenNext,
+                                  accumulate: false)
+            try encodeAdd(commands, a: hiddenNext, b: ffnOut, out: hiddenNext,
                           count: embd)
-            try endCommands(commands)
+            try endCommands(commands, phase: .experts)
+            profile.expertsS += Date().timeIntervalSince(expertsStart)
         }
 
+        profile.layers += 1
         swap(&hidden, &hiddenNext)
     }
 
@@ -473,7 +634,7 @@ public final class LagunaResidentModel {
                               inputWidth: Int(shape.nEmbd),
                               weights: outputHead, input: normed,
                               output: logits, accumulate: false)
-        try endCommands(commands)
+        try endCommands(commands, phase: .head)
     }
 
     // MARK: Command encoding
@@ -491,11 +652,22 @@ public final class LagunaResidentModel {
         return Commands(buffer: buffer, encoder: encoder)
     }
 
-    private func endCommands(_ commands: Commands) throws {
+    private enum GpuPhase { case attention, experts, dense, head }
+
+    private func endCommands(_ commands: Commands,
+                             phase: GpuPhase) throws {
         commands.encoder.endEncoding()
         commands.buffer.commit()
         commands.buffer.waitUntilCompleted()
         if let error = commands.buffer.error { throw error }
+        let gpu = commands.buffer.gpuEndTime - commands.buffer.gpuStartTime
+        guard gpu.isFinite, gpu > 0 else { return }
+        switch phase {
+        case .attention: gpuAttnS += gpu
+        case .experts: gpuExpertsS += gpu
+        case .dense: gpuDenseS += gpu
+        case .head: gpuHeadS += gpu
+        }
     }
 
     private func setArguments(_ encoder: MTLComputeCommandEncoder,

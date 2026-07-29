@@ -63,6 +63,8 @@ acted on.
 | F7 | low | The CPU oracle's sliding-window spec pinned the ring at 512 rows without the upstream `min(512, n_ctx)` clamp (the engine already clamped) | Clamp added to `LagunaAttentionSpec.slidingWindow` |
 | F8 | low | Stale engine header claimed the mixed Q2_K/Q3_K file is refused (it is accepted since the K-quant matvecs were wired) | Comment corrected |
 | — | low | ASCII vs Unicode whitespace in the renderer/parsers (C uses `isspace`) | ASCII whitespace helpers used throughout the Laguna backend |
+| F9 | low | Deep engine audit: the MoE residual folded the shared expert into the routed accumulator, i.e. `after_attn + (routed + shared)`; upstream `add3` and the CPU oracle both evaluate `(after_attn + routed) + shared` | Routed sum closed by its own add, shared expert added second — engine now matches oracle and upstream |
+| F10 | low | `kernel_glm52_rms_norm_f32` used hardware `rsqrt`; upstream's layer-width norms use `1.0f/sqrt` and document the ~1 ULP reciprocal drift compounding across the stack (Laguna's per-head kernel keeps `rsqrt` because upstream's own does) | Kernel switched to `1.0f/sqrt`, aligning both Laguna and GLM layer norms with upstream |
 
 Additionally, `LagunaRuntimeGate` now honours `DS4_LAGUNA_RUNTIME=1` as a
 per-process bring-up override; the committed default stays off until the
@@ -89,6 +91,11 @@ logits-parity gate passes.
   logits parity vs `ds4 --temp 0`, batched prefill and the flash split-K
   decode dispatch (`kernel_laguna_flash_attn_reduce_gate_f32` is ported but
   not yet dispatched), the legacy F16/Q6_K recipe, DFlash, catalog digests.
+- Router-logit matvec reduction: the port's `kernel_glm52_matvec_f32` is a
+  serial per-row accumulation, upstream uses a `float4`+`simd_sum` shape;
+  ULP differences there can flip a rank-10/11 expert near-tie (upstream
+  acknowledges the same sensitivity class for low-bit drift). Re-shape if
+  token-exact selection parity is required.
 - Server-level Laguna behaviors found by the completeness sweep and not yet
   declared anywhere: the model-alias system (`laguna-s-2.1-chat/-nothink/
   -reasoner` think-mode mapping and the `/v1/models` listing), wiring the

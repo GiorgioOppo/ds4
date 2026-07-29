@@ -38,8 +38,12 @@ kernel void kernel_glm52_rms_norm_f32(
         if (tid < step) scratch[tid] += scratch[tid + step];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // 1/sqrt, NOT rsqrt: the hardware reciprocal estimate differs by ~1 ULP
+    // and the reference engine documents that drift compounding across the
+    // layer stack (upstream metal/norm.metal). The CPU oracles on both
+    // families divide by sqrt as well.
     const float inverse_rms =
-        rsqrt(scratch[0] / (float)args.width + args.epsilon);
+        1.0f / sqrt(scratch[0] / (float)args.width + args.epsilon);
     for (uint i = tid; i < args.width; i += nth) {
         output[i] = (input[i] * inverse_rms) * weight[i];
     }
