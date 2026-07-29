@@ -459,6 +459,60 @@ do {
                 + (reasoning.enabled ? ", think" : ", nothink")
                 + ") — prompt: \(prompt)")
             let tokenizer = try LagunaTokenizer(model: model)
+            // Quant-format audit (DS4_TYPES_ONLY=1), il gemello del blocco
+            // DeepSeek: stampa i dtype che il motore assume (ricetta Q8_0 sul
+            // segnale, esperti instradati Q2_K/Q3_K/Q4_K per layer nel file
+            // misto), gli id speciali e i token del prompt. Mismatch => garbage.
+            // Nessun Metal: utile anche su macchine senza RAM per il modello.
+            if environment["DS4_TYPES_ONLY"] != nil {
+                func typeLine(_ nm: String) -> String {
+                    if let t = model.findTensor(nm) {
+                        return "  TYPE \(nm) = \(t.typeName) (code \(t.type))"
+                    }
+                    return "  TYPE \(nm) = <missing>"
+                }
+                for nm in ["token_embd.weight", "output_norm.weight",
+                           "output.weight", "blk.0.attn_q.weight",
+                           "blk.0.attn_gate.weight", "blk.0.ffn_gate.weight",
+                           "blk.0.ffn_down.weight",
+                           "blk.1.ffn_gate_inp.weight",
+                           "blk.1.exp_probs_b.bias",
+                           "blk.1.ffn_gate_shexp.weight"] {
+                    log(typeLine(nm))
+                }
+                var layer = 1
+                while model.findTensor("blk.\(layer).attn_norm.weight") != nil {
+                    let types = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                        .map {
+                            model.findTensor("blk.\(layer).\($0).weight")?
+                                .typeName ?? "<missing>"
+                        }
+                    log("  ROUTED blk.\(String(format: "%2d", layer)) "
+                        + "gate/up/down = " + types.joined(separator: "/"))
+                    layer += 1
+                }
+                log("  SPECIAL bos=\(tokenizer.special.beginOfSequence)"
+                    + " eos=\(tokenizer.special.endOfSequence)"
+                    + " eot=\(tokenizer.special.endOfTurn)"
+                    + " assistant=\(tokenizer.special.assistant)"
+                    + " think=\(tokenizer.special.thinkOpen)"
+                    + "/\(tokenizer.special.thinkClose)"
+                    + " tool=\(tokenizer.special.toolCallOpen)"
+                    + "/\(tokenizer.special.toolCallClose)")
+                let ids = try tokenizer.encodeChatPrompt(
+                    system: environment["DS4_SYSTEM"]
+                        ?? LagunaConversationProtocol.defaultSystemPrompt,
+                    prompt: prompt,
+                    reasoning: reasoning
+                )
+                log("  PROMPT ids (\(ids.count)) = \(ids)")
+                for id in ids {
+                    let text = String(bytes: tokenizer.tokenText(id),
+                                      encoding: .utf8) ?? "?"
+                    log("    \(id) -> '\(text)'")
+                }
+                exit(0)
+            }
             let runtime = try MetalRuntime()
             var options = LagunaResidentModelOptions()
             options.cacheCapacity = maxKeys
@@ -467,9 +521,9 @@ do {
             let laguna = try LagunaResidentModel(
                 runtime: runtime, path: ggufPath, options: options
             )
+            let loadSeconds = Date().timeIntervalSince(loadStart)
             log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer)",
-                       Date().timeIntervalSince(loadStart),
-                       laguna.loadedLayerCount))
+                       loadSeconds, laguna.loadedLayerCount))
             // The reference CLI passes the Poolside default system prompt
             // into `ds4_encode_chat_prompt` when none is given.
             let tokens = try tokenizer.encodeChatPrompt(
@@ -480,10 +534,15 @@ do {
             )
             let prefillStart = Date()
             var logits = try laguna.prefill(tokens)
+            let prefillSeconds = Date().timeIntervalSince(prefillStart)
             log(String(format: "DS4Demo: prefill %d token in %.1fs",
-                       tokens.count, Date().timeIntervalSince(prefillStart)))
+                       tokens.count, prefillSeconds))
+            // Come il percorso GLM: DS4_WARMUP=N esclude i primi N token dal
+            // regime, così il tok/s a regime non paga caches fredde e ramp-up.
+            let warmup = environment["DS4_WARMUP"].flatMap(Int.init) ?? 0
             var generated: [Int32] = []
             let decodeStart = Date()
+            var steadyStart = decodeStart
             for _ in 0..<maxNew {
                 let next = Int32(Sampler.sample(
                     logits, temperature: temperature, topK: topK,
@@ -494,6 +553,9 @@ do {
                 let piece = tokenizer.tokenText(next)
                 FileHandle.standardOutput.write(Data(piece))
                 logits = try laguna.forwardNext(next)
+                if generated.count == warmup {
+                    steadyStart = Date()
+                }
             }
             FileHandle.standardOutput.write(Data("\n".utf8))
             let decodeSeconds = Date().timeIntervalSince(decodeStart)
@@ -502,6 +564,16 @@ do {
                            generated.count, decodeSeconds,
                            Double(generated.count) / max(decodeSeconds, 0.001)))
             }
+            if warmup > 0, generated.count > warmup {
+                let steadyTokens = generated.count - warmup
+                let steadySeconds = Date().timeIntervalSince(steadyStart)
+                log(String(format: "DS4Demo: REGIME (dal token %d): %d token in %.1fs (%.2f tok/s)",
+                           warmup + 1, steadyTokens, steadySeconds,
+                           Double(steadyTokens) / max(steadySeconds, 0.001)))
+            }
+            log(String(format: "DS4Demo: totale %.1fs (load %.1f + prefill %.1f + decode %.1f)",
+                       Date().timeIntervalSince(loadStart), loadSeconds,
+                       prefillSeconds, decodeSeconds))
             exit(0)
         }
         if detectedArchitecture.family == .qwen
