@@ -74,7 +74,7 @@ extension ChatStore {
             _ = setenv("DS4_MTLIO", "1", 1)
             _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)
             _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)
-            _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)
+            _ = setenv(DS4RuntimeKnob.prefillMoEBatch.rawValue, "1", 1)
             _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)
             _ = setenv("DS4_DENSE_Q4_KERNEL", "1", 1)
             _ = setenv("DS4_FUSED_ROUTER_PROBS", "1", 1)
@@ -147,7 +147,7 @@ extension ChatStore {
     }
 
     /// Sidecar GLM (layer Q4 unificati + bundle legacy da migrare): l'engine
-    /// li cerca in DS4_GLM_LAYERQ4_DIR / DS4_GLM_BUNDLE_DIR con default
+    /// li cerca in DS4_GLM_LAYERQ4_DIR / DS4_BUNDLE_DIR con default
     /// ACCANTO al GGUF. STESSA politica del bundle DeepSeek: in lettura si
     /// riusa il sibling quando esiste GIÀ (es. costruito dalla demo CLI — e
     /// un sidecar parziale avviato lì non va frammentato su due cartelle);
@@ -160,7 +160,7 @@ extension ChatStore {
         guard !modelPath.isEmpty else { return }
         _ = setenv("DS4_GLM_LAYERQ4_DIR",
                    glmResolvedLayerQ4Directory(modelPath: modelPath), 1)
-        _ = setenv("DS4_GLM_BUNDLE_DIR",
+        _ = setenv("DS4_BUNDLE_DIR",
                    glmResolvedLegacyBundleDirectory(modelPath: modelPath), 1)
     }
 

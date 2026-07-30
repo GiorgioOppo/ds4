@@ -225,12 +225,12 @@ public final class GLM52ResidentModel {
 
         LoadProgress.shared.set(0.02, "GLM: mappa pesi e schema")
         // Sidecar convention (like the DeepSeek .expbundle): the expert
-        // bundles live beside the GGUF unless DS4_GLM_BUNDLE_DIR overrides.
+        // bundles live beside the GGUF unless DS4_BUNDLE_DIR overrides.
         // Auto-discovered and identity-validated per layer; absence is
         // simply the plain GGUF path.
         let bundleDirectory = DS4RuntimeEnvironment.value(
-            "DS4_BUNDLE_DIR",
-            overrides: ["DS4_GLM_BUNDLE_DIR"])
+            .bundleDirectory,
+            backend: .glm52)
             ?? (path + ".glm-experts")
         let layerQ4Directory = ProcessInfo.processInfo
             .environment["DS4_GLM_LAYERQ4_DIR"] ?? (path + ".glm-layers-q4")
@@ -491,15 +491,15 @@ public final class GLM52ResidentModel {
         }
         // Knob attivi nel log a OGNI init, come il motore DeepSeek: "l'app
         // vede davvero le env var?" deve essere rispondibile dal solo log.
-        let knobs = ["DS4_GLM_MTLIO", "DS4_GLM_ACTIVE_EXPERTS",
-                     "DS4_GLM_RESIDENT_LAYERS", "DS4_GLM_FUSE",
-                     "DS4_GLM_READ_SPLIT", "DS4_GLM_SPEC_EXPERTS",
-                     "DS4_GLM_SPEC_K", "DS4_GLM_EXPERT_ARENA",
-                     "DS4_GLM_STREAM_SLOTS", "DS4_GLM_EXPERT_SLOTS",
-                     "DS4_GLM_SG", "DS4_GLM_NSG", "DS4_GLM_NOCACHE",
-                     "DS4_GLM_MLOCK", "DS4_GLM_MOE_BATCH",
+        let knobs = ["DS4_MTLIO", "DS4_ACTIVE_EXPERTS",
+                     "DS4_RESIDENT_LAYERS", "DS4_GLM_FUSE",
+                     "DS4_PREAD_SPLIT", "DS4_GLM_SPEC_EXPERTS",
+                     "DS4_SPEC_K", "DS4_GLM_EXPERT_ARENA",
+                     "DS4_STREAM_SLOTS", "DS4_EXPERT_CACHE_SLOTS",
+                     "DS4_GLM_SG", "DS4_NSG", "DS4_GLM_NOCACHE",
+                     "DS4_MLOCK", "DS4_GLM_MOE_BATCH",
                      "DS4_GLM_GPU_ROUTER", "DS4_GLM_LAYERQ4",
-                     "DS4_GLM_USAGE_FILE"]
+                     "DS4_USAGE_FILE"]
         let env = ProcessInfo.processInfo.environment
         DS4Log.info("glm", "knob " + knobs
             .map { "\($0)=\(env[$0] ?? "·")" }.joined(separator: "  "))
@@ -760,8 +760,8 @@ public final class GLM52ResidentModel {
 
     private var usageProfilePath: String {
         DS4RuntimeEnvironment.value(
-            "DS4_USAGE_FILE",
-            overrides: ["DS4_GLM_USAGE_FILE"])
+            .usageFile,
+            backend: .glm52)
             ?? (reader.path + ".glm-usage.json")
     }
 
@@ -983,7 +983,7 @@ public final class GLM52ResidentModel {
         // freed with the prefill).
         let planeStride = embeddingWidth * MemoryLayout<Float>.stride
         var planes: (hidden: MTLBuffer, ffnIn: MTLBuffer)?
-        // Leva 1 del prefill (DS4_GLM_PREFILL_BATCH=1): pool di scratch
+        // Leva 1 del prefill (DS4_PREFILL_BATCH=1): pool di scratch
         // per-token per attraversare ogni layer a GRUPPI di token con due
         // soli commit per gruppo (GLM52PrefillBatch.swift) invece di 2-3
         // commit per token. Richiede il router fuso per leggere il routing
@@ -1474,14 +1474,14 @@ extension GLM52ResidentModel {
     /// logits) e tutti letti a init del motore, quindi applicabili con
     /// setenv + reload (~3 s: il load streaming GLM rende possibile ciò che
     /// per DeepSeek è proibitivo). Esclusi per costruzione: i knob di
-    /// qualità (DS4_GLM_ACTIVE_EXPERTS, sidecar Q4 lossy) e quelli
-    /// process-static (DS4_GLM_NSG/SG, DS4_GLM_MLOCK, DS4_GLM_READ_SPLIT —
+    /// qualità (DS4_ACTIVE_EXPERTS, sidecar Q4 lossy) e quelli
+    /// process-static (DS4_NSG/GLM_SG, DS4_MLOCK, DS4_PREAD_SPLIT —
     /// cache in static let, un setenv a metà processo non li muove).
     static let autoTuneKnobs: [(knob: String, alternatives: [String?])] = [
-        ("DS4_GLM_MTLIO", ["0", "1"]),
-        ("DS4_GLM_STREAM_SLOTS", [nil, "5"]),
+        ("DS4_MTLIO", ["0", "1"]),
+        ("DS4_STREAM_SLOTS", [nil, "5"]),
         ("DS4_GLM_EXPERT_ARENA", [nil, "48"]),
-        ("DS4_GLM_RESIDENT_LAYERS", [nil, "7"]),
+        ("DS4_RESIDENT_LAYERS", [nil, "7"]),
         ("DS4_GLM_FUSE", [nil, "0"]),
     ]
 
@@ -1514,24 +1514,24 @@ extension GLM52ResidentModel {
             let env = ProcessInfo.processInfo.environment
             var options = GLM52ResidentModelOptions()
             options.residentLayerCount = DS4RuntimeEnvironment.integer(
-                "DS4_RESIDENT_LAYERS",
-                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                .residentLayers,
+                backend: .glm52,
                 environment: env)
                 ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
             options.activeExperts = DS4RuntimeEnvironment.integer(
-                "DS4_ACTIVE_EXPERTS",
-                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                .activeExperts,
+                backend: .glm52,
                 environment: env)
             if let slots = DS4RuntimeEnvironment.integer(
-                "DS4_EXPERT_CACHE_SLOTS",
-                overrides: ["DS4_GLM_EXPERT_SLOTS"],
+                .expertCacheSlots,
+                backend: .glm52,
                 environment: env
             ) {
                 options.expertSlotCount = slots
             }
             if let slots = DS4RuntimeEnvironment.integer(
-                "DS4_STREAM_SLOTS",
-                overrides: ["DS4_GLM_STREAM_SLOTS"],
+                .streamSlots,
+                backend: .glm52,
                 environment: env
             ) {
                 options.streamSlotCount = slots

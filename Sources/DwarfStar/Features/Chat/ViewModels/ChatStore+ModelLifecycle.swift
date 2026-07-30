@@ -157,14 +157,29 @@ extension ChatStore {
         let lagunaKVInitial = max(256, min(self.lagunaKVInitial, ctx))
         let glmResident = glmResidentLayers
         let glmExperts = glmActiveExperts
+        let glmStreamSlotValue =
+            glmStreamSlots > 0 ? String(glmStreamSlots) : "3"
+        let glmMetalIOValue = glmMetalIOEnabled ? "1" : "0"
+        let glmPrefillBatchValue = glmPrefillBatchEnabled ? "1" : "0"
+        let glmPrefillMoEValue = glmPrefillMoEEnabled ? "1" : "0"
+        let glmMlockValue = glmMlockEnabled ? "1" : "0"
+        let glmReadSplitValue =
+            glmReadSplit > 0 ? String(glmReadSplit) : "4"
+        let glmNSGValue = glmNSG > 0 ? String(glmNSG) : "4"
+        let deepSeekPrefillChunk = String(prefillChunk)
+        let deepSeekPrefillRouteBatch = String(prefillRouteBatch)
+        let deepSeekExpertPread = expertPreadEnabled ? "1" : "0"
+        let deepSeekWillNeed = willNeedEnabled ? "1" : "0"
+        let deepSeekPreadSplit = String(preadSplit)
+        let deepSeekMetalIO = metalIOEnabled ? "1" : "0"
+        let deepSeekMlock = mlockEnabled ? "1" : "0"
+        let deepSeekIndexedAttention = indexedAttnEnabled ? "1" : "0"
+        let deepSeekBundleDirectory = Self.bundleDirectory.path
         // Knob GLM aggiuntivi: il motore li legge dall'ambiente (stessa
         // strada della demo CLI), quindi la GUI li fissa QUI, prima della
         // costruzione del servizio. 0 = default del motore.
         _ = setenv("DS4_GLM_EXPERT_ARENA",
                    glmExpertArena > 0 ? String(glmExpertArena) : "24", 1)
-        _ = setenv("DS4_GLM_STREAM_SLOTS",
-                   glmStreamSlots > 0 ? String(glmStreamSlots) : "3", 1)
-        _ = setenv("DS4_GLM_MTLIO", glmMetalIOEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_SPEC_EXPERTS",
                    glmSpeculativeExperts ? "1" : "0", 1)
         _ = setenv("DS4_GLM_LAYERQ4", glmUseQ4Sidecar ? "1" : "0", 1)
@@ -172,14 +187,8 @@ extension ChatStore {
         // rilegge a ogni init (GLM52DispatchKnobs.refresh), quindi un
         // toggle qui ha effetto al reload.
         _ = setenv("DS4_GLM_FUSE", glmFuseEnabled ? "1" : "0", 1)
-        _ = setenv("DS4_GLM_PREFILL_BATCH", glmPrefillBatchEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_MOE_BATCH", glmMoEBatchEnabled ? "1" : "0", 1)
-        _ = setenv("DS4_GLM_PREFILL_MOE", glmPrefillMoEEnabled ? "1" : "0", 1)
         _ = setenv("DS4_GLM_GPU_ROUTER", glmGpuRouterEnabled ? "1" : "0", 1)
-        _ = setenv("DS4_GLM_MLOCK", glmMlockEnabled ? "1" : "0", 1)
-        _ = setenv("DS4_GLM_READ_SPLIT",
-                   glmReadSplit > 0 ? String(glmReadSplit) : "4", 1)
-        _ = setenv("DS4_GLM_NSG", glmNSG > 0 ? String(glmNSG) : "4", 1)
         let loadEngineSignature = machineAutoTuneEngineSignature()
         let kvDir = diskKVEnabled ? Self.diskKVDirectory : nil
         let kvBudgetTokens = diskKVBudgetKTok * 1000
@@ -214,6 +223,33 @@ extension ChatStore {
                 if inspected.architecture
                        == GLM52BackendDefinition.supportedArchitecture,
                    GLM52BackendDefinition.runtimeEnabled {
+                    // Canonical, architecture-neutral runtime names. This is
+                    // deliberately done after inspection: the same process
+                    // may previously have hosted DeepSeek or Laguna.
+                    _ = setenv(DS4RuntimeKnob.activeExperts.rawValue,
+                               glmExperts > 0 ? String(glmExperts) : "8", 1)
+                    if glmResident > 0 {
+                        _ = setenv(DS4RuntimeKnob.residentLayers.rawValue,
+                                   String(glmResident), 1)
+                    } else {
+                        _ = unsetenv(DS4RuntimeKnob.residentLayers.rawValue)
+                    }
+                    _ = setenv(DS4RuntimeKnob.streamSlots.rawValue,
+                               glmStreamSlotValue, 1)
+                    _ = setenv(DS4RuntimeKnob.metalIO.rawValue,
+                               glmMetalIOValue, 1)
+                    _ = setenv(DS4RuntimeKnob.prefillBatch.rawValue,
+                               glmPrefillBatchValue, 1)
+                    _ = setenv(DS4RuntimeKnob.prefillMoEBatch.rawValue,
+                               glmPrefillMoEValue, 1)
+                    _ = setenv(DS4RuntimeKnob.prefillRouteBatch.rawValue,
+                               "16", 1)
+                    _ = setenv(DS4RuntimeKnob.mlock.rawValue,
+                               glmMlockValue, 1)
+                    _ = setenv(DS4RuntimeKnob.preadSplit.rawValue,
+                               glmReadSplitValue, 1)
+                    _ = setenv(DS4RuntimeKnob.simdgroups.rawValue,
+                               glmNSGValue, 1)
                     // Sidecar GLM: riusa quello accanto al GGUF quando c'è,
                     // altrimenti redirigi la build in Application Support
                     // (in sandbox la cartella del modello non è scrivibile).
@@ -260,6 +296,8 @@ extension ChatStore {
                 if inspected.architecture
                        == LagunaBackendDefinition.supportedArchitecture,
                    LagunaBackendDefinition.runtimeEnabled {
+                    LagunaInferenceService.installGUIEnvironmentDefaults(
+                        overwrite: true)
                     let laguna = try await withCheckedThrowingContinuation {
                         (cont: CheckedContinuation<LagunaChatService, Error>) in
                         DispatchQueue.global(qos: .userInitiated).async {
@@ -290,6 +328,30 @@ extension ChatStore {
                     }
                     return
                 }
+                // Restore the canonical shared knobs after another backend
+                // may have occupied this process. DeepSeek-only controls do
+                // not need restoration because GLM/Laguna never write them.
+                _ = setenv(DS4RuntimeKnob.activeExperts.rawValue, "6", 1)
+                _ = setenv(DS4RuntimeKnob.prefillBatch.rawValue, "1", 1)
+                _ = setenv(DS4RuntimeKnob.prefillDenseMM.rawValue, "1", 1)
+                _ = setenv(DS4RuntimeKnob.prefillMoEBatch.rawValue, "1", 1)
+                _ = setenv(DS4RuntimeKnob.prefillChunk.rawValue,
+                           deepSeekPrefillChunk, 1)
+                _ = setenv(DS4RuntimeKnob.prefillRouteBatch.rawValue,
+                           deepSeekPrefillRouteBatch, 1)
+                _ = setenv(DS4RuntimeKnob.expertPread.rawValue,
+                           deepSeekExpertPread, 1)
+                _ = setenv(DS4RuntimeKnob.willNeedExperts.rawValue,
+                           deepSeekWillNeed, 1)
+                _ = setenv(DS4RuntimeKnob.preadSplit.rawValue,
+                           deepSeekPreadSplit, 1)
+                _ = setenv(DS4RuntimeKnob.metalIO.rawValue,
+                           deepSeekMetalIO, 1)
+                _ = setenv(DS4RuntimeKnob.mlock.rawValue, deepSeekMlock, 1)
+                _ = setenv(DS4RuntimeKnob.indexedAttention.rawValue,
+                           deepSeekIndexedAttention, 1)
+                _ = setenv(DS4RuntimeKnob.bundleDirectory.rawValue,
+                           deepSeekBundleDirectory, 1)
                 // Il motore si costruisce su un thread GCD CLASSICO, non sul
                 // thread del pool cooperativo di Swift Concurrency di questo
                 // Task: il load usa DispatchQueue.concurrentPerform ovunque

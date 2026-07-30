@@ -6,16 +6,32 @@ tool, distribuzione e UI che non modificano il runtime del modello.
 
 ## Regola di risoluzione
 
-I nuovi nomi comuni sono backend-agnostici. I nomi storici specifici restano
-supportati e hanno precedenza:
+I nomi comuni `DS4_*` sono l'interfaccia pubblica e backend-agnostica. I nomi
+storici specifici restano supportati solo come fallback deprecato:
 
-1. nome specifico del backend, per esempio `DS4_GLM_PREFILL_BATCH`;
-2. nome comune, per esempio `DS4_PREFILL_BATCH`;
+1. nome comune, per esempio `DS4_PREFILL_BATCH`;
+2. alias storico, per esempio `DS4_GLM_PREFILL_BATCH`;
 3. default del backend.
 
-In questo modo i preset esistenti non cambiano significato. I default possono
-restare diversi quando sono il risultato di A/B differenti: un nome comune
-uniforma il controllo, non forza una politica identica su architetture diverse.
+GUI, demo, diagnostica e auto-tune scrivono esclusivamente i nomi comuni.
+I default possono restare diversi quando sono il risultato di A/B differenti:
+un nome comune uniforma il controllo, non forza una politica identica su
+architetture diverse.
+
+## Schema condiviso
+
+La fonte di verità compilabile è `DS4RuntimeKnob`: ogni controllo condiviso
+dichiara nome canonico, categoria, tipo del valore e soli alias legacy
+applicabili a ciascun backend. `DS4RuntimeEnvironment` risolve questo schema
+con precedenza canonica e mantiene gli alias isolati, quindi per esempio un
+vecchio `DS4_GLM_MTLIO` non può configurare Laguna.
+
+Regola per i backend futuri:
+
+- riusare un caso `DS4RuntimeKnob` quando la semantica operativa coincide;
+- aggiungere un nuovo `DS4_*` allo schema quando il concetto è riutilizzabile;
+- usare `DS4_<BACKEND>_*` soltanto per gate, formati o algoritmi esclusivi;
+- non aggiungere un alias backend-specifico per un nuovo backend.
 
 ## Parametri comuni della demo
 
@@ -54,25 +70,26 @@ automaticamente.
 
 | Concetto comune | Nome comune | DeepSeek V4 | GLM 5.2 | Laguna S 2.1 |
 |---|---|---|---|---|
-| Esperti attivi | `DS4_ACTIVE_EXPERTS` | `1...6`, default `6` | `1...8`, default `8`; alias `DS4_GLM_ACTIVE_EXPERTS` | `1...10`, default `10`; alias `DS4_LAGUNA_ACTIVE_EXPERTS` |
-| Cache esperti in slot/layer | `DS4_EXPERT_CACHE_SLOTS` | default `0`; pool per layer | default `16`; alias `DS4_GLM_EXPERT_SLOTS` | pool globale; alias `DS4_LAGUNA_EXPERT_CACHE_SLOTS`, altrimenti derivato dai MiB |
-| Cache esperti in MiB | `DS4_EXPERT_CACHE_MB` | — | — | default `2048`; alias `DS4_LAGUNA_EXPERT_CACHE_MB` |
-| Layer residenti | `DS4_RESIDENT_LAYERS` | dense residency separata | adattivo; alias `DS4_GLM_RESIDENT_LAYERS` | prefisso di layer routed residenti; alias `DS4_LAGUNA_RESIDENT_LAYERS` |
-| Slot dello streamer | `DS4_STREAM_SLOTS` | ring denso controllato da `DS4_DENSE_AHEAD` | default `3`; alias `DS4_GLM_STREAM_SLOTS` | staging/cache derivati dal budget |
-| Prefill batch principale | `DS4_PREFILL_BATCH` | on; alias `DS4_PREFILL_BATCH_ATTN` | off; alias `DS4_GLM_PREFILL_BATCH` | on; alias `DS4_LAGUNA_PREFILL_BATCH` |
-| Proiezioni dense multi-token | `DS4_PREFILL_DENSE_MM` | on | — | on; alias `DS4_LAGUNA_PREFILL_DENSE_MM` |
-| MoE multi-token nel prefill | `DS4_PREFILL_MOE_BATCH` | on; alias `DS4_PREFILL_FFN_BATCH` | on; alias `DS4_GLM_PREFILL_MOE` | off sperimentale; alias `DS4_LAGUNA_PREFILL_MOE_BATCH` |
-| Route batch nel prefill | `DS4_PREFILL_ROUTE_BATCH` | default `32` | default `16`; alias `DS4_GLM_PREFILL_ROUTE_BATCH` | incorporato nel chunk layer-major |
-| Chunk prefill | `DS4_PREFILL_CHUNK` | default `512` | intero prompt layer-major | default/max richiesto `256`, ridotto automaticamente dalla cache; alias `DS4_LAGUNA_PREFILL_CHUNK` |
-| Wiring RAM | `DS4_MLOCK` | off | on; alias `DS4_GLM_MLOCK` | off; alias `DS4_LAGUNA_MLOCK` |
-| MetalIO | `DS4_MTLIO` | off | on; alias `DS4_GLM_MTLIO` | off; alias `DS4_LAGUNA_MTLIO`, fallback automatico a pread |
-| Split delle `pread` | `DS4_PREAD_SPLIT` | default `1` | default `4`; alias `DS4_GLM_READ_SPLIT` | default `1`, `1...8`; alias `DS4_LAGUNA_PREAD_SPLIT` |
-| Directory bundle | `DS4_BUNDLE_DIR` | `.expbundle` | `.glm-experts`; alias `DS4_GLM_BUNDLE_DIR` | — |
-| Storico routing | `DS4_USAGE_FILE` | `.usage.json` | `.glm-usage.json`; alias `DS4_GLM_USAGE_FILE` | — |
-| Decode speculativo | `DS4_SPEC_K` | self-speculative | prompt lookup; alias `DS4_GLM_SPEC_K` | — |
-| SIMD group generico | `DS4_NSG` | usa controlli distinti Q8/MoE | default `4`; alias `DS4_GLM_NSG` | default `4`, `1...8`; alias `DS4_LAGUNA_NSG` |
-| Attention lunga indicizzata | `DS4_INDEXED_ATTN` | on, indexer appreso DSA | — | on oltre 4096 token, indice a centroidi; alias `DS4_LAGUNA_INDEXED_ATTN` |
-| Overlap shared expert/I/O | `DS4_SHARED_EXPERT_OVERLAP` | incorporato in `DS4_ASYNC_ROUTE` | — | off nel preset M1 Pro; alias `DS4_LAGUNA_SHARED_EXPERT_OVERLAP` |
+| Esperti attivi | `DS4_ACTIVE_EXPERTS` | `1...6`, default `6` | `1...8`, default `8` | `1...10`, default `10` |
+| Cache esperti in slot/layer | `DS4_EXPERT_CACHE_SLOTS` | default `0`; pool per layer | default `16` | pool globale, altrimenti derivato dai MiB |
+| Cache esperti in MiB | `DS4_EXPERT_CACHE_MB` | — | — | default `2048` |
+| Layer residenti | `DS4_RESIDENT_LAYERS` | dense residency separata | adattivo | prefisso di layer routed residenti |
+| Slot dello streamer | `DS4_STREAM_SLOTS` | ring denso controllato da `DS4_DENSE_AHEAD` | default `3` | staging/cache derivati dal budget |
+| Streaming SSD | `DS4_SSD_STREAM` | implicito nel gather | implicito per i layer non residenti | on nel preset GUI |
+| Prefill batch principale | `DS4_PREFILL_BATCH` | on | off | on |
+| Proiezioni dense multi-token | `DS4_PREFILL_DENSE_MM` | on | — | on |
+| MoE multi-token nel prefill | `DS4_PREFILL_MOE_BATCH` | on | on | off sperimentale |
+| Route batch nel prefill | `DS4_PREFILL_ROUTE_BATCH` | default `32` | default `16` | incorporato nel chunk layer-major |
+| Chunk prefill | `DS4_PREFILL_CHUNK` | default `512` | intero prompt layer-major | default/max richiesto `256`, ridotto automaticamente dalla cache |
+| Wiring RAM | `DS4_MLOCK` | off | on | off |
+| MetalIO | `DS4_MTLIO` | off | on | off, fallback automatico a pread |
+| Split delle `pread` | `DS4_PREAD_SPLIT` | default `1` | default `4` | default `1`, `1...8` |
+| Directory bundle | `DS4_BUNDLE_DIR` | `.expbundle` | `.glm-experts` | — |
+| Storico routing | `DS4_USAGE_FILE` | `.usage.json` | `.glm-usage.json` | — |
+| Decode speculativo | `DS4_SPEC_K` | self-speculative | prompt lookup | — |
+| SIMD group generico | `DS4_NSG` | usa controlli distinti Q8/MoE | default `4` | default `4`, `1...8` |
+| Attention lunga indicizzata | `DS4_INDEXED_ATTN` | on, indexer appreso DSA | — | on oltre 4096 token, indice a centroidi |
+| Overlap shared expert/I/O | `DS4_SHARED_EXPERT_OVERLAP` | incorporato in `DS4_ASYNC_ROUTE` | — | off nel preset M1 Pro |
 
 Lo stesso nome non promette lo stesso default o la stessa implementazione
 interna. Promette la stessa intenzione operativa: per esempio
@@ -87,8 +104,8 @@ interna. Promette la stessa intenzione operativa: per esempio
 | `DS4_PREFILL_CHUNK` | `512` | Token per chunk. |
 | `DS4_PREFILL_UNION` | `192` | Esperti massimi per unione I/O. |
 | `DS4_PREFILL_ROUTE_BATCH` | `32` | Token per commit della fase route. |
-| `DS4_PREFILL_BATCH_ATTN` | on | Attention multi-query nel route batch. |
-| `DS4_PREFILL_FFN_BATCH` | on | Un command buffer FFN per gruppo. |
+| `DS4_PREFILL_BATCH` | on | Attention multi-query nel route batch. |
+| `DS4_PREFILL_MOE_BATCH` | on | Un command buffer FFN per gruppo. |
 | `DS4_PREFILL_MM` | off | FFN matmul multi-token, non bit-identica. |
 | `DS4_PREFILL_DENSE_MM` | on | Proiezioni dense matmul nel batch. |
 | `DS4_PREFILL_FULL_LAYER` | on | Stream dell'intero layer routed sui prompt lunghi. |
@@ -173,27 +190,27 @@ interna. Promette la stessa intenzione operativa: per esempio
 
 | Parametro | Default | Funzione |
 |---|---:|---|
-| `DS4_GLM_RESIDENT_LAYERS` | adattivo | Prefisso di layer residenti. |
-| `DS4_GLM_ACTIVE_EXPERTS` | `8` | Cap esperti routed. |
-| `DS4_GLM_EXPERT_SLOTS` | `16` | Slot cache per layer sparse. |
+| `DS4_RESIDENT_LAYERS` | adattivo | Prefisso di layer residenti. |
+| `DS4_ACTIVE_EXPERTS` | `8` | Cap esperti routed. |
+| `DS4_EXPERT_CACHE_SLOTS` | `16` | Slot cache per layer sparse. |
 | `DS4_GLM_EXPERT_ARENA` | `24` | Record dell'arena expert-major. |
-| `DS4_GLM_STREAM_SLOTS` | `3` | Slot dello streamer di layer. |
+| `DS4_STREAM_SLOTS` | `3` | Slot dello streamer di layer. |
 | `DS4_GLM_SG` | on | Matvec cooperativi simdgroup. |
-| `DS4_GLM_NSG` | `4` | Righe/simdgroup per threadgroup. |
+| `DS4_NSG` | `4` | Righe/simdgroup per threadgroup. |
 | `DS4_GLM_MOE_BATCH` | on | MoE batchato nel decode. |
 | `DS4_GLM_GPU_ROUTER` | on | Router fuso su GPU. |
 | `DS4_GLM_FUSE` | on | Fusione commit FFN/trunk. |
-| `DS4_GLM_MLOCK` | on | Wiring dei pesi residenti. |
-| `DS4_GLM_MTLIO` | on | MetalIO per layer streaming. |
+| `DS4_MLOCK` | on | Wiring dei pesi residenti. |
+| `DS4_MTLIO` | on | MetalIO per layer streaming. |
 | `DS4_GLM_NOCACHE` | off | `F_NOCACHE` sul reader. |
-| `DS4_GLM_READ_SPLIT` | `4` | Split concorrenti nel prefill. |
-| `DS4_GLM_PREFILL_BATCH` | off | Route batch multi-token. |
-| `DS4_GLM_PREFILL_ROUTE_BATCH` | `16` | Token per route batch. |
-| `DS4_GLM_PREFILL_MOE` | on | Fase MoE expert-major multi-token. |
+| `DS4_PREAD_SPLIT` | `4` | Split concorrenti nel prefill. |
+| `DS4_PREFILL_BATCH` | off | Route batch multi-token. |
+| `DS4_PREFILL_ROUTE_BATCH` | `16` | Token per route batch. |
+| `DS4_PREFILL_MOE_BATCH` | on | Fase MoE expert-major multi-token. |
 | `DS4_GLM_SPEC_EXPERTS` | backend | Esperti del percorso speculativo. |
-| `DS4_GLM_SPEC_K` | off | Prompt-lookup speculative decode. |
-| `DS4_GLM_USAGE_FILE` | sibling `.glm-usage.json` | Storico routing. |
-| `DS4_GLM_BUNDLE_DIR` | sibling `.glm-experts` | Bundle esperti legacy. |
+| `DS4_SPEC_K` | off | Prompt-lookup speculative decode. |
+| `DS4_USAGE_FILE` | sibling `.glm-usage.json` | Storico routing. |
+| `DS4_BUNDLE_DIR` | sibling `.glm-experts` | Bundle esperti legacy. |
 | `DS4_GLM_LAYERQ4` | on | Usa tensori Q4 del sidecar unificato. |
 | `DS4_GLM_LAYERQ4_DIR` | sibling `.glm-layers-q4` | Directory sidecar. |
 | `DS4_GLM_BUILD_BUNDLES` | off | Prepass builder bundle legacy. |
@@ -208,58 +225,58 @@ interna. Promette la stessa intenzione operativa: per esempio
 | Parametro | Default | Funzione |
 |---|---:|---|
 | `DS4_LAGUNA_RUNTIME` | off | Gate esplicito del backend. |
-| `DS4_LAGUNA_SSD_STREAM` | on nel preset GUI, off nella demo | Streaming degli esperti routed; i chiamanti senza preset usano la selezione automatica file/RAM. |
-| `DS4_LAGUNA_EXPERT_CACHE_MB` | `2048` con streaming | Budget globale cache esperti. |
-| `DS4_LAGUNA_EXPERT_CACHE_SLOTS` | derivato dai MiB | Numero esplicito di slot globali; ha precedenza sul budget. |
-| `DS4_LAGUNA_ACTIVE_EXPERTS` | `10` nel motore/demo, `6` nel preset GUI | Top-N routed realmente eseguito (`1...10`), con rinormalizzazione dei pesi. |
-| `DS4_LAGUNA_RESIDENT_LAYERS` | `0` con streaming | Prefisso di layer routed i cui esperti restano residenti. |
+| `DS4_SSD_STREAM` | on nel preset GUI, off nella demo | Streaming degli esperti routed; i chiamanti senza preset usano la selezione automatica file/RAM. |
+| `DS4_EXPERT_CACHE_MB` | `2048` con streaming | Budget globale cache esperti. |
+| `DS4_EXPERT_CACHE_SLOTS` | derivato dai MiB | Numero esplicito di slot globali; ha precedenza sul budget. |
+| `DS4_ACTIVE_EXPERTS` | `10` nel motore/demo, `6` nel preset GUI | Top-N routed realmente eseguito (`1...10`), con rinormalizzazione dei pesi. |
+| `DS4_RESIDENT_LAYERS` | `0` con streaming | Prefisso di layer routed i cui esperti restano residenti. |
 | `DS4_LAGUNA_LAYERS` | tutti | Tronca lo stack per bring-up. |
-| `DS4_LAGUNA_KV_INITIAL` | `512` | Righe iniziali dei 12 layer full-attention; crescita geometrica fino al contesto configurato. Evita di riservare subito la KV massima. |
-| `DS4_LAGUNA_PREFILL_BATCH` | on | QK/RoPE e attention causale batchati. |
-| `DS4_LAGUNA_PREFILL_DENSE_MM` | on | RMSNorm, Q/K/V/gate, output attention, router e FFN denso/condiviso multi-token; `0` ripristina il percorso matvec. |
-| `DS4_LAGUNA_PREFILL_MOE_BATCH` | off | MoE expert-major sperimentale; A/B regressivo. |
-| `DS4_LAGUNA_PREFILL_CHUNK` | `256` | Limite del chunk layer-major (`1...1024`); la cache può ridurlo. |
-| `DS4_LAGUNA_DECODE_CHAINED` | off | Variante A/B: accoda tail esperti N + trunk N+1; regressiva sul M1 Pro misurato. |
-| `DS4_LAGUNA_DECODE_SPLIT_K` | off | Variante A/B GQA split-K sui 12 layer globali; regressiva sul M1 Pro misurato. |
-| `DS4_LAGUNA_DECODE_SPLIT_K_MIN` | `384` | Soglia di token visibili per lo split-K globale. |
-| `DS4_LAGUNA_SHARED_EXPERT_OVERLAP` | off | Calcola lo shared expert residente mentre avanzano le letture SSD routed; alias comune `DS4_SHARED_EXPERT_OVERLAP`. L'A/B stabilizzato sul M1 Pro favorisce off. |
-| `DS4_LAGUNA_INDEXED_ATTN` | on | Indice compresso a blocchi e attention sparsa GPU sui layer globali oltre soglia; alias comune `DS4_INDEXED_ATTN`. |
-| `DS4_LAGUNA_INDEXED_ATTN_BLOCK` | `16` | Token per centroide dell'indice; alias `DS4_LONG_ATTN_BLOCK`. |
-| `DS4_LAGUNA_INDEXED_ATTN_TOP_BLOCKS` | `32` | Blocchi storici selezionati per testa; alias `DS4_LONG_ATTN_TOP_BLOCKS`. |
-| `DS4_LAGUNA_INDEXED_ATTN_RECENT` | `512` | Coda recente sempre densa; alias `DS4_LONG_ATTN_RECENT`. |
-| `DS4_LAGUNA_INDEXED_ATTN_THRESHOLD` | `4096` | Token visibili prima di attivare la selezione sparsa; alias `DS4_LONG_ATTN_THRESHOLD`. |
-| `DS4_LAGUNA_DISCARD_UPLOAD_PAGES` | off | Variante A/B: scarta le pagine mmap già copiate; leggermente regressiva sul target misurato. |
-| `DS4_LAGUNA_RESIDENT_PRIVATE` | off | Variante A/B: copia i pesi residenti in buffer Metal private via staging riusabile. |
-| `DS4_LAGUNA_EXPERT_CACHE_PARTITIONED` | off | Variante A/B: partiziona gli slot per layer quando il budget copre tutti i top-N; regressiva sul target misurato. |
-| `DS4_LAGUNA_EXPERT_PREAD` | on | Miss esperti via `pread/F_NOCACHE`; off usa mmap+memcpy. |
-| `DS4_LAGUNA_PREAD_SPLIT` | `1` | Range concorrenti per slab (`1...8`). |
-| `DS4_LAGUNA_WILLNEED_EXPERTS` | on | `WILLNEED` sui soli slab selezionati nel percorso mmap. |
-| `DS4_LAGUNA_MTLIO` | off | Caricamento diretto SSD → `MTLBuffer`, con fallback permanente. |
-| `DS4_LAGUNA_MLOCK` | off | Pin best-effort di output head e pool/staging esperti. |
-| `DS4_LAGUNA_NSG` | `4` | SIMD group per threadgroup (`1...8`). |
+| `DS4_KV_INITIAL` | `512` | Righe iniziali dei 12 layer full-attention; crescita geometrica fino al contesto configurato. Evita di riservare subito la KV massima. |
+| `DS4_PREFILL_BATCH` | on | QK/RoPE e attention causale batchati. |
+| `DS4_PREFILL_DENSE_MM` | on | RMSNorm, Q/K/V/gate, output attention, router e FFN denso/condiviso multi-token; `0` ripristina il percorso matvec. |
+| `DS4_PREFILL_MOE_BATCH` | off | MoE expert-major sperimentale; A/B regressivo. |
+| `DS4_PREFILL_CHUNK` | `256` | Limite del chunk layer-major (`1...1024`); la cache può ridurlo. |
+| `DS4_DECODE_CHAINED` | off | Variante A/B: accoda tail esperti N + trunk N+1; regressiva sul M1 Pro misurato. |
+| `DS4_DECODE_SPLIT_K` | off | Variante A/B GQA split-K sui 12 layer globali; regressiva sul M1 Pro misurato. |
+| `DS4_DECODE_SPLIT_K_MIN` | `384` | Soglia di token visibili per lo split-K globale. |
+| `DS4_SHARED_EXPERT_OVERLAP` | off | Calcola lo shared expert residente mentre avanzano le letture SSD routed; l'A/B stabilizzato sul M1 Pro favorisce off. |
+| `DS4_INDEXED_ATTN` | on | Indice compresso a blocchi e attention sparsa GPU sui layer globali oltre soglia. |
+| `DS4_LONG_ATTN_BLOCK` | `16` | Token per centroide dell'indice. |
+| `DS4_LONG_ATTN_TOP_BLOCKS` | `32` | Blocchi storici selezionati per testa. |
+| `DS4_LONG_ATTN_RECENT` | `512` | Coda recente sempre densa. |
+| `DS4_LONG_ATTN_THRESHOLD` | `4096` | Token visibili prima di attivare la selezione sparsa. |
+| `DS4_DISCARD_UPLOAD_PAGES` | off | Variante A/B: scarta le pagine mmap già copiate; leggermente regressiva sul target misurato. |
+| `DS4_RESIDENT_PRIVATE` | off | Variante A/B: copia i pesi residenti in buffer Metal private via staging riusabile. |
+| `DS4_EXPERT_CACHE_PARTITIONED` | off | Variante A/B: partiziona gli slot per layer quando il budget copre tutti i top-N; regressiva sul target misurato. |
+| `DS4_EXPERT_PREAD` | on | Miss esperti via `pread/F_NOCACHE`; off usa mmap+memcpy. |
+| `DS4_PREAD_SPLIT` | `1` | Range concorrenti per slab (`1...8`). |
+| `DS4_WILLNEED_EXPERTS` | on | `WILLNEED` sui soli slab selezionati nel percorso mmap. |
+| `DS4_MTLIO` | off | Caricamento diretto SSD → `MTLBuffer`, con fallback permanente. |
+| `DS4_MLOCK` | off | Pin best-effort di output head e pool/staging esperti. |
+| `DS4_NSG` | `4` | SIMD group per threadgroup (`1...8`). |
 
 Il preset GUI per M1 Pro con circa 10 GiB disponibili usa streaming SSD,
 cache esperti 2.048 MiB, top-6, nessun layer routed residente, chunk 256,
 attention e proiezioni dense batchate, MoE expert-major disattivato,
 KV full-attention lazy da 512 righe, decode chained/split-K e rilascio
 pagine upload disattivati, `pread×1`,
-MetalIO/mlock disattivati e NSG 4. Gli alias specifici
-`DS4_LAGUNA_*` isolano questo profilo dai controlli comuni persistiti dalla
-GUI per DeepSeek; variabili esplicite passate al processo hanno comunque
-precedenza.
+MetalIO/mlock disattivati e NSG 4. La GUI applica il preset canonico soltanto
+dopo aver identificato Laguna, così i valori comuni rimasti dal backend
+caricato in precedenza non contaminano quello selezionato.
 
 La GUI espone “KV full-attention iniziale” con 256/512/1024/2048/4096
 righe e persiste la scelta in `DS4LagunaKVInitial`; 512 è il default
 consigliato. La scelta viene passata direttamente al servizio al prossimo
 caricamento e ha precedenza sul preset d'ambiente della GUI.
 
-## Nomi comuni già accettati
+## Alias storici deprecati
 
 | Nome comune | Alias storici |
 |---|---|
 | `DS4_ACTIVE_EXPERTS` | `DS4_GLM_ACTIVE_EXPERTS`, `DS4_LAGUNA_ACTIVE_EXPERTS` |
 | `DS4_EXPERT_CACHE_SLOTS` | `DS4_GLM_EXPERT_SLOTS`, `DS4_LAGUNA_EXPERT_CACHE_SLOTS` |
 | `DS4_EXPERT_CACHE_MB` | `DS4_LAGUNA_EXPERT_CACHE_MB` |
+| `DS4_SSD_STREAM` | `DS4_LAGUNA_SSD_STREAM` |
 | `DS4_RESIDENT_LAYERS` | `DS4_GLM_RESIDENT_LAYERS`, `DS4_LAGUNA_RESIDENT_LAYERS` |
 | `DS4_STREAM_SLOTS` | `DS4_GLM_STREAM_SLOTS` |
 | `DS4_PREFILL_BATCH` | `DS4_PREFILL_BATCH_ATTN`, `DS4_GLM_PREFILL_BATCH`, `DS4_LAGUNA_PREFILL_BATCH` |
@@ -267,6 +284,7 @@ caricamento e ha precedenza sul preset d'ambiente della GUI.
 | `DS4_PREFILL_MOE_BATCH` | `DS4_PREFILL_FFN_BATCH`, `DS4_GLM_PREFILL_MOE`, `DS4_LAGUNA_PREFILL_MOE_BATCH` |
 | `DS4_PREFILL_ROUTE_BATCH` | `DS4_GLM_PREFILL_ROUTE_BATCH` |
 | `DS4_PREFILL_CHUNK` | `DS4_LAGUNA_PREFILL_CHUNK` |
+| `DS4_KV_INITIAL` | `DS4_LAGUNA_KV_INITIAL` |
 | `DS4_SHARED_EXPERT_OVERLAP` | `DS4_LAGUNA_SHARED_EXPERT_OVERLAP` |
 | `DS4_INDEXED_ATTN` | `DS4_LAGUNA_INDEXED_ATTN` |
 | `DS4_LONG_ATTN_BLOCK` | `DS4_LAGUNA_INDEXED_ATTN_BLOCK` |
@@ -282,6 +300,12 @@ caricamento e ha precedenza sul preset d'ambiente della GUI.
 | `DS4_USAGE_FILE` | `DS4_GLM_USAGE_FILE` |
 | `DS4_SPEC_K` | `DS4_GLM_SPEC_K` |
 | `DS4_NSG` | `DS4_GLM_NSG`, `DS4_LAGUNA_NSG` |
+| `DS4_DECODE_CHAINED` | `DS4_LAGUNA_DECODE_CHAINED` |
+| `DS4_DECODE_SPLIT_K` | `DS4_LAGUNA_DECODE_SPLIT_K` |
+| `DS4_DECODE_SPLIT_K_MIN` | `DS4_LAGUNA_DECODE_SPLIT_K_MIN` |
+| `DS4_DISCARD_UPLOAD_PAGES` | `DS4_LAGUNA_DISCARD_UPLOAD_PAGES` |
+| `DS4_RESIDENT_PRIVATE` | `DS4_LAGUNA_RESIDENT_PRIVATE` |
+| `DS4_EXPERT_CACHE_PARTITIONED` | `DS4_LAGUNA_EXPERT_CACHE_PARTITIONED` |
 
 ## Cosa non va unificato alla cieca
 

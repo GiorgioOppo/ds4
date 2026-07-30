@@ -41,7 +41,7 @@ ottimizzazioni sono default del motore, ognuna con verdetto misurato:
   N+1 in un command buffer — metà delle attese sincrone (~154 → ~77/token);
 - **kernel vettorizzati**: dot IQ2_XXS/Q8_0/Q4_K con FMA float4 e letture
   larghe (−19% GPU);
-- **fase B del prefill multi-token** (`DS4_GLM_PREFILL_MOE`, sulla tecnica
+- **fase B del prefill multi-token** (`DS4_PREFILL_MOE_BATCH`, sulla tecnica
   GEMM fusa di ds4): il loop sui token sta dentro i kernel, così i pesi di
   ogni esperto staged attraversano la DRAM una volta per tile di 4 token
   invece che una volta per token, e una wave è 3 dispatch invece di 3 per
@@ -55,8 +55,8 @@ ottimizzazioni sono default del motore, ognuna con verdetto misurato:
 - **argmax su device** per il decode greedy (readback 4 byte), **coppia
   qA+kvA** in un dispatch, **top-k dell'indexer su device** (contesti oltre
   2.048);
-- **mlock dei pesi residenti** (`DS4_GLM_MLOCK`): head da 433 a 39 ms/token;
-- **letture parallele nel prefill** (`DS4_GLM_READ_SPLIT`, solo prefill —
+- **mlock dei pesi residenti** (`DS4_MLOCK`): head da 433 a 39 ms/token;
+- **letture parallele nel prefill** (`DS4_PREAD_SPLIT`, solo prefill —
   misurato controproducente in decode, dove il ritmo seriale del fill è ciò
   che lascia banda SSD alle letture demand degli esperti);
 - **sidecar Q4 dei layer** come pack unico (`<gguf>.q4dense`, sezioni per

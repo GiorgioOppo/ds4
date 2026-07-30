@@ -151,33 +151,35 @@ When a new parameter is introduced:
 
 ## GLM 5.2 knobs
 
-The GLM backend has its own `DS4_GLM_*` namespace (setting a DeepSeek
-`DS4_*` knob never affects GLM, and vice versa). All engine optimizations
-are defaults; the knobs exist for A/B and diagnostics, are mirrored in the
-GLM settings UI, and every value is dumped at engine init in the engine log
+Knobs with the same meaning across backends use the shared `DS4_*`
+namespace. GLM-only implementation details keep the `DS4_GLM_*` prefix.
+Historical backend-prefixed names are accepted only as fallback aliases;
+the canonical shared name always wins. All engine optimizations are
+defaults; the knobs exist for A/B and diagnostics, are mirrored in the GLM
+settings UI, and every value is dumped at engine init in the engine log
 (`DS4 glm: knob …`). Measured verdicts are on an M1 Pro 16 GB with the
 published IQ2_XXS.
 
 | Knob | Default | Notes |
 |---|---|---|
-| `DS4_GLM_MTLIO` | 1 | 0 measured +18% decode on 16 GB (MetalIO contends with the decode commits); GUI preset sets 0 |
-| `DS4_GLM_ACTIVE_EXPERTS` | 8 | routed experts per token; the shared expert always runs. 6 = −25% expert I/O, mild quality trade-off |
-| `DS4_GLM_RESIDENT_LAYERS` | adaptive | floor of 3 dense layers under RAM pressure (extra residents get paged: ~+750 ms/token measured) |
+| `DS4_MTLIO` | 1 | 0 measured +18% decode on 16 GB (MetalIO contends with the decode commits); GUI preset sets 0 |
+| `DS4_ACTIVE_EXPERTS` | 8 | routed experts per token; the shared expert always runs. 6 = −25% expert I/O, mild quality trade-off |
+| `DS4_RESIDENT_LAYERS` | adaptive | floor of 3 dense layers under RAM pressure (extra residents get paged: ~+750 ms/token measured) |
 | `DS4_GLM_FUSE` | 1 | commit fusion (half the synchronous waits) |
 | `DS4_GLM_MOE_BATCH` | 1 | batched MoE (all routed experts in two dispatches) |
-| `DS4_GLM_PREFILL_MOE` | 1 | multi-token prefill phase B (expert weights read once per 4-token tile; 3 dispatches per wave, bit-exact vs the per-application path) |
+| `DS4_PREFILL_MOE_BATCH` | 1 | multi-token prefill phase B (expert weights read once per 4-token tile; 3 dispatches per wave, bit-exact vs the per-application path) |
 | `DS4_GLM_GPU_ROUTER` | 1 | fused GPU router (−18% prefill) |
-| `DS4_GLM_MLOCK` | 1 | wire resident weights (head 433 → 39 ms/token) |
-| `DS4_GLM_READ_SPLIT` | 4 | parallel prefill layer reads (prefill only; serial in decode by design) |
-| `DS4_GLM_SG` / `DS4_GLM_NSG` | 1 / 4 | cooperative kernel dispatch and simdgroups per threadgroup |
-| `DS4_GLM_STREAM_SLOTS` | 3 (4 fused) | layer staging slots (~250 MiB each) |
+| `DS4_MLOCK` | 1 | wire resident weights (head 433 → 39 ms/token) |
+| `DS4_PREAD_SPLIT` | 4 | parallel prefill layer reads (prefill only; serial in decode by design) |
+| `DS4_GLM_SG` / `DS4_NSG` | 1 / 4 | cooperative kernel dispatch and simdgroups per threadgroup |
+| `DS4_STREAM_SLOTS` | 3 (4 fused) | layer staging slots (~250 MiB each) |
 | `DS4_GLM_EXPERT_ARENA` | 24 | shared staged-expert arena slots (~10 MiB each) |
 | `DS4_GLM_SPEC_EXPERTS` | off | expert speculation; N ≥ 2 = top-N only. Measured net-zero on a saturated SSD |
 | `DS4_GLM_SPEC_K` | off | prompt-lookup speculative decode (demo) |
 | `DS4_GLM_LAYERQ4` / `DS4_GLM_LAYERQ4_DIR` | 1 / sibling→managed | Q4 layer sidecar pack (`<gguf>.q4dense`) |
-| `DS4_GLM_BUNDLE_DIR` | sibling→managed | legacy expert bundle pack (`<gguf>.expbundle`) |
+| `DS4_BUNDLE_DIR` | sibling→managed | legacy expert bundle pack (`<gguf>.expbundle`) |
 | `DS4_GLM_NOCACHE` | off | F_NOCACHE reads; measured counterproductive as default |
-| `DS4_GLM_USAGE_FILE` | `<gguf>.glm-usage.json` | usage imatrix persistence ("off" disables) |
+| `DS4_USAGE_FILE` | `<gguf>.glm-usage.json` | usage imatrix persistence ("off" disables) |
 | `DS4_GLM_AUTOTUNE` / `DS4_GLM_BUILD_LAYERQ4` | off | demo prepasses: auto-tune / sidecar pack build |
 
 Dispatch knobs are re-read at every engine init (`GLM52DispatchKnobs`), so a

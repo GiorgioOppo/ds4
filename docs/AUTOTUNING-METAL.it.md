@@ -214,8 +214,8 @@ esterno.
 
 GLM ha il suo auto-tune pragmatico (bottone "Auto-tune GLM" nelle
 impostazioni GLM, o `DS4_GLM_AUTOTUNE=1` nel demo): sale un gradino alla
-volta sui soli knob ESATTI di caricamento (`DS4_GLM_MTLIO`,
-`DS4_GLM_STREAM_SLOTS`, `DS4_GLM_EXPERT_ARENA`, `DS4_GLM_RESIDENT_LAYERS`,
+volta sui soli knob ESATTI di caricamento (`DS4_MTLIO`,
+`DS4_STREAM_SLOTS`, `DS4_GLM_EXPERT_ARENA`, `DS4_RESIDENT_LAYERS`,
 `DS4_GLM_FUSE`), ricaricando il motore per configurazione — il load
 streaming da ~3 s rende sostenibile il reload per config, cosa preclusa al
 record-holder DeepSeek. I knob di qualità (esperti attivi, Q4 lossy) non

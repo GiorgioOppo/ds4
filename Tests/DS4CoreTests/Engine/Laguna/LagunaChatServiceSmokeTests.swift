@@ -10,22 +10,25 @@ import XCTest
 final class LagunaChatServiceSmokeTests: XCTestCase {
     func testGUIProfilePinsMeasuredLagunaOverrides() {
         let profile = LagunaInferenceService.guiEnvironmentDefaults
-        XCTAssertEqual(profile["DS4_LAGUNA_SSD_STREAM"], "1")
-        XCTAssertEqual(profile["DS4_LAGUNA_EXPERT_CACHE_MB"], "2048")
-        XCTAssertEqual(profile["DS4_LAGUNA_ACTIVE_EXPERTS"], "6")
-        XCTAssertEqual(profile["DS4_LAGUNA_RESIDENT_LAYERS"], "0")
-        XCTAssertEqual(profile["DS4_LAGUNA_KV_INITIAL"], "512")
-        XCTAssertEqual(profile["DS4_LAGUNA_PREFILL_CHUNK"], "256")
-        XCTAssertEqual(profile["DS4_LAGUNA_PREFILL_BATCH"], "1")
-        XCTAssertEqual(profile["DS4_LAGUNA_PREFILL_DENSE_MM"], "1")
-        XCTAssertEqual(profile["DS4_LAGUNA_PREFILL_MOE_BATCH"], "0")
-        XCTAssertEqual(profile["DS4_LAGUNA_EXPERT_PREAD"], "1")
-        XCTAssertEqual(profile["DS4_LAGUNA_PREAD_SPLIT"], "1")
-        XCTAssertEqual(profile["DS4_LAGUNA_MTLIO"], "0")
-        XCTAssertEqual(profile["DS4_LAGUNA_MLOCK"], "0")
-        XCTAssertEqual(profile["DS4_LAGUNA_NSG"], "4")
-        XCTAssertEqual(profile["DS4_LAGUNA_DECODE_CHAINED"], "0")
-        XCTAssertEqual(profile["DS4_LAGUNA_DECODE_SPLIT_K"], "0")
+        XCTAssertEqual(profile["DS4_SSD_STREAM"], "1")
+        XCTAssertEqual(profile["DS4_EXPERT_CACHE_MB"], "2048")
+        XCTAssertEqual(profile["DS4_ACTIVE_EXPERTS"], "6")
+        XCTAssertEqual(profile["DS4_RESIDENT_LAYERS"], "0")
+        XCTAssertEqual(profile["DS4_KV_INITIAL"], "512")
+        XCTAssertEqual(profile["DS4_PREFILL_CHUNK"], "256")
+        XCTAssertEqual(profile["DS4_PREFILL_BATCH"], "1")
+        XCTAssertEqual(profile["DS4_PREFILL_DENSE_MM"], "1")
+        XCTAssertEqual(profile["DS4_PREFILL_MOE_BATCH"], "0")
+        XCTAssertEqual(profile["DS4_EXPERT_PREAD"], "1")
+        XCTAssertEqual(profile["DS4_PREAD_SPLIT"], "1")
+        XCTAssertEqual(profile["DS4_MTLIO"], "0")
+        XCTAssertEqual(profile["DS4_MLOCK"], "0")
+        XCTAssertEqual(profile["DS4_NSG"], "4")
+        XCTAssertEqual(profile["DS4_DECODE_CHAINED"], "0")
+        XCTAssertEqual(profile["DS4_DECODE_SPLIT_K"], "0")
+        XCTAssertFalse(profile.keys.contains {
+            $0.hasPrefix("DS4_LAGUNA_")
+        })
     }
 
     func testStreamedChatProducesText() async throws {

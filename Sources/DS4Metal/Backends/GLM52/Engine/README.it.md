@@ -41,8 +41,8 @@ streaming è una strategia di memoria, mai numerica: il percorso in streaming
 esegue le stesse identiche funzioni del grafo residente sui buffer in
 staging.
 
-Manopole (demo: DS4_GLM_RESIDENT_LAYERS / DS4_GLM_ACTIVE_EXPERTS /
-DS4_GLM_EXPERT_SLOTS): budget dei layer residenti, tetto degli esperti routed
+Manopole (demo: `DS4_RESIDENT_LAYERS` / `DS4_ACTIVE_EXPERTS` /
+`DS4_EXPERT_CACHE_SLOTS`): budget dei layer residenti, tetto degli esperti routed
 (troncamento in ordine di rank — meno I/O, qualità inferiore), dimensione
 della slot cache degli esperti. Dopo ogni token il motore riscalda la slot
 cache di ciascun layer sparso con gli esperti selezionati da quel token
@@ -52,7 +52,7 @@ layer legge ~36 GiB/token — il budget residente, l'accorpamento dei record
 degli esperti già svolto da `read(plan:)` e i futuri percorsi MTLIO/bundle
 sono ciò che rende praticabili le macchine da 16-32 GiB.
 
-MetalIO (`DS4_GLM_MTLIO=1`): lo streamer riempie i propri slot di staging
+MetalIO (`DS4_MTLIO=1`): lo streamer riempie i propri slot di staging
 tramite una `MTLIOCommandQueue` (SSD → MTLBuffer, nessuna copia pread via
 CPU), con una probe di warm-up al caricamento e fallback permanente per
 l'esecuzione verso pread su qualsiasi anomalia — la stessa disciplina del

@@ -15,7 +15,7 @@ import Foundation
 //
 // Disk cost is honest and deliberate: the routed payload is duplicated
 // (~most of the GGUF). This is the same trade the DeepSeek bundle makes —
-// an explicit user opt-in via DS4_GLM_BUNDLE_DIR.
+// an explicit user opt-in via DS4_BUNDLE_DIR.
 
 public enum GLM52ExpertBundleError: Error, Sendable, Equatable,
     CustomStringConvertible {

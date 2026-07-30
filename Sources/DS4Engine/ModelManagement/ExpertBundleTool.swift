@@ -30,8 +30,8 @@ public enum ExpertBundleTool {
                 let directory = environment["DS4_GLM_LAYERQ4_DIR"]
                     ?? (modelPath + ".glm-layers-q4")
                 let legacyBundles = DS4RuntimeEnvironment.value(
-                    "DS4_BUNDLE_DIR",
-                    overrides: ["DS4_GLM_BUNDLE_DIR"],
+                    .bundleDirectory,
+                    backend: .glm52,
                     environment: environment)
                     ?? (modelPath + ".glm-experts")
                 let summary = try GLM52LayerQuantSidecar.buildAvailable(

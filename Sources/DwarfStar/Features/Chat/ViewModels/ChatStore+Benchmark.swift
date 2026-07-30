@@ -215,16 +215,16 @@ extension ChatStore {
                     priority: .userInitiated) {
                     try GLM52ChatService.autoTune(modelPath: path)
                 }.value
-                if let value = outcome.winners["DS4_GLM_MTLIO"] {
+                if let value = outcome.winners["DS4_MTLIO"] {
                     glmMetalIOEnabled = value != "0"
                 }
-                if let value = outcome.winners["DS4_GLM_STREAM_SLOTS"] {
+                if let value = outcome.winners["DS4_STREAM_SLOTS"] {
                     glmStreamSlots = Int(value) ?? 0
                 }
                 if let value = outcome.winners["DS4_GLM_EXPERT_ARENA"] {
                     glmExpertArena = Int(value) ?? 0
                 }
-                if let value = outcome.winners["DS4_GLM_RESIDENT_LAYERS"] {
+                if let value = outcome.winners["DS4_RESIDENT_LAYERS"] {
                     glmResidentLayers = Int(value) ?? 0
                 }
                 if let value = outcome.winners["DS4_GLM_FUSE"] {

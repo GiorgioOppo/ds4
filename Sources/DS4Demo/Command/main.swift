@@ -156,34 +156,34 @@ do {
             log("DS4Demo: GLM 5.2 greedy — prompt: \(prompt)")
             let tokenizer = try GLM52Tokenizer(model: model)
             let runtime = try MetalRuntime()
-            // Knob GLM: DS4_GLM_RESIDENT_LAYERS (quanti layer restano
-            // residenti; gli altri streammano da SSD), DS4_GLM_ACTIVE_EXPERTS
+            // Knob condivisi: DS4_RESIDENT_LAYERS (quanti layer restano
+            // residenti; gli altri streammano da SSD), DS4_ACTIVE_EXPERTS
             // (meno esperti = meno I/O, qualità ridotta),
-            // DS4_GLM_EXPERT_SLOTS (slot cache esperti per layer sparse).
+            // DS4_EXPERT_CACHE_SLOTS (slot cache esperti per layer sparse).
             let environment = ProcessInfo.processInfo.environment
             var glmOptions = GLM52ResidentModelOptions()
             glmOptions.cacheCapacity = maxKeys
             glmOptions.residentLayerCount = DS4RuntimeEnvironment.integer(
-                "DS4_RESIDENT_LAYERS",
-                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                .residentLayers,
+                backend: .glm52,
                 environment: environment)
                 ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
             glmOptions.activeExperts = DS4RuntimeEnvironment.integer(
-                "DS4_ACTIVE_EXPERTS",
-                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                .activeExperts,
+                backend: .glm52,
                 environment: environment)
             if let slots = DS4RuntimeEnvironment.integer(
-                "DS4_EXPERT_CACHE_SLOTS",
-                overrides: ["DS4_GLM_EXPERT_SLOTS"],
+                .expertCacheSlots,
+                backend: .glm52,
                 environment: environment
             ) {
                 glmOptions.expertSlotCount = slots
             }
-            // DS4_GLM_STREAM_SLOTS: slot di staging del layer streamer
+            // DS4_STREAM_SLOTS: slot di staging del layer streamer
             // (default 3 = due fill SSD in volo mentre un layer computa).
             if let slots = DS4RuntimeEnvironment.integer(
-                "DS4_STREAM_SLOTS",
-                overrides: ["DS4_GLM_STREAM_SLOTS"],
+                .streamSlots,
+                backend: .glm52,
                 environment: environment
             ) {
                 glmOptions.streamSlotCount = slots
@@ -194,7 +194,7 @@ do {
             } else {
                 log("DS4Demo: caricamento pesi residenti GLM (decine di GB)…")
             }
-            // Prepass bundle: DS4_GLM_BUILD_BUNDLES=1 + DS4_GLM_BUNDLE_DIR
+            // Prepass bundle: DS4_GLM_BUILD_BUNDLES=1 + DS4_BUNDLE_DIR
             // riimpacchetta i record esperti di ogni layer sparse in file
             // contigui (una lettura per esperto invece di tre; duplica su
             // disco il payload routed). Resumabile: i bundle validi vengono
@@ -202,8 +202,8 @@ do {
             if environment["DS4_GLM_BUILD_BUNDLES"] == "1" {
                 // Convenzione sidecar: accanto al GGUF, salvo override.
                 let bundleDir = DS4RuntimeEnvironment.value(
-                    "DS4_BUNDLE_DIR",
-                    overrides: ["DS4_GLM_BUNDLE_DIR"],
+                    .bundleDirectory,
+                    backend: .glm52,
                     environment: environment)
                     ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
@@ -242,8 +242,8 @@ do {
                 let sidecarDir = environment["DS4_GLM_LAYERQ4_DIR"]
                     ?? (ggufPath + ".glm-layers-q4")
                 let legacyBundles = DS4RuntimeEnvironment.value(
-                    "DS4_BUNDLE_DIR",
-                    overrides: ["DS4_GLM_BUNDLE_DIR"],
+                    .bundleDirectory,
+                    backend: .glm52,
                     environment: environment)
                     ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
@@ -321,8 +321,8 @@ do {
             // dell'I/O per token). Accettazione greedy; il rifiuto fa
             // rollback delle cache e ricommitta solo il prefisso valido.
             let specK = DS4RuntimeEnvironment.integer(
-                "DS4_SPEC_K",
-                overrides: ["DS4_GLM_SPEC_K"],
+                .speculativeTokens,
+                backend: .glm52,
                 environment: environment) ?? 0
             if specK >= 2 {
                 log("DS4Demo: decode speculativo prompt-lookup GLM — "
@@ -439,7 +439,7 @@ do {
                        Date().timeIntervalSince(loadStart), loadSeconds,
                        prefillSeconds, decodeSeconds))
             // Usage imatrix persistita tra i run (come la .usage.json di
-            // DeepSeek): <gguf>.glm-usage.json, DS4_GLM_USAGE_FILE=off per
+            // DeepSeek): <gguf>.glm-usage.json, DS4_USAGE_FILE=off per
             // disattivare.
             glm.saveUsageProfile()
             exit(0)
@@ -553,8 +553,8 @@ do {
             options.cacheCapacity = maxKeys
             options.initialFullCacheCapacity =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_KV_INITIAL",
-                    overrides: ["DS4_LAGUNA_KV_INITIAL"],
+                    .kvInitial,
+                    backend: .laguna,
                     environment: environment)
             options.layerCount = environment["DS4_LAGUNA_LAYERS"].flatMap(Int.init)
             // Streaming SSD sperimentale degli esperti instradati
@@ -562,90 +562,93 @@ do {
             // residenza): segnale Q8_0 residente, ~1.6 GB di letture per
             // token. Rende eseguibile il file da 45 GiB su macchine da
             // 32 GB, a pochi tok/s.
-            options.expertStreaming =
-                environment["DS4_LAGUNA_SSD_STREAM"] == "1"
+            options.expertStreaming = DS4RuntimeEnvironment.flag(
+                .ssdStream,
+                backend: .laguna,
+                default: false,
+                environment: environment)
             // Cache LRU degli slab esperti streamati (slot da un esperto,
             // stile ExpertSlotCache DeepSeek): gli hit non pagano né SSD né
-            // copia. DS4_LAGUNA_EXPERT_CACHE_MB regola il budget; default
+            // copia. DS4_EXPERT_CACHE_MB regola il budget; default
             // 2048 quando lo streaming è attivo: sul target M1 Pro 16 GB
             // è il miglior compromesso end-to-end per prefill e decode.
             // Budget più larghi riducono l'I/O ma introducono pressione
             // memoria; 0 disattiva la cache.
             options.expertCacheMB =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_EXPERT_CACHE_MB",
-                    overrides: ["DS4_LAGUNA_EXPERT_CACHE_MB"],
+                    .expertCacheMB,
+                    backend: .laguna,
                     environment: environment)
                 ?? (options.expertStreaming ? 2_048 : 0)
             options.expertCacheSlots = DS4RuntimeEnvironment.integer(
-                "DS4_EXPERT_CACHE_SLOTS",
-                overrides: ["DS4_LAGUNA_EXPERT_CACHE_SLOTS"],
+                .expertCacheSlots,
+                backend: .laguna,
                 environment: environment)
             options.activeExperts = DS4RuntimeEnvironment.integer(
-                "DS4_ACTIVE_EXPERTS",
-                overrides: ["DS4_LAGUNA_ACTIVE_EXPERTS"],
+                .activeExperts,
+                backend: .laguna,
                 environment: environment)
             options.residentExpertLayers = DS4RuntimeEnvironment.integer(
-                "DS4_RESIDENT_LAYERS",
-                overrides: ["DS4_LAGUNA_RESIDENT_LAYERS"],
+                .residentLayers,
+                backend: .laguna,
                 environment: environment)
             options.prefillChunk = DS4RuntimeEnvironment.integer(
-                "DS4_PREFILL_CHUNK",
-                overrides: ["DS4_LAGUNA_PREFILL_CHUNK"],
+                .prefillChunk,
+                backend: .laguna,
                 environment: environment)
             options.expertPread = DS4RuntimeEnvironment.flag(
-                "DS4_EXPERT_PREAD",
-                overrides: ["DS4_LAGUNA_EXPERT_PREAD"],
+                .expertPread,
+                backend: .laguna,
                 default: true,
                 environment: environment)
             options.willNeedExperts = DS4RuntimeEnvironment.flag(
-                "DS4_WILLNEED_EXPERTS",
-                overrides: ["DS4_LAGUNA_WILLNEED_EXPERTS"],
+                .willNeedExperts,
+                backend: .laguna,
                 default: true,
                 environment: environment)
             options.preadSplit = DS4RuntimeEnvironment.integer(
-                "DS4_PREAD_SPLIT",
-                overrides: ["DS4_LAGUNA_PREAD_SPLIT"],
+                .preadSplit,
+                backend: .laguna,
                 environment: environment) ?? 1
             options.metalIO = DS4RuntimeEnvironment.flag(
-                "DS4_MTLIO",
-                overrides: ["DS4_LAGUNA_MTLIO"],
+                .metalIO,
+                backend: .laguna,
                 default: false,
                 environment: environment)
             options.lockResident = DS4RuntimeEnvironment.flag(
-                "DS4_MLOCK",
-                overrides: ["DS4_LAGUNA_MLOCK"],
+                .mlock,
+                backend: .laguna,
                 default: false,
                 environment: environment)
             options.simdgroupsPerThreadgroup =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_NSG",
-                    overrides: ["DS4_LAGUNA_NSG"],
+                    .simdgroups,
+                    backend: .laguna,
                     environment: environment)
             options.longAttentionIndex = DS4RuntimeEnvironment.flag(
-                "DS4_INDEXED_ATTN",
-                overrides: ["DS4_LAGUNA_INDEXED_ATTN"],
+                .indexedAttention,
+                backend: .laguna,
                 default: true,
                 environment: environment)
             options.longAttentionBlockSize =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_LONG_ATTN_BLOCK",
-                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_BLOCK"],
+                    .longAttentionBlock,
+                    backend: .laguna,
                     environment: environment)
             options.longAttentionTopBlocks =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_LONG_ATTN_TOP_BLOCKS",
-                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_TOP_BLOCKS"],
+                    .longAttentionTopBlocks,
+                    backend: .laguna,
                     environment: environment)
             options.longAttentionRecentTokens =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_LONG_ATTN_RECENT",
-                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_RECENT"],
+                    .longAttentionRecent,
+                    backend: .laguna,
                     environment: environment)
             options.longAttentionThreshold =
                 DS4RuntimeEnvironment.integer(
-                    "DS4_LONG_ATTN_THRESHOLD",
-                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_THRESHOLD"],
+                    .longAttentionThreshold,
+                    backend: .laguna,
                     environment: environment)
             let loadStart = Date()
             let laguna = try LagunaResidentModel(

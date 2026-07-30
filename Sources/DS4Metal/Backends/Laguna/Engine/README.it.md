@@ -33,9 +33,9 @@ K/V tra le sei teste query di produzione) e infine le righe vengono
 committate. Lo staging conserva la semantica sequenziale quando un chunk
 sliding-window attraversa il wrap dell'anello. I piani delle attivazioni
 restano allocati e crescono solo quando un prompt successivo richiede un
-chunk più largo. `DS4_LAGUNA_PREFILL_BATCH=0` ripristina i dispatch
+chunk più largo. `DS4_PREFILL_BATCH=0` ripristina i dispatch
 dell'attention per-token per confronti diagnostici di logits o prestazioni.
-`DS4_PREFILL_DENSE_MM` (alias `DS4_LAGUNA_PREFILL_DENSE_MM`) è attivo per
+`DS4_PREFILL_DENSE_MM` è attivo per
 default e batchea anche RMSNorm, Q/K/V/gate, proiezione di output, router e
 FFN denso/condiviso. Usa le matmul Q8_0 multi-token condivise con DeepSeek;
 lo staging delle attivazioni in F16 rende il risultato numericamente vicino
@@ -59,8 +59,7 @@ usa sui 12 layer globali GQA split-K oltre
 interne già copiate. I percorsi restano utili su GPU/pressioni memoria
 diverse, ma vanno abilitati esplicitamente.
 
-`DS4_SHARED_EXPERT_OVERLAP` (alias
-`DS4_LAGUNA_SHARED_EXPERT_OVERLAP`) avvia lo shared expert
+`DS4_SHARED_EXPERT_OVERLAP` avvia lo shared expert
 residente prima del primo wait sugli slab routed. Lo shared scrive in un
 accumulatore separato mentre le `pread` avanzano; la chiusura conserva
 esattamente l'associazione `(after_attn + routed) + shared`. Il percorso vale
@@ -68,8 +67,7 @@ sia per decode sia per prefill layer-major e `=0` mantiene il precedente
 gather-then-shared. Resta off nel preset M1 Pro: l'A/B top-10 è risultato
 instabile e le misure stabilizzate hanno favorito il percorso non sovrapposto.
 
-Sui 12 layer globali `DS4_INDEXED_ATTN` (alias
-`DS4_LAGUNA_INDEXED_ATTN`, default on) costruisce durante il prefill un indice
+Sui 12 layer globali `DS4_INDEXED_ATTN` (default on) costruisce durante il prefill un indice
 F16 compresso a centroidi di blocco. Oltre 4096 token, ogni testa calcola gli
 score e seleziona top-32 blocchi interamente sulla GPU, poi l'attention legge
 le K/V F16 originali dei blocchi scelti più gli ultimi 512 token densi. Il
@@ -79,12 +77,12 @@ Laguna non contiene i pesi di compressore/indexer appresi di DeepSeek:
 l'indice a centroidi è perciò una selezione sparsa approssimata, mentre le K/V
 dei token selezionati restano esatte. I controlli sono
 `DS4_LONG_ATTN_BLOCK=16`, `DS4_LONG_ATTN_TOP_BLOCKS=32`,
-`DS4_LONG_ATTN_RECENT=512` e `DS4_LONG_ATTN_THRESHOLD=4096`, con i rispettivi
-alias `DS4_LAGUNA_INDEXED_ATTN_*`. `DS4_INDEXED_ATTN=0` ripristina
+`DS4_LONG_ATTN_RECENT=512` e `DS4_LONG_ATTN_THRESHOLD=4096`.
+`DS4_INDEXED_ATTN=0` ripristina
 l'attention densa originale.
 
 La KV attiva cresce lazy: i 12 layer globali partono da
-`DS4_KV_INITIAL`/`DS4_LAGUNA_KV_INITIAL=512`, mentre i 36 layer sliding
+`DS4_KV_INITIAL=512`, mentre i 36 layer sliding
 mantengono il ring da 512 righe. Un contesto massimo 32k non riserva quindi
 subito ~1,5 GiB: sul test da 999 token la KV iniziale è scesa da 1.608 a
 96 MiB e il decode da 0,36 a 1,67 tok/s. Quando si cambia conversazione, la
@@ -103,14 +101,14 @@ percorso "segnale" Q8_0 resta residente e gli slab degli esperti instradati
 vengono letti con `pread`/`F_NOCACHE` direttamente in una cache LRU di buffer
 Metal shared. Gli hit saltano completamente I/O e copia. Demo e GUI usano
 2.048 MiB per default durante lo streaming (529 slot sul GGUF misto provato);
-`DS4_LAGUNA_EXPERT_CACHE_MB=3072` è disponibile per gli A/B e `=0` disabilita
+`DS4_EXPERT_CACHE_MB=3072` è disponibile per gli A/B e `=0` disabilita
 la cache. Sul target M1 Pro 16 GB, 3.072 MiB alza gli hit dal 46% al 53% e
 riduce il gather, ma la pressione memoria peggiora sia il prefill sia il
 decode: il miglior wall-clock osservato resta quello da 2.048 MiB.
 `DecodeProfile`
 (`profileReport()`) riporta il costo per fase.
 
-`DS4_ACTIVE_EXPERTS` (alias `DS4_LAGUNA_ACTIVE_EXPERTS`) riduce il top-k
+`DS4_ACTIVE_EXPERTS` riduce il top-k
 effettivamente eseguito da 10 a `1...10`. Il router seleziona direttamente
 top-N e rinormalizza i pesi sugli esperti rimasti, come DeepSeek; buffer,
 staging, I/O e compute si riducono insieme. Il default del motore 10 conserva
@@ -124,10 +122,10 @@ Gli altri controlli lossless condivisi con DeepSeek sono
 `DS4_EXPERT_PREAD` (on), `DS4_PREAD_SPLIT` (`1...8`),
 `DS4_WILLNEED_EXPERTS` (per il fallback mmap), `DS4_MTLIO` (opt-in con
 fallback automatico), `DS4_MLOCK` (opt-in su head e pool esperti) e
-`DS4_NSG` (`1...8`, default 4). Ognuno accetta anche l'override
-`DS4_LAGUNA_*`.
+`DS4_NSG` (`1...8`, default 4). Gli alias `DS4_LAGUNA_*` sono accettati
+soltanto per compatibilità con vecchi script.
 
-`DS4_LAGUNA_PREFILL_MOE_BATCH=1` abilita una variante sperimentale
+`DS4_PREFILL_MOE_BATCH=1` abilita una variante sperimentale
 expert-major del MoE prefill. Resta disabilitata per default: sullo stesso
 GGUF ha aumentato il prefill da 12,8 a 13,2 s.
 

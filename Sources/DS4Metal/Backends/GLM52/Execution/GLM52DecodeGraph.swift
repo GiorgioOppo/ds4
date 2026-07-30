@@ -16,7 +16,7 @@ enum GLM52MatvecDispatch {
         ProcessInfo.processInfo.environment["DS4_GLM_SG"] != "0"
     nonisolated(unsafe) static var rowsPerThreadgroup = max(1, min(8,
         DS4RuntimeEnvironment.integer(
-            "DS4_NSG", overrides: ["DS4_GLM_NSG"]) ?? 4))
+            .simdgroups, backend: .glm52) ?? 4))
 }
 
 /// MoE BATCHED nel decode (DS4_GLM_MOE_BATCH=0 per disattivare): tutti gli
@@ -27,14 +27,14 @@ enum GLM52MoEBatchDispatch {
         .environment["DS4_GLM_MOE_BATCH"] != "0"
 }
 
-/// Fase B del prefill multi-token (DS4_GLM_PREFILL_MOE=0 per il percorso
+/// Fase B del prefill multi-token (DS4_PREFILL_MOE_BATCH=0 per il percorso
 /// legacy per-applicazione): loop sui token dell'esperto dentro il kernel —
 /// pesi letti una volta per tile invece che una volta per token, tre
 /// dispatch per wave invece di tre per applicazione.
 enum GLM52PrefillMoEDispatch {
     nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
-        "DS4_PREFILL_MOE_BATCH",
-        overrides: ["DS4_GLM_PREFILL_MOE"],
+        .prefillMoEBatch,
+        backend: .glm52,
         default: true)
     /// Applications per wave: bounds the mids/contribs planes (~32 MB at
     /// 1024). Var so the parity test can force multi-wave splits.
@@ -60,34 +60,34 @@ public enum GLM52DispatchKnobs {
         GLM52MatvecDispatch.cooperative = env["DS4_GLM_SG"] != "0"
         GLM52MatvecDispatch.rowsPerThreadgroup = max(1, min(8,
             DS4RuntimeEnvironment.integer(
-                "DS4_NSG", overrides: ["DS4_GLM_NSG"],
+                .simdgroups, backend: .glm52,
                 environment: env) ?? 4))
         GLM52MoEBatchDispatch.enabled = env["DS4_GLM_MOE_BATCH"] != "0"
         GLM52PrefillMoEDispatch.enabled = DS4RuntimeEnvironment.flag(
-            "DS4_PREFILL_MOE_BATCH",
-            overrides: ["DS4_GLM_PREFILL_MOE"],
+            .prefillMoEBatch,
+            backend: .glm52,
             default: true,
             environment: env)
         GLM52GpuRouterDispatch.enabled = env["DS4_GLM_GPU_ROUTER"] != "0"
         GLM52ResidentWiring.enabled = DS4RuntimeEnvironment.flag(
-            "DS4_MLOCK", overrides: ["DS4_GLM_MLOCK"],
+            .mlock, backend: .glm52,
             default: true, environment: env)
         GLM52LayerStreamer.refreshReadSplit(
             DS4RuntimeEnvironment.integer(
-                "DS4_PREAD_SPLIT",
-                overrides: ["DS4_GLM_READ_SPLIT"],
+                .preadSplit,
+                backend: .glm52,
                 environment: env))
         // Leva 1 del prefill (route a gruppi): opt-in finché la parità sul
         // GGUF reale non è certificata; rilettura qui = toggle GUI al reload.
         GLM52PrefillBatchDispatch.enabled = DS4RuntimeEnvironment.flag(
-            "DS4_PREFILL_BATCH",
-            overrides: ["DS4_GLM_PREFILL_BATCH"],
+            .prefillBatch,
+            backend: .glm52,
             default: false,
             environment: env)
         GLM52PrefillBatchDispatch.groupSize = max(2,
             DS4RuntimeEnvironment.integer(
-                "DS4_PREFILL_ROUTE_BATCH",
-                overrides: ["DS4_GLM_PREFILL_ROUTE_BATCH"],
+                .prefillRouteBatch,
+                backend: .glm52,
                 environment: env) ?? 16)
     }
 }
@@ -168,15 +168,15 @@ public struct GLM52StreamedWeightTypes: Sendable {
     public init() {}
 }
 
-/// DS4_GLM_MLOCK (default ON, =0 per disattivare — l'analogo di DS4_MLOCK
-/// DeepSeek): blocca in RAM i pesi RESIDENTI (head, proiezioni attn e FFN
+/// DS4_MLOCK (default ON, =0 per disattivare): blocca in RAM i pesi
+/// RESIDENTI (head, proiezioni attn e FFN
 /// dei layer residenti). Sotto pressione il sistema li comprime/pagina e
 /// ogni token ne ripaga la residency al driver: misurato −394 ms/token sul
 /// solo head (433 → 39 ms). Gli slot di staging dei layer streamati NON
 /// passano da qui: sono riscritti da SSD di continuo, mai freddi.
 enum GLM52ResidentWiring {
     nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
-        "DS4_MLOCK", overrides: ["DS4_GLM_MLOCK"], default: true)
+        .mlock, backend: .glm52, default: true)
 
     static func wire(_ buffer: MTLBuffer) {
         guard enabled else { return }

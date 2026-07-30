@@ -37,8 +37,8 @@ with the next layer's fill overlapping the current layer's GPU compute.
 Streaming is a memory strategy, never a numeric one: the streamed path runs
 the exact same resident-graph functions on the staged buffers.
 
-Knobs (demo: DS4_GLM_RESIDENT_LAYERS / DS4_GLM_ACTIVE_EXPERTS /
-DS4_GLM_EXPERT_SLOTS): resident-layer budget, routed-expert cap (rank-order
+Knobs (demo: `DS4_RESIDENT_LAYERS` / `DS4_ACTIVE_EXPERTS` /
+`DS4_EXPERT_CACHE_SLOTS`): resident-layer budget, routed-expert cap (rank-order
 truncation — less I/O, lower quality), expert slot-cache size. After every
 token the engine warms each sparse layer's slot cache with that token's
 selected experts (`GLM52StreamedExpertProvider.prefetch`, serialized against
@@ -47,7 +47,7 @@ the decode thread). Honest arithmetic: a fully streamed 78-layer pass reads
 done by `read(plan:)`, and the future MTLIO/bundle paths are what make the
 16-32 GiB machines viable.
 
-MetalIO (`DS4_GLM_MTLIO=1`): the streamer fills its staging slots through an
+MetalIO (`DS4_MTLIO=1`): the streamer fills its staging slots through an
 `MTLIOCommandQueue` (SSD → MTLBuffer, no CPU pread copy), with a load-time
 warm-up probe and permanent per-run fallback to pread on any anomaly — the
 same discipline as the DeepSeek ExpertBundle backend.

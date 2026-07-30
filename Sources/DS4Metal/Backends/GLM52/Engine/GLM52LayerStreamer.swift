@@ -116,7 +116,7 @@ public final class GLM52LayerStreamer {
         label: "glm52.layer.streamer", qos: .userInitiated,
         attributes: .concurrent)
     private let stateLock = NSLock()
-    /// Optional Metal fast-resource-loading path (DS4_GLM_MTLIO=1): SSD →
+    /// Optional Metal fast-resource-loading path (DS4_MTLIO=1): SSD →
     /// MTLBuffer without the CPU pread copy, mirroring the DeepSeek
     /// ExpertBundle backend. Any failure permanently falls back to pread.
     /// Guarded by `stateLock` (fills are concurrent); serves the MAIN GGUF
@@ -139,12 +139,12 @@ public final class GLM52LayerStreamer {
 
     private static func makeMetalIO(runtime: MetalRuntime, path: String)
         -> (queue: MTLIOCommandQueue, handle: MTLIOFileHandle)? {
-        // Default ON (DS4_GLM_MTLIO=0 opts out): the fallback to pread on
+        // Default ON (DS4_MTLIO=0 opts out): the fallback to pread on
         // any anomaly is automatic and permanent, so the fast path is safe
         // to prefer.
         guard DS4RuntimeEnvironment.flag(
-            "DS4_MTLIO",
-            overrides: ["DS4_GLM_MTLIO"],
+            .metalIO,
+            backend: .glm52,
             default: true)
         else { return nil }
         do {
@@ -295,13 +295,13 @@ public final class GLM52LayerStreamer {
         }
     }
 
-    /// Sotto-intervalli per tensore del fill parallelo (DS4_GLM_READ_SPLIT,
+    /// Sotto-intervalli per tensore del fill parallelo (DS4_PREAD_SPLIT,
     /// default 4, 1 ripristina di fatto una pread per tensore). Latch
     /// per-load via GLM52DispatchKnobs.refresh, come gli altri knob.
     nonisolated(unsafe) private static var readSplit = max(1, min(8,
         DS4RuntimeEnvironment.integer(
-            "DS4_PREAD_SPLIT",
-            overrides: ["DS4_GLM_READ_SPLIT"]) ?? 4))
+            .preadSplit,
+            backend: .glm52) ?? 4))
 
     static func refreshReadSplit(_ value: Int?) {
         readSplit = max(1, min(8, value ?? 4))

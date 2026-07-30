@@ -47,8 +47,8 @@ public final class StreamingDecoder {
     /// fixed cost at 512-token chunks (43 layers × 512 sync round-trips).
     /// DS4_PREFILL_FFN_BATCH=0 restores the per-token path (A/B parity check).
     let prefillFFNBatch = DS4RuntimeEnvironment.flag(
-        "DS4_PREFILL_MOE_BATCH",
-        overrides: ["DS4_PREFILL_FFN_BATCH"],
+        .prefillMoEBatch,
+        backend: .deepSeekV4,
         default: true)
     /// Batched prefill phase A: encode up to DS4_PREFILL_ROUTE_BATCH consecutive
     /// tokens' routes into ONE command buffer — per-token scratch snapshots are
@@ -86,8 +86,8 @@ public final class StreamingDecoder {
     /// attention for A/B parity. Runs that would overflow the raw ring
     /// (DS4_RAW_RING) fall back automatically.
     let prefillBatchAttn = DS4RuntimeEnvironment.flag(
-        "DS4_PREFILL_BATCH",
-        overrides: ["DS4_PREFILL_BATCH_ATTN"],
+        .prefillBatch,
+        backend: .deepSeekV4,
         default: true)
     /// DS4_PROFILE_PREFILL=1: time the BATCHED prefill run's sub-phases
     /// (dense path only) with commit boundaries, accumulated under the same

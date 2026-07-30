@@ -71,28 +71,28 @@ public actor GLM52ChatService {
         var options = GLM52ResidentModelOptions()
         options.cacheCapacity = max(256, contextSize)
         // RAM-adaptive residency (the biggest tok/s lever on streaming);
-        // GUI setting first, DS4_GLM_RESIDENT_LAYERS next.
+        // GUI setting first, DS4_RESIDENT_LAYERS next.
         options.residentLayerCount = residentLayers
             ?? DS4RuntimeEnvironment.integer(
-                "DS4_RESIDENT_LAYERS",
-                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                .residentLayers,
+                backend: .glm52,
                 environment: environment)
             ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
         options.activeExperts = activeExperts
             ?? DS4RuntimeEnvironment.integer(
-                "DS4_ACTIVE_EXPERTS",
-                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                .activeExperts,
+                backend: .glm52,
                 environment: environment)
         if let slots = DS4RuntimeEnvironment.integer(
-            "DS4_EXPERT_CACHE_SLOTS",
-            overrides: ["DS4_GLM_EXPERT_SLOTS"],
+            .expertCacheSlots,
+            backend: .glm52,
             environment: environment
         ) {
             options.expertSlotCount = slots
         }
         if let slots = DS4RuntimeEnvironment.integer(
-            "DS4_STREAM_SLOTS",
-            overrides: ["DS4_GLM_STREAM_SLOTS"],
+            .streamSlots,
+            backend: .glm52,
             environment: environment
         ) {
             options.streamSlotCount = slots

@@ -43,7 +43,7 @@ defaults, each with a measured verdict:
   loads (−19% GPU);
 - **batched MoE** (`DS4_GLM_MOE_BATCH`): every routed expert in two
   dispatches; the shared expert (always active) stays separate;
-- **multi-token prefill phase B** (`DS4_GLM_PREFILL_MOE`, after the ds4
+- **multi-token prefill phase B** (`DS4_PREFILL_MOE_BATCH`, after the ds4
   fused-GEMM technique): the token loop lives inside the kernels, so each
   staged expert's weights cross DRAM once per 4-token tile instead of once
   per token, and one wave is 3 dispatches instead of 3 per application —
@@ -54,8 +54,8 @@ defaults, each with a measured verdict:
   the trunk commit, 64-byte readback (−18% prefill);
 - **device argmax** for greedy decode (4-byte readback), **paired qA+kvA
   matvec**, **device indexer top-k** (contexts beyond 2,048);
-- **mlock of resident weights** (`DS4_GLM_MLOCK`): head 433 → 39 ms/token;
-- **parallel prefill reads** (`DS4_GLM_READ_SPLIT`, prefill only — measured
+- **mlock of resident weights** (`DS4_MLOCK`): head 433 → 39 ms/token;
+- **parallel prefill reads** (`DS4_PREAD_SPLIT`, prefill only — measured
   counterproductive in decode, where the serial fill pace is what leaves
   SSD bandwidth to the demand expert reads);
 - **Q4 layer sidecar** as a single pack (`<gguf>.q4dense`, sections per

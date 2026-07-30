@@ -633,7 +633,7 @@ extension MetalRuntime {
     /// prefill and token-by-token decode agree within accumulation
     /// tolerance, no longer bit-exactly.
     ///
-    /// Default path (DS4_GLM_PREFILL_MOE): the token loop lives INSIDE the
+    /// Default path (DS4_PREFILL_MOE_BATCH): the token loop lives INSIDE the
     /// multi-token kernels — expert weights cross DRAM once per 4-token
     /// tile instead of once per token, and one wave is 3 dispatches instead
     /// of 3 per application. Per-token math and per-token accumulation
@@ -780,7 +780,7 @@ extension MetalRuntime {
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    /// Legacy per-application path (DS4_GLM_PREFILL_MOE=0 or scalar-dot
+    /// Legacy per-application path (DS4_PREFILL_MOE_BATCH=0 or scalar-dot
     /// mode): three dispatches per (expert, token), shared scratch.
     func glm52ApplyRoutedExpertsLegacy(
         staged: GLM52StagedExpertSelection,

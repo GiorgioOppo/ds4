@@ -172,7 +172,7 @@ final class ChatStore {
         _ = setenv("DS4_MTLIO", metalIOEnabled ? "1" : "0", 1)              // Metal fast resource loading (A/B sperimentale)
         _ = setenv("DS4_MTLIO_MIN_GBS", "4.0", 1)                           // M1 Pro: pread arriva a ~5 GB/s
         _ = setenv("DS4_POOL_INTERLEAVE", "1", 1)                            // un record contiguo per slot/esperto
-        _ = setenv("DS4_PREFILL_FFN_BATCH", "1", 1)                          // un command buffer FFN per gruppo
+        _ = setenv(DS4RuntimeKnob.prefillMoEBatch.rawValue, "1", 1)          // un command buffer FFN per gruppo
         _ = setenv("DS4_PREFILL_MM", "1", 1)                                 // esperti prefill in GEMM (misurato: 48.9 → 20.7 ms/token su M1 Pro)
         _ = setenv("DS4_GPU_INDEXER_TOPK", "1", 1)                           // evita top-k/readback sulla CPU
         _ = setenv("DS4_DENSE_Q4_KERNEL", "1", 1)                            // matvec Q4 dense senza wrapper MoE k=1
@@ -348,7 +348,7 @@ final class ChatStore {
     }
     /// GLM 5.2: fusione dei commit (FFN layer N + trunk N+1 in un command
     /// buffer — ~metà delle attese sincrone). OFF = percorso storico.
-    /// Leva 1 del prefill GLM (DS4_GLM_PREFILL_BATCH): route a gruppi con
+    /// Leva 1 del prefill GLM (DS4_PREFILL_BATCH): route a gruppi con
     /// due commit per gruppo invece di 2-3 per token. Parità bit-esatta nei
     /// test sintetici; OFF finché non validata sul GGUF reale.
     var glmPrefillBatchEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMPrefillBatch") as? Bool) ?? false {
@@ -362,7 +362,7 @@ final class ChatStore {
     var glmMoEBatchEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMMoEBatch") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(glmMoEBatchEnabled, forKey: "GLMMoEBatch") }
     }
-    /// Fase B del prefill multi-token (DS4_GLM_PREFILL_MOE): pesi esperti
+    /// Fase B del prefill multi-token (DS4_PREFILL_MOE_BATCH): pesi esperti
     /// letti una volta per tile di token invece che una volta per token.
     var glmPrefillMoEEnabled: Bool = (UserDefaults.standard.object(forKey: "GLMPrefillMoE") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(glmPrefillMoEEnabled, forKey: "GLMPrefillMoE") }

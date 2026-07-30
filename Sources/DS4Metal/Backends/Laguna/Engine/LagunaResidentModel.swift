@@ -293,15 +293,15 @@ public final class LagunaResidentModel {
     /// hatch for real-GGUF logits audits and performance A/B runs.
     private static let batchedPrefillAttention =
         DS4RuntimeEnvironment.flag(
-            "DS4_PREFILL_BATCH",
-            overrides: ["DS4_LAGUNA_PREFILL_BATCH"],
+            .prefillBatch,
+            backend: .laguna,
             default: true)
     /// Experimental expert-major MoE prefill. The real-model A/B currently
     /// shows a regression, so it remains opt-in for further kernel tuning.
     private static let batchedPrefillMoE =
         DS4RuntimeEnvironment.flag(
-            "DS4_PREFILL_MOE_BATCH",
-            overrides: ["DS4_LAGUNA_PREFILL_MOE_BATCH"],
+            .prefillMoEBatch,
+            backend: .laguna,
             default: false)
     /// Dense multi-token GEMMs for the Laguna signal path. This is the same
     /// portable Q8_0 prefill family used by DeepSeek: mathematically
@@ -310,8 +310,8 @@ public final class LagunaResidentModel {
     /// 32.6 s on M1 Pro; the switch remains as an exact-path escape hatch.
     private static let batchedPrefillDenseMM =
         DS4RuntimeEnvironment.flag(
-            "DS4_PREFILL_DENSE_MM",
-            overrides: ["DS4_LAGUNA_PREFILL_DENSE_MM"],
+            .prefillDenseMM,
+            backend: .laguna,
             default: true)
     private static let prefillDenseMMMinimumTokens = 8
     /// Once a resident tensor has been copied out of the GGUF mmap, its clean
@@ -321,34 +321,34 @@ public final class LagunaResidentModel {
     /// path after model load. Exact bytes in the Metal buffers are unchanged.
     private static let discardUploadedFilePages =
         DS4RuntimeEnvironment.flag(
-            "DS4_DISCARD_UPLOAD_PAGES",
-            overrides: ["DS4_LAGUNA_DISCARD_UPLOAD_PAGES"],
+            .discardUploadPages,
+            backend: .laguna,
             default: false)
     /// GPU-only storage for immutable resident weights. Upload uses one
     /// reusable shared staging buffer and preserves every tensor byte.
     private static let privateResidentWeights =
         DS4RuntimeEnvironment.flag(
-            "DS4_RESIDENT_PRIVATE",
-            overrides: ["DS4_LAGUNA_RESIDENT_PRIVATE"],
+            .residentPrivate,
+            backend: .laguna,
             default: false)
     private static let partitionExpertCache =
         DS4RuntimeEnvironment.flag(
-            "DS4_EXPERT_CACHE_PARTITIONED",
-            overrides: ["DS4_LAGUNA_EXPERT_CACHE_PARTITIONED"],
+            .partitionExpertCache,
+            backend: .laguna,
             default: false)
     /// Long-context full-attention decode. The grouped kernel evaluates three
     /// query heads sharing one KV head, then a specialized reducer applies the
     /// learned gate. Sliding-window layers keep the ring-aware legacy kernel.
     private static let decodeSplitK =
         DS4RuntimeEnvironment.flag(
-            "DS4_DECODE_SPLIT_K",
-            overrides: ["DS4_LAGUNA_DECODE_SPLIT_K"],
+            .decodeSplitK,
+            backend: .laguna,
             default: false)
     private static let decodeSplitKMinimumKeys = max(
         257,
         DS4RuntimeEnvironment.integer(
-            "DS4_DECODE_SPLIT_K_MIN",
-            overrides: ["DS4_LAGUNA_DECODE_SPLIT_K_MIN"]) ?? 384)
+            .decodeSplitKMinimum,
+            backend: .laguna) ?? 384)
     private static let decodeSplitKMaximumWorkgroups = 32
     /// Queue the expert tail of layer N without a CPU wait, then append the
     /// attention/router trunk of N+1 on the same in-order Metal queue. Waiting
@@ -356,8 +356,8 @@ public final class LagunaResidentModel {
     /// preserving every kernel and dependency.
     private static let chainedDecode =
         DS4RuntimeEnvironment.flag(
-            "DS4_DECODE_CHAINED",
-            overrides: ["DS4_LAGUNA_DECODE_CHAINED"],
+            .decodeChained,
+            backend: .laguna,
             default: false)
     /// Start the resident shared expert before the first routed-expert SSD
     /// wait. Its result is kept in `hiddenNext`; routed experts continue to
@@ -365,8 +365,8 @@ public final class LagunaResidentModel {
     /// `(after_attn + routed) + shared` association exactly.
     private static let sharedExpertIOOverlap =
         DS4RuntimeEnvironment.flag(
-            "DS4_SHARED_EXPERT_OVERLAP",
-            overrides: ["DS4_LAGUNA_SHARED_EXPERT_OVERLAP"],
+            .sharedExpertOverlap,
+            backend: .laguna,
             default: false)
 
     /// Routed-expert types with a wired matvec path (the K-quant dot helpers
