@@ -79,6 +79,34 @@ final class SamplerTests: XCTestCase {
         XCTAssertEqual(penalized, 3)
     }
 
+    func testUnsafeBufferSamplingMatchesArrayPath() {
+        let logits = makeLogits(2003)
+        let cases: [(Float, Int, Float, Float, Float, [Int])] = [
+            (0, 0, 1, 0, 1, []),
+            (0.7, 20, 0.95, 0.05, 1, []),
+            (0.8, 0, 0.9, 0.01, 1, []),
+            (0.6, 40, 0.95, 0.05, 1.2, [7, 19, 23]),
+        ]
+        for (temperature, topK, topP, minP, penalty, recent) in cases {
+            var arrayRNG: UInt64 = 0x1234_5678
+            var pointerRNG = arrayRNG
+            let arrayToken = Sampler.sample(
+                logits, temperature: temperature,
+                topK: topK, topP: topP, minP: minP,
+                repetitionPenalty: penalty, recent: recent[...],
+                rng: &arrayRNG)
+            let pointerToken = logits.withUnsafeBufferPointer {
+                Sampler.sample(
+                    $0, temperature: temperature,
+                    topK: topK, topP: topP, minP: minP,
+                    repetitionPenalty: penalty, recent: recent[...],
+                    rng: &pointerRNG)
+            }
+            XCTAssertEqual(pointerToken, arrayToken)
+            XCTAssertEqual(pointerRNG, arrayRNG)
+        }
+    }
+
     /// DS4_FAST_SAMPLER parity: the threshold-collected fast path of the
     /// full-vocabulary sampler must reproduce the historical full build
     /// exactly — same token AND same RNG stream — across a grid of parameters

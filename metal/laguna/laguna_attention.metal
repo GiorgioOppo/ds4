@@ -1,240 +1,254 @@
-// Laguna S 2.1 (`laguna`) kernels, ported from the reference `laguna-s2.1`
-// branch (`metal/laguna.metal`, head 448d569).
-//
-// Keep these kernels architecture-owned instead of adding Laguna branches to
-// the DeepSeek or GLM source. The C graph equivalents own model semantics and
-// scheduling; these kernels only cover operations that are not represented by
-// the shared DeepSeek/GLM Metal API: per-head RMSNorm + NeoX RoPE, the F16
-// ring KV store, gated GQA attention (decode and prefill), the fused
-// flash-attention reduce with the per-head softplus gate, and a dense Q6_K
-// projection for the legacy recipe. Shared helpers used here — `rope_yarn`,
-// `rope_yarn_corr_dims` (metal/deepseek/dsv4_rope.metal) and the
-// flash-attention vec-reduce args/function-constants
-// (metal/deepseek/flash_attn.metal) — must precede this file in the
-// concatenation order.
+// Laguna S 2.1 — gated GQA attention, prefill and decode, plus the fused
+// flash-attention reduce with the per-head softplus gate (ported from the
+// Part of the concatenated library: see MetalRuntime.kernelFiles for the order.
 
 #include <metal_stdlib>
 using namespace metal;
 
-// llama.cpp Q6_K block (256 elements / 210 bytes), spelled with literal sizes
-// because the port does not define a shared QK_K macro. Used only by
-// kernel_laguna_q6_K_matmul_f32 at the end of this file.
-struct block_q6_K {
-    uchar ql[128];
-    uchar qh[64];
-    char scales[16];
-    half d;
-};
+// reference laguna-s2.1 branch, head 448d569). Needs laguna_kv.metal (the
+// prefill args struct) and metal/deepseek/flash_attn.metal before it.
 
-// Laguna-specific primitives. The C graph owns model semantics and scheduling;
-// these kernels only cover operations that are not represented by the shared
-// DeepSeek/GLM Metal API.
-
-struct ds4_metal_args_laguna_norm_rope {
-    uint32_t n_tokens;
+struct ds4_metal_args_laguna_long_index {
     uint32_t n_head;
+    uint32_t n_head_kv;
     uint32_t head_dim;
-    uint32_t n_rot;
-    uint32_t pos0;
-    uint32_t n_ctx_orig;
-    float    eps;
-    float    freq_base;
-    float    freq_scale;
-    float    ext_factor;
-    float    attn_factor;
-    float    beta_fast;
-    float    beta_slow;
-    uint32_t pad0;
+    uint32_t cache_cap;
+    uint32_t block_size;
+    uint32_t block_count;
+    uint32_t top_k;
+    uint32_t raw_start;
+    uint32_t raw_count;
+    uint32_t score_stride;
+    float    scale;
+    uint32_t _pad;
 };
 
-static inline void laguna_head_rms_norm_rope_neox(
-        constant ds4_metal_args_laguna_norm_rope &args,
-        device float       *row,
-        device const float *weight,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid,
-        uint nth,
-        uint token) {
-    float ss = 0.0f;
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        const float v = row[i];
-        ss += v * v;
+// One F16 centroid per completed raw-key block. These rows are a search index
+// only: indexed attention below consumes the original K/V of selected blocks.
+kernel void kernel_laguna_long_index_compress_f16(
+        constant uint32_t *args,
+        device const half *key_cache,
+        device half       *index_keys,
+        uint gid [[thread_position_in_grid]]) {
+    const uint row_width = args[0];
+    const uint block_size = args[1];
+    const uint first_block = args[2];
+    const uint block_count = args[3];
+    const uint total = block_count * row_width;
+    if (gid >= total || row_width == 0u || block_size == 0u) return;
+    const uint local_block = gid / row_width;
+    const uint column = gid - local_block * row_width;
+    const uint block = first_block + local_block;
+    float sum = 0.0f;
+    const uint first_row = block * block_size;
+    for (uint r = 0; r < block_size; ++r) {
+        sum += (float)key_cache[
+            (uint64_t)(first_row + r) * row_width + column];
     }
-    scratch[tid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
-        if (tid < step) scratch[tid] += scratch[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        row[i] = row[i] * inv * weight[i];
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    const uint half_rot = args.n_rot >> 1u;
-    if (tid >= half_rot) return;
-
-    float corr_dims[2] = {0.0f, 0.0f};
-    if (args.ext_factor != 0.0f) {
-        rope_yarn_corr_dims((int)args.n_rot,
-                            (int)args.n_ctx_orig,
-                            args.freq_base,
-                            args.beta_fast,
-                            args.beta_slow,
-                            corr_dims);
-    }
-    const int rel_i0 = (int)(tid * 2u);
-    const float inv_ndims = -1.0f / (float)args.n_rot;
-#ifdef DS4_METAL_ROPE_EXP2_LOG2
-    const float theta = (float)(args.pos0 + token) *
-        exp2(inv_ndims * (float)rel_i0 * log2(args.freq_base));
-#else
-    const float theta = (float)(args.pos0 + token) *
-        pow(args.freq_base, inv_ndims * (float)rel_i0);
-#endif
-    float cos_theta;
-    float sin_theta;
-    rope_yarn(theta,
-              args.freq_scale,
-              corr_dims,
-              rel_i0,
-              args.ext_factor,
-              args.attn_factor,
-              &cos_theta,
-              &sin_theta);
-    const float x0 = row[tid];
-    const float x1 = row[tid + half_rot];
-    row[tid] = x0 * cos_theta - x1 * sin_theta;
-    row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
+    index_keys[(uint64_t)block * row_width + column] =
+        half(sum / (float)block_size);
 }
 
-// Laguna uses Qwen-style per-head RMSNorm and NeoX rotary pairs. Rotary
-// dimensions occupy the prefix of each head; any remaining dimensions are
-// normalized but left unrotated.
-kernel void kernel_laguna_head_rms_norm_rope_neox(
-        constant ds4_metal_args_laguna_norm_rope &args,
-        device float       *x,
-        device const float *weight,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
+// Score every compressed block for every query head. GQA heads share index
+// rows but retain independent selections, which avoids degrading one head to
+// the aggregate preference of its siblings.
+kernel void kernel_laguna_long_index_scores_f16(
+        constant ds4_metal_args_laguna_long_index &args,
+        device const float *query,
+        device const half  *index_keys,
+        device float       *scores,
+        ushort lane [[thread_index_in_simdgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint block = tgpig.x;
+    const uint head = tgpig.y;
+    if (block >= args.block_count || head >= args.n_head ||
+        args.n_head_kv == 0u || args.head_dim != 128u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint row_width = args.n_head_kv * args.head_dim;
+    device const float *qh = query + (uint64_t)head * args.head_dim;
+    device const half *kh = index_keys +
+        (uint64_t)block * row_width +
+        (uint64_t)kv_head * args.head_dim;
+    float dot = 0.0f;
+    for (uint d = lane; d < args.head_dim; d += 32u) {
+        dot += qh[d] * (float)kh[d];
+    }
+    dot = simd_sum(dot);
+    if (lane == 0u) {
+        scores[(uint64_t)head * args.score_stride + block] =
+            dot * args.scale;
+    }
+}
+
+static inline bool laguna_long_index_better(
+        device const float *scores, int a, int b) {
+    const float sa = scores[a];
+    const float sb = scores[b];
+    return sa != sb ? sa > sb : a < b;
+}
+
+// Heap selection is identical in spirit to DeepSeek's indexer path. The
+// selected ids are sorted in cache order before attention, so row visitation
+// stays deterministic.
+kernel void kernel_laguna_long_index_topk(
+        constant ds4_metal_args_laguna_long_index &args,
+        device const float *all_scores,
+        device int         *selected,
+        threadgroup int    *heap [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint head [[threadgroup_position_in_grid]]) {
+    if (head >= args.n_head) return;
+    const uint keep = min(args.top_k, args.block_count);
+    device const float *scores =
+        all_scores + (uint64_t)head * args.score_stride;
+    if (tid == 0u) {
+        uint heap_count = 0u;
+        for (uint candidate = 0u;
+             candidate < args.block_count; ++candidate) {
+            if (heap_count < keep) {
+                uint i = heap_count++;
+                heap[i] = (int)candidate;
+                while (i > 0u) {
+                    const uint parent = (i - 1u) >> 1u;
+                    if (!laguna_long_index_better(
+                            scores, heap[parent], heap[i])) break;
+                    const int swap = heap[parent];
+                    heap[parent] = heap[i];
+                    heap[i] = swap;
+                    i = parent;
+                }
+            } else if (laguna_long_index_better(
+                           scores, (int)candidate, heap[0])) {
+                heap[0] = (int)candidate;
+                uint i = 0u;
+                while (true) {
+                    const uint left = 2u * i + 1u;
+                    const uint right = left + 1u;
+                    uint worst = i;
+                    if (left < heap_count &&
+                        laguna_long_index_better(
+                            scores, heap[worst], heap[left])) {
+                        worst = left;
+                    }
+                    if (right < heap_count &&
+                        laguna_long_index_better(
+                            scores, heap[worst], heap[right])) {
+                        worst = right;
+                    }
+                    if (worst == i) break;
+                    const int swap = heap[i];
+                    heap[i] = heap[worst];
+                    heap[worst] = swap;
+                    i = worst;
+                }
+            }
+        }
+        // Stable cache-order traversal of the selected blocks.
+        for (uint i = 1u; i < keep; ++i) {
+            const int value = heap[i];
+            uint j = i;
+            while (j > 0u && heap[j - 1u] > value) {
+                heap[j] = heap[j - 1u];
+                --j;
+            }
+            heap[j] = value;
+        }
+        device int *out =
+            selected + (uint64_t)head * args.top_k;
+        for (uint i = 0u; i < args.top_k; ++i) {
+            out[i] = i < keep ? heap[i] : -1;
+        }
+    }
+}
+
+static inline void laguna_long_attention_row(
+        device const float *qh,
+        device const half *key_cache,
+        device const half *value_cache,
+        uint64_t base,
+        uint lane,
+        float scale,
+        thread float4 &acc,
+        thread float &max_score,
+        thread float &score_sum) {
+    float partial = 0.0f;
+    for (uint d = lane; d < 128u; d += 32u) {
+        partial += qh[d] * (float)key_cache[base + d];
+    }
+    const float score = simd_sum(partial) * scale;
+    const float next_max = max(max_score, score);
+    const float old_scale = max_score == -INFINITY ?
+        0.0f : exp(max_score - next_max);
+    const float value_scale = exp(score - next_max);
+    score_sum = score_sum * old_scale + value_scale;
+    const float4 value = float4(
+        (float)value_cache[base + lane],
+        (float)value_cache[base + lane + 32u],
+        (float)value_cache[base + lane + 64u],
+        (float)value_cache[base + lane + 96u]);
+    acc = acc * old_scale + value * value_scale;
+    max_score = next_max;
+}
+
+// Sparse global attention: original K/V rows from the selected historic
+// blocks, followed by the dense recent tail. Cost is bounded by
+// top_k*block_size + raw_count rather than the complete context.
+kernel void kernel_laguna_attention_decode_indexed_f16(
+        constant ds4_metal_args_laguna_long_index &args,
+        device const float *query,
+        device const float *gate,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device const int   *selected,
+        device float       *out,
+        ushort lane [[thread_index_in_simdgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
     const uint head = tgpig.x;
-    const uint token = tgpig.y;
-    if (head >= args.n_head || token >= args.n_tokens ||
-        args.head_dim == 0u || args.n_rot > args.head_dim ||
-        (args.n_rot & 1u) != 0u) {
-        return;
+    if (head >= args.n_head || args.n_head_kv == 0u ||
+        args.head_dim != 128u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint row_width = args.n_head_kv * args.head_dim;
+    device const float *qh = query + (uint64_t)head * args.head_dim;
+    device const int *ids =
+        selected + (uint64_t)head * args.top_k;
+    float4 acc = float4(0.0f);
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+
+    for (uint pick = 0u; pick < args.top_k; ++pick) {
+        const int block = ids[pick];
+        if (block < 0 || (uint)block >= args.block_count) continue;
+        const uint first = (uint)block * args.block_size;
+        for (uint r = 0u; r < args.block_size; ++r) {
+            const uint64_t base =
+                (uint64_t)(first + r) * row_width +
+                (uint64_t)kv_head * args.head_dim;
+            laguna_long_attention_row(
+                qh, key_cache, value_cache, base, lane, args.scale,
+                acc, max_score, score_sum);
+        }
+    }
+    for (uint r = 0u; r < args.raw_count; ++r) {
+        const uint row = args.raw_start + r;
+        const uint64_t base =
+            (uint64_t)row * row_width +
+            (uint64_t)kv_head * args.head_dim;
+        laguna_long_attention_row(
+            qh, key_cache, value_cache, base, lane, args.scale,
+            acc, max_score, score_sum);
     }
 
-    device float *row = x +
-        ((uint64_t)token * args.n_head + head) * args.head_dim;
-    laguna_head_rms_norm_rope_neox(
-        args, row, weight, scratch, tid, ntg_u.x, token);
-}
-
-// Decode uses the same norm/RoPE arithmetic for Q and K. Keeping both tensors
-// in one grid removes a small Metal dispatch without changing the per-head
-// reduction order.
-kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
-        constant ds4_metal_args_laguna_norm_rope &args,
-        device float       *q,
-        device float       *k,
-        device const float *q_weight,
-        device const float *k_weight,
-        constant uint      &n_q_head,
-        threadgroup float  *scratch [[threadgroup(0)]],
-        uint tid [[thread_index_in_threadgroup]],
-        ushort3 ntg_u [[threads_per_threadgroup]],
-        uint3 tgpig [[threadgroup_position_in_grid]]) {
-    const uint combined_head = tgpig.x;
-    const uint token = tgpig.y;
-    if (combined_head >= args.n_head || token >= args.n_tokens ||
-        n_q_head >= args.n_head || args.head_dim == 0u ||
-        args.n_rot > args.head_dim || (args.n_rot & 1u) != 0u) {
-        return;
-    }
-
-    const bool is_q = combined_head < n_q_head;
-    const uint tensor_head = is_q ? combined_head : combined_head - n_q_head;
-    const uint tensor_n_head = is_q ? n_q_head : args.n_head - n_q_head;
-    device float *row = (is_q ? q : k) +
-        ((uint64_t)token * tensor_n_head + tensor_head) * args.head_dim;
-    device const float *weight = is_q ? q_weight : k_weight;
-    laguna_head_rms_norm_rope_neox(
-        args, row, weight, scratch, tid, ntg_u.x, token);
-}
-
-struct ds4_metal_args_laguna_kv_store {
-    uint32_t cache_cap;
-    uint32_t cache_row;
-    uint32_t n_head_kv;
-    uint32_t head_dim;
-};
-
-kernel void kernel_laguna_store_kv_f16(
-        constant ds4_metal_args_laguna_kv_store &args,
-        device const float *k,
-        device const float *v,
-        device half *key_cache,
-        device half *value_cache,
-        uint gid [[thread_position_in_grid]]) {
-    const uint width = args.n_head_kv * args.head_dim;
-    if (gid >= width || args.cache_row >= args.cache_cap) return;
-    const uint64_t dst = (uint64_t)args.cache_row * width + gid;
-    key_cache[dst] = (half)k[gid];
-    value_cache[dst] = (half)v[gid];
-}
-
-struct ds4_metal_args_laguna_prefill_attention {
-    uint32_t n_tokens;
-    uint32_t pos0;
-    uint32_t cache_cap;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t head_dim;
-    float    scale;
-    uint32_t pad0;
-};
-
-// Before the sliding window wraps, verifier rows occupy distinct cache slots.
-// Store the complete speculative block at once; each query still limits its
-// key count, so later rows cannot become visible to earlier queries.
-kernel void kernel_laguna_store_kv_rows_f16(
-        constant ds4_metal_args_laguna_prefill_attention &args,
-        device const float *k,
-        device const float *v,
-        device half *key_cache,
-        device half *value_cache,
-        uint gid [[thread_position_in_grid]]) {
-    const uint width = args.n_head_kv * args.head_dim;
-    const uint values = args.n_tokens * width;
-    if (gid >= values) return;
-    const uint token = gid / width;
-    const uint col = gid - token * width;
-    const uint cache_row = (args.pos0 + token) % args.cache_cap;
-    const uint64_t dst = (uint64_t)cache_row * width + col;
-    key_cache[dst] = (half)k[gid];
-    value_cache[dst] = (half)v[gid];
-}
-
-// Stage the current chunk as f16 before attention. This preserves the same KV
-// precision as decode without overwriting sliding-window rows that early
-// queries in the chunk still need.
-kernel void kernel_laguna_stage_kv_f16(
-        constant ds4_metal_args_laguna_prefill_attention &args,
-        device const float *k,
-        device const float *v,
-        device half *staged_key,
-        device half *staged_value,
-        uint gid [[thread_position_in_grid]]) {
-    const uint width = args.n_head_kv * args.head_dim;
-    const uint values = args.n_tokens * width;
-    if (gid >= values) return;
-    staged_key[gid] = (half)k[gid];
-    staged_value[gid] = (half)v[gid];
+    const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+    const float gate_value = gate[head];
+    const float gate_scale = gate_value > 20.0f ?
+        gate_value : log(1.0f + exp(gate_value));
+    device float *oh = out + (uint64_t)head * args.head_dim;
+    oh[lane]       = acc.x * inv_sum * gate_scale;
+    oh[lane + 32u] = acc.y * inv_sum * gate_scale;
+    oh[lane + 64u] = acc.z * inv_sum * gate_scale;
+    oh[lane + 96u] = acc.w * inv_sum * gate_scale;
 }
 
 // One SIMD group owns one query head. Queries in a prefill chunk execute in
@@ -644,24 +658,6 @@ kernel void kernel_laguna_attention_prefill_gqa6_f16(
     oh5[lane + 32u] = acc5.y * inv_sum5 * gate_scale5;
     oh5[lane + 64u] = acc5.z * inv_sum5 * gate_scale5;
     oh5[lane + 96u] = acc5.w * inv_sum5 * gate_scale5;
-}
-
-kernel void kernel_laguna_commit_kv_f16(
-        constant ds4_metal_args_laguna_prefill_attention &args,
-        device const half *staged_key,
-        device const half *staged_value,
-        device half *key_cache,
-        device half *value_cache,
-        uint gid [[thread_position_in_grid]]) {
-    const uint width = args.n_head_kv * args.head_dim;
-    const uint values = args.n_tokens * width;
-    if (gid >= values) return;
-    const uint token = gid / width;
-    const uint col = gid - token * width;
-    const uint cache_row = (args.pos0 + token) % args.cache_cap;
-    const uint64_t dst = (uint64_t)cache_row * width + col;
-    key_cache[dst] = staged_key[gid];
-    value_cache[dst] = staged_value[gid];
 }
 
 struct ds4_metal_args_laguna_attention {
@@ -1119,92 +1115,4 @@ kernel void kernel_laguna_flash_attn_reduce_gate_f32(
 
 #undef NWG
 #undef DV
-}
-
-struct ds4_metal_args_laguna_q6_matmul {
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t n_tokens;
-    uint32_t pad0;
-    uint64_t row_bytes;
-};
-
-// Dense Q6_K projection used by Laguna's down projections and output head.
-// The quantized arithmetic follows DwarfStar's existing Q6_K routed-down
-// implementation, but addresses a single dense matrix directly.
-kernel void kernel_laguna_q6_K_matmul_f32(
-        constant ds4_metal_args_laguna_q6_matmul &args,
-        device const char  *weight,
-        device const float *x,
-        device float       *out,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint rows_per_simd = 2u;
-    constexpr uint simd_groups = 2u;
-    constexpr uint kmask1 = 0x03u;
-    constexpr uint kmask2 = 0x0Cu;
-    constexpr uint kmask3 = 0x30u;
-    constexpr uint kmask4 = 0xC0u;
-    constexpr uint qk_k = 256u;
-
-    const uint row0 = (tgpig.x * simd_groups + simd_group) * rows_per_simd;
-    const uint token = tgpig.y;
-    if (row0 >= args.out_dim || token >= args.n_tokens) return;
-
-    const int n_blocks = (int)(args.in_dim / qk_k);
-    const short tid = (short)(lane / 2u);
-    const short ix = (short)(lane & 1u);
-    const short ip = (short)(tid / 8);
-    const short il = (short)(tid % 8);
-    const short l0 = (short)(4 * il);
-    const short is = (short)(8 * ip + l0 / 16);
-    const short y_offset = (short)(128 * ip + l0);
-    const short q_offset_l = (short)(64 * ip + l0);
-    const short q_offset_h = (short)(32 * ip + l0);
-    device const float *input = x + (uint64_t)token * args.in_dim;
-    float sums[rows_per_simd] = {0.0f, 0.0f};
-    float yl[16];
-
-    for (int ib = ix; ib < n_blocks; ib += 2) {
-        device const float *y = input + (uint64_t)ib * qk_k + y_offset;
-        for (short l = 0; l < 4; l++) {
-            yl[4 * l + 0] = y[l + 0];
-            yl[4 * l + 1] = y[l + 32];
-            yl[4 * l + 2] = y[l + 64];
-            yl[4 * l + 3] = y[l + 96];
-        }
-
-        for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
-            device const block_q6_K *block =
-                (device const block_q6_K *)(weight +
-                    (uint64_t)(row0 + r) * args.row_bytes) + ib;
-            device const uchar *q1 = block->ql + q_offset_l;
-            device const uchar *q2 = q1 + 32;
-            device const uchar *qh = block->qh + q_offset_h;
-            device const char *sc = block->scales + is;
-            float4 part = float4(0.0f);
-            for (short l = 0; l < 4; l++) {
-                const uint h = (uint)qh[l];
-                part[0] += yl[4 * l + 0] *
-                    (float)((int)((q1[l] & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
-                part[1] += yl[4 * l + 1] *
-                    (float)((int)((q2[l] & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
-                part[2] += yl[4 * l + 2] *
-                    (float)((int)((q1[l] >> 4u) | (h & kmask3)) - 32);
-                part[3] += yl[4 * l + 3] *
-                    (float)((int)((q2[l] >> 4u) | ((h & kmask4) >> 2u)) - 32);
-            }
-            sums[r] += (float)block->d *
-                (part[0] * (float)sc[0] + part[1] * (float)sc[2] +
-                 part[2] * (float)sc[4] + part[3] * (float)sc[6]);
-        }
-    }
-
-    for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
-        const float sum = simd_sum(sums[r]);
-        if (lane == 0u) {
-            out[(uint64_t)token * args.out_dim + row0 + r] = sum;
-        }
-    }
 }

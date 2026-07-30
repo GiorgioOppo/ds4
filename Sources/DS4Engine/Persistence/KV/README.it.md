@@ -18,6 +18,9 @@ prefill completo.
   motore — stesso lookup per prefisso, budget in token ed eviction con
   `KVCFile.evictionScore`, con hit/lastUsed in un `index.json` a lato così
   il formato wire del motore resta intatto.
+- `LagunaDiskKVStore.swift`: la controparte Laguna sui file `LKV1` F16 nativi.
+  La KV attiva resta in Metal; lo store ripristina sessioni fredde e scrive
+  ogni plane sequenzialmente con `F_NOCACHE`, senza una copia cache-sized.
 
 Il layout è documentato in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.it.md).
 

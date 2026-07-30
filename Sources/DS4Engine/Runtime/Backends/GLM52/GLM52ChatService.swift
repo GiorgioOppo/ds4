@@ -73,15 +73,28 @@ public actor GLM52ChatService {
         // RAM-adaptive residency (the biggest tok/s lever on streaming);
         // GUI setting first, DS4_GLM_RESIDENT_LAYERS next.
         options.residentLayerCount = residentLayers
-            ?? environment["DS4_GLM_RESIDENT_LAYERS"].flatMap(Int.init)
+            ?? DS4RuntimeEnvironment.integer(
+                "DS4_RESIDENT_LAYERS",
+                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                environment: environment)
             ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
         options.activeExperts = activeExperts
-            ?? environment["DS4_GLM_ACTIVE_EXPERTS"].flatMap(Int.init)
-        if let slots = environment["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {
+            ?? DS4RuntimeEnvironment.integer(
+                "DS4_ACTIVE_EXPERTS",
+                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                environment: environment)
+        if let slots = DS4RuntimeEnvironment.integer(
+            "DS4_EXPERT_CACHE_SLOTS",
+            overrides: ["DS4_GLM_EXPERT_SLOTS"],
+            environment: environment
+        ) {
             options.expertSlotCount = slots
         }
-        if let slots = environment["DS4_GLM_STREAM_SLOTS"]
-            .flatMap(Int.init) {
+        if let slots = DS4RuntimeEnvironment.integer(
+            "DS4_STREAM_SLOTS",
+            overrides: ["DS4_GLM_STREAM_SLOTS"],
+            environment: environment
+        ) {
             options.streamSlotCount = slots
         }
         service = try GLM52InferenceService(modelPath: modelPath,
@@ -148,8 +161,8 @@ public actor GLM52ChatService {
         public let contextTokens: Int
         public let prefillTps: Double
         public let genTps: Double
-        /// p99 of the per-token decode speed — the reached steady state,
-        /// insensitive to the cold first token (same metric DeepSeek charts).
+        /// Throughput equivalent to p99 per-token decode latency: the slow
+        /// generation tail (same metric DeepSeek charts).
         public let genTpsP99: Double
         public let kvBytes: UInt64
         public let report: String
@@ -228,8 +241,8 @@ public actor GLM52ChatService {
             var p99 = 0.0
             if !tokenSpeeds.isEmpty {
                 let sorted = tokenSpeeds.sorted()
-                p99 = sorted[min(sorted.count - 1,
-                                 Int(Double(sorted.count - 1) * 0.99))]
+                let latencyRank = Int(ceil(0.99 * Double(sorted.count)))
+                p99 = sorted[max(0, sorted.count - latencyRank)]
             }
             return BenchmarkNumbers(
                 contextTokens: tokens.count,

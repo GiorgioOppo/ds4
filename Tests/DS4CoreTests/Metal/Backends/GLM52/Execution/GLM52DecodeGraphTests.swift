@@ -149,6 +149,27 @@ final class GLM52DecodeGraphTests: XCTestCase {
             values: [1, 2], weight: [1]))
     }
 
+    func testBatchedRMSNormKernelMatchesPerRowOracle() throws {
+        let runtime = try makeRuntime()
+        let width = 300
+        let rows = 5
+        let values = Self.floats(
+            width * rows, seed: 91, scale: 0.7)
+        let weight = Self.floats(
+            width, seed: 92, scale: 0.5).map { $0 + 1.5 }
+        let gpu = try runtime.glm52RMSNormRows(
+            values: values, weight: weight, width: width)
+        var oracle: [Float] = []
+        oracle.reserveCapacity(values.count)
+        for row in 0..<rows {
+            oracle += try GLM52FFNCPUReference.rmsNorm(
+                Array(values[row * width..<(row + 1) * width]),
+                weight: weight)
+        }
+        assertClose(
+            gpu, oracle, label: "batched rmsNorm", tolerance: 1e-4)
+    }
+
     func testF32MatvecKernelMatchesOracle() throws {
         let runtime = try makeRuntime()
         let rows = Self.floats(32 * 256, seed: 61, scale: 0.4)

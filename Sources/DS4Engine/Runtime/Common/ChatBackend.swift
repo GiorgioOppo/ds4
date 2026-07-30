@@ -38,3 +38,4 @@ public protocol ChatBackend: Actor {
 
 extension InferenceService: ChatBackend {}
 extension GLM52ChatService: ChatBackend {}
+extension LagunaChatService: ChatBackend {}

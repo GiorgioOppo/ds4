@@ -49,6 +49,12 @@ final class ChatStore {
 
     init(settings: AppSettings) {
         self.settings = settings
+        if ![256, 512, 1_024, 2_048, 4_096]
+            .contains(lagunaKVInitial) {
+            lagunaKVInitial = 512
+            UserDefaults.standard.set(
+                512, forKey: "DS4LagunaKVInitial")
+        }
         AgentRegistry.shared.set(agents)   // didSet doesn't fire for the initial value
         // MCP servers connect asynchronously: when one (dis)connects, bump the
         // observable mirror (so pickers listing MCP tools re-render) and re-push
@@ -288,6 +294,18 @@ final class ChatStore {
     var expertCacheSlots: Int = (UserDefaults.standard.object(forKey: "DS4ExpertCacheSlots") as? Int) ?? 22 {
         didSet { UserDefaults.standard.set(expertCacheSlots, forKey: "DS4ExpertCacheSlots") }
     }
+    /// Laguna: righe iniziali dei 12 layer full-attention. La capacità
+    /// logica resta `contextSize`; il motore cresce geometricamente solo
+    /// quando la conversazione usa davvero più righe. 512 è il punto
+    /// misurato sul M1 Pro (96 MiB iniziali anche con contesto 32k).
+    var lagunaKVInitial: Int =
+        (UserDefaults.standard.object(
+            forKey: "DS4LagunaKVInitial") as? Int) ?? 512 {
+        didSet {
+            UserDefaults.standard.set(
+                lagunaKVInitial, forKey: "DS4LagunaKVInitial")
+        }
+    }
     /// GLM 5.2: layer residenti (0 = adattivo alla RAM fisica). MISURATO su
     /// 16 GB: pochi residenti extra sono controproducenti (il sistema li
     /// pagina e ogni commit ne ripaga la residency, ~+750 ms/token con 11
@@ -461,8 +479,9 @@ final class ChatStore {
     }
     /// Disk-KV budget in THOUSANDS of tokens (default 1000 = 1M tokens total
     /// across checkpoints — the live window stays `contextSize`). Tokens, not MB:
-    /// per-token checkpoint bytes depend on the model (~22 KB/token on the 61-layer
-    /// 2-bit Flash → 1M tokens ≈ 22 GB on disk), so tokens are the stable unit.
+    /// per-token checkpoint bytes depend on the backend (~22 KB DeepSeek,
+    /// ~96 KB GLM, ~48 KB Laguna after its 512-token sliding window plus
+    /// ~72 MiB fixed per mature Laguna entry), so tokens are the stable unit.
     var diskKVBudgetKTok: Int = UserDefaults.standard.object(forKey: "DS4DiskKVBudgetKTok") as? Int ?? 1000 {
         didSet { UserDefaults.standard.set(diskKVBudgetKTok, forKey: "DS4DiskKVBudgetKTok") }
     }
@@ -816,6 +835,10 @@ final class ChatStore {
     /// (decode profiles, sub-agents, distributed) stay disabled while this
     /// is set, while benchmark/correctness/diagnostics have GLM paths.
     var glmService: GLM52ChatService?
+    /// Laguna S 2.1 chat service — mutually exclusive with `service` and
+    /// `glmService`. Chat-only in v1: the benchmark/tuning panels have no
+    /// Laguna surface yet (the streaming profile lives in the demo CLI).
+    var lagunaService: LagunaChatService?
     /// Full load signature of `service`, including fixed knobs and context.
     var loadedEngineSignature: LoadedEngineSignature?
     var generation: Task<Void, Never>?
@@ -843,13 +866,16 @@ final class ChatStore {
     /// `service`/`glmService` concreti.
     var chatBackend: (any ChatBackend)? {
         if let service { return service }
-        return glmService
+        if let glmService { return glmService }
+        return lagunaService
     }
     /// Shared engine gated for KV-mutating uses (benchmark): a run rewrites the
     /// KV, so it's refused while the chat is mid-generation.
     var benchmarkService: InferenceService? { (isReady && !isGenerating) ? service : nil }
     /// GLM counterpart of `benchmarkService`, same KV-mutating gate.
     var glmBenchmarkService: GLM52ChatService? { (isReady && !isGenerating) ? glmService : nil }
+    /// Laguna counterpart of `benchmarkService`, same KV-mutating gate.
+    var lagunaBenchmarkService: LagunaChatService? { (isReady && !isGenerating) ? lagunaService : nil }
     var loadedModelPath: String? { isReady ? modelPath : nil }
 
     var isReady: Bool { if case .ready = phase { return true } else { return false } }

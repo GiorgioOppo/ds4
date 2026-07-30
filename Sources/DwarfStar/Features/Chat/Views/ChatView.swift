@@ -33,7 +33,7 @@ struct ChatView: View {
                      ?? "Nessun modello caricato")
                     .font(.headline)
                 if let info = store.info {
-                    Text("\(info.architecture.rawValue) · \(info.layers) layer · \(info.quantizationSummary) · ctx \(info.contextSize) · KV ~\(kvSize(info.kvCacheBytes))")
+                    Text("\(info.architecture.rawValue) · \(info.layers) layer · \(info.quantizationSummary) · ctx \(info.contextSize) · \(kvLabel(info))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else if let descriptor = store.inspectedModelDescriptor {
@@ -168,6 +168,14 @@ struct ChatView: View {
 
     private func kvSize(_ bytes: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+    }
+
+    private func kvLabel(_ info: ModelInfo) -> String {
+        if info.architecture
+            == LagunaBackendDefinition.supportedArchitecture {
+            return "KV lazy iniziale ~\(kvSize(info.kvCacheBytes))"
+        }
+        return "KV ~\(kvSize(info.kvCacheBytes))"
     }
 
     private var transcript: some View {

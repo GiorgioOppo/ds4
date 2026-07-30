@@ -582,7 +582,7 @@ struct BenchView: View {
     private var speedExportSubtitle: String {
         let model = (controller.modelPath as NSString).lastPathComponent
         return "\(model) · \(controller.mode.rawValue) engine" +
-               " · \(controller.genTokens) generated tokens per point · generation is p99" +
+               " · \(controller.genTokens) generated tokens per point · generation is 1/p99 latency" +
                " · \(Date.now.formatted(date: .abbreviated, time: .shortened))"
     }
 
@@ -595,7 +595,7 @@ struct BenchView: View {
     }
 
     private func speedCSV() -> String {
-        var out = "context_tokens,prefill_tps,gen_tps_p99,kvcache_bytes\n"
+        var out = "context_tokens,prefill_tps,gen_tps_at_p99_latency,kvcache_bytes\n"
         for row in controller.rows {
             out += "\(row.ctxTokens),\(row.prefillTps),\(row.genTps),\(row.kvcacheBytes)\n"
         }
@@ -629,7 +629,8 @@ struct BenchView: View {
     private static let prefillColor = Color.blue
     private static let generationColor = Color.green
 
-    /// Dual-scale throughput chart: prefill on the LEFT axis, generation (p99) on
+    /// Dual-scale throughput chart: prefill on the LEFT axis, generation
+    /// (throughput equivalent to p99 latency) on
     /// the RIGHT axis. Prefill (tens–thousands t/s) and generation (~0.05–0.3 t/s)
     /// differ by orders of magnitude, so a single shared axis squashes generation
     /// flat. Swift Charts has no native second Y scale, so generation is plotted
@@ -660,16 +661,16 @@ struct BenchView: View {
                 // Rescaled onto the prefill axis; the right axis shows real t/s.
                 LineMark(x: .value("Context", row.ctxTokens),
                          y: .value("t/s", row.genTps * genToPrefill),
-                         series: .value("Series", "Generation (p99)"))
-                    .foregroundStyle(by: .value("Series", "Generation (p99)"))
+                         series: .value("Series", "Generation (1/p99 lat)"))
+                    .foregroundStyle(by: .value("Series", "Generation (1/p99 lat)"))
                 PointMark(x: .value("Context", row.ctxTokens),
                           y: .value("t/s", row.genTps * genToPrefill))
-                    .foregroundStyle(by: .value("Series", "Generation (p99)"))
+                    .foregroundStyle(by: .value("Series", "Generation (1/p99 lat)"))
             }
         }
         .chartForegroundStyleScale([
             "Prefill": prefillColor,
-            "Generation (p99)": generationColor,
+            "Generation (1/p99 lat)": generationColor,
         ])
         .chartXAxisLabel("Context Tokens")
         .chartYScale(domain: 0...top)

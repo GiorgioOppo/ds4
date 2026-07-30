@@ -154,6 +154,7 @@ extension ChatStore {
         }
         let path = modelPath, ctx = contextSize
         let cacheSlots = expertCacheSlots
+        let lagunaKVInitial = max(256, min(self.lagunaKVInitial, ctx))
         let glmResident = glmResidentLayers
         let glmExperts = glmActiveExperts
         // Knob GLM aggiuntivi: il motore li legge dall'ambiente (stessa
@@ -195,6 +196,7 @@ extension ChatStore {
                 await MainActor.run {
                     self.service = nil
                     self.glmService = nil
+                    self.lagunaService = nil
                     self.loadedEngineSignature = nil
                     self.info = nil
                 }
@@ -241,7 +243,47 @@ extension ChatStore {
                     await MainActor.run {
                         self.glmService = glm
                         self.service = nil
+                        self.lagunaService = nil
                         self.info = glmInfo
+                        self.enginePrimed = false
+                        self.activate(self.activeSessionId)
+                        self.phase = .ready
+                    }
+                    return
+                }
+                // Laguna S 2.1: chat servita dal motore residente/streaming
+                // Laguna dietro il contratto ChatBackend — stessa forma di
+                // integrazione del ramo GLM. Streaming SSD e cache esperti
+                // si decidono da soli in base a file/RAM
+                // (LagunaInferenceService.defaultOptions); benchmark e
+                // tuning restano superfici della demo CLI nella v1.
+                if inspected.architecture
+                       == LagunaBackendDefinition.supportedArchitecture,
+                   LagunaBackendDefinition.runtimeEnabled {
+                    let laguna = try await withCheckedThrowingContinuation {
+                        (cont: CheckedContinuation<LagunaChatService, Error>) in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                cont.resume(returning: try LagunaChatService(
+                                    modelPath: path, contextSize: ctx,
+                                    systemPrompt: nil,
+                                    initialKVCapacity: lagunaKVInitial,
+                                    diskKVDirectory: kvDir?.path,
+                                    diskKVBudgetTokens: kvBudgetTokens))
+                            } catch {
+                                cont.resume(throwing: error)
+                            }
+                        }
+                    }
+                    let lagunaInfo = await laguna.modelInfo()
+                    // Warmup reale: il primo token utente non paga i costi
+                    // una-tantum (compilazioni pipeline, slot cache, fd).
+                    _ = await laguna.warmup()
+                    await MainActor.run {
+                        self.lagunaService = laguna
+                        self.service = nil
+                        self.glmService = nil
+                        self.info = lagunaInfo
                         self.enginePrimed = false
                         self.activate(self.activeSessionId)
                         self.phase = .ready

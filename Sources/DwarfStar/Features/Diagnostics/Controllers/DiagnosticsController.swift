@@ -2,7 +2,7 @@ import Foundation
 import DS4Engine
 
 /// Tokenizer diagnostic — NATIVE (DS4Engine.Diagnostics over the backend
-/// tokenizer selected by the GGUF's architecture, DeepSeek or GLM), no
+/// tokenizer selected by the GGUF's architecture — DeepSeek, GLM or Laguna), no
 /// `ds4 --dump-tokens` subprocess. Tokenizes a string exactly as written
 /// (recognizing the backend's protocol specials). Opens the GGUF for its
 /// tokenizer tables.

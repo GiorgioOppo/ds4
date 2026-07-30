@@ -142,7 +142,10 @@ public final class GLM52LayerStreamer {
         // Default ON (DS4_GLM_MTLIO=0 opts out): the fallback to pread on
         // any anomaly is automatic and permanent, so the fast path is safe
         // to prefer.
-        guard ProcessInfo.processInfo.environment["DS4_GLM_MTLIO"] != "0"
+        guard DS4RuntimeEnvironment.flag(
+            "DS4_MTLIO",
+            overrides: ["DS4_GLM_MTLIO"],
+            default: true)
         else { return nil }
         do {
             let descriptor = MTLIOCommandQueueDescriptor()
@@ -296,8 +299,9 @@ public final class GLM52LayerStreamer {
     /// default 4, 1 ripristina di fatto una pread per tensore). Latch
     /// per-load via GLM52DispatchKnobs.refresh, come gli altri knob.
     nonisolated(unsafe) private static var readSplit = max(1, min(8,
-        ProcessInfo.processInfo.environment["DS4_GLM_READ_SPLIT"]
-            .flatMap(Int.init) ?? 4))
+        DS4RuntimeEnvironment.integer(
+            "DS4_PREAD_SPLIT",
+            overrides: ["DS4_GLM_READ_SPLIT"]) ?? 4))
 
     static func refreshReadSplit(_ value: Int?) {
         readSplit = max(1, min(8, value ?? 4))

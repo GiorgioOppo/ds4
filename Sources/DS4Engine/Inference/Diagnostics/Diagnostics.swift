@@ -3,9 +3,10 @@ import DS4Core
 
 // Native replacement for `ds4 --dump-tokens`: opens the GGUF's tokenizer and
 // tokenizes a string exactly as written (recognizing the backend's protocol
-// specials). Architecture-aware: the GGUF's `general.architecture` selects the
-// DeepSeek or GLM tokenizer/renderer, so a GLM file never hits the DeepSeek
-// validator and its misleading `deepseek4.*` errors. No subprocess.
+// specials). Architecture-aware: the GGUF's `general.architecture` selects
+// the DeepSeek, GLM or Laguna tokenizer/renderer, so a non-DeepSeek file
+// never hits the DeepSeek validator and its misleading `deepseek4.*`
+// errors. No subprocess.
 
 public enum Diagnostics {
     /// Tokenize `text` with the model's tokenizer and return a readable dump
@@ -14,11 +15,16 @@ public enum Diagnostics {
         let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
         let ids: [Int32]
         let textOf: (Int32) -> [UInt8]
-        if try ModelArchitectureDetector.detect(in: model).family == .glm {
+        switch try ModelArchitectureDetector.detect(in: model).family {
+        case .glm:
             let tok = try GLM52Tokenizer(model: model)
             ids = tok.tokenizeRenderedChat(text)
             textOf = tok.tokenText
-        } else {
+        case .laguna:
+            let tok = try LagunaTokenizer(model: model)
+            ids = tok.tokenizeRenderedChat(text)
+            textOf = tok.tokenText
+        default:
             let tok = try Tokenizer(model: model)
             ids = tok.tokenizeRenderedChat(text)
             textOf = tok.tokenText
@@ -39,8 +45,13 @@ public enum Diagnostics {
     /// currently render with tools (so the two can be compared).
     public static func dumpChatTemplate(modelPath: String) throws -> String {
         let model = try GGUFModel(path: modelPath, metalMapping: false, prefetchCPU: false)
-        if try ModelArchitectureDetector.detect(in: model).family == .glm {
+        switch try ModelArchitectureDetector.detect(in: model).family {
+        case .glm:
             return try dumpGLMChatTemplate(model: model)
+        case .laguna:
+            return try dumpLagunaChatTemplate(model: model)
+        default:
+            break
         }
         let tok = try Tokenizer(model: model)
 
@@ -109,6 +120,38 @@ public enum Diagnostics {
         out += "\n=== Prompt con tool — formato XML nativo GLM ===\n"
         out += try GLM52ChatRenderer.render(turns: [.user("Ciao, come stai?")],
                                             tools: tools)
+        return out
+    }
+
+    /// Laguna counterpart: same sections over the Laguna control tokens and
+    /// the `LagunaChatRenderer` `<tool_call>` format (one wire format, no
+    /// compact variant).
+    private static func dumpLagunaChatTemplate(model: GGUFModel) throws -> String {
+        let tok = try LagunaTokenizer(model: model)
+
+        var out = "=== tokenizer.chat_template ===\n"
+        if let tpl = model.string("tokenizer.chat_template"), !tpl.isEmpty {
+            out += tpl + "\n"
+        } else {
+            out += "<assente nel GGUF>\n"
+        }
+
+        out += "\n=== Token speciali del protocollo Laguna (vocab, tipo, atomico?) ===\n"
+        out += "Legenda tipo: 1=NORMAL 2=UNKNOWN 3=CONTROL 4=USER_DEFINED 6=BYTE.\n"
+        out += "'atomico' = la stringa tokenizza in un solo id (necessario per i marcatori di ruolo/tool).\n"
+        let types = model.intArray("tokenizer.ggml.token_type")
+        for s in LagunaConversationProtocol.atomicControlTokens {
+            guard let id = tok.tokenID(s) else { out += "\(s) -> ASSENTE\n"; continue }
+            let type = types.flatMap { Int(id) < $0.count ? $0[Int(id)] : nil }
+            let typeStr = type.map { "tipo \($0)" } ?? "tipo ?"
+            let atomic = tok.tokenizeRenderedChat(s) == [id]
+            out += "\(s) -> id \(id), \(typeStr), \(atomic ? "atomico ✓" : "SPEZZATO ✗")\n"
+        }
+
+        let tools = ToolRegistry.specs(enabled: Set(ToolRegistry.builtins.map { $0.spec.name }))
+        out += "\n=== Prompt con tool — formato nativo Laguna ===\n"
+        out += try LagunaChatRenderer.render(turns: [.user("Ciao, come stai?")],
+                                             tools: tools)
         return out
     }
 }

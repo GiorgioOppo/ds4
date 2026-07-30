@@ -55,9 +55,11 @@ public final class MetalRuntime {
         // (helper di dot) DEVE precedere glm52_moe che li usa.
         "glm52_router", "glm52_quant", "glm52_kv", "glm52_indexer",
         "glm52_attention", "glm52_moe", "glm52_rope", "glm52_misc",
-        // Laguna S 2.1: dopo dsv4_rope (rope_yarn/rope_yarn_corr_dims) e
-        // flash_attn (args/function-constants del vec-reduce), che usa.
-        "laguna",
+        // Laguna S 2.1, un file per area come metal/glm5.2/: dopo dsv4_rope
+        // (rope_yarn/rope_yarn_corr_dims) e flash_attn (args/function-constant
+        // del vec-reduce), che usa; laguna_kv definisce la struct args del
+        // prefill e DEVE precedere laguna_attention.
+        "laguna_quant", "laguna_rope", "laguna_kv", "laguna_attention",
         "argsort", "cpy", "concat", "get_rows", "sum_rows",
         "softmax", "repeat", "glu", "norm", "bin", "set_rows",
     ]

@@ -228,8 +228,10 @@ public final class GLM52ResidentModel {
         // bundles live beside the GGUF unless DS4_GLM_BUNDLE_DIR overrides.
         // Auto-discovered and identity-validated per layer; absence is
         // simply the plain GGUF path.
-        let bundleDirectory = ProcessInfo.processInfo
-            .environment["DS4_GLM_BUNDLE_DIR"] ?? (path + ".glm-experts")
+        let bundleDirectory = DS4RuntimeEnvironment.value(
+            "DS4_BUNDLE_DIR",
+            overrides: ["DS4_GLM_BUNDLE_DIR"])
+            ?? (path + ".glm-experts")
         let layerQ4Directory = ProcessInfo.processInfo
             .environment["DS4_GLM_LAYERQ4_DIR"] ?? (path + ".glm-layers-q4")
         // DS4_GLM_LAYERQ4=0: ignora i TENSORI Q4 del sidecar (lossy) e
@@ -757,7 +759,9 @@ public final class GLM52ResidentModel {
     private var usageDirty = false
 
     private var usageProfilePath: String {
-        ProcessInfo.processInfo.environment["DS4_GLM_USAGE_FILE"]
+        DS4RuntimeEnvironment.value(
+            "DS4_USAGE_FILE",
+            overrides: ["DS4_GLM_USAGE_FILE"])
             ?? (reader.path + ".glm-usage.json")
     }
 
@@ -1509,15 +1513,27 @@ extension GLM52ResidentModel {
             // esattamente ciò che qui non si vuole mai.
             let env = ProcessInfo.processInfo.environment
             var options = GLM52ResidentModelOptions()
-            options.residentLayerCount = env["DS4_GLM_RESIDENT_LAYERS"]
-                .flatMap(Int.init)
+            options.residentLayerCount = DS4RuntimeEnvironment.integer(
+                "DS4_RESIDENT_LAYERS",
+                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                environment: env)
                 ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
-            options.activeExperts = env["DS4_GLM_ACTIVE_EXPERTS"]
-                .flatMap(Int.init)
-            if let slots = env["DS4_GLM_EXPERT_SLOTS"].flatMap(Int.init) {
+            options.activeExperts = DS4RuntimeEnvironment.integer(
+                "DS4_ACTIVE_EXPERTS",
+                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                environment: env)
+            if let slots = DS4RuntimeEnvironment.integer(
+                "DS4_EXPERT_CACHE_SLOTS",
+                overrides: ["DS4_GLM_EXPERT_SLOTS"],
+                environment: env
+            ) {
                 options.expertSlotCount = slots
             }
-            if let slots = env["DS4_GLM_STREAM_SLOTS"].flatMap(Int.init) {
+            if let slots = DS4RuntimeEnvironment.integer(
+                "DS4_STREAM_SLOTS",
+                overrides: ["DS4_GLM_STREAM_SLOTS"],
+                environment: env
+            ) {
                 options.streamSlotCount = slots
             }
             // Motore nuovo per ogni config; ARC libera il precedente (e i

@@ -1,3 +1,4 @@
+import DS4Core
 import Foundation
 import Metal
 
@@ -34,13 +35,17 @@ import Metal
 /// sul modello reale non è certificata dai test di integrazione
 /// (DS4_GLM52_SPARSE_GGUF); il default storico resta il per-token.
 enum GLM52PrefillBatchDispatch {
-    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
-        .environment["DS4_GLM_PREFILL_BATCH"] == "1"
+    nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
+        "DS4_PREFILL_BATCH",
+        overrides: ["DS4_GLM_PREFILL_BATCH"],
+        default: false)
     /// Token per gruppo (DS4_GLM_PREFILL_ROUTE_BATCH, default 16): ogni
     /// token del gruppo ha il SUO set di scratch, quindi il costo è
     /// ~R × footprint di GLM52DecodeScratch (qualche MB a set).
-    nonisolated(unsafe) static var groupSize = max(2, ProcessInfo.processInfo
-        .environment["DS4_GLM_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 16)
+    nonisolated(unsafe) static var groupSize = max(2,
+        DS4RuntimeEnvironment.integer(
+            "DS4_PREFILL_ROUTE_BATCH",
+            overrides: ["DS4_GLM_PREFILL_ROUTE_BATCH"]) ?? 16)
 }
 
 /// R set di scratch indipendenti: dentro un gruppo ogni token scrive solo

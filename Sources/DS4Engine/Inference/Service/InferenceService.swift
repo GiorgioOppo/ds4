@@ -119,14 +119,18 @@ public actor InferenceService: DS4Logging {
         // This actor IS the DeepSeek hot loop. A .glm52 or .laguna selection
         // must stop HERE with an actionable message, not fall through into
         // the DeepSeek tokenizer/config validators and their misleading
-        // refusals — those chat surfaces are their own engines, not yet
-        // wired into the GUI ChatStore.
+        // refusals — those chat surfaces are their own engines
+        // (GLM52ChatService / LagunaChatService), hosted by ChatStore
+        // directly. Reaching this guard means a DeepSeek-only surface
+        // (benchmark, auto-tune, distributed) was pointed at a non-DeepSeek
+        // GGUF.
         guard selection.backend == .deepSeekV4 else {
             throw GGUFError.cannotOpen(
                 "backend \(selection.backend.rawValue) riconosciuto e "
-                + "abilitato, ma la chat GUI non è ancora collegata al suo "
-                + "motore: usa la demo CLI (swift run DS4Demo <gguf> con "
-                + "DS4_PROMPT) in attesa dell'integrazione ChatStore.")
+                + "abilitato, ma questa superficie è solo DeepSeek: la chat "
+                + "GUI serve \(selection.backend.rawValue) col suo motore "
+                + "dedicato (ChatStore), mentre benchmark/auto-tune/"
+                + "distribuito non hanno ancora quel backend.")
         }
         self.model = openedModel
         self.backendDescriptor = selection.descriptor

@@ -13,10 +13,17 @@ public enum LagunaBackendDefinition {
         .chat, .tools, .reasoning, .mixtureOfExperts,
     ]
 
-    /// No runtime generation capability is advertised until the Laguna Metal
-    /// decoder from the reference `laguna-s2.1` branch has been ported and
-    /// validated (see `docs/PORTING-GAPS.md`).
-    public static let runtimeCapabilities: BackendCapabilities = []
+    /// What the Laguna runtime SERVES today, behind the same opt-in gate as
+    /// the selector routing: chat generation with interleaved reasoning and
+    /// native tool calls over the resident/streaming engine
+    /// (`LagunaChatService`). Outside stay the GLM/DeepSeek-specific
+    /// surfaces (auto-tune, distributed).
+    public static var runtimeCapabilities: BackendCapabilities {
+        guard runtimeEnabled else { return [] }
+        return [
+            .generation, .reasoning, .tools, .diskKV, .expertRouting,
+        ]
+    }
 
     /// The enablement switch, forwarded from the target-visible gate in
     /// DS4Metal (`LagunaRuntimeGate.enabled`): selector routing, catalog

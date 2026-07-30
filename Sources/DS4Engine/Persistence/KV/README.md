@@ -17,6 +17,9 @@ allowing chat, stateless API, sub-agents and workers to avoid a full prefill.
   `GKV1` files — same prefix-keyed lookup, token budget and
   `KVCFile.evictionScore` eviction, with hits/lastUsed in a sidecar
   `index.json` so the engine wire format stays untouched.
+- `LagunaDiskKVStore.swift`: the Laguna counterpart over native F16 `LKV1`
+  files. Active KV remains in Metal; the store restores cold sessions and
+  streams each plane through F_NOCACHE without a cache-sized duplicate.
 
 The layout is documented in [`FORMATO-CHECKPOINT.md`](FORMATO-CHECKPOINT.md).
 

@@ -10,6 +10,17 @@ struct DwarfStarApp: App {
     @State private var mcp: MCPStore
 
     init() {
+        // La GUI opta nel runtime Laguna (bring-up): il gate
+        // LagunaRuntimeGate legge DS4_LAGUNA_RUNTIME al primo accesso, e
+        // qui siamo prima di qualunque load/inspect. overwrite=0: un
+        // DS4_LAGUNA_RUNTIME=0 esplicito nell'ambiente vince ancora.
+        setenv("DS4_LAGUNA_RUNTIME", "1", 0)
+        // Profilo Laguna misurato sul M1 Pro con ~10 GiB liberi. Va
+        // installato PRIMA di ChatStore: quest'ultimo pubblica i knob comuni
+        // ottimizzati per DeepSeek, mentre gli alias DS4_LAGUNA_* devono
+        // conservare chunk/cache/I/O specifici del backend. Gli override
+        // espliciti nell'ambiente vincono perché il preset non sovrascrive.
+        LagunaInferenceService.installGUIEnvironmentDefaults()
         // Capture the C engine's stderr so Metal/kernel errors are visible.
         EngineLog.shared.install()
         // Recover before AppSettings/ChatStore stored-property initializers read

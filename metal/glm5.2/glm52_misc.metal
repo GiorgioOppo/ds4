@@ -24,12 +24,16 @@ kernel void kernel_glm52_rms_norm_f32(
         device float       *output,
         threadgroup float  *scratch [[threadgroup(0)]],
         uint tid [[thread_index_in_threadgroup]],
+        uint3 group [[threadgroup_position_in_grid]],
         uint3 threads [[threads_per_threadgroup]]) {
     const uint nth = threads.x;
     if (nth != 256u) return;
+    const uint64_t row_offset = (uint64_t)group.x * args.width;
+    device const float *row_input = input + row_offset;
+    device float *row_output = output + row_offset;
     float sum_squares = 0.0f;
     for (uint i = tid; i < args.width; i += nth) {
-        const float value = input[i];
+        const float value = row_input[i];
         sum_squares += value * value;
     }
     scratch[tid] = sum_squares;
@@ -45,7 +49,7 @@ kernel void kernel_glm52_rms_norm_f32(
     const float inverse_rms =
         1.0f / sqrt(scratch[0] / (float)args.width + args.epsilon);
     for (uint i = tid; i < args.width; i += nth) {
-        output[i] = (input[i] * inverse_rms) * weight[i];
+        row_output[i] = (row_input[i] * inverse_rms) * weight[i];
     }
 }
 
@@ -65,13 +69,20 @@ kernel void kernel_glm52_matvec_f32(
         device const float *x,
         device float       *out,
         uint tid [[thread_position_in_grid]]) {
-    if (tid >= args.row_count) return;
-    device const float *row = rows + (uint64_t)tid * args.input_width;
+    const uint token_count = max(args.pad0, 1u);
+    const uint total_rows = args.row_count * token_count;
+    if (tid >= total_rows) return;
+    const uint token = tid / args.row_count;
+    const uint row_index = tid - token * args.row_count;
+    device const float *row =
+        rows + (uint64_t)row_index * args.input_width;
+    device const float *token_x =
+        x + (uint64_t)token * args.input_width;
     float acc = 0.0f;
     for (uint i = 0u; i < args.input_width; i++) {
-        acc += row[i] * x[i];
+        acc += row[i] * token_x[i];
     }
-    out[tid] = acc;
+    out[(uint64_t)token * args.row_count + row_index] = acc;
 }
 
 struct ds4_metal_args_glm52_add {

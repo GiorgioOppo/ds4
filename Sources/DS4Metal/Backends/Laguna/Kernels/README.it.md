@@ -3,7 +3,7 @@
 # Wrapper dei kernel Laguna
 
 Wrapper `extension MetalRuntime` sui kernel di decode di
-`metal/laguna/laguna.metal`, nello stile GLM: `[Float]` in ingresso,
+`metal/laguna/`, nello stile GLM: `[Float]` in ingresso,
 `[Float]` in uscita, un command buffer per chiamata, ogni pipeline risolta
 con l'esatto nome della funzione Metal. Esistono perché i kernel possano
 essere giudicati su hardware contro gli oracoli CPU di

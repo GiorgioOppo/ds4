@@ -46,7 +46,10 @@ public final class StreamingDecoder {
     /// N separate buffers) instead of one commit+wait per token — the dominant
     /// fixed cost at 512-token chunks (43 layers × 512 sync round-trips).
     /// DS4_PREFILL_FFN_BATCH=0 restores the per-token path (A/B parity check).
-    let prefillFFNBatch = ProcessInfo.processInfo.environment["DS4_PREFILL_FFN_BATCH"] != "0"
+    let prefillFFNBatch = DS4RuntimeEnvironment.flag(
+        "DS4_PREFILL_MOE_BATCH",
+        overrides: ["DS4_PREFILL_FFN_BATCH"],
+        default: true)
     /// Batched prefill phase A: encode up to DS4_PREFILL_ROUTE_BATCH consecutive
     /// tokens' routes into ONE command buffer — per-token scratch snapshots are
     /// blit-copied GPU-side between tokens, and the CPU reads ALL the selections
@@ -82,7 +85,10 @@ public final class StreamingDecoder {
     /// outputs are close but not bit-identical. `=0` restores the per-token
     /// attention for A/B parity. Runs that would overflow the raw ring
     /// (DS4_RAW_RING) fall back automatically.
-    let prefillBatchAttn = ProcessInfo.processInfo.environment["DS4_PREFILL_BATCH_ATTN"] != "0"
+    let prefillBatchAttn = DS4RuntimeEnvironment.flag(
+        "DS4_PREFILL_BATCH",
+        overrides: ["DS4_PREFILL_BATCH_ATTN"],
+        default: true)
     /// DS4_PROFILE_PREFILL=1: time the BATCHED prefill run's sub-phases
     /// (dense path only) with commit boundaries, accumulated under the same
     /// route-split labels the decode profiler prints (comp/q/kv/attn/out-proj/

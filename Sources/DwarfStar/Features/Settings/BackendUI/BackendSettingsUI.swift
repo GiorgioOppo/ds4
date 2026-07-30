@@ -41,6 +41,10 @@ class BackendSettingsUI {
            GLM52BackendDefinition.runtimeEnabled {
             return GLM52SettingsUI(store: store, dist: dist)
         }
+        if architecture == LagunaBackendDefinition.supportedArchitecture,
+           LagunaBackendDefinition.runtimeEnabled {
+            return LagunaSettingsUI(store: store, dist: dist)
+        }
         return BackendSettingsUI(store: store, dist: dist)
     }
 
@@ -96,6 +100,25 @@ class BackendSettingsUI {
         AnyView(DiskKVRows(store: store, showBudget: showBudget,
                            gbPerKTok: gbPerKTok, note: note))
     }
+}
+
+/// Laguna exposes its measured preset plus the initial lazy-KV allocation.
+/// Disk-KV is a first-class backend setting and uses the same persisted
+/// toggle/token budget.
+@MainActor
+final class LagunaSettingsUI: BackendSettingsUI {
+    override var backendName: String? { "Laguna S 2.1" }
+
+    override func memorySection() -> AnyView {
+        AnyView(LagunaMemorySection(
+            store: store,
+            diskKVRows: diskKVRows(
+                showBudget: true,
+                gbPerKTok: 0.049,
+                note: "Checkpoint LKV1 per prefisso: la KV attiva resta in Metal durante il decode. Oltre 512 token, ogni file costa ~48 KB/token più ~72 MiB fissi per i ring sliding. Ripristinare evita il re-prefill; budget ed eviction valgono dal prossimo caricamento.")))
+    }
+
+    override func tuningPanel() -> AnyView? { memorySection() }
 }
 
 // MARK: - Viste comuni della base
@@ -168,6 +191,30 @@ private struct DiskKVRows: View {
                 Text(note)
                     .font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+private struct LagunaMemorySection: View {
+    @Bindable var store: ChatStore
+    let diskKVRows: AnyView
+
+    var body: some View {
+        Section("Memory · Laguna S 2.1") {
+            Picker("KV full-attention iniziale",
+                   selection: $store.lagunaKVInitial) {
+                Text("256 righe (~84 MiB)").tag(256)
+                Text("512 righe (~96 MiB, consigliato)").tag(512)
+                Text("1.024 righe (~120 MiB)").tag(1_024)
+                Text("2.048 righe (~168 MiB)").tag(2_048)
+                Text("4.096 righe (~264 MiB)").tag(4_096)
+            }
+            .pickerStyle(.menu)
+            Text("La KV dei 12 layer globali parte dal valore selezionato e cresce solo con il contesto realmente usato; i 36 layer sliding mantengono un ring da 512. Cambiando conversazione, la capacità in eccesso viene rilasciata.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Il valore selezionato si applica al prossimo caricamento. La capacità massima resta il Context configurato: con Context 32k e 512 righe iniziali il load usa ~96 MiB di KV, poi cresce 512 → 1k → 2k soltanto quando serve.")
+                .font(.caption).foregroundStyle(.tertiary)
+            diskKVRows
         }
     }
 }

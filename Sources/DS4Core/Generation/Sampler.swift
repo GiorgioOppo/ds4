@@ -24,14 +24,27 @@ public enum Sampler {
     static let fastFullVocab: Bool =
         ProcessInfo.processInfo.environment["DS4_FAST_SAMPLER"] != "0"
 
-    /// Port of sample_argmax.
-    public static func argmax(_ logits: [Float]) -> Int {
+    private static func argmaxValues<C: RandomAccessCollection>(
+        _ logits: C
+    ) -> Int where C.Element == Float, C.Index == Int {
         var best = 0
         var bestV = negInf
         for i in 0..<logits.count where logits[i] > bestV {
             bestV = logits[i]; best = i
         }
         return best
+    }
+
+    /// Port of sample_argmax.
+    public static func argmax(_ logits: [Float]) -> Int {
+        argmaxValues(logits)
+    }
+
+    /// Zero-copy form for logits held in a shared Metal buffer.
+    public static func argmax(
+        _ logits: UnsafeBufferPointer<Float>
+    ) -> Int {
+        argmaxValues(logits)
     }
 
     /// Port of sample_rng_next (xorshift64* with the C's nonzero reseed).
@@ -59,9 +72,11 @@ public enum Sampler {
     /// sort — same selection, same RNG consumption (see the fast-path comment).
     /// `fast` is injectable (internal) so the parity test can compare both
     /// builds without touching the process environment.
-    static func fullVocab(_ logits: [Float], _ nVocab: Int,
-                          _ temperature: Float, _ topP: Float, _ minP: Float,
-                          _ rng: inout UInt64, fast: Bool = Sampler.fastFullVocab) -> Int {
+    private static func fullVocabValues<C: RandomAccessCollection>(
+        _ logits: C, _ nVocab: Int,
+        _ temperature: Float, _ topP: Float, _ minP: Float,
+        _ rng: inout UInt64, fast: Bool
+    ) -> Int where C.Element == Float, C.Index == Int {
         var maxLogit = negInf
         var best = 0
         var finite = 0
@@ -69,7 +84,7 @@ public enum Sampler {
             finite += 1
             if logits[i] > maxLogit { maxLogit = logits[i]; best = i }
         }
-        if finite == 0 { return argmax(logits) }
+        if finite == 0 { return argmaxValues(logits) }
 
         if topP >= 1.0 {
             let minRel: Float = minP > 0.0 ? minP : 0.0
@@ -156,6 +171,15 @@ public enum Sampler {
         return cand[filtered - 1].id
     }
 
+    static func fullVocab(
+        _ logits: [Float], _ nVocab: Int,
+        _ temperature: Float, _ topP: Float, _ minP: Float,
+        _ rng: inout UInt64, fast: Bool = Sampler.fastFullVocab
+    ) -> Int {
+        fullVocabValues(
+            logits, nVocab, temperature, topP, minP, &rng, fast: fast)
+    }
+
     /// Apply a repetition penalty to a copy of the logits for the recently produced
     /// tokens (llama.cpp `penalty_repeat`): logit /= penalty if positive, else
     /// logit *= penalty. Returns the logits unchanged when disabled.
@@ -174,19 +198,33 @@ public enum Sampler {
     /// quantized model that emits one low-confidence token can lock into a repeat
     /// loop ("è è è ( ( (") and never recover. `recent` is the tail of the token
     /// stream to penalize; `repetitionPenalty` > 1 divides those tokens' logits.
-    public static func sample(_ logits: [Float], temperature: Float,
-                              topK: Int, topP: Float, minP: Float,
-                              repetitionPenalty: Float = 1.0, recent: ArraySlice<Int> = ArraySlice<Int>(),
-                              rng: inout UInt64) -> Int {
-        let logits = applyRepetitionPenalty(logits, recent: recent, penalty: repetitionPenalty)
+    private static func sampleValues<C: RandomAccessCollection>(
+        _ logits: C, temperature: Float,
+        topK: Int, topP: Float, minP: Float,
+        repetitionPenalty: Float,
+        recent: ArraySlice<Int>,
+        rng: inout UInt64
+    ) -> Int where C.Element == Float, C.Index == Int {
+        if repetitionPenalty > 1.0, !recent.isEmpty {
+            let penalized = applyRepetitionPenalty(
+                Array(logits), recent: recent, penalty: repetitionPenalty)
+            return sampleValues(
+                penalized, temperature: temperature,
+                topK: topK, topP: topP, minP: minP,
+                repetitionPenalty: 1, recent: [], rng: &rng)
+        }
         let nVocab = logits.count
-        if temperature <= 0.0 { return argmax(logits) }
+        if temperature <= 0.0 { return argmaxValues(logits) }
         var topP = topP
         var minP = minP
         var topK = topK
         if topP <= 0.0 || topP > 1.0 { topP = 1.0 }
         if minP < 0.0 { minP = 0.0 }
-        if topK <= 0 { return fullVocab(logits, nVocab, temperature, topP, minP, &rng) }
+        if topK <= 0 {
+            return fullVocabValues(
+                logits, nVocab, temperature, topP, minP, &rng,
+                fast: fastFullVocab)
+        }
         if topK > 1024 { topK = 1024 }
         if topK > nVocab { topK = nVocab }
 
@@ -205,7 +243,7 @@ public enum Sampler {
             }
             vals[j] = v; ids[j] = i
         }
-        if n == 0 { return argmax(logits) }
+        if n == 0 { return argmaxValues(logits) }
 
         var probs = [Float](repeating: 0, count: n)
         let maxLogit = vals[0]
@@ -234,5 +272,34 @@ public enum Sampler {
             if r <= 0.0 { return ids[i] }
         }
         return ids[filtered - 1]
+    }
+
+    public static func sample(
+        _ logits: [Float], temperature: Float,
+        topK: Int, topP: Float, minP: Float,
+        repetitionPenalty: Float = 1.0,
+        recent: ArraySlice<Int> = ArraySlice<Int>(),
+        rng: inout UInt64
+    ) -> Int {
+        sampleValues(
+            logits, temperature: temperature,
+            topK: topK, topP: topP, minP: minP,
+            repetitionPenalty: repetitionPenalty, recent: recent, rng: &rng)
+    }
+
+    /// Zero-copy sampling for logits exposed directly from shared GPU memory.
+    /// A repetition penalty still materializes a private copy because only
+    /// the penalized token positions may be mutated.
+    public static func sample(
+        _ logits: UnsafeBufferPointer<Float>, temperature: Float,
+        topK: Int, topP: Float, minP: Float,
+        repetitionPenalty: Float = 1.0,
+        recent: ArraySlice<Int> = ArraySlice<Int>(),
+        rng: inout UInt64
+    ) -> Int {
+        sampleValues(
+            logits, temperature: temperature,
+            topK: topK, topP: topP, minP: minP,
+            repetitionPenalty: repetitionPenalty, recent: recent, rng: &rng)
     }
 }

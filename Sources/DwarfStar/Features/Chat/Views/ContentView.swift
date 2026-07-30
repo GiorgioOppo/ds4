@@ -100,9 +100,9 @@ struct ModelLoadView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Disk KV (reuse prefixes across sessions)", isOn: $store.diskKVEnabled)
                 if store.diskKVEnabled {
-                    Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * 0.022)) GB)",
+                    Stepper("Budget: \(store.diskKVBudgetKTok)k tokens (≈ \(String(format: "%.1f", Double(store.diskKVBudgetKTok) * diskKVGBPerKTok)) GB)",
                             value: $store.diskKVBudgetKTok, in: 128...4096, step: 128)
-                    Text("At the end of a response, the KV state is saved to disk; a new conversation or server request that starts with a known prefix restores it instead of redoing prefill. The budget counts TOTAL checkpointed tokens across conversations (the live context window is separate). Applies on the next model load.")
+                    Text("At the end of a response, the KV state is saved to disk; a new conversation or server request that starts with a known prefix restores it instead of redoing prefill. The live decode KV remains in Metal. Laguna's estimate excludes the additional ~72 MiB sliding-ring overhead per mature checkpoint. Applies on the next model load.")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
                 Toggle("Raw-KV ring (experimental): constant KV RAM", isOn: $store.rawRingEnabled)
@@ -139,7 +139,7 @@ struct ModelLoadView: View {
             Section("Context and System Prompt") {
                 Stepper("Context: \(store.contextSize) tokens",
                         value: $store.contextSize, in: 1024...1_000_000, step: 1024)
-                Text("KV caches grow with context and take page cache away from expert streaming. On low RAM, a large context slows generation a lot. The default is RAM-aware (4096 on <=16 GB, like the demo); raise it only if you need a longer window.")
+                Text("KV caches grow with the context actually used and take page cache away from expert streaming. Laguna starts its full-attention KV at 512 rows and grows lazily, so its configured maximum is no longer reserved at load. On low RAM, very long active conversations can still slow generation; raise the window only when needed.")
                     .font(.caption).foregroundStyle(.secondary)
                 TextField("Additional system prompt (added to the agent role)",
                           text: $store.systemPrompt, axis: .vertical)
@@ -177,5 +177,17 @@ struct ModelLoadView: View {
         .sheet(isPresented: $showDownload) {
             DownloadView(store: store)
         }
+    }
+
+    private var diskKVGBPerKTok: Double {
+        let architecture = store.info?.architecture
+            ?? store.inspectedModelDescriptor?.architecture
+        if architecture == LagunaBackendDefinition.supportedArchitecture {
+            return 0.049
+        }
+        if architecture == GLM52BackendDefinition.supportedArchitecture {
+            return 0.096
+        }
+        return 0.022
     }
 }

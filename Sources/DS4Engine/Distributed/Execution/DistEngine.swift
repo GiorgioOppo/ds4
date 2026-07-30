@@ -151,7 +151,8 @@ public final class DistEngine: @unchecked Sendable {
         var p99 = 0.0
         if !tokenSpeeds.isEmpty {
             let sorted = tokenSpeeds.sorted()
-            p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
+            let latencyRank = Int(ceil(0.99 * Double(sorted.count)))
+            p99 = sorted[max(0, sorted.count - latencyRank)]
         }
         let kv = UInt64(nLayers) * UInt64(ctx) * UInt64(headDim) * 4
         return InferenceService.BenchPoint(contextTokens: ctx,

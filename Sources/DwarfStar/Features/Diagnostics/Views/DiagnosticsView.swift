@@ -13,7 +13,7 @@ struct DiagnosticsView: View {
                                    value: (controller.modelPath as NSString).lastPathComponent)
                     TextField("Text", text: $controller.text, axis: .vertical)
                         .lineLimit(2...6)
-                    Text("Opens the GGUF only for the tokenizer (pure Swift, no subprocess), selected by the model's architecture — DeepSeek or GLM. Choose the model in Settings.")
+                    Text("Opens the GGUF only for the tokenizer (pure Swift, no subprocess), selected by the model's architecture — DeepSeek, GLM or Laguna. Choose the model in Settings.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {

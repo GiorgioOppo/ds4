@@ -163,19 +163,29 @@ do {
             let environment = ProcessInfo.processInfo.environment
             var glmOptions = GLM52ResidentModelOptions()
             glmOptions.cacheCapacity = maxKeys
-            glmOptions.residentLayerCount = environment["DS4_GLM_RESIDENT_LAYERS"]
-                .flatMap(Int.init)
+            glmOptions.residentLayerCount = DS4RuntimeEnvironment.integer(
+                "DS4_RESIDENT_LAYERS",
+                overrides: ["DS4_GLM_RESIDENT_LAYERS"],
+                environment: environment)
                 ?? GLM52ResidentModelOptions.adaptiveResidentLayerCount()
-            glmOptions.activeExperts = environment["DS4_GLM_ACTIVE_EXPERTS"]
-                .flatMap(Int.init)
-            if let slots = environment["DS4_GLM_EXPERT_SLOTS"]
-                .flatMap(Int.init) {
+            glmOptions.activeExperts = DS4RuntimeEnvironment.integer(
+                "DS4_ACTIVE_EXPERTS",
+                overrides: ["DS4_GLM_ACTIVE_EXPERTS"],
+                environment: environment)
+            if let slots = DS4RuntimeEnvironment.integer(
+                "DS4_EXPERT_CACHE_SLOTS",
+                overrides: ["DS4_GLM_EXPERT_SLOTS"],
+                environment: environment
+            ) {
                 glmOptions.expertSlotCount = slots
             }
             // DS4_GLM_STREAM_SLOTS: slot di staging del layer streamer
             // (default 3 = due fill SSD in volo mentre un layer computa).
-            if let slots = environment["DS4_GLM_STREAM_SLOTS"]
-                .flatMap(Int.init) {
+            if let slots = DS4RuntimeEnvironment.integer(
+                "DS4_STREAM_SLOTS",
+                overrides: ["DS4_GLM_STREAM_SLOTS"],
+                environment: environment
+            ) {
                 glmOptions.streamSlotCount = slots
             }
             if let resident = glmOptions.residentLayerCount {
@@ -191,7 +201,10 @@ do {
             // saltati.
             if environment["DS4_GLM_BUILD_BUNDLES"] == "1" {
                 // Convenzione sidecar: accanto al GGUF, salvo override.
-                let bundleDir = environment["DS4_GLM_BUNDLE_DIR"]
+                let bundleDir = DS4RuntimeEnvironment.value(
+                    "DS4_BUNDLE_DIR",
+                    overrides: ["DS4_GLM_BUNDLE_DIR"],
+                    environment: environment)
                     ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: ggufPath,
@@ -228,7 +241,10 @@ do {
             if environment["DS4_GLM_BUILD_LAYERQ4"] == "1" {
                 let sidecarDir = environment["DS4_GLM_LAYERQ4_DIR"]
                     ?? (ggufPath + ".glm-layers-q4")
-                let legacyBundles = environment["DS4_GLM_BUNDLE_DIR"]
+                let legacyBundles = DS4RuntimeEnvironment.value(
+                    "DS4_BUNDLE_DIR",
+                    overrides: ["DS4_GLM_BUNDLE_DIR"],
+                    environment: environment)
                     ?? (ggufPath + ".glm-experts")
                 let map = try GLM52WeightMap(model: model)
                 let reader = try GLM52PayloadReader(path: ggufPath,
@@ -304,7 +320,10 @@ do {
             // per l'intera finestra: è l'unico modo di battere il tetto
             // dell'I/O per token). Accettazione greedy; il rifiuto fa
             // rollback delle cache e ricommitta solo il prefisso valido.
-            let specK = environment["DS4_GLM_SPEC_K"].flatMap(Int.init) ?? 0
+            let specK = DS4RuntimeEnvironment.integer(
+                "DS4_SPEC_K",
+                overrides: ["DS4_GLM_SPEC_K"],
+                environment: environment) ?? 0
             if specK >= 2 {
                 log("DS4Demo: decode speculativo prompt-lookup GLM — "
                     + "finestra \(specK), n-gramma 4→2")
@@ -436,8 +455,24 @@ do {
             // Prompt from DS4_PROMPT; token budget from DS4_MAX_NEW;
             // DS4_LAGUNA_LAYERS truncates the stack for bring-up runs.
             let environment = ProcessInfo.processInfo.environment
-            let prompt = environment["DS4_PROMPT"]
+            var prompt = environment["DS4_PROMPT"]
                 ?? "Ciao! Presentati in una frase."
+            if let file = environment["DS4_PROMPT_FILE"], !file.isEmpty {
+                let path = (file as NSString).expandingTildeInPath
+                guard var text = try? String(
+                    contentsOfFile: path, encoding: .utf8
+                ) else {
+                    log("DS4Demo: impossibile leggere il file prompt '\(path)'")
+                    exit(2)
+                }
+                let cap = environment["DS4_PROMPT_MAX_CHARS"]
+                    .flatMap(Int.init) ?? 12_000
+                if text.count > cap {
+                    text = String(text.prefix(cap))
+                    log("DS4Demo: prompt Laguna troncato a \(cap) caratteri")
+                }
+                prompt = text
+            }
             let maxNew = Int(environment["DS4_MAX_NEW"] ?? "") ?? 128
             let reasoning: ThinkMode =
                 environment["DS4_NOTHINK"] == "1" ? .none : .high
@@ -516,6 +551,11 @@ do {
             let runtime = try MetalRuntime()
             var options = LagunaResidentModelOptions()
             options.cacheCapacity = maxKeys
+            options.initialFullCacheCapacity =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_KV_INITIAL",
+                    overrides: ["DS4_LAGUNA_KV_INITIAL"],
+                    environment: environment)
             options.layerCount = environment["DS4_LAGUNA_LAYERS"].flatMap(Int.init)
             // Streaming SSD sperimentale degli esperti instradati
             // (divergenza dichiarata dal C, che per Laguna impone la
@@ -524,15 +564,130 @@ do {
             // 32 GB, a pochi tok/s.
             options.expertStreaming =
                 environment["DS4_LAGUNA_SSD_STREAM"] == "1"
+            // Cache LRU degli slab esperti streamati (slot da un esperto,
+            // stile ExpertSlotCache DeepSeek): gli hit non pagano né SSD né
+            // copia. DS4_LAGUNA_EXPERT_CACHE_MB regola il budget; default
+            // 2048 quando lo streaming è attivo: sul target M1 Pro 16 GB
+            // è il miglior compromesso end-to-end per prefill e decode.
+            // Budget più larghi riducono l'I/O ma introducono pressione
+            // memoria; 0 disattiva la cache.
+            options.expertCacheMB =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_EXPERT_CACHE_MB",
+                    overrides: ["DS4_LAGUNA_EXPERT_CACHE_MB"],
+                    environment: environment)
+                ?? (options.expertStreaming ? 2_048 : 0)
+            options.expertCacheSlots = DS4RuntimeEnvironment.integer(
+                "DS4_EXPERT_CACHE_SLOTS",
+                overrides: ["DS4_LAGUNA_EXPERT_CACHE_SLOTS"],
+                environment: environment)
+            options.activeExperts = DS4RuntimeEnvironment.integer(
+                "DS4_ACTIVE_EXPERTS",
+                overrides: ["DS4_LAGUNA_ACTIVE_EXPERTS"],
+                environment: environment)
+            options.residentExpertLayers = DS4RuntimeEnvironment.integer(
+                "DS4_RESIDENT_LAYERS",
+                overrides: ["DS4_LAGUNA_RESIDENT_LAYERS"],
+                environment: environment)
+            options.prefillChunk = DS4RuntimeEnvironment.integer(
+                "DS4_PREFILL_CHUNK",
+                overrides: ["DS4_LAGUNA_PREFILL_CHUNK"],
+                environment: environment)
+            options.expertPread = DS4RuntimeEnvironment.flag(
+                "DS4_EXPERT_PREAD",
+                overrides: ["DS4_LAGUNA_EXPERT_PREAD"],
+                default: true,
+                environment: environment)
+            options.willNeedExperts = DS4RuntimeEnvironment.flag(
+                "DS4_WILLNEED_EXPERTS",
+                overrides: ["DS4_LAGUNA_WILLNEED_EXPERTS"],
+                default: true,
+                environment: environment)
+            options.preadSplit = DS4RuntimeEnvironment.integer(
+                "DS4_PREAD_SPLIT",
+                overrides: ["DS4_LAGUNA_PREAD_SPLIT"],
+                environment: environment) ?? 1
+            options.metalIO = DS4RuntimeEnvironment.flag(
+                "DS4_MTLIO",
+                overrides: ["DS4_LAGUNA_MTLIO"],
+                default: false,
+                environment: environment)
+            options.lockResident = DS4RuntimeEnvironment.flag(
+                "DS4_MLOCK",
+                overrides: ["DS4_LAGUNA_MLOCK"],
+                default: false,
+                environment: environment)
+            options.simdgroupsPerThreadgroup =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_NSG",
+                    overrides: ["DS4_LAGUNA_NSG"],
+                    environment: environment)
+            options.longAttentionIndex = DS4RuntimeEnvironment.flag(
+                "DS4_INDEXED_ATTN",
+                overrides: ["DS4_LAGUNA_INDEXED_ATTN"],
+                default: true,
+                environment: environment)
+            options.longAttentionBlockSize =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_LONG_ATTN_BLOCK",
+                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_BLOCK"],
+                    environment: environment)
+            options.longAttentionTopBlocks =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_LONG_ATTN_TOP_BLOCKS",
+                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_TOP_BLOCKS"],
+                    environment: environment)
+            options.longAttentionRecentTokens =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_LONG_ATTN_RECENT",
+                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_RECENT"],
+                    environment: environment)
+            options.longAttentionThreshold =
+                DS4RuntimeEnvironment.integer(
+                    "DS4_LONG_ATTN_THRESHOLD",
+                    overrides: ["DS4_LAGUNA_INDEXED_ATTN_THRESHOLD"],
+                    environment: environment)
             let loadStart = Date()
             let laguna = try LagunaResidentModel(
                 runtime: runtime, path: ggufPath, options: options
             )
             let loadSeconds = Date().timeIntervalSince(loadStart)
-            log(String(format: "DS4Demo: Laguna caricato in %.1fs (%d layer%@)",
-                       loadSeconds, laguna.loadedLayerCount,
-                       laguna.isExpertStreaming
-                           ? ", esperti in streaming SSD" : ""))
+            let streamingNote = laguna.isExpertStreaming
+                ? ", esperti in streaming SSD"
+                    + (laguna.expertCacheSlots > 0
+                           ? " · cache \(laguna.expertCacheSlots) slot"
+                           : "")
+                    + (laguna.isExpertPreadEnabled
+                           ? " · pread×\(laguna.expertPreadSplit)"
+                           : " · mmap")
+                    + (laguna.isMetalIOEnabled ? " · MetalIO" : "")
+                : ""
+            log(String(
+                format: "DS4Demo: Laguna caricato in %.1fs (%d layer · top-%d"
+                    + " · chunk %d%@ · KV %d MiB · decode %@%@"
+                    + " · weights %@ · mmap %@)",
+                loadSeconds, laguna.loadedLayerCount,
+                laguna.activeExpertCount, laguna.prefillChunkSize,
+                streamingNote,
+                laguna.allocatedKVCacheBytes >> 20,
+                laguna.isChainedDecodeEnabled ? "chained" : "sync",
+                laguna.isDecodeSplitKEnabled ? "+splitK" : "",
+                laguna.usesPrivateResidentWeights ? "private" : "shared",
+                laguna.discardsUploadedFilePages ? "drop" : "keep"))
+            if laguna.residentExpertLayerCount > 0 {
+                log("DS4Demo: Laguna routed layer residenti = "
+                    + "\(laguna.residentExpertLayerCount)")
+            }
+            if laguna.isLongAttentionIndexEnabled {
+                let indexed = laguna.longAttentionConfiguration
+                log("DS4Demo: Laguna attention lunga indicizzata"
+                    + " — blocco \(indexed.blockSize)"
+                    + " · top-\(indexed.topBlocks) blocchi"
+                    + " · recente \(indexed.recentTokens)"
+                    + " · soglia \(indexed.threshold)")
+            }
+            log("DS4Demo: Laguna shared expert/I/O overlap = "
+                + (laguna.isSharedExpertIOOverlapEnabled ? "on" : "off"))
             // The reference CLI passes the Poolside default system prompt
             // into `ds4_encode_chat_prompt` when none is given.
             let tokens = try tokenizer.encodeChatPrompt(
@@ -546,6 +701,9 @@ do {
             let prefillSeconds = Date().timeIntervalSince(prefillStart)
             log(String(format: "DS4Demo: prefill %d token in %.1fs",
                        tokens.count, prefillSeconds))
+            // Ripartizione per-fase del prompt (come la demo GLM): senza
+            // questa riga la composizione del prefill non è mai visibile.
+            log(laguna.profileReport(title: "Profilo prefill"))
             // Il profilo per-fase riparte qui: il report a fine decode
             // descrive solo il regime di generazione, come nella demo GLM.
             laguna.resetProfile()

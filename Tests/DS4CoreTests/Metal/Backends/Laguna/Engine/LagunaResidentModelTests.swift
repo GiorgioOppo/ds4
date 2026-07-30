@@ -6,6 +6,38 @@ import DS4Core
 /// Device-free coverage of the engine's CPU helpers plus an opt-in
 /// real-weights smoke test.
 final class LagunaResidentModelTests: XCTestCase {
+    func testRuntimeKnobsAreClampedToSupportedRanges() {
+        XCTAssertEqual(LagunaResidentModel.resolvedActiveExperts(nil), 10)
+        XCTAssertEqual(LagunaResidentModel.resolvedActiveExperts(0), 1)
+        XCTAssertEqual(LagunaResidentModel.resolvedActiveExperts(6), 6)
+        XCTAssertEqual(LagunaResidentModel.resolvedActiveExperts(99), 10)
+
+        XCTAssertEqual(LagunaResidentModel.resolvedPrefillChunk(nil), 256)
+        XCTAssertEqual(LagunaResidentModel.resolvedPrefillChunk(0), 1)
+        XCTAssertEqual(LagunaResidentModel.resolvedPrefillChunk(2_048),
+                       1_024)
+        XCTAssertEqual(LagunaResidentModel.resolvedPreadSplit(0), 1)
+        XCTAssertEqual(LagunaResidentModel.resolvedPreadSplit(99), 8)
+        XCTAssertEqual(LagunaResidentModel.resolvedSimdgroups(nil), 4)
+        XCTAssertEqual(LagunaResidentModel.resolvedSimdgroups(99), 8)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionBlockSize(nil), 16)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionBlockSize(7), 8)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionBlockSize(80), 64)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionTopBlocks(nil), 32)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionTopBlocks(0), 1)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionTopBlocks(999), 128)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionRecentTokens(nil), 512)
+        XCTAssertEqual(
+            LagunaResidentModel.resolvedLongAttentionRecentTokens(1), 128)
+    }
+
     func testQ8RowDequantizationMatchesTheEncoder() throws {
         // Encode two known rows with the shared Q8_0 encoder, then read row 1
         // back through the engine's embedding-row dequantizer.
@@ -95,5 +127,18 @@ final class LagunaResidentModelTests: XCTestCase {
         let second = try engine.forwardNext(2)
         XCTAssertTrue(second.allSatisfy(\.isFinite))
         XCTAssertEqual(engine.position, 2)
+
+        // Native disk-KV round trip: restoring the exact F16 planes must
+        // reproduce the next-token logits bit-for-bit.
+        let checkpoint = FileManager.default.temporaryDirectory
+            .appendingPathComponent("laguna-engine-\(UUID().uuidString).lkv")
+        defer { try? FileManager.default.removeItem(at: checkpoint) }
+        try engine.saveKVCheckpoint(to: checkpoint, tokens: [1, 2])
+        let expected = try engine.forwardNext(3)
+        engine.resetContext(releaseExcessKV: true)
+        XCTAssertEqual(
+            try engine.restoreKVCheckpoint(from: checkpoint), [1, 2])
+        let restored = try engine.forwardNext(3)
+        XCTAssertEqual(restored, expected)
     }
 }

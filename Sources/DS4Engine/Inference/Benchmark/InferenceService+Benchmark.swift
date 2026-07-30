@@ -9,9 +9,8 @@ public struct BenchPoint: Sendable {
         /// Media semplice (token generati / tempo totale) — sporca dei costi
         /// una-tantum (primo token freddo, stalli).
         public let genTps: Double
-        /// 99° percentile della VELOCITÀ per-token (1/durata di ogni token,
-        /// ordinati): la velocità di regime raggiunta, robusta agli outlier
-        /// lenti. È la metrica riportata dal Bench.
+        /// Throughput equivalente al 99° percentile della LATENZA per-token
+        /// (`1 / p99 latency`): rappresenta la coda lenta del decode.
         public let genTpsP99: Double
         public let kvBytes: UInt64
         /// Velocità per-token IN ORDINE DI GENERAZIONE (1/durata di ciascuno):
@@ -962,13 +961,14 @@ public struct BenchPoint: Sendable {
         let genDt = Date().timeIntervalSince(g0)
         kvDirty = true   // synthetic KV state — force a rebuild on the next real turn
         let kv = UInt64(runtimeGeometry.nLayers) * UInt64(ctx) * UInt64(dims.headDim) * 4
-        // p99 della velocità per-token: ordina le velocità e prendi il valore
-        // al 99° percentile — il regime raggiunto, insensibile al primo token
-        // freddo e agli stalli che schiacciano la media.
+        // Throughput equivalente al p99 della LATENZA per-token. Velocità e
+        // latenza sono reciproche, quindi la coda lenta è all'inizio
+        // dell'array delle velocità ordinato in senso crescente.
         var p99 = 0.0
         if !tokenSpeeds.isEmpty {
             let sorted = tokenSpeeds.sorted()
-            p99 = sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * 0.99))]
+            let latencyRank = Int(ceil(0.99 * Double(sorted.count)))
+            p99 = sorted[max(0, sorted.count - latencyRank)]
         }
         let signature: MachineAutoTuneQualitySignature? = captureQuality
             ? MachineAutoTuneQualitySignature(

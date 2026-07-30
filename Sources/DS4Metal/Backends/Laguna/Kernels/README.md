@@ -3,7 +3,7 @@
 # Laguna kernel wrappers
 
 `extension MetalRuntime` wrappers over the decode kernels in
-`metal/laguna/laguna.metal`, in the GLM style: `[Float]` in, `[Float]` out,
+`metal/laguna/`, in the GLM style: `[Float]` in, `[Float]` out,
 one command buffer per call, every pipeline resolved by its exact Metal
 function name. They exist so the kernels can be judged against the CPU
 oracles in [`../Reference/`](../Reference/README.md) on hardware before any

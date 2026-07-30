@@ -44,9 +44,9 @@ File principali per peso a runtime:
 - `deepseek/dsv4_misc.metal`, `dsv4_hc.metal`, `dsv4_kv.metal`, `dsv4_rope.metal`:
   helper specifici di DeepSeek-V4.
 - `glm5.2/glm52.metal`: router GLM 5.2 e primitive compact-DSA.
-- `laguna/laguna.metal`: norm/RoPE per-testa Laguna, store KV ad anello F16,
-  attention GQA gated (decode e prefill), reduce flash-attention gated e una
-  proiezione densa Q6_K.
+- `laguna/laguna_{quant,rope,kv,attention}.metal`: norm/RoPE per-testa Laguna,
+  store KV ad anello F16, attention GQA gated (decode e prefill), reduce
+  flash-attention gated e una proiezione densa Q6_K.
 - kernel di utilità per normalizzazione, softmax, argsort, operazioni unarie e
   la relativa colla.
 

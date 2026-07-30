@@ -176,6 +176,8 @@ final class BenchController {
             runLocalDeepSeek(svc: svc, frontiers: frontiers, gen: gen)
         } else if let glm = store.glmBenchmarkService {
             runLocalGLM(svc: glm, frontiers: frontiers, gen: gen)
+        } else if let laguna = store.lagunaBenchmarkService {
+            runLocalLaguna(svc: laguna, frontiers: frontiers, gen: gen)
         } else {
             log = store.isReady
                 ? "The engine is generating. Wait for the chat turn to finish, then run the benchmark.\n"
@@ -200,12 +202,11 @@ final class BenchController {
                     try Task.checkCancellation()
                     onLog("context \(c): prefill + \(gen) tokens...\n")
                     let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
-                    // Il grafico/report usano il p99 della velocità per-token:
-                    // il regime raggiunto, non la media schiacciata dal primo
-                    // token freddo (la media resta nel log per confronto).
+                    // Il grafico/report usano il throughput equivalente al
+                    // p99 della latenza: la coda lenta del decode.
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
                                  p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
                 }
                 return nil
@@ -216,7 +217,7 @@ final class BenchController {
     }
 
     /// Same sweep on the GLM streaming engine: identical chart semantics
-    /// (p99 decode speed, kv bytes per frontier) plus the per-phase
+    /// (throughput at p99 decode latency, kv bytes per frontier) plus the per-phase
     /// streaming profile appended to the log for each point.
     private func runLocalGLM(svc: GLM52ChatService, frontiers: [Int], gen: Int) {
         let (logCont, rowCont) = makeChannels()
@@ -232,7 +233,37 @@ final class BenchController {
                     let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
+                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
+                    onLog(p.report.split(separator: "\n")
+                        .map { "    \($0)\n" }.joined())
+                }
+                return nil
+            } catch is CancellationError { return nil }
+            catch { return "\(error)" }
+        }
+        finish(benchWork: benchWork, logCont: logCont, rowCont: rowCont)
+    }
+
+    /// Same sweep on the Laguna resident/streaming engine: identical chart
+    /// semantics (throughput at p99 decode latency, kv bytes per frontier) plus the
+    /// per-phase profile appended to the log for each point.
+    private func runLocalLaguna(svc: LagunaChatService, frontiers: [Int],
+                                gen: Int) {
+        let (logCont, rowCont) = makeChannels()
+        let onLog: @Sendable (String) -> Void = { logCont.yield($0) }
+
+        let benchWork = Task.detached(priority: .userInitiated) { () -> String? in
+            do {
+                onLog("Running on the shared Laguna engine (no second model copy)...\n")
+                await svc.warmup()
+                for c in frontiers {
+                    try Task.checkCancellation()
+                    onLog("context \(c): prefill + \(gen) tokens...\n")
+                    let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
+                    rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
+                                           genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
                                  p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
                     onLog(p.report.split(separator: "\n")
                         .map { "    \($0)\n" }.joined())
@@ -271,7 +302,7 @@ final class BenchController {
                     let p = try await coord.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen p99 %.2f t/s (media %.2f)\n",
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
                                  p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
                 }
                 return nil
@@ -294,7 +325,8 @@ final class BenchController {
         }
         let deepSeek = store.benchmarkService
         let glm = store.glmBenchmarkService
-        guard deepSeek != nil || glm != nil else {
+        let laguna = store.lagunaBenchmarkService
+        guard deepSeek != nil || glm != nil || laguna != nil else {
             log = store.isReady
                 ? "The engine is generating. Wait for the chat turn to finish, then run the benchmark.\n"
                 : "No model loaded. Load the model in Settings first — the benchmark reuses that single engine.\n"
@@ -349,6 +381,15 @@ final class BenchController {
         } else if let glm {
             runEvaluation = {
                 try await glm.accuracyBenchmark(
+                    text: text, minContextTokens: minContextTokens,
+                    maxContextTokens: maxContextTokens,
+                    maxTokensPerPiece: maxTokensPerPiece,
+                    pieceCount: pieceCount, seed: seed,
+                    bucketSize: bucketSize, onObservation: onObservation)
+            }
+        } else if let laguna {
+            runEvaluation = {
+                try await laguna.accuracyBenchmark(
                     text: text, minContextTokens: minContextTokens,
                     maxContextTokens: maxContextTokens,
                     maxTokensPerPiece: maxTokensPerPiece,

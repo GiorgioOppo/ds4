@@ -213,10 +213,35 @@ a Laguna GGUF is recognized, validated and refused with a distinct error.
   (`Backends/Laguna/Reference/LagunaLayerReference.swift`): per-head
   norm/RoPE with YaRN, gated GQA attention over the F16 ring, 10-expert
   router, FFN blocks — with hand-computable unit tests.
-- Kernel port: `metal/laguna/laguna.metal` (verbatim from upstream plus a
-  local `block_q6_K`), wired into `MetalRuntime.kernelFiles`,
+- Kernel port: `metal/laguna/laguna_{quant,rope,kv,attention}.metal`
+  (verbatim from upstream plus a local `block_q6_K`, split one file per
+  area in the GLM style), wired into `MetalRuntime.kernelFiles`,
   `kernelSubdirectories` and `scripts/embed_kernels.sh`;
   `KernelSources.swift` regenerated.
+- First-cut resident engine (`LagunaResidentModel`) with the opt-in SSD
+  expert streaming for tight-RAM machines: concurrent `F_NOCACHE` preads,
+  LRU expert slot cache (`expertCacheMB`), and the shared-event overlap of
+  slab I/O with the routed-expert GPU batch (rank order — and therefore
+  rounding — preserved). Measured on a 16 GB M1 Pro with the mixed
+  Q2_K/Q3_K 45 GiB file: 0.29 → 2.40 tok/s.
+- Layer-major prefill (`LagunaResidentModel.prefill`/`forwardBatch`):
+  multi-token prompts sweep in chunks — phase A of every token in ONE
+  command buffer per layer (causal order = encode order, numerics
+  identical by construction), one router readback per layer, one union
+  gather over the slot cache, one rank-ordered expert batch behind
+  per-token shared-event waits. Two syncs per layer for the whole chunk
+  instead of two per layer×token; measured 1.9 → 4.05 prefill tok/s on
+  the 47-token demo prompt (the gap to DeepSeek's ~20 tok/s is the
+  missing multi-token GEMM prefill kernels — next tranche).
+- GUI chat integration behind the common `ChatBackend` contract:
+  `LagunaInferenceService` + `LagunaChatService` (render → incremental
+  prefill with live per-layer progress → sampled decode → think/tool
+  stream), hosted by `ChatStore` next to the GLM branch; the DwarfStar
+  app opts into `DS4_LAGUNA_RUNTIME=1` at launch (an explicit `=0` in
+  the environment still wins). Benchmark (speed sweep + teacher-forced
+  correctness via `forwardBatch`) and the tokenizer/chat-template
+  diagnostics have Laguna branches. The logits-parity gate against the
+  C engine remains open — outputs stay bring-up grade until it runs.
 - Validation wrappers (`Backends/Laguna/Kernels/LagunaKernels.swift`):
   `lagunaQKHeadRMSNormRope`, `lagunaStoreKV`, `lagunaAttentionDecode`, with
   GPU/CPU parity tests (skip without Metal) covering both block kinds, ring

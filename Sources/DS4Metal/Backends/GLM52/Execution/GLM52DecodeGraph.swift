@@ -15,8 +15,8 @@ enum GLM52MatvecDispatch {
     nonisolated(unsafe) static var cooperative =
         ProcessInfo.processInfo.environment["DS4_GLM_SG"] != "0"
     nonisolated(unsafe) static var rowsPerThreadgroup = max(1, min(8,
-        ProcessInfo.processInfo.environment["DS4_GLM_NSG"]
-            .flatMap(Int.init) ?? 4))
+        DS4RuntimeEnvironment.integer(
+            "DS4_NSG", overrides: ["DS4_GLM_NSG"]) ?? 4))
 }
 
 /// MoE BATCHED nel decode (DS4_GLM_MOE_BATCH=0 per disattivare): tutti gli
@@ -32,8 +32,10 @@ enum GLM52MoEBatchDispatch {
 /// pesi letti una volta per tile invece che una volta per token, tre
 /// dispatch per wave invece di tre per applicazione.
 enum GLM52PrefillMoEDispatch {
-    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
-        .environment["DS4_GLM_PREFILL_MOE"] != "0"
+    nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
+        "DS4_PREFILL_MOE_BATCH",
+        overrides: ["DS4_GLM_PREFILL_MOE"],
+        default: true)
     /// Applications per wave: bounds the mids/contribs planes (~32 MB at
     /// 1024). Var so the parity test can force multi-wave splits.
     nonisolated(unsafe) static var waveCap = 1024
@@ -57,18 +59,36 @@ public enum GLM52DispatchKnobs {
         let env = ProcessInfo.processInfo.environment
         GLM52MatvecDispatch.cooperative = env["DS4_GLM_SG"] != "0"
         GLM52MatvecDispatch.rowsPerThreadgroup = max(1, min(8,
-            env["DS4_GLM_NSG"].flatMap(Int.init) ?? 4))
+            DS4RuntimeEnvironment.integer(
+                "DS4_NSG", overrides: ["DS4_GLM_NSG"],
+                environment: env) ?? 4))
         GLM52MoEBatchDispatch.enabled = env["DS4_GLM_MOE_BATCH"] != "0"
-        GLM52PrefillMoEDispatch.enabled = env["DS4_GLM_PREFILL_MOE"] != "0"
+        GLM52PrefillMoEDispatch.enabled = DS4RuntimeEnvironment.flag(
+            "DS4_PREFILL_MOE_BATCH",
+            overrides: ["DS4_GLM_PREFILL_MOE"],
+            default: true,
+            environment: env)
         GLM52GpuRouterDispatch.enabled = env["DS4_GLM_GPU_ROUTER"] != "0"
-        GLM52ResidentWiring.enabled = env["DS4_GLM_MLOCK"] != "0"
-        GLM52LayerStreamer.refreshReadSplit(env["DS4_GLM_READ_SPLIT"]
-            .flatMap(Int.init))
+        GLM52ResidentWiring.enabled = DS4RuntimeEnvironment.flag(
+            "DS4_MLOCK", overrides: ["DS4_GLM_MLOCK"],
+            default: true, environment: env)
+        GLM52LayerStreamer.refreshReadSplit(
+            DS4RuntimeEnvironment.integer(
+                "DS4_PREAD_SPLIT",
+                overrides: ["DS4_GLM_READ_SPLIT"],
+                environment: env))
         // Leva 1 del prefill (route a gruppi): opt-in finché la parità sul
         // GGUF reale non è certificata; rilettura qui = toggle GUI al reload.
-        GLM52PrefillBatchDispatch.enabled = env["DS4_GLM_PREFILL_BATCH"] == "1"
+        GLM52PrefillBatchDispatch.enabled = DS4RuntimeEnvironment.flag(
+            "DS4_PREFILL_BATCH",
+            overrides: ["DS4_GLM_PREFILL_BATCH"],
+            default: false,
+            environment: env)
         GLM52PrefillBatchDispatch.groupSize = max(2,
-            env["DS4_GLM_PREFILL_ROUTE_BATCH"].flatMap(Int.init) ?? 16)
+            DS4RuntimeEnvironment.integer(
+                "DS4_PREFILL_ROUTE_BATCH",
+                overrides: ["DS4_GLM_PREFILL_ROUTE_BATCH"],
+                environment: env) ?? 16)
     }
 }
 
@@ -155,8 +175,8 @@ public struct GLM52StreamedWeightTypes: Sendable {
 /// solo head (433 → 39 ms). Gli slot di staging dei layer streamati NON
 /// passano da qui: sono riscritti da SSD di continuo, mai freddi.
 enum GLM52ResidentWiring {
-    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo
-        .environment["DS4_GLM_MLOCK"] != "0"
+    nonisolated(unsafe) static var enabled = DS4RuntimeEnvironment.flag(
+        "DS4_MLOCK", overrides: ["DS4_GLM_MLOCK"], default: true)
 
     static func wire(_ buffer: MTLBuffer) {
         guard enabled else { return }
@@ -646,12 +666,13 @@ extension MetalRuntime {
     func glm52EncodeRMSNorm(into commandBuffer: MTLCommandBuffer,
                                     input: MTLBuffer, weight: MTLBuffer,
                                     output: MTLBuffer, width: Int,
-                                    epsilon: Float = 1e-5) throws {
+                                    epsilon: Float = 1e-5,
+                                    rows: Int = 1) throws {
         try glm52GraphEncode(
             into: commandBuffer, pipelineName: "kernel_glm52_rms_norm_f32",
             arguments: [UInt32(width), epsilon.bitPattern, 0, 0],
             buffers: [input, weight, output],
-            threadgroups: MTLSize(width: 1, height: 1, depth: 1),
+            threadgroups: MTLSize(width: rows, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1),
             threadgroupMemoryLength: 256 * MemoryLayout<Float>.stride)
     }
@@ -1381,6 +1402,32 @@ extension MetalRuntime {
         try glm52EncodeRMSNorm(into: commandBuffer, input: input,
                                weight: weights, output: output,
                                width: values.count, epsilon: epsilon)
+        try glm52GraphCommit(commandBuffer)
+        return glm52GraphReadback(output, count: values.count)
+    }
+
+    /// Validation wrapper for the row-batched RMSNorm dispatch used by
+    /// Laguna prefill. `weight` is shared by every tightly packed row.
+    public func glm52RMSNormRows(
+        values: [Float], weight: [Float], width: Int,
+        epsilon: Float = 1e-5
+    ) throws -> [Float] {
+        guard width > 0, !values.isEmpty,
+              values.count % width == 0, weight.count == width,
+              width <= Int(UInt32.max), epsilon > 0 else {
+            throw MetalError.unsupported(
+                "GLM 5.2 batched RMSNorm expects packed rows and one weight row")
+        }
+        let rows = values.count / width
+        let input = try glm52GraphBuffer(values)
+        let weights = try glm52GraphBuffer(weight)
+        let output = try glm52GraphOutputBuffer(floats: values.count)
+        guard let commandBuffer = queue.makeCommandBuffer() else {
+            throw MetalError.bufferAlloc
+        }
+        try glm52EncodeRMSNorm(
+            into: commandBuffer, input: input, weight: weights,
+            output: output, width: width, epsilon: epsilon, rows: rows)
         try glm52GraphCommit(commandBuffer)
         return glm52GraphReadback(output, count: values.count)
     }

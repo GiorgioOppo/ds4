@@ -59,6 +59,8 @@ campionamento.
 
 Le opzioni avanzate sono variabili d'ambiente perché l'engine legge le stesse
 manopole a runtime nella demo, nell'app e nei test.
+Il confronto completo fra nomi, default e semantica di DeepSeek, GLM e Laguna
+è in [Parametri runtime dei backend](../../docs/BACKEND-RUNTIME-PARAMETERS.it.md).
 
 Come leggere le manopole:
 

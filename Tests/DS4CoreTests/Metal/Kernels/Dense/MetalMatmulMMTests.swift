@@ -4,12 +4,8 @@ import XCTest
 /// Phase 9 / Stage A1: validates the real metal/dense.metal prefill matmul
 /// kernels (kernel_mul_mm_q8_0_f32 / kernel_mul_mm_f16_f32) vs CPU, multi-token.
 final class MetalMatmulMMTests: XCTestCase {
-    static let metalDir = "/Users/oppog/Downloads/ds4-main/DS4-gui/metal"
-
     private func makeRuntime() throws -> MetalRuntime {
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.metalDir + "/dense.metal"),
-                          "vendored metal kernels not present")
-        do { return try MetalRuntime(metalDir: Self.metalDir) }
+        do { return try MetalRuntime() }
         catch { throw XCTSkip("Metal unavailable: \(error)") }
     }
 
