@@ -8,6 +8,31 @@ import XCTest
 /// `DS4_LAGUNA_SMOKE_GGUF` points at one — otherwise it skips, keeping the
 /// suite hermetic.
 final class LagunaChatServiceSmokeTests: XCTestCase {
+    func testBenchmarkPlanReservesWarmupAndMeasuredDecode() {
+        let regular = LagunaChatService.benchmarkPlan(
+            contextTokens: 512, genTokens: 32, contextSize: 1_024)
+        XCTAssertEqual(regular.contextTokens, 512)
+        XCTAssertEqual(regular.decodeWarmupTokens, 4)
+        XCTAssertEqual(regular.measuredGenTokens, 32)
+
+        let clampedPrompt = LagunaChatService.benchmarkPlan(
+            contextTokens: 1_000, genTokens: 32, contextSize: 1_024)
+        XCTAssertEqual(clampedPrompt.contextTokens, 987)
+        XCTAssertEqual(clampedPrompt.decodeWarmupTokens, 4)
+        XCTAssertEqual(clampedPrompt.measuredGenTokens, 32)
+        XCTAssertLessThan(
+            clampedPrompt.contextTokens
+                + clampedPrompt.decodeWarmupTokens
+                + clampedPrompt.measuredGenTokens,
+            1_024)
+
+        let oversizedDecode = LagunaChatService.benchmarkPlan(
+            contextTokens: 60, genTokens: 60, contextSize: 64)
+        XCTAssertEqual(oversizedDecode.contextTokens, 8)
+        XCTAssertEqual(oversizedDecode.decodeWarmupTokens, 0)
+        XCTAssertEqual(oversizedDecode.measuredGenTokens, 55)
+    }
+
     func testGUIProfilePinsMeasuredLagunaOverrides() {
         let profile = LagunaInferenceService.guiEnvironmentDefaults
         XCTAssertEqual(profile["DS4_SSD_STREAM"], "1")
@@ -83,6 +108,28 @@ final class LagunaChatServiceSmokeTests: XCTestCase {
         // del motore copre già il prefisso comune del transcript).
         let committed = await service.committedTokens()
         XCTAssertGreaterThan(committed, 0)
+    }
+
+    func testSpeedBenchmarkReportsOnlyMeasuredDecodeIfProvided()
+        async throws {
+        guard let path = ProcessInfo.processInfo
+            .environment["DS4_LAGUNA_SMOKE_GGUF"] else {
+            throw XCTSkip(
+                "set DS4_LAGUNA_SMOKE_GGUF=<laguna.gguf> to run")
+        }
+        let service = try LagunaChatService(
+            modelPath: path, contextSize: 256, systemPrompt: nil)
+        let point = try await service.benchmark(
+            contextTokens: 64, genTokens: 8)
+        XCTAssertEqual(point.contextTokens, 64)
+        XCTAssertEqual(point.decodeWarmupTokens, 4)
+        XCTAssertEqual(point.measuredGenTokens, 8)
+        XCTAssertGreaterThan(point.prefillTps, 0)
+        XCTAssertGreaterThan(point.genTps, 0)
+        XCTAssertGreaterThan(point.genTpsP99, 0)
+        XCTAssertTrue(point.report.contains("Profilo prefill — 64 token"))
+        XCTAssertTrue(point.report.contains("Profilo decode — 8 token"),
+                      "il profilo non deve includere i 4 token di warm-up")
     }
 
     func testExplicitLazyKVReportsTheAllocatedLoadFootprint()

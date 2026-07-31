@@ -207,7 +207,8 @@ final class BenchController {
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
                     onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
-                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
+                                 p.contextTokens, p.prefillTps,
+                                 p.genTpsP99, p.genTps))
                 }
                 return nil
             } catch is CancellationError { return nil }
@@ -263,8 +264,11 @@ final class BenchController {
                     let p = try await svc.benchmark(contextTokens: c, genTokens: gen)
                     rowCont.yield(BenchRow(ctxTokens: p.contextTokens, prefillTps: p.prefillTps,
                                            genTps: p.genTpsP99, kvcacheBytes: Int64(p.kvBytes)))
-                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f)\n",
-                                 p.contextTokens, p.prefillTps, p.genTpsP99, p.genTps))
+                    onLog(String(format: "  ctx %d · prefill %.1f t/s · gen 1/p99lat %.2f t/s (media %.2f; %d token misurati, warm-up %d esclusi)\n",
+                                 p.contextTokens, p.prefillTps,
+                                 p.genTpsP99, p.genTps,
+                                 p.measuredGenTokens,
+                                 p.decodeWarmupTokens))
                     onLog(p.report.split(separator: "\n")
                         .map { "    \($0)\n" }.joined())
                 }

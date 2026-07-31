@@ -74,8 +74,10 @@ e non esiste un fallback silenzioso al motore locale.
 - Il decode è una sequenza token-per-token; sul profilo Flash in streaming può
   essere dominato dal gather SSD, mentre a contesti lunghi cresce il peso
   dell'attenzione e del KV.
-- Il primo punto e i primi token possono includere warm-up, wiring e cache
-  fredde. Confrontare sempre la stessa metrica di regime.
+- Laguna esegue quattro token di warm-up a ogni frontiera, dopo il prefill, e
+  li esclude da media, p99 e profilo decode. In questo modo ogni punto misura
+  lo stesso regime della demo con `DS4_WARMUP=4`; gli altri backend possono
+  ancora includere costi di partenza e vanno confrontati a parità di metrica.
 - I risultati locali e distribuiti non sono confrontabili se cambiano GGUF,
   contesto, activation bits, route, cache o knob del motore.
 

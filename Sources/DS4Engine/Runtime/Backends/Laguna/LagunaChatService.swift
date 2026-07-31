@@ -155,8 +155,37 @@ public actor LagunaChatService {
         /// Throughput equivalent to p99 per-token decode latency: the slow
         /// generation tail (same metric as DeepSeek/GLM).
         public let genTpsP99: Double
+        /// Decode iterations measured after the per-frontier cold-cache
+        /// warm-up. Kept explicit so the GUI can describe the sample exactly.
+        public let measuredGenTokens: Int
+        public let decodeWarmupTokens: Int
         public let kvBytes: UInt64
         public let report: String
+    }
+
+    struct BenchmarkPlan: Equatable, Sendable {
+        let contextTokens: Int
+        let measuredGenTokens: Int
+        let decodeWarmupTokens: Int
+    }
+
+    /// Four untimed iterations are enough to remove pipeline/page-cache ramp
+    /// up on the measured M1 Pro. The plan always leaves one position spare
+    /// and reduces generation first only when the requested run cannot fit.
+    static func benchmarkPlan(contextTokens: Int, genTokens: Int,
+                              contextSize: Int) -> BenchmarkPlan {
+        let capacity = max(10, contextSize)
+        let minimumPrompt = 8
+        let maximumDecode = capacity - minimumPrompt - 1
+        let measured = min(max(1, genTokens), maximumDecode)
+        let warmup = min(4, max(0,
+            capacity - minimumPrompt - measured - 1))
+        let maximumPrompt = capacity - measured - warmup - 1
+        return BenchmarkPlan(
+            contextTokens: min(max(minimumPrompt, contextTokens),
+                               maximumPrompt),
+            measuredGenTokens: measured,
+            decodeWarmupTokens: warmup)
     }
 
     /// Synthetic MEASUREMENT benchmark: prefill (layer-major) + greedy
@@ -165,13 +194,16 @@ public actor LagunaChatService {
     public func benchmark(contextTokens: Int, genTokens: Int) async throws
         -> BenchmarkNumbers {
         let service = self.service
-        let limit = max(8, min(contextTokens, contextSize - genTokens - 1))
+        let plan = Self.benchmarkPlan(
+            contextTokens: contextTokens,
+            genTokens: genTokens,
+            contextSize: contextSize)
         primedTokens = []
         let prior = lastEnginePass
         let pass = Task.detached(priority: .userInitiated) {
             await prior?.value
             return try Self.benchmarkPass(
-                service: service, limit: limit, genTokens: genTokens)
+                service: service, plan: plan)
         }
         lastEnginePass = Task { _ = try? await pass.value }
         return try await withTaskCancellationHandler {
@@ -182,13 +214,13 @@ public actor LagunaChatService {
     }
 
     private static func benchmarkPass(service: LagunaInferenceService,
-                                      limit: Int, genTokens: Int)
+                                      plan: BenchmarkPlan)
         throws -> BenchmarkNumbers {
         var tokens = service.tokenizer.tokenizeRenderedChat(
             "benchmark sintetico DwarfStar — misura di prefill e decode ")
         if tokens.isEmpty { tokens = [1] }
-        while tokens.count < limit { tokens += tokens }
-        tokens = Array(tokens.prefix(limit))
+        while tokens.count < plan.contextTokens { tokens += tokens }
+        tokens = Array(tokens.prefix(plan.contextTokens))
         // Come nel warmup: cache coerenti anche quando il run fallisce.
         defer { service.engine.resetContext() }
         service.engine.resetContext()
@@ -199,21 +231,27 @@ public actor LagunaChatService {
             Date().timeIntervalSince(prefillStart), 0.001)
         let prefillReport = service.engine.profileReport(
             title: "Profilo prefill")
+
+        // A load-level warmup cannot make every context frontier representative:
+        // prefill changes the routed-expert working set. Prime decode at this
+        // exact frontier, then restart both timing and phase counters so cold
+        // cache fills never masquerade as steady-state generation.
+        for _ in 0..<plan.decodeWarmupTokens {
+            try Task.checkCancellation()
+            logits = try service.engine.forwardNext(greedyToken(logits))
+        }
         service.engine.resetProfile()
         let decodeStart = Date()
         var produced = 0
         var tokenSpeeds: [Double] = []
-        tokenSpeeds.reserveCapacity(genTokens)
-        for _ in 0..<genTokens {
+        tokenSpeeds.reserveCapacity(plan.measuredGenTokens)
+        for _ in 0..<plan.measuredGenTokens {
             try Task.checkCancellation()
-            var best = logits[0]
-            var bestIndex: Int32 = 0
-            for index in 1..<logits.count where logits[index] > best {
-                best = logits[index]
-                bestIndex = Int32(index)
-            }
+            // Include greedy selection in both the aggregate and per-token
+            // clocks. Previously only the aggregate included it, so media and
+            // p99 described different workloads.
             let tokenStart = Date()
-            logits = try service.engine.forwardNext(bestIndex)
+            logits = try service.engine.forwardNext(greedyToken(logits))
             let tokenSeconds = Date().timeIntervalSince(tokenStart)
             if tokenSeconds > 0 { tokenSpeeds.append(1.0 / tokenSeconds) }
             produced += 1
@@ -233,11 +271,23 @@ public actor LagunaChatService {
             prefillTps: Double(tokens.count) / prefillSeconds,
             genTps: Double(produced) / decodeSeconds,
             genTpsP99: p99,
+            measuredGenTokens: produced,
+            decodeWarmupTokens: plan.decodeWarmupTokens,
             kvBytes: kvCacheBytes(
                 shape: service.engine.configuration.shape,
                 tokens: tokens.count),
             report: "prefill: " + prefillReport
                 + "\ndecode: " + decodeReport)
+    }
+
+    private static func greedyToken(_ logits: [Float]) -> Int32 {
+        guard var best = logits.first else { return 0 }
+        var bestIndex: Int32 = 0
+        for index in logits.indices.dropFirst() where logits[index] > best {
+            best = logits[index]
+            bestIndex = Int32(index)
+        }
+        return bestIndex
     }
 
     /// Teacher-forced Top-1/2/3 next-token accuracy — shares the DeepSeek
